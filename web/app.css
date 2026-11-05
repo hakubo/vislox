@@ -219,6 +219,12 @@ button.chip { cursor: pointer; } button.chip:hover { border-color: var(--brand);
 .blk .sym { fill: #3b423b; font-size: 200px; font-weight: 700; }
 .blk .icon { fill: #ffffffd9; }
 .blk .icon-t { fill: #5f665f; font-size: 112px; font-weight: 700; }
+.blk.note .note-body { stroke-width: 1px; }
+.blk.note.sel .note-body { stroke: var(--sel); stroke-width: 2px; }
+.note-fold { fill: #00000014; }
+.note-t { font-size: 120px; line-height: 1.35; color: #3a3520; white-space: pre-wrap; word-break: break-word; overflow: hidden; height: 100%; font-family: inherit; }
+.lod-far .note-t { visibility: hidden; }
+.note-p { white-space: pre-wrap; word-break: break-word; padding: 6px 12px 8px; background: #fffbe0; border-left: 3px solid #e8d77a; margin: 4px 12px; border-radius: 4px; }
 .tag .bar { fill: #eff0ef; stroke: #5d635d; stroke-width: 1px; vector-effect: non-scaling-stroke; }
 .tag.sel .bar { fill: var(--sel-body); }
 .tag .cell-t, .tag .addr-t { fill: #1d211d; font-weight: 700; font-size: 112px; }

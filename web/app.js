@@ -35,7 +35,7 @@ const FRIENDLY = {
   AnalogThresholdTrigger: "Threshold switch", Div: "Divide", Sub: "Subtract", Mult: "Multiply", Add: "Add", Avg: "Average",
   MultiClick: "Multiclick", LongClick: "Long click", TextGenerator: "Text generator", OnOffDelay: "On/off delay",
   EdgeDetection: "Edge detection", HeatIRoomController2: "Intelligent room controller", LightController2: "Lighting controller",
-  AutoJalousie: "Automatic blinds", PushButton: "Push button", PulseAt: "Pulse at", AutopilotRule: "Automatic rule",
+  AutoJalousie: "Automatic blinds", Text: "Note", PushButton: "Push button", PulseAt: "Pulse at", AutopilotRule: "Automatic rule",
   MeterAbsUni: "Meter", MeterAbsBi: "Meter (bidirectional)", Radio: "Radio buttons", OnPulseDelay: "On-pulse delay",
   OffDelay: "Off delay", OnDelay: "On delay", PButtonT: "Push button +", AnalogMultiplexer2: "Analog multiplexer",
 };
@@ -487,8 +487,9 @@ function renderFar() {
     const sw = w * v.k;
     if (sw < 26) continue;
     const n = Math.floor(sw / 7.2);
-    const lines = [displayTitle(o)];
-    if (o.shape === "large" && h * v.k > 34 && !autoTitle(o.title)) lines.push(prettyType(o.ty));
+    const note = o.ty === "Text" ? noteText(o).split("\n").find((l) => l.trim()) : null;
+    const lines = [note || displayTitle(o)];
+    if (!note && o.shape === "large" && h * v.k > 34 && !autoTitle(o.title)) lines.push(prettyType(o.ty));
     const cy = y + Math.min(h / 2, 900) - ((lines.length - 1) * px) / 2 + px * 0.35;
     lines.forEach((s, i) => {
       el("text", { class: i ? "far-sub" : "far-t", x: x + w / 2, y: cy + i * px * 1.15, "text-anchor": "middle", "font-size": i ? px * 0.88 : px }, L.far, clip(s, n));
@@ -516,6 +517,7 @@ function objTip(o) {
   if (info.old_title) parts.push(`renamed from <i>${esc(info.old_title)}</i>`);
   if (o.target) parts.push(`mirrors <b>${esc(o.target.title)}</b>${o.target.page_title ? ` on page “${esc(o.target.page_title)}”` : o.target.path ? ` in ${esc(o.target.path)}` : ""}${o.target.page && o.target.page !== S.page ? "<br><span class='tm'>double-click to go there</span>" : ""}`);
   if (info.room || info.category) parts.push(esc([info.room, info.category].filter(Boolean).join(" · ")));
+  if (o.ty === "Text") parts.push(esc(clip(noteText(o), 300)).replace(/\n/g, "<br>"));
   if (o.status) parts.push(`<i>${o.status}</i>`);
   return parts.join("<br>");
 }
@@ -538,7 +540,25 @@ function drawPins(g, o, inner) {
   }
 }
 
+function noteText(o) { return S.view.objects[o.uuid]?.attrs.find((a) => a.name === "Text")?.value || ""; }
+
+/** A note (`Text` object): a sticky note in its own colour, carrying its text. */
+function drawNote(parent, o) {
+  const [x, y, w, h] = o.rect;
+  const g = wrapObj(parent, o, "blk note");
+  const color = o.color && o.color !== "0,0,0" ? `rgb(${o.color})` : "#fff9c4";
+  el("rect", { class: "halo", x: x - 50, y: y - 50, width: w + 100, height: h + 100, rx: 60 }, g);
+  el("rect", { class: "body note-body", x, y, width: w, height: h, style: `fill:${color}`, stroke: "#d8cf8a" }, g);
+  el("path", { class: "note-fold", d: `M${x + w - 240},${y + h} L${x + w},${y + h - 240} L${x + w},${y + h} Z` }, g);
+  const fo = el("foreignObject", { x: x + 90, y: y + 70, width: Math.max(0, w - 180), height: Math.max(0, h - 140) }, g);
+  const div = document.createElement("div");
+  div.className = "note-t";
+  div.textContent = noteText(o) || o.title;
+  fo.appendChild(div);
+}
+
 function drawBlock(parent, o) {
+  if (o.ty === "Text") return drawNote(parent, o);
   const [x, y, w, h] = o.rect;
   const g = wrapObj(parent, o, "blk");
   const color = o.color && o.color !== "0,0,0" ? `rgb(${o.color})` : "#5cb83f";
@@ -738,6 +758,8 @@ function renderProps() {
   const section = (name, rows, count) => { if (rows.length) sections.push({ name, rows, count }); };
   const row = (k, v, cls) => `<div class="pr ${cls || ""}"><div class="k">${esc(k)}</div><div class="v">${v}</div></div>`;
 
+  const note = o.ty === "Text" ? o.attrs.find((a) => a.name === "Text") : null;
+  if (note) section("Note", [`<div class="note-p${marks && note.changed ? " chg" : ""}">${marks && note.changed ? chg(note.old, note.value, true) : esc(note.value || "")}</div>`]);
   const params = o.ports.filter((q) => q.def != null || q.def_changed || q.inv)
     .map((q) => row(q.name + (q.inv ? " (inverted)" : ""), chg(q.old_def, q.def, q.def_changed), marks && q.def_changed ? "chg" : ""));
   section("Parameters", params, params.length);
@@ -768,7 +790,7 @@ function renderProps() {
   details.push(row("UUID", `<span class="mono">${esc(o.uuid)}</span><button type="button" class="copy" data-copy="${esc(o.uuid)}">Copy</button>`));
   section("Details", details);
 
-  const raw = o.attrs.filter((a) => !["Title", "Type", "IName"].includes(a.name) || a.changed).map((a) => {
+  const raw = o.attrs.filter((a) => !["Title", "Type", "IName", ...(note ? ["Text"] : [])].includes(a.name) || (a.changed && a !== note)).map((a) => {
     let v;
     if (a.name === "Cl" && a.value && /^\d+,\d+,\d+$/.test(a.value) && !(marks && a.changed)) v = `<span class="swatch" style="background:rgb(${esc(a.value)})"></span> ${esc(a.value)}`;
     else if (marks && a.changed) v = chg(a.old, a.value, true);
@@ -786,6 +808,7 @@ function renderProps() {
   if (o.category) facts.push(`<span class="chip" title="Category">◆ ${esc(o.category)}</span>`);
   if (o.target) facts.push(`<span class="chip" title="Mirrors">↪ ${linkTarget(o.target)}</span>`);
   const title = autoTitle(o.title) ? prettyType(o.ty) : o.title;
+  if (note) S.closed.delete("Note");
   const st = marks && o.status ? ` <span class="st ${o.status}">${o.status}</span>` : "";
   const renamed = marks && o.old_title ? `<div class="ph-s"><span class="old">${esc(o.old_title)}</span>→ <span class="new">${esc(o.title)}</span></div>` : "";
   box.innerHTML = `<div class="ph"><div class="ph-top">${color && /^\d+,\d+,\d+$/.test(color) && color !== "0,0,0" ? `<span class="swatch" style="background:rgb(${esc(color)})"></span>` : ""}<span class="ph-t">${esc(title)}</span>${st}</div>
