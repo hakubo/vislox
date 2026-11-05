@@ -100,10 +100,16 @@
 
   <aside id="right" aria-label="History and changes">
     <section class="pane hidden" id="ai-pane" aria-labelledby="ai-h">
-      <h2 class="pane-title" id="ai-h"><span>Change with AI</span></h2>
+      <h2 class="pane-title" id="ai-h"><span>Change with AI</span>
+        <button type="button" id="btn-sync" class="pull-btn" title="Make the Miniserver's running config the project's base (lox config merge), then commit and push">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2v8M4.5 6.5 8 10l3.5-3.5M3 13h10" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          <span class="lbl">Sync from Miniserver</span>
+        </button>
+      </h2>
       <form id="ai-form" class="ai-form">
         <textarea id="ai-prompt" rows="3" maxlength="4000" aria-label="Describe a change"
           placeholder="Describe a change, e.g. “turn the hallway light on with motion after sunset”"></textarea>
+        <div class="ai-ctx" id="ai-ctx" aria-label="Context sent with the request"></div>
         <div class="ai-row">
           <button type="submit" id="ai-send" class="primary small">Send</button>
           <span class="ai-hint" id="ai-hint" role="status" aria-live="polite"></span>

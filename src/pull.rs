@@ -82,7 +82,7 @@ impl Pull {
             .current_dir(cmd.cwd.ancestors().find(|d| d.is_dir()).unwrap_or(&cmd.cwd))
             .stdin(std::process::Stdio::null())
             .kill_on_drop(true);
-        let out = tokio::time::timeout(TIMEOUT, c.output())
+        let out = tokio::time::timeout(TIMEOUT, output_retrying(&mut c))
             .await
             .map_err(|_| format!("lox config pull took longer than {} s", TIMEOUT.as_secs()))?
             .map_err(|e| format!("cannot run {}: {e}", cmd.lox.display()))?;
@@ -154,6 +154,23 @@ fn check(
         ctx: f.ctx.clone(),
         cwd: start.to_path_buf(),
     })
+}
+
+/// Run `c`, retrying briefly while the binary is "busy" (ETXTBSY): on
+/// Linux, a file just written can still be held open for writing by a child
+/// another thread forked at that moment, and executing it fails until that
+/// child execs.
+async fn output_retrying(c: &mut tokio::process::Command) -> std::io::Result<std::process::Output> {
+    let mut tries = 0;
+    loop {
+        match c.output().await {
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && tries < 20 => {
+                tries += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+            res => return res,
+        }
+    }
 }
 
 /// `name` as a path, or looked up on `PATH`.

@@ -219,6 +219,7 @@ async fn main() -> Result<()> {
         .route("/api/ai/status", axum::routing::post(api_ai_status))
         .route("/api/apply", axum::routing::post(api_apply))
         .route("/api/discard", axum::routing::post(api_discard))
+        .route("/api/sync", axum::routing::post(api_sync))
         .with_state(app)
         .layer(tower_http::compression::CompressionLayer::new());
 
@@ -478,6 +479,8 @@ fn refused((status, msg): actions::Refusal) -> Response {
 #[derive(Deserialize)]
 struct AskBody {
     prompt: String,
+    #[serde(default)]
+    context: actions::AskContext,
 }
 
 /// Send a change request to the AI agent's webhook.
@@ -489,7 +492,7 @@ async fn api_ai(
     if let Err(r) = app.actions.check(&headers) {
         return refused(r);
     }
-    match app.actions.ask(&b.prompt).await {
+    match app.actions.ask(&b.prompt, &b.context).await {
         Ok(v) => Json(v).into_response(),
         Err(r) => refused(r),
     }
@@ -508,16 +511,26 @@ async fn api_ai_status(State(app): State<Arc<App>>, Json(v): Json<serde_json::Va
 }
 
 /// Deploy the pending changes with `lox config push --force`, commit, push.
-async fn api_apply(State(app): State<Arc<App>>, headers: axum::http::HeaderMap) -> Response {
+async fn api_apply(
+    State(app): State<Arc<App>>,
+    headers: axum::http::HeaderMap,
+    body: Option<Json<actions::ApplyOpts>>,
+) -> Response {
     if let Err(r) = app.actions.check(&headers) {
         return refused(r);
     }
-    let res = app.actions.apply().await;
+    let opts = body.map(|Json(o)| o).unwrap_or_default();
+    let res = app.actions.apply(&opts).await;
     let a = app.clone();
     let _ = tokio::task::spawn_blocking(move || refresh(&a)).await;
     match res {
         Ok(m) => Json(serde_json::json!({ "message": m })).into_response(),
-        Err(r) => refused(r),
+        // What the user could allow to retry (a newer Loxone Config, custom changes).
+        Err((status, msg)) => (
+            status,
+            Json(serde_json::json!({ "error": msg, "hints": actions::apply_hints(&msg) })),
+        )
+            .into_response(),
     }
 }
 
@@ -527,6 +540,20 @@ async fn api_discard(State(app): State<Arc<App>>, headers: axum::http::HeaderMap
         return refused(r);
     }
     let res = app.actions.discard().await;
+    let a = app.clone();
+    let _ = tokio::task::spawn_blocking(move || refresh(&a)).await;
+    match res {
+        Ok(m) => Json(serde_json::json!({ "message": m })).into_response(),
+        Err(r) => refused(r),
+    }
+}
+
+/// Make the Miniserver's running config the project's base, commit, push.
+async fn api_sync(State(app): State<Arc<App>>, headers: axum::http::HeaderMap) -> Response {
+    if let Err(r) = app.actions.check(&headers) {
+        return refused(r);
+    }
+    let res = app.actions.sync().await;
     let a = app.clone();
     let _ = tokio::task::spawn_blocking(move || refresh(&a)).await;
     match res {
