@@ -100,7 +100,13 @@
 
   <aside id="right" aria-label="History and changes">
     <section class="pane" id="hist-pane" aria-labelledby="hist-h">
-      <h2 class="pane-title" id="hist-h">History</h2>
+      <h2 class="pane-title" id="hist-h"><span>History</span>
+        <button type="button" id="btn-pull" class="pull-btn hidden" title="Download the Miniserver's current config and commit it (lox config pull)">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2v8M4.5 6.5 8 10l3.5-3.5M3 13h10" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          <span class="lbl">Pull from Miniserver</span>
+        </button>
+      </h2>
+      <div class="pull-msg hidden" id="pull-msg" role="status" aria-live="polite"></div>
       <div class="hist" id="hist"></div>
     </section>
     <div class="splitter" id="split-right" role="separator" aria-orientation="horizontal" aria-label="Resize"></div>

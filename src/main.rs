@@ -4,6 +4,7 @@
 mod history;
 mod live;
 mod model;
+mod pull;
 mod source;
 
 use anyhow::{Context, Result};
@@ -56,6 +57,12 @@ struct Args {
     /// No live values: never connect to the Miniserver.
     #[arg(long, conflicts_with = "live_from")]
     no_live: bool,
+    /// No "Pull from Miniserver" button.
+    #[arg(long)]
+    no_pull: bool,
+    /// The lox binary that pulls the config (`lox config pull`).
+    #[arg(long, value_name = "PATH", default_value = "lox")]
+    lox: PathBuf,
 }
 
 struct App {
@@ -64,6 +71,7 @@ struct App {
     views: Mutex<HashMap<(String, String), Arc<String>>>,
     tx: broadcast::Sender<u64>,
     live: Arc<live::Live>,
+    pull: pull::Pull,
 }
 
 #[tokio::main]
@@ -78,6 +86,23 @@ async fn main() -> Result<()> {
     if let Some(root) = history.git_root() {
         eprintln!("vislox: history from git repository {}", root.display());
     }
+    let start = src.current.parent().unwrap_or(&args.path).to_path_buf();
+    let found = live::find_miniserver(&start, src.miniserver.as_deref(), args.ctx.as_deref());
+    if let (Some(_), Err(why)) = (&args.ctx, &found) {
+        anyhow::bail!("{why}");
+    }
+    let pull = pull::Pull::new(
+        &args.lox,
+        args.no_pull.then_some("turned off (--no-pull)"),
+        &src,
+        found.as_ref(),
+        &start,
+    );
+    match pull.why_not() {
+        None => eprintln!("vislox: \"Pull from Miniserver\" runs `lox config pull`"),
+        Some(why) if src.miniserver.is_some() => eprintln!("vislox: no pull: {why}"),
+        Some(_) => {}
+    }
     let (feed, live_source) = if args.no_live {
         (
             live::Feed::Off("turned off (--no-live)".into()),
@@ -91,19 +116,15 @@ async fn main() -> Result<()> {
         };
         (live::Feed::Ndjson(f.clone()), name)
     } else {
-        let start = src.current.parent().unwrap_or(&args.path);
-        match live::find_miniserver(start, src.miniserver.as_deref(), args.ctx.as_deref()) {
-            Ok((conn, from)) => {
-                let host = conn.host.clone();
-                eprintln!("vislox: live values from {host} (lox config {from})");
-                (live::Feed::Miniserver(Box::new(conn)), host)
+        match &found {
+            Ok(f) => {
+                let host = f.conn.host.clone();
+                eprintln!("vislox: live values from {host} (lox config {})", f.from);
+                (live::Feed::Miniserver(Box::new(f.conn.clone())), host)
             }
             Err(why) => {
-                if args.ctx.is_some() {
-                    anyhow::bail!("{why}");
-                }
                 eprintln!("vislox: no live values: {why}");
-                (live::Feed::Off(why), String::new())
+                (live::Feed::Off(why.clone()), String::new())
             }
         }
     };
@@ -114,6 +135,7 @@ async fn main() -> Result<()> {
         views: Mutex::new(HashMap::new()),
         tx,
         live: live::Live::new(feed, live_source),
+        pull,
     });
 
     spawn_watcher(app.clone())?;
@@ -151,6 +173,7 @@ async fn main() -> Result<()> {
         .route("/api/view", get(api_view))
         .route("/api/events", get(api_events))
         .route("/api/live", get(api_live))
+        .route("/api/pull", axum::routing::post(api_pull))
         .with_state(app)
         .layer(tower_http::compression::CompressionLayer::new());
 
@@ -263,6 +286,7 @@ async fn api_history(State(app): State<Arc<App>>) -> impl IntoResponse {
         "history": hist,
         "error": h.last_error,
         "live": app.live.info(),
+        "pull": app.pull.info(),
     }))
 }
 
@@ -366,4 +390,30 @@ async fn api_live(
     });
     let stream = tokio_stream::iter(first).chain(rest).map(Ok);
     Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+/// Fetch the Miniserver's current config with `lox config pull`, then show
+/// the new revision at once. Needs the `X-Vislox` header, which a page on
+/// another site cannot send without asking first (CORS), so no other site
+/// can start a pull in this browser.
+async fn api_pull(State(app): State<Arc<App>>, headers: axum::http::HeaderMap) -> Response {
+    if !headers.contains_key("x-vislox") {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": "missing X-Vislox header" })),
+        )
+            .into_response();
+    }
+    match app.pull.run().await {
+        Ok(p) => {
+            let a = app.clone();
+            let _ = tokio::task::spawn_blocking(move || refresh(&a)).await;
+            Json(serde_json::json!({ "committed": p.committed })).into_response()
+        }
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({ "error": e })),
+        )
+            .into_response(),
+    }
 }

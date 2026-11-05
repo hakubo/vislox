@@ -155,6 +155,7 @@ async function loadHistory(fromEvent) {
   renderSelects();
   if (S.live.on && h.live?.available) liveStart();
   renderLiveSwitch();
+  renderPull();
   if (fromEvent) {
     setStatus("updated " + new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }), "live flash");
     setTimeout(() => setStatus("live", "live"), 2500);
@@ -1270,6 +1271,46 @@ for (const [sid, a, b] of [["split-left", "tree-pane", "props-pane"], ["split-ri
     window.addEventListener("mouseup", up);
   });
 }
+
+// ── pull from the Miniserver ───────────────────────────────────────────
+// `lox config pull` on the server: the new backup arrives as a git commit.
+let pulling = false;
+function renderPull() {
+  const info = S.hist?.pull || { available: false };
+  const b = $("btn-pull");
+  // A config repository without a usable lox setup still gets the button, disabled, to say why.
+  b.classList.toggle("hidden", !info.shown);
+  b.disabled = pulling || !info.available;
+  b.classList.toggle("busy", pulling);
+  b.querySelector(".lbl").textContent = pulling ? "Pulling…" : "Pull from Miniserver";
+  b.title = info.available ? "Download the Miniserver's current config and commit it (lox config pull)" : `Cannot pull: ${info.reason}`;
+}
+function pullMsg(text, cls) {
+  const m = $("pull-msg");
+  m.textContent = text || "";
+  m.className = "pull-msg" + (cls ? " " + cls : "") + (text ? "" : " hidden");
+  clearTimeout(m._t);
+  if (text && cls !== "error") m._t = setTimeout(() => pullMsg(""), 8000);
+}
+async function pull() {
+  if (pulling) return;
+  pulling = true; renderPull(); pullMsg("");
+  try {
+    const r = await fetch("/api/pull", { method: "POST", headers: { "X-Vislox": "pull" } });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.error || r.statusText);
+    if (j.committed) {
+      pullMsg("Pulled: the Miniserver's config is committed as a new backup.");
+      await loadHistory(true);
+    } else pullMsg("Up to date: the Miniserver runs the config of the last backup.", "info");
+  } catch (e) {
+    pullMsg(e.message, "error");
+  } finally {
+    pulling = false; renderPull();
+  }
+}
+$("btn-pull").onclick = pull;
+$("pull-msg").onclick = () => pullMsg("");
 
 // ── live values ────────────────────────────────────────────────────────
 // The Miniserver streams a value per state UUID; a wire's source connector

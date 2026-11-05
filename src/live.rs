@@ -56,6 +56,9 @@ struct LoxConf {
     serial: String,
     #[serde(default)]
     verify_ssl: Option<bool>,
+    /// The config repository `lox config pull` commits to.
+    #[serde(default)]
+    config_repo: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -90,6 +93,31 @@ impl LoxConf {
         (!self.serial.is_empty() && norm(&self.serial) == name) || norm(host) == name
     }
 
+    /// The folder `lox config pull` writes this Miniserver's config to:
+    /// its serial, else its address (`ms_dir` in lox's `gitops.rs`).
+    fn ms_dir(&self) -> String {
+        if !self.serial.is_empty() {
+            return self.serial.clone();
+        }
+        self.host
+            .trim_start_matches("https://")
+            .trim_start_matches("http://")
+            .split(':')
+            .next()
+            .unwrap_or("default")
+            .replace(['/', '.'], "_")
+    }
+
+    fn found(&self, data_dir: &Path, from: String, ctx: Option<String>) -> Found {
+        Found {
+            conn: self.connection(data_dir),
+            from,
+            ctx,
+            config_repo: self.config_repo.as_ref().map(PathBuf::from),
+            ms_dir: self.ms_dir(),
+        }
+    }
+
     fn connection(&self, data_dir: &Path) -> Connection {
         let host = if self.host.starts_with("http://") || self.host.starts_with("https://") {
             self.host.clone()
@@ -109,17 +137,29 @@ impl LoxConf {
     }
 }
 
+/// The Miniserver lox would talk to, and how lox was told about it.
+pub struct Found {
+    pub conn: Connection,
+    /// The config file, for messages.
+    pub from: String,
+    /// The context, when it came from a config with several.
+    pub ctx: Option<String>,
+    /// The repository `lox config pull` commits to.
+    pub config_repo: Option<PathBuf>,
+    /// The folder in it `lox config pull` writes to.
+    pub ms_dir: String,
+}
+
 /// The Miniserver connection lox would use, found the way lox finds it:
 /// `LOX_CONFIG`, then a project-local `.lox/config.yaml` above `start` (or
 /// the working directory), then `~/.lox/config.yaml`. In a config with
 /// several contexts: `ctx`, else the one for the Miniserver being viewed
-/// (`miniserver`), else the active one. Returns the connection and where it
-/// came from.
+/// (`miniserver`), else the active one.
 pub fn find_miniserver(
     start: &Path,
     miniserver: Option<&str>,
     ctx: Option<&str>,
-) -> Result<(Connection, String), String> {
+) -> Result<Found, String> {
     let home = std::env::home_dir().unwrap_or_default();
     find_in(
         std::env::var_os("LOX_CONFIG").map(PathBuf::from),
@@ -136,8 +176,8 @@ fn find_in(
     start: &Path,
     miniserver: Option<&str>,
     ctx: Option<&str>,
-) -> Result<(Connection, String), String> {
-    let flat = |path: &Path, data_dir: &Path| -> Result<(Connection, String), String> {
+) -> Result<Found, String> {
+    let flat = |path: &Path, data_dir: &Path| -> Result<Found, String> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
         let c: LoxConf = serde_yaml::from_str(&text)
@@ -145,7 +185,7 @@ fn find_in(
         if c.host.is_empty() {
             return Err(format!("{} names no host", path.display()));
         }
-        Ok((c.connection(data_dir), path.display().to_string()))
+        Ok(c.found(data_dir, path.display().to_string(), None))
     };
     if let Some(path) = env {
         let dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
@@ -196,9 +236,10 @@ fn find_in(
         .contexts
         .get(&name)
         .ok_or_else(|| format!("no lox context `{name}`"))?;
-    Ok((
-        c.connection(&global_dir.join("contexts").join(&name)),
+    Ok(c.found(
+        &global_dir.join("contexts").join(&name),
         format!("{} (context {name})", path.display()),
+        Some(name),
     ))
 }
 
@@ -798,18 +839,27 @@ mod tests {
         write(
             &home.join(".lox/config.yaml"),
             "active_context: office\ncontexts:\n  office:\n    host: 10.0.0.2\n    user: u\n    pass: p\n  \
-             home:\n    host: https://192.168.1.120\n    user: u\n    pass: p\n",
+             home:\n    host: https://192.168.1.120\n    user: u\n    pass: p\n    config_repo: /srv/cfg\n",
         );
         let start = tmp.path().join("repo");
         std::fs::create_dir_all(&start).unwrap();
-        let (c, from) = find_in(None, &home, &start, Some("192_168_1_120"), None).unwrap();
-        assert_eq!(c.host, "https://192.168.1.120");
-        assert!(from.contains("context home"), "{from}");
-        assert!(c.token_path.unwrap().ends_with("contexts/home/token.json"));
-        let (c, _) = find_in(None, &home, &start, Some("504F94000001"), None).unwrap();
-        assert_eq!(c.host, "https://10.0.0.2");
-        let (c, _) = find_in(None, &home, &start, None, Some("home")).unwrap();
-        assert_eq!(c.host, "https://192.168.1.120");
+        let f = find_in(None, &home, &start, Some("192_168_1_120"), None).unwrap();
+        assert_eq!(f.conn.host, "https://192.168.1.120");
+        assert!(f.from.contains("context home"), "{}", f.from);
+        assert_eq!(f.ctx.as_deref(), Some("home"));
+        assert_eq!(f.ms_dir, "192_168_1_120");
+        assert_eq!(f.config_repo, Some(PathBuf::from("/srv/cfg")));
+        assert!(
+            f.conn
+                .token_path
+                .unwrap()
+                .ends_with("contexts/home/token.json")
+        );
+        let f = find_in(None, &home, &start, Some("504F94000001"), None).unwrap();
+        assert_eq!(f.conn.host, "https://10.0.0.2");
+        assert_eq!(f.ms_dir, "10_0_0_2");
+        let f = find_in(None, &home, &start, None, Some("home")).unwrap();
+        assert_eq!(f.conn.host, "https://192.168.1.120");
         assert!(find_in(None, &home, &start, None, Some("nope")).is_err());
     }
 
@@ -828,14 +878,15 @@ mod tests {
         );
         let sub = project.join("pages");
         std::fs::create_dir_all(&sub).unwrap();
-        let (c, _) = find_in(None, &home, &sub, None, None).unwrap();
-        assert_eq!(c.host, "http://local");
-        let (c, _) = find_in(None, &home, &tmp.path().join("home"), None, None).unwrap();
-        assert_eq!(c.host, "https://global");
+        let f = find_in(None, &home, &sub, None, None).unwrap();
+        assert_eq!(f.conn.host, "http://local");
+        assert_eq!(f.ctx, None);
+        let f = find_in(None, &home, &tmp.path().join("home"), None, None).unwrap();
+        assert_eq!(f.conn.host, "https://global");
         let env = tmp.path().join("env.yaml");
         write(&env, "host: envhost\nuser: u\npass: p\n");
-        let (c, _) = find_in(Some(env), &home, &sub, None, None).unwrap();
-        assert_eq!(c.host, "https://envhost");
+        let f = find_in(Some(env), &home, &sub, None, None).unwrap();
+        assert_eq!(f.conn.host, "https://envhost");
         assert!(
             find_in(
                 None,

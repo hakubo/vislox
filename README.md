@@ -23,6 +23,8 @@ marked so you can review it before you deploy.
     This is what `lox config push` would apply.
   - *Changed on disk*: snapshots taken while vislox runs, whenever the file changes.
   - *Git commits*: the file's history, e.g. from `lox config pull`.
+  - **Pull from Miniserver** (in a `lox config init` repository): runs `lox config pull`, which downloads the
+    Miniserver's current config and commits it when it changed. The new backup appears at once.
 - **Change review**: added (green), changed (amber), removed (red, dashed ghost) and moved (blue, ghost at
   the old place) blocks. Wires and parameters are marked too: changed values show old → new in the
   properties. The Changes list can be filtered by kind, and clicking an entry jumps to it.
@@ -40,7 +42,8 @@ marked so you can review it before you deploy.
   wires between pure logic blocks have no value. Those are faded ("Dim wires without a value" in the legend
   turns this off). Values show on the current, deployed revision only.
 
-Read-only: vislox never writes to the config, and live values only listen: no commands are sent.
+Read-only: vislox never writes to the config, and live values only listen: no commands are sent. A pull reads
+from the Miniserver, and lox commits the download to your repository; nothing is sent to the Miniserver.
 
 ## Run
 
@@ -69,6 +72,11 @@ vislox config.Loxone --live-from recorded.ndjson   # replay a recording (followe
 The Miniserver connection is opened when a browser turns live values on, and closed shortly after the last
 one turns them off.
 
+**Pull from Miniserver** runs `lox config pull` (the `lox` on `PATH`, or `--lox <path>`), with the same lox
+configuration and context as live values. It is offered only when lox would commit to the repository vislox
+shows, into the folder of the Miniserver vislox shows (`config_repo` and the serial or address in lox's
+configuration). Otherwise the button is greyed out and its tooltip says why. `--no-pull` hides it.
+
 | Input | Click | Shift+click |
 |---|---|---|
 | History entry | view it, compared with the entry before it | compare the viewed revision with this one |
@@ -94,6 +102,8 @@ The binary is an `axum` server with the UI embedded (plain JS and SVG, no build 
 - `src/model.rs` turns a revision, plus an optional base, into pages, objects, wires, cross-page links,
   properties and a change list. It uses `loxone_config::diff` and adds its own checks for attributes,
   positions and wires.
+- `src/pull.rs` runs `lox config pull` for the Pull button (`POST /api/pull`, which needs an `X-Vislox` header so
+  that no other web page can trigger it), then refreshes the history.
 - `src/live.rs` streams the Miniserver's states with lox's `loxone-client` crate. A wire's source
   connector has the UUID of the state it carries, so the browser matches values to wires by UUID. Values
   reach the browser on `/api/live` (server-sent events).

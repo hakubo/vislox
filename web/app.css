@@ -410,3 +410,14 @@ button.chip { cursor: pointer; } button.chip:hover { border-color: var(--brand);
 .pr .lv.none { background: none; border-color: transparent; color: var(--faint); padding: 0; }
 .pr .lv.tick { background: var(--live-tick); }
 .pr .lv-of { color: var(--faint); font-size: 11px; margin-left: 6px; }
+
+/* ── pull from the Miniserver ─────────────────────── */
+.pull-btn { margin-left: auto; display: inline-flex; align-items: center; gap: 5px; height: 24px; padding: 0 8px; border: 1px solid var(--line); border-radius: 4px; background: #fff; color: var(--text); font-size: 12px; font-weight: 600; text-transform: none; letter-spacing: 0; white-space: nowrap; }
+.pull-btn:hover:not(:disabled) { border-color: var(--brand); color: var(--brand-strong); }
+.pull-btn svg { width: 13px; height: 13px; }
+.pull-btn:disabled { cursor: progress; opacity: .7; }
+.pull-btn.busy svg { animation: pull-bob 1s ease-in-out infinite; }
+@keyframes pull-bob { 50% { transform: translateY(2px); } }
+.pull-msg { flex: none; margin: 6px 10px 0; padding: 6px 8px; border-radius: 4px; font-size: 12px; background: var(--brand-soft); color: var(--brand-strong); word-break: break-word; }
+.pull-msg.error { background: var(--removed-bg); color: var(--removed); }
+.pull-msg.info { background: var(--panel-2); color: var(--muted); }
