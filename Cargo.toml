@@ -10,6 +10,7 @@ license = "Apache-2.0"
 loxone-config = { git = "https://github.com/discostu105/lox" }
 anyhow = "1"
 axum = "0.8"
+tower-http = { version = "0.6", features = ["compression-gzip"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process", "signal"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 futures-util = "0.3"

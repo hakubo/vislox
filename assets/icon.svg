@@ -1,4 +1,8 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
-  <rect width="64" height="64" rx="14" fill="#d97706"/>
-  <text x="32" y="32" dy="0.35em" text-anchor="middle" font-family="ui-sans-serif, system-ui, -apple-system, sans-serif" font-size="32" font-weight="600" fill="#ffffff">V</text>
+  <rect width="64" height="64" rx="14" fill="#5cb83f"/>
+  <path d="M6 22h10M6 34h10M48 28h10" stroke="#ffffff" stroke-width="3" stroke-linecap="round"/>
+  <rect x="16" y="13" width="32" height="36" rx="3" fill="#ffffff"/>
+  <rect x="16" y="13" width="32" height="9" rx="3" fill="#2f6e1d"/>
+  <rect x="16" y="18" width="32" height="4" fill="#2f6e1d"/>
+  <path d="M21 31h7M21 38h7M36 34.5h7" stroke="#5cb83f" stroke-width="3" stroke-linecap="round"/>
 </svg>

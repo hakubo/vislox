@@ -95,7 +95,8 @@ async fn main() -> Result<()> {
         .route("/api/history", get(api_history))
         .route("/api/view", get(api_view))
         .route("/api/events", get(api_events))
-        .with_state(app);
+        .with_state(app)
+        .layer(tower_http::compression::CompressionLayer::new());
 
     let listener = tokio::net::TcpListener::bind(args.listen)
         .await
