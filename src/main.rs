@@ -219,6 +219,7 @@ async fn main() -> Result<()> {
         .route("/api/ai/status", axum::routing::post(api_ai_status))
         .route("/api/apply", axum::routing::post(api_apply))
         .route("/api/discard", axum::routing::post(api_discard))
+        .route("/api/sync", axum::routing::post(api_sync))
         .with_state(app)
         .layer(tower_http::compression::CompressionLayer::new());
 
@@ -537,6 +538,20 @@ async fn api_discard(State(app): State<Arc<App>>, headers: axum::http::HeaderMap
         return refused(r);
     }
     let res = app.actions.discard().await;
+    let a = app.clone();
+    let _ = tokio::task::spawn_blocking(move || refresh(&a)).await;
+    match res {
+        Ok(m) => Json(serde_json::json!({ "message": m })).into_response(),
+        Err(r) => refused(r),
+    }
+}
+
+/// Make the Miniserver's running config the project's base, commit, push.
+async fn api_sync(State(app): State<Arc<App>>, headers: axum::http::HeaderMap) -> Response {
+    if let Err(r) = app.actions.check(&headers) {
+        return refused(r);
+    }
+    let res = app.actions.sync().await;
     let a = app.clone();
     let _ = tokio::task::spawn_blocking(move || refresh(&a)).await;
     match res {

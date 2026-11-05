@@ -1372,12 +1372,20 @@ function renderActions() {
   $("ai-pend").textContent = a.running === "Apply" ? "Deploying to the Miniserver… (download, check, upload, restart, verify)"
     : a.running ? `${a.running}…` : pend ? `Compiled changes are pending (${fmtWhen(pend.time)}). Review them, then apply.` : "";
   $("btn-apply").disabled = !a.apply.available || busy || !pend;
+  const sync = $("btn-sync");
+  sync.disabled = !a.apply.available || busy || !!pend;
+  sync.classList.toggle("busy", a.running === "Sync");
+  sync.querySelector(".lbl").textContent = a.running === "Sync" ? "Syncing…" : "Sync from Miniserver";
+  sync.title = !a.apply.available ? `Cannot sync: ${a.apply.reason}`
+    : pend ? "Apply or discard the pending changes first"
+    : "Make the Miniserver's running config the project's base (lox config merge), then commit and push";
   $("btn-discard").disabled = !a.apply.available || busy || !pend;
   $("btn-apply").title = a.apply.available ? "Deploy to the Miniserver with lox config push, then commit and push to git" : `Cannot apply: ${a.apply.reason}`;
   const last = a.last;
   if (last && last.at !== renderActions.shownAt) {
     renderActions.shownAt = last.at;
-    aiMsg((last.kind === "apply" ? (last.ok ? "Applied.\n" : "Apply failed.\n") : last.ok ? "" : "Discard failed.\n") + last.message, !last.ok);
+    const head = { apply: ["Applied.\n", "Apply failed.\n"], sync: ["", "Sync failed.\n"], discard: ["", "Discard failed.\n"] }[last.kind] || ["", ""];
+    aiMsg(head[last.ok ? 0 : 1] + last.message, !last.ok);
   }
 }
 $("ai-form").addEventListener("submit", async (e) => {
@@ -1424,6 +1432,10 @@ $("btn-apply").onclick = async () => {
       return;
     }
   }
+};
+$("btn-sync").onclick = async () => {
+  aiMsg("");
+  try { const j = await act("/api/sync"); aiMsg(j.message); } catch (err) { aiMsg(err.message, true); }
 };
 $("btn-discard").onclick = async () => {
   if (!window.confirm("Discard the pending changes? The module, lock and compiled config go back to the last commit.")) return;

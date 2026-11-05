@@ -55,7 +55,9 @@ marked so you can review it before you deploy.
   in words. vislox sends it to a webhook, where an AI agent edits the project's Lox Logic module with `lox logic`
   and compiles it. The result shows as the pending revision, so you review it like any compile. **Apply** deploys
   it with `lox config push --force` (download, drift check, upload, program restart, verify), then commits the
-  project and pushes it to its git remote. **Discard** puts the module back to the last commit.
+  project and pushes it to its git remote. **Discard** puts the module back to the last commit. **Sync from
+  Miniserver** makes what the Miniserver runs now the project's base (`lox config merge`: changes saved from
+  Loxone Config, rules edited in the app), then commits and pushes; it waits until nothing is pending.
 
 vislox itself never writes to the config: lox and git do, and only on Pull, Apply and Discard. Live values only
 listen. A pull reads from the Miniserver; only Apply writes to it.
@@ -137,7 +139,8 @@ The binary is an `axum` server with the UI embedded (plain JS and SVG, no build 
   properties and a change list. It uses `loxone_config::diff` and adds its own checks for attributes,
   positions and wires.
 - `src/actions.rs` sends AI requests to the webhook, takes the agent's reports, and runs Apply (`lox config push
-  --force`, `git commit`, `git push`) and Discard (`git checkout` of the module, lock and out).
+  --force`, `git commit`, `git push`), Sync (`lox config merge`, `git commit`, `git push`) and Discard
+  (`git checkout` of the module, lock and out).
 - `src/pull.rs` runs `lox config pull` for the Pull button (`POST /api/pull`, which needs an `X-Vislox` header so
   that no other web page can trigger it), then refreshes the history.
 - `src/live.rs` streams the Miniserver's states with lox's `loxone-client` crate. A wire's source

@@ -321,7 +321,7 @@ impl Actions {
             },
             at: now(),
         });
-        if res.is_ok() {
+        if res.is_ok() && !mark.is_empty() {
             for r in st.requests.iter_mut().filter(|r| r.state == "done") {
                 r.state = mark.to_string();
                 r.updated = now();
@@ -401,6 +401,76 @@ impl Actions {
             Ok(_) => report.push("Pushed to git.".into()),
             Err(e) => report.push(format!(
                 "Deployed and committed, but git push failed: {}",
+                last_lines(&e, 3)
+            )),
+        }
+        Ok(report.join("\n"))
+    }
+
+    /// Make the Miniserver's running config the project's base
+    /// (`lox config merge`), then commit and push.
+    pub async fn sync(&self) -> Result<String, Refusal> {
+        use axum::http::StatusCode;
+        let _one = self
+            .busy
+            .try_lock()
+            .map_err(|_| (StatusCode::CONFLICT, "already running".to_string()))?;
+        self.begin("Sync")?;
+        let res = self.sync_steps().await;
+        self.end("sync", &res, "");
+        res.map_err(|e| (StatusCode::BAD_GATEWAY, e))
+    }
+
+    async fn sync_steps(&self) -> Result<String, String> {
+        let dir = self.s.project.as_deref().unwrap();
+        // A sync commits the project; pending (uncommitted) changes would go
+        // with it and Discard could no longer drop them.
+        let dirty = git(dir, &["status", "--porcelain", "--", "."]).await?;
+        if !dirty.trim().is_empty() {
+            return Err(
+                "Apply or discard the pending changes first: a sync commits the project.".into(),
+            );
+        }
+        let out = run(
+            &self.s.lox,
+            &["config", "merge", "-o", "json"],
+            dir,
+            PUSH_TIMEOUT,
+        )
+        .await
+        .map_err(|e| format!("lox config merge failed:\n{}", last_lines(&e, 8)))?;
+        let report: Value = out
+            .find('{')
+            // The first JSON value; lox's progress messages may follow it.
+            .and_then(|i| {
+                serde_json::Deserializer::from_str(&out[i..])
+                    .into_iter::<Value>()
+                    .next()?
+                    .ok()
+            })
+            .unwrap_or(Value::Null);
+        let rules = report["rules_updated"].as_array().map_or(0, Vec::len)
+            + report["rules_removed"].as_array().map_or(0, Vec::len);
+        git(dir, &["add", "-A", "."]).await?;
+        if git(dir, &["diff", "--cached", "--quiet"]).await.is_ok() {
+            return Ok(
+                "Already up to date: the project's base is what the Miniserver runs.".into(),
+            );
+        }
+        let mut msg = String::from("Sync with the Miniserver's running config\n");
+        if rules > 0 {
+            msg.push_str(&format!("\nTook over {rules} rule(s) edited in the app.\n"));
+        }
+        git(dir, &["commit", "-q", "-m", &msg]).await?;
+        let mut report =
+            vec!["Synced: the project's base is now the Miniserver's running config.".to_string()];
+        if rules > 0 {
+            report.push(format!("Took over {rules} rule(s) edited in the app."));
+        }
+        match git(dir, &["push", "-q"]).await {
+            Ok(_) => report.push("Committed and pushed to git.".into()),
+            Err(e) => report.push(format!(
+                "Committed, but git push failed: {}",
                 last_lines(&e, 3)
             )),
         }
