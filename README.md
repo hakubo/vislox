@@ -60,7 +60,9 @@ marked so you can review it before you deploy.
   project and pushes it to its git remote. The page you are on goes with the request, and so do blocks you pick
   (Alt+click on the canvas, or **＋ AI context** in Properties), so the agent knows where to look. **Discard** puts the module back to the last commit. **Sync from
   Miniserver** makes what the Miniserver runs now the project's base (`lox config merge`: changes saved from
-  Loxone Config, rules edited in the app), then commits and pushes; it waits until nothing is pending.
+  Loxone Config, rules edited in the app), then commits and pushes; it waits until nothing is pending. When
+  merge refuses because the Miniserver holds custom changes no download carries, Sync makes a plain download the
+  base instead (rules edited in the app are then not taken over).
 
 vislox itself never writes to the config: lox and git do, and only on Pull, Apply and Discard. Live values only
 listen. A pull reads from the Miniserver; only Apply writes to it.

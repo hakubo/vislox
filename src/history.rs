@@ -266,10 +266,17 @@ impl History {
             first.current = Some(&first.blob) == disk_blob.as_ref();
         }
         let head_id = hist.first().map(|r| r.id.clone());
+        // A compile that is the deployed config would deploy nothing; when
+        // the newest one is, nothing is pending at all.
+        let head_blob = hist.first().map(|r| r.blob.clone());
+        if self.pending.last().map(|r| &r.blob) == head_blob.as_ref() {
+            return (Vec::new(), hist);
+        }
         let pending: Vec<Revision> = self
             .pending
             .iter()
             .rev()
+            .filter(|r| Some(&r.blob) != head_blob.as_ref())
             .enumerate()
             .map(|(i, r)| {
                 let mut r = r.clone();
@@ -423,5 +430,24 @@ mod tests {
         assert!(pending[0].current && !pending[1].current);
         assert_eq!(pending[1].label, "Earlier compile");
         assert!(h.find(&pending[1].id).is_some());
+    }
+
+    #[test]
+    fn a_compile_identical_to_the_deployed_config_is_not_pending() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("base.Loxone");
+        let out = tmp.path().join("out.Loxone");
+        fs::write(&base, "deployed").unwrap();
+        fs::write(&out, "deployed").unwrap();
+        let mut h = History::new(base, Some(out.clone()));
+        assert!(h.list().0.is_empty());
+        fs::write(&out, "a change").unwrap();
+        assert!(h.poll_files());
+        assert_eq!(h.list().0.len(), 1, "the identical compile is not listed");
+        // Compiled back to the deployed config (a sync, a discard): nothing
+        // is pending, the earlier compile included.
+        fs::write(&out, "deployed").unwrap();
+        assert!(h.poll_files());
+        assert!(h.list().0.is_empty());
     }
 }

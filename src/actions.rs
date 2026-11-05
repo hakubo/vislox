@@ -438,31 +438,56 @@ impl Actions {
                 "Apply or discard the pending changes first: a sync commits the project.".into(),
             );
         }
-        let out = run(
+        let p = loxone_config::Project::load(&dir.join("lox.toml"))
+            .map_err(|e| format!("cannot read lox.toml: {e}"))?;
+        let mut notes = Vec::new();
+        let rules = match run(
             &self.s.lox,
             &["config", "merge", "-o", "json"],
             dir,
             PUSH_TIMEOUT,
         )
         .await
-        .map_err(|e| format!("lox config merge failed:\n{}", last_lines(&e, 8)))?;
-        let report: Value = out
-            .find('{')
-            // The first JSON value; lox's progress messages may follow it.
-            .and_then(|i| {
-                serde_json::Deserializer::from_str(&out[i..])
-                    .into_iter::<Value>()
-                    .next()?
-                    .ok()
-            })
-            .unwrap_or(Value::Null);
-        let rules = report["rules_updated"].as_array().map_or(0, Vec::len)
-            + report["rules_removed"].as_array().map_or(0, Vec::len);
+        {
+            Ok(out) => {
+                let report: Value = out
+                    .find('{')
+                    // The first JSON value; lox's progress messages may follow it.
+                    .and_then(|i| {
+                        serde_json::Deserializer::from_str(&out[i..])
+                            .into_iter::<Value>()
+                            .next()?
+                            .ok()
+                    })
+                    .unwrap_or(Value::Null);
+                report["rules_updated"].as_array().map_or(0, Vec::len)
+                    + report["rules_removed"].as_array().map_or(0, Vec::len)
+            }
+            // merge refuses while the Miniserver holds custom changes no
+            // download carries (some keep reappearing). The download is
+            // still what the Miniserver runs: make it the base directly.
+            Err(e) if e.contains("custom change(s) that no download carries") => {
+                self.rebase_on_download(dir, &p.base).await?;
+                notes.push(
+                    "lox config merge refused because the Miniserver holds custom changes no download \
+                     carries, so the project was synced from a plain download instead (rules edited in \
+                     the app are not taken over). Apply will ask before deleting those changes."
+                        .to_string(),
+                );
+                0
+            }
+            Err(e) => return Err(format!("lox config merge failed:\n{}", last_lines(&e, 8))),
+        };
+        if let Some(m) = keep_base(dir, &p.base)? {
+            notes.push(m);
+        }
         git(dir, &["add", "-A", "."]).await?;
         if git(dir, &["diff", "--cached", "--quiet"]).await.is_ok() {
-            return Ok(
-                "Already up to date: the project's base is what the Miniserver runs.".into(),
-            );
+            let mut m = vec![
+                "Already up to date: the project's base is what the Miniserver runs.".to_string(),
+            ];
+            m.extend(notes);
+            return Ok(m.join("\n"));
         }
         let mut msg = String::from("Sync with the Miniserver's running config\n");
         if rules > 0 {
@@ -474,6 +499,7 @@ impl Actions {
         if rules > 0 {
             report.push(format!("Took over {rules} rule(s) edited in the app."));
         }
+        report.extend(notes);
         match git(dir, &["push", "-q"]).await {
             Ok(_) => report.push("Committed and pushed to git.".into()),
             Err(e) => report.push(format!(
@@ -482,6 +508,49 @@ impl Actions {
             )),
         }
         Ok(report.join("\n"))
+    }
+
+    /// Download the running config, make it the base, and compile the
+    /// module on top (accepting the Loxone Config release it was saved by).
+    async fn rebase_on_download(&self, dir: &Path, base: &Path) -> Result<(), String> {
+        let lox = &self.s.lox;
+        std::fs::create_dir_all(dir.join("backups"))
+            .map_err(|e| format!("cannot create backups/: {e}"))?;
+        let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+        let zip = format!("backups/{stamp}-sync.zip");
+        run(
+            lox,
+            &["config", "download", "--extract", "--save-as", &zip],
+            dir,
+            PUSH_TIMEOUT,
+        )
+        .await
+        .map_err(|e| format!("lox config download failed:\n{}", last_lines(&e, 6)))?;
+        let downloaded = dir.join(format!("backups/{stamp}-sync.Loxone"));
+        std::fs::copy(&downloaded, base).map_err(|e| {
+            format!(
+                "cannot copy {} to {}: {e}",
+                downloaded.display(),
+                base.display()
+            )
+        })?;
+        let compile = |extra: Vec<String>| async move {
+            let mut args = vec!["logic".to_string(), "compile".to_string()];
+            args.extend(extra);
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            run(lox, &args, dir, PUSH_TIMEOUT).await
+        };
+        if let Err(e) = compile(Vec::new()).await {
+            // The live config may be saved by a newer Loxone Config: it is
+            // what the Miniserver runs, so accept its release.
+            let Some(v) = apply_hints(&e)["accept_version"].as_str().map(String::from) else {
+                return Err(format!("lox logic compile failed:\n{}", last_lines(&e, 6)));
+            };
+            compile(vec!["--accept-version".into(), v])
+                .await
+                .map_err(|e| format!("lox logic compile failed:\n{}", last_lines(&e, 6)))?;
+        }
+        Ok(())
     }
 
     /// Put the module, lock and compiled config back to the last commit.
