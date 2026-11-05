@@ -14,7 +14,10 @@ const S = {
   follow: true, marks: true, vp: {}, open: new Set(["__pages"]), chgOff: new Set(),
   objPage: new Map(), pageOf: new Map(), loadSeq: 0, onlyChanged: false, chgIdx: -1,
   closed: new Set(["Advanced"]), dim: true, treeFocus: null, hash: null, applyingHash: false,
+  live: { on: pref("live", false), dim: pref("liveDim", true), es: null, status: null, values: new Map(), controls: {} },
 };
+function pref(k, d) { try { const v = localStorage.getItem("vislox." + k); return v === null ? d : v === "1"; } catch { return d; } }
+function setPref(k, v) { try { localStorage.setItem("vislox." + k, v ? "1" : "0"); } catch { /* private mode */ } }
 
 // ── helpers ────────────────────────────────────────────────────────────
 function esc(s) {
@@ -145,6 +148,10 @@ async function loadHistory(fromEvent) {
   if (S.base && !revById(S.base)) { S.base = revById(S.rev)?.base || null; changed = true; }
   renderHistory();
   renderSelects();
+  if (S.live.on && h.live?.available) liveStart();
+  renderLiveSwitch();
+  renderPull();
+  renderActions();
   if (fromEvent) {
     setStatus("updated " + new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }), "live flash");
     setTimeout(() => setStatus("live", "live"), 2500);
@@ -417,7 +424,7 @@ function renderPage() {
   el("rect", { class: "sheet", x: sx1, y: sy1, width: sx2 - sx1, height: sy2 - sy1 }, vpG);
   el("rect", { class: "sheet-dots", x: sx1, y: sy1, width: sx2 - sx1, height: sy2 - sy1 }, vpG);
 
-  L = { ghost: el("g", {}, vpG), wires: el("g", {}, vpG), refs: el("g", {}, vpG), objs: el("g", {}, vpG), badges: el("g", {}, vpG), far: el("g", {}, vpG), xrefs: [], wired: new Map(), kind: new Map() };
+  L = { ghost: el("g", {}, vpG), wires: el("g", {}, vpG), refs: el("g", {}, vpG), objs: el("g", {}, vpG), pills: el("g", {}, vpG), badges: el("g", {}, vpG), far: el("g", {}, vpG), xrefs: [], wired: new Map(), kind: new Map() };
   const wire = (uuid, key) => { if (!L.wired.has(uuid)) L.wired.set(uuid, new Set()); L.wired.get(uuid).add(key); };
   for (const w of p.wires) {
     wire(w.from[0], w.from[1]); wire(w.to[0], w.to[1]);
@@ -428,10 +435,10 @@ function renderPage() {
 
   for (const w of p.wires) {
     const pts = w.points.map((q) => q.join(",")).join(" ");
-    const line = el("polyline", { class: `wire${w.analog ? " analog" : ""}${w.status ? " d-" + w.status : ""}`, points: pts, "data-f": w.from[0], "data-t": w.to[0] }, L.wires);
+    const line = el("polyline", { class: `wire${w.analog ? " analog" : ""}${w.status ? " d-" + w.status : ""}`, points: pts, "data-f": w.from[0], "data-t": w.to[0], "data-src": w.src }, L.wires);
     const hit = el("polyline", { class: "wire-hit", points: pts }, L.wires);
     const fo = objByUuid.get(w.from[0]), to = objByUuid.get(w.to[0]);
-    hoverTip(hit, () => `<b>${esc(fo ? displayTitle(fo) : "")}</b>.${esc(portName(fo, w.from[1]))} → <b>${esc(to ? displayTitle(to) : "")}</b>.${esc(portName(to, w.to[1]))}<br><span class="tm">${w.analog ? "analog" : "digital"}${w.status ? " · " + w.status : ""}</span>`);
+    hoverTip(hit, () => `<b>${esc(fo ? displayTitle(fo) : "")}</b>.${esc(portName(fo, w.from[1]))} → <b>${esc(to ? displayTitle(to) : "")}</b>.${esc(portName(to, w.to[1]))}<br><span class="tm">${w.analog ? "analog" : "digital"}${w.status ? " · " + w.status : ""}</span>${liveTip(w.src)}`);
     hit.addEventListener("mouseenter", () => line.classList.add("hl"));
     hit.addEventListener("mouseleave", () => line.classList.remove("hl"));
     hit.addEventListener("click", (e) => { e.stopPropagation(); if (!drag?.moved) select(w.to[0]); });
@@ -461,6 +468,8 @@ function renderPage() {
       el("line", { class: "ghost-line ghost", x1: x + w / 2, y1: y + h / 2, x2: o.rect[0] + o.rect[2] / 2, y2: o.rect[1] + o.rect[3] / 2 }, L.ghost);
     }
   }
+  L.live = liveBuild(p);
+  liveApply(null);
   renderMinimap();
   if (!S.vp[S.page]) fit(); else applyVp();
   markCurrentChange();
@@ -700,7 +709,7 @@ function drawXref(parent, l, n) {
   L.xrefs.push({ x: bx, y, text: label, page: t.page_title || "" });
   const analog = /^A[QI]/.test(l.port) || /^A[QI]/.test(t.port || "");
   const wx = left ? bx + LABEL_W : bx;
-  el("polyline", { class: `xref-wire${analog ? " analog" : ""}${l.status ? " d-" + l.status : ""}`, "data-f": l.obj, points: `${l.x},${l.y} ${(l.x + wx) / 2},${l.y} ${(l.x + wx) / 2},${y} ${wx},${y}` }, g);
+  el("polyline", { class: `xref-wire${analog ? " analog" : ""}${l.status ? " d-" + l.status : ""}`, "data-f": l.obj, "data-src": l.src, points: `${l.x},${l.y} ${(l.x + wx) / 2},${l.y} ${(l.x + wx) / 2},${y} ${wx},${y}` }, g);
   const top = y - ROW / 2, rx = ROW / 2;
   el("rect", { class: "bar", x: bx, y: top, width: LABEL_W, height: ROW, rx, ry: rx }, g);
   // The link icon in its own pill at the wired end, like Loxone Config's connection references.
@@ -711,7 +720,7 @@ function drawXref(parent, l, n) {
   el("text", { class: "t", x: tx, y: y + 36 }, g, clip(label, 19));
   el("text", { class: "pg", x: tEnd, y: y + 34, "text-anchor": "end" }, g, clip(t.page_title ? "↗ " + t.page_title : t.path ? "⌂ " + (t.path.split(" / ").pop() || "") : "", 10));
   g.addEventListener("click", (e) => { e.stopPropagation(); if (!drag?.moved) followTarget(t); });
-  hoverTip(g, () => `${l.incoming ? "Comes from" : "Goes to"} <b>${esc(t.title)}</b>${t.port ? "." + esc(t.port) : ""} <span class="tm">${esc(prettyType(t.ty))}</span><br>${t.page_title ? `on page “${esc(t.page_title)}” — click to go there` : t.path ? `in ${esc(t.path)} — click to select` : ""}${l.status ? `<br><i>${l.status}</i>` : ""}`);
+  hoverTip(g, () => `${l.incoming ? "Comes from" : "Goes to"} <b>${esc(t.title)}</b>${t.port ? "." + esc(t.port) : ""} <span class="tm">${esc(prettyType(t.ty))}</span><br>${t.page_title ? `on page “${esc(t.page_title)}” — click to go there` : t.path ? `in ${esc(t.path)} — click to select` : ""}${l.status ? `<br><i>${l.status}</i>` : ""}${liveTip(l.src)}`);
 }
 
 function drawBadge(parent, o) {
@@ -811,6 +820,7 @@ function applyFocus() {
   });
   vpG.querySelectorAll(".xref").forEach((x) => { if (x.dataset.obj === sel) { x.classList.add("lit"); x.querySelector(".xref-wire")?.classList.add("lit"); } });
   for (const u of lit) vpG.querySelectorAll(`[data-uuid="${CSS.escape(u)}"]`).forEach((n) => n.classList.add("lit"));
+  vpG.querySelectorAll(".live-pill").forEach((n) => { if (lit.has(n.dataset.f)) n.classList.add("lit"); });
 }
 
 function linkTarget(t) {
@@ -835,6 +845,18 @@ function renderProps() {
   const section = (name, rows, count) => { if (rows.length) sections.push({ name, rows, count }); };
   const row = (k, v, cls) => `<div class="pr ${cls || ""}"><div class="k">${esc(k)}</div><div class="v">${v}</div></div>`;
 
+  if (liveHere()) {
+    const rows = [];
+    const ctl = S.live.controls[o.uuid];
+    for (const [name, su] of Object.entries(ctl?.states || {})) rows.push(row(name, lvSpan(su)));
+    for (const q of o.ports) {
+      const inc = q.conns.find((c) => c.dir === "in");
+      const src = inc ? inc.src : q.uuid;
+      if (!inc && !q.conns.length && !liveVal(q.uuid)) continue;
+      rows.push(row(q.name, lvSpan(src) + `<span class="lv-of">${inc ? "in" : "out"}</span>`));
+    }
+    section("Live values", rows.length ? rows : [`<div class="empty">The Miniserver sends no values for this block.</div>`], rows.length);
+  }
   const note = o.ty === "Text" ? o.attrs.find((a) => a.name === "Text") : null;
   if (note) section("Note", [`<div class="note-p${marks && note.changed ? " pr-chg" : ""}">${marks && note.changed ? chg(note.old, note.value, true) : esc(note.value || "")}</div>`]);
   const params = o.ports.filter((q) => q.def != null || q.def_changed || q.inv)
@@ -1246,6 +1268,9 @@ $("chk-changes").onchange = (e) => {
   if (!S.view) return;
   renderLegend(); renderTabs(); renderTree(); renderPage(); renderProps(); applyFocus();
 };
+$("chk-live").onchange = (e) => setLive(e.target.checked);
+$("chk-live-dim").checked = S.live.dim;
+$("chk-live-dim").onchange = (e) => { S.live.dim = e.target.checked; setPref("liveDim", S.live.dim); renderLiveSwitch(); };
 $("chk-dim").onchange = (e) => { S.dim = e.target.checked; renderPage(); applyFocus(); };
 $("chk-follow").onchange = (e) => { S.follow = e.target.checked; if (S.follow) { S.rev = null; loadHistory(); } writeHash(false); };
 
@@ -1271,6 +1296,7 @@ window.addEventListener("keydown", (e) => {
     case "]": case "n": gotoChange(S.chgIdx + 1); break;
     case "[": case "p": gotoChange(S.chgIdx < 0 ? -1 : S.chgIdx - 1); break;
     case "?": openHelp(); break;
+    case "l": case "L": if (S.hist?.live?.available) setLive(!S.live.on); break;
     case "/": openPalette(""); break;
     case "Escape": select(null, { noReveal: true }); break;
     case "ArrowLeft": if (inTree || inTabs) return; pan(step, 0); break;
@@ -1296,11 +1322,410 @@ for (const [sid, a, b] of [["split-left", "tree-pane", "props-pane"], ["split-ri
   });
 }
 
+// ── pull from the Miniserver ───────────────────────────────────────────
+// `lox config pull` on the server: the new backup arrives as a git commit.
+let pulling = false;
+function renderPull() {
+  const info = S.hist?.pull || { available: false };
+  const b = $("btn-pull");
+  // A config repository without a usable lox setup still gets the button, disabled, to say why.
+  b.classList.toggle("hidden", !info.shown);
+  b.disabled = pulling || !info.available;
+  b.classList.toggle("busy", pulling);
+  b.querySelector(".lbl").textContent = pulling ? "Pulling…" : "Pull from Miniserver";
+  b.title = info.available ? "Download the Miniserver's current config and commit it (lox config pull)" : `Cannot pull: ${info.reason}`;
+}
+function pullMsg(text, cls) {
+  const m = $("pull-msg");
+  m.textContent = text || "";
+  m.className = "pull-msg" + (cls ? " " + cls : "") + (text ? "" : " hidden");
+  clearTimeout(m._t);
+  if (text && cls !== "error") m._t = setTimeout(() => pullMsg(""), 8000);
+}
+async function pull() {
+  if (pulling) return;
+  pulling = true; renderPull(); pullMsg("");
+  try {
+    const r = await fetch("/api/pull", { method: "POST", headers: { "X-Vislox": "pull" } });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.error || r.statusText);
+    if (j.committed) {
+      pullMsg("Pulled: the Miniserver's config is committed as a new backup.");
+      await loadHistory(true);
+    } else pullMsg("Up to date: the Miniserver runs the config of the last backup.", "info");
+  } catch (e) {
+    pullMsg(e.message, "error");
+  } finally {
+    pulling = false; renderPull();
+  }
+}
+$("btn-pull").onclick = pull;
+$("pull-msg").onclick = () => pullMsg("");
+
+// ── change with AI, apply, discard ─────────────────────────────────────
+// A prompt goes to an AI agent (webhook) that edits the lox.toml project's module and compiles it;
+// the compile shows as the pending revision. Apply deploys it (lox config push) and pushes to git.
+function adminToken(ask) {
+  let t = "";
+  try { t = localStorage.getItem("vislox.token") || ""; } catch { /* private mode */ }
+  if (!t && ask) {
+    t = (window.prompt("Admin token for changes (the contents of vislox's --admin-token-file):") || "").trim();
+    if (t) try { localStorage.setItem("vislox.token", t); } catch { /* private mode */ }
+  }
+  return t;
+}
+async function act(path, body) {
+  const t = adminToken(true);
+  if (!t) throw new Error("Changes need the admin token.");
+  const r = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Vislox-Token": t },
+    body: JSON.stringify(body || {}),
+  });
+  const j = await r.json().catch(() => ({}));
+  if (r.status === 401) try { localStorage.removeItem("vislox.token"); } catch { /* private mode */ }
+  if (!r.ok) throw new Error(j.error || r.statusText);
+  return j;
+}
+/** Re-read the AI / Apply state (it changes outside revisions). */
+async function refreshActions() {
+  if (!S.hist) return;
+  try { S.hist.actions = (await api("/api/history")).actions; } catch { return; }
+  renderActions();
+}
+function aiMsg(text, error) {
+  const m = $("ai-msg");
+  m.textContent = text || "";
+  m.className = "ai-msg" + (error ? " error" : "") + (text ? "" : " hidden");
+}
+/** The newest compile, if it differs from what is deployed. */
+function pendingChange() {
+  const p = S.hist?.pending?.[0];
+  const base = p && revById(p.base);
+  return p && base && p.blob !== base.blob ? p : null;
+}
+function renderActions() {
+  const a = S.hist?.actions;
+  $("ai-pane").classList.toggle("hidden", !a?.shown);
+  if (!a?.shown) return;
+  const working = a.requests.some((r) => r.state === "sent" || r.state === "working");
+  const busy = working || !!a.running;
+  $("ai-prompt").disabled = !a.ai.available;
+  $("ai-send").disabled = !a.ai.available || busy;
+  $("ai-hint").textContent = !a.ai.available ? a.ai.reason : a.running ? `${a.running} is running…` : working ? "The AI is working on it…" : "";
+  $("ai-reqs").innerHTML = a.requests.slice(0, 4).map((r) => `<div class="ai-req st-${esc(r.state.replace(/ /g, "-"))}">
+      <div class="top"><span class="st">${esc(r.state)}</span><span class="p">${esc(r.prompt)}</span><span class="t">${esc(fmtWhen(r.updated))}</span></div>
+      ${r.summary ? `<div class="s">${esc(r.summary)}</div>` : ""}</div>`).join("");
+  const pend = pendingChange();
+  $("ai-deploy").classList.toggle("hidden", !pend && !a.running);
+  $("ai-pend").textContent = a.running === "Apply" ? "Deploying to the Miniserver… (download, check, upload, restart, verify)"
+    : a.running ? `${a.running}…` : pend ? `Compiled changes are pending (${fmtWhen(pend.time)}). Review them, then apply.` : "";
+  $("btn-apply").disabled = !a.apply.available || busy || !pend;
+  $("btn-discard").disabled = !a.apply.available || busy || !pend;
+  $("btn-apply").title = a.apply.available ? "Deploy to the Miniserver with lox config push, then commit and push to git" : `Cannot apply: ${a.apply.reason}`;
+  const last = a.last;
+  if (last && last.at !== renderActions.shownAt) {
+    renderActions.shownAt = last.at;
+    aiMsg((last.kind === "apply" ? (last.ok ? "Applied.\n" : "Apply failed.\n") : last.ok ? "" : "Discard failed.\n") + last.message, !last.ok);
+  }
+}
+$("ai-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const text = $("ai-prompt").value.trim();
+  if (!text) return;
+  $("ai-send").disabled = true;
+  aiMsg("");
+  try {
+    await act("/api/ai", { prompt: text });
+    $("ai-prompt").value = "";
+    await refreshActions();
+  } catch (err) {
+    aiMsg(err.message, true);
+  } finally { renderActions(); }
+});
+$("ai-prompt").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); $("ai-form").requestSubmit(); }
+});
+$("btn-apply").onclick = async () => {
+  const pend = pendingChange();
+  if (!pend) return;
+  if (!window.confirm("Deploy the pending changes to the Miniserver?\n\nlox config push uploads the config and restarts the Miniserver's program (a few seconds), " +
+    "checks that it runs exactly the compiled config, then vislox commits and pushes to git.")) return;
+  aiMsg("");
+  try { await act("/api/apply"); } catch (err) { aiMsg(err.message, true); }
+};
+$("btn-discard").onclick = async () => {
+  if (!window.confirm("Discard the pending changes? The module, lock and compiled config go back to the last commit.")) return;
+  aiMsg("");
+  try { const j = await act("/api/discard"); aiMsg(j.message); } catch (err) { aiMsg(err.message, true); }
+};
+
+// ── live values ────────────────────────────────────────────────────────
+// The Miniserver streams a value per state UUID; a wire's source connector
+// has the UUID of the state it carries. Logic blocks the app does not see
+// stream nothing, so their wires have no value.
+
+/** Live values belong to what runs on the Miniserver: the current, deployed revision. */
+function liveHere() {
+  const r = revById(S.rev);
+  return S.live.on && !!S.live.es && !!r && !!r.current && r.kind !== "pending";
+}
+/** A connector's value: streamed by the Miniserver, passed on by a reference or a memory flag,
+ *  a constant in the config, or computed from a simple gate's inputs (`view.live`).
+ *  Entries are `[value, text, label, kind]`; kind is "const" or "computed" for values the
+ *  Miniserver did not send. Cached until the next change. */
+let lvCache = new Map();
+function liveVal(uuid) { return liveHere() ? lvResolve(uuid, 0) : undefined; }
+function lvResolve(u, depth) {
+  if (!u || depth > 60) return undefined;
+  if (lvCache.has(u)) return lvCache.get(u);
+  lvCache.set(u, undefined); // a loop resolves to nothing
+  const r = lvFind(u, depth);
+  lvCache.set(u, r);
+  return r;
+}
+function lvFind(u, depth) {
+  const e = S.live.values.get(u);
+  if (e) return e;
+  const g = S.view?.live || {};
+  if (g.pass?.[u]) { const r = lvResolve(g.pass[u], depth + 1); if (r) return r; }
+  const ref = g.refs?.[u];
+  if (ref) {
+    const st = S.live.controls[ref]?.states || {};
+    const k = ["value", "active", "position"].find((k) => typeof st[k] === "string" && S.live.values.has(st[k]));
+    if (k) return S.live.values.get(st[k]);
+  }
+  const lc = g.moods?.[u];
+  if (lc) {
+    // Mood is the number of the active mood; with several active it is not known.
+    const su = S.live.controls[lc]?.states?.activeMoods;
+    let ids;
+    try { ids = JSON.parse(S.live.values.get(su)?.[0]); } catch { ids = null; }
+    if (Array.isArray(ids) && ids.length === 1) return [ids[0], null, "the lighting controller's active mood", "computed"];
+  }
+  if (g.consts && u in g.consts) return [g.consts[u], null, "constant in the config", "const"];
+  const gate = g.gates?.[u];
+  if (gate) {
+    const v = gateEval(gate, depth);
+    if (v !== undefined) return [v, null, `computed by vislox from the ${GATE_NAME[gate.op]} block's inputs`, "computed"];
+  }
+  return undefined;
+}
+const GATE_NAME = { and: "AND", or: "OR", xor: "XOR", not: "NOT", eq: "Equal", ne: "Not equal", gt: "Greater", ge: "Greater or equal",
+  lt: "Less", le: "Less or equal", add: "Add", sub: "Subtract", mul: "Multiply", div: "Divide" };
+function lvNum(e) {
+  const v = e?.[0];
+  const n = typeof v === "number" ? v : typeof v === "string" && v.trim() !== "" ? Number(v) : NaN;
+  return Number.isFinite(n) ? n : undefined;
+}
+/** A stateless gate's output from its inputs; undefined when an input it needs is unknown. */
+function gateEval(g, depth) {
+  // Each input: a number, null (unwired: ignored), or undefined (wired, value unknown).
+  const xs = g.ins.map((i) => {
+    if (i.src) {
+      const n = lvNum(lvResolve(i.src, depth + 1));
+      return n === undefined ? undefined : i.inv ? +(n === 0) : n;
+    }
+    if (i.inv) return 1; // an unwired inverted input is a constant 1
+    return i.def ?? null;
+  });
+  const wired = xs.filter((x) => x !== null);
+  const known = wired.filter((x) => x !== undefined).map((x) => x !== 0);
+  const unknown = wired.length - known.length;
+  switch (g.op) {
+    case "and": return known.includes(false) ? 0 : unknown || !wired.length ? undefined : 1;
+    case "or": return known.includes(true) ? 1 : unknown || !wired.length ? undefined : 0;
+    case "xor": return unknown || !wired.length ? undefined : known.filter(Boolean).length % 2;
+    case "not": return unknown || !wired.length ? undefined : +!known[0];
+  }
+  if (xs[0] === undefined || xs[1] === undefined) return undefined;
+  const a = xs[0] ?? 0, b = xs[1] ?? 0;
+  switch (g.op) {
+    case "eq": return +(a === b);
+    case "ne": return +(a !== b);
+    case "gt": return +(a > b);
+    case "ge": return +(a >= b);
+    case "lt": return +(a < b);
+    case "le": return +(a <= b);
+    case "add": return a + b;
+    case "sub": return a - b;
+    case "mul": return a * b;
+    case "div": return b === 0 ? undefined : a / b;
+  }
+  return undefined;
+}
+/** `[value, text in the control's format, "Control · state"]` → what to show. */
+function liveText(e) {
+  const [v, t] = e;
+  if (t) return t;
+  if (typeof v === "number") return String(Number.isInteger(v) ? v : +v.toFixed(2));
+  return String(v ?? "");
+}
+function liveOn(e) { const v = e[0]; return typeof v === "number" ? v !== 0 : !!v && v !== "0"; }
+function liveTip(src) {
+  if (!liveHere()) return "";
+  const e = liveVal(src);
+  return e ? `<br>value <b>${esc(liveText(e))}</b>${e[2] ? ` <span class="tm">${esc(e[2])}</span>` : ""}` : `<br><span class="tm">no live value</span>`;
+}
+function lvSpan(u) {
+  const e = liveVal(u);
+  return `<span class="lv${e ? "" : " none"}${e?.[3] ? " " + e[3] : ""}" data-lv="${esc(u)}"${e?.[2] ? ` title="${esc(e[2])}"` : ""}>${e ? esc(clip(liveText(e), 40)) : "no value"}</span>`;
+}
+
+function renderLiveSwitch() {
+  const info = S.hist?.live || { available: false, reason: "" };
+  const sw = $("sw-live"), chk = $("chk-live");
+  const on = info.available && S.live.on;
+  chk.disabled = !info.available;
+  chk.checked = on;
+  sw.classList.toggle("disabled", !info.available);
+  sw.classList.toggle("on", on);
+  sw.title = info.available ? `Show the current values from ${info.source} on the wires (L)` : `No live values: ${info.reason}`;
+  const here = liveHere();
+  const st = S.live.status || { state: "connecting" };
+  const ls = $("live-state");
+  ls.textContent = !here ? "other revision" : { live: "", connecting: "connecting…", idle: "connecting…", offline: "offline", ended: "input ended", off: "off" }[st.state] ?? st.state;
+  ls.className = "live-state st-" + (here ? st.state : "elsewhere");
+  ls.title = [st.detail, info.source && `from ${info.source}`].filter(Boolean).join("\n");
+  $("legend").classList.toggle("live", on);
+  $("live-note").textContent = on && !here ? "Live values show on the current, deployed revision only" : "";
+  svg.classList.toggle("live", here);
+  svg.classList.toggle("live-dim", here && S.live.dim);
+}
+
+function liveStart() {
+  if (S.live.es) return;
+  const es = new EventSource("/api/live");
+  S.live.es = es;
+  S.live.status = { state: "connecting" };
+  es.addEventListener("status", (e) => { S.live.status = JSON.parse(e.data); renderLiveSwitch(); });
+  es.addEventListener("snapshot", (e) => {
+    const d = JSON.parse(e.data);
+    S.live.values = new Map(Object.entries(d.values));
+    S.live.controls = d.controls || {};
+    lvCache = new Map();
+    liveQueue(null);
+  });
+  es.addEventListener("values", (e) => {
+    const d = JSON.parse(e.data);
+    for (const k in d) S.live.values.set(k, d[k]);
+    lvCache = new Map();
+    liveQueue(Object.keys(d));
+  });
+  es.onerror = () => {
+    if (es.readyState === EventSource.OPEN) return;
+    S.live.status = { state: "offline", detail: "vislox is not reachable; retrying" };
+    renderLiveSwitch();
+  };
+}
+function liveStop() {
+  S.live.es?.close();
+  S.live.es = null;
+  S.live.status = null;
+  S.live.values = new Map();
+  S.live.controls = {};
+  liveQueue(null);
+}
+function setLive(on) {
+  S.live.on = on;
+  setPref("live", on);
+  if (on) liveStart(); else liveStop();
+  renderLiveSwitch();
+}
+
+/** Repaint changed values once per frame; `null`: everything. */
+let livePending = new Set(), liveAll = false, liveRaf = 0;
+function liveQueue(keys) {
+  if (keys) keys.forEach((k) => livePending.add(k)); else liveAll = true;
+  if (!liveRaf) liveRaf = requestAnimationFrame(() => {
+    liveRaf = 0;
+    const ch = liveAll ? null : livePending;
+    liveAll = false; livePending = new Set();
+    liveApply(ch);
+    if (!ch && S.sel) renderProps();
+  });
+}
+
+/** Index the page by source connector: its wires, and where its value is written. */
+function liveBuild(p) {
+  const idx = new Map();
+  const get = (src) => {
+    let it = idx.get(src);
+    if (!it) idx.set(src, (it = { lines: [], pills: [], analog: false, seen: new Set() }));
+    return it;
+  };
+  vpG.querySelectorAll("[data-src]").forEach((n) => {
+    const it = get(n.dataset.src);
+    it.lines.push(n);
+    if (n.classList.contains("analog")) it.analog = true;
+  });
+  const pill = (src, x, y, end, owner) => {
+    const it = get(src), key = `${Math.round(x / 50)}|${Math.round(y / 50)}`;
+    if (it.seen.has(key)) return;
+    it.seen.add(key);
+    const g = el("g", { class: "live-pill", "data-f": owner }, L.pills);
+    g.style.display = "none";
+    const r = el("rect", { y: y - 190, height: 150, rx: 75 }, g);
+    const t = el("text", { y: y - 79 }, g);
+    it.pills.push({ g, r, t, x: end ? x - 150 : x + 150, end });
+  };
+  for (const w of p.wires) pill(w.src, w.points[0][0], w.points[0][1], false, w.from[0]);
+  for (const l of p.labels) pill(l.src, l.x, l.y, l.side === "L", l.obj);
+  return idx;
+}
+
+/** Repaint every value on the page: derived values change with their inputs, so `ch` (the
+ *  streamed values that changed, or null for a full repaint) only decides what flashes. */
+function liveApply(ch) {
+  renderLiveSwitch();
+  if (!ch) lvCache = new Map();
+  for (const [src, it] of L.live || []) {
+    const e = liveVal(src);
+    for (const n of it.lines) {
+      n.classList.toggle("lv-has", !!e);
+      n.classList.toggle("lv-on", !!e && !n.classList.contains("analog") && liveOn(e));
+    }
+    const show = !!e && (it.analog || typeof e[0] === "string");
+    const txt = show ? clip(liveText(e), 18) : "";
+    for (const pl of it.pills) {
+      pl.g.style.display = show ? "" : "none";
+      pl.g.classList.toggle("computed", e?.[3] === "computed");
+      if (!show) continue;
+      if (pl.t.textContent !== txt) {
+        const was = pl.t.textContent;
+        pl.t.textContent = txt;
+        const w = txt.length * 58 + 100, x = pl.end ? pl.x - w : pl.x;
+        pl.r.setAttribute("x", x); pl.r.setAttribute("width", w);
+        pl.t.setAttribute("x", x + 50);
+        if (ch && was) flash(pl.g);
+      }
+    }
+  }
+  $("props").querySelectorAll("[data-lv]").forEach((n) => {
+    const e = liveVal(n.dataset.lv);
+    const txt = e ? clip(liveText(e), 40) : "no value";
+    const changed = n.textContent !== txt;
+    n.textContent = txt;
+    n.className = "lv" + (e ? "" : " none") + (e?.[3] ? " " + e[3] : "");
+    n.title = e?.[2] || "";
+    if (ch && e && changed) flash(n);
+  });
+}
+function flash(n) {
+  n.classList.remove("tick");
+  void n.getBoundingClientRect();
+  n.classList.add("tick");
+  clearTimeout(n._tick);
+  n._tick = setTimeout(() => n.classList.remove("tick"), 700);
+}
+
 // ── live updates ───────────────────────────────────────────────────────
 function connect() {
   const es = new EventSource("/api/events");
-  es.onopen = () => setStatus("live", "live");
+  // Changes while the stream was down (or before it opened) are not replayed: catch up.
+  es.onopen = () => { setStatus("live", "live"); if (S.hist) loadHistory(); };
   es.addEventListener("history", () => loadHistory(true));
+  es.addEventListener("actions", (e) => { if (S.hist) { S.hist.actions = JSON.parse(e.data); renderActions(); } });
   es.onerror = () => setStatus("disconnected — retrying", "error");
 }
 S.hash = readHash();

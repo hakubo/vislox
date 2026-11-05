@@ -29,6 +29,10 @@
   <label class="switch" id="sw-changes" title="Colour what changed against the compared revision">
     <input type="checkbox" id="chk-changes" checked><span class="track" aria-hidden="true"></span><span class="lbl"><span class="long">Mark changes</span><span class="short">Changes</span></span>
   </label>
+  <label class="switch" id="sw-live" title="Show the Miniserver's current values on the wires">
+    <input type="checkbox" id="chk-live"><span class="track" aria-hidden="true"></span><span class="lbl"><span class="long">Live values</span><span class="short">Live</span></span>
+    <span class="live-state" id="live-state" aria-live="polite"></span>
+  </label>
   <label class="switch" title="Jump to each new revision as it appears">
     <input type="checkbox" id="chk-follow" checked><span class="track" aria-hidden="true"></span><span class="lbl"><span class="long">Follow latest</span><span class="short">Follow</span></span>
   </label>
@@ -73,6 +77,9 @@
         <span class="lg w-dig">digital</span><span class="lg w-ana">analog</span>
         <span class="lg-sep diff-only"></span>
         <span class="lg added diff-only">added</span><span class="lg changed diff-only">changed</span><span class="lg removed diff-only">removed</span><span class="lg moved diff-only">moved</span>
+        <span class="lg-sep live-only"></span>
+        <span class="lg w-on live-only">on</span><span class="lg-pill live-only">21.5°</span><span class="lg-pill computed live-only" title="Computed by vislox from the block's inputs; the Miniserver does not send it">computed</span><span class="lg-note live-only" id="live-note"></span>
+        <label class="lg-dim live-only" title="Fade wires the Miniserver sends no value for"><input type="checkbox" id="chk-live-dim" checked> Dim wires without a value</label>
       </div>
       <div id="minimap" class="hud minimap" aria-hidden="true"><svg id="mm"><g id="mm-objs"></g><rect id="mm-view"/></svg></div>
     </div>
@@ -92,8 +99,34 @@
   </section>
 
   <aside id="right" aria-label="History and changes">
+    <section class="pane hidden" id="ai-pane" aria-labelledby="ai-h">
+      <h2 class="pane-title" id="ai-h"><span>Change with AI</span></h2>
+      <form id="ai-form" class="ai-form">
+        <textarea id="ai-prompt" rows="3" maxlength="4000" aria-label="Describe a change"
+          placeholder="Describe a change, e.g. “turn the hallway light on with motion after sunset”"></textarea>
+        <div class="ai-row">
+          <button type="submit" id="ai-send" class="primary small">Send</button>
+          <span class="ai-hint" id="ai-hint" role="status" aria-live="polite"></span>
+        </div>
+      </form>
+      <div class="ai-reqs" id="ai-reqs"></div>
+      <div class="ai-deploy hidden" id="ai-deploy">
+        <div class="ai-pend" id="ai-pend"></div>
+        <div class="ai-row">
+          <button type="button" id="btn-apply" class="primary small" title="Deploy to the Miniserver with lox config push, then commit and push to git">Apply to Miniserver</button>
+          <button type="button" id="btn-discard" class="ghost small" title="Put the module back to the last commit">Discard</button>
+        </div>
+      </div>
+      <div class="ai-msg hidden" id="ai-msg" role="status" aria-live="polite"></div>
+    </section>
     <section class="pane" id="hist-pane" aria-labelledby="hist-h">
-      <h2 class="pane-title" id="hist-h">History</h2>
+      <h2 class="pane-title" id="hist-h"><span>History</span>
+        <button type="button" id="btn-pull" class="pull-btn hidden" title="Download the Miniserver's current config and commit it (lox config pull)">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2v8M4.5 6.5 8 10l3.5-3.5M3 13h10" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          <span class="lbl">Pull from Miniserver</span>
+        </button>
+      </h2>
+      <div class="pull-msg hidden" id="pull-msg" role="status" aria-live="polite"></div>
       <div class="hist" id="hist"></div>
     </section>
     <div class="splitter" id="split-right" role="separator" aria-orientation="horizontal" aria-label="Resize"></div>
@@ -134,6 +167,7 @@
       <dt><kbd>Esc</kbd></dt><dd>Clear the selection</dd>
       <dt>Double-click</dt><dd>Zoom to a block · follow a reference to its page</dd>
       <dt>Shift + click history</dt><dd>Compare the viewed revision with that one</dd>
+      <dt><kbd>L</kbd></dt><dd>Live values on / off</dd>
     </dl>
     <button type="button" class="primary" id="help-close">Close</button>
   </div>
