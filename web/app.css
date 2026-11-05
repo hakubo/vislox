@@ -20,8 +20,8 @@
   --changed: #b86e00; --changed-bg: #fff1d6;  --changed-dot: #e89400;
   --moved: #1f6fd1;  --moved-bg: #e1edfb;
   --pending: #b86e00;
-  --wire-dig: #b3261e;
-  --wire-ana: #4b5866;
+  --wire-dig: #2f2f2f;
+  --wire-ana: #5b7290;
   --live-on: #1fa83a;        /* a digital wire that is on */
   --live-pill: #fffbe3;
   --live-pill-line: #c9b25a;
@@ -178,7 +178,7 @@ button.chip { cursor: pointer; } button.chip:hover { border-color: var(--brand);
 .more { border: none; background: none; color: var(--sel); padding: 0; font-size: 12px; }
 
 /* ── canvas ────────────────────────────────────────── */
-#center { flex: 1; display: flex; flex-direction: column; min-width: 0; background: #b9bdb9; }
+#center { flex: 1; display: flex; flex-direction: column; min-width: 0; background: #e6e7e6; }
 #canvas-wrap { flex: 1; position: relative; overflow: hidden; }
 #canvas { width: 100%; height: 100%; display: block; cursor: grab; user-select: none; }
 #canvas:focus-visible { outline: 2px solid var(--focus); outline-offset: -2px; }
@@ -210,51 +210,55 @@ button.chip { cursor: pointer; } button.chip:hover { border-color: var(--brand);
 @media (max-width: 1400px) { .minimap { width: 140px; height: 94px; } }
 
 /* svg content — canvas units: one port row is 192 */
-.sheet { fill: #fff; stroke: #8f948f; stroke-width: 1px; vector-effect: non-scaling-stroke; }
-.sheet-dots { fill: url(#dots); opacity: .32; }
+.sheet { fill: #f6f6f6; stroke: #d2d4d2; stroke-width: 1px; vector-effect: non-scaling-stroke; }
+.sheet-dots { fill: url(#dots); opacity: .14; }
 .blk, .tag { cursor: pointer; }
 .halo { fill: none; stroke: none; }
-.blk .body { fill: #fff; stroke-width: 1.4px; vector-effect: non-scaling-stroke; }
+.blk .body { fill: #fff; stroke-width: 1.5px; vector-effect: non-scaling-stroke; }
+.blk .edge { fill: none; stroke-width: 1.5px; vector-effect: non-scaling-stroke; pointer-events: none; }
+.marks-on .d-added .edge, .marks-on .d-changed .edge, .marks-on .d-moved .edge, .marks-on .d-removed .edge, .cur-change .edge { display: none; }
 .blk.sel .body { fill: var(--sel-body); }
-.blk .hdr-t { fill: #fff; font-weight: 700; font-size: 124px; }
-.blk .hdr-t.dark { fill: #1d211d; }
-.blk .sub { fill: #eeefee; }
-.blk .sub-t { fill: #2b302b; font-size: 112px; }
-.blk .port-t { fill: #1d211d; font-size: 104px; }
-.blk .meta-t { fill: #7d847d; font-size: 104px; }
-.blk .sym { fill: #3b423b; font-size: 200px; font-weight: 700; }
-.blk .icon { fill: #ffffffd9; }
-.blk .icon-t { fill: #5f665f; font-size: 112px; font-weight: 700; }
+.blk .hdr-t { fill: #fff; font-weight: 700; font-size: 118px; }
+.blk .hdr-t.dark { fill: #161a16; }
+.blk .sub { fill: #f1f1f1; }
+.blk.sel .sub { fill: #c4dcf5; }
+.blk .sub-t { fill: #2b302b; font-size: 108px; }
+.blk .port-t { fill: #1d211d; font-size: 106px; }
+.def-t { fill: #2b302b; font-size: 104px; }
+.blk .meta-t { fill: #8a8f8a; font-size: 104px; }
+.blk .icon { fill: #ffffffcc; stroke: #00000026; stroke-width: 1px; vector-effect: non-scaling-stroke; }
+.blk .icon-t { fill: #3d433d; font-size: 100px; font-weight: 700; }
 .blk.note .note-body { stroke-width: 1px; }
 .blk.note.sel .note-body { stroke: var(--sel); stroke-width: 2px; }
 .note-fold { fill: #00000014; }
 .note-t { font-size: 120px; line-height: 1.35; color: #3a3520; white-space: pre-wrap; word-break: break-word; overflow: hidden; height: 100%; font-family: inherit; }
 .lod-far .note-t { visibility: hidden; }
 .note-p { white-space: pre-wrap; word-break: break-word; padding: 6px 12px 8px; background: #fffbe0; border-left: 3px solid #e8d77a; margin: 4px 12px; border-radius: 4px; }
-.tag .bar { fill: #eff0ef; stroke: #5d635d; stroke-width: 1px; vector-effect: non-scaling-stroke; }
-.tag.sel .bar { fill: var(--sel-body); }
-.tag .cell-t, .tag .addr-t { fill: #1d211d; font-weight: 700; font-size: 112px; }
-.tag .ic { fill: #fff; stroke: #5d635d; stroke-width: 1px; vector-effect: non-scaling-stroke; }
-.tag .ic-t { fill: #4a514a; font-size: 100px; font-weight: 700; }
-.pin-in { fill: #f3a83c; }
-.pin-in.analog { fill: #13a6cc; }
-.pin-in.inv { fill: #d93a3a; }
-.pin-out { fill: #5cb83f; }
-.wire { fill: none; stroke: var(--wire-dig); stroke-width: 1.4px; vector-effect: non-scaling-stroke; }
+.tag .bar, .xref .bar { fill: #fff; stroke: #b9bcb9; stroke-width: 1.2px; vector-effect: non-scaling-stroke; }
+.tag .addr, .xref .addr { fill: #fff; stroke: #b9bcb9; stroke-width: 1.2px; vector-effect: non-scaling-stroke; }
+.tag .kind { fill: #1d211d; } .tag .kind-ring { fill: #fff; stroke: #1d211d; stroke-width: 1.4px; vector-effect: non-scaling-stroke; }
+.tag .kind-t { fill: #fff; font-size: 84px; font-weight: 700; }
+.tag.sel .bar, .tag.sel .addr { fill: var(--sel-body); }
+.tag .cell-t { fill: #1d211d; font-size: 108px; }
+.tag .addr-t { fill: #1d211d; font-weight: 700; font-size: 108px; }
+.tag .ic-t { fill: #1d211d; font-size: 108px; font-weight: 700; }
+.stub { fill: #c9cbc9; }
+.stub.inv { fill: #e0352b; }
+.inv-dot { fill: #fff; stroke: #1d211d; stroke-width: 1.6px; vector-effect: non-scaling-stroke; }
+.wire { fill: none; stroke: var(--wire-dig); stroke-width: 1.2px; vector-effect: non-scaling-stroke; }
 .wire.analog { stroke: var(--wire-ana); }
 .wire-hit { fill: none; stroke: transparent; stroke-width: 10px; vector-effect: non-scaling-stroke; cursor: pointer; }
 .wire.hl { stroke: var(--sel) !important; stroke-width: 3px; }
 .xref { cursor: pointer; }
-.xref .bar { fill: #fff; stroke: #7d847d; stroke-width: 1px; vector-effect: non-scaling-stroke; }
-.xref:hover .bar { fill: #eaf2fd; stroke: var(--sel); }
-.xref .t { fill: #1d211d; font-weight: 700; font-size: 104px; }
+.xref:hover .bar, .xref:hover .addr { fill: #eaf2fd; stroke: var(--sel); }
+.xref .t { fill: #1d211d; font-size: 104px; }
 .xref .pg { fill: var(--sel); font-size: 94px; }
-.xref .ic-t { fill: #4a514a; font-size: 110px; }
-.xref-wire { fill: none; stroke: var(--wire-dig); stroke-width: 1.4px; vector-effect: non-scaling-stroke; }
+.xref .ic-t { fill: #1d211d; font-size: 110px; }
+.xref-wire { fill: none; stroke: var(--wire-dig); stroke-width: 1.2px; vector-effect: non-scaling-stroke; }
 .xref-wire.analog { stroke: var(--wire-ana); }
 .far-t { font-weight: 700; fill: #1d211d; stroke: #ffffff; stroke-width: 4px; paint-order: stroke; stroke-linejoin: round; vector-effect: non-scaling-stroke; pointer-events: none; }
 .far-sub { font-weight: 400; fill: #4a514a; stroke: #fff; stroke-width: 3px; paint-order: stroke; vector-effect: non-scaling-stroke; pointer-events: none; }
-.lod-far .port-t, .lod-far .meta-t, .lod-far .sub-t, .lod-far .hdr-t, .lod-far .icon, .lod-far .icon-t, .lod-far .sym,
+.lod-far .port-t, .lod-far .meta-t, .lod-far .sub-t, .lod-far .hdr-t, .lod-far .icon, .lod-far .icon-t, .lod-far .def-t, .lod-far .kind, .lod-far .kind-ring,
 .lod-far .xref .t, .lod-far .xref .pg, .lod-far .xref .ic-t, .lod-far .tag text, .lod-far .tag .ic { display: none; }
 
 /* review: fade what did not change */

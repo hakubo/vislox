@@ -9,7 +9,9 @@ marked so you can review it before you deploy.
 
 - **Pages as tabs**: one sheet tab per logic page along the bottom, as in Loxone Config. Each tab shows how
   many changes it holds.
-- **Blocks, refs and wires**: block footprints, port rows and wire routing come from
+- **Blocks, refs and wires** in the Loxone Config 16 look: rounded blocks with a coloured header, grey port
+  stubs, constants beside unwired inputs, and pill-shaped references with their address and an analog (`#`) or
+  digital (◉) mark. Block footprints, port rows and wire routing come from
   `loxone_config::layout`, the same geometry `lox` uses to place blocks. Input and output refs show as
   reference bars with their short address (`VI1`, `AQ1`, …).
 - **Links between pages**: when a wire's far end is on another page, the port gets a reference bar with
@@ -29,8 +31,8 @@ marked so you can review it before you deploy.
   the old place) blocks. Wires and parameters are marked too: changed values show old → new in the
   properties. The Changes list can be filtered by kind, and clicking an entry jumps to it.
 - **Readable at every zoom**: zoomed out, each block shows only its name, at a readable size. From about 80 %
-  the full detail appears. Gates show their operation (`AND`, `≥`, `f(x)`) instead of Loxone's automatic names
-  (`O208698`). Selecting a block highlights its wires and neighbours and dims the rest.
+  the full detail appears. Gates show their operation (`AND`, `Less`, `Divide`) instead of Loxone's automatic names
+  (`O208698`); a named gate keeps its operation in grey, as Loxone Config 16 shows it. Selecting a block highlights its wires and neighbours and dims the rest.
 - **Navigation**: Ctrl+K finds any page or block. There is a minimap, a "Changed pages only" filter, and links
   (`#page=…&sel=…&rev=…`) that reopen the same page, block and revision. The browser's Back button works.
 - **Keyboard**: the tree, tabs and canvas all work from the keyboard; press `?` for the shortcuts.
