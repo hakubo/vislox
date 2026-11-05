@@ -40,11 +40,6 @@ const FRIENDLY = {
   MeterAbsUni: "Meter", MeterAbsBi: "Meter (bidirectional)", Radio: "Radio buttons", OnPulseDelay: "On-pulse delay",
   OffDelay: "Off delay", OnDelay: "On delay", PButtonT: "Push button +", AnalogMultiplexer2: "Analog multiplexer",
 };
-const SYMBOL = {
-  And: "&", Or: "≥1", Not: "1", Xor: "=1", Equal: "=", NotEqual: "≠", Greater: ">", GreaterEqual: "≥", Less: "<",
-  LessEqual: "≤", Formula: "f(x)", Minmax: "↕", AMinmax: "↕", Div: "÷", Sub: "−", Mult: "×", Add: "+", Avg: "Ø",
-  AnalogThresholdTrigger: "⊓", Monoflop: "⎍", MultiClick: "⋯", LongClick: "⏱", TextGenerator: "T", OnOffDelay: "⏲",
-};
 function prettyType(t) { return FRIENDLY[t] || String(t || "").replace(/([a-z])([A-Z0-9])/g, "$1 $2"); }
 /** Loxone numbers untitled objects `O12345`; those names mean nothing to a reader. */
 function autoTitle(t) { return !t || /^O\d+$/.test(t); }
@@ -422,7 +417,13 @@ function renderPage() {
   el("rect", { class: "sheet", x: sx1, y: sy1, width: sx2 - sx1, height: sy2 - sy1 }, vpG);
   el("rect", { class: "sheet-dots", x: sx1, y: sy1, width: sx2 - sx1, height: sy2 - sy1 }, vpG);
 
-  L = { ghost: el("g", {}, vpG), wires: el("g", {}, vpG), refs: el("g", {}, vpG), objs: el("g", {}, vpG), badges: el("g", {}, vpG), far: el("g", {}, vpG), xrefs: [] };
+  L = { ghost: el("g", {}, vpG), wires: el("g", {}, vpG), refs: el("g", {}, vpG), objs: el("g", {}, vpG), badges: el("g", {}, vpG), far: el("g", {}, vpG), xrefs: [], wired: new Map(), kind: new Map() };
+  const wire = (uuid, key) => { if (!L.wired.has(uuid)) L.wired.set(uuid, new Set()); L.wired.get(uuid).add(key); };
+  for (const w of p.wires) {
+    wire(w.from[0], w.from[1]); wire(w.to[0], w.to[1]);
+    for (const [u, k] of [w.from, w.to]) L.kind.set(u + "|" + k, !!L.kind.get(u + "|" + k) || w.analog);
+  }
+  for (const l of p.labels) wire(l.obj, l.port);
   const objByUuid = new Map(p.objects.map((o) => [o.uuid, o]));
 
   for (const w of p.wires) {
@@ -549,22 +550,38 @@ function objTip(o) {
   return parts.join("<br>");
 }
 
+/** Loxone Config 16 port stubs: a small grey tab on the block edge. The wire ends under it. */
+function drawStub(g, q) {
+  const left = q.side === "L";
+  const cls = `stub${q.inv ? " inv" : ""}`;
+  el("rect", { class: cls, x: left ? q.x - 112 : q.x + 12, y: q.y - 40, width: 100, height: 80, rx: 14 }, g);
+  if (q.inv) el("circle", { class: "inv-dot", cx: q.x - 6, cy: q.y, r: 34 }, g);
+  if (q.status) el("circle", { class: "pin-chg", cx: left ? q.x - 62 : q.x + 62, cy: q.y, r: 50 }, g);
+}
+
 function drawPins(g, o, inner) {
+  const wired = L.wired?.get(o.uuid);
   for (const q of o.ports) {
-    const analog = /^A[QI]/.test(q.key);
-    if (q.side === "L") {
-      el("polygon", { class: `pin-in${analog ? " analog" : ""}${q.inv ? " inv" : ""}`, points: `${q.x - 130},${q.y - 60} ${q.x},${q.y - 60} ${q.x},${q.y + 60} ${q.x - 130},${q.y + 60} ${q.x - 70},${q.y}` }, g);
-    } else {
-      el("polygon", { class: "pin-out", points: `${q.x},${q.y - 62} ${q.x + 120},${q.y} ${q.x},${q.y + 62}` }, g);
+    drawStub(g, q);
+    // An unwired input with a constant shows the constant, as Loxone Config does.
+    if (q.side === "L" && q.def != null && !wired?.has(q.key)) {
+      el("text", { class: "def-t", x: q.x - 160, y: q.y + 36, "text-anchor": "end" }, g, clip(q.def, 10));
     }
-    if (q.status) el("circle", { class: "pin-chg", cx: q.side === "L" ? q.x + 40 : q.x - 40, cy: q.y, r: 45 }, g);
     if (inner) {
       const twin = o.ports.some((r) => r !== q && r.side !== q.side && Math.abs(r.y - q.y) < 10);
       const n = twin ? Math.floor(inner * 0.55) : inner;
-      const t = el("text", { class: "port-t", x: q.side === "L" ? q.x + 80 : q.x - 80, y: q.y + 40, "text-anchor": q.side === "L" ? "start" : "end" }, g, clip(q.name, n));
+      const t = el("text", { class: "port-t", x: q.side === "L" ? q.x + 70 : q.x - 70, y: q.y + 36, "text-anchor": q.side === "L" ? "start" : "end" }, g, clip(q.name, n));
       el("title", {}, t, `${q.name} (${q.key})${q.def != null ? ` = ${q.def}` : ""}`);
     }
   }
+}
+
+/** The block's border: its header colour, a shade darker. */
+function edgeColor(rgb) {
+  const m = /^(\d+),(\d+),(\d+)$/.exec(rgb || "");
+  if (!m) return "#5f7f68";
+  const [r, g, b] = m.slice(1).map((v) => Math.round(+v * 0.62 + 40 * 0.38));
+  return `rgb(${r},${g},${b})`;
 }
 
 function noteText(o) { return S.view.objects[o.uuid]?.attrs.find((a) => a.name === "Text")?.value || ""; }
@@ -588,63 +605,89 @@ function drawBlock(parent, o) {
   if (o.ty === "Text") return drawNote(parent, o);
   const [x, y, w, h] = o.rect;
   const g = wrapObj(parent, o, "blk");
-  const color = o.color && o.color !== "0,0,0" ? `rgb(${o.color})` : "#5cb83f";
+  const rgb = o.color && o.color !== "0,0,0" ? o.color : "141,255,112";
+  const color = `rgb(${rgb})`;
   const large = o.shape === "large";
-  const hh = large ? 240 : 288;
-  el("rect", { class: "halo", x: x - 50, y: y - 50, width: w + 100, height: h + 100, rx: 60 }, g);
-  el("rect", { class: "body", x, y, width: w, height: h, stroke: color }, g);
-  el("rect", { x, y, width: w, height: hh, fill: color }, g);
-  const dark = lightColor(o.color);
+  const hh = large ? 264 : 288, r = 60;
+  el("rect", { class: "halo", x: x - 50, y: y - 50, width: w + 100, height: h + 100, rx: 90 }, g);
+  el("rect", { class: "body", x, y, width: w, height: h, rx: r, stroke: edgeColor(rgb) }, g);
+  el("path", { class: "hdr", d: `M${x},${y + hh} V${y + r} Q${x},${y} ${x + r},${y} H${x + w - r} Q${x + w},${y} ${x + w},${y + r} V${y + hh} Z`, fill: color }, g);
+  el("rect", { class: "edge", x, y, width: w, height: h, rx: r, stroke: edgeColor(rgb) }, g);
+  const dark = lightColor(rgb);
   const named = !autoTitle(o.title) && o.title !== o.ty;
+  // Header: the name, left-aligned, with the settings and info buttons on the right.
+  const icons = w >= 1100 ? 2 : 0;
+  const title = large ? displayTitle(o) : named ? o.title : prettyType(o.ty);
+  el("text", { class: "hdr-t" + (dark ? " dark" : ""), x: x + 90, y: y + hh / 2 + 42 }, g, clip(title, Math.floor((w - 140 - icons * 190) / 66)));
+  for (let i = 0; i < icons; i++) {
+    const cx = x + w - 130 - i * 180;
+    el("circle", { class: "icon", cx, cy: y + hh / 2, r: 70 }, g);
+    el("text", { class: "icon-t", x: cx, y: y + hh / 2 + 34, "text-anchor": "middle" }, g, i ? "⚙" : "i");
+  }
   if (large) {
-    el("text", { class: "hdr-t" + (dark ? " dark" : ""), x: x + 70, y: y + 170 }, g, clip(displayTitle(o), Math.floor((w - 460) / 70)));
-    for (const [i, s] of [[0, "i"], [1, "⚙"]]) {
-      const cx = x + w - 120 - i * 190;
-      el("circle", { class: "icon", cx, cy: y + 120, r: 78 }, g);
-      el("text", { class: "icon-t", x: cx, y: y + 158, "text-anchor": "middle" }, g, s);
-    }
-    el("rect", { class: "sub", x: x + 1, y: y + hh, width: w - 2, height: 240 }, g);
-    el("text", { class: "sub-t", x: x + w / 2, y: y + hh + 170, "text-anchor": "middle" }, g, clip(prettyType(o.ty), Math.floor(w / 60)));
+    el("rect", { class: "sub", x: x + 1, y: y + hh, width: w - 2, height: 216 }, g);
+    el("text", { class: "sub-t", x: x + w / 2, y: y + hh + 146, "text-anchor": "middle" }, g, clip(prettyType(o.ty), Math.floor(w / 60)));
     const info = S.view.objects[o.uuid] || {};
     [info.room, info.category].filter(Boolean).forEach((m, i) => {
       if (480 + ROW * (i + 1) <= h) el("text", { class: "meta-t", x: x + w / 2, y: y + 480 + ROW * i + 136, "text-anchor": "middle" }, g, clip(m, 15));
     });
     drawPins(g, o, 20);
   } else {
-    // Small logic blocks: the operation is what matters; a name only if someone gave one.
-    const sym = SYMBOL[o.ty];
-    const head = named ? o.title : prettyType(o.ty);
-    el("text", { class: "hdr-t" + (dark ? " dark" : ""), x: x + w / 2, y: y + 196, "text-anchor": "middle", style: "font-size:112px" }, g, clip(head, Math.floor(w / 64)));
-    if (sym && (named || sym.length <= 2)) {
-      el("text", { class: "sym", x: x + w / 2, y: y + hh + (h - hh) / 2 + 70, "text-anchor": "middle" }, g, sym);
+    // A named logic block keeps its operation in grey in the middle, as Loxone Config shows it.
+    if (named) {
+      const n = Math.floor((w - 2 * 380) / 56);
+      if (n >= 3) el("text", { class: "meta-t", x: x + w / 2, y: y + hh + 96 + 36, "text-anchor": "middle" }, g, clip(prettyType(o.ty), n));
     }
     drawPins(g, o, 7);
+  }
+}
+
+/** Analog references get a black "#" chip, digital ones a ring, as in Loxone Config 16. */
+function drawKind(g, cx, cy, analog) {
+  if (analog) {
+    el("rect", { class: "kind", x: cx - 52, y: cy - 52, width: 104, height: 104, rx: 18 }, g);
+    el("text", { class: "kind-t", x: cx, y: cy + 30, "text-anchor": "middle" }, g, "#");
+  } else {
+    el("circle", { class: "kind-ring", cx, cy, r: 54 }, g);
+    el("circle", { class: "kind", cx, cy, r: 30 }, g);
   }
 }
 
 function drawTag(parent, o, page) {
   const [x, y, w, h] = o.rect;
   const g = wrapObj(parent, o, "tag");
-  const feedsRight = o.ports.some((q) => q.side === "R");
-  const rx = h / 2;
+  const wired = L.wired?.get(o.uuid);
+  const sideWired = (side) => o.ports.some((q) => q.side === side && wired?.has(q.key));
+  // The side the wire leaves from: where it is wired, else what the type says.
+  const feedsRight = sideWired("R") || (!sideWired("L") && o.ty === "InputRef");
+  // Analog if the wires on its feeding side are; an unwired reference goes by its address (AI, AQ, VI…).
+  const fed = o.ports.filter((q) => (q.side === "R") === feedsRight && L.kind.has(o.uuid + "|" + q.key));
+  const analog = fed.length ? fed.some((q) => L.kind.get(o.uuid + "|" + q.key)) : /^(A[QI]|VI|VA)/.test(o.target?.iname || "");
+  const rx = h / 2, cy = y + h / 2;
   el("rect", { class: "halo", x: x - 50, y: y - 50, width: w + 100, height: h + 100, rx: rx + 50 }, g);
   el("rect", { class: "bar", x, y, width: w, height: h, rx, ry: rx }, g);
   const t = o.target || {};
   const addr = t.iname || (o.ty === "Memory" ? "M" : o.ty === "OutputRefLM" ? "✉" : "");
-  const addrW = addr ? Math.max(380, addr.length * 80 + 120) : 0;
-  const icX = feedsRight ? x + 110 : x + w - 110;
+  const addrW = addr ? Math.max(400, addr.length * 76 + 180) : 0;
+  // The address sits in its own pill at the wired end, with the kind chip beside it.
+  const ax = feedsRight ? x + w - addrW : x;
   if (addr) {
-    const ax = feedsRight ? x + w - addrW : x;
-    el("line", { x1: feedsRight ? ax : ax + addrW, y1: y, x2: feedsRight ? ax : ax + addrW, y2: y + h, stroke: "#5d635d", "stroke-width": 1, "vector-effect": "non-scaling-stroke" }, g);
-    el("text", { class: "addr-t", x: ax + addrW / 2, y: y + 136, "text-anchor": "middle" }, g, clip(addr, 7));
+    el("rect", { class: "addr", x: ax, y, width: addrW, height: h, rx, ry: rx }, g);
+    el("text", { class: "addr-t", x: ax + addrW / 2, y: cy + 38, "text-anchor": "middle" }, g, clip(addr, 7));
   }
-  el("circle", { class: "ic", cx: icX, cy: y + h / 2, r: 62 }, g);
-  el("text", { class: "ic-t", x: icX, y: y + h / 2 + 34, "text-anchor": "middle" }, g, t.page ? "⚙" : "i");
-  const nameX = feedsRight ? x + 230 : x + addrW + 60;
-  const nameW = w - addrW - 290;
+  const kx = feedsRight ? ax - 100 : ax + addrW + 100;
+  drawKind(g, kx, cy, analog);
+  const icX = feedsRight ? x + 110 : x + w - 110;
+  el("text", { class: "ic-t", x: icX, y: cy + 36, "text-anchor": "middle" }, g, t.page ? "⚙" : "i");
   const offPage = t.page && t.page !== page.uuid;
-  el("text", { class: "cell-t", x: nameX, y: y + 136 }, g, clip(o.title + (offPage ? " ↗" : ""), Math.floor(nameW / 64)));
-  drawPins(g, o, 0);
+  const nameW = w - addrW - 220 - 200 - 60;
+  const name = clip(o.title + (offPage ? " ↗" : ""), Math.floor(nameW / 60));
+  if (feedsRight) el("text", { class: "cell-t", x: x + 210, y: cy + 36 }, g, name);
+  else el("text", { class: "cell-t", x: x + w - 210, y: cy + 36, "text-anchor": "end" }, g, name);
+  for (const side of ["L", "R"]) {
+    const q = o.ports.find((p) => p.side === side && wired?.has(p.key)) || ((side === "R") === feedsRight ? o.ports.find((p) => p.side === side) : null);
+    if (q) drawStub(g, q);
+  }
 }
 
 function drawXref(parent, l, n) {
@@ -653,14 +696,20 @@ function drawXref(parent, l, n) {
   const bx = left ? l.x - 150 - LABEL_W : l.x + 150;
   const t = l.target;
   const g = el("g", { class: `xref${l.status ? " d-" + l.status : ""}`, "data-obj": l.obj }, parent);
-  L.xrefs.push({ x: bx, y, text: `${t.port ? t.port + ": " : ""}${autoTitle(t.title) ? prettyType(t.ty) : t.title}`, page: t.page_title || "" });
+  const label = `${t.port ? t.port + ": " : ""}${autoTitle(t.title) ? prettyType(t.ty) : t.title}`;
+  L.xrefs.push({ x: bx, y, text: label, page: t.page_title || "" });
   const analog = /^A[QI]/.test(l.port) || /^A[QI]/.test(t.port || "");
   const wx = left ? bx + LABEL_W : bx;
   el("polyline", { class: `xref-wire${analog ? " analog" : ""}${l.status ? " d-" + l.status : ""}`, "data-f": l.obj, points: `${l.x},${l.y} ${(l.x + wx) / 2},${l.y} ${(l.x + wx) / 2},${y} ${wx},${y}` }, g);
-  el("rect", { class: "bar", x: bx, y: y - ROW / 2, width: LABEL_W, height: ROW, rx: 30 }, g);
-  el("text", { class: "ic-t", x: bx + 90, y: y + 38, "text-anchor": "middle" }, g, l.incoming ? "⇥" : "↦");
-  el("text", { class: "t", x: bx + 190, y: y + 36 }, g, clip(`${t.port ? t.port + ": " : ""}${autoTitle(t.title) ? prettyType(t.ty) : t.title}`, 22));
-  el("text", { class: "pg", x: bx + LABEL_W - 60, y: y + 34, "text-anchor": "end" }, g, clip(t.page_title ? "↗ " + t.page_title : t.path ? "⌂ " + (t.path.split(" / ").pop() || "") : "", 12));
+  const top = y - ROW / 2, rx = ROW / 2;
+  el("rect", { class: "bar", x: bx, y: top, width: LABEL_W, height: ROW, rx, ry: rx }, g);
+  // The link icon in its own pill at the wired end, like Loxone Config's connection references.
+  const pw = 300, px = left ? bx + LABEL_W - pw : bx;
+  el("rect", { class: "addr", x: px, y: top, width: pw, height: ROW, rx, ry: rx }, g);
+  el("text", { class: "ic-t", x: px + pw / 2, y: y + 36, "text-anchor": "middle" }, g, l.incoming ? "⇥" : "↦");
+  const tx = left ? bx + 90 : bx + pw + 70, tEnd = left ? px - 60 : bx + LABEL_W - 90;
+  el("text", { class: "t", x: tx, y: y + 36 }, g, clip(label, 19));
+  el("text", { class: "pg", x: tEnd, y: y + 34, "text-anchor": "end" }, g, clip(t.page_title ? "↗ " + t.page_title : t.path ? "⌂ " + (t.path.split(" / ").pop() || "") : "", 10));
   g.addEventListener("click", (e) => { e.stopPropagation(); if (!drag?.moved) followTarget(t); });
   hoverTip(g, () => `${l.incoming ? "Comes from" : "Goes to"} <b>${esc(t.title)}</b>${t.port ? "." + esc(t.port) : ""} <span class="tm">${esc(prettyType(t.ty))}</span><br>${t.page_title ? `on page “${esc(t.page_title)}” — click to go there` : t.path ? `in ${esc(t.path)} — click to select` : ""}${l.status ? `<br><i>${l.status}</i>` : ""}`);
 }
