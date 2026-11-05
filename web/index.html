@@ -2,87 +2,144 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>vislox</title>
 <link rel="icon" href="/icon.svg">
 <link rel="stylesheet" href="/app.css">
 </head>
 <body>
-<header id="ribbon">
+<a class="skip" href="#canvas">Skip to the page canvas</a>
+
+<header id="bar">
   <div class="brand"><img src="/icon.svg" alt=""><span>vislox</span></div>
-  <div class="group">
-    <div class="doc-title" id="doc-title">—</div>
+  <div class="doc">
+    <div class="doc-title" id="doc-title">Loading…</div>
     <div class="doc-sub" id="doc-sub"></div>
   </div>
-  <div class="group compare">
-    <label>Viewing <select id="sel-rev"></select></label>
-    <label>compared with <select id="sel-base"></select></label>
+  <div class="revs" role="group" aria-label="Revisions">
+    <label class="rev"><span class="rev-k">Viewing</span><select id="sel-rev" aria-label="Revision to view"></select></label>
+    <span class="vs" aria-hidden="true">vs</span>
+    <label class="rev"><span class="rev-k">Compared with</span><select id="sel-base" aria-label="Revision to compare with"></select></label>
   </div>
-  <div class="group toggles">
-    <label class="chk"><input type="checkbox" id="chk-changes" checked> Mark changes</label>
-    <label class="chk"><input type="checkbox" id="chk-follow" checked> Follow latest</label>
-  </div>
-  <div class="group zoom">
-    <button id="btn-zoom-out" title="Zoom out (-)">−</button>
-    <button id="btn-fit" title="Fit page (0)">Fit</button>
-    <button id="btn-zoom-in" title="Zoom in (+)">+</button>
-  </div>
-  <div class="status" id="status"><span class="dot"></span><span id="status-text">connecting…</span></div>
+  <div class="spacer"></div>
+  <button id="btn-search" class="search-btn" type="button" title="Go to a page or block (Ctrl+K)">
+    <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="7" cy="7" r="4.5" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M10.5 10.5 14 14" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+    <span class="lbl">Go to page or block</span><kbd>Ctrl K</kbd>
+  </button>
+  <label class="switch" id="sw-changes" title="Colour what changed against the compared revision">
+    <input type="checkbox" id="chk-changes" checked><span class="track" aria-hidden="true"></span><span class="lbl"><span class="long">Mark changes</span><span class="short">Changes</span></span>
+  </label>
+  <label class="switch" title="Jump to each new revision as it appears">
+    <input type="checkbox" id="chk-follow" checked><span class="track" aria-hidden="true"></span><span class="lbl"><span class="long">Follow latest</span><span class="short">Follow</span></span>
+  </label>
+  <button id="btn-help" class="icon-btn" type="button" title="Keyboard shortcuts (?)" aria-label="Keyboard shortcuts">?</button>
+  <div class="status" id="status" role="status" aria-live="polite"><span class="dot" aria-hidden="true"></span><span id="status-text">connecting…</span></div>
 </header>
 
 <main>
-  <aside id="left">
-    <section class="pane" id="tree-pane">
-      <div class="pane-title">Periphery &amp; pages</div>
-      <div class="filter"><input id="tree-filter" placeholder="Filter (Ctrl + F)" spellcheck="false"></div>
-      <div class="tree" id="tree"></div>
+  <aside id="left" aria-label="Project and properties">
+    <section class="pane" id="tree-pane" aria-labelledby="tree-h">
+      <h2 class="pane-title" id="tree-h">Project</h2>
+      <div class="filter">
+        <input id="tree-filter" type="search" placeholder="Filter blocks, inputs, rooms…" spellcheck="false" aria-label="Filter the project tree">
+      </div>
+      <div class="tree" id="tree" role="tree" tabindex="0" aria-label="Pages and periphery"></div>
     </section>
-    <div class="splitter" id="split-left"></div>
-    <section class="pane" id="props-pane">
-      <div class="pane-title" id="props-title">Properties</div>
-      <div class="props" id="props"><div class="empty">Select a block to see its configuration.</div></div>
+    <div class="splitter" id="split-left" role="separator" aria-orientation="horizontal" aria-label="Resize"></div>
+    <section class="pane" id="props-pane" aria-labelledby="props-h">
+      <h2 class="pane-title" id="props-h">Properties</h2>
+      <div class="props" id="props"></div>
     </section>
   </aside>
 
-  <section id="center">
+  <section id="center" aria-label="Logic page">
     <div id="canvas-wrap">
-      <svg id="canvas" xmlns="http://www.w3.org/2000/svg">
+      <svg id="canvas" xmlns="http://www.w3.org/2000/svg" tabindex="0" role="img" aria-label="Logic page. Drag or use the arrow keys to pan, scroll or plus and minus to zoom.">
         <defs>
           <pattern id="dots" width="96" height="96" patternUnits="userSpaceOnUse">
-            <rect x="0" y="0" width="7" height="7" fill="#9a9a9a"/>
+            <rect x="0" y="0" width="8" height="8" fill="#9a9a9a"/>
           </pattern>
-          <marker id="arr-out" viewBox="0 0 10 10" refX="0" refY="5" markerWidth="5" markerHeight="5" orient="auto">
-            <path d="M0,0 L10,5 L0,10 z" fill="#69c350"/>
-          </marker>
         </defs>
         <g id="viewport"></g>
       </svg>
-      <div id="canvas-msg" class="canvas-msg"></div>
-      <div id="legend" class="legend hidden">
-        <span class="lg added">added</span><span class="lg changed">changed</span><span class="lg removed">removed</span><span class="lg moved">moved</span>
+      <div id="canvas-msg" class="canvas-msg" role="status"></div>
+      <div class="hud hud-zoom" role="group" aria-label="Zoom">
+        <button id="btn-zoom-out" type="button" title="Zoom out (−)" aria-label="Zoom out">−</button>
+        <button id="btn-zoom-pct" type="button" title="Zoom to 100%" class="pct">100%</button>
+        <button id="btn-zoom-in" type="button" title="Zoom in (+)" aria-label="Zoom in">+</button>
+        <button id="btn-fit" type="button" title="Fit the page (0)">Fit</button>
       </div>
+      <div id="legend" class="hud legend" aria-label="Legend">
+        <span class="lg w-dig">digital</span><span class="lg w-ana">analog</span>
+        <span class="lg-sep diff-only"></span>
+        <span class="lg added diff-only">added</span><span class="lg changed diff-only">changed</span><span class="lg removed diff-only">removed</span><span class="lg moved diff-only">moved</span>
+      </div>
+      <div id="minimap" class="hud minimap" aria-hidden="true"><svg id="mm"><g id="mm-objs"></g><rect id="mm-view"/></svg></div>
     </div>
-    <nav id="tabs">
+    <nav id="tabs" aria-label="Pages">
+      <button id="btn-pages" class="pages-btn" type="button" title="All pages (Ctrl+K)">
+        <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2 4h12M2 8h12M2 12h12" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+        <span id="pages-count">Pages</span>
+      </button>
       <div class="tab-nav">
-        <button data-nav="first" title="First page">⏮</button><button data-nav="prev" title="Previous page">◀</button><button data-nav="next" title="Next page">▶</button><button data-nav="last" title="Last page">⏭</button>
+        <button type="button" data-nav="prev" title="Previous page (PageUp)" aria-label="Previous page">‹</button><button type="button" data-nav="next" title="Next page (PageDown)" aria-label="Next page">›</button>
       </div>
-      <div class="tab-list" id="tab-list"></div>
+      <div class="tab-list" id="tab-list" role="tablist"></div>
+      <label class="only-changed" id="only-changed-w" title="Show only pages with changes">
+        <input type="checkbox" id="chk-only-changed"> Changed pages only
+      </label>
     </nav>
   </section>
 
-  <aside id="right">
-    <section class="pane" id="hist-pane">
-      <div class="pane-title">History</div>
+  <aside id="right" aria-label="History and changes">
+    <section class="pane" id="hist-pane" aria-labelledby="hist-h">
+      <h2 class="pane-title" id="hist-h">History</h2>
       <div class="hist" id="hist"></div>
     </section>
-    <div class="splitter" id="split-right"></div>
-    <section class="pane" id="chg-pane">
-      <div class="pane-title" id="chg-title">Changes</div>
-      <div class="chg-filter" id="chg-filter"></div>
-      <div class="changes" id="changes"></div>
+    <div class="splitter" id="split-right" role="separator" aria-orientation="horizontal" aria-label="Resize"></div>
+    <section class="pane" id="chg-pane" aria-labelledby="chg-h">
+      <h2 class="pane-title" id="chg-h"><span>Changes</span><span class="count" id="chg-count"></span>
+        <span class="chg-nav" id="chg-nav">
+          <button type="button" id="chg-prev" title="Previous change ([)" aria-label="Previous change">‹</button>
+          <span id="chg-pos"></span>
+          <button type="button" id="chg-next" title="Next change (])" aria-label="Next change">›</button>
+        </span>
+      </h2>
+      <label class="chg-dim hidden" id="chg-dim" title="Fade everything on the page that did not change"><input type="checkbox" id="chk-dim" checked> Dim what did not change</label>
+      <div class="chg-filter" id="chg-filter" role="group" aria-label="Filter changes"></div>
+      <div class="changes" id="changes" role="list"></div>
     </section>
   </aside>
 </main>
-<div id="tooltip" class="tooltip hidden"></div>
+
+<div id="palette" class="overlay hidden" role="dialog" aria-modal="true" aria-label="Go to page or block">
+  <div class="pal-box">
+    <input id="pal-input" type="text" placeholder="Go to a page or block…" autocomplete="off" spellcheck="false"
+      role="combobox" aria-expanded="true" aria-controls="pal-list" aria-autocomplete="list">
+    <ul id="pal-list" role="listbox"></ul>
+    <div class="pal-foot"><kbd>↑</kbd><kbd>↓</kbd> choose · <kbd>Enter</kbd> open · <kbd>Esc</kbd> close</div>
+  </div>
+</div>
+
+<div id="help" class="overlay hidden" role="dialog" aria-modal="true" aria-labelledby="help-h">
+  <div class="help-box">
+    <h2 id="help-h">Keyboard shortcuts</h2>
+    <dl>
+      <dt><kbd>Ctrl</kbd> <kbd>K</kbd></dt><dd>Go to a page or block</dd>
+      <dt><kbd>Ctrl</kbd> <kbd>F</kbd></dt><dd>Filter the project tree</dd>
+      <dt><kbd>PageUp</kbd> <kbd>PageDown</kbd></dt><dd>Previous / next page</dd>
+      <dt><kbd>[</kbd> <kbd>]</kbd></dt><dd>Previous / next change</dd>
+      <dt><kbd>←</kbd><kbd>↑</kbd><kbd>→</kbd><kbd>↓</kbd></dt><dd>Pan the page (with <kbd>Shift</kbd>: faster)</dd>
+      <dt><kbd>+</kbd> <kbd>−</kbd> <kbd>0</kbd> <kbd>1</kbd></dt><dd>Zoom in, out, fit page, 100%</dd>
+      <dt><kbd>Esc</kbd></dt><dd>Clear the selection</dd>
+      <dt>Double-click</dt><dd>Zoom to a block · follow a reference to its page</dd>
+      <dt>Shift + click history</dt><dd>Compare the viewed revision with that one</dd>
+    </dl>
+    <button type="button" class="primary" id="help-close">Close</button>
+  </div>
+</div>
+
+<div id="tooltip" class="tooltip hidden" role="tooltip"></div>
 <script src="/app.js"></script>
 </body>
 </html>

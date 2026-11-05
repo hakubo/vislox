@@ -227,6 +227,8 @@ struct Ctx<'a> {
     mirrors: HashMap<String, Vec<[String; 2]>>,
     /// Document child order of each object, for the tree.
     order: Vec<String>,
+    /// Ports with at least one wire.
+    wired: HashSet<String>,
 }
 
 impl<'a> Ctx<'a> {
@@ -241,7 +243,13 @@ impl<'a> Ctx<'a> {
             wires: doc.wires(),
             mirrors: HashMap::new(),
             order: Vec::new(),
+            wired: HashSet::new(),
         };
+        c.wired = c
+            .wires
+            .iter()
+            .flat_map(|w| [w.from_port.clone(), w.to_port.clone()])
+            .collect();
         c.walk(&doc.xml.root, None, None);
         c
     }
@@ -343,6 +351,66 @@ impl<'a> Ctx<'a> {
         let id = io.attr(attr)?;
         Some(self.el(id).map(|_| self.title(id)).unwrap_or_else(|| id.to_string()))
     }
+}
+
+/// Loxone Config lets the user hide unused connectors, and saves the block
+/// at the height of the rows it shows. The geometry model draws every
+/// connector of a known type, so a block with hidden connectors comes out
+/// taller than Loxone draws it and runs into its neighbours. When the saved
+/// height is smaller, keep it: show the wired connectors (they cannot be
+/// hidden), then unwired ones in order while rows are left.
+fn fit_written(g: &GeoObject, el: &Element, wired: &HashSet<String>) -> GeoObject {
+    let mut g = g.clone();
+    let Some(written) = Layout::of_element(el) else {
+        return g;
+    };
+    if g.shape == Shape::Tag {
+        return g;
+    }
+    // Math blocks (Divide, Average, …) are small in Loxone Config whatever
+    // the model says: the saved width tells.
+    let mut width = g.rect.w();
+    if g.shape == Shape::Large && written.w() <= Shape::Small.width() {
+        g.shape = Shape::Small;
+        width = written.w();
+    }
+    // Footprint height = base + ROW × rows (see layout::Shape::height).
+    let base = match g.shape {
+        Shape::Small => 312,
+        _ => 504,
+    };
+    let capacity = ((written.h() - base) / ROW).max(1);
+    let mut rows_used = 0;
+    for side in [Side::Left, Side::Right] {
+        let on_side: Vec<usize> = (0..g.ports.len()).filter(|&i| g.ports[i].side == side).collect();
+        let n_wired = on_side.iter().filter(|&&i| wired.contains(&g.ports[i].uuid)).count() as i64;
+        let hide = on_side.len() as i64 > capacity;
+        let mut spare = (capacity - n_wired).max(0);
+        let mut keep = Vec::new();
+        for &i in &on_side {
+            if !hide || wired.contains(&g.ports[i].uuid) {
+                keep.push(i);
+            } else if spare > 0 {
+                spare -= 1;
+                keep.push(i);
+            }
+        }
+        for (row, &i) in keep.iter().enumerate() {
+            g.ports[i].row = row as i64;
+        }
+        rows_used = rows_used.max(keep.len() as i64);
+        let drop: HashSet<usize> = on_side.into_iter().filter(|i| !keep.contains(i)).collect();
+        g.ports = g
+            .ports
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !drop.contains(i))
+            .map(|(_, p)| p.clone())
+            .collect();
+    }
+    let h = (base + ROW * rows_used.max(1)).max(written.h());
+    g.rect = Layout::at(written.px, written.py, width, h);
+    g
 }
 
 fn layout_of(el: &Element) -> Option<Layout> {
@@ -574,6 +642,8 @@ fn page_view(c: &Ctx, old: Option<&Ctx>, uuid: &str, d: &Delta, gone: bool) -> O
     let mut port_pos: HashMap<String, ((i64, i64), Side, Layout)> = HashMap::new();
     let add_obj = |g: &GeoObject, ctx: &Ctx, status: &'static str, objects: &mut Vec<PObj>, port_pos: &mut HashMap<String, ((i64, i64), Side, Layout)>| {
         let el = ctx.el(&g.uuid);
+        let fitted = el.map(|e| fit_written(g, e, &ctx.wired));
+        let g = fitted.as_ref().unwrap_or(g);
         let defs: HashMap<String, PortView> = el
             .map(|e| ports(e).into_iter().map(|p| (p.uuid.clone(), p)).collect())
             .unwrap_or_default();
@@ -964,12 +1034,7 @@ fn changes(view: &mut View, nc: &Ctx, oc: &Ctx, d: &Delta) {
             for (n, o, new) in a {
                 v.push(Change {
                     kind: "attr",
-                    text: format!(
-                        "{} · {n}: {} → {}",
-                        nc.title(&u),
-                        short(o.as_deref()),
-                        short(new.as_deref())
-                    ),
+                    text: attr_change_text(&nc.title(&u), &nc.ty(&u), n, o.as_deref(), new.as_deref()),
                     page: page_for(&u),
                     obj: Some(u.clone()),
                 });
@@ -1023,6 +1088,29 @@ fn changes(view: &mut View, nc: &Ctx, oc: &Ctx, d: &Delta) {
         v.push(Change { kind: MOVED, text, page: page_for(&u), obj: Some(u) });
     }
     view.changes = v;
+}
+
+/// One changed attribute, for the change list. Long or multi-line text
+/// (notes, program code) shows the lines that changed, not two cut-off
+/// copies of the same beginning.
+fn attr_change_text(title: &str, ty: &str, name: &str, old: Option<&str>, new: Option<&str>) -> String {
+    let label = if ty == "Text" && name == "Text" { "note" } else { name };
+    let long = |v: Option<&str>| v.is_some_and(|v| v.contains('\n') || v.chars().count() > 40);
+    if !(long(old) || long(new)) {
+        return format!("{title} · {label}: {} → {}", short(old), short(new));
+    }
+    let clean = |v: Option<&str>| v.unwrap_or("").replace('\r', "");
+    let lines: Vec<String> = diff::text_changes(&clean(old), &clean(new))
+        .into_iter()
+        .skip(1)
+        .filter(|l| l.trim() != "+" && l.trim() != "-")
+        .take(4)
+        .collect();
+    if lines.is_empty() {
+        format!("{title} · {label}: whitespace changed")
+    } else {
+        format!("{title} · {label}: {}", lines.join(" · "))
+    }
 }
 
 fn short(s: Option<&str>) -> String {

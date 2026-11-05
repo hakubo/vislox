@@ -26,6 +26,12 @@ marked so you can review it before you deploy.
 - **Change review**: added (green), changed (amber), removed (red, dashed ghost) and moved (blue, ghost at
   the old place) blocks. Wires and parameters are marked too: changed values show old → new in the
   properties. The Changes list can be filtered by kind, and clicking an entry jumps to it.
+- **Readable at every zoom**: zoomed out, each block shows only its name, at a readable size. From about 80 %
+  the full detail appears. Gates show their operation (`AND`, `≥`, `f(x)`) instead of Loxone's automatic names
+  (`O208698`). Selecting a block highlights its wires and neighbours and dims the rest.
+- **Navigation**: Ctrl+K finds any page or block. There is a minimap, a "Changed pages only" filter, and links
+  (`#page=…&sel=…&rev=…`) that reopen the same page, block and revision. The browser's Back button works.
+- **Keyboard**: the tree, tabs and canvas all work from the keyboard; press `?` for the shortcuts.
 
 Read-only: vislox never writes to the config.
 
@@ -49,8 +55,13 @@ Then open <http://127.0.0.1:7878> (`--listen` changes the address, and `--open` 
 The *Viewing* and *compared with* menus in the toolbar pick any pair of revisions. Pick *nothing* to see
 a revision without change marks. *Follow latest* jumps to each new revision as it appears.
 
-Keys: `+` / `-` / `0` zoom and fit, PageUp/PageDown switch pages, Ctrl+F filters the tree, Esc clears the
-selection. Drag to pan, scroll to zoom.
+Keys:
+- `Ctrl+K`: go to a page or block. `Ctrl+F`: filter the tree. `?`: list all shortcuts.
+- `[` / `]`: previous / next change. PageUp / PageDown: switch pages.
+- Arrow keys: pan. `+` / `-` / `0` / `1`: zoom in, zoom out, fit, 100 %.
+- Esc: clear the selection.
+
+With the mouse, drag to pan and scroll to zoom.
 
 ## How it works
 
