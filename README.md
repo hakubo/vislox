@@ -105,7 +105,9 @@ vislox ~/loxone-config/project --admin-token-file ~/.config/vislox/admin-token \
   reports back is given up after 30 minutes.
 - The agent should only edit and compile (`lox logic …`). Deploying is Apply's job, and Apply needs the token.
 - Apply commits with the change summary as the subject (`lox logic diff --summary`) and the AI requests in the
-  body, then runs `git push`, which needs credentials for the project's remote.
+  body, then runs `git push`, which needs credentials for the project's remote. A verified push makes lox point
+  `base` at its download in `backups/` (git-ignored); Apply copies that download over the project's base file and
+  points lox.toml back at it, so the deployed config stays in git.
 
 The Miniserver connection is opened when a browser turns live values on, and closed shortly after the last
 one turns them off.

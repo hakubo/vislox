@@ -389,6 +389,9 @@ impl Actions {
             .await
             .map_err(|e| format!("lox config push failed:\n{e}"))?;
         let mut report = vec![last_lines(&pushed, 6)];
+        if let Some(m) = keep_base(dir, &p.base)? {
+            report.push(m);
+        }
         git(dir, &["add", "-A", "."]).await?;
         let staged = git(dir, &["diff", "--cached", "--quiet"]).await.is_err();
         if staged {
@@ -630,6 +633,69 @@ pub fn apply_hints(msg: &str) -> Value {
     })
 }
 
+/// After a verified push, lox points `base` in lox.toml at its download in
+/// `backups/`, which is git-ignored (configs carry personal data). This
+/// project keeps its deployed config in git instead: copy that download to
+/// where the base was and point lox.toml back at it.
+fn keep_base(dir: &Path, old_base: &Path) -> Result<Option<String>, String> {
+    let toml = dir.join("lox.toml");
+    let p =
+        loxone_config::Project::load(&toml).map_err(|e| format!("cannot read lox.toml: {e}"))?;
+    let same = |a: &Path, b: &Path| match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    };
+    if same(&p.base, old_base) {
+        return Ok(None);
+    }
+    std::fs::copy(&p.base, old_base).map_err(|e| {
+        format!(
+            "cannot copy {} to {}: {e}",
+            p.base.display(),
+            old_base.display()
+        )
+    })?;
+    let rel = old_base
+        .strip_prefix(&p.root)
+        .unwrap_or(old_base)
+        .to_string_lossy()
+        .into_owned();
+    let text = std::fs::read_to_string(&toml).map_err(|e| format!("cannot read lox.toml: {e}"))?;
+    std::fs::write(&toml, set_base(&text, &rel))
+        .map_err(|e| format!("cannot write lox.toml: {e}"))?;
+    Ok(Some(format!(
+        "Kept the verified download as {rel} (lox had pointed lox.toml at {}).",
+        p.base.strip_prefix(&p.root).unwrap_or(&p.base).display()
+    )))
+}
+
+/// lox.toml with its `base = …` line pointing at `rel`; comments and other
+/// keys stay as they are.
+fn set_base(toml: &str, rel: &str) -> String {
+    let mut out: Vec<String> = toml
+        .lines()
+        .map(|l| {
+            let key = l.trim_start();
+            let is_base = key
+                .strip_prefix("base")
+                .is_some_and(|rest| rest.trim_start().starts_with('='));
+            if is_base {
+                format!("base   = {}", toml_string(rel))
+            } else {
+                l.to_string()
+            }
+        })
+        .collect();
+    if toml.ends_with('\n') {
+        out.push(String::new());
+    }
+    out.join("\n")
+}
+
+fn toml_string(s: &str) -> String {
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
 fn in_progress(r: &Req) -> bool {
     matches!(r.state.as_str(), "sent" | "working")
 }
@@ -825,6 +891,43 @@ mod tests {
                 .collect(),
         };
         assert_eq!(context_text(&many).lines().count(), 1 + MAX_CONTEXT_BLOCKS);
+    }
+
+    #[test]
+    fn the_base_line_is_pointed_back_and_the_rest_kept() {
+        let toml = "# comment about base = here\nbase = \"backups/20261106-003332-post-push.Loxone\"\nmodule = \"pages\"\nbaseline = 1\n";
+        assert_eq!(
+            set_base(toml, "base.Loxone"),
+            "# comment about base = here\nbase   = \"base.Loxone\"\nmodule = \"pages\"\nbaseline = 1\n"
+        );
+    }
+
+    #[test]
+    fn the_verified_download_becomes_the_tracked_base() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        std::fs::create_dir_all(d.join("pages")).unwrap();
+        std::fs::create_dir_all(d.join("backups")).unwrap();
+        std::fs::write(d.join("base.Loxone"), "old").unwrap();
+        std::fs::write(d.join("backups/post.Loxone"), "verified").unwrap();
+        std::fs::write(
+            d.join("lox.toml"),
+            "base = \"backups/post.Loxone\"\nmodule = \"pages\"\n",
+        )
+        .unwrap();
+        let msg = keep_base(d, &d.join("base.Loxone")).unwrap().unwrap();
+        assert!(msg.contains("base.Loxone"), "{msg}");
+        assert_eq!(
+            std::fs::read_to_string(d.join("base.Loxone")).unwrap(),
+            "verified"
+        );
+        assert!(
+            std::fs::read_to_string(d.join("lox.toml"))
+                .unwrap()
+                .starts_with("base   = \"base.Loxone\"")
+        );
+        // Nothing to do when the base did not move.
+        assert!(keep_base(d, &d.join("base.Loxone")).unwrap().is_none());
     }
 
     #[test]
