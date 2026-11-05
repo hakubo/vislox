@@ -106,12 +106,31 @@ async fn main() -> Result<()> {
     if args.open {
         let _ = open::that(&url);
     }
-    axum::serve(listener, router)
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
-        .await?;
+    // Browsers keep the live-update stream open for good, so waiting for
+    // connections to close would never end: stop at once instead.
+    tokio::select! {
+        res = axum::serve(listener, router) => res?,
+        _ = shutdown_signal() => {
+            eprintln!("vislox: stopped");
+            std::process::exit(0);
+        }
+    }
     Ok(())
+}
+
+/// Ctrl+C, or SIGTERM where there is one (`kill`, systemd, docker stop).
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("install the SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 fn asset(ty: &'static str, body: &'static str) -> Response {
