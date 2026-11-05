@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>vislox</title>
+<link rel="icon" href="/icon.svg">
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<header id="ribbon">
+  <div class="brand"><img src="/icon.svg" alt=""><span>vislox</span></div>
+  <div class="group">
+    <div class="doc-title" id="doc-title">—</div>
+    <div class="doc-sub" id="doc-sub"></div>
+  </div>
+  <div class="group compare">
+    <label>Viewing <select id="sel-rev"></select></label>
+    <label>compared with <select id="sel-base"></select></label>
+  </div>
+  <div class="group toggles">
+    <label class="chk"><input type="checkbox" id="chk-changes" checked> Mark changes</label>
+    <label class="chk"><input type="checkbox" id="chk-follow" checked> Follow latest</label>
+  </div>
+  <div class="group zoom">
+    <button id="btn-zoom-out" title="Zoom out (-)">−</button>
+    <button id="btn-fit" title="Fit page (0)">Fit</button>
+    <button id="btn-zoom-in" title="Zoom in (+)">+</button>
+  </div>
+  <div class="status" id="status"><span class="dot"></span><span id="status-text">connecting…</span></div>
+</header>
+
+<main>
+  <aside id="left">
+    <section class="pane" id="tree-pane">
+      <div class="pane-title">Periphery &amp; pages</div>
+      <div class="filter"><input id="tree-filter" placeholder="Filter (Ctrl + F)" spellcheck="false"></div>
+      <div class="tree" id="tree"></div>
+    </section>
+    <div class="splitter" id="split-left"></div>
+    <section class="pane" id="props-pane">
+      <div class="pane-title" id="props-title">Properties</div>
+      <div class="props" id="props"><div class="empty">Select a block to see its configuration.</div></div>
+    </section>
+  </aside>
+
+  <section id="center">
+    <div id="canvas-wrap">
+      <svg id="canvas" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <pattern id="dots" width="96" height="96" patternUnits="userSpaceOnUse">
+            <rect x="0" y="0" width="7" height="7" fill="#9a9a9a"/>
+          </pattern>
+          <marker id="arr-out" viewBox="0 0 10 10" refX="0" refY="5" markerWidth="5" markerHeight="5" orient="auto">
+            <path d="M0,0 L10,5 L0,10 z" fill="#69c350"/>
+          </marker>
+        </defs>
+        <g id="viewport"></g>
+      </svg>
+      <div id="canvas-msg" class="canvas-msg"></div>
+      <div id="legend" class="legend hidden">
+        <span class="lg added">added</span><span class="lg changed">changed</span><span class="lg removed">removed</span><span class="lg moved">moved</span>
+      </div>
+    </div>
+    <nav id="tabs">
+      <div class="tab-nav">
+        <button data-nav="first" title="First page">⏮</button><button data-nav="prev" title="Previous page">◀</button><button data-nav="next" title="Next page">▶</button><button data-nav="last" title="Last page">⏭</button>
+      </div>
+      <div class="tab-list" id="tab-list"></div>
+    </nav>
+  </section>
+
+  <aside id="right">
+    <section class="pane" id="hist-pane">
+      <div class="pane-title">History</div>
+      <div class="hist" id="hist"></div>
+    </section>
+    <div class="splitter" id="split-right"></div>
+    <section class="pane" id="chg-pane">
+      <div class="pane-title" id="chg-title">Changes</div>
+      <div class="chg-filter" id="chg-filter"></div>
+      <div class="changes" id="changes"></div>
+    </section>
+  </aside>
+</main>
+<div id="tooltip" class="tooltip hidden"></div>
+<script src="/app.js"></script>
+</body>
+</html>
