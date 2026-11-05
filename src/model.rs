@@ -1404,6 +1404,35 @@ fn live_graph(c: &Ctx) -> LiveGraph {
                     }
                 }
             }
+            // An output reference sends what is wired to it on to the object
+            // it refers to (a mode, a system variable, an actuator).
+            "OutputRef" | "OutputRefLM" => {
+                for (i, o) in [("AI", "AQ"), ("I", "Q")] {
+                    if let (Some(f), Some(p)) = (src(i), by(o)) {
+                        g.pass.insert(p.uuid.clone(), f);
+                    }
+                }
+                if let Some(r) = el.attr("Ref") {
+                    for o in outs(&["AQ", "Q"]) {
+                        g.refs.insert(o, r.to_string());
+                    }
+                }
+            }
+            // A mode is on while its input (set by an output reference) is.
+            "Mode" => {
+                if let (Some(f), Some(p)) = (src("I"), by("Q")) {
+                    g.pass.insert(p.uuid.clone(), f);
+                }
+            }
+            // A system variable set from the program, when it does not scale.
+            "SysVar" => {
+                let num = |k: &str, d: f64| el.attr(k).and_then(|v| v.parse().ok()).unwrap_or(d);
+                let same = num("SourceValLow", 0.0) == num("DestValLow", 0.0)
+                    && num("SourceValHigh", 1.0) == num("DestValHigh", 1.0);
+                if let (true, Some(f), Some(p)) = (same, src("AI"), by("AQ")) {
+                    g.pass.insert(p.uuid.clone(), f);
+                }
+            }
             // A memory flag holds what its input is set to.
             "Memory" => {
                 if let Some(f) = src("Input") {
@@ -1518,6 +1547,45 @@ mod tests {
         let div = &g.gates["10000006-0000-0063-02ff504f94000001"];
         assert_eq!(div.op, "div");
         assert_eq!(div.ins[1].def, Some(1000.0));
+    }
+
+    #[test]
+    fn live_graph_follows_output_references_through_modes() {
+        // Push button Q → OutputRef → Mode; the Mode's Q → InputRef elsewhere.
+        // A system variable that scales does not pass its input on.
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<ControlList Version="1">
+	<C Type="Document" V="1" U="d" Title="T">
+		<C Type="Mode" V="1" U="m" Title="Night">
+			<Co K="I" Nc="1" U="m-i"><In Input="o-aq"/></Co>
+			<Co K="Q" U="m-q"/>
+		</C>
+		<C Type="SysVar" V="1" U="s" Title="Scaled" SourceValHigh="10" DestValHigh="100">
+			<Co K="AI" Nc="1" U="s-ai"><In Input="o-aq"/></Co>
+			<Co K="AQ" U="s-aq"/>
+			<Co K="Q" U="s-q"/>
+		</C>
+		<C Type="Page" V="1" U="p" Title="P">
+			<C Type="PushButton" V="1" U="b" Title="Night" Px="0" Py="0" Px2="960" Py2="960">
+				<Co K="Q" U="b-q"/>
+			</C>
+			<C Type="OutputRef" V="1" U="o" Title="Night" Ref="m" Px="2000" Py="0" Px2="3000" Py2="192">
+				<Co K="AI" Nc="1" U="o-ai"><In Input="b-q"/></Co>
+				<Co K="AQ" U="o-aq"/>
+			</C>
+			<C Type="InputRef" V="1" U="r" Title="Night" Ref="m" Px="0" Py="2000" Px2="1000" Py2="2192">
+				<Co K="AI" Nc="1" U="r-ai"><In Input="m-q"/></Co>
+				<Co K="Q" U="r-q"/>
+			</C>
+		</C>
+	</C>
+</ControlList>"#;
+        let g = build(&doc(xml), None, "t").live;
+        assert_eq!(g.pass["o-aq"], "b-q");
+        assert_eq!(g.refs["o-aq"], "m");
+        assert_eq!(g.pass["m-q"], "o-aq");
+        assert_eq!(g.pass["r-q"], "m-q");
+        assert!(!g.pass.contains_key("s-aq"));
     }
 
     #[test]
