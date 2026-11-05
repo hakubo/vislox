@@ -3,8 +3,9 @@
 // Canvas coordinates are the config's own units: one port row is 192.
 
 const ROW = 192, LABEL_W = 2112, SVGNS = "http://www.w3.org/2000/svg";
-/** Below this zoom the page is an overview: names only, drawn at a constant screen size. */
-const FAR_K = 0.08;
+/** Below this zoom the page is an overview: names only, drawn at a constant screen size.
+ *  Port text (104 units) switches off below ~5 px on high-density screens and ~6.5 px elsewhere. */
+const FAR_K = (window.devicePixelRatio >= 2 ? 5 : 6.5) / 104;
 /** "100 %": one port row is about 19 px, as in Loxone Config at its default zoom. */
 const K100 = 0.1;
 const $ = (id) => document.getElementById(id);
@@ -420,7 +421,7 @@ function renderPage() {
   el("rect", { class: "sheet", x: sx1, y: sy1, width: sx2 - sx1, height: sy2 - sy1 }, vpG);
   el("rect", { class: "sheet-dots", x: sx1, y: sy1, width: sx2 - sx1, height: sy2 - sy1 }, vpG);
 
-  L = { ghost: el("g", {}, vpG), wires: el("g", {}, vpG), refs: el("g", {}, vpG), objs: el("g", {}, vpG), badges: el("g", {}, vpG), far: el("g", {}, vpG) };
+  L = { ghost: el("g", {}, vpG), wires: el("g", {}, vpG), refs: el("g", {}, vpG), objs: el("g", {}, vpG), badges: el("g", {}, vpG), far: el("g", {}, vpG), xrefs: [] };
   const objByUuid = new Map(p.objects.map((o) => [o.uuid, o]));
 
   for (const w of p.wires) {
@@ -480,6 +481,11 @@ function renderFar() {
     const t = o.target || {};
     const addr = t.iname ? ` · ${t.iname}` : "";
     el("text", { class: "far-sub", x: x + w / 2, y: y + ROW / 2 + tagPx * 0.36, "text-anchor": "middle", "font-size": tagPx }, L.far, clip(o.title + addr, Math.floor((w * v.k) / (tagPx * v.k * 0.56))));
+  }
+  // Links to other pages: name and page, as big as the bar allows.
+  if (ROW * v.k >= 7) for (const r of L.xrefs) {
+    const n = Math.floor((LABEL_W * v.k) / (tagPx * v.k * 0.56));
+    el("text", { class: "far-sub", x: r.x + LABEL_W / 2, y: r.y + tagPx * 0.36, "text-anchor": "middle", "font-size": tagPx }, L.far, clip(r.text + (r.page ? " ↗ " + r.page : ""), n));
   }
   for (const o of p.objects) {
     if (o.shape === "tag" || o.moved_to) continue;
@@ -626,6 +632,7 @@ function drawXref(parent, l, n) {
   const bx = left ? l.x - 150 - LABEL_W : l.x + 150;
   const t = l.target;
   const g = el("g", { class: `xref${l.status ? " d-" + l.status : ""}`, "data-obj": l.obj }, parent);
+  L.xrefs.push({ x: bx, y, text: `${t.port ? t.port + ": " : ""}${autoTitle(t.title) ? prettyType(t.ty) : t.title}`, page: t.page_title || "" });
   const analog = /^A[QI]/.test(l.port) || /^A[QI]/.test(t.port || "");
   const wx = left ? bx + LABEL_W : bx;
   el("polyline", { class: `xref-wire${analog ? " analog" : ""}${l.status ? " d-" + l.status : ""}`, "data-f": l.obj, points: `${l.x},${l.y} ${(l.x + wx) / 2},${l.y} ${(l.x + wx) / 2},${y} ${wx},${y}` }, g);
