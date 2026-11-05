@@ -331,21 +331,33 @@ impl Actions {
         self.changed();
     }
 
-    /// Deploy what is pending, then commit and push.
-    pub async fn apply(&self) -> Result<String, Refusal> {
+    /// Deploy what is pending, then commit and push. `opts` are the
+    /// user's answers to an earlier refusal (a newer Loxone Config, custom
+    /// changes on the Miniserver).
+    pub async fn apply(&self, opts: &ApplyOpts) -> Result<String, Refusal> {
         use axum::http::StatusCode;
         let _one = self
             .busy
             .try_lock()
             .map_err(|_| (StatusCode::CONFLICT, "already running".to_string()))?;
         self.begin("Apply")?;
-        let res = self.apply_steps().await;
+        let res = self.apply_steps(opts).await;
         self.end("apply", &res, "applied");
         res.map_err(|e| (StatusCode::BAD_GATEWAY, e))
     }
 
-    async fn apply_steps(&self) -> Result<String, String> {
+    async fn apply_steps(&self, opts: &ApplyOpts) -> Result<String, String> {
         let dir = self.s.project.as_deref().unwrap();
+        let mut args = vec!["config", "push", "--force"];
+        if let Some(v) = &opts.accept_version {
+            if v.is_empty() || v.len() > 12 || !v.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(format!("not a Loxone Config version: {v}"));
+            }
+            args.extend(["--accept-version", v.as_str()]);
+        }
+        if opts.discard_custom_changes {
+            args.push("--discard-custom-changes");
+        }
         let lox = &self.s.lox;
         // The commit subject: the change, by name (before the base moves).
         let p = loxone_config::Project::load(&dir.join("lox.toml"))
@@ -369,7 +381,7 @@ impl Actions {
                 .map(|r| format!("- {}", r.prompt.replace('\n', " ")))
                 .collect()
         };
-        let pushed = run(lox, &["config", "push", "--force"], dir, PUSH_TIMEOUT)
+        let pushed = run(lox, &args, dir, PUSH_TIMEOUT)
             .await
             .map_err(|e| format!("lox config push failed:\n{e}"))?;
         let mut report = vec![last_lines(&pushed, 6)];
@@ -428,6 +440,47 @@ impl Actions {
         git(dir, &["clean", "-fdq", "--", &module]).await?;
         Ok("The module, lock and compiled config are back at the last commit.".into())
     }
+}
+
+/// The user's answers to a refused Apply.
+#[derive(serde::Deserialize, Default)]
+pub struct ApplyOpts {
+    /// Accept a base saved by this Loxone Config release (`--accept-version`).
+    pub accept_version: Option<String>,
+    /// Delete the custom changes the Miniserver holds (`--discard-custom-changes`).
+    #[serde(default)]
+    pub discard_custom_changes: bool,
+}
+
+/// What a refused Apply could be retried with, from lox's message: the
+/// Loxone Config release to accept, and the custom changes an upload would
+/// delete.
+pub fn apply_hints(msg: &str) -> Value {
+    let accept_version = msg.split("--accept-version").nth(1).and_then(|rest| {
+        let v: String = rest
+            .trim_start()
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        (!v.is_empty()).then_some(v)
+    });
+    let mut custom = Vec::new();
+    let mut lines = msg.lines();
+    while let Some(l) = lines.next() {
+        if l.contains("custom change(s)") {
+            for item in lines.by_ref() {
+                if !item.starts_with(char::is_whitespace) || item.trim().is_empty() {
+                    break;
+                }
+                custom.push(item.trim().to_string());
+            }
+            break;
+        }
+    }
+    json!({
+        "accept_version": accept_version,
+        "custom_changes": (!custom.is_empty() && msg.contains("--discard-custom-changes")).then_some(custom),
+    })
 }
 
 fn in_progress(r: &Req) -> bool {
@@ -571,6 +624,26 @@ mod tests {
             i["requests"][0].get("key").is_none(),
             "the key never leaves the server"
         );
+    }
+
+    #[test]
+    fn a_refused_push_says_what_it_could_be_retried_with() {
+        let version = "Error: Compiling the module failed: compile error: Base config saved by Loxone \
+                       Config 17021021, but the lockfile expects 17020828. Run `loxl compile --accept-version 17021021`.";
+        assert_eq!(apply_hints(version)["accept_version"], "17021021");
+        assert!(apply_hints(version)["custom_changes"].is_null());
+        let custom = "Downloading the live config...\n\
+            The Miniserver holds 2 custom change(s) that are not in the program file (made in the app):\n  \
+              2190f3b7-0017 (LoxAIRDevice, not in the program file)\n  \
+              \"Budzik\" (AlarmClock, page \"Pokój\")\n\
+            Error: refusing: loading the upload deletes them (pass --discard-custom-changes to delete them)";
+        let h = apply_hints(custom);
+        assert_eq!(
+            h["custom_changes"][1],
+            "\"Budzik\" (AlarmClock, page \"Pokój\")"
+        );
+        assert!(h["accept_version"].is_null());
+        assert!(apply_hints("lox config push failed: network down")["custom_changes"].is_null());
     }
 
     #[test]
