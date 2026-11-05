@@ -787,16 +787,16 @@ function renderProps() {
   const row = (k, v, cls) => `<div class="pr ${cls || ""}"><div class="k">${esc(k)}</div><div class="v">${v}</div></div>`;
 
   const note = o.ty === "Text" ? o.attrs.find((a) => a.name === "Text") : null;
-  if (note) section("Note", [`<div class="note-p${marks && note.changed ? " chg" : ""}">${marks && note.changed ? chg(note.old, note.value, true) : esc(note.value || "")}</div>`]);
+  if (note) section("Note", [`<div class="note-p${marks && note.changed ? " pr-chg" : ""}">${marks && note.changed ? chg(note.old, note.value, true) : esc(note.value || "")}</div>`]);
   const params = o.ports.filter((q) => q.def != null || q.def_changed || q.inv)
-    .map((q) => row(q.name + (q.inv ? " (inverted)" : ""), chg(q.old_def, q.def, q.def_changed), marks && q.def_changed ? "chg" : ""));
+    .map((q) => row(q.name + (q.inv ? " (inverted)" : ""), chg(q.old_def, q.def, q.def_changed), marks && q.def_changed ? "pr-chg" : ""));
   section("Parameters", params, params.length);
 
   const connRows = (dir) => o.ports.filter((q) => q.conns.some((c) => c.dir === dir)).map((q) => {
     const cs = q.conns.filter((c) => c.dir === dir);
     const add = marks && cs.some((c) => c.status === "added"), rem = marks && cs.some((c) => c.status === "removed");
     return row(q.name, cs.map((c) => `<div class="conn ${marks ? c.status : ""}"><span class="arr">${dir === "in" ? "←" : "→"}</span>${linkTarget(c.target)}</div>`).join(""),
-      add && !rem ? "chg-add" : rem && !add ? "chg-rem" : add && rem ? "chg" : "");
+      add && !rem ? "pr-add" : rem && !add ? "pr-rem" : add && rem ? "pr-chg" : "");
   });
   const ins = connRows("in"), outs = connRows("out");
   section("Inputs", ins, ins.length);
@@ -824,7 +824,7 @@ function renderProps() {
     else if (marks && a.changed) v = chg(a.old, a.value, true);
     else if (a.value && a.value.length > 160) v = `<span class="long">${esc(a.value)}</span><button type="button" class="more">Show all</button>`;
     else v = val(a.value);
-    return row(a.name, v, marks && a.changed ? (a.value == null ? "chg-rem" : "chg") : "");
+    return row(a.name, v, marks && a.changed ? (a.value == null ? "pr-rem" : "pr-chg") : "");
   });
   const rawChanged = marks && o.attrs.some((a) => a.changed);
   section("Advanced", raw, raw.length);

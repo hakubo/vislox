@@ -152,9 +152,9 @@ button.chip { cursor: pointer; } button.chip:hover { border-color: var(--brand);
 .pr:hover { background: #fafbfa; }
 .pr .k { color: var(--muted); word-break: break-word; }
 .pr .v { word-break: break-word; min-width: 0; }
-.pr.chg { background: var(--changed-bg); box-shadow: inset 3px 0 0 var(--changed-dot); }
-.pr.chg-add { background: var(--added-bg); box-shadow: inset 3px 0 0 var(--added); }
-.pr.chg-rem { background: var(--removed-bg); box-shadow: inset 3px 0 0 var(--removed); }
+.pr.pr-chg { background: var(--changed-bg); box-shadow: inset 3px 0 0 var(--changed-dot); }
+.pr.pr-add { background: var(--added-bg); box-shadow: inset 3px 0 0 var(--added); }
+.pr.pr-rem { background: var(--removed-bg); box-shadow: inset 3px 0 0 var(--removed); }
 .none-v { color: var(--faint); }
 .old { color: var(--removed); text-decoration: line-through; margin-right: 6px; }
 .new { color: var(--added); font-weight: 600; }
@@ -343,17 +343,17 @@ button.chip { cursor: pointer; } button.chip:hover { border-color: var(--brand);
 .chg-filter button.pill { cursor: pointer; }
 .chg-filter button.pill[aria-pressed="false"] { opacity: .45; text-decoration: line-through; }
 .changes { flex: 1; overflow: auto; }
-.chg { display: flex; width: 100%; text-align: left; gap: 8px; padding: 6px 10px; border: none; border-bottom: 1px solid var(--line-2); background: #fff; align-items: baseline; }
-.chg:hover { background: #f4f8f2; }
-.chg.cur { background: var(--sel-soft); box-shadow: inset 3px 0 0 var(--sel); }
-.chg .k { flex: none; width: 18px; height: 18px; border-radius: 4px; color: #fff; font-weight: 700; font-size: 12px; display: inline-flex; align-items: center; justify-content: center; }
-.chg .k.added, .chg .k.wire\+ { background: var(--added); }
-.chg .k.removed, .chg .k.wire- { background: var(--removed); }
-.chg .k.renamed, .chg .k.param, .chg .k.attr { background: var(--changed-dot); color: #2b1d00; }
-.chg .k.moved { background: var(--moved); }
-.chg .x { flex: 1; min-width: 0; }
-.chg .x .t { display: block; word-break: break-word; }
-.chg .x .p { display: block; color: var(--muted); font-size: 12px; }
+.changes .chg { display: flex; width: 100%; text-align: left; gap: 8px; padding: 6px 10px; border: none; border-bottom: 1px solid var(--line-2); background: #fff; align-items: baseline; }
+.changes .chg:hover { background: #f4f8f2; }
+.changes .chg.cur { background: var(--sel-soft); box-shadow: inset 3px 0 0 var(--sel); }
+.changes .chg .k { flex: none; width: 18px; height: 18px; border-radius: 4px; color: #fff; font-weight: 700; font-size: 12px; display: inline-flex; align-items: center; justify-content: center; }
+.changes .chg .k.added, .changes .chg .k.wire\+ { background: var(--added); }
+.changes .chg .k.removed, .changes .chg .k.wire- { background: var(--removed); }
+.changes .chg .k.renamed, .changes .chg .k.param, .changes .chg .k.attr { background: var(--changed-dot); color: #2b1d00; }
+.changes .chg .k.moved { background: var(--moved); }
+.changes .chg .x { flex: 1; min-width: 0; }
+.changes .chg .x .t { display: block; word-break: break-word; }
+.changes .chg .x .p { display: block; color: var(--muted); font-size: 12px; }
 
 /* ── overlays ──────────────────────────────────────── */
 .overlay { position: fixed; inset: 0; z-index: 20; background: #1d211d55; display: flex; align-items: flex-start; justify-content: center; padding-top: 12vh; }
