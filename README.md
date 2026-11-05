@@ -50,8 +50,14 @@ marked so you can review it before you deploy.
   without a value. Those wires are faded ("Dim wires without a value" in the legend turns this off). Values
   show on the current, deployed revision only.
 
-Read-only: vislox never writes to the config, and live values only listen: no commands are sent. A pull reads
-from the Miniserver, and lox commits the download to your repository; nothing is sent to the Miniserver.
+- **Change with AI, then Apply** (for a `lox.toml` project, when started with an admin token): describe a change
+  in words. vislox sends it to a webhook, where an AI agent edits the project's Lox Logic module with `lox logic`
+  and compiles it. The result shows as the pending revision, so you review it like any compile. **Apply** deploys
+  it with `lox config push --force` (download, drift check, upload, program restart, verify), then commits the
+  project and pushes it to its git remote. **Discard** puts the module back to the last commit.
+
+vislox itself never writes to the config: lox and git do, and only on Pull, Apply and Discard. Live values only
+listen. A pull reads from the Miniserver; only Apply writes to it.
 
 ## Run
 
@@ -76,6 +82,25 @@ vislox ~/loxone-config --no-live       # never connect to the Miniserver
 lox stream -o json --initial --reconnect | vislox ~/loxone-config --live-from -   # values from lox
 vislox config.Loxone --live-from recorded.ndjson   # replay a recording (followed as it grows)
 ```
+
+### Change with AI and Apply
+
+For a `lox.toml` project:
+
+```bash
+vislox ~/loxone-config/project --admin-token-file ~/.config/vislox/admin-token \
+       --ai-webhook-file ~/.config/vislox/ai-webhook
+```
+
+- `--admin-token-file`: a file holding a passphrase. The AI box, Apply and Discard ask for it once per browser
+  (`X-Vislox-Token`). Without it they are off; viewing needs no token.
+- `--ai-webhook-file`: a file holding the URL that requests are POSTed to, as JSON: `id`, `key`, `prompt`,
+  `project` and `status_url`. The agent behind it reports back by POSTing `{"id", "key", "state": "working" |
+  "done" | "failed", "summary"}` to `status_url`; the key authorizes only that request. A request that never
+  reports back is given up after 30 minutes.
+- The agent should only edit and compile (`lox logic …`). Deploying is Apply's job, and Apply needs the token.
+- Apply commits with the change summary as the subject (`lox logic diff --summary`) and the AI requests in the
+  body, then runs `git push`, which needs credentials for the project's remote.
 
 The Miniserver connection is opened when a browser turns live values on, and closed shortly after the last
 one turns them off.
@@ -110,6 +135,8 @@ The binary is an `axum` server with the UI embedded (plain JS and SVG, no build 
 - `src/model.rs` turns a revision, plus an optional base, into pages, objects, wires, cross-page links,
   properties and a change list. It uses `loxone_config::diff` and adds its own checks for attributes,
   positions and wires.
+- `src/actions.rs` sends AI requests to the webhook, takes the agent's reports, and runs Apply (`lox config push
+  --force`, `git commit`, `git push`) and Discard (`git checkout` of the module, lock and out).
 - `src/pull.rs` runs `lox config pull` for the Pull button (`POST /api/pull`, which needs an `X-Vislox` header so
   that no other web page can trigger it), then refreshes the history.
 - `src/live.rs` streams the Miniserver's states with lox's `loxone-client` crate. A wire's source

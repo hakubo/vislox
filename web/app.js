@@ -156,6 +156,7 @@ async function loadHistory(fromEvent) {
   if (S.live.on && h.live?.available) liveStart();
   renderLiveSwitch();
   renderPull();
+  renderActions();
   if (fromEvent) {
     setStatus("updated " + new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }), "live flash");
     setTimeout(() => setStatus("live", "live"), 2500);
@@ -1312,6 +1313,104 @@ async function pull() {
 $("btn-pull").onclick = pull;
 $("pull-msg").onclick = () => pullMsg("");
 
+// ── change with AI, apply, discard ─────────────────────────────────────
+// A prompt goes to an AI agent (webhook) that edits the lox.toml project's module and compiles it;
+// the compile shows as the pending revision. Apply deploys it (lox config push) and pushes to git.
+function adminToken(ask) {
+  let t = "";
+  try { t = localStorage.getItem("vislox.token") || ""; } catch { /* private mode */ }
+  if (!t && ask) {
+    t = (window.prompt("Admin token for changes (the contents of vislox's --admin-token-file):") || "").trim();
+    if (t) try { localStorage.setItem("vislox.token", t); } catch { /* private mode */ }
+  }
+  return t;
+}
+async function act(path, body) {
+  const t = adminToken(true);
+  if (!t) throw new Error("Changes need the admin token.");
+  const r = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Vislox-Token": t },
+    body: JSON.stringify(body || {}),
+  });
+  const j = await r.json().catch(() => ({}));
+  if (r.status === 401) try { localStorage.removeItem("vislox.token"); } catch { /* private mode */ }
+  if (!r.ok) throw new Error(j.error || r.statusText);
+  return j;
+}
+/** Re-read the AI / Apply state (it changes outside revisions). */
+async function refreshActions() {
+  if (!S.hist) return;
+  try { S.hist.actions = (await api("/api/history")).actions; } catch { return; }
+  renderActions();
+}
+function aiMsg(text, error) {
+  const m = $("ai-msg");
+  m.textContent = text || "";
+  m.className = "ai-msg" + (error ? " error" : "") + (text ? "" : " hidden");
+}
+/** The newest compile, if it differs from what is deployed. */
+function pendingChange() {
+  const p = S.hist?.pending?.[0];
+  const base = p && revById(p.base);
+  return p && base && p.blob !== base.blob ? p : null;
+}
+function renderActions() {
+  const a = S.hist?.actions;
+  $("ai-pane").classList.toggle("hidden", !a?.shown);
+  if (!a?.shown) return;
+  const working = a.requests.some((r) => r.state === "sent" || r.state === "working");
+  const busy = working || !!a.running;
+  $("ai-prompt").disabled = !a.ai.available;
+  $("ai-send").disabled = !a.ai.available || busy;
+  $("ai-hint").textContent = !a.ai.available ? a.ai.reason : a.running ? `${a.running} is running…` : working ? "The AI is working on it…" : "";
+  $("ai-reqs").innerHTML = a.requests.slice(0, 4).map((r) => `<div class="ai-req st-${esc(r.state.replace(/ /g, "-"))}">
+      <div class="top"><span class="st">${esc(r.state)}</span><span class="p">${esc(r.prompt)}</span><span class="t">${esc(fmtWhen(r.updated))}</span></div>
+      ${r.summary ? `<div class="s">${esc(r.summary)}</div>` : ""}</div>`).join("");
+  const pend = pendingChange();
+  $("ai-deploy").classList.toggle("hidden", !pend && !a.running);
+  $("ai-pend").textContent = a.running === "Apply" ? "Deploying to the Miniserver… (download, check, upload, restart, verify)"
+    : a.running ? `${a.running}…` : pend ? `Compiled changes are pending (${fmtWhen(pend.time)}). Review them, then apply.` : "";
+  $("btn-apply").disabled = !a.apply.available || busy || !pend;
+  $("btn-discard").disabled = !a.apply.available || busy || !pend;
+  $("btn-apply").title = a.apply.available ? "Deploy to the Miniserver with lox config push, then commit and push to git" : `Cannot apply: ${a.apply.reason}`;
+  const last = a.last;
+  if (last && last.at !== renderActions.shownAt) {
+    renderActions.shownAt = last.at;
+    aiMsg((last.kind === "apply" ? (last.ok ? "Applied.\n" : "Apply failed.\n") : last.ok ? "" : "Discard failed.\n") + last.message, !last.ok);
+  }
+}
+$("ai-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const text = $("ai-prompt").value.trim();
+  if (!text) return;
+  $("ai-send").disabled = true;
+  aiMsg("");
+  try {
+    await act("/api/ai", { prompt: text });
+    $("ai-prompt").value = "";
+    await refreshActions();
+  } catch (err) {
+    aiMsg(err.message, true);
+  } finally { renderActions(); }
+});
+$("ai-prompt").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); $("ai-form").requestSubmit(); }
+});
+$("btn-apply").onclick = async () => {
+  const pend = pendingChange();
+  if (!pend) return;
+  if (!window.confirm("Deploy the pending changes to the Miniserver?\n\nlox config push uploads the config and restarts the Miniserver's program (a few seconds), " +
+    "checks that it runs exactly the compiled config, then vislox commits and pushes to git.")) return;
+  aiMsg("");
+  try { await act("/api/apply"); } catch (err) { aiMsg(err.message, true); }
+};
+$("btn-discard").onclick = async () => {
+  if (!window.confirm("Discard the pending changes? The module, lock and compiled config go back to the last commit.")) return;
+  aiMsg("");
+  try { const j = await act("/api/discard"); aiMsg(j.message); } catch (err) { aiMsg(err.message, true); }
+};
+
 // ── live values ────────────────────────────────────────────────────────
 // The Miniserver streams a value per state UUID; a wire's source connector
 // has the UUID of the state it carries. Logic blocks the app does not see
@@ -1574,8 +1673,10 @@ function flash(n) {
 // ── live updates ───────────────────────────────────────────────────────
 function connect() {
   const es = new EventSource("/api/events");
-  es.onopen = () => setStatus("live", "live");
+  // Changes while the stream was down (or before it opened) are not replayed: catch up.
+  es.onopen = () => { setStatus("live", "live"); if (S.hist) loadHistory(); };
   es.addEventListener("history", () => loadHistory(true));
+  es.addEventListener("actions", (e) => { if (S.hist) { S.hist.actions = JSON.parse(e.data); renderActions(); } });
   es.onerror = () => setStatus("disconnected — retrying", "error");
 }
 S.hash = readHash();

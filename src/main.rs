@@ -1,6 +1,7 @@
 //! vislox — a read-only, Loxone-Config-style view of the configs `lox` and
 //! `loxone-config` manage, with live reload, history and change review.
 
+mod actions;
 mod history;
 mod live;
 mod model;
@@ -63,6 +64,14 @@ struct Args {
     /// The lox binary that pulls the config (`lox config pull`).
     #[arg(long, value_name = "PATH", default_value = "lox")]
     lox: PathBuf,
+    /// For a lox.toml project: a file holding the admin token that the AI
+    /// box, Apply and Discard ask for. Without it they are off.
+    #[arg(long, value_name = "FILE")]
+    admin_token_file: Option<PathBuf>,
+    /// For a lox.toml project: a file holding the webhook URL that AI
+    /// requests are sent to.
+    #[arg(long, value_name = "FILE")]
+    ai_webhook_file: Option<PathBuf>,
 }
 
 struct App {
@@ -72,6 +81,7 @@ struct App {
     tx: broadcast::Sender<u64>,
     live: Arc<live::Live>,
     pull: pull::Pull,
+    actions: actions::Actions,
 }
 
 #[tokio::main]
@@ -136,7 +146,38 @@ async fn main() -> Result<()> {
         tx,
         live: live::Live::new(feed, live_source),
         pull,
+        actions: actions::Actions::new(actions::Settings {
+            token: args
+                .admin_token_file
+                .as_deref()
+                .map(actions::read_secret)
+                .transpose()?,
+            webhook: args
+                .ai_webhook_file
+                .as_deref()
+                .map(actions::read_secret)
+                .transpose()?,
+            project: src.project.clone(),
+            lox: args.lox.clone(),
+            status_url: {
+                // The agent runs on this machine.
+                let mut a = args.listen;
+                if a.ip().is_unspecified() {
+                    a.set_ip(std::net::Ipv4Addr::LOCALHOST.into());
+                }
+                format!("http://{a}/api/ai/status")
+            },
+        }),
     });
+    if src.project.is_some() {
+        let i = app.actions.info();
+        for (what, k) in [("AI requests", "ai"), ("Apply", "apply")] {
+            match i[k]["reason"].as_str() {
+                None => eprintln!("vislox: {what} on"),
+                Some(why) => eprintln!("vislox: no {what}: {why}"),
+            }
+        }
+    }
 
     spawn_watcher(app.clone())?;
     // Fallback poll, and the only way to notice new git commits.
@@ -174,6 +215,10 @@ async fn main() -> Result<()> {
         .route("/api/events", get(api_events))
         .route("/api/live", get(api_live))
         .route("/api/pull", axum::routing::post(api_pull))
+        .route("/api/ai", axum::routing::post(api_ai))
+        .route("/api/ai/status", axum::routing::post(api_ai_status))
+        .route("/api/apply", axum::routing::post(api_apply))
+        .route("/api/discard", axum::routing::post(api_discard))
         .with_state(app)
         .layer(tower_http::compression::CompressionLayer::new());
 
@@ -287,6 +332,7 @@ async fn api_history(State(app): State<Arc<App>>) -> impl IntoResponse {
         "error": h.last_error,
         "live": app.live.info(),
         "pull": app.pull.info(),
+        "actions": app.actions.info(),
     }))
 }
 
@@ -358,10 +404,17 @@ async fn api_events(
     State(app): State<Arc<App>>,
 ) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
     let rx = app.tx.subscribe();
-    let stream = BroadcastStream::new(rx)
+    let history = BroadcastStream::new(rx)
         .filter_map(|v| v.ok())
         .map(|v| Ok(Event::default().event("history").data(v.to_string())));
-    Sse::new(stream).keep_alive(KeepAlive::default())
+    // AI requests, Apply and Discard: the whole state, on every change.
+    let a = app.clone();
+    let actions = BroadcastStream::new(app.actions.subscribe()).map(move |_| {
+        Ok(Event::default()
+            .event("actions")
+            .data(a.actions.info().to_string()))
+    });
+    Sse::new(history.merge(actions)).keep_alive(KeepAlive::default())
 }
 
 /// Live values for one browser, while it keeps this stream open: `status`,
@@ -415,5 +468,69 @@ async fn api_pull(State(app): State<Arc<App>>, headers: axum::http::HeaderMap) -
             Json(serde_json::json!({ "error": e })),
         )
             .into_response(),
+    }
+}
+
+fn refused((status, msg): actions::Refusal) -> Response {
+    (status, Json(serde_json::json!({ "error": msg }))).into_response()
+}
+
+#[derive(Deserialize)]
+struct AskBody {
+    prompt: String,
+}
+
+/// Send a change request to the AI agent's webhook.
+async fn api_ai(
+    State(app): State<Arc<App>>,
+    headers: axum::http::HeaderMap,
+    Json(b): Json<AskBody>,
+) -> Response {
+    if let Err(r) = app.actions.check(&headers) {
+        return refused(r);
+    }
+    match app.actions.ask(&b.prompt).await {
+        Ok(v) => Json(v).into_response(),
+        Err(r) => refused(r),
+    }
+}
+
+/// The agent reports on a request; authorized by the request's own key.
+async fn api_ai_status(State(app): State<Arc<App>>, Json(v): Json<serde_json::Value>) -> Response {
+    match app.actions.report(&v) {
+        Ok(()) => {
+            let a = app.clone();
+            let _ = tokio::task::spawn_blocking(move || refresh(&a)).await;
+            Json(serde_json::json!({ "ok": true })).into_response()
+        }
+        Err(r) => refused(r),
+    }
+}
+
+/// Deploy the pending changes with `lox config push --force`, commit, push.
+async fn api_apply(State(app): State<Arc<App>>, headers: axum::http::HeaderMap) -> Response {
+    if let Err(r) = app.actions.check(&headers) {
+        return refused(r);
+    }
+    let res = app.actions.apply().await;
+    let a = app.clone();
+    let _ = tokio::task::spawn_blocking(move || refresh(&a)).await;
+    match res {
+        Ok(m) => Json(serde_json::json!({ "message": m })).into_response(),
+        Err(r) => refused(r),
+    }
+}
+
+/// Put the module, lock and compiled config back to the last commit.
+async fn api_discard(State(app): State<Arc<App>>, headers: axum::http::HeaderMap) -> Response {
+    if let Err(r) = app.actions.check(&headers) {
+        return refused(r);
+    }
+    let res = app.actions.discard().await;
+    let a = app.clone();
+    let _ = tokio::task::spawn_blocking(move || refresh(&a)).await;
+    match res {
+        Ok(m) => Json(serde_json::json!({ "message": m })).into_response(),
+        Err(r) => refused(r),
     }
 }
