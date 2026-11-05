@@ -78,3 +78,15 @@ The binary is an `axum` server with the UI embedded (plain JS and SVG, no build 
 
 `docs/reference/` holds the Loxone Config screenshots the look is based on (see `SOURCES.md`). They are
 copyright Loxone and are for internal reference only.
+
+## Development
+
+```bash
+cargo fmt --check && cargo clippy --all-targets -- -D warnings
+cargo test                                   # model, history, source; fixture: tests/fixtures/house.Loxone
+cargo build --release
+cd tests/ui && npm ci && npx playwright install chromium && cd ../..
+VISLOX_BIN=target/release/vislox node tests/ui/smoke.mjs   # drives the UI in headless Chromium
+```
+
+CI (`.github/workflows/ci.yml`) runs all of these on every push to `main` and on every pull request.

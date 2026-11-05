@@ -192,24 +192,24 @@ impl History {
                 self.last_error = Some(format!("{}: {e}", self.current_path.display()));
             }
         }
-        if let Some(path) = self.proposed_path.clone() {
-            if let Ok(bytes) = std::fs::read(&path) {
-                let blob = blob_id(&bytes);
-                if self.pending.last().map(|r| &r.blob) != Some(&blob) {
-                    let n = self.pending.len();
-                    self.contents.insert(blob.clone(), Arc::new(bytes));
-                    self.pending.push(Revision {
-                        id: format!("pending:{n}"),
-                        kind: "pending",
-                        label: "Compiled, not deployed".into(),
-                        detail: path.display().to_string(),
-                        time: mtime(&path).unwrap_or_else(now),
-                        blob,
-                        base: None,
-                        current: false,
-                    });
-                    changed = true;
-                }
+        if let Some(path) = self.proposed_path.clone()
+            && let Ok(bytes) = std::fs::read(&path)
+        {
+            let blob = blob_id(&bytes);
+            if self.pending.last().map(|r| &r.blob) != Some(&blob) {
+                let n = self.pending.len();
+                self.contents.insert(blob.clone(), Arc::new(bytes));
+                self.pending.push(Revision {
+                    id: format!("pending:{n}"),
+                    kind: "pending",
+                    label: "Compiled, not deployed".into(),
+                    detail: path.display().to_string(),
+                    time: mtime(&path).unwrap_or_else(now),
+                    blob,
+                    base: None,
+                    current: false,
+                });
+                changed = true;
             }
         }
         if changed {
@@ -304,4 +304,124 @@ impl History {
 fn mtime(p: &Path) -> Option<i64> {
     let t = std::fs::metadata(p).ok()?.modified().ok()?;
     Some(chrono::DateTime::<chrono::Utc>::from(t).timestamp())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let ok = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@example.com",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .output()
+            .expect("git runs")
+            .status
+            .success();
+        assert!(ok, "git {args:?}");
+    }
+
+    #[test]
+    fn blob_id_matches_git() {
+        // `printf 'hello\n' | git hash-object --stdin`
+        assert_eq!(
+            blob_id(b"hello\n"),
+            "ce013625030ba8dba906f756967f9e9ca394464a"
+        );
+    }
+
+    #[test]
+    fn git_history_and_live_snapshots() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().canonicalize().unwrap();
+        git(&repo, &["init", "-q"]);
+        let file = repo.join("config.Loxone");
+        fs::write(&file, "v1").unwrap();
+        git(&repo, &["add", "."]);
+        git(
+            &repo,
+            &[
+                "commit",
+                "-q",
+                "-m",
+                "[504F94000001] Config backup 2026-11-01 10:00:00 (v1)",
+            ],
+        );
+        fs::write(&file, "v2").unwrap();
+        git(
+            &repo,
+            &[
+                "commit",
+                "-q",
+                "-am",
+                "[504F94000001] Config backup 2026-11-02 10:00:00 (v2)",
+            ],
+        );
+
+        let mut h = History::new(file.clone(), None);
+        assert_eq!(h.git_root(), Some(repo.as_path()));
+        let (pending, hist) = h.list();
+        assert!(pending.is_empty());
+        // The file on disk equals HEAD: shown as that commit, not as a live snapshot.
+        assert_eq!(hist.len(), 2);
+        assert!(hist.iter().all(|r| r.kind == "git"));
+        assert!(hist[0].current && hist[0].label.ends_with("(v2)"));
+        assert_eq!(hist[0].base.as_deref(), Some(hist[1].id.as_str()));
+        assert_eq!(hist[1].base, None);
+        // Old content comes from git.
+        assert_eq!(h.content(&hist[1].blob).unwrap().as_slice(), b"v1");
+
+        // An edit on disk is a new, uncommitted revision on top.
+        fs::write(&file, "v3").unwrap();
+        assert!(h.poll_files());
+        assert!(!h.poll_files(), "unchanged file adds nothing");
+        let (_, hist) = h.list();
+        assert_eq!(hist.len(), 3);
+        assert_eq!(hist[0].kind, "live");
+        assert!(hist[0].current);
+        assert_eq!(hist[0].label, "Changed on disk, not committed");
+        assert_eq!(hist[0].base.as_deref(), Some(hist[1].id.as_str()));
+        assert_eq!(h.content(&hist[0].blob).unwrap().as_slice(), b"v3");
+
+        // Committing it folds the snapshot into the new commit.
+        git(&repo, &["commit", "-q", "-am", "v3"]);
+        assert!(h.refresh_git());
+        let (_, hist) = h.list();
+        assert_eq!(hist.len(), 3);
+        assert!(hist.iter().all(|r| r.kind == "git"));
+        assert!(hist[0].current);
+    }
+
+    #[test]
+    fn compiled_config_is_pending_against_the_deployed_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("base.Loxone");
+        let out = tmp.path().join("out.Loxone");
+        fs::write(&base, "deployed").unwrap();
+        fs::write(&out, "compiled").unwrap();
+        let mut h = History::new(base, Some(out.clone()));
+        let (pending, hist) = h.list();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(hist.len(), 1, "no git: the file as seen at start");
+        assert_eq!(pending[0].kind, "pending");
+        assert_eq!(pending[0].base.as_deref(), Some(hist[0].id.as_str()));
+
+        fs::write(&out, "compiled again").unwrap();
+        assert!(h.poll_files());
+        let (pending, _) = h.list();
+        assert_eq!(pending.len(), 2);
+        assert!(pending[0].current && !pending[1].current);
+        assert_eq!(pending[1].label, "Earlier compile");
+        assert!(h.find(&pending[1].id).is_some());
+    }
 }
