@@ -26,6 +26,7 @@
   --live-pill: #fffbe3;
   --live-pill-line: #c9b25a;
   --live-tick: #ffe27a;      /* a value that just changed */
+  --live-computed: #f1f5fb;  /* a value vislox computed, not the Miniserver's */
   --radius: 6px;
   --shadow: 0 1px 2px #0000000f, 0 2px 8px #0000000f;
   font-family: "Segoe UI", system-ui, -apple-system, "Noto Sans", "DejaVu Sans", Arial, sans-serif;
@@ -421,3 +422,6 @@ button.chip { cursor: pointer; } button.chip:hover { border-color: var(--brand);
 .pull-msg { flex: none; margin: 6px 10px 0; padding: 6px 8px; border-radius: 4px; font-size: 12px; background: var(--brand-soft); color: var(--brand-strong); word-break: break-word; }
 .pull-msg.error { background: var(--removed-bg); color: var(--removed); }
 .pull-msg.info { background: var(--panel-2); color: var(--muted); }
+.live-pill.computed rect { stroke-dasharray: 4 3; fill: var(--live-computed); }
+.pr .lv.computed, .lg-pill.computed { border-style: dashed; background: var(--live-computed); }
+.pr .lv.const { background: var(--panel-2); border-color: var(--line); }

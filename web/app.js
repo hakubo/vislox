@@ -802,7 +802,7 @@ function renderProps() {
     for (const q of o.ports) {
       const inc = q.conns.find((c) => c.dir === "in");
       const src = inc ? inc.src : q.uuid;
-      if (!inc && !q.conns.length && !S.live.values.has(q.uuid)) continue;
+      if (!inc && !q.conns.length && !liveVal(q.uuid)) continue;
       rows.push(row(q.name, lvSpan(src) + `<span class="lv-of">${inc ? "in" : "out"}</span>`));
     }
     section("Live values", rows.length ? rows : [`<div class="empty">The Miniserver sends no values for this block.</div>`], rows.length);
@@ -1322,7 +1322,90 @@ function liveHere() {
   const r = revById(S.rev);
   return S.live.on && !!S.live.es && !!r && !!r.current && r.kind !== "pending";
 }
-function liveVal(uuid) { return liveHere() ? S.live.values.get(uuid) : undefined; }
+/** A connector's value: streamed by the Miniserver, passed on by a reference or a memory flag,
+ *  a constant in the config, or computed from a simple gate's inputs (`view.live`).
+ *  Entries are `[value, text, label, kind]`; kind is "const" or "computed" for values the
+ *  Miniserver did not send. Cached until the next change. */
+let lvCache = new Map();
+function liveVal(uuid) { return liveHere() ? lvResolve(uuid, 0) : undefined; }
+function lvResolve(u, depth) {
+  if (!u || depth > 60) return undefined;
+  if (lvCache.has(u)) return lvCache.get(u);
+  lvCache.set(u, undefined); // a loop resolves to nothing
+  const r = lvFind(u, depth);
+  lvCache.set(u, r);
+  return r;
+}
+function lvFind(u, depth) {
+  const e = S.live.values.get(u);
+  if (e) return e;
+  const g = S.view?.live || {};
+  if (g.pass?.[u]) { const r = lvResolve(g.pass[u], depth + 1); if (r) return r; }
+  const ref = g.refs?.[u];
+  if (ref) {
+    const st = S.live.controls[ref]?.states || {};
+    const k = ["value", "active", "position"].find((k) => typeof st[k] === "string" && S.live.values.has(st[k]));
+    if (k) return S.live.values.get(st[k]);
+  }
+  const lc = g.moods?.[u];
+  if (lc) {
+    // Mood is the number of the active mood; with several active it is not known.
+    const su = S.live.controls[lc]?.states?.activeMoods;
+    let ids;
+    try { ids = JSON.parse(S.live.values.get(su)?.[0]); } catch { ids = null; }
+    if (Array.isArray(ids) && ids.length === 1) return [ids[0], null, "the lighting controller's active mood", "computed"];
+  }
+  if (g.consts && u in g.consts) return [g.consts[u], null, "constant in the config", "const"];
+  const gate = g.gates?.[u];
+  if (gate) {
+    const v = gateEval(gate, depth);
+    if (v !== undefined) return [v, null, `computed by vislox from the ${GATE_NAME[gate.op]} block's inputs`, "computed"];
+  }
+  return undefined;
+}
+const GATE_NAME = { and: "AND", or: "OR", xor: "XOR", not: "NOT", eq: "Equal", ne: "Not equal", gt: "Greater", ge: "Greater or equal",
+  lt: "Less", le: "Less or equal", add: "Add", sub: "Subtract", mul: "Multiply", div: "Divide" };
+function lvNum(e) {
+  const v = e?.[0];
+  const n = typeof v === "number" ? v : typeof v === "string" && v.trim() !== "" ? Number(v) : NaN;
+  return Number.isFinite(n) ? n : undefined;
+}
+/** A stateless gate's output from its inputs; undefined when an input it needs is unknown. */
+function gateEval(g, depth) {
+  // Each input: a number, null (unwired: ignored), or undefined (wired, value unknown).
+  const xs = g.ins.map((i) => {
+    if (i.src) {
+      const n = lvNum(lvResolve(i.src, depth + 1));
+      return n === undefined ? undefined : i.inv ? +(n === 0) : n;
+    }
+    if (i.inv) return 1; // an unwired inverted input is a constant 1
+    return i.def ?? null;
+  });
+  const wired = xs.filter((x) => x !== null);
+  const known = wired.filter((x) => x !== undefined).map((x) => x !== 0);
+  const unknown = wired.length - known.length;
+  switch (g.op) {
+    case "and": return known.includes(false) ? 0 : unknown || !wired.length ? undefined : 1;
+    case "or": return known.includes(true) ? 1 : unknown || !wired.length ? undefined : 0;
+    case "xor": return unknown || !wired.length ? undefined : known.filter(Boolean).length % 2;
+    case "not": return unknown || !wired.length ? undefined : +!known[0];
+  }
+  if (xs[0] === undefined || xs[1] === undefined) return undefined;
+  const a = xs[0] ?? 0, b = xs[1] ?? 0;
+  switch (g.op) {
+    case "eq": return +(a === b);
+    case "ne": return +(a !== b);
+    case "gt": return +(a > b);
+    case "ge": return +(a >= b);
+    case "lt": return +(a < b);
+    case "le": return +(a <= b);
+    case "add": return a + b;
+    case "sub": return a - b;
+    case "mul": return a * b;
+    case "div": return b === 0 ? undefined : a / b;
+  }
+  return undefined;
+}
 /** `[value, text in the control's format, "Control · state"]` → what to show. */
 function liveText(e) {
   const [v, t] = e;
@@ -1333,12 +1416,12 @@ function liveText(e) {
 function liveOn(e) { const v = e[0]; return typeof v === "number" ? v !== 0 : !!v && v !== "0"; }
 function liveTip(src) {
   if (!liveHere()) return "";
-  const e = S.live.values.get(src);
+  const e = liveVal(src);
   return e ? `<br>value <b>${esc(liveText(e))}</b>${e[2] ? ` <span class="tm">${esc(e[2])}</span>` : ""}` : `<br><span class="tm">no live value</span>`;
 }
 function lvSpan(u) {
   const e = liveVal(u);
-  return `<span class="lv${e ? "" : " none"}" data-lv="${esc(u)}"${e?.[2] ? ` title="${esc(e[2])}"` : ""}>${e ? esc(clip(liveText(e), 40)) : "no value"}</span>`;
+  return `<span class="lv${e ? "" : " none"}${e?.[3] ? " " + e[3] : ""}" data-lv="${esc(u)}"${e?.[2] ? ` title="${esc(e[2])}"` : ""}>${e ? esc(clip(liveText(e), 40)) : "no value"}</span>`;
 }
 
 function renderLiveSwitch() {
@@ -1372,11 +1455,13 @@ function liveStart() {
     const d = JSON.parse(e.data);
     S.live.values = new Map(Object.entries(d.values));
     S.live.controls = d.controls || {};
+    lvCache = new Map();
     liveQueue(null);
   });
   es.addEventListener("values", (e) => {
     const d = JSON.parse(e.data);
     for (const k in d) S.live.values.set(k, d[k]);
+    lvCache = new Map();
     liveQueue(Object.keys(d));
   });
   es.onerror = () => {
@@ -1441,10 +1526,12 @@ function liveBuild(p) {
   return idx;
 }
 
+/** Repaint every value on the page: derived values change with their inputs, so `ch` (the
+ *  streamed values that changed, or null for a full repaint) only decides what flashes. */
 function liveApply(ch) {
   renderLiveSwitch();
+  if (!ch) lvCache = new Map();
   for (const [src, it] of L.live || []) {
-    if (ch && !ch.has(src)) continue;
     const e = liveVal(src);
     for (const n of it.lines) {
       n.classList.toggle("lv-has", !!e);
@@ -1454,23 +1541,26 @@ function liveApply(ch) {
     const txt = show ? clip(liveText(e), 18) : "";
     for (const pl of it.pills) {
       pl.g.style.display = show ? "" : "none";
+      pl.g.classList.toggle("computed", e?.[3] === "computed");
       if (!show) continue;
       if (pl.t.textContent !== txt) {
+        const was = pl.t.textContent;
         pl.t.textContent = txt;
         const w = txt.length * 58 + 100, x = pl.end ? pl.x - w : pl.x;
         pl.r.setAttribute("x", x); pl.r.setAttribute("width", w);
         pl.t.setAttribute("x", x + 50);
+        if (ch && was) flash(pl.g);
       }
-      if (ch) flash(pl.g);
     }
   }
   $("props").querySelectorAll("[data-lv]").forEach((n) => {
-    if (ch && !ch.has(n.dataset.lv)) return;
     const e = liveVal(n.dataset.lv);
-    n.textContent = e ? clip(liveText(e), 40) : "no value";
-    n.classList.toggle("none", !e);
-    if (e?.[2]) n.title = e[2];
-    if (ch && e) flash(n);
+    const txt = e ? clip(liveText(e), 40) : "no value";
+    const changed = n.textContent !== txt;
+    n.textContent = txt;
+    n.className = "lv" + (e ? "" : " none") + (e?.[3] ? " " + e[3] : "");
+    n.title = e?.[2] || "";
+    if (ch && e && changed) flash(n);
   });
 }
 function flash(n) {

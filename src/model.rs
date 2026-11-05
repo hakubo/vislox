@@ -27,6 +27,47 @@ pub struct View {
     pub changes: Vec<Change>,
     pub stats: Stats,
     pub compared: bool,
+    /// How values flow where the Miniserver streams none (live values).
+    pub live: LiveGraph,
+}
+
+/// What the browser needs to give a wire a live value the Miniserver does
+/// not stream: references and memory flags carry another connector's value,
+/// constants are in the config, and simple gates can be computed from their
+/// inputs. Keyed by output connector UUID.
+#[derive(Serialize, Default)]
+pub struct LiveGraph {
+    /// Output → the connector whose value it passes on (a reference or a
+    /// memory flag, from its input's wire).
+    pub pass: BTreeMap<String, String>,
+    /// Output of a reference → the object it refers to, whose app control
+    /// may stream its value.
+    pub refs: BTreeMap<String, String>,
+    /// Output → its constant value.
+    pub consts: BTreeMap<String, f64>,
+    /// Output → the stateless gate that computes it.
+    pub gates: BTreeMap<String, Gate>,
+    /// A lighting controller's Mood output → the controller, whose app
+    /// control streams its active moods.
+    pub moods: BTreeMap<String, String>,
+}
+
+#[derive(Serialize)]
+pub struct Gate {
+    /// `and`, `or`, `xor`, `not`, `eq`, `ne`, `gt`, `ge`, `lt`, `le`, `add`,
+    /// `sub`, `mul`, `div`.
+    pub op: &'static str,
+    pub ins: Vec<GateIn>,
+}
+
+#[derive(Serialize)]
+pub struct GateIn {
+    /// The wire's source, if wired.
+    pub src: Option<String>,
+    /// The parameter value, if not wired.
+    pub def: Option<f64>,
+    /// The input is inverted (wired), or a constant 1 (unwired).
+    pub inv: bool,
 }
 
 #[derive(Serialize, Default)]
@@ -679,6 +720,7 @@ pub fn build(new: &LoxoneDoc, old: Option<&LoxoneDoc>, title: &str) -> View {
         }
     }
 
+    view.live = live_graph(&nc);
     view.tree = tree(&nc, oc.as_ref(), &d);
     if d.on {
         changes(&mut view, &nc, oc.as_ref().unwrap(), &d);
@@ -1311,6 +1353,104 @@ fn short(s: Option<&str>) -> String {
     }
 }
 
+/// The gate op of a block type, and its inputs in order.
+fn gate_of(ty: &str) -> Option<(&'static str, &'static [&'static str])> {
+    const LOGIC: &[&str] = &["I1", "I2", "I3", "I4", "I5", "I6", "I7", "I8"];
+    const TWO: &[&str] = &["Input1", "Input2"];
+    Some(match ty {
+        "And" => ("and", LOGIC),
+        "Or" => ("or", LOGIC),
+        "Xor" => ("xor", LOGIC),
+        "Not" => ("not", &["I"]),
+        "Equal" => ("eq", TWO),
+        "NotEqual" => ("ne", TWO),
+        "Greater" => ("gt", TWO),
+        "GreaterEqual" => ("ge", TWO),
+        "Less" => ("lt", TWO),
+        "LessEqual" => ("le", TWO),
+        "Add" => ("add", TWO),
+        "Sub" => ("sub", TWO),
+        "Mult" => ("mul", TWO),
+        "Div" => ("div", TWO),
+        _ => return None,
+    })
+}
+
+fn live_graph(c: &Ctx) -> LiveGraph {
+    let mut g = LiveGraph::default();
+    for el in c.els.values() {
+        let Some(ty) = el.attr("Type") else {
+            continue;
+        };
+        let ps = ports(el);
+        let by = |k: &str| ps.iter().find(|p| p.key == k);
+        let src = |k: &str| by(k).and_then(|p| p.inputs.first().cloned());
+        let outs = |keys: &[&str]| -> Vec<String> {
+            keys.iter()
+                .filter_map(|k| by(k))
+                .map(|p| p.uuid.clone())
+                .collect()
+        };
+        match ty {
+            // A reference's input is wired from the object it shows.
+            "InputRef" => {
+                let from = src("AI").or_else(|| src("I"));
+                for o in outs(&["AQ", "Q"]) {
+                    if let Some(f) = &from {
+                        g.pass.insert(o.clone(), f.clone());
+                    }
+                    if let Some(r) = el.attr("Ref") {
+                        g.refs.insert(o, r.to_string());
+                    }
+                }
+            }
+            // A memory flag holds what its input is set to.
+            "Memory" => {
+                if let Some(f) = src("Input") {
+                    for o in outs(&["AQ", "Q"]) {
+                        g.pass.insert(o, f.clone());
+                    }
+                }
+            }
+            "LightController2" => {
+                if let (Some(p), Some(u)) = (by("Scene"), el.attr("U")) {
+                    g.moods.insert(p.uuid.clone(), u.to_string());
+                }
+            }
+            "Constant" => {
+                let v = el
+                    .attr("AnalogConstant")
+                    .or_else(|| el.attr("DigitalConstant"))
+                    .and_then(|v| v.parse::<f64>().ok());
+                if let Some(v) = v {
+                    for o in outs(&["AQ", "Q"]) {
+                        g.consts.insert(o, v);
+                    }
+                }
+            }
+            _ => {
+                let Some((op, keys)) = gate_of(ty) else {
+                    continue;
+                };
+                let ins = keys
+                    .iter()
+                    .filter_map(|k| by(k))
+                    .map(|p| GateIn {
+                        src: p.inputs.first().cloned(),
+                        def: p.def.as_deref().and_then(|d| d.parse().ok()),
+                        inv: p.inv,
+                    })
+                    .collect();
+                let out = by("Q").or_else(|| by("AQ"));
+                if let Some(o) = out {
+                    g.gates.insert(o.uuid.clone(), Gate { op, ins });
+                }
+            }
+        }
+    }
+    g
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1351,6 +1491,33 @@ mod tests {
             s = s.replacen(from, to, 1);
         }
         s
+    }
+
+    #[test]
+    fn live_graph_passes_references_on_and_knows_the_gates() {
+        let v = build(&doc(HOUSE), None, "t");
+        let g = &v.live;
+        // The Temperatur reference passes on VirtualIn VI1's output.
+        assert_eq!(
+            g.pass["10000003-0000-0032-01ff504f94000001"],
+            "10000001-0000-0011-00ff504f94000001"
+        );
+        assert_eq!(
+            g.refs["10000003-0000-0032-01ff504f94000001"],
+            "10000001-0000-0010-ffff504f94000001"
+        );
+        let and = &g.gates["10000004-0000-0043-02ff504f94000001"];
+        assert_eq!(and.op, "and");
+        assert_eq!(and.ins.len(), 2);
+        assert_eq!(
+            and.ins[0].src.as_deref(),
+            Some("10000003-0000-0032-01ff504f94000001")
+        );
+        assert!(and.ins[1].src.is_none());
+        assert!(g.moods.is_empty());
+        let div = &g.gates["10000006-0000-0063-02ff504f94000001"];
+        assert_eq!(div.op, "div");
+        assert_eq!(div.ins[1].def, Some(1000.0));
     }
 
     #[test]

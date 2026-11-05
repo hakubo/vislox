@@ -38,9 +38,17 @@ marked so you can review it before you deploy.
 - **Live values** (toggle in the toolbar, or `L`): the Miniserver's current values on the wires, as in
   Loxone Config's Liveview. Digital wires that are on turn green, and analog and text values are written at
   the wire's source and flash when they change. The selected block's states and port values are listed in
-  the sidebar. The Miniserver only streams what the app sees (visualized blocks and the periphery), so
-  wires between pure logic blocks have no value. Those are faded ("Dim wires without a value" in the legend
-  turns this off). Values show on the current, deployed revision only.
+  the sidebar. The Miniserver only streams what the app sees (visualized blocks and the periphery). vislox
+  fills in more:
+  - input references and memory flags carry the value of what feeds them, and constants show their value
+    from the config;
+  - simple stateless gates (AND, OR, XOR, NOT, comparisons, Add, Subtract, Multiply, Divide) are computed
+    from their inputs, and a lighting controller's Mood output from its active mood. Computed values have a
+    dashed outline and say so in the tooltip.
+
+  Blocks with timing or memory (delays, edge detection, Formula, …) and inputs the app does not show stay
+  without a value. Those wires are faded ("Dim wires without a value" in the legend turns this off). Values
+  show on the current, deployed revision only.
 
 Read-only: vislox never writes to the config, and live values only listen: no commands are sent. A pull reads
 from the Miniserver, and lox commits the download to your repository; nothing is sent to the Miniserver.

@@ -118,6 +118,9 @@ try {
     const pill = (t) => page.waitForFunction((t) => [...document.querySelectorAll(".live-pill")].some((n) => n.style.display !== "none" && n.textContent === t), t);
     await pill("21.5");
     assert.ok((await page.$$("#viewport .wire.lv-on")).length >= 1, "the AND gate's wire is on");
+    // The Divide block streams nothing: vislox computes 21.5 / 100 (the edited parameter).
+    await page.click('[data-uuid="10000006-0000-0060-ffff504f94000001"]');
+    await page.waitForFunction(() => [...document.querySelectorAll("#props .lv.computed")].some((n) => /^0\.2\d$/.test(n.textContent)));
     appendFileSync(liveFile, liveLine("Temperatur", "value", "22.25", TEMP));
     await pill("22.25");
     await page.click("#sw-live .track");
