@@ -1,0 +1,592 @@
+//! Changing the config, for a lox.toml project:
+//!
+//! - **AI request**: a prompt from the UI goes to a webhook (an agent that
+//!   edits the project's module with `lox logic` and compiles it). The agent
+//!   reports back on `/api/ai/status` with the request's key. The compiled
+//!   result shows as the pending revision, like any compile.
+//! - **Apply**: `lox config push --force` deploys what is pending (download,
+//!   drift check, upload, program restart, verify), then vislox commits the
+//!   project and pushes it to its git remote.
+//! - **Discard**: put the module, lock and compiled config back to the last
+//!   commit.
+//!
+//! All three need the admin token (`X-Vislox-Token`). vislox itself still
+//! writes no config: lox and git do.
+
+use serde::Serialize;
+use serde_json::{Value, json};
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::Duration;
+use tokio::sync::broadcast;
+
+/// An AI request that has not reported back for this long is given up.
+const REQUEST_TIMEOUT_SECS: i64 = 30 * 60;
+/// `lox config push --force` downloads twice and restarts the program.
+const PUSH_TIMEOUT: Duration = Duration::from_secs(600);
+const GIT_TIMEOUT: Duration = Duration::from_secs(120);
+/// Requests kept for the UI.
+const KEEP: usize = 10;
+
+pub struct Settings {
+    pub token: Option<String>,
+    pub webhook: Option<String>,
+    pub project: Option<PathBuf>,
+    pub lox: PathBuf,
+    /// Where the agent reports back.
+    pub status_url: String,
+}
+
+pub struct Actions {
+    s: Settings,
+    http: reqwest::Client,
+    st: Mutex<St>,
+    /// Apply and Discard run one at a time.
+    busy: tokio::sync::Mutex<()>,
+    tx: broadcast::Sender<()>,
+}
+
+#[derive(Default)]
+struct St {
+    requests: Vec<Req>,
+    /// What Apply or Discard is doing now.
+    running: Option<&'static str>,
+    last: Option<Outcome>,
+}
+
+#[derive(Clone, Serialize)]
+struct Req {
+    id: String,
+    #[serde(skip)]
+    key: String,
+    prompt: String,
+    /// `sent`, `working`, `done`, `failed`, `applied`, `discarded`, `timed out`
+    state: String,
+    summary: Option<String>,
+    /// The agent's thread, if it said.
+    thread: Option<String>,
+    at: i64,
+    updated: i64,
+}
+
+#[derive(Clone, Serialize)]
+struct Outcome {
+    /// `apply` or `discard`
+    kind: &'static str,
+    ok: bool,
+    message: String,
+    at: i64,
+}
+
+/// A refused or failed action: HTTP status and message.
+pub type Refusal = (axum::http::StatusCode, String);
+
+fn now() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+
+fn random_hex(bytes: usize) -> String {
+    let mut b = vec![0u8; bytes];
+    getrandom::getrandom(&mut b).expect("the OS random source");
+    hex::encode(b)
+}
+
+/// Read a one-line secret file (token, webhook URL).
+pub fn read_secret(path: &Path) -> anyhow::Result<String> {
+    let s = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", path.display()))?;
+    let s = s.trim().to_string();
+    anyhow::ensure!(!s.is_empty(), "{} is empty", path.display());
+    Ok(s)
+}
+
+impl Actions {
+    pub fn new(s: Settings) -> Actions {
+        let (tx, _) = broadcast::channel(16);
+        Actions {
+            s,
+            http: reqwest::Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .expect("an HTTP client"),
+            st: Mutex::new(St::default()),
+            busy: tokio::sync::Mutex::new(()),
+            tx,
+        }
+    }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<()> {
+        self.tx.subscribe()
+    }
+
+    fn changed(&self) {
+        let _ = self.tx.send(());
+    }
+
+    fn why_not_apply(&self) -> Option<&'static str> {
+        if self.s.project.is_none() {
+            Some("only for a lox.toml project")
+        } else if self.s.token.is_none() {
+            Some("start vislox with --admin-token-file")
+        } else {
+            None
+        }
+    }
+
+    fn why_not_ai(&self) -> Option<&'static str> {
+        self.why_not_apply().or(self
+            .s
+            .webhook
+            .is_none()
+            .then_some("start vislox with --ai-webhook-file"))
+    }
+
+    /// For `/api/history` and the `actions` event.
+    pub fn info(&self) -> Value {
+        let mut st = self.st.lock().unwrap();
+        expire(&mut st.requests);
+        let flag = |why: Option<&str>| match why {
+            None => json!({ "available": true }),
+            Some(r) => json!({ "available": false, "reason": r }),
+        };
+        json!({
+            "shown": self.s.project.is_some(),
+            "ai": flag(self.why_not_ai()),
+            "apply": flag(self.why_not_apply()),
+            "requests": st.requests.iter().rev().collect::<Vec<_>>(),
+            "running": st.running,
+            "last": st.last,
+        })
+    }
+
+    /// The admin token, from the `X-Vislox-Token` header.
+    pub fn check(&self, headers: &axum::http::HeaderMap) -> Result<(), Refusal> {
+        use axum::http::StatusCode;
+        let Some(want) = &self.s.token else {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "no admin token configured (--admin-token-file)".into(),
+            ));
+        };
+        let got = headers
+            .get("x-vislox-token")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        // Compare without an early exit on the first differing byte.
+        let same = got.len() == want.len()
+            && got
+                .bytes()
+                .zip(want.bytes())
+                .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+                == 0;
+        if same {
+            Ok(())
+        } else {
+            Err((StatusCode::UNAUTHORIZED, "wrong admin token".into()))
+        }
+    }
+
+    /// Send a prompt to the agent's webhook.
+    pub async fn ask(&self, prompt: &str) -> Result<Value, Refusal> {
+        use axum::http::StatusCode;
+        let bad = |m: &str| (StatusCode::CONFLICT, m.to_string());
+        if let Some(why) = self.why_not_ai() {
+            return Err(bad(why));
+        }
+        let prompt = prompt.trim();
+        if prompt.is_empty() {
+            return Err((StatusCode::BAD_REQUEST, "the request is empty".into()));
+        }
+        if prompt.chars().count() > 4000 {
+            return Err((StatusCode::BAD_REQUEST, "the request is too long".into()));
+        }
+        {
+            let mut st = self.st.lock().unwrap();
+            expire(&mut st.requests);
+            if st.requests.iter().any(in_progress) {
+                return Err(bad("an AI request is still in progress"));
+            }
+            if let Some(what) = st.running {
+                return Err(bad(&format!("wait: {what} is running")));
+            }
+        }
+        let id = random_hex(6);
+        let key = random_hex(16);
+        let project = self.s.project.as_ref().unwrap();
+        let body = json!({
+            "id": id,
+            "key": key,
+            "prompt": prompt,
+            "project": project,
+            "status_url": self.s.status_url,
+        });
+        let url = self.s.webhook.as_deref().unwrap();
+        let res = self.http.post(url).json(&body).send().await.map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("cannot reach the AI webhook: {}", e.without_url()),
+            )
+        })?;
+        if !res.status().is_success() {
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                format!("the AI webhook answered {}", res.status()),
+            ));
+        }
+        let req = Req {
+            id: id.clone(),
+            key,
+            prompt: prompt.to_string(),
+            state: "sent".into(),
+            summary: None,
+            thread: None,
+            at: now(),
+            updated: now(),
+        };
+        {
+            let mut st = self.st.lock().unwrap();
+            st.requests.push(req);
+            let n = st.requests.len();
+            if n > KEEP {
+                st.requests.drain(..n - KEEP);
+            }
+        }
+        self.changed();
+        Ok(json!({ "id": id }))
+    }
+
+    /// The agent reports: `working`, `done` or `failed`, with a summary.
+    pub fn report(&self, v: &Value) -> Result<(), Refusal> {
+        use axum::http::StatusCode;
+        let field = |k: &str| v[k].as_str().unwrap_or_default();
+        let state = field("state");
+        if !matches!(state, "working" | "done" | "failed") {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "state must be working, done or failed".into(),
+            ));
+        }
+        let mut st = self.st.lock().unwrap();
+        let Some(r) = st
+            .requests
+            .iter_mut()
+            .find(|r| r.id == field("id") && !r.key.is_empty() && r.key == field("key"))
+        else {
+            return Err((
+                StatusCode::NOT_FOUND,
+                "no such request, or a wrong key".into(),
+            ));
+        };
+        r.state = state.to_string();
+        let clip = |s: &str, n: usize| s.chars().take(n).collect::<String>();
+        if let Some(s) = v["summary"].as_str() {
+            r.summary = Some(clip(s, 4000));
+        }
+        if let Some(t) = v["thread"].as_str() {
+            r.thread = Some(clip(t, 300));
+        }
+        r.updated = now();
+        drop(st);
+        self.changed();
+        Ok(())
+    }
+
+    fn begin(&self, what: &'static str) -> Result<(), Refusal> {
+        use axum::http::StatusCode;
+        if let Some(why) = self.why_not_apply() {
+            return Err((StatusCode::CONFLICT, why.to_string()));
+        }
+        let mut st = self.st.lock().unwrap();
+        expire(&mut st.requests);
+        if st.requests.iter().any(in_progress) {
+            return Err((
+                StatusCode::CONFLICT,
+                "wait until the AI request is done".into(),
+            ));
+        }
+        st.running = Some(what);
+        drop(st);
+        self.changed();
+        Ok(())
+    }
+
+    fn end(&self, kind: &'static str, res: &Result<String, String>, mark: &str) {
+        let mut st = self.st.lock().unwrap();
+        st.running = None;
+        st.last = Some(Outcome {
+            kind,
+            ok: res.is_ok(),
+            message: match res {
+                Ok(m) | Err(m) => m.clone(),
+            },
+            at: now(),
+        });
+        if res.is_ok() {
+            for r in st.requests.iter_mut().filter(|r| r.state == "done") {
+                r.state = mark.to_string();
+                r.updated = now();
+            }
+        }
+        drop(st);
+        self.changed();
+    }
+
+    /// Deploy what is pending, then commit and push.
+    pub async fn apply(&self) -> Result<String, Refusal> {
+        use axum::http::StatusCode;
+        let _one = self
+            .busy
+            .try_lock()
+            .map_err(|_| (StatusCode::CONFLICT, "already running".to_string()))?;
+        self.begin("Apply")?;
+        let res = self.apply_steps().await;
+        self.end("apply", &res, "applied");
+        res.map_err(|e| (StatusCode::BAD_GATEWAY, e))
+    }
+
+    async fn apply_steps(&self) -> Result<String, String> {
+        let dir = self.s.project.as_deref().unwrap();
+        let lox = &self.s.lox;
+        // The commit subject: the change, by name (before the base moves).
+        let p = loxone_config::Project::load(&dir.join("lox.toml"))
+            .map_err(|e| format!("cannot read lox.toml: {e}"))?;
+        let (base, out) = (p.base.to_string_lossy(), p.out.to_string_lossy());
+        let subject = run(
+            lox,
+            &["logic", "diff", "--summary", &base, &out],
+            dir,
+            GIT_TIMEOUT,
+        )
+        .await
+        .ok()
+        .and_then(|o| o.lines().find(|l| !l.trim().is_empty()).map(String::from))
+        .unwrap_or_else(|| "Apply pending changes".into());
+        let prompts: Vec<String> = {
+            let st = self.st.lock().unwrap();
+            st.requests
+                .iter()
+                .filter(|r| r.state == "done")
+                .map(|r| format!("- {}", r.prompt.replace('\n', " ")))
+                .collect()
+        };
+        let pushed = run(lox, &["config", "push", "--force"], dir, PUSH_TIMEOUT)
+            .await
+            .map_err(|e| format!("lox config push failed:\n{e}"))?;
+        let mut report = vec![last_lines(&pushed, 6)];
+        git(dir, &["add", "-A", "."]).await?;
+        let staged = git(dir, &["diff", "--cached", "--quiet"]).await.is_err();
+        if staged {
+            let mut msg = format!("{subject}\n");
+            if !prompts.is_empty() {
+                msg.push_str("\nRequested with AI in vislox:\n");
+                msg.push_str(&prompts.join("\n"));
+                msg.push('\n');
+            }
+            git(dir, &["commit", "-q", "-m", &msg]).await?;
+            report.push(format!("Committed: {subject}"));
+        }
+        match git(dir, &["push", "-q"]).await {
+            Ok(_) => report.push("Pushed to git.".into()),
+            Err(e) => report.push(format!(
+                "Deployed and committed, but git push failed: {}",
+                last_lines(&e, 3)
+            )),
+        }
+        Ok(report.join("\n"))
+    }
+
+    /// Put the module, lock and compiled config back to the last commit.
+    pub async fn discard(&self) -> Result<String, Refusal> {
+        use axum::http::StatusCode;
+        let _one = self
+            .busy
+            .try_lock()
+            .map_err(|_| (StatusCode::CONFLICT, "already running".to_string()))?;
+        self.begin("Discard")?;
+        let res = self.discard_steps().await;
+        self.end("discard", &res, "discarded");
+        res.map_err(|e| (StatusCode::BAD_GATEWAY, e))
+    }
+
+    async fn discard_steps(&self) -> Result<String, String> {
+        let dir = self.s.project.as_deref().unwrap();
+        let p = loxone_config::Project::load(&dir.join("lox.toml"))
+            .map_err(|e| format!("cannot read lox.toml: {e}"))?;
+        let rel = |q: &Path| {
+            q.strip_prefix(&p.root)
+                .unwrap_or(q)
+                .to_string_lossy()
+                .into_owned()
+        };
+        let (module, lock, out) = (rel(&p.module), rel(&p.lock), rel(&p.out));
+        // Only what lox logic writes: the module, the lock and out.
+        for path in [&module, &lock, &out] {
+            if dir.join(path).exists() || tracked(dir, path).await {
+                git(dir, &["checkout", "-q", "HEAD", "--", path]).await?;
+            }
+        }
+        git(dir, &["clean", "-fdq", "--", &module]).await?;
+        Ok("The module, lock and compiled config are back at the last commit.".into())
+    }
+}
+
+fn in_progress(r: &Req) -> bool {
+    matches!(r.state.as_str(), "sent" | "working")
+}
+
+/// Requests that never reported back are given up.
+fn expire(reqs: &mut [Req]) {
+    let t = now();
+    for r in reqs.iter_mut() {
+        if in_progress(r) && t - r.updated > REQUEST_TIMEOUT_SECS {
+            r.state = "timed out".into();
+            r.key.clear();
+        }
+    }
+}
+
+fn last_lines(s: &str, n: usize) -> String {
+    let lines: Vec<&str> = s.lines().filter(|l| !l.trim().is_empty()).collect();
+    lines[lines.len().saturating_sub(n)..].join("\n")
+}
+
+async fn tracked(dir: &Path, path: &str) -> bool {
+    git(dir, &["ls-files", "--error-unmatch", "--", path])
+        .await
+        .is_ok()
+}
+
+async fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
+    run(Path::new("git"), args, dir, GIT_TIMEOUT)
+        .await
+        .map_err(|e| format!("git {}: {e}", args.first().unwrap_or(&"")))
+}
+
+/// Run a command; its output, or its output as the error when it fails.
+async fn run(cmd: &Path, args: &[&str], dir: &Path, limit: Duration) -> Result<String, String> {
+    let mut c = tokio::process::Command::new(cmd);
+    c.args(args)
+        .current_dir(dir)
+        .stdin(std::process::Stdio::null())
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .kill_on_drop(true);
+    let out = tokio::time::timeout(limit, c.output())
+        .await
+        .map_err(|_| format!("took longer than {} s", limit.as_secs()))?
+        .map_err(|e| format!("cannot run {}: {e}", cmd.display()))?;
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    if out.status.success() {
+        Ok(text)
+    } else {
+        Err(if text.trim().is_empty() {
+            format!("exit {}", out.status)
+        } else {
+            text
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderMap;
+
+    fn actions(token: Option<&str>, webhook: Option<&str>, project: Option<&Path>) -> Actions {
+        Actions::new(Settings {
+            token: token.map(String::from),
+            webhook: webhook.map(String::from),
+            project: project.map(Path::to_path_buf),
+            lox: PathBuf::from("lox"),
+            status_url: "http://127.0.0.1:1/api/ai/status".into(),
+        })
+    }
+
+    #[test]
+    fn actions_need_a_project_a_token_and_a_webhook() {
+        let p = Path::new("/tmp");
+        let i = actions(None, None, None).info();
+        assert_eq!(i["shown"], false);
+        assert_eq!(i["apply"]["reason"], "only for a lox.toml project");
+        let i = actions(None, Some("http://x"), Some(p)).info();
+        assert_eq!(i["shown"], true);
+        assert!(
+            i["ai"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("--admin-token-file")
+        );
+        let i = actions(Some("t"), None, Some(p)).info();
+        assert_eq!(i["apply"]["available"], true);
+        assert!(
+            i["ai"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("--ai-webhook-file")
+        );
+        assert_eq!(
+            actions(Some("t"), Some("http://x"), Some(p)).info()["ai"]["available"],
+            true
+        );
+    }
+
+    #[test]
+    fn the_token_must_match() {
+        let a = actions(Some("s3cret"), None, None);
+        let mut h = HeaderMap::new();
+        assert!(a.check(&h).is_err());
+        h.insert("x-vislox-token", "s3cre".parse().unwrap());
+        assert!(a.check(&h).is_err());
+        h.insert("x-vislox-token", "s3cret".parse().unwrap());
+        assert!(a.check(&h).is_ok());
+        assert!(actions(None, None, None).check(&h).is_err());
+    }
+
+    #[test]
+    fn reports_need_the_request_key() {
+        let a = actions(Some("t"), Some("http://x"), Some(Path::new("/tmp")));
+        a.st.lock().unwrap().requests.push(Req {
+            id: "r1".into(),
+            key: "k1".into(),
+            prompt: "p".into(),
+            state: "sent".into(),
+            summary: None,
+            thread: None,
+            at: now(),
+            updated: now(),
+        });
+        let bad = json!({ "id": "r1", "key": "nope", "state": "done" });
+        assert!(a.report(&bad).is_err());
+        let wrong_state = json!({ "id": "r1", "key": "k1", "state": "applied" });
+        assert!(a.report(&wrong_state).is_err());
+        let ok = json!({ "id": "r1", "key": "k1", "state": "done", "summary": "added a block" });
+        a.report(&ok).unwrap();
+        let i = a.info();
+        assert_eq!(i["requests"][0]["state"], "done");
+        assert_eq!(i["requests"][0]["summary"], "added a block");
+        assert!(
+            i["requests"][0].get("key").is_none(),
+            "the key never leaves the server"
+        );
+    }
+
+    #[test]
+    fn requests_that_never_report_time_out() {
+        let mut reqs = vec![Req {
+            id: "r".into(),
+            key: "k".into(),
+            prompt: "p".into(),
+            state: "working".into(),
+            summary: None,
+            thread: None,
+            at: 0,
+            updated: now() - REQUEST_TIMEOUT_SECS - 1,
+        }];
+        expire(&mut reqs);
+        assert_eq!(reqs[0].state, "timed out");
+        assert!(reqs[0].key.is_empty());
+    }
+}

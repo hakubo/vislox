@@ -23,6 +23,8 @@ marked so you can review it before you deploy.
     This is what `lox config push` would apply.
   - *Changed on disk*: snapshots taken while vislox runs, whenever the file changes.
   - *Git commits*: the file's history, e.g. from `lox config pull`.
+  - **Pull from Miniserver** (in a `lox config init` repository): runs `lox config pull`, which downloads the
+    Miniserver's current config and commits it when it changed. The new backup appears at once.
 - **Change review**: added (green), changed (amber), removed (red, dashed ghost) and moved (blue, ghost at
   the old place) blocks. Wires and parameters are marked too: changed values show old → new in the
   properties. The Changes list can be filtered by kind, and clicking an entry jumps to it.
@@ -33,7 +35,29 @@ marked so you can review it before you deploy.
   (`#page=…&sel=…&rev=…`) that reopen the same page, block and revision. The browser's Back button works.
 - **Keyboard**: the tree, tabs and canvas all work from the keyboard; press `?` for the shortcuts.
 
-Read-only: vislox never writes to the config.
+- **Live values** (toggle in the toolbar, or `L`): the Miniserver's current values on the wires, as in
+  Loxone Config's Liveview. Digital wires that are on turn green, and analog and text values are written at
+  the wire's source and flash when they change. The selected block's states and port values are listed in
+  the sidebar. The Miniserver only streams what the app sees (visualized blocks and the periphery). vislox
+  fills in more:
+  - input references and memory flags carry the value of what feeds them, and constants show their value
+    from the config;
+  - simple stateless gates (AND, OR, XOR, NOT, comparisons, Add, Subtract, Multiply, Divide) are computed
+    from their inputs, and a lighting controller's Mood output from its active mood. Computed values have a
+    dashed outline and say so in the tooltip.
+
+  Blocks with timing or memory (delays, edge detection, Formula, …) and inputs the app does not show stay
+  without a value. Those wires are faded ("Dim wires without a value" in the legend turns this off). Values
+  show on the current, deployed revision only.
+
+- **Change with AI, then Apply** (for a `lox.toml` project, when started with an admin token): describe a change
+  in words. vislox sends it to a webhook, where an AI agent edits the project's Lox Logic module with `lox logic`
+  and compiles it. The result shows as the pending revision, so you review it like any compile. **Apply** deploys
+  it with `lox config push --force` (download, drift check, upload, program restart, verify), then commits the
+  project and pushes it to its git remote. **Discard** puts the module back to the last commit.
+
+vislox itself never writes to the config: lox and git do, and only on Pull, Apply and Discard. Live values only
+listen. A pull reads from the Miniserver; only Apply writes to it.
 
 ## Run
 
@@ -47,6 +71,44 @@ vislox ~/loxone-config --serial 504F94AABBCC   # several Miniservers in one repo
 ```
 
 Then open <http://127.0.0.1:7878> (`--listen` changes the address, and `--open` launches the browser).
+
+Live values use the Miniserver connection of `lox` (`lox setup set …`), found the way lox finds it:
+`LOX_CONFIG`, a project's `.lox/config.yaml`, then `~/.lox/config.yaml`. With several contexts, vislox picks
+the one for the Miniserver it shows (a repository's `<serial>` or `192_168_1_77` folder), else the active one.
+
+```bash
+vislox ~/loxone-config --ctx home      # pick a lox context
+vislox ~/loxone-config --no-live       # never connect to the Miniserver
+lox stream -o json --initial --reconnect | vislox ~/loxone-config --live-from -   # values from lox
+vislox config.Loxone --live-from recorded.ndjson   # replay a recording (followed as it grows)
+```
+
+### Change with AI and Apply
+
+For a `lox.toml` project:
+
+```bash
+vislox ~/loxone-config/project --admin-token-file ~/.config/vislox/admin-token \
+       --ai-webhook-file ~/.config/vislox/ai-webhook
+```
+
+- `--admin-token-file`: a file holding a passphrase. The AI box, Apply and Discard ask for it once per browser
+  (`X-Vislox-Token`). Without it they are off; viewing needs no token.
+- `--ai-webhook-file`: a file holding the URL that requests are POSTed to, as JSON: `id`, `key`, `prompt`,
+  `project` and `status_url`. The agent behind it reports back by POSTing `{"id", "key", "state": "working" |
+  "done" | "failed", "summary"}` to `status_url`; the key authorizes only that request. A request that never
+  reports back is given up after 30 minutes.
+- The agent should only edit and compile (`lox logic …`). Deploying is Apply's job, and Apply needs the token.
+- Apply commits with the change summary as the subject (`lox logic diff --summary`) and the AI requests in the
+  body, then runs `git push`, which needs credentials for the project's remote.
+
+The Miniserver connection is opened when a browser turns live values on, and closed shortly after the last
+one turns them off.
+
+**Pull from Miniserver** runs `lox config pull` (the `lox` on `PATH`, or `--lox <path>`), with the same lox
+configuration and context as live values. It is offered only when lox would commit to the repository vislox
+shows, into the folder of the Miniserver vislox shows (`config_repo` and the serial or address in lox's
+configuration). Otherwise the button is greyed out and its tooltip says why. `--no-pull` hides it.
 
 | Input | Click | Shift+click |
 |---|---|---|
@@ -73,6 +135,13 @@ The binary is an `axum` server with the UI embedded (plain JS and SVG, no build 
 - `src/model.rs` turns a revision, plus an optional base, into pages, objects, wires, cross-page links,
   properties and a change list. It uses `loxone_config::diff` and adds its own checks for attributes,
   positions and wires.
+- `src/actions.rs` sends AI requests to the webhook, takes the agent's reports, and runs Apply (`lox config push
+  --force`, `git commit`, `git push`) and Discard (`git checkout` of the module, lock and out).
+- `src/pull.rs` runs `lox config pull` for the Pull button (`POST /api/pull`, which needs an `X-Vislox` header so
+  that no other web page can trigger it), then refreshes the history.
+- `src/live.rs` streams the Miniserver's states with lox's `loxone-client` crate. A wire's source
+  connector has the UUID of the state it carries, so the browser matches values to wires by UUID. Values
+  reach the browser on `/api/live` (server-sent events).
 - File changes are noticed with `notify`. Git is polled every 3 s. Browsers get a server-sent event and
   reload.
 

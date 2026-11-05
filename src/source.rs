@@ -18,6 +18,11 @@ pub struct Source {
     pub proposed: Option<PathBuf>,
     /// Short description for the title bar.
     pub label: String,
+    /// The Miniserver's directory name in a config repository (its serial,
+    /// or its address as `192_168_1_77`), to pick the matching lox context.
+    pub miniserver: Option<String>,
+    /// The project's directory (the one with lox.toml), for a project.
+    pub project: Option<PathBuf>,
 }
 
 impl Source {
@@ -44,6 +49,8 @@ impl Source {
                 current: p.base.clone(),
                 proposed: Some(p.out.clone()),
                 label: format!("project {name}"),
+                miniserver: None,
+                project: Some(p.root.clone()),
             });
         }
 
@@ -55,6 +62,8 @@ impl Source {
                     .unwrap_or_default(),
                 current: path,
                 proposed: None,
+                miniserver: None,
+                project: None,
             });
         }
 
@@ -91,6 +100,8 @@ impl Source {
                     current: file,
                     proposed: None,
                     label: format!("Miniserver {ms}"),
+                    miniserver: Some(ms),
+                    project: None,
                 })
             }
             _ => bail!(
@@ -145,6 +156,10 @@ mod tests {
         assert!(s.current.ends_with("base.Loxone"));
         assert!(s.proposed.as_ref().unwrap().ends_with("out.Loxone"));
         assert!(s.label.starts_with("project "));
+        assert_eq!(
+            s.project.as_deref(),
+            Some(dir.canonicalize().unwrap().as_path())
+        );
     }
 
     #[test]

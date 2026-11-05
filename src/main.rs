@@ -1,8 +1,11 @@
 //! vislox — a read-only, Loxone-Config-style view of the configs `lox` and
 //! `loxone-config` manage, with live reload, history and change review.
 
+mod actions;
 mod history;
+mod live;
 mod model;
+mod pull;
 mod source;
 
 use anyhow::{Context, Result};
@@ -44,6 +47,31 @@ struct Args {
     /// Open the UI in the default browser.
     #[arg(long)]
     open: bool,
+    /// Live values: the lox context (`lox ctx`) of the Miniserver. Default:
+    /// the context for the Miniserver being viewed, else the active one.
+    #[arg(long, value_name = "NAME")]
+    ctx: Option<String>,
+    /// Live values from a file (or `-`: standard input) of
+    /// `lox stream -o json --initial` lines, instead of the Miniserver.
+    #[arg(long, value_name = "FILE")]
+    live_from: Option<PathBuf>,
+    /// No live values: never connect to the Miniserver.
+    #[arg(long, conflicts_with = "live_from")]
+    no_live: bool,
+    /// No "Pull from Miniserver" button.
+    #[arg(long)]
+    no_pull: bool,
+    /// The lox binary that pulls the config (`lox config pull`).
+    #[arg(long, value_name = "PATH", default_value = "lox")]
+    lox: PathBuf,
+    /// For a lox.toml project: a file holding the admin token that the AI
+    /// box, Apply and Discard ask for. Without it they are off.
+    #[arg(long, value_name = "FILE")]
+    admin_token_file: Option<PathBuf>,
+    /// For a lox.toml project: a file holding the webhook URL that AI
+    /// requests are sent to.
+    #[arg(long, value_name = "FILE")]
+    ai_webhook_file: Option<PathBuf>,
 }
 
 struct App {
@@ -51,6 +79,9 @@ struct App {
     history: Mutex<History>,
     views: Mutex<HashMap<(String, String), Arc<String>>>,
     tx: broadcast::Sender<u64>,
+    live: Arc<live::Live>,
+    pull: pull::Pull,
+    actions: actions::Actions,
 }
 
 #[tokio::main]
@@ -65,13 +96,88 @@ async fn main() -> Result<()> {
     if let Some(root) = history.git_root() {
         eprintln!("vislox: history from git repository {}", root.display());
     }
+    let start = src.current.parent().unwrap_or(&args.path).to_path_buf();
+    let found = live::find_miniserver(&start, src.miniserver.as_deref(), args.ctx.as_deref());
+    if let (Some(_), Err(why)) = (&args.ctx, &found) {
+        anyhow::bail!("{why}");
+    }
+    let pull = pull::Pull::new(
+        &args.lox,
+        args.no_pull.then_some("turned off (--no-pull)"),
+        &src,
+        found.as_ref(),
+        &start,
+    );
+    match pull.why_not() {
+        None => eprintln!("vislox: \"Pull from Miniserver\" runs `lox config pull`"),
+        Some(why) if src.miniserver.is_some() => eprintln!("vislox: no pull: {why}"),
+        Some(_) => {}
+    }
+    let (feed, live_source) = if args.no_live {
+        (
+            live::Feed::Off("turned off (--no-live)".into()),
+            String::new(),
+        )
+    } else if let Some(f) = &args.live_from {
+        let name = if f.as_os_str() == "-" {
+            "standard input".to_string()
+        } else {
+            f.display().to_string()
+        };
+        (live::Feed::Ndjson(f.clone()), name)
+    } else {
+        match &found {
+            Ok(f) => {
+                let host = f.conn.host.clone();
+                eprintln!("vislox: live values from {host} (lox config {})", f.from);
+                (live::Feed::Miniserver(Box::new(f.conn.clone())), host)
+            }
+            Err(why) => {
+                eprintln!("vislox: no live values: {why}");
+                (live::Feed::Off(why.clone()), String::new())
+            }
+        }
+    };
     let (tx, _) = broadcast::channel(16);
     let app = Arc::new(App {
         label: src.label.clone(),
         history: Mutex::new(history),
         views: Mutex::new(HashMap::new()),
         tx,
+        live: live::Live::new(feed, live_source),
+        pull,
+        actions: actions::Actions::new(actions::Settings {
+            token: args
+                .admin_token_file
+                .as_deref()
+                .map(actions::read_secret)
+                .transpose()?,
+            webhook: args
+                .ai_webhook_file
+                .as_deref()
+                .map(actions::read_secret)
+                .transpose()?,
+            project: src.project.clone(),
+            lox: args.lox.clone(),
+            status_url: {
+                // The agent runs on this machine.
+                let mut a = args.listen;
+                if a.ip().is_unspecified() {
+                    a.set_ip(std::net::Ipv4Addr::LOCALHOST.into());
+                }
+                format!("http://{a}/api/ai/status")
+            },
+        }),
     });
+    if src.project.is_some() {
+        let i = app.actions.info();
+        for (what, k) in [("AI requests", "ai"), ("Apply", "apply")] {
+            match i[k]["reason"].as_str() {
+                None => eprintln!("vislox: {what} on"),
+                Some(why) => eprintln!("vislox: no {what}: {why}"),
+            }
+        }
+    }
 
     spawn_watcher(app.clone())?;
     // Fallback poll, and the only way to notice new git commits.
@@ -107,6 +213,12 @@ async fn main() -> Result<()> {
         .route("/api/history", get(api_history))
         .route("/api/view", get(api_view))
         .route("/api/events", get(api_events))
+        .route("/api/live", get(api_live))
+        .route("/api/pull", axum::routing::post(api_pull))
+        .route("/api/ai", axum::routing::post(api_ai))
+        .route("/api/ai/status", axum::routing::post(api_ai_status))
+        .route("/api/apply", axum::routing::post(api_apply))
+        .route("/api/discard", axum::routing::post(api_discard))
         .with_state(app)
         .layer(tower_http::compression::CompressionLayer::new());
 
@@ -218,6 +330,9 @@ async fn api_history(State(app): State<Arc<App>>) -> impl IntoResponse {
         "pending": pending,
         "history": hist,
         "error": h.last_error,
+        "live": app.live.info(),
+        "pull": app.pull.info(),
+        "actions": app.actions.info(),
     }))
 }
 
@@ -289,8 +404,133 @@ async fn api_events(
     State(app): State<Arc<App>>,
 ) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
     let rx = app.tx.subscribe();
-    let stream = BroadcastStream::new(rx)
+    let history = BroadcastStream::new(rx)
         .filter_map(|v| v.ok())
         .map(|v| Ok(Event::default().event("history").data(v.to_string())));
+    // AI requests, Apply and Discard: the whole state, on every change.
+    let a = app.clone();
+    let actions = BroadcastStream::new(app.actions.subscribe()).map(move |_| {
+        Ok(Event::default()
+            .event("actions")
+            .data(a.actions.info().to_string()))
+    });
+    Sse::new(history.merge(actions)).keep_alive(KeepAlive::default())
+}
+
+/// Live values for one browser, while it keeps this stream open: `status`,
+/// then a `snapshot` of every value, then `values` as they change.
+async fn api_live(
+    State(app): State<Arc<App>>,
+) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
+    let live = app.live.clone();
+    let (rx, watcher) = live.subscribe();
+    let first = [
+        Event::default().event("status").data(live.status_json()),
+        Event::default()
+            .event("snapshot")
+            .data(live.snapshot_json()),
+    ];
+    let rest = BroadcastStream::new(rx).map(move |m| {
+        let _on = &watcher;
+        match m {
+            Ok(live::Msg::Status) => Event::default().event("status").data(live.status_json()),
+            Ok(live::Msg::Values(v)) => Event::default().event("values").data(v.as_str()),
+            // A new structure, or this browser fell behind: start over.
+            Ok(live::Msg::Snapshot) | Err(_) => Event::default()
+                .event("snapshot")
+                .data(live.snapshot_json()),
+        }
+    });
+    let stream = tokio_stream::iter(first).chain(rest).map(Ok);
     Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+/// Fetch the Miniserver's current config with `lox config pull`, then show
+/// the new revision at once. Needs the `X-Vislox` header, which a page on
+/// another site cannot send without asking first (CORS), so no other site
+/// can start a pull in this browser.
+async fn api_pull(State(app): State<Arc<App>>, headers: axum::http::HeaderMap) -> Response {
+    if !headers.contains_key("x-vislox") {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": "missing X-Vislox header" })),
+        )
+            .into_response();
+    }
+    match app.pull.run().await {
+        Ok(p) => {
+            let a = app.clone();
+            let _ = tokio::task::spawn_blocking(move || refresh(&a)).await;
+            Json(serde_json::json!({ "committed": p.committed })).into_response()
+        }
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({ "error": e })),
+        )
+            .into_response(),
+    }
+}
+
+fn refused((status, msg): actions::Refusal) -> Response {
+    (status, Json(serde_json::json!({ "error": msg }))).into_response()
+}
+
+#[derive(Deserialize)]
+struct AskBody {
+    prompt: String,
+}
+
+/// Send a change request to the AI agent's webhook.
+async fn api_ai(
+    State(app): State<Arc<App>>,
+    headers: axum::http::HeaderMap,
+    Json(b): Json<AskBody>,
+) -> Response {
+    if let Err(r) = app.actions.check(&headers) {
+        return refused(r);
+    }
+    match app.actions.ask(&b.prompt).await {
+        Ok(v) => Json(v).into_response(),
+        Err(r) => refused(r),
+    }
+}
+
+/// The agent reports on a request; authorized by the request's own key.
+async fn api_ai_status(State(app): State<Arc<App>>, Json(v): Json<serde_json::Value>) -> Response {
+    match app.actions.report(&v) {
+        Ok(()) => {
+            let a = app.clone();
+            let _ = tokio::task::spawn_blocking(move || refresh(&a)).await;
+            Json(serde_json::json!({ "ok": true })).into_response()
+        }
+        Err(r) => refused(r),
+    }
+}
+
+/// Deploy the pending changes with `lox config push --force`, commit, push.
+async fn api_apply(State(app): State<Arc<App>>, headers: axum::http::HeaderMap) -> Response {
+    if let Err(r) = app.actions.check(&headers) {
+        return refused(r);
+    }
+    let res = app.actions.apply().await;
+    let a = app.clone();
+    let _ = tokio::task::spawn_blocking(move || refresh(&a)).await;
+    match res {
+        Ok(m) => Json(serde_json::json!({ "message": m })).into_response(),
+        Err(r) => refused(r),
+    }
+}
+
+/// Put the module, lock and compiled config back to the last commit.
+async fn api_discard(State(app): State<Arc<App>>, headers: axum::http::HeaderMap) -> Response {
+    if let Err(r) = app.actions.check(&headers) {
+        return refused(r);
+    }
+    let res = app.actions.discard().await;
+    let a = app.clone();
+    let _ = tokio::task::spawn_blocking(move || refresh(&a)).await;
+    match res {
+        Ok(m) => Json(serde_json::json!({ "message": m })).into_response(),
+        Err(r) => refused(r),
+    }
 }

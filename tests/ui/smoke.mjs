@@ -6,7 +6,7 @@
 // CHROMIUM_PATH picks a browser other than Playwright's own.
 import { chromium } from "playwright";
 import { spawn, execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, copyFileSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, appendFileSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -30,8 +30,32 @@ const edit = (from, to) => writeFileSync(cfg, readFileSync(cfg, "utf8").replace(
 edit('Title="Licht OG"', 'Title="Licht oben"');
 edit('K="Input2" Def="1000"', 'K="Input2" Def="100"');
 
+// Live values as `lox stream -o json --initial` writes them: the fixture's
+// temperature (an analog output) and its AND gate (a digital one).
+const TEMP = "10000003-0000-0032-01ff504f94000001", GATE = "10000004-0000-0043-02ff504f94000001";
+const liveFile = join(mkdtempSync(join(tmpdir(), "vislox-live-")), "stream.ndjson");
+const liveLine = (control, state, value, uuid) => JSON.stringify({ control, state, value, uuid }) + "\n";
+writeFileSync(liveFile, liveLine("Temperatur", "value", "21.5", TEMP) + liveLine("AND", "active", "1", GATE));
+
+// "Pull from Miniserver" runs `lox config pull`. A lox configuration that pulls
+// into this repository, and a stand-in lox that commits a newer config.
+const loxDir = mkdtempSync(join(tmpdir(), "vislox-lox-"));
+const loxConfig = join(loxDir, "config.yaml");
+writeFileSync(loxConfig, `host: 127.0.0.1:9\nuser: u\npass: p\nserial: 504F94000001\nconfig_repo: ${repo}\n`);
+const fakeLox = join(loxDir, "lox");
+writeFileSync(fakeLox, `#!/bin/sh
+[ "$*" = "config pull --quiet" ] || { echo "unexpected: $*" >&2; exit 2; }
+sed -i 's/Title="Temperatur"/Title="Temperatur Wohnen"/' "${cfg}"
+git -C "${repo}" -c user.name=lox -c user.email=lox@example.com commit -qam "[504F94000001] Config backup 2026-11-02 10:00:00 (v2)"
+echo committed
+`);
+chmodSync(fakeLox, 0o755);
+
 const port = 7900 + Math.floor(Math.random() * 90);
-const server = spawn(bin, [repo, "--listen", `127.0.0.1:${port}`], { stdio: ["ignore", "ignore", "pipe"] });
+const server = spawn(bin, [repo, "--listen", `127.0.0.1:${port}`, "--live-from", liveFile, "--lox", fakeLox], {
+  stdio: ["ignore", "ignore", "pipe"],
+  env: { ...process.env, LOX_CONFIG: loxConfig },
+});
 let log = "";
 server.stderr.on("data", (d) => (log += d));
 await new Promise((ok, fail) => {
@@ -88,10 +112,29 @@ try {
     await again.waitForFunction(() => document.querySelector(".ph-t")?.textContent === "Licht oben");
     await again.close();
   });
+  await step("live values go on the wires and follow the stream", async () => {
+    await page.click('.tab:has-text("Erdgeschoss")');
+    await page.click("#sw-live .track");
+    const pill = (t) => page.waitForFunction((t) => [...document.querySelectorAll(".live-pill")].some((n) => n.style.display !== "none" && n.textContent === t), t);
+    await pill("21.5");
+    assert.ok((await page.$$("#viewport .wire.lv-on")).length >= 1, "the AND gate's wire is on");
+    // The Divide block streams nothing: vislox computes 21.5 / 100 (the edited parameter).
+    await page.click('[data-uuid="10000006-0000-0060-ffff504f94000001"]');
+    await page.waitForFunction(() => [...document.querySelectorAll("#props .lv.computed")].some((n) => /^0\.2\d$/.test(n.textContent)));
+    appendFileSync(liveFile, liveLine("Temperatur", "value", "22.25", TEMP));
+    await pill("22.25");
+    await page.click("#sw-live .track");
+    await page.waitForFunction(() => !document.querySelector("#canvas").classList.contains("live"));
+  });
   await step("an edit on disk shows up live", async () => {
     const before = (await page.$$(".hrev")).length;
     edit('Title="Zähler"', 'Title="Stromzähler"');
     await page.waitForFunction((n) => document.querySelectorAll(".hrev").length > n, before, { timeout: 10000 });
+  });
+  await step("pull from the Miniserver commits a new backup and shows it", async () => {
+    await page.click("#btn-pull");
+    await page.waitForFunction(() => /^Pulled/.test(document.querySelector("#pull-msg")?.textContent || ""), null, { timeout: 15000 });
+    await page.waitForFunction(() => [...document.querySelectorAll(".hrev .lbl")].some((n) => n.textContent === "Backup v2"), null, { timeout: 10000 });
   });
   await step("keyboard help opens and closes", async () => {
     await page.focus("#canvas");
