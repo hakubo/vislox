@@ -40,8 +40,9 @@ marked so you can review it before you deploy.
   the wire's source and flash when they change. The selected block's states and port values are listed in
   the sidebar. The Miniserver only streams what the app sees (visualized blocks and the periphery). vislox
   fills in more:
-  - input references and memory flags carry the value of what feeds them, and constants show their value
-    from the config;
+  - input and output references and memory flags carry the value of what feeds them, as do modes and
+    unscaled system variables set through an output reference, and constants show their value from the
+    config;
   - simple stateless gates (AND, OR, XOR, NOT, comparisons, Add, Subtract, Multiply, Divide) are computed
     from their inputs, and a lighting controller's Mood output from its active mood. Computed values have a
     dashed outline and say so in the tooltip.
