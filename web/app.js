@@ -1335,7 +1335,7 @@ async function act(path, body) {
   });
   const j = await r.json().catch(() => ({}));
   if (r.status === 401) try { localStorage.removeItem("vislox.token"); } catch { /* private mode */ }
-  if (!r.ok) throw new Error(j.error || r.statusText);
+  if (!r.ok) { const e = new Error(j.error || r.statusText); e.data = j; throw e; }
   return j;
 }
 /** Re-read the AI / Apply state (it changes outside revisions). */
@@ -1403,7 +1403,27 @@ $("btn-apply").onclick = async () => {
   if (!window.confirm("Deploy the pending changes to the Miniserver?\n\nlox config push uploads the config and restarts the Miniserver's program (a few seconds), " +
     "checks that it runs exactly the compiled config, then vislox commits and pushes to git.")) return;
   aiMsg("");
-  try { await act("/api/apply"); } catch (err) { aiMsg(err.message, true); }
+  // lox refuses some pushes until the user allows them; ask, then retry with that allowed.
+  const opts = {};
+  for (let tries = 0; tries < 3; tries++) {
+    try { await act("/api/apply", opts); return; } catch (err) {
+      const h = err.data?.hints || {};
+      if (h.accept_version && !opts.accept_version && window.confirm(
+        `This config was saved by a newer Loxone Config (version ${h.accept_version}) than the project last compiled with.\n\n` +
+        "Accept that version and apply? Nothing else changes; the project's lockfile records the new version.")) {
+        opts.accept_version = h.accept_version; continue;
+      }
+      if (h.custom_changes && !opts.discard_custom_changes && window.confirm(
+        `The Miniserver holds ${h.custom_changes.length} change(s) that are not in its program file ` +
+        "(made in the app, the web UI or by Loxone Config without saving):\n\n  " + h.custom_changes.join("\n  ") +
+        "\n\nApplying DELETES them. To keep them instead, load the project from the Miniserver in Loxone Config and save it, then apply again." +
+        "\n\nDelete them and apply?")) {
+        opts.discard_custom_changes = true; continue;
+      }
+      aiMsg(err.message, true);
+      return;
+    }
+  }
 };
 $("btn-discard").onclick = async () => {
   if (!window.confirm("Discard the pending changes? The module, lock and compiled config go back to the last commit.")) return;
