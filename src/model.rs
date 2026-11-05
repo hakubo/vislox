@@ -1034,12 +1034,7 @@ fn changes(view: &mut View, nc: &Ctx, oc: &Ctx, d: &Delta) {
             for (n, o, new) in a {
                 v.push(Change {
                     kind: "attr",
-                    text: format!(
-                        "{} · {n}: {} → {}",
-                        nc.title(&u),
-                        short(o.as_deref()),
-                        short(new.as_deref())
-                    ),
+                    text: attr_change_text(&nc.title(&u), &nc.ty(&u), n, o.as_deref(), new.as_deref()),
                     page: page_for(&u),
                     obj: Some(u.clone()),
                 });
@@ -1093,6 +1088,29 @@ fn changes(view: &mut View, nc: &Ctx, oc: &Ctx, d: &Delta) {
         v.push(Change { kind: MOVED, text, page: page_for(&u), obj: Some(u) });
     }
     view.changes = v;
+}
+
+/// One changed attribute, for the change list. Long or multi-line text
+/// (notes, program code) shows the lines that changed, not two cut-off
+/// copies of the same beginning.
+fn attr_change_text(title: &str, ty: &str, name: &str, old: Option<&str>, new: Option<&str>) -> String {
+    let label = if ty == "Text" && name == "Text" { "note" } else { name };
+    let long = |v: Option<&str>| v.is_some_and(|v| v.contains('\n') || v.chars().count() > 40);
+    if !(long(old) || long(new)) {
+        return format!("{title} · {label}: {} → {}", short(old), short(new));
+    }
+    let clean = |v: Option<&str>| v.unwrap_or("").replace('\r', "");
+    let lines: Vec<String> = diff::text_changes(&clean(old), &clean(new))
+        .into_iter()
+        .skip(1)
+        .filter(|l| l.trim() != "+" && l.trim() != "-")
+        .take(4)
+        .collect();
+    if lines.is_empty() {
+        format!("{title} · {label}: whitespace changed")
+    } else {
+        format!("{title} · {label}: {}", lines.join(" · "))
+    }
 }
 
 fn short(s: Option<&str>) -> String {
