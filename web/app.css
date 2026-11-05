@@ -187,9 +187,10 @@ button.chip { cursor: pointer; } button.chip:hover { border-color: var(--brand);
 .hud-zoom button:last-child { border-right: none; font-size: 13px; padding: 0 10px; }
 .hud-zoom button.pct { font-size: 12px; min-width: 52px; color: var(--muted); font-variant-numeric: tabular-nums; }
 .hud-zoom button:hover { background: var(--brand-soft); }
-.legend { left: 50%; transform: translateX(-50%); bottom: 10px; padding: 5px 10px; display: flex; gap: 12px; align-items: center; font-size: 12px; color: var(--muted); }
+.legend { white-space: nowrap; flex-wrap: nowrap; left: 50%; transform: translateX(-50%); bottom: 10px; padding: 5px 10px; display: flex; gap: 12px; align-items: center; font-size: 12px; color: var(--muted); }
 .legend:not(.diff) .diff-only { display: none; }
 .lg-sep { width: 1px; height: 14px; background: var(--line); }
+.lg { display: inline-flex; align-items: center; }
 .lg::before { content: ""; display: inline-block; width: 12px; height: 12px; margin-right: 5px; vertical-align: -2px; border: 2px solid; border-radius: 3px; }
 .lg.w-dig::before, .lg.w-ana::before { height: 0; border-width: 2px 0 0 0; border-radius: 0; width: 16px; vertical-align: 3px; }
 .lg.w-dig::before { border-color: var(--wire-dig); } .lg.w-ana::before { border-color: var(--wire-ana); }
@@ -251,6 +252,16 @@ button.chip { cursor: pointer; } button.chip:hover { border-color: var(--brand);
 .lod-far .port-t, .lod-far .meta-t, .lod-far .sub-t, .lod-far .hdr-t, .lod-far .icon, .lod-far .icon-t, .lod-far .sym,
 .lod-far .xref .t, .lod-far .xref .pg, .lod-far .xref .ic-t, .lod-far .tag text, .lod-far .tag .ic { display: none; }
 
+/* review: fade what did not change */
+.dim-unchanged .blk:not(.d-added):not(.d-changed):not(.d-removed):not(.d-moved):not(.lit),
+.dim-unchanged .tag:not(.d-added):not(.d-changed):not(.d-removed):not(.d-moved):not(.lit),
+.dim-unchanged .xref:not(.d-added):not(.d-removed):not(.lit) { opacity: .3; }
+.dim-unchanged .wire:not(.d-added):not(.d-removed):not(.lit) { opacity: .22; }
+.dim-unchanged .far-t.unch, .dim-unchanged .far-sub.unch { opacity: .45; }
+.far-t.st-added { fill: var(--added); } .far-t.st-removed { fill: var(--removed); text-decoration: line-through; }
+.far-t.st-changed { fill: #8a5200; } .far-t.st-moved { fill: var(--moved); }
+.chg-dim { flex: none; display: flex; align-items: center; gap: 6px; padding: 6px 10px 0; cursor: pointer; color: var(--text); }
+
 /* focus mode: selected block and its neighbours */
 .focus .wire:not(.lit), .focus .xref-wire:not(.lit) { opacity: .15; }
 .focus .blk:not(.lit), .focus .tag:not(.lit), .focus .xref:not(.lit) { opacity: .35; }
@@ -272,8 +283,8 @@ button.chip { cursor: pointer; } button.chip:hover { border-color: var(--brand);
 .marks-on .ghosted .body, .marks-on .ghosted .bar { stroke-dasharray: 6 4; }
 .marks-off .halo, .marks-off .ghost, .marks-off .dbadge, .marks-off .pin-chg, .marks-off .ghost-note { display: none; }
 .marks-off .d-removed, .marks-off .wire.d-removed, .marks-off .xref.d-removed, .marks-off .ghosted { display: none; }
-.ghost { fill: none; stroke: var(--moved); stroke-width: 1.5px; stroke-dasharray: 5 4; vector-effect: non-scaling-stroke; }
-.ghost-line { stroke: var(--moved); stroke-width: 1.2px; stroke-dasharray: 3 3; vector-effect: non-scaling-stroke; }
+.ghost { fill: #1f6fd10a; stroke: var(--moved); stroke-opacity: .45; stroke-width: 1.2px; stroke-dasharray: 4 5; vector-effect: non-scaling-stroke; pointer-events: none; }
+.ghost-line { stroke: var(--moved); stroke-opacity: .4; stroke-width: 1px; stroke-dasharray: 2 4; vector-effect: non-scaling-stroke; }
 .dbadge circle { stroke: #fff; stroke-width: 1.5px; vector-effect: non-scaling-stroke; }
 .dbadge text { fill: #fff; font-weight: 700; font-size: 150px; }
 .cur-change .body, .cur-change .bar { stroke-width: 4px !important; }

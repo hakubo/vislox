@@ -13,7 +13,7 @@ const S = {
   hist: null, view: null, rev: null, base: null, page: null, sel: null,
   follow: true, marks: true, vp: {}, open: new Set(["__pages"]), chgOff: new Set(),
   objPage: new Map(), pageOf: new Map(), loadSeq: 0, onlyChanged: false, chgIdx: -1,
-  closed: new Set(["Advanced"]), treeFocus: null, hash: null, applyingHash: false,
+  closed: new Set(["Advanced"]), dim: true, treeFocus: null, hash: null, applyingHash: false,
 };
 
 // ── helpers ────────────────────────────────────────────────────────────
@@ -345,7 +345,7 @@ function fit() {
   const [x, y, w, h] = pageExtent(p);
   const W = svg.clientWidth, H = svg.clientHeight, pad = 30;
   const k = Math.min((W - 2 * pad) / Math.max(w, 1), (H - 2 * pad) / Math.max(h, 1), 0.12);
-  S.vp[S.page] = { k, x: (W - w * k) / 2 - x * k, y: Math.max(pad, (H - h * k) / 2) - y * k };
+  S.vp[S.page] = { k, x: (W - w * k) / 2 - x * k, y: pad - y * k };
   applyVp();
 }
 function zoomAt(f, cx, cy) {
@@ -410,6 +410,7 @@ function renderPage() {
   const marks = S.marks && !!S.view?.compared;
   svg.classList.toggle("marks-on", marks);
   svg.classList.toggle("marks-off", !marks);
+  svg.classList.toggle("dim-unchanged", marks && S.dim && !!p && p.changes > 0);
   if (!p) { showMsg(S.view && !S.view.pages.length ? "This config has no logic pages." : ""); renderMinimap(); return; }
   showMsg(p.objects.length ? "" : "This page is empty.");
   svg.setAttribute("aria-label", `Logic page ${p.title}: ${plural(p.objects.filter((o) => o.shape !== "tag").length, "block")}. Drag or use the arrow keys to pan, scroll or plus and minus to zoom.`);
@@ -492,15 +493,35 @@ function renderFar() {
     const [x, y, w, h] = o.rect;
     const sw = w * v.k;
     if (sw < 26) continue;
-    const n = Math.floor(sw / 7.2);
+    const n = Math.floor(sw / 7.4);
     const note = o.ty === "Text" ? noteText(o).split("\n").find((l) => l.trim()) : null;
-    const lines = [note || displayTitle(o)];
-    if (!note && o.shape === "large" && h * v.k > 34 && !autoTitle(o.title)) lines.push(prettyType(o.ty));
-    const cy = y + Math.min(h / 2, 900) - ((lines.length - 1) * px) / 2 + px * 0.35;
-    lines.forEach((s, i) => {
-      el("text", { class: i ? "far-sub" : "far-t", x: x + w / 2, y: cy + i * px * 1.15, "text-anchor": "middle", "font-size": i ? px * 0.88 : px }, L.far, clip(s, n));
+    // The name gets up to two lines (three for notes), never cut mid-word if it fits.
+    const room = Math.max(1, Math.floor((h * v.k) / 16));
+    const name = wrapWords(note || displayTitle(o), n, Math.min(note ? 3 : 2, room));
+    const lines = name.map((t) => [t, "far-t"]);
+    if (!note && o.shape === "large" && h * v.k > 16 * (name.length + 1) && !autoTitle(o.title)) lines.push([prettyType(o.ty), "far-sub"]);
+    const cy = y + Math.min(h / 2, 900) - ((lines.length - 1) * px * 1.15) / 2 + px * 0.35;
+    const st = S.marks && S.view.compared && o.status ? " st-" + o.status : " unch";
+    lines.forEach(([t, cls], i) => {
+      el("text", { class: cls + st, x: x + w / 2, y: cy + i * px * 1.15, "text-anchor": "middle", "font-size": cls === "far-sub" ? px * 0.88 : px }, L.far, t);
     });
   }
+}
+
+/** Greedy word wrap into at most `max` lines of `n` characters; the last line ends in … if text is left. */
+function wrapWords(text, n, max) {
+  const words = String(text || "").split(/\s+/).filter(Boolean);
+  const lines = [];
+  for (const w of words) {
+    const last = lines[lines.length - 1];
+    if (last !== undefined && (last + " " + w).length <= n) lines[lines.length - 1] = last + " " + w;
+    else lines.push(w);
+  }
+  if (lines.length <= max) return lines.map((l) => clip(l, n));
+  const out = lines.slice(0, max - 1).map((l) => clip(l, n));
+  const rest = lines.slice(max - 1).join(" ");
+  out.push(rest.length > n ? clip(rest, n) : rest.slice(0, Math.max(1, n - 1)) + "…");
+  return out;
 }
 
 function portName(o, key) { return o?.ports.find((q) => q.key === key)?.name || key; }
@@ -1008,6 +1029,7 @@ function renderChanges() {
   const compact = !v.compared || !v.changes.length;
   $("right").classList.toggle("compact", compact);
   $("chg-nav").classList.toggle("hidden", !v.compared || !v.changes.length);
+  $("chg-dim").classList.toggle("hidden", !v.compared || !v.changes.length);
   if (!v.compared) {
     $("chg-count").textContent = "";
     const only = allRevs().length < 2;
@@ -1175,6 +1197,7 @@ $("chk-changes").onchange = (e) => {
   if (!S.view) return;
   renderLegend(); renderTabs(); renderTree(); renderPage(); renderProps(); applyFocus();
 };
+$("chk-dim").onchange = (e) => { S.dim = e.target.checked; renderPage(); applyFocus(); };
 $("chk-follow").onchange = (e) => { S.follow = e.target.checked; if (S.follow) { S.rev = null; loadHistory(); } writeHash(false); };
 
 window.addEventListener("keydown", (e) => {
