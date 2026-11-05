@@ -76,7 +76,9 @@ impl Source {
             0 => bail!(
                 "`{}` holds no lox.toml, and no <serial>/config.Loxone{}",
                 path.display(),
-                serial.map(|s| format!(" for serial {s}")).unwrap_or_default()
+                serial
+                    .map(|s| format!(" for serial {s}"))
+                    .unwrap_or_default()
             ),
             1 => {
                 let file = found.remove(0);
@@ -110,4 +112,63 @@ pub fn program_xml(bytes: &[u8]) -> Result<Vec<u8>> {
     Ok(loxone_config::archive::program_xml(bytes)
         .map_err(|e| anyhow::anyhow!("{e}"))?
         .into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn a_file_is_watched_as_is() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("my.Loxone");
+        fs::write(&f, "x").unwrap();
+        let s = Source::resolve(&f, None).unwrap();
+        assert_eq!(s.current, f.canonicalize().unwrap());
+        assert!(s.proposed.is_none());
+        assert_eq!(s.label, "my.Loxone");
+    }
+
+    #[test]
+    fn a_project_compares_out_with_base() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        fs::write(dir.join("base.Loxone"), "x").unwrap();
+        fs::create_dir(dir.join("pages")).unwrap();
+        fs::write(
+            dir.join("lox.toml"),
+            "base = \"base.Loxone\"\nmodule = \"pages\"\nout = \"out.Loxone\"\n",
+        )
+        .unwrap();
+        let s = Source::resolve(dir, None).unwrap();
+        assert!(s.current.ends_with("base.Loxone"));
+        assert!(s.proposed.as_ref().unwrap().ends_with("out.Loxone"));
+        assert!(s.label.starts_with("project "));
+    }
+
+    #[test]
+    fn a_config_repository_picks_the_miniserver() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        for serial in ["504F94000001", "504F94000002"] {
+            fs::create_dir(dir.join(serial)).unwrap();
+            fs::write(dir.join(serial).join("config.Loxone"), "x").unwrap();
+        }
+        let err = Source::resolve(dir, None).unwrap_err().to_string();
+        assert!(
+            err.contains("--serial") && err.contains("504F94000001"),
+            "{err}"
+        );
+        let s = Source::resolve(dir, Some("504f94000002")).unwrap();
+        assert!(s.current.ends_with("504F94000002/config.Loxone"));
+        assert_eq!(s.label, "Miniserver 504F94000002");
+        assert!(Source::resolve(dir, Some("FFFF")).is_err());
+    }
+
+    #[test]
+    fn program_xml_passes_plain_xml_through() {
+        let xml = b"<?xml version=\"1.0\"?><ControlList/>";
+        assert_eq!(program_xml(xml).unwrap(), xml);
+    }
 }

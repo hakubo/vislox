@@ -2,3 +2,4 @@
 # Loxone screenshots are copyrighted reference material: keep them local
 /docs/reference/*.png
 /docs/reference/*.jpg
+node_modules/

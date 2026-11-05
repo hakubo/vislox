@@ -1,0 +1,7 @@
+{
+  "name": "vislox-ui-smoke",
+  "private": true,
+  "description": "Browser smoke test for the vislox UI",
+  "scripts": { "test": "node smoke.mjs" },
+  "dependencies": { "playwright": "^1.50.0" }
+}

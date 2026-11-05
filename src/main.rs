@@ -88,10 +88,22 @@ async fn main() -> Result<()> {
     }
 
     let router = Router::new()
-        .route("/", get(|| async { asset("text/html", include_str!("../web/index.html")) }))
-        .route("/app.js", get(|| async { asset("text/javascript", include_str!("../web/app.js")) }))
-        .route("/app.css", get(|| async { asset("text/css", include_str!("../web/app.css")) }))
-        .route("/icon.svg", get(|| async { asset("image/svg+xml", include_str!("../assets/icon.svg")) }))
+        .route(
+            "/",
+            get(|| async { asset("text/html", include_str!("../web/index.html")) }),
+        )
+        .route(
+            "/app.js",
+            get(|| async { asset("text/javascript", include_str!("../web/app.js")) }),
+        )
+        .route(
+            "/app.css",
+            get(|| async { asset("text/css", include_str!("../web/app.css")) }),
+        )
+        .route(
+            "/icon.svg",
+            get(|| async { asset("image/svg+xml", include_str!("../assets/icon.svg")) }),
+        )
         .route("/api/history", get(api_history))
         .route("/api/view", get(api_view))
         .route("/api/events", get(api_events))
@@ -134,7 +146,14 @@ async fn shutdown_signal() {
 }
 
 fn asset(ty: &'static str, body: &'static str) -> Response {
-    ([(header::CONTENT_TYPE, ty), (header::CACHE_CONTROL, "no-cache")], body).into_response()
+    (
+        [
+            (header::CONTENT_TYPE, ty),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        body,
+    )
+        .into_response()
 }
 
 /// Re-read files and git; tell the browsers when something changed.
@@ -155,13 +174,19 @@ fn spawn_watcher(app: Arc<App>) -> Result<()> {
     let paths = app.history.lock().unwrap().paths();
     let (tx, rx) = std::sync::mpsc::channel();
     let mut watcher = notify::recommended_watcher(tx)?;
-    let mut dirs: Vec<PathBuf> = paths.iter().filter_map(|p| p.parent().map(PathBuf::from)).collect();
+    let mut dirs: Vec<PathBuf> = paths
+        .iter()
+        .filter_map(|p| p.parent().map(PathBuf::from))
+        .collect();
     dirs.sort();
     dirs.dedup();
     for d in &dirs {
         watcher.watch(d, RecursiveMode::NonRecursive)?;
     }
-    let names: Vec<_> = paths.iter().filter_map(|p| p.file_name().map(|n| n.to_owned())).collect();
+    let names: Vec<_> = paths
+        .iter()
+        .filter_map(|p| p.file_name().map(|n| n.to_owned()))
+        .collect();
     std::thread::spawn(move || {
         let _watcher = watcher;
         while let Ok(ev) = rx.recv() {
@@ -203,13 +228,23 @@ struct ViewQuery {
 }
 
 async fn api_view(State(app): State<Arc<App>>, Query(q): Query<ViewQuery>) -> Response {
-    let res = tokio::task::spawn_blocking(move || view(&app, &q.rev, q.base.as_deref().filter(|b| !b.is_empty())))
-        .await
-        .map_err(|e| e.to_string())
-        .and_then(|r| r);
+    let res = tokio::task::spawn_blocking(move || {
+        view(&app, &q.rev, q.base.as_deref().filter(|b| !b.is_empty()))
+    })
+    .await
+    .map_err(|e| e.to_string())
+    .and_then(|r| r);
     match res {
-        Ok(body) => ([(header::CONTENT_TYPE, "application/json")], body.to_string()).into_response(),
-        Err(e) => (StatusCode::UNPROCESSABLE_ENTITY, Json(serde_json::json!({ "error": e }))).into_response(),
+        Ok(body) => (
+            [(header::CONTENT_TYPE, "application/json")],
+            body.to_string(),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({ "error": e })),
+        )
+            .into_response(),
     }
 }
 

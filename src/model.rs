@@ -327,7 +327,9 @@ impl<'a> Ctx<'a> {
             uuid: uuid.to_string(),
             title: self.title(uuid),
             ty: self.ty(uuid),
-            iname: self.el(uuid).and_then(|e| e.attr_decoded("IName").map(|t| t.into_owned())),
+            iname: self
+                .el(uuid)
+                .and_then(|e| e.attr_decoded("IName").map(|t| t.into_owned())),
             port: port.map(|p| port_names::name_of(&self.ty(uuid), p).to_string()),
             page_title: page.as_ref().map(|p| self.title(p)),
             path: if page.is_none() {
@@ -349,7 +351,11 @@ impl<'a> Ctx<'a> {
     fn binding(&self, el: &Element, attr: &str) -> Option<String> {
         let io = el.child_elements().find(|c| c.name == "IoData")?;
         let id = io.attr(attr)?;
-        Some(self.el(id).map(|_| self.title(id)).unwrap_or_else(|| id.to_string()))
+        Some(
+            self.el(id)
+                .map(|_| self.title(id))
+                .unwrap_or_else(|| id.to_string()),
+        )
     }
 }
 
@@ -382,8 +388,13 @@ fn fit_written(g: &GeoObject, el: &Element, wired: &HashSet<String>) -> GeoObjec
     let capacity = ((written.h() - base) / ROW).max(1);
     let mut rows_used = 0;
     for side in [Side::Left, Side::Right] {
-        let on_side: Vec<usize> = (0..g.ports.len()).filter(|&i| g.ports[i].side == side).collect();
-        let n_wired = on_side.iter().filter(|&&i| wired.contains(&g.ports[i].uuid)).count() as i64;
+        let on_side: Vec<usize> = (0..g.ports.len())
+            .filter(|&i| g.ports[i].side == side)
+            .collect();
+        let n_wired = on_side
+            .iter()
+            .filter(|&&i| wired.contains(&g.ports[i].uuid))
+            .count() as i64;
         let hide = on_side.len() as i64 > capacity;
         let mut spare = (capacity - n_wired).max(0);
         let mut keep = Vec::new();
@@ -424,7 +435,9 @@ fn attrs_of(el: &Element) -> BTreeMap<String, String> {
         .map(|a| {
             (
                 a.name.clone(),
-                el.attr_decoded(&a.name).map(|v| v.into_owned()).unwrap_or_default(),
+                el.attr_decoded(&a.name)
+                    .map(|v| v.into_owned())
+                    .unwrap_or_default(),
             )
         })
         .collect()
@@ -433,7 +446,14 @@ fn attrs_of(el: &Element) -> BTreeMap<String, String> {
 /// The orthogonal route of a wire, as Loxone Config draws it: out of the
 /// source, across at the midpoint, into the sink; a wire running right to
 /// left loops around.
-fn route(a: (i64, i64), b: (i64, i64), ra: &Layout, rb: &Layout, leaves_right: bool, enters_left: bool) -> Vec<[i64; 2]> {
+fn route(
+    a: (i64, i64),
+    b: (i64, i64),
+    ra: &Layout,
+    rb: &Layout,
+    leaves_right: bool,
+    enters_left: bool,
+) -> Vec<[i64; 2]> {
     const LOOP: i64 = 240;
     let ((x1, y1), (x2, y2)) = (a, b);
     if leaves_right && enters_left && x2 - x1 >= 2 * LOOP {
@@ -447,8 +467,18 @@ fn route(a: (i64, i64), b: (i64, i64), ra: &Layout, rb: &Layout, leaves_right: b
     } else {
         ra.py2.max(rb.py2) + ROW
     };
-    vec![[x1, y1], [out, y1], [out, ym], [into, ym], [into, y2], [x2, y2]]
+    vec![
+        [x1, y1],
+        [out, y1],
+        [out, ym],
+        [into, ym],
+        [into, y2],
+        [x2, y2],
+    ]
 }
+
+/// One changed attribute: (name, old value, new value).
+type AttrDelta = (String, Option<String>, Option<String>);
 
 /// What changed between two documents, keyed for lookups.
 #[derive(Default)]
@@ -460,7 +490,7 @@ struct Delta {
     /// (object, port key) → old Def
     params: HashMap<(String, String), Option<String>>,
     /// object → attr changes (name, old, new)
-    attrs: HashMap<String, Vec<(String, Option<String>, Option<String>)>>,
+    attrs: HashMap<String, Vec<AttrDelta>>,
     moved: HashMap<String, Layout>,
     /// Objects now on another page than before.
     repaged: HashSet<String>,
@@ -527,14 +557,24 @@ fn delta(new: &Ctx, old: &Ctx, d: &DocDiff) -> Delta {
         x.placements.insert(p.object_uuid.clone());
     }
     for w in &d.wires_added {
-        x.wires_added.insert((w.from_port.clone(), w.to_port.clone()));
+        x.wires_added
+            .insert((w.from_port.clone(), w.to_port.clone()));
     }
     for w in &d.wires_removed {
-        x.wires_removed.insert((w.from_port.clone(), w.to_port.clone()));
+        x.wires_removed
+            .insert((w.from_port.clone(), w.to_port.clone()));
     }
     // Wires the semantic diff folds away still show on the page.
-    let nw: HashSet<(String, String)> = new.wires.iter().map(|w| (w.from_port.clone(), w.to_port.clone())).collect();
-    let ow: HashSet<(String, String)> = old.wires.iter().map(|w| (w.from_port.clone(), w.to_port.clone())).collect();
+    let nw: HashSet<(String, String)> = new
+        .wires
+        .iter()
+        .map(|w| (w.from_port.clone(), w.to_port.clone()))
+        .collect();
+    let ow: HashSet<(String, String)> = old
+        .wires
+        .iter()
+        .map(|w| (w.from_port.clone(), w.to_port.clone()))
+        .collect();
     x.wires_added.extend(nw.difference(&ow).cloned());
     x.wires_removed.extend(ow.difference(&nw).cloned());
 
@@ -559,7 +599,10 @@ fn delta(new: &Ctx, old: &Ctx, d: &DocDiff) -> Delta {
         }
         let (np, op): (Vec<PortView>, Vec<PortView>) = (ports(nel), ports(oel));
         for p in &np {
-            let od = op.iter().find(|q| q.key == p.key).and_then(|q| q.def.clone());
+            let od = op
+                .iter()
+                .find(|q| q.key == p.key)
+                .and_then(|q| q.def.clone());
             if od != p.def {
                 x.params.insert((u.clone(), p.key.clone()), od);
             }
@@ -617,12 +660,14 @@ pub fn build(new: &LoxoneDoc, old: Option<&LoxoneDoc>, title: &str) -> View {
 
     // Properties of every object.
     for u in &nc.order {
-        view.objects.insert(u.clone(), obj_info(&nc, oc.as_ref(), u, &d, false));
+        view.objects
+            .insert(u.clone(), obj_info(&nc, oc.as_ref(), u, &d, false));
     }
     if let Some(oc) = &oc {
         for u in &oc.order {
             if !nc.els.contains_key(u) {
-                view.objects.insert(u.clone(), obj_info(oc, None, u, &d, true));
+                view.objects
+                    .insert(u.clone(), obj_info(oc, None, u, &d, true));
             }
         }
     }
@@ -640,7 +685,11 @@ fn page_view(c: &Ctx, old: Option<&Ctx>, uuid: &str, d: &Delta, gone: bool) -> O
     let mut objects = Vec::new();
     // port uuid → (x, y, side, rect)
     let mut port_pos: HashMap<String, ((i64, i64), Side, Layout)> = HashMap::new();
-    let add_obj = |g: &GeoObject, ctx: &Ctx, status: &'static str, objects: &mut Vec<PObj>, port_pos: &mut HashMap<String, ((i64, i64), Side, Layout)>| {
+    let add_obj = |g: &GeoObject,
+                   ctx: &Ctx,
+                   status: &'static str,
+                   objects: &mut Vec<PObj>,
+                   port_pos: &mut HashMap<String, ((i64, i64), Side, Layout)>| {
         let el = ctx.el(&g.uuid);
         let fitted = el.map(|e| fit_written(g, e, &ctx.wired));
         let g = fitted.as_ref().unwrap_or(g);
@@ -650,7 +699,9 @@ fn page_view(c: &Ctx, old: Option<&Ctx>, uuid: &str, d: &Delta, gone: bool) -> O
         let mut pp = Vec::new();
         for (i, p) in g.ports.iter().enumerate() {
             let (x, y) = g.port_point(i);
-            port_pos.entry(p.uuid.clone()).or_insert(((x, y), p.side, g.rect));
+            port_pos
+                .entry(p.uuid.clone())
+                .or_insert(((x, y), p.side, g.rect));
             let pv = defs.get(&p.uuid);
             pp.push(PPort {
                 key: p.key.clone(),
@@ -667,9 +718,7 @@ fn page_view(c: &Ctx, old: Option<&Ctx>, uuid: &str, d: &Delta, gone: bool) -> O
                 },
             });
         }
-        let target = el
-            .and_then(|e| e.attr("Ref"))
-            .map(|r| ctx.target(r, None));
+        let target = el.and_then(|e| e.attr("Ref")).map(|r| ctx.target(r, None));
         let title = match (&target, el.and_then(|e| e.attr("Title"))) {
             (Some(t), None) => t.title.clone(),
             _ => g.title.clone(),
@@ -721,7 +770,11 @@ fn page_view(c: &Ctx, old: Option<&Ctx>, uuid: &str, d: &Delta, gone: bool) -> O
         .filter(|o| o.shape == "tag")
         .map(|o| o.uuid.clone())
         .collect();
-    let mut emit = |w: &WireView, ctx: &Ctx, status: &'static str, wires: &mut Vec<PWire>, labels: &mut Vec<PLabel>| {
+    let mut emit = |w: &WireView,
+                    ctx: &Ctx,
+                    status: &'static str,
+                    wires: &mut Vec<PWire>,
+                    labels: &mut Vec<PLabel>| {
         let a = port_pos.get(&w.from_port);
         let b = port_pos.get(&w.to_port);
         let key = |p: &str| ctx.port_owner.get(p).cloned().unwrap_or_default();
@@ -734,9 +787,27 @@ fn page_view(c: &Ctx, old: Option<&Ctx>, uuid: &str, d: &Delta, gone: bool) -> O
                 }
                 // Orient source (right side) → sink (left side).
                 let (pa, sa, ra, pb, sb, rb, from, to_) = if sa == Side::Left && sb == Side::Right {
-                    (pb, sb, rb, pa, sa, ra, [to.clone(), tk.clone()], [fo.clone(), fk.clone()])
+                    (
+                        pb,
+                        sb,
+                        rb,
+                        pa,
+                        sa,
+                        ra,
+                        [to.clone(), tk.clone()],
+                        [fo.clone(), fk.clone()],
+                    )
                 } else {
-                    (pa, sa, ra, pb, sb, rb, [fo.clone(), fk.clone()], [to.clone(), tk.clone()])
+                    (
+                        pa,
+                        sa,
+                        ra,
+                        pb,
+                        sb,
+                        rb,
+                        [fo.clone(), fk.clone()],
+                        [to.clone(), tk.clone()],
+                    )
                 };
                 wires.push(PWire {
                     points: route(pa, pb, &ra, &rb, sa == Side::Right, sb == Side::Left),
@@ -777,12 +848,18 @@ fn page_view(c: &Ctx, old: Option<&Ctx>, uuid: &str, d: &Delta, gone: bool) -> O
         }
     };
     for w in &c.wires {
-        let status = if gone { REMOVED } else { d.wire(&w.from_port, &w.to_port) };
+        let status = if gone {
+            REMOVED
+        } else {
+            d.wire(&w.from_port, &w.to_port)
+        };
         emit(w, c, status, &mut wires, &mut labels);
     }
     if let Some(oc) = old {
         for w in &oc.wires {
-            if d.wires_removed.contains(&(w.from_port.clone(), w.to_port.clone())) {
+            if d.wires_removed
+                .contains(&(w.from_port.clone(), w.to_port.clone()))
+            {
                 emit(w, oc, REMOVED, &mut wires, &mut labels);
             }
         }
@@ -811,7 +888,11 @@ fn page_view(c: &Ctx, old: Option<&Ctx>, uuid: &str, d: &Delta, gone: bool) -> O
         uuid: uuid.to_string(),
         title: geo.title.clone(),
         old_title,
-        status: if status.is_empty() && changes > 0 { CHANGED } else { status },
+        status: if status.is_empty() && changes > 0 {
+            CHANGED
+        } else {
+            status
+        },
         changes,
         objects,
         wires,
@@ -854,21 +935,35 @@ fn obj_info(c: &Ctx, old: Option<&Ctx>, uuid: &str, d: &Delta, gone: bool) -> Ob
         let mut push = |w: &WireView, ctx: &Ctx, status: &'static str| {
             if w.to_port == p.uuid {
                 if let Some(t) = ctx.port_target(&w.from_port) {
-                    conns.push(Conn { dir: "in", target: t, status });
+                    conns.push(Conn {
+                        dir: "in",
+                        target: t,
+                        status,
+                    });
                 }
-            } else if w.from_port == p.uuid {
-                if let Some(t) = ctx.port_target(&w.to_port) {
-                    conns.push(Conn { dir: "out", target: t, status });
-                }
+            } else if w.from_port == p.uuid
+                && let Some(t) = ctx.port_target(&w.to_port)
+            {
+                conns.push(Conn {
+                    dir: "out",
+                    target: t,
+                    status,
+                });
             }
         };
         for w in &c.wires {
-            let st = if gone { REMOVED } else { d.wire(&w.from_port, &w.to_port) };
+            let st = if gone {
+                REMOVED
+            } else {
+                d.wire(&w.from_port, &w.to_port)
+            };
             push(w, c, st);
         }
         if let Some(oc) = old {
             for w in &oc.wires {
-                if d.wires_removed.contains(&(w.from_port.clone(), w.to_port.clone())) {
+                if d.wires_removed
+                    .contains(&(w.from_port.clone(), w.to_port.clone()))
+                {
                     push(w, oc, REMOVED);
                 }
             }
@@ -903,11 +998,33 @@ fn obj_info(c: &Ctx, old: Option<&Ctx>, uuid: &str, d: &Delta, gone: bool) -> Ob
 }
 
 fn tree(c: &Ctx, old: Option<&Ctx>, d: &Delta) -> Vec<TreeNode> {
-    fn node(c: &Ctx, uuid: &str, d: &Delta, kids: &HashMap<String, Vec<String>>, status: &'static str) -> TreeNode {
+    fn node(
+        c: &Ctx,
+        uuid: &str,
+        d: &Delta,
+        kids: &HashMap<String, Vec<String>>,
+        status: &'static str,
+    ) -> TreeNode {
         let ty = c.ty(uuid);
         let children = kids
             .get(uuid)
-            .map(|v| v.iter().map(|k| node(c, k, d, kids, if status == REMOVED { REMOVED } else { d.status(k) })).collect())
+            .map(|v| {
+                v.iter()
+                    .map(|k| {
+                        node(
+                            c,
+                            k,
+                            d,
+                            kids,
+                            if status == REMOVED {
+                                REMOVED
+                            } else {
+                                d.status(k)
+                            },
+                        )
+                    })
+                    .collect()
+            })
             .unwrap_or_default();
         TreeNode {
             uuid: uuid.to_string(),
@@ -928,8 +1045,15 @@ fn tree(c: &Ctx, old: Option<&Ctx>, d: &Delta) -> Vec<TreeNode> {
         m
     };
     let nk = kids(c);
-    let root: Vec<&String> = c.order.iter().filter(|u| !c.parent.contains_key(*u)).collect();
-    let mut out: Vec<TreeNode> = root.iter().map(|u| node(c, u, d, &nk, d.status(u))).collect();
+    let root: Vec<&String> = c
+        .order
+        .iter()
+        .filter(|u| !c.parent.contains_key(*u))
+        .collect();
+    let mut out: Vec<TreeNode> = root
+        .iter()
+        .map(|u| node(c, u, d, &nk, d.status(u)))
+        .collect();
     // Removed objects under their former parent, where it still exists.
     if let Some(oc) = old {
         let ok = kids(oc);
@@ -973,7 +1097,11 @@ fn changes(view: &mut View, nc: &Ctx, oc: &Ctx, d: &Delta) {
     let page_for = |u: &str| nc.page_of.get(u).or_else(|| oc.page_of.get(u)).cloned();
     let name = |ctx: &Ctx, u: &str| format!("{} ({})", ctx.title(u), ctx.ty(u));
     let sorted = |set: &HashSet<String>, ctx: &Ctx| {
-        let mut x: Vec<String> = set.iter().filter(|u| ctx.els.contains_key(*u)).cloned().collect();
+        let mut x: Vec<String> = set
+            .iter()
+            .filter(|u| ctx.els.contains_key(*u))
+            .cloned()
+            .collect();
         x.sort_by_key(|u| ctx.order.iter().position(|o| o == u));
         x
     };
@@ -983,14 +1111,24 @@ fn changes(view: &mut View, nc: &Ctx, oc: &Ctx, d: &Delta) {
             continue;
         }
         view.stats.added += 1;
-        v.push(Change { kind: ADDED, text: name(nc, &u), page: page_for(&u), obj: Some(u) });
+        v.push(Change {
+            kind: ADDED,
+            text: name(nc, &u),
+            page: page_for(&u),
+            obj: Some(u),
+        });
     }
     for u in sorted(&d.removed, oc) {
         if oc.parent.get(&u).is_some_and(|p| d.removed.contains(p)) {
             continue;
         }
         view.stats.removed += 1;
-        v.push(Change { kind: REMOVED, text: name(oc, &u), page: page_for(&u), obj: Some(u) });
+        v.push(Change {
+            kind: REMOVED,
+            text: name(oc, &u),
+            page: page_for(&u),
+            obj: Some(u),
+        });
     }
     let mut changed: Vec<String> = nc
         .order
@@ -1034,7 +1172,13 @@ fn changes(view: &mut View, nc: &Ctx, oc: &Ctx, d: &Delta) {
             for (n, o, new) in a {
                 v.push(Change {
                     kind: "attr",
-                    text: attr_change_text(&nc.title(&u), &nc.ty(&u), n, o.as_deref(), new.as_deref()),
+                    text: attr_change_text(
+                        &nc.title(&u),
+                        &nc.ty(&u),
+                        n,
+                        o.as_deref(),
+                        new.as_deref(),
+                    ),
                     page: page_for(&u),
                     obj: Some(u.clone()),
                 });
@@ -1060,32 +1204,56 @@ fn changes(view: &mut View, nc: &Ctx, oc: &Ctx, d: &Delta) {
     };
     let wire_page = |ctx: &Ctx, w: &(String, String)| {
         let owner = |p: &str| ctx.port_owner.get(p).map(|(o, _)| o.clone());
-        owner(&w.1).and_then(|o| ctx.page_of.get(&o).cloned())
+        owner(&w.1)
+            .and_then(|o| ctx.page_of.get(&o).cloned())
             .or_else(|| owner(&w.0).and_then(|o| ctx.page_of.get(&o).cloned()))
     };
-    let wire_obj = |ctx: &Ctx, w: &(String, String)| ctx.port_owner.get(&w.1).map(|(o, _)| o.clone());
+    let wire_obj =
+        |ctx: &Ctx, w: &(String, String)| ctx.port_owner.get(&w.1).map(|(o, _)| o.clone());
     let mut wa: Vec<_> = d.wires_added.iter().collect();
     wa.sort();
     for w in wa {
         view.stats.wires_added += 1;
-        v.push(Change { kind: "wire+", text: wire_text(nc, w), page: wire_page(nc, w), obj: wire_obj(nc, w) });
+        v.push(Change {
+            kind: "wire+",
+            text: wire_text(nc, w),
+            page: wire_page(nc, w),
+            obj: wire_obj(nc, w),
+        });
     }
     let mut wr: Vec<_> = d.wires_removed.iter().collect();
     wr.sort();
     for w in wr {
         view.stats.wires_removed += 1;
-        v.push(Change { kind: "wire-", text: wire_text(oc, w), page: wire_page(oc, w), obj: wire_obj(oc, w) });
+        v.push(Change {
+            kind: "wire-",
+            text: wire_text(oc, w),
+            page: wire_page(oc, w),
+            obj: wire_obj(oc, w),
+        });
     }
-    let mut moved: Vec<_> = d.moved.keys().filter(|u| d.status(u) == MOVED).cloned().collect();
+    let mut moved: Vec<_> = d
+        .moved
+        .keys()
+        .filter(|u| d.status(u) == MOVED)
+        .cloned()
+        .collect();
     moved.sort_by_key(|u| nc.order.iter().position(|o| o == u));
     for u in moved {
         view.stats.moved += 1;
         let (from, to) = (oc.page_of.get(&u), nc.page_of.get(&u));
         let text = match (from, to) {
-            (Some(a), Some(b)) if a != b => format!("{} · page {} → {}", nc.title(&u), oc.title(a), nc.title(b)),
+            (Some(a), Some(b)) if a != b => {
+                format!("{} · page {} → {}", nc.title(&u), oc.title(a), nc.title(b))
+            }
             _ => nc.title(&u),
         };
-        v.push(Change { kind: MOVED, text, page: page_for(&u), obj: Some(u) });
+        v.push(Change {
+            kind: MOVED,
+            text,
+            page: page_for(&u),
+            obj: Some(u),
+        });
     }
     view.changes = v;
 }
@@ -1093,8 +1261,18 @@ fn changes(view: &mut View, nc: &Ctx, oc: &Ctx, d: &Delta) {
 /// One changed attribute, for the change list. Long or multi-line text
 /// (notes, program code) shows the lines that changed, not two cut-off
 /// copies of the same beginning.
-fn attr_change_text(title: &str, ty: &str, name: &str, old: Option<&str>, new: Option<&str>) -> String {
-    let label = if ty == "Text" && name == "Text" { "note" } else { name };
+fn attr_change_text(
+    title: &str,
+    ty: &str,
+    name: &str,
+    old: Option<&str>,
+    new: Option<&str>,
+) -> String {
+    let label = if ty == "Text" && name == "Text" {
+        "note"
+    } else {
+        name
+    };
     let long = |v: Option<&str>| v.is_some_and(|v| v.contains('\n') || v.chars().count() > 40);
     if !(long(old) || long(new)) {
         return format!("{title} · {label}: {} → {}", short(old), short(new));
@@ -1118,5 +1296,309 @@ fn short(s: Option<&str>) -> String {
         None => "—".into(),
         Some(s) if s.chars().count() > 40 => format!("{}…", s.chars().take(40).collect::<String>()),
         Some(s) => s.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const HOUSE: &str = include_str!("../tests/fixtures/house.Loxone");
+    const AND: &str = "10000004-0000-0040-ffff504f94000001";
+    const METER: &str = "10000005-0000-0050-ffff504f94000001";
+    const DIV: &str = "10000006-0000-0060-ffff504f94000001";
+    const NOTE: &str = "10000007-0000-0070-ffff504f94000001";
+    const OR: &str = "10000009-0000-0090-ffff504f94000001";
+    const PAGE_EG: &str = "10000002-0000-0020-ffff504f94000001";
+    const PAGE_OG: &str = "10000008-0000-0080-ffff504f94000001";
+
+    fn doc(src: &str) -> LoxoneDoc {
+        LoxoneDoc::parse(src.as_bytes()).expect("fixture parses")
+    }
+
+    fn page<'a>(v: &'a View, uuid: &str) -> &'a Page {
+        v.pages.iter().find(|p| p.uuid == uuid).expect("page")
+    }
+
+    fn obj<'a>(p: &'a Page, uuid: &str) -> &'a PObj {
+        p.objects
+            .iter()
+            .find(|o| o.uuid == uuid && o.moved_to.is_none())
+            .expect("object on page")
+    }
+
+    /// The fixture with each `(from, to)` replacement applied exactly once.
+    fn edited(edits: &[(&str, &str)]) -> String {
+        let mut s = HOUSE.to_string();
+        for (from, to) in edits {
+            assert_eq!(
+                s.matches(from).count(),
+                1,
+                "edit target `{from}` must be unique"
+            );
+            s = s.replacen(from, to, 1);
+        }
+        s
+    }
+
+    #[test]
+    fn plain_view_has_pages_blocks_and_no_marks() {
+        let v = build(&doc(HOUSE), None, "Testhaus");
+        assert_eq!(v.title, "Testhaus");
+        assert!(!v.compared);
+        let titles: Vec<&str> = v.pages.iter().map(|p| p.title.as_str()).collect();
+        assert_eq!(titles, ["Erdgeschoss", "Obergeschoss"]);
+        let eg = page(&v, PAGE_EG);
+        assert_eq!(eg.objects.len(), 5);
+        assert!(eg.objects.iter().all(|o| o.status.is_empty()));
+        assert!(v.changes.is_empty());
+        assert_eq!(eg.wires.len(), 3, "ref→AND, ref→Div, AND→meter");
+    }
+
+    #[test]
+    fn ref_tag_names_what_it_mirrors() {
+        let v = build(&doc(HOUSE), None, "");
+        let tag = obj(page(&v, PAGE_EG), "10000003-0000-0030-ffff504f94000001");
+        assert_eq!(tag.shape, "tag");
+        let t = tag.target.as_ref().expect("ref target");
+        assert_eq!(t.title, "Temperatur");
+        assert_eq!(t.iname.as_deref(), Some("VI1"));
+        assert_eq!(t.page, None, "a virtual input lives in the periphery");
+        assert_eq!(t.path.as_deref(), Some("Virtuelle Eingänge"));
+    }
+
+    #[test]
+    fn wire_to_another_page_becomes_a_link_on_both_pages() {
+        let v = build(&doc(HOUSE), None, "");
+        let out = page(&v, PAGE_EG)
+            .labels
+            .iter()
+            .find(|l| l.obj == AND && l.port == "Q")
+            .expect("link at AND.Q");
+        assert!(!out.incoming);
+        assert_eq!(out.target.uuid, OR);
+        assert_eq!(out.target.page.as_deref(), Some(PAGE_OG));
+        assert_eq!(out.target.page_title.as_deref(), Some("Obergeschoss"));
+
+        let inc = page(&v, PAGE_OG)
+            .labels
+            .iter()
+            .find(|l| l.obj == OR)
+            .expect("link at OR.I1");
+        assert!(inc.incoming);
+        assert_eq!(inc.target.uuid, AND);
+        assert_eq!(inc.target.page.as_deref(), Some(PAGE_EG));
+    }
+
+    #[test]
+    fn blocks_keep_the_size_loxone_saved() {
+        let v = build(&doc(HOUSE), None, "");
+        let eg = page(&v, PAGE_EG);
+        // Saved 1272 high: header plus four rows. Wired Pf stays, unwired outputs fill the rows left.
+        let meter = obj(eg, METER);
+        assert_eq!(meter.rect, [6720, 768, 2688, 1272]);
+        assert!(meter.ports.iter().any(|p| p.key == "Pf"));
+        assert!(meter.ports.iter().filter(|p| p.side == "R").count() <= 4);
+        // Divide is saved at the small block width.
+        let div = obj(eg, DIV);
+        assert_eq!(div.shape, "small");
+        assert_eq!(div.rect[2], 1344);
+        // Ports sit on the block's edges.
+        for p in &div.ports {
+            let edge = if p.side == "L" {
+                div.rect[0]
+            } else {
+                div.rect[0] + div.rect[2]
+            };
+            assert_eq!(p.x, edge, "{} on its edge", p.key);
+        }
+    }
+
+    #[test]
+    fn note_carries_its_text() {
+        let v = build(&doc(HOUSE), None, "");
+        let info = &v.objects[NOTE];
+        assert_eq!(info.ty, "Text");
+        let text = info
+            .attrs
+            .iter()
+            .find(|a| a.name == "Text")
+            .and_then(|a| a.value.as_deref());
+        assert_eq!(text, Some("Erste Zeile\nZweite Zeile"));
+    }
+
+    #[test]
+    fn properties_list_connections_both_ways() {
+        let v = build(&doc(HOUSE), None, "");
+        let and = &v.objects[AND];
+        assert_eq!(and.page.as_deref(), Some(PAGE_EG));
+        let q = and.ports.iter().find(|p| p.key == "Q").expect("Q");
+        let targets: Vec<&str> = q.conns.iter().map(|c| c.target.uuid.as_str()).collect();
+        assert!(targets.contains(&METER) && targets.contains(&OR));
+        assert!(q.conns.iter().all(|c| c.dir == "out"));
+        let div = &v.objects[DIV];
+        let input2 = div
+            .ports
+            .iter()
+            .find(|p| p.key == "Input2")
+            .expect("Input2");
+        assert_eq!(input2.def.as_deref(), Some("1000"));
+    }
+
+    #[test]
+    fn comparing_marks_every_kind_of_change() {
+        let base = doc(HOUSE);
+        let new = doc(&edited(&[
+            // rename
+            ("Title=\"Licht OG\"", "Title=\"Licht oben\""),
+            // parameter
+            ("K=\"Input2\" Def=\"1000\"", "K=\"Input2\" Def=\"100\""),
+            // move
+            (
+                "Title=\"Zähler\" Px=\"6720\" Py=\"768\" Px2=\"9408\"",
+                "Title=\"Zähler\" Px=\"7680\" Py=\"768\" Px2=\"10368\"",
+            ),
+            // note text
+            ("Zweite Zeile\"", "Zweite Zeile\nDritte Zeile\""),
+            // remove the AND → OR wire (OR.I1 left unwired)
+            (
+                "<Co K=\"I1\" Nc=\"1\" U=\"10000009-0000-0091-00ff504f94000001\">\n\t\t\t\t\t<In Input=\"10000004-0000-0043-02ff504f94000001\"/>\n\t\t\t\t</Co>",
+                "<Co K=\"I1\" U=\"10000009-0000-0091-00ff504f94000001\"/>",
+            ),
+        ]));
+        let v = build(&new, Some(&base), "");
+        assert!(v.compared);
+        let kinds: Vec<&str> = v.changes.iter().map(|c| c.kind).collect();
+        for k in ["renamed", "param", "moved", "attr", "wire-"] {
+            assert!(kinds.contains(&k), "missing a `{k}` change in {kinds:?}");
+        }
+        let og = page(&v, PAGE_OG);
+        assert_eq!(obj(og, OR).status, CHANGED);
+        assert_eq!(og.status, CHANGED);
+        assert_eq!(v.objects[OR].old_title.as_deref(), Some("Licht OG"));
+
+        let eg = page(&v, PAGE_EG);
+        assert_eq!(obj(eg, METER).status, MOVED);
+        assert_eq!(obj(eg, METER).old_rect.map(|r| r[0]), Some(6720));
+        let div = obj(eg, DIV);
+        assert_eq!(div.status, CHANGED);
+        assert_eq!(
+            div.ports
+                .iter()
+                .find(|p| p.key == "Input2")
+                .map(|p| p.status),
+            Some(CHANGED)
+        );
+        let param = v.objects[DIV]
+            .ports
+            .iter()
+            .find(|p| p.key == "Input2")
+            .unwrap();
+        assert_eq!(
+            (param.old_def.as_deref(), param.def.as_deref()),
+            (Some("1000"), Some("100"))
+        );
+
+        let note = v.changes.iter().find(|c| c.kind == "attr").unwrap();
+        assert!(
+            note.text.contains("note") && note.text.contains("+ Dritte Zeile"),
+            "{}",
+            note.text
+        );
+
+        // The removed wire still shows, marked, as a link on the page it left.
+        let gone = eg
+            .labels
+            .iter()
+            .find(|l| l.obj == AND && l.status == REMOVED);
+        assert!(gone.is_some(), "removed cross-page link is drawn");
+        assert_eq!(v.stats.wires_removed, 1);
+    }
+
+    #[test]
+    fn removed_and_added_blocks_show_on_their_page() {
+        let base = doc(HOUSE);
+        let div_start = HOUSE.find("\t\t\t<C Type=\"Div\"").unwrap();
+        let div_end = HOUSE[div_start..].find("</C>\n").unwrap() + div_start + "</C>\n".len();
+        let added = "\t\t\t<C Type=\"Or\" V=\"178\" U=\"1000000a-0000-00a0-ffff504f94000001\" Title=\"Neu\" Px=\"960\" Py=\"2880\" Px2=\"2304\" Py2=\"3576\" Nio=\"3\" WF=\"16384\">\n\t\t\t\t<Co K=\"I1\" Nc=\"1\" U=\"1000000a-0000-00a1-00ff504f94000001\">\n\t\t\t\t\t<In Input=\"10000003-0000-0032-01ff504f94000001\"/>\n\t\t\t\t</Co>\n\t\t\t\t<Co K=\"I2\" U=\"1000000a-0000-00a2-01ff504f94000001\"/>\n\t\t\t\t<Co K=\"Q\" U=\"1000000a-0000-00a3-02ff504f94000001\"/>\n\t\t\t</C>\n";
+        let src = format!("{}{}{}", &HOUSE[..div_start], added, &HOUSE[div_end..]);
+        let v = build(&doc(&src), Some(&base), "");
+        let eg = page(&v, PAGE_EG);
+
+        let ghost = eg
+            .objects
+            .iter()
+            .find(|o| o.uuid == DIV)
+            .expect("removed block is drawn");
+        assert_eq!(ghost.status, REMOVED);
+        assert_eq!(v.objects[DIV].status, REMOVED);
+        let new = obj(eg, "1000000a-0000-00a0-ffff504f94000001");
+        assert_eq!(new.status, ADDED);
+        assert!(
+            eg.wires
+                .iter()
+                .any(|w| w.status == ADDED && w.to[0] == new.uuid)
+        );
+        assert!(
+            eg.wires
+                .iter()
+                .any(|w| w.status == REMOVED && w.to[0] == DIV)
+        );
+        assert_eq!((v.stats.added, v.stats.removed), (1, 1));
+    }
+
+    #[test]
+    fn block_moved_to_another_page_leaves_a_pointer_behind() {
+        let base = doc(HOUSE);
+        let div_start = HOUSE.find("\t\t\t<C Type=\"Div\"").unwrap();
+        let div_end = HOUSE[div_start..].find("</C>\n").unwrap() + div_start + "</C>\n".len();
+        let div = &HOUSE[div_start..div_end];
+        let without = format!("{}{}", &HOUSE[..div_start], &HOUSE[div_end..]);
+        let og_at = without.find("\t\t\t<C Type=\"Or\"").unwrap();
+        let src = format!("{}{}{}", &without[..og_at], div, &without[og_at..]);
+        let v = build(&doc(&src), Some(&base), "");
+        let ghost = page(&v, PAGE_EG)
+            .objects
+            .iter()
+            .find(|o| o.uuid == DIV)
+            .expect("ghost");
+        assert_eq!(ghost.status, MOVED);
+        assert_eq!(
+            ghost.moved_to.as_ref().and_then(|t| t.page.as_deref()),
+            Some(PAGE_OG)
+        );
+        assert_eq!(
+            obj(page(&v, PAGE_OG), DIV).old_rect,
+            None,
+            "no ghost box on the new page"
+        );
+        let moved = v.changes.iter().find(|c| c.kind == "moved").unwrap();
+        assert!(
+            moved.text.contains("Erdgeschoss → Obergeschoss"),
+            "{}",
+            moved.text
+        );
+    }
+
+    #[test]
+    fn identical_revisions_have_no_changes() {
+        let v = build(&doc(HOUSE), Some(&doc(HOUSE)), "");
+        assert!(v.compared);
+        assert!(v.changes.is_empty());
+        assert!(
+            v.pages
+                .iter()
+                .all(|p| p.changes == 0 && p.status.is_empty())
+        );
+    }
+
+    #[test]
+    fn attr_change_text_shows_changed_lines() {
+        let t = attr_change_text("Notiz", "Text", "Text", Some("a\nb"), Some("a\nb\nc"));
+        assert_eq!(t, "Notiz · note: + c");
+        let t = attr_change_text("X", "Switch", "Cl", Some("1,2,3"), Some("4,5,6"));
+        assert_eq!(t, "X · Cl: 1,2,3 → 4,5,6");
+        let t = attr_change_text("X", "Text", "Text", Some("a\r\nb"), Some("a\nb"));
+        assert_eq!(t, "X · note: whitespace changed");
     }
 }
