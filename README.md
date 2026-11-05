@@ -55,7 +55,8 @@ marked so you can review it before you deploy.
   in words. vislox sends it to a webhook, where an AI agent edits the project's Lox Logic module with `lox logic`
   and compiles it. The result shows as the pending revision, so you review it like any compile. **Apply** deploys
   it with `lox config push --force` (download, drift check, upload, program restart, verify), then commits the
-  project and pushes it to its git remote. **Discard** puts the module back to the last commit. **Sync from
+  project and pushes it to its git remote. The page you are on goes with the request, and so do blocks you pick
+  (Alt+click on the canvas, or **＋ AI context** in Properties), so the agent knows where to look. **Discard** puts the module back to the last commit. **Sync from
   Miniserver** makes what the Miniserver runs now the project's base (`lox config merge`: changes saved from
   Loxone Config, rules edited in the app), then commits and pushes; it waits until nothing is pending.
 
@@ -98,7 +99,8 @@ vislox ~/loxone-config/project --admin-token-file ~/.config/vislox/admin-token \
 - `--admin-token-file`: a file holding a passphrase. The AI box, Apply and Discard ask for it once per browser
   (`X-Vislox-Token`). Without it they are off; viewing needs no token.
 - `--ai-webhook-file`: a file holding the URL that requests are POSTed to, as JSON: `id`, `key`, `prompt`,
-  `project` and `status_url`. The agent behind it reports back by POSTing `{"id", "key", "state": "working" |
+  `context` (plain lines naming the page on screen and the picked blocks, with their UUIDs), `project` and
+  `status_url`. The agent behind it reports back by POSTing `{"id", "key", "state": "working" |
   "done" | "failed", "summary"}` to `status_url`; the key authorizes only that request. A request that never
   reports back is given up after 30 minutes.
 - The agent should only edit and compile (`lox logic …`). Deploying is Apply's job, and Apply needs the token.

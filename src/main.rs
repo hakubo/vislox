@@ -479,6 +479,8 @@ fn refused((status, msg): actions::Refusal) -> Response {
 #[derive(Deserialize)]
 struct AskBody {
     prompt: String,
+    #[serde(default)]
+    context: actions::AskContext,
 }
 
 /// Send a change request to the AI agent's webhook.
@@ -490,7 +492,7 @@ async fn api_ai(
     if let Err(r) = app.actions.check(&headers) {
         return refused(r);
     }
-    match app.actions.ask(&b.prompt).await {
+    match app.actions.ask(&b.prompt, &b.context).await {
         Ok(v) => Json(v).into_response(),
         Err(r) => refused(r),
     }
