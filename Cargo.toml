@@ -2,16 +2,18 @@
 name = "vislox"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.91"
 description = "Read-only visual viewer for Loxone configs managed by lox / loxone-config, with live reload, history and change review"
 license = "Apache-2.0"
 
 [dependencies]
 loxone-config = { git = "https://github.com/discostu105/lox" }
+loxone-client = { git = "https://github.com/discostu105/lox" }
+serde_yaml = "0.9"
 anyhow = "1"
 axum = "0.8"
 tower-http = { version = "0.6", features = ["compression-gzip"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process", "signal", "io-std", "io-util", "fs"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 futures-util = "0.3"
 notify = "8"

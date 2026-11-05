@@ -33,7 +33,14 @@ marked so you can review it before you deploy.
   (`#page=…&sel=…&rev=…`) that reopen the same page, block and revision. The browser's Back button works.
 - **Keyboard**: the tree, tabs and canvas all work from the keyboard; press `?` for the shortcuts.
 
-Read-only: vislox never writes to the config.
+- **Live values** (toggle in the toolbar, or `L`): the Miniserver's current values on the wires, as in
+  Loxone Config's Liveview. Digital wires that are on turn green, and analog and text values are written at
+  the wire's source and flash when they change. The selected block's states and port values are listed in
+  the sidebar. The Miniserver only streams what the app sees (visualized blocks and the periphery), so
+  wires between pure logic blocks have no value. Those are faded ("Dim wires without a value" in the legend
+  turns this off). Values show on the current, deployed revision only.
+
+Read-only: vislox never writes to the config, and live values only listen: no commands are sent.
 
 ## Run
 
@@ -47,6 +54,20 @@ vislox ~/loxone-config --serial 504F94AABBCC   # several Miniservers in one repo
 ```
 
 Then open <http://127.0.0.1:7878> (`--listen` changes the address, and `--open` launches the browser).
+
+Live values use the Miniserver connection of `lox` (`lox setup set …`), found the way lox finds it:
+`LOX_CONFIG`, a project's `.lox/config.yaml`, then `~/.lox/config.yaml`. With several contexts, vislox picks
+the one for the Miniserver it shows (a repository's `<serial>` or `192_168_1_77` folder), else the active one.
+
+```bash
+vislox ~/loxone-config --ctx home      # pick a lox context
+vislox ~/loxone-config --no-live       # never connect to the Miniserver
+lox stream -o json --initial --reconnect | vislox ~/loxone-config --live-from -   # values from lox
+vislox config.Loxone --live-from recorded.ndjson   # replay a recording (followed as it grows)
+```
+
+The Miniserver connection is opened when a browser turns live values on, and closed shortly after the last
+one turns them off.
 
 | Input | Click | Shift+click |
 |---|---|---|
@@ -73,6 +94,9 @@ The binary is an `axum` server with the UI embedded (plain JS and SVG, no build 
 - `src/model.rs` turns a revision, plus an optional base, into pages, objects, wires, cross-page links,
   properties and a change list. It uses `loxone_config::diff` and adds its own checks for attributes,
   positions and wires.
+- `src/live.rs` streams the Miniserver's states with lox's `loxone-client` crate. A wire's source
+  connector has the UUID of the state it carries, so the browser matches values to wires by UUID. Values
+  reach the browser on `/api/live` (server-sent events).
 - File changes are noticed with `notify`. Git is polled every 3 s. Browsers get a server-sent event and
   reload.
 

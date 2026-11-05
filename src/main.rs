@@ -2,6 +2,7 @@
 //! `loxone-config` manage, with live reload, history and change review.
 
 mod history;
+mod live;
 mod model;
 mod source;
 
@@ -44,6 +45,17 @@ struct Args {
     /// Open the UI in the default browser.
     #[arg(long)]
     open: bool,
+    /// Live values: the lox context (`lox ctx`) of the Miniserver. Default:
+    /// the context for the Miniserver being viewed, else the active one.
+    #[arg(long, value_name = "NAME")]
+    ctx: Option<String>,
+    /// Live values from a file (or `-`: standard input) of
+    /// `lox stream -o json --initial` lines, instead of the Miniserver.
+    #[arg(long, value_name = "FILE")]
+    live_from: Option<PathBuf>,
+    /// No live values: never connect to the Miniserver.
+    #[arg(long, conflicts_with = "live_from")]
+    no_live: bool,
 }
 
 struct App {
@@ -51,6 +63,7 @@ struct App {
     history: Mutex<History>,
     views: Mutex<HashMap<(String, String), Arc<String>>>,
     tx: broadcast::Sender<u64>,
+    live: Arc<live::Live>,
 }
 
 #[tokio::main]
@@ -65,12 +78,42 @@ async fn main() -> Result<()> {
     if let Some(root) = history.git_root() {
         eprintln!("vislox: history from git repository {}", root.display());
     }
+    let (feed, live_source) = if args.no_live {
+        (
+            live::Feed::Off("turned off (--no-live)".into()),
+            String::new(),
+        )
+    } else if let Some(f) = &args.live_from {
+        let name = if f.as_os_str() == "-" {
+            "standard input".to_string()
+        } else {
+            f.display().to_string()
+        };
+        (live::Feed::Ndjson(f.clone()), name)
+    } else {
+        let start = src.current.parent().unwrap_or(&args.path);
+        match live::find_miniserver(start, src.miniserver.as_deref(), args.ctx.as_deref()) {
+            Ok((conn, from)) => {
+                let host = conn.host.clone();
+                eprintln!("vislox: live values from {host} (lox config {from})");
+                (live::Feed::Miniserver(Box::new(conn)), host)
+            }
+            Err(why) => {
+                if args.ctx.is_some() {
+                    anyhow::bail!("{why}");
+                }
+                eprintln!("vislox: no live values: {why}");
+                (live::Feed::Off(why), String::new())
+            }
+        }
+    };
     let (tx, _) = broadcast::channel(16);
     let app = Arc::new(App {
         label: src.label.clone(),
         history: Mutex::new(history),
         views: Mutex::new(HashMap::new()),
         tx,
+        live: live::Live::new(feed, live_source),
     });
 
     spawn_watcher(app.clone())?;
@@ -107,6 +150,7 @@ async fn main() -> Result<()> {
         .route("/api/history", get(api_history))
         .route("/api/view", get(api_view))
         .route("/api/events", get(api_events))
+        .route("/api/live", get(api_live))
         .with_state(app)
         .layer(tower_http::compression::CompressionLayer::new());
 
@@ -218,6 +262,7 @@ async fn api_history(State(app): State<Arc<App>>) -> impl IntoResponse {
         "pending": pending,
         "history": hist,
         "error": h.last_error,
+        "live": app.live.info(),
     }))
 }
 
@@ -292,5 +337,33 @@ async fn api_events(
     let stream = BroadcastStream::new(rx)
         .filter_map(|v| v.ok())
         .map(|v| Ok(Event::default().event("history").data(v.to_string())));
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+/// Live values for one browser, while it keeps this stream open: `status`,
+/// then a `snapshot` of every value, then `values` as they change.
+async fn api_live(
+    State(app): State<Arc<App>>,
+) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
+    let live = app.live.clone();
+    let (rx, watcher) = live.subscribe();
+    let first = [
+        Event::default().event("status").data(live.status_json()),
+        Event::default()
+            .event("snapshot")
+            .data(live.snapshot_json()),
+    ];
+    let rest = BroadcastStream::new(rx).map(move |m| {
+        let _on = &watcher;
+        match m {
+            Ok(live::Msg::Status) => Event::default().event("status").data(live.status_json()),
+            Ok(live::Msg::Values(v)) => Event::default().event("values").data(v.as_str()),
+            // A new structure, or this browser fell behind: start over.
+            Ok(live::Msg::Snapshot) | Err(_) => Event::default()
+                .event("snapshot")
+                .data(live.snapshot_json()),
+        }
+    });
+    let stream = tokio_stream::iter(first).chain(rest).map(Ok);
     Sse::new(stream).keep_alive(KeepAlive::default())
 }

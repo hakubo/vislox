@@ -22,6 +22,10 @@
   --pending: #b86e00;
   --wire-dig: #b3261e;
   --wire-ana: #4b5866;
+  --live-on: #1fa83a;        /* a digital wire that is on */
+  --live-pill: #fffbe3;
+  --live-pill-line: #c9b25a;
+  --live-tick: #ffe27a;      /* a value that just changed */
   --radius: 6px;
   --shadow: 0 1px 2px #0000000f, 0 2px 8px #0000000f;
   font-family: "Segoe UI", system-ui, -apple-system, "Noto Sans", "DejaVu Sans", Arial, sans-serif;
@@ -379,3 +383,30 @@ button.chip { cursor: pointer; } button.chip:hover { border-color: var(--brand);
 .tooltip { position: fixed; z-index: 30; max-width: 380px; background: #1d211d; color: #fff; border-radius: 5px; padding: 6px 9px; box-shadow: var(--shadow); pointer-events: none; font-size: 12px; line-height: 1.4; }
 .tooltip b { font-weight: 700; }
 .tooltip .tm { color: #b9c0b9; }
+
+/* ── live values ───────────────────────────────────── */
+.live-state { display: none; font-size: 11px; color: var(--muted); max-width: 150px; overflow: hidden; text-overflow: ellipsis; }
+.live-state::before { content: ""; display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 4px; background: #bbb; vertical-align: 0; }
+#sw-live.on .live-state { display: inline; }
+.live-state.st-live::before { background: var(--brand); box-shadow: 0 0 0 2px #5cb83f33; }
+.live-state.st-connecting::before { background: var(--changed-dot); }
+.live-state.st-offline::before, .live-state.st-ended::before { background: var(--removed); }
+@media (max-width: 1500px) { .live-state { max-width: 70px; } }
+.legend:not(.live) .live-only { display: none; }
+.lg.w-on::before { height: 0; border-width: 3px 0 0 0; border-radius: 0; width: 16px; vertical-align: 3px; border-color: var(--live-on); }
+.lg-pill { font-size: 11px; padding: 0 5px; border: 1px solid var(--live-pill-line); border-radius: 8px; background: var(--live-pill); color: var(--text); }
+.lg-note { color: var(--changed); }
+.lg-note:empty { display: none; }
+.lg-dim { display: inline-flex; align-items: center; gap: 4px; cursor: pointer; color: var(--text); }
+.live .wire.lv-on, .live .xref-wire.lv-on { stroke: var(--live-on); stroke-width: 3px; }
+.live.live-dim .wire:not(.lv-has):not(.hl), .live.live-dim .xref-wire:not(.lv-has) { opacity: .16; }
+.live-pill rect { fill: var(--live-pill); stroke: var(--live-pill-line); stroke-width: 1px; vector-effect: non-scaling-stroke; }
+.live-pill text { font-size: 104px; fill: var(--text); font-variant-numeric: tabular-nums; }
+.live-pill.tick rect { fill: var(--live-tick); }
+.live-pill { pointer-events: none; }
+.lod-far .live-pill { display: none; }
+.focus .live-pill:not(.lit) { opacity: .25; }
+.pr .lv { font-variant-numeric: tabular-nums; padding: 0 5px; border-radius: 8px; background: var(--live-pill); border: 1px solid var(--live-pill-line); white-space: nowrap; }
+.pr .lv.none { background: none; border-color: transparent; color: var(--faint); padding: 0; }
+.pr .lv.tick { background: var(--live-tick); }
+.pr .lv-of { color: var(--faint); font-size: 11px; margin-left: 6px; }

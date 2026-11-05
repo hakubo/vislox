@@ -18,6 +18,9 @@ pub struct Source {
     pub proposed: Option<PathBuf>,
     /// Short description for the title bar.
     pub label: String,
+    /// The Miniserver's directory name in a config repository (its serial,
+    /// or its address as `192_168_1_77`), to pick the matching lox context.
+    pub miniserver: Option<String>,
 }
 
 impl Source {
@@ -44,6 +47,7 @@ impl Source {
                 current: p.base.clone(),
                 proposed: Some(p.out.clone()),
                 label: format!("project {name}"),
+                miniserver: None,
             });
         }
 
@@ -55,6 +59,7 @@ impl Source {
                     .unwrap_or_default(),
                 current: path,
                 proposed: None,
+                miniserver: None,
             });
         }
 
@@ -91,6 +96,7 @@ impl Source {
                     current: file,
                     proposed: None,
                     label: format!("Miniserver {ms}"),
+                    miniserver: Some(ms),
                 })
             }
             _ => bail!(

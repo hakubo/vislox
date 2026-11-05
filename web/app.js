@@ -14,7 +14,10 @@ const S = {
   follow: true, marks: true, vp: {}, open: new Set(["__pages"]), chgOff: new Set(),
   objPage: new Map(), pageOf: new Map(), loadSeq: 0, onlyChanged: false, chgIdx: -1,
   closed: new Set(["Advanced"]), dim: true, treeFocus: null, hash: null, applyingHash: false,
+  live: { on: pref("live", false), dim: pref("liveDim", true), es: null, status: null, values: new Map(), controls: {} },
 };
+function pref(k, d) { try { const v = localStorage.getItem("vislox." + k); return v === null ? d : v === "1"; } catch { return d; } }
+function setPref(k, v) { try { localStorage.setItem("vislox." + k, v ? "1" : "0"); } catch { /* private mode */ } }
 
 // ── helpers ────────────────────────────────────────────────────────────
 function esc(s) {
@@ -150,6 +153,8 @@ async function loadHistory(fromEvent) {
   if (S.base && !revById(S.base)) { S.base = revById(S.rev)?.base || null; changed = true; }
   renderHistory();
   renderSelects();
+  if (S.live.on && h.live?.available) liveStart();
+  renderLiveSwitch();
   if (fromEvent) {
     setStatus("updated " + new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }), "live flash");
     setTimeout(() => setStatus("live", "live"), 2500);
@@ -422,15 +427,15 @@ function renderPage() {
   el("rect", { class: "sheet", x: sx1, y: sy1, width: sx2 - sx1, height: sy2 - sy1 }, vpG);
   el("rect", { class: "sheet-dots", x: sx1, y: sy1, width: sx2 - sx1, height: sy2 - sy1 }, vpG);
 
-  L = { ghost: el("g", {}, vpG), wires: el("g", {}, vpG), refs: el("g", {}, vpG), objs: el("g", {}, vpG), badges: el("g", {}, vpG), far: el("g", {}, vpG), xrefs: [] };
+  L = { ghost: el("g", {}, vpG), wires: el("g", {}, vpG), refs: el("g", {}, vpG), objs: el("g", {}, vpG), pills: el("g", {}, vpG), badges: el("g", {}, vpG), far: el("g", {}, vpG), xrefs: [] };
   const objByUuid = new Map(p.objects.map((o) => [o.uuid, o]));
 
   for (const w of p.wires) {
     const pts = w.points.map((q) => q.join(",")).join(" ");
-    const line = el("polyline", { class: `wire${w.analog ? " analog" : ""}${w.status ? " d-" + w.status : ""}`, points: pts, "data-f": w.from[0], "data-t": w.to[0] }, L.wires);
+    const line = el("polyline", { class: `wire${w.analog ? " analog" : ""}${w.status ? " d-" + w.status : ""}`, points: pts, "data-f": w.from[0], "data-t": w.to[0], "data-src": w.src }, L.wires);
     const hit = el("polyline", { class: "wire-hit", points: pts }, L.wires);
     const fo = objByUuid.get(w.from[0]), to = objByUuid.get(w.to[0]);
-    hoverTip(hit, () => `<b>${esc(fo ? displayTitle(fo) : "")}</b>.${esc(portName(fo, w.from[1]))} → <b>${esc(to ? displayTitle(to) : "")}</b>.${esc(portName(to, w.to[1]))}<br><span class="tm">${w.analog ? "analog" : "digital"}${w.status ? " · " + w.status : ""}</span>`);
+    hoverTip(hit, () => `<b>${esc(fo ? displayTitle(fo) : "")}</b>.${esc(portName(fo, w.from[1]))} → <b>${esc(to ? displayTitle(to) : "")}</b>.${esc(portName(to, w.to[1]))}<br><span class="tm">${w.analog ? "analog" : "digital"}${w.status ? " · " + w.status : ""}</span>${liveTip(w.src)}`);
     hit.addEventListener("mouseenter", () => line.classList.add("hl"));
     hit.addEventListener("mouseleave", () => line.classList.remove("hl"));
     hit.addEventListener("click", (e) => { e.stopPropagation(); if (!drag?.moved) select(w.to[0]); });
@@ -460,6 +465,8 @@ function renderPage() {
       el("line", { class: "ghost-line ghost", x1: x + w / 2, y1: y + h / 2, x2: o.rect[0] + o.rect[2] / 2, y2: o.rect[1] + o.rect[3] / 2 }, L.ghost);
     }
   }
+  L.live = liveBuild(p);
+  liveApply(null);
   renderMinimap();
   if (!S.vp[S.page]) fit(); else applyVp();
   markCurrentChange();
@@ -656,13 +663,13 @@ function drawXref(parent, l, n) {
   L.xrefs.push({ x: bx, y, text: `${t.port ? t.port + ": " : ""}${autoTitle(t.title) ? prettyType(t.ty) : t.title}`, page: t.page_title || "" });
   const analog = /^A[QI]/.test(l.port) || /^A[QI]/.test(t.port || "");
   const wx = left ? bx + LABEL_W : bx;
-  el("polyline", { class: `xref-wire${analog ? " analog" : ""}${l.status ? " d-" + l.status : ""}`, "data-f": l.obj, points: `${l.x},${l.y} ${(l.x + wx) / 2},${l.y} ${(l.x + wx) / 2},${y} ${wx},${y}` }, g);
+  el("polyline", { class: `xref-wire${analog ? " analog" : ""}${l.status ? " d-" + l.status : ""}`, "data-f": l.obj, "data-src": l.src, points: `${l.x},${l.y} ${(l.x + wx) / 2},${l.y} ${(l.x + wx) / 2},${y} ${wx},${y}` }, g);
   el("rect", { class: "bar", x: bx, y: y - ROW / 2, width: LABEL_W, height: ROW, rx: 30 }, g);
   el("text", { class: "ic-t", x: bx + 90, y: y + 38, "text-anchor": "middle" }, g, l.incoming ? "⇥" : "↦");
   el("text", { class: "t", x: bx + 190, y: y + 36 }, g, clip(`${t.port ? t.port + ": " : ""}${autoTitle(t.title) ? prettyType(t.ty) : t.title}`, 22));
   el("text", { class: "pg", x: bx + LABEL_W - 60, y: y + 34, "text-anchor": "end" }, g, clip(t.page_title ? "↗ " + t.page_title : t.path ? "⌂ " + (t.path.split(" / ").pop() || "") : "", 12));
   g.addEventListener("click", (e) => { e.stopPropagation(); if (!drag?.moved) followTarget(t); });
-  hoverTip(g, () => `${l.incoming ? "Comes from" : "Goes to"} <b>${esc(t.title)}</b>${t.port ? "." + esc(t.port) : ""} <span class="tm">${esc(prettyType(t.ty))}</span><br>${t.page_title ? `on page “${esc(t.page_title)}” — click to go there` : t.path ? `in ${esc(t.path)} — click to select` : ""}${l.status ? `<br><i>${l.status}</i>` : ""}`);
+  hoverTip(g, () => `${l.incoming ? "Comes from" : "Goes to"} <b>${esc(t.title)}</b>${t.port ? "." + esc(t.port) : ""} <span class="tm">${esc(prettyType(t.ty))}</span><br>${t.page_title ? `on page “${esc(t.page_title)}” — click to go there` : t.path ? `in ${esc(t.path)} — click to select` : ""}${l.status ? `<br><i>${l.status}</i>` : ""}${liveTip(l.src)}`);
 }
 
 function drawBadge(parent, o) {
@@ -762,6 +769,7 @@ function applyFocus() {
   });
   vpG.querySelectorAll(".xref").forEach((x) => { if (x.dataset.obj === sel) { x.classList.add("lit"); x.querySelector(".xref-wire")?.classList.add("lit"); } });
   for (const u of lit) vpG.querySelectorAll(`[data-uuid="${CSS.escape(u)}"]`).forEach((n) => n.classList.add("lit"));
+  vpG.querySelectorAll(".live-pill").forEach((n) => { if (lit.has(n.dataset.f)) n.classList.add("lit"); });
 }
 
 function linkTarget(t) {
@@ -786,6 +794,18 @@ function renderProps() {
   const section = (name, rows, count) => { if (rows.length) sections.push({ name, rows, count }); };
   const row = (k, v, cls) => `<div class="pr ${cls || ""}"><div class="k">${esc(k)}</div><div class="v">${v}</div></div>`;
 
+  if (liveHere()) {
+    const rows = [];
+    const ctl = S.live.controls[o.uuid];
+    for (const [name, su] of Object.entries(ctl?.states || {})) rows.push(row(name, lvSpan(su)));
+    for (const q of o.ports) {
+      const inc = q.conns.find((c) => c.dir === "in");
+      const src = inc ? inc.src : q.uuid;
+      if (!inc && !q.conns.length && !S.live.values.has(q.uuid)) continue;
+      rows.push(row(q.name, lvSpan(src) + `<span class="lv-of">${inc ? "in" : "out"}</span>`));
+    }
+    section("Live values", rows.length ? rows : [`<div class="empty">The Miniserver sends no values for this block.</div>`], rows.length);
+  }
   const note = o.ty === "Text" ? o.attrs.find((a) => a.name === "Text") : null;
   if (note) section("Note", [`<div class="note-p${marks && note.changed ? " pr-chg" : ""}">${marks && note.changed ? chg(note.old, note.value, true) : esc(note.value || "")}</div>`]);
   const params = o.ports.filter((q) => q.def != null || q.def_changed || q.inv)
@@ -1197,6 +1217,9 @@ $("chk-changes").onchange = (e) => {
   if (!S.view) return;
   renderLegend(); renderTabs(); renderTree(); renderPage(); renderProps(); applyFocus();
 };
+$("chk-live").onchange = (e) => setLive(e.target.checked);
+$("chk-live-dim").checked = S.live.dim;
+$("chk-live-dim").onchange = (e) => { S.live.dim = e.target.checked; setPref("liveDim", S.live.dim); renderLiveSwitch(); };
 $("chk-dim").onchange = (e) => { S.dim = e.target.checked; renderPage(); applyFocus(); };
 $("chk-follow").onchange = (e) => { S.follow = e.target.checked; if (S.follow) { S.rev = null; loadHistory(); } writeHash(false); };
 
@@ -1222,6 +1245,7 @@ window.addEventListener("keydown", (e) => {
     case "]": case "n": gotoChange(S.chgIdx + 1); break;
     case "[": case "p": gotoChange(S.chgIdx < 0 ? -1 : S.chgIdx - 1); break;
     case "?": openHelp(); break;
+    case "l": case "L": if (S.hist?.live?.available) setLive(!S.live.on); break;
     case "/": openPalette(""); break;
     case "Escape": select(null, { noReveal: true }); break;
     case "ArrowLeft": if (inTree || inTabs) return; pan(step, 0); break;
@@ -1245,6 +1269,175 @@ for (const [sid, a, b] of [["split-left", "tree-pane", "props-pane"], ["split-ri
     window.addEventListener("mousemove", mv);
     window.addEventListener("mouseup", up);
   });
+}
+
+// ── live values ────────────────────────────────────────────────────────
+// The Miniserver streams a value per state UUID; a wire's source connector
+// has the UUID of the state it carries. Logic blocks the app does not see
+// stream nothing, so their wires have no value.
+
+/** Live values belong to what runs on the Miniserver: the current, deployed revision. */
+function liveHere() {
+  const r = revById(S.rev);
+  return S.live.on && !!S.live.es && !!r && !!r.current && r.kind !== "pending";
+}
+function liveVal(uuid) { return liveHere() ? S.live.values.get(uuid) : undefined; }
+/** `[value, text in the control's format, "Control · state"]` → what to show. */
+function liveText(e) {
+  const [v, t] = e;
+  if (t) return t;
+  if (typeof v === "number") return String(Number.isInteger(v) ? v : +v.toFixed(2));
+  return String(v ?? "");
+}
+function liveOn(e) { const v = e[0]; return typeof v === "number" ? v !== 0 : !!v && v !== "0"; }
+function liveTip(src) {
+  if (!liveHere()) return "";
+  const e = S.live.values.get(src);
+  return e ? `<br>value <b>${esc(liveText(e))}</b>${e[2] ? ` <span class="tm">${esc(e[2])}</span>` : ""}` : `<br><span class="tm">no live value</span>`;
+}
+function lvSpan(u) {
+  const e = liveVal(u);
+  return `<span class="lv${e ? "" : " none"}" data-lv="${esc(u)}"${e?.[2] ? ` title="${esc(e[2])}"` : ""}>${e ? esc(clip(liveText(e), 40)) : "no value"}</span>`;
+}
+
+function renderLiveSwitch() {
+  const info = S.hist?.live || { available: false, reason: "" };
+  const sw = $("sw-live"), chk = $("chk-live");
+  const on = info.available && S.live.on;
+  chk.disabled = !info.available;
+  chk.checked = on;
+  sw.classList.toggle("disabled", !info.available);
+  sw.classList.toggle("on", on);
+  sw.title = info.available ? `Show the current values from ${info.source} on the wires (L)` : `No live values: ${info.reason}`;
+  const here = liveHere();
+  const st = S.live.status || { state: "connecting" };
+  const ls = $("live-state");
+  ls.textContent = !here ? "other revision" : { live: "", connecting: "connecting…", idle: "connecting…", offline: "offline", ended: "input ended", off: "off" }[st.state] ?? st.state;
+  ls.className = "live-state st-" + (here ? st.state : "elsewhere");
+  ls.title = [st.detail, info.source && `from ${info.source}`].filter(Boolean).join("\n");
+  $("legend").classList.toggle("live", on);
+  $("live-note").textContent = on && !here ? "Live values show on the current, deployed revision only" : "";
+  svg.classList.toggle("live", here);
+  svg.classList.toggle("live-dim", here && S.live.dim);
+}
+
+function liveStart() {
+  if (S.live.es) return;
+  const es = new EventSource("/api/live");
+  S.live.es = es;
+  S.live.status = { state: "connecting" };
+  es.addEventListener("status", (e) => { S.live.status = JSON.parse(e.data); renderLiveSwitch(); });
+  es.addEventListener("snapshot", (e) => {
+    const d = JSON.parse(e.data);
+    S.live.values = new Map(Object.entries(d.values));
+    S.live.controls = d.controls || {};
+    liveQueue(null);
+  });
+  es.addEventListener("values", (e) => {
+    const d = JSON.parse(e.data);
+    for (const k in d) S.live.values.set(k, d[k]);
+    liveQueue(Object.keys(d));
+  });
+  es.onerror = () => {
+    if (es.readyState === EventSource.OPEN) return;
+    S.live.status = { state: "offline", detail: "vislox is not reachable; retrying" };
+    renderLiveSwitch();
+  };
+}
+function liveStop() {
+  S.live.es?.close();
+  S.live.es = null;
+  S.live.status = null;
+  S.live.values = new Map();
+  S.live.controls = {};
+  liveQueue(null);
+}
+function setLive(on) {
+  S.live.on = on;
+  setPref("live", on);
+  if (on) liveStart(); else liveStop();
+  renderLiveSwitch();
+}
+
+/** Repaint changed values once per frame; `null`: everything. */
+let livePending = new Set(), liveAll = false, liveRaf = 0;
+function liveQueue(keys) {
+  if (keys) keys.forEach((k) => livePending.add(k)); else liveAll = true;
+  if (!liveRaf) liveRaf = requestAnimationFrame(() => {
+    liveRaf = 0;
+    const ch = liveAll ? null : livePending;
+    liveAll = false; livePending = new Set();
+    liveApply(ch);
+    if (!ch && S.sel) renderProps();
+  });
+}
+
+/** Index the page by source connector: its wires, and where its value is written. */
+function liveBuild(p) {
+  const idx = new Map();
+  const get = (src) => {
+    let it = idx.get(src);
+    if (!it) idx.set(src, (it = { lines: [], pills: [], analog: false, seen: new Set() }));
+    return it;
+  };
+  vpG.querySelectorAll("[data-src]").forEach((n) => {
+    const it = get(n.dataset.src);
+    it.lines.push(n);
+    if (n.classList.contains("analog")) it.analog = true;
+  });
+  const pill = (src, x, y, end, owner) => {
+    const it = get(src), key = `${Math.round(x / 50)}|${Math.round(y / 50)}`;
+    if (it.seen.has(key)) return;
+    it.seen.add(key);
+    const g = el("g", { class: "live-pill", "data-f": owner }, L.pills);
+    g.style.display = "none";
+    const r = el("rect", { y: y - 190, height: 150, rx: 75 }, g);
+    const t = el("text", { y: y - 79 }, g);
+    it.pills.push({ g, r, t, x: end ? x - 150 : x + 150, end });
+  };
+  for (const w of p.wires) pill(w.src, w.points[0][0], w.points[0][1], false, w.from[0]);
+  for (const l of p.labels) pill(l.src, l.x, l.y, l.side === "L", l.obj);
+  return idx;
+}
+
+function liveApply(ch) {
+  renderLiveSwitch();
+  for (const [src, it] of L.live || []) {
+    if (ch && !ch.has(src)) continue;
+    const e = liveVal(src);
+    for (const n of it.lines) {
+      n.classList.toggle("lv-has", !!e);
+      n.classList.toggle("lv-on", !!e && !n.classList.contains("analog") && liveOn(e));
+    }
+    const show = !!e && (it.analog || typeof e[0] === "string");
+    const txt = show ? clip(liveText(e), 18) : "";
+    for (const pl of it.pills) {
+      pl.g.style.display = show ? "" : "none";
+      if (!show) continue;
+      if (pl.t.textContent !== txt) {
+        pl.t.textContent = txt;
+        const w = txt.length * 58 + 100, x = pl.end ? pl.x - w : pl.x;
+        pl.r.setAttribute("x", x); pl.r.setAttribute("width", w);
+        pl.t.setAttribute("x", x + 50);
+      }
+      if (ch) flash(pl.g);
+    }
+  }
+  $("props").querySelectorAll("[data-lv]").forEach((n) => {
+    if (ch && !ch.has(n.dataset.lv)) return;
+    const e = liveVal(n.dataset.lv);
+    n.textContent = e ? clip(liveText(e), 40) : "no value";
+    n.classList.toggle("none", !e);
+    if (e?.[2]) n.title = e[2];
+    if (ch && e) flash(n);
+  });
+}
+function flash(n) {
+  n.classList.remove("tick");
+  void n.getBoundingClientRect();
+  n.classList.add("tick");
+  clearTimeout(n._tick);
+  n._tick = setTimeout(() => n.classList.remove("tick"), 700);
 }
 
 // ── live updates ───────────────────────────────────────────────────────

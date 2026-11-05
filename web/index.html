@@ -29,6 +29,10 @@
   <label class="switch" id="sw-changes" title="Colour what changed against the compared revision">
     <input type="checkbox" id="chk-changes" checked><span class="track" aria-hidden="true"></span><span class="lbl"><span class="long">Mark changes</span><span class="short">Changes</span></span>
   </label>
+  <label class="switch" id="sw-live" title="Show the Miniserver's current values on the wires">
+    <input type="checkbox" id="chk-live"><span class="track" aria-hidden="true"></span><span class="lbl"><span class="long">Live values</span><span class="short">Live</span></span>
+    <span class="live-state" id="live-state" aria-live="polite"></span>
+  </label>
   <label class="switch" title="Jump to each new revision as it appears">
     <input type="checkbox" id="chk-follow" checked><span class="track" aria-hidden="true"></span><span class="lbl"><span class="long">Follow latest</span><span class="short">Follow</span></span>
   </label>
@@ -73,6 +77,9 @@
         <span class="lg w-dig">digital</span><span class="lg w-ana">analog</span>
         <span class="lg-sep diff-only"></span>
         <span class="lg added diff-only">added</span><span class="lg changed diff-only">changed</span><span class="lg removed diff-only">removed</span><span class="lg moved diff-only">moved</span>
+        <span class="lg-sep live-only"></span>
+        <span class="lg w-on live-only">on</span><span class="lg-pill live-only">21.5°</span><span class="lg-note live-only" id="live-note"></span>
+        <label class="lg-dim live-only" title="Fade wires the Miniserver sends no value for"><input type="checkbox" id="chk-live-dim" checked> Dim wires without a value</label>
       </div>
       <div id="minimap" class="hud minimap" aria-hidden="true"><svg id="mm"><g id="mm-objs"></g><rect id="mm-view"/></svg></div>
     </div>
@@ -134,6 +141,7 @@
       <dt><kbd>Esc</kbd></dt><dd>Clear the selection</dd>
       <dt>Double-click</dt><dd>Zoom to a block · follow a reference to its page</dd>
       <dt>Shift + click history</dt><dd>Compare the viewed revision with that one</dd>
+      <dt><kbd>L</kbd></dt><dd>Live values on / off</dd>
     </dl>
     <button type="button" class="primary" id="help-close">Close</button>
   </div>

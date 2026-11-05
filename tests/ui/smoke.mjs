@@ -6,7 +6,7 @@
 // CHROMIUM_PATH picks a browser other than Playwright's own.
 import { chromium } from "playwright";
 import { spawn, execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, copyFileSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, appendFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -30,8 +30,15 @@ const edit = (from, to) => writeFileSync(cfg, readFileSync(cfg, "utf8").replace(
 edit('Title="Licht OG"', 'Title="Licht oben"');
 edit('K="Input2" Def="1000"', 'K="Input2" Def="100"');
 
+// Live values as `lox stream -o json --initial` writes them: the fixture's
+// temperature (an analog output) and its AND gate (a digital one).
+const TEMP = "10000003-0000-0032-01ff504f94000001", GATE = "10000004-0000-0043-02ff504f94000001";
+const liveFile = join(mkdtempSync(join(tmpdir(), "vislox-live-")), "stream.ndjson");
+const liveLine = (control, state, value, uuid) => JSON.stringify({ control, state, value, uuid }) + "\n";
+writeFileSync(liveFile, liveLine("Temperatur", "value", "21.5", TEMP) + liveLine("AND", "active", "1", GATE));
+
 const port = 7900 + Math.floor(Math.random() * 90);
-const server = spawn(bin, [repo, "--listen", `127.0.0.1:${port}`], { stdio: ["ignore", "ignore", "pipe"] });
+const server = spawn(bin, [repo, "--listen", `127.0.0.1:${port}`, "--live-from", liveFile], { stdio: ["ignore", "ignore", "pipe"] });
 let log = "";
 server.stderr.on("data", (d) => (log += d));
 await new Promise((ok, fail) => {
@@ -87,6 +94,17 @@ try {
     await again.goto(link);
     await again.waitForFunction(() => document.querySelector(".ph-t")?.textContent === "Licht oben");
     await again.close();
+  });
+  await step("live values go on the wires and follow the stream", async () => {
+    await page.click('.tab:has-text("Erdgeschoss")');
+    await page.click("#sw-live .track");
+    const pill = (t) => page.waitForFunction((t) => [...document.querySelectorAll(".live-pill")].some((n) => n.style.display !== "none" && n.textContent === t), t);
+    await pill("21.5");
+    assert.ok((await page.$$("#viewport .wire.lv-on")).length >= 1, "the AND gate's wire is on");
+    appendFileSync(liveFile, liveLine("Temperatur", "value", "22.25", TEMP));
+    await pill("22.25");
+    await page.click("#sw-live .track");
+    await page.waitForFunction(() => !document.querySelector("#canvas").classList.contains("live"));
   });
   await step("an edit on disk shows up live", async () => {
     const before = (await page.$$(".hrev")).length;

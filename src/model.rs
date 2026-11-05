@@ -89,6 +89,8 @@ pub struct PWire {
     pub points: Vec<[i64; 2]>,
     pub analog: bool,
     pub status: &'static str,
+    /// The source connector: its UUID is the state the Miniserver streams.
+    pub src: String,
 }
 
 #[derive(Serialize)]
@@ -102,6 +104,8 @@ pub struct PLabel {
     /// The signal flows into this page's port (the far end is the source).
     pub incoming: bool,
     pub status: &'static str,
+    /// The source connector (live value).
+    pub src: String,
 }
 
 #[derive(Serialize, Clone, Default)]
@@ -148,6 +152,7 @@ pub struct AttrInfo {
 #[derive(Serialize)]
 pub struct PortInfo {
     pub key: String,
+    pub uuid: String,
     pub name: String,
     pub def: Option<String>,
     pub old_def: Option<String>,
@@ -162,6 +167,8 @@ pub struct Conn {
     pub dir: &'static str,
     pub target: Target,
     pub status: &'static str,
+    /// The wire's source connector (live value).
+    pub src: String,
 }
 
 #[derive(Serialize)]
@@ -815,6 +822,7 @@ fn page_view(c: &Ctx, old: Option<&Ctx>, uuid: &str, d: &Delta, gone: bool) -> O
                     from,
                     to: to_,
                     status,
+                    src: w.from_port.clone(),
                 });
             }
             (Some(&(p, s, _)), None) | (None, Some(&(p, s, _))) => {
@@ -842,6 +850,7 @@ fn page_view(c: &Ctx, old: Option<&Ctx>, uuid: &str, d: &Delta, gone: bool) -> O
                     target,
                     incoming: !here_is_from,
                     status,
+                    src: w.from_port.clone(),
                 });
             }
             _ => {}
@@ -939,6 +948,7 @@ fn obj_info(c: &Ctx, old: Option<&Ctx>, uuid: &str, d: &Delta, gone: bool) -> Ob
                         dir: "in",
                         target: t,
                         status,
+                        src: w.from_port.clone(),
                     });
                 }
             } else if w.from_port == p.uuid
@@ -948,6 +958,7 @@ fn obj_info(c: &Ctx, old: Option<&Ctx>, uuid: &str, d: &Delta, gone: bool) -> Ob
                     dir: "out",
                     target: t,
                     status,
+                    src: w.from_port.clone(),
                 });
             }
         };
@@ -975,6 +986,7 @@ fn obj_info(c: &Ctx, old: Option<&Ctx>, uuid: &str, d: &Delta, gone: bool) -> Ob
             old_def: d.params.get(&k).cloned().flatten(),
             def: p.def.clone(),
             inv: p.inv,
+            uuid: p.uuid.clone(),
             key: p.key,
             conns,
         });
