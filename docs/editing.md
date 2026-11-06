@@ -71,6 +71,7 @@ A new block (#59) is a managed block, declared in vislox's file for its page:
 ```text
 # Blocks added in vislox on this page. vislox rewrites this file on every edit;
 # see docs/editing.md in vislox.
+# page uuid: 10000008-0000-0080-ffff504f94000001
 page "Obergeschoss"
 
 vx_monoflop_1 = Monoflop("Nachlauf", Time: 30)
@@ -82,15 +83,23 @@ vx_pulseat_1 = PulseAt(At: 07:05, Pulse: "time")
 - vislox picks the slug, `vx_<type>_<n>`, the lowest `n` that no name of the module, no lockfile entry and no
   removal tombstone has. It never follows the name, so renaming a block never changes its identity.
 - `page "…"` names the page by its title, and lox builds on the first page with that title. So a block is added
-  only to a page whose title no earlier page has.
-- The file is named after the page's title (`Küche Licht` → `kueche-licht.loxl`); one with that name for another
-  page gets `-2`.
-- A block added here is edited in Properties like any other: its name and its unwired inputs' constants change
-  its declaration (`"Name"`, `Port: n`), not a claim.
-- **Remove** takes out a block added here that is not deployed yet (it is not in the project's base). Its
-  declaration goes, and `removed vx_monoflop_1` tells lox the lockfile entry is meant to go (lox refuses a
-  managed block the source lost). vislox drops that line once the lockfile no longer has the block. A deployed
-  block is deleted with #80.
+  only to a page whose title no earlier page of the project's base has.
+- The file belongs to its page by UUID (the `# page uuid:` line), not by title. When Loxone Config renames the
+  page, the next edit writes the new title into the same file. A file written without the line takes the first
+  page with its title.
+- The file is named after the page's title when it is made (`Küche Licht` → `kueche-licht.loxl`); one with that
+  name for another page gets `-2`. It is deleted when its last block and `removed` line are gone.
+- A block added here is edited in Properties like any other: its name, its unwired inputs' constants and its
+  settings (`Formula:`, `Type:`, `At:`, …) change its declaration, not a claim. lox has no room or category for
+  a managed block, so the form does not offer them. An empty setting drops it: Loxone Config's value again.
+- **Remove** takes out a block added here that is not deployed yet: not in the deployed revision, the same one
+  the browser marks *not deployed* (the newest commit of the base). Its declaration goes, and
+  `removed vx_monoflop_1` tells lox the lockfile entry is meant to go (lox refuses a managed block the source
+  lost). vislox drops that line once the lockfile no longer has the block. A deployed block is deleted with #80.
+- **Discard** puts the module, lock and out back to the last commit. A lock or out the last commit does not have
+  (never committed, or ignored by git) goes back to how it was before vislox's first edit since that commit,
+  which vislox keeps in the git directory; one vislox never edited stays as it is, since a lost lock re-mints
+  every managed block. Discard is all or nothing: when a step fails, it puts back what the others did.
 
 vislox offers only what lox (v0.83.0, the version `Cargo.lock` and the Docker image pin) can express. What lox
 cannot express is left out, not worked around.

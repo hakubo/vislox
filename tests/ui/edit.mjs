@@ -144,10 +144,12 @@ try {
     await page.waitForFunction((u) => S.sel === u && document.querySelector('[data-body="Edit"]'), uuid);
   };
   const field = (f) => `#props [data-ed-field="${f}"]`;
+  // What the page shows once it settles: an edit's reply, the History and /api/edits come one after another.
+  const waitText = (sel, re) => page.waitForFunction(([s, src]) => new RegExp(src).test(document.querySelector(s)?.textContent || ""), [sel, re.source], { timeout: 10000 });
 
   await step("nothing is pending, and Properties offers to edit the Divide block", async () => {
     await page.waitForSelector("#deploy-pane:not(.hidden)");
-    assert.match(await page.textContent("#deploy-pend"), /Nothing pending\. Edit values in Properties/);
+    await waitText("#deploy-pend", /Nothing pending\. Edit values in Properties/);
     await pick(DIV);
     await page.click('#props [data-ed="open"]');
     // Its name and its divisor; the dividend is wired.
@@ -176,12 +178,10 @@ try {
     ]);
     await page.waitForFunction(() => document.querySelectorAll("#props .ed-tag").length === 3);
     assert.equal(await page.evaluate((u) => S.view.objects[u].room, DIV), "Bad");
-    assert.match(await page.textContent("#props"), /Saved and compiled: pending, not deployed/);
-    assert.match(await page.textContent("#deploy-pend"), /not deployed\. They include 3 values edited here/);
+    await waitText("#props", /Saved and compiled: pending, not deployed/);
+    await waitText("#deploy-pend", /not deployed\. They include 3 values edited here/);
     await page.waitForSelector("#btn-apply:not([disabled])");
-    const changes = await page.$$eval(".changes .chg .t", (n) => n.map((x) => x.textContent).join(" | "));
-    assert.match(changes, /Teiler/, changes);
-    assert.match(changes, /1000 → 100/, changes);
+    await waitText(".changes", /Teiler[\s\S]*1000 → 100|1000 → 100[\s\S]*Teiler/);
     const file = readFileSync(join(dir, "pages/vislox/edits.loxl"), "utf8");
     assert.match(file, /^extern vx_10000006_0000_0060_ffff504f94000001 = Div\(uuid: "10000006-0000-0060-ffff504f94000001"\)$/m);
     assert.match(file, /\.In2 = 100$/m);
@@ -240,17 +240,19 @@ try {
     const file = readFileSync(join(dir, "pages/vislox/obergeschoss.loxl"), "utf8");
     assert.match(file, /^page "Obergeschoss"$/m);
     assert.match(file, /^vx_monoflop_1 = Monoflop\("Nachlauf", Time: 30\)$/m);
-    await page.waitForFunction(() => /added here/.test(document.querySelector("#props")?.textContent || ""));
-    assert.match(await page.textContent("#props"), /Added and compiled: pending, not deployed/);
-    await page.waitForFunction(() => /1 block added here/.test(document.querySelector("#deploy-pend")?.textContent || ""));
-    const changes = await page.$$eval(".changes .chg", (n) => n.map((x) => x.textContent).join(" | "));
-    assert.match(changes, /Nachlauf/, changes);
+    await waitText("#props", /added here/);
+    await waitText("#props", /Added and compiled: pending, not deployed/);
+    await waitText("#deploy-pend", /1 block added here/);
+    await waitText(".changes", /Nachlauf/);
   });
   await step("a block added here is edited like any other", async () => {
     await page.click('#props [data-ed="open"]');
+    // Its declaration takes the name and constants; lox has no room or category for it.
+    assert.deepEqual(await page.$$eval("#props [data-ed-field]", (n) => n.map((x) => x.dataset.edField)), ["title", "p:Time"]);
     await page.fill(field("p:Time"), "45");
     await page.press(field("p:Time"), "Enter");
     await page.waitForFunction((u) => S.view?.objects[u]?.ports.find((p) => p.key === "Time")?.def === "45", added, { timeout: 10000 });
+    await waitText("#props", /Saved and compiled: pending, not deployed/);
     assert.match(readFileSync(join(dir, "pages/vislox/obergeschoss.loxl"), "utf8"), /Time: 45\)$/m);
   });
   await step("Remove takes it out again", async () => {

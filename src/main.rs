@@ -1486,7 +1486,8 @@ async fn api_edit(
     if let Err(r) = app.actions.check(&headers) {
         return refused(r);
     }
-    let res = app.actions.edit(&req).await;
+    let (deployed, _) = edit_revisions(&app).await;
+    let res = app.actions.edit(&req, deployed.map(|d| d.bytes)).await;
     let a = app.clone();
     let _ = tokio::task::spawn_blocking(move || refresh(&a)).await;
     match res {
@@ -1495,8 +1496,15 @@ async fn api_edit(
     }
 }
 
-/// What vislox's file of the module claims, and which of it is not deployed.
+/// What vislox's files of the module claim, and which of it is not deployed.
 async fn api_edits(State(app): State<Arc<App>>) -> Response {
+    let (deployed, pending) = edit_revisions(&app).await;
+    Json(app.actions.edits(deployed, pending).await).into_response()
+}
+
+/// The deployed revision ([`deployed_revision`]) and the pending compile,
+/// as editing compares them: the same for an edit and for `GET /api/edits`.
+async fn edit_revisions(app: &Arc<App>) -> (Option<actions::DeployedRev>, Option<Arc<Vec<u8>>>) {
     let a = app.clone();
     let revs = tokio::task::spawn_blocking(move || {
         let mut h = a.history.lock().unwrap();
@@ -1513,8 +1521,7 @@ async fn api_edits(State(app): State<Arc<App>>) -> Response {
         (deployed, pending)
     })
     .await;
-    let (deployed, pending) = revs.unwrap_or((None, None));
-    Json(app.actions.edits(deployed, pending).await).into_response()
+    revs.unwrap_or((None, None))
 }
 
 /// The block types vislox adds on a page, and what lox knows of each (#59).

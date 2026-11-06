@@ -14,7 +14,9 @@ published under the same version (see [docker/README.md](docker/README.md)).
   (`<module>/vislox/<page>.loxl`) and runs `lox logic compile`, which mints the block and places it. It shows in
   the pending revision and the Changes list as added, is edited in Properties like any block, and has *Remove*
   until it is deployed. Never deploys (#59).
-- Fixed: Discard failed when the last commit had no lockfile (the first compile writes one).
+- Fixed: Discard failed when the last commit had no lockfile (the first compile writes one), or one was staged
+  but not committed. Discard now reads the last commit, never deletes a lock vislox did not write (one not in git
+  goes back to how it was before vislox's first edit), and puts everything back when a step fails.
 - Fixed: Discard and the operate buttons ignored mouse clicks.
 
 ## 0.2.0

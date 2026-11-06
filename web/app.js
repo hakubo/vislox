@@ -2388,6 +2388,8 @@ function editRev() {
   const h = S.hist?.history?.[0];
   return h?.current ? h : null;
 }
+/** The block added here (#59) with UUID `uuid`, deployed or not. */
+function editsBlock(uuid) { return (S.edits?.blocks || []).find((b) => b.uuid && b.uuid === uuid) || null; }
 /** The blocks added here (#59) that are not deployed yet, or the one with UUID `uuid`. */
 function editsAdded(uuid) { return (S.edits?.blocks || []).filter((b) => b.uuid && !b.deployed && (!uuid || b.uuid === uuid)); }
 /** The values vislox edited and has not deployed yet, of one object or of all; not those of a new block, which is new as a whole. */
@@ -2415,6 +2417,15 @@ function editPlaces(ty) {
 /** The fields of the edit form: [field, label, value now, kind, unit]. */
 function editFields(o) {
   const f = [];
+  // A block added here: its declaration takes the name, the constants and the settings lox takes there
+  // (a Formula's text, a PulseAt's time, …); lox has no room or category for it.
+  const nb = editsBlock(o.uuid);
+  if (nb) {
+    f.push(["title", "Name", o.title || "", "text"]);
+    for (const p of o.edit.params) f.push([`p:${p.key}`, portName(o, p.key), o.ports.find((q) => q.key === p.key)?.def ?? "0", "number", p.unit]);
+    for (const st of nb.settings || []) f.push([`s:${st.name}`, st.name, st.value ?? "", st.kind, null, st.choices]);
+    return f;
+  }
   if (o.edit.title) f.push(["title", "Name", o.title || "", "text"]);
   if (o.edit.room) f.push(["room", "Room", o.room || "", "Place"]);
   if (o.edit.category) f.push(["category", "Category", o.category || "", "Category"]);
@@ -2444,13 +2455,15 @@ function editRows(o, row) {
     rows.push(`<div class="ed-bar"><button type="button" class="ed-btn small" data-ed="open">Edit values</button>` +
       (mine?.msg ? `<span class="ed-msg${mine.err ? " err" : ""}" role="status">${esc(mine.msg)}</span>` : "") + "</div>");
   } else {
-    for (const [field, label, now, kind, unit] of editFields(o)) {
+    for (const [field, label, now, kind, unit, choices] of editFields(o)) {
       const v = mine.draft[field] ?? now, bad = mine.bad[field];
       const id = `ed-${field.replace(/[^\w-]/g, "_")}`;
       const attrs = `id="${id}" data-ed-field="${esc(field)}"${bad ? ` aria-invalid="true" aria-describedby="${id}-e"` : ""}${mine.busy ? " disabled" : ""}`;
       const input = kind === "Place" || kind === "Category"
         ? `<select ${attrs}>${editPlaces(kind).map(([t, n]) => `<option value="${esc(t)}"${t === v ? " selected" : ""}${n > 1 ? ' disabled title="Two of them have this title: rename one in Loxone Config to pick it"' : ""}>${esc(t)}</option>`).join("")}</select>`
-        : `<input ${attrs} value="${esc(v)}" ${kind === "number" ? 'inputmode="decimal" class="num"' : ""} autocomplete="off" spellcheck="false">`;
+        : kind === "choice" || kind === "on_off"
+        ? `<select ${attrs}><option value="">as Loxone Config places it</option>${(kind === "on_off" ? ["on", "off"] : choices || []).map((c) => `<option${c === v ? " selected" : ""}>${esc(c)}</option>`).join("")}</select>`
+        : `<input ${attrs} value="${esc(v)}" ${kind === "number" || kind === "time" ? `inputmode="decimal" class="num"${kind === "time" ? ' placeholder="HH:MM"' : ""}` : ""} autocomplete="off" spellcheck="false">`;
       rows.push(`<div class="pr ed-row"><label class="k" for="${id}">${esc(label)}</label><div class="v">${input}` +
         (unit ? `<span class="ed-unit">${esc(unit)}</span>` : "") + (bad ? `<div class="ed-bad" id="${id}-e">${esc(bad)}</div>` : "") + "</div></div>");
     }
@@ -2476,14 +2489,17 @@ const EDIT_NUMBER = /^-?\d+(\.\d+)?$/;
 async function editSave() {
   const o = S.view?.objects[S.edit.uuid], st = o && editState(o);
   if (!st?.ok || S.edit.busy || !S.edit.open) return;
-  const ops = [], bad = {};
+  const ops = [], bad = {}, added = !!editsBlock(o.uuid);
   for (const [field, , now, kind] of editFields(o)) {
     const v = S.edit.draft[field];
     if (v == null || v === now) continue;
-    const t = kind === "number" ? v.trim() : v;
-    if (kind === "number" && !EDIT_NUMBER.test(t)) { bad[field] = /,/.test(t) ? "Write a decimal point, not a comma." : "A number, like 12 or -2.5."; continue; }
-    if (field === "title" && !t.trim()) { bad[field] = "The name cannot be empty."; continue; }
+    const t = kind === "number" || kind === "time" ? v.trim() : v;
     const [k, key] = field.split(/:(.*)/s);
+    // On a block added here an empty setting is dropped: Loxone Config's value again.
+    if (added && k === "s" && !t.trim()) { ops.push({ op: "setting", uuid: o.uuid, name: key, value: null }); continue; }
+    if (kind === "number" && !EDIT_NUMBER.test(t)) { bad[field] = /,/.test(t) ? "Write a decimal point, not a comma." : "A number, like 12 or -2.5."; continue; }
+    if (kind === "time" && !AB_TIME.test(t)) { bad[field] = "A time of day, like 19:00."; continue; }
+    if (field === "title" && !t.trim()) { bad[field] = "The name cannot be empty."; continue; }
     ops.push(EDIT_ATTR[field] ? { op: field, uuid: o.uuid, value: t } : k === "p" ? { op: "param", uuid: o.uuid, port: key, value: t } : { op: "setting", uuid: o.uuid, name: key, value: t });
   }
   S.edit.bad = bad; S.edit.err = ""; S.edit.msg = "";
@@ -2566,7 +2582,11 @@ async function abOpen() {
   $("ab-page").textContent = `on ${st.page.title || "this page"}`;
   if (!S.types) {
     $("ab-body").innerHTML = '<div class="ab-sum">Loading the block types…</div>';
-    try { S.types = (await api("/api/block-types")).types; } catch (err) { $("ab-body").innerHTML = `<div class="ab-sum">${esc(err.message)}</div>`; return; }
+    let types;
+    try { types = (await api("/api/block-types")).types; } catch (err) { if (AB.open) $("ab-body").innerHTML = `<div class="ab-sum">${esc(err.message)}</div>`; return; }
+    S.types = types;
+    // Closed while the types loaded: leave the focus where it is.
+    if (!AB.open) return;
   }
   abPick("");
 }

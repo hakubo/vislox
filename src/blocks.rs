@@ -245,6 +245,9 @@ impl NewBlock {
 /// the removals of blocks added here that lox has not forgotten yet.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PageFile {
+    /// The page's UUID, from a `# page uuid: …` line: the file follows its
+    /// page when Loxone Config renames it (`page "…"` names it by title).
+    pub uuid: Option<String>,
     pub page: String,
     /// `page "…" (room: …, category: …)`: kept as written (#88 writes them).
     pub room: Option<String>,
@@ -253,6 +256,9 @@ pub struct PageFile {
     pub removed: BTreeSet<String>,
 }
 
+/// The comment that ties a file to its page: `# page uuid: …`.
+const UUID_LINE: &str = "page uuid:";
+
 fn foreign(what: &str) -> String {
     format!("it holds {what}, which vislox did not write; move it to another file of the module")
 }
@@ -260,6 +266,7 @@ fn foreign(what: &str) -> String {
 impl PageFile {
     pub fn new(page: &str) -> PageFile {
         PageFile {
+            uuid: None,
             page: page.to_string(),
             room: None,
             category: None,
@@ -277,10 +284,15 @@ impl PageFile {
     pub fn parse(text: &str) -> Result<PageFile, String> {
         let m = Module::parse(text).map_err(|e| e.to_string())?;
         let mut file: Option<PageFile> = None;
+        let mut uuid = None;
         for item in m.items {
             match item {
+                Item::Comment(c) if file.is_none() && c.trim().starts_with(UUID_LINE) => {
+                    uuid = Some(c.trim()[UUID_LINE.len()..].trim().to_string());
+                }
                 Item::Page(p) if file.is_none() => {
                     file = Some(PageFile {
+                        uuid: uuid.take(),
                         room: p.room,
                         category: p.category,
                         ..PageFile::new(&p.title)
@@ -334,11 +346,15 @@ impl PageFile {
             category: self.category.clone(),
             comment: None,
         };
-        let mut out = format!(
+        let mut out = String::from(
             "# Blocks added in vislox on this page. vislox rewrites this file on every edit;\n\
-             # see docs/editing.md in vislox.\n{}\n",
-            render_page(&page)
+             # see docs/editing.md in vislox.\n",
         );
+        if let Some(u) = &self.uuid {
+            out.push_str(&format!("# {UUID_LINE} {u}\n"));
+        }
+        out.push_str(&render_page(&page));
+        out.push('\n');
         if !self.blocks.is_empty() {
             out.push('\n');
         }
@@ -488,6 +504,7 @@ mod tests {
     #[test]
     fn a_page_file_round_trips() {
         let mut f = PageFile::new("Küche \"Licht\"");
+        f.uuid = Some("10000008-0000-0080-ffff504f94000001".into());
         f.blocks.push(NewBlock {
             slug: "vx_and_1".into(),
             ty: "And".into(),
@@ -503,6 +520,10 @@ mod tests {
         f.removed.insert("vx_not_1".into());
         let text = f.render();
         assert!(text.contains("page \"Küche \\\"Licht\\\"\"\n"), "{text}");
+        assert!(
+            text.contains("# page uuid: 10000008-0000-0080-ffff504f94000001\npage "),
+            "{text}"
+        );
         assert!(
             text.contains("vx_and_1 = And(\"Licht an\", In2: 1)\n"),
             "{text}"
