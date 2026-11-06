@@ -22,6 +22,7 @@
 
 use chrono::{Days, NaiveDate};
 use serde::Serialize;
+use std::collections::HashMap;
 
 /// The block type of a calendar entry.
 pub const ENTRY: &str = "CalendarEntry";
@@ -221,6 +222,260 @@ pub fn change_text(old: &EntryDate, new: &EntryDate) -> String {
     }
 }
 
+// ── Entries changed in the Loxone app ─────────────────────────────────
+//
+// Admins can add, change and delete entries in the Loxone app. Those edits
+// live on the Miniserver only, until a Pull or Sync takes them over. The
+// Miniserver lists the entries it uses with `jdev/sps/calendargetentries`
+// (admin rights only), in the datasheet's terms: `calMode` 0 a date every
+// year (`startMonth`/`startDay`), 1 Easter (`easterOffset`), 2 one date
+// (`startYear`/…), 3 one period (`start…` to `endYear`/`endMonth`/`endDay`),
+// 4 a range every year (`startMonth`/`startDay` to `endMonth`/`endDay`, as
+// a real Miniserver sends it; the datasheet's list differs), 5 a weekday of
+// the month. `operatingMode` is the mode's `Mode=` number, the file's
+// `CalType=`. The numbering differs from the file's `Mode=`, so entries are
+// compared by their decoded dates, never by raw numbers.
+
+/// A calendar entry, from the config file or from the Miniserver.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Entry {
+    pub uuid: String,
+    pub name: String,
+    /// The `Mode=` number of the operating mode it switches on; `None`
+    /// when that cannot be read.
+    pub mode: Option<i64>,
+    pub date: Result<EntryDate, String>,
+}
+
+impl EntryDate {
+    /// Decode an entry of `calendargetentries`. `Err` says why not.
+    pub fn from_api(e: &serde_json::Value) -> Result<EntryDate, String> {
+        let int = |name: &str, absent: Option<i64>| -> Result<i64, String> {
+            match &e[name] {
+                serde_json::Value::Null => absent.ok_or_else(|| format!("it has no {name}")),
+                v => v
+                    .as_i64()
+                    .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+                    .ok_or_else(|| format!("{name} is {v}, not a whole number")),
+            }
+        };
+        let day_of_year = |m: &str, d: &str| -> Result<(u32, u32), String> {
+            let (month, day) = (int(m, None)?, int(d, None)?);
+            if is_day_of_year(month, day) {
+                Ok((month as u32, day as u32))
+            } else {
+                Err(format!("{m} {month} and {d} {day} are no day of the year"))
+            }
+        };
+        let date = |y: &str, m: &str, d: &str| -> Result<NaiveDate, String> {
+            let (year, month, day) = (int(y, None)?, int(m, None)?, int(d, None)?);
+            i32::try_from(year)
+                .ok()
+                .zip(u32::try_from(month).ok())
+                .zip(u32::try_from(day).ok())
+                .and_then(|((y, m), d)| NaiveDate::from_ymd_opt(y, m, d))
+                .ok_or_else(|| format!("{year}-{month}-{day} is no date"))
+        };
+        Ok(match int("calMode", None)? {
+            0 => {
+                let (month, day) = day_of_year("startMonth", "startDay")?;
+                EntryDate::Fixed { month, day }
+            }
+            1 => EntryDate::Easter {
+                offset: int("easterOffset", Some(0))?,
+            },
+            2 => {
+                let d = date("startYear", "startMonth", "startDay")?;
+                EntryDate::Period { from: d, to: d }
+            }
+            3 => EntryDate::Period {
+                from: date("startYear", "startMonth", "startDay")?,
+                to: date("endYear", "endMonth", "endDay")?,
+            },
+            4 => {
+                let (month, day) = day_of_year("startMonth", "startDay")?;
+                let (month2, day2) = day_of_year("endMonth", "endDay")?;
+                EntryDate::Yearly {
+                    month,
+                    day,
+                    month2,
+                    day2,
+                }
+            }
+            5 => {
+                return Err(
+                    "a weekday of the month (calMode 5), which vislox does not read".into(),
+                );
+            }
+            m => {
+                return Err(format!(
+                    "calMode {m} is a kind of date vislox does not know"
+                ));
+            }
+        })
+    }
+}
+
+/// The entries of a `calendargetentries` answer (its `LL.value`).
+pub fn parse_api(value: &str) -> Result<Vec<Entry>, String> {
+    let v: serde_json::Value =
+        serde_json::from_str(value).map_err(|e| format!("not a list of entries: {e}"))?;
+    let list = v.as_array().ok_or("not a list of entries")?;
+    list.iter()
+        .map(|e| {
+            let uuid = e["uuid"].as_str().ok_or("an entry without a uuid")?;
+            Ok(Entry {
+                uuid: uuid.to_ascii_lowercase(),
+                name: e["name"].as_str().unwrap_or_default().to_string(),
+                mode: e["operatingMode"].as_i64(),
+                date: EntryDate::from_api(e),
+            })
+        })
+        .collect()
+}
+
+/// The calendar entries of a config, and its operating modes by `Mode=`
+/// number (title), for naming the mode an entry switches on.
+pub fn of_doc(doc: &loxone_config::doc::LoxoneDoc) -> (Vec<Entry>, HashMap<i64, String>) {
+    let idx = doc.index();
+    let (mut entries, mut modes) = (Vec::new(), HashMap::new());
+    for (uuid, path) in &idx.by_uuid {
+        let Some(el) = doc.element_at(path) else {
+            continue;
+        };
+        let title = || {
+            el.attr_decoded("Title")
+                .map(|t| t.into_owned())
+                .unwrap_or_default()
+        };
+        match el.attr("Type") {
+            Some(ENTRY) => entries.push(Entry {
+                uuid: uuid.to_ascii_lowercase(),
+                name: title(),
+                mode: mode_number(el.attr(MODE_ATTR)),
+                date: EntryDate::from_attrs(|n| el.attr(n)),
+            }),
+            // As in the view: absent is 0, an unreadable number none.
+            Some("Mode") => {
+                if let Some(n) = mode_number(el.attr("Mode")) {
+                    modes.entry(n).or_insert_with(title);
+                }
+            }
+            _ => {}
+        }
+    }
+    entries.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.uuid.cmp(&b.uuid)));
+    (entries, modes)
+}
+
+/// How an entry on the Miniserver differs from the config's.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DriftKind {
+    /// Added in the app: the config has no entry with its UUID.
+    Added,
+    /// Changed in the app: name, mode or date.
+    Changed,
+    /// Deleted in the app: the Miniserver no longer has it.
+    Deleted,
+}
+
+/// One entry the app changed, as the banner and the entry's properties
+/// read it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Drift {
+    pub kind: DriftKind,
+    pub uuid: String,
+    /// The name on the Miniserver (the config's, when deleted).
+    pub name: String,
+    /// The entry in one line, as the Miniserver has it (the config's, when
+    /// deleted): *Every year on 24 Dec · switches on Holiday*.
+    pub what: String,
+    /// What changed: *name: Party → Fest*, *when: 24 Dec → 26 Dec*,
+    /// *switches on: Holiday → Party*.
+    pub changes: Vec<String>,
+}
+
+fn mode_title(modes: &HashMap<i64, String>, n: Option<i64>) -> String {
+    match n {
+        Some(n) => modes
+            .get(&n)
+            .cloned()
+            .unwrap_or_else(|| format!("Mode {n} (not in this config)")),
+        None => "an unreadable mode".to_string(),
+    }
+}
+
+fn date_text(d: &Result<EntryDate, String>) -> String {
+    match d {
+        Ok(d) => d.text(),
+        Err(why) => format!("a date vislox cannot read ({why})"),
+    }
+}
+
+/// Compare the entries the Miniserver uses (`app`) with the config's
+/// (`file`), by UUID. A date counts as changed only when both sides
+/// decode: one vislox cannot read on either side is not compared.
+pub fn drift(file: &[Entry], app: &[Entry], modes: &HashMap<i64, String>) -> Vec<Drift> {
+    let what = |e: &Entry| {
+        format!(
+            "{} · switches on {}",
+            date_text(&e.date),
+            mode_title(modes, e.mode)
+        )
+    };
+    let mut out = Vec::new();
+    for a in app {
+        let Some(f) = file.iter().find(|f| f.uuid == a.uuid) else {
+            out.push(Drift {
+                kind: DriftKind::Added,
+                uuid: a.uuid.clone(),
+                name: a.name.clone(),
+                what: what(a),
+                changes: Vec::new(),
+            });
+            continue;
+        };
+        let mut changes = Vec::new();
+        if f.name != a.name {
+            changes.push(format!("name: {} → {}", f.name, a.name));
+        }
+        if let (Ok(old), Ok(new)) = (&f.date, &a.date)
+            && old != new
+        {
+            changes.push(format!("when: {}", change_text(old, new)));
+        }
+        if f.mode != a.mode {
+            changes.push(format!(
+                "switches on: {} → {}",
+                mode_title(modes, f.mode),
+                mode_title(modes, a.mode)
+            ));
+        }
+        if !changes.is_empty() {
+            out.push(Drift {
+                kind: DriftKind::Changed,
+                uuid: a.uuid.clone(),
+                name: a.name.clone(),
+                what: what(a),
+                changes,
+            });
+        }
+    }
+    for f in file {
+        if !app.iter().any(|a| a.uuid == f.uuid) {
+            out.push(Drift {
+                kind: DriftKind::Deleted,
+                uuid: f.uuid.clone(),
+                name: f.name.clone(),
+                what: what(f),
+                changes: Vec::new(),
+            });
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -371,5 +626,176 @@ mod tests {
             }),
             r#"{"kind":"period","from":"2026-07-04","to":"2026-09-05"}"#
         );
+    }
+
+    /// Entries as a real Miniserver (firmware 16) sends them.
+    const API: &str = r#"[
+        {"uuid":"1b344a7c-0374-3516-ffff450b2297409e","name":"Sezon grzewczy","operatingMode":10,"calMode":4,"startMonth":10,"startDay":1,"endMonth":4,"endDay":30},
+        {"uuid":"b18873ee-7e61-11e1-b511f20f692e0d8a","name":"PL - Nowy Rok","operatingMode":0,"calMode":0,"startMonth":1,"startDay":1},
+        {"uuid":"b4772f6e-7e61-11e1-b592f20f692e0d8a","name":"PL - Poniedziałek Wielkanocny","operatingMode":0,"calMode":1,"easterOffset":1},
+        {"uuid":"1860737a-026c-e539-ffffeee000d80263","name":"PL - Pierwszy dzień Wielkiej Nocy","operatingMode":0,"calMode":1,"easterOffset":0}
+    ]"#;
+
+    #[test]
+    fn the_miniserver_s_entries_decode_to_the_file_s_dates() {
+        let e = parse_api(API).unwrap();
+        assert_eq!(e.len(), 4);
+        assert_eq!(e[0].mode, Some(10));
+        assert_eq!(
+            e[0].date,
+            Ok(EntryDate::Yearly {
+                month: 10,
+                day: 1,
+                month2: 4,
+                day2: 30
+            })
+        );
+        assert_eq!(e[1].date, Ok(EntryDate::Fixed { month: 1, day: 1 }));
+        assert_eq!(e[2].date, Ok(EntryDate::Easter { offset: 1 }));
+        assert_eq!(e[3].date, Ok(EntryDate::Easter { offset: 0 }));
+        // The same entries as the file stores them decode to the same dates.
+        assert_eq!(
+            e[0].date,
+            decode(&[
+                ("Mode", "4"),
+                ("Month", "10"),
+                ("Day", "1"),
+                ("Month2", "4"),
+                ("Day2", "30")
+            ])
+        );
+        assert_eq!(
+            e[1].date,
+            decode(&[("Month", "1"), ("Day", "1"), ("Month2", "1"), ("Day2", "1")])
+        );
+    }
+
+    #[test]
+    fn one_date_and_a_period_are_periods() {
+        let one =
+            serde_json::json!({"calMode": 2, "startYear": 2026, "startMonth": 12, "startDay": 31});
+        assert_eq!(
+            EntryDate::from_api(&one),
+            Ok(EntryDate::Period {
+                from: ymd(2026, 12, 31),
+                to: ymd(2026, 12, 31)
+            })
+        );
+        let span = serde_json::json!({"calMode": 3, "startYear": 2026, "startMonth": 7, "startDay": 4,
+            "endYear": 2026, "endMonth": 9, "endDay": 5});
+        // As the file's Mode=3, From=6393, To=6456.
+        assert_eq!(
+            EntryDate::from_api(&span),
+            decode(&[("Mode", "3"), ("From", "6393"), ("To", "6456")])
+        );
+    }
+
+    #[test]
+    fn what_the_api_sends_and_vislox_cannot_read_says_why() {
+        let d = |v| EntryDate::from_api(&v).unwrap_err();
+        assert_eq!(
+            d(serde_json::json!({"calMode": 5, "startMonth": 13, "weekDay": 0})),
+            "a weekday of the month (calMode 5), which vislox does not read"
+        );
+        assert_eq!(
+            d(serde_json::json!({"calMode": 9})),
+            "calMode 9 is a kind of date vislox does not know"
+        );
+        assert_eq!(d(serde_json::json!({})), "it has no calMode");
+        assert_eq!(
+            d(
+                serde_json::json!({"calMode": 2, "startYear": 2026, "startMonth": 2, "startDay": 30})
+            ),
+            "2026-2-30 is no date"
+        );
+        assert_eq!(
+            d(serde_json::json!({"calMode": 0, "startMonth": 13, "startDay": 1})),
+            "startMonth 13 and startDay 1 are no day of the year"
+        );
+        assert!(parse_api("{}").is_err());
+        assert!(parse_api(r#"[{"name":"x"}]"#).is_err());
+    }
+
+    fn entry(uuid: &str, name: &str, mode: i64, date: EntryDate) -> Entry {
+        Entry {
+            uuid: uuid.into(),
+            name: name.into(),
+            mode: Some(mode),
+            date: Ok(date),
+        }
+    }
+
+    #[test]
+    fn drift_lists_what_the_app_added_changed_and_deleted() {
+        let modes = HashMap::from([(0, "Holiday".to_string()), (-1, "Party".to_string())]);
+        let xmas = EntryDate::Fixed { month: 12, day: 24 };
+        let file = vec![
+            entry("a", "Christmas", 0, xmas),
+            entry("b", "Easter", 0, EntryDate::Easter { offset: 1 }),
+            entry("c", "Same", 0, xmas),
+        ];
+        let app = vec![
+            entry("a", "Xmas", -1, EntryDate::Fixed { month: 12, day: 26 }),
+            entry("c", "Same", 0, xmas),
+            entry("d", "Fest", -1, EntryDate::Fixed { month: 7, day: 1 }),
+        ];
+        let d = drift(&file, &app, &modes);
+        assert_eq!(d.len(), 3);
+        assert_eq!(d[0].kind, DriftKind::Changed);
+        assert_eq!(
+            d[0].changes,
+            [
+                "name: Christmas → Xmas",
+                "when: 24 Dec → 26 Dec",
+                "switches on: Holiday → Party"
+            ]
+        );
+        assert_eq!(d[0].what, "Every year on 26 Dec · switches on Party");
+        assert_eq!(
+            (d[1].kind.clone(), d[1].uuid.as_str()),
+            (DriftKind::Added, "d")
+        );
+        assert_eq!(d[1].what, "Every year on 1 Jul · switches on Party");
+        assert_eq!(
+            (d[2].kind.clone(), d[2].name.as_str()),
+            (DriftKind::Deleted, "Easter")
+        );
+        assert_eq!(d[2].what, "Easter Monday (Easter +1) · switches on Holiday");
+        // Nothing changed, nothing listed.
+        assert!(drift(&file, &file, &modes).is_empty());
+    }
+
+    #[test]
+    fn a_date_either_side_cannot_read_is_not_compared() {
+        let modes = HashMap::new();
+        let mut a = entry("a", "Weekday", 3, EntryDate::Fixed { month: 1, day: 1 });
+        let file = vec![a.clone()];
+        a.date = Err("a weekday".into());
+        assert!(drift(&file, &[a], &modes).is_empty());
+        let unknown = entry("a", "X", 7, EntryDate::Fixed { month: 1, day: 1 });
+        let other = Entry {
+            mode: Some(8),
+            ..unknown.clone()
+        };
+        assert_eq!(
+            drift(&[unknown], &[other], &modes)[0].changes,
+            ["switches on: Mode 7 (not in this config) → Mode 8 (not in this config)"]
+        );
+    }
+
+    #[test]
+    fn the_fixture_s_entries_are_read_with_their_modes() {
+        let src = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/house.Loxone"
+        ))
+        .unwrap();
+        let doc = loxone_config::doc::LoxoneDoc::parse(src.as_bytes()).unwrap();
+        let (entries, modes) = of_doc(&doc);
+        let xmas = entries.iter().find(|e| e.name == "Heiligabend").unwrap();
+        assert_eq!(xmas.uuid, "10000013-0000-0130-ffff504f94000001");
+        assert_eq!(xmas.mode, Some(0));
+        assert_eq!(xmas.date, Ok(EntryDate::Fixed { month: 12, day: 24 }));
+        assert!(modes.contains_key(&0));
     }
 }

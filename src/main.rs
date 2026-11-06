@@ -2,6 +2,7 @@
 //! `loxone-config` manage, with live reload, history and change review.
 
 mod actions;
+mod appcalendar;
 mod calendar;
 mod configdate;
 mod discover;
@@ -96,12 +97,19 @@ struct App {
     live: Arc<live::Live>,
     /// The Miniserver's structure file: what the app shows.
     structure: Arc<structure::Structure>,
+    /// The calendar entries the Miniserver uses, edited in the app or not.
+    calendar: appcalendar::AppCalendar,
+    /// Their drift from the deployed revision, for (its blob, the read's seq).
+    cal_drift: Mutex<Option<CalDrift>>,
     pull: pull::Pull,
     log: log::Log,
     ms: miniserver::Miniserver,
     actions: actions::Actions,
     operate: Arc<operate::Operate>,
 }
+
+/// A calendar drift, for (the deployed revision's blob, the read's seq).
+type CalDrift = ((String, u64), Arc<serde_json::Value>);
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -232,6 +240,13 @@ async fn main() -> Result<()> {
         },
         found.as_ref().ok().map(|f| f.ms_dir.as_str()),
     );
+    // The calendar entries come with the structure file (live values, or a
+    // user's request), and after Pull, Apply and Sync; never with --no-live.
+    let calendar = appcalendar::AppCalendar::new(if args.no_live {
+        Err("turned off (--no-live)".to_string())
+    } else {
+        found.as_ref().map(|f| f.conn.clone()).map_err(Clone::clone)
+    });
     let live = live::Live::new(feed, live_source);
     live.share_structure(structure.clone());
     let (tx, _) = broadcast::channel(16);
@@ -242,6 +257,8 @@ async fn main() -> Result<()> {
         tx,
         live,
         structure,
+        calendar,
+        cal_drift: Mutex::new(None),
         pull,
         log,
         ms,
@@ -292,6 +309,18 @@ async fn main() -> Result<()> {
         });
     }
 
+    // Each structure file read (a live session starting, or a user asking)
+    // also asks for the calendar entries, at most once a minute.
+    {
+        let app = app.clone();
+        let mut rx = app.structure.subscribe();
+        tokio::spawn(async move {
+            while let Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) = rx.recv().await {
+                app.calendar.read(appcalendar::ON_LIVE).await;
+            }
+        });
+    }
+
     spawn_watcher(app.clone())?;
     // Fallback poll, and the only way to notice new git commits.
     {
@@ -337,6 +366,7 @@ async fn main() -> Result<()> {
         .route("/api/app", get(api_app))
         .route("/api/app/load", axum::routing::post(api_app_load))
         .route("/api/app/icon", get(api_app_icon))
+        .route("/api/calendar", get(api_calendar))
         .route("/api/pull", axum::routing::post(api_pull))
         .route("/api/apply", axum::routing::post(api_apply))
         .route("/api/discard", axum::routing::post(api_discard))
@@ -593,8 +623,17 @@ async fn api_events(
         };
         Ok(Event::default().event("app").data(what))
     });
-    Sse::new(history.merge(actions).merge(operate).merge(app_changed))
-        .keep_alive(KeepAlive::default())
+    // The calendar entries on the Miniserver: read again, with another result.
+    let calendar = BroadcastStream::new(app.calendar.subscribe())
+        .map(|_| Ok(Event::default().event("calendar").data("changed")));
+    Sse::new(
+        history
+            .merge(actions)
+            .merge(operate)
+            .merge(app_changed)
+            .merge(calendar),
+    )
+    .keep_alive(KeepAlive::default())
 }
 
 /// Requests that make vislox talk to the Miniserver carry an `X-Vislox`
@@ -891,6 +930,7 @@ async fn api_pull(State(app): State<Arc<App>>, headers: axum::http::HeaderMap) -
             let _ = tokio::task::spawn_blocking(move || refresh(&a)).await;
             // The base may have changed: the next check reads its date again.
             app.ms.forget();
+            reread_calendar(&app);
             Json(serde_json::json!({ "committed": p.committed })).into_response()
         }
         Err(e) => (
@@ -925,6 +965,7 @@ async fn api_apply(
     let _ = tokio::task::spawn_blocking(move || refresh(&a)).await;
     // The base may have changed: the next check reads its date again.
     app.ms.forget();
+    reread_calendar(&app);
     match res {
         Ok(m) => Json(serde_json::json!({ "message": m })).into_response(),
         // What the user could allow to retry (a newer Loxone Config, custom changes).
@@ -937,6 +978,104 @@ async fn api_apply(
         )
             .into_response(),
     }
+}
+
+/// After Pull, Apply and Sync: read the Miniserver's calendar entries
+/// again, in the background, now that the base or the Miniserver changed.
+fn reread_calendar(app: &Arc<App>) {
+    let app = app.clone();
+    tokio::spawn(async move {
+        app.calendar.read(Duration::ZERO).await;
+    });
+}
+
+#[derive(Deserialize)]
+struct CalQuery {
+    /// Any value but `0` or `false`: read the entries again (before Apply),
+    /// unless a read started in the last few seconds. Needs `X-Vislox`.
+    fresh: Option<String>,
+}
+
+/// The calendar entries edited in the Loxone app: how the Miniserver's
+/// differ from the deployed revision's. Reads nothing from the Miniserver
+/// unless `fresh`.
+async fn api_calendar(
+    State(app): State<Arc<App>>,
+    headers: axum::http::HeaderMap,
+    Query(q): Query<CalQuery>,
+) -> Response {
+    if let Err(why) = app.calendar.available() {
+        return Json(serde_json::json!({ "available": false, "reason": why })).into_response();
+    }
+    if q.fresh.as_deref().is_some_and(|f| f != "0" && f != "false") {
+        if let Some(r) = not_from_vislox(&headers) {
+            return r;
+        }
+        app.calendar.read(appcalendar::BEFORE_APPLY).await;
+    }
+    let a = app.clone();
+    match tokio::task::spawn_blocking(move || calendar_drift(&a)).await {
+        Ok(Ok(v)) => Json(v.as_ref().clone()).into_response(),
+        Ok(Err(e)) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({ "error": e })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+/// The last read of the Miniserver's calendar entries against the deployed
+/// revision (the current one that is not pending). Blocking: it may parse
+/// that revision.
+fn calendar_drift(app: &App) -> Result<Arc<serde_json::Value>, String> {
+    let Some(read) = app.calendar.last() else {
+        return Ok(Arc::new(serde_json::json!({ "available": true })));
+    };
+    let entries = match &read.entries {
+        Ok(e) => e.clone(),
+        Err(why) => {
+            return Ok(Arc::new(serde_json::json!({
+                "available": true,
+                "read_at": read.at,
+                "error": why,
+            })));
+        }
+    };
+    let rev = {
+        let h = app.history.lock().unwrap();
+        let (_, hist) = h.list();
+        hist.into_iter().find(|r| r.current)
+    };
+    let Some(rev) = rev else {
+        return Ok(Arc::new(serde_json::json!({
+            "available": true,
+            "read_at": read.at,
+            "error": "no deployed revision to compare them with",
+        })));
+    };
+    let key = (rev.blob.clone(), read.seq);
+    if let Some((k, v)) = &*app.cal_drift.lock().unwrap()
+        && *k == key
+    {
+        return Ok(v.clone());
+    }
+    let (_, doc) = load(app, &rev.id)?;
+    let (file, modes) = calendar::of_doc(&doc);
+    let drift = calendar::drift(&file, &entries, &modes);
+    let v = Arc::new(serde_json::json!({
+        "available": true,
+        "read_at": read.at,
+        "rev": rev.id,
+        "entries": entries.len(),
+        "drift": drift,
+    }));
+    *app.cal_drift.lock().unwrap() = Some((key, v.clone()));
+    Ok(v)
 }
 
 /// Put the module, lock and compiled config back to the last commit.
@@ -968,6 +1107,7 @@ async fn api_sync(State(app): State<Arc<App>>, headers: axum::http::HeaderMap) -
     let _ = tokio::task::spawn_blocking(move || refresh(&a)).await;
     // The base may have changed: the next check reads its date again.
     app.ms.forget();
+    reread_calendar(&app);
     match res {
         Ok(m) => Json(serde_json::json!({ "message": m })).into_response(),
         Err((status, msg)) => refused((status, reason::explain(&msg))),

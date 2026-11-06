@@ -902,6 +902,12 @@ function renderProps() {
     section("Calendar entry", [
       row("When", marks && cal.old_when != null ? `<span class="old">${esc(cal.old_when)}</span><span class="new">${when}</span>` : when, marks && cal.old_when != null ? "pr-chg" : ""),
       row("Switches on", marks && cal.old_mode ? `<span class="old">${esc(cal.old_mode.title)}</span><span class="new">${modeV(cal.mode)}</span>` : modeV(cal.mode), marks && cal.old_mode ? "pr-chg" : ""),
+      ...(() => {
+        const d = calDriftOf(o.uuid);
+        if (!d) return [];
+        const what = d.kind === "deleted" ? "Deleted in the app. Pull or Sync to take that over." : `Changed in the app: ${d.changes.join("; ")}. Pull or Sync to take it over.`;
+        return [row("In the app", `<span class="cal-app">${esc(what)}</span>`, "pr-chg")];
+      })(),
     ]);
   }
   const inApp = appRows(o, row, chg, marks);
@@ -1462,6 +1468,8 @@ function renderMs() {
       ${row("Config last changed", m.configDate?.error ? `can't tell (${m.configDate.error})`
         : m.configDate?.miniserver && msDate(m.configDate.miniserver) + ({ after: " (after the base)", before: " (before the base: an older config runs)" }[m.configDate.order] || ""))}
       ${row("Base taken at", m.configDate?.base && msDate(m.configDate.base))}
+      ${row("Calendar entries", !S.cal?.available || !S.cal.read_at ? "" : S.cal.error ? `can't tell (${S.cal.error})`
+        : calDrift().length ? `${calDrift().length} changed in the app` : `${S.cal.entries}, as in the deployed config`)}
       ${m.reachable ? row("Connection", m.local === false ? "remote" : m.local ? "local" : "unknown") + row("TLS", tls)
         + row("Live-update slot", m.eventSlots == null ? "" : m.eventSlots ? "free" : "none free") : ""}
       ${row("lox's token valid until", tok)}</dl>
@@ -1488,6 +1496,7 @@ function staleText() {
   return c?.changed ? `The Miniserver's config changed at ${msDate(c.miniserver)}, after the base vislox shows (taken at ${msDate(c.base)}).` : "";
 }
 function renderStale() {
+  renderCalDrift();
   const text = staleText();
   $("stale").classList.toggle("hidden", !text);
   if (!text) return;
@@ -1503,6 +1512,65 @@ function renderStale() {
 }
 $("stale-pull").onclick = () => $("btn-pull").click();
 $("stale-sync").onclick = () => $("btn-sync").click();
+
+// ── calendar entries changed in the Loxone app ─────────────────────────
+// The server reads the Miniserver's entries (calendargetentries, admin only) when live values
+// start, after Pull, Apply and Sync, and before Apply, and compares them with the deployed
+// revision. Without admin rights nothing shows.
+S.cal = null;
+async function loadCal(fresh) {
+  try {
+    const r = await fetch("/api/calendar" + (fresh ? "?fresh=1" : ""), { headers: fresh ? { "X-Vislox": "calendar" } : {} });
+    const j = await r.json();
+    if (!r.ok) return;
+    S.cal = j;
+  } catch { return; }
+  renderCalDrift();
+  if (S.ms) renderMs();
+  if (S.view && S.sel && S.view.objects[S.sel]?.calendar) renderProps();
+}
+/** The entries the app changed, against the deployed revision. */
+function calDrift() { return S.cal?.available && Array.isArray(S.cal.drift) ? S.cal.drift : []; }
+/** How entry `uuid` was changed in the app, when it was and the deployed revision is viewed. */
+function calDriftOf(uuid) { return viewingDeployed() ? calDrift().find((d) => d.uuid === uuid) : undefined; }
+function calDriftText() {
+  const d = calDrift();
+  if (!d.length) return "";
+  const n = d.length;
+  const by = ["added", "changed", "deleted"].map((k) => [k, d.filter((x) => x.kind === k).length]).filter(([, c]) => c);
+  return `${n} calendar ${n === 1 ? "entry was" : "entries were"} ${by.length === 1 ? by[0][0] : `changed (${by.map(([k, c]) => `${c} ${k}`).join(", ")})`} in the Loxone app. The base vislox shows does not have ${n === 1 ? "it" : "them"}.`;
+}
+function calDriftLine(d) {
+  const has = !!S.view?.objects[d.uuid];
+  const name = has ? `<button type="button" class="lnk" data-go="${esc(d.uuid)}">${esc(d.name)}</button>` : `<b>${esc(d.name)}</b>`;
+  if (d.kind === "added") return `${name}: added, ${esc(d.what)}`;
+  if (d.kind === "deleted") return `${name}: deleted (was ${esc(d.what)})`;
+  return `${name}: ${esc(d.changes.join("; "))}`;
+}
+function renderCalDrift() {
+  const text = calDriftText();
+  $("cal-drift").classList.toggle("hidden", !text);
+  if (!text) return;
+  const pullOk = !!S.hist?.pull?.available;
+  const a = S.hist?.actions;
+  const syncOk = !!a?.shown && !!a.apply?.available && !pendingChange() && !a.running;
+  $("cal-drift-text").textContent = text + (pullOk || syncOk ? " Take them over before you change anything:" : " An Apply would overwrite them.");
+  $("cal-drift-text").title = S.cal.read_at ? `Read from the Miniserver ${new Date(S.cal.read_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}` : "";
+  $("cal-drift-list").innerHTML = calDrift().map((d) => `<li>${calDriftLine(d)}</li>`).join("");
+  $("cal-drift-pull").classList.toggle("hidden", !pullOk);
+  $("cal-drift-pull").disabled = pulling;
+  $("cal-drift-sync").classList.toggle("hidden", !syncOk);
+  $("cal-drift-row").classList.toggle("hidden", !pullOk && !syncOk);
+}
+$("cal-drift-pull").onclick = () => $("btn-pull").click();
+$("cal-drift-sync").onclick = () => $("btn-sync").click();
+$("cal-drift-list").addEventListener("click", (e) => {
+  const g = e.target.closest("[data-go]");
+  if (!g) return;
+  const u = g.dataset.go, pg = S.view?.objects[u]?.page;
+  if (pg) gotoPage(pg, { focus: u });
+  select(u);
+});
 function closeMsPop() { $("ms-pop").classList.add("hidden"); $("ms-chip").setAttribute("aria-expanded", "false"); }
 $("ms-chip").onclick = () => {
   const open = $("ms-pop").classList.toggle("hidden") === false;
@@ -1785,10 +1853,12 @@ $("btn-apply").onclick = async () => {
 async function apply() {
   const pend = pendingChange();
   if (!pend) return;
-  // Ask the Miniserver once more whether its config changed after the base.
-  await loadMs(true);
-  const stale = staleText();
+  // Ask the Miniserver once more whether its config changed after the base, and for the
+  // calendar entries edited in the app.
+  await Promise.all([loadMs(true), loadCal(true)]);
+  const stale = staleText(), cal = calDriftText();
   if (!window.confirm((stale ? `⚠ ${stale} Applying overwrites what changed there since.\n\n` : "") +
+    (cal ? `⚠ ${cal} Applying overwrites ${calDrift().length === 1 ? "it" : "them"}:\n${calDrift().map((d) => `  ${d.name}: ${d.kind === "changed" ? d.changes.join("; ") : d.kind}`).join("\n")}\n\n` : "") +
     "Deploy the pending changes to the Miniserver?\n\nlox config push uploads the config and restarts the Miniserver's program (a few seconds), " +
     "checks that it runs exactly the compiled config, then vislox commits and pushes to git.")) return;
   deployMsg("");
@@ -2496,10 +2566,12 @@ function connect() {
   const es = new EventSource("/api/events");
   // Changes while the stream was down (or before it opened) are not replayed: catch up.
   es.onopen = () => { setStatus("live", "live"); if (S.hist) loadHistory(); };
-  es.addEventListener("history", () => loadHistory(true));
+  // A new deployed revision may have taken over the app's calendar edits.
+  es.addEventListener("history", () => { loadHistory(true); loadCal(); });
   // `changed`: re-read it. `read` again unchanged: only an Apply waiting for a read cares.
   es.addEventListener("app", (e) => { if (e.data !== "read" || (S.deployed && !awaitedAppRead())) loadApp(); });
   es.addEventListener("actions", (e) => { if (S.hist) { S.hist.actions = JSON.parse(e.data); renderActions(); } });
+  es.addEventListener("calendar", () => loadCal());
   es.addEventListener("operate", (e) => { if (S.hist) { S.hist.operate = JSON.parse(e.data); renderHistory(); } });
   es.onerror = () => setStatus("disconnected — retrying", "error");
 }
@@ -2507,6 +2579,7 @@ S.hash = readHash();
 loadHistory().then(connect);
 loadMs();
 loadApp();
+loadCal();
 // The chip stays roughly current while the page is open.
 // Every minute, to notice a config saved on the Miniserver: the server asks only for its config
 // date again (reused for half a minute, so several tabs still ask once), and the full check every
