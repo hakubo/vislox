@@ -10,8 +10,6 @@ license = "Apache-2.0"
 loxone-config = { git = "https://github.com/discostu105/lox" }
 loxone-client = { git = "https://github.com/discostu105/lox" }
 serde_yaml = "0.9"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-getrandom = "0.2"
 anyhow = "1"
 axum = "0.8"
 tower-http = { version = "0.6", features = ["compression-gzip"] }

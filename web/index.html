@@ -99,31 +99,21 @@
   </section>
 
   <aside id="right" aria-label="History and changes">
-    <section class="pane hidden" id="ai-pane" aria-labelledby="ai-h">
-      <h2 class="pane-title" id="ai-h"><span>Change with AI</span>
+    <section class="pane hidden" id="deploy-pane" aria-labelledby="deploy-h">
+      <h2 class="pane-title" id="deploy-h"><span>Deploy</span>
         <button type="button" id="btn-sync" class="pull-btn" title="Make the Miniserver's running config the project's base (lox config merge), then commit and push">
           <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2v8M4.5 6.5 8 10l3.5-3.5M3 13h10" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
           <span class="lbl">Sync from Miniserver</span>
         </button>
       </h2>
-      <form id="ai-form" class="ai-form">
-        <textarea id="ai-prompt" rows="3" maxlength="4000" aria-label="Describe a change"
-          placeholder="Describe a change, e.g. “turn the hallway light on with motion after sunset”"></textarea>
-        <div class="ai-ctx" id="ai-ctx" aria-label="Context sent with the request"></div>
-        <div class="ai-row">
-          <button type="submit" id="ai-send" class="primary small">Send</button>
-          <span class="ai-hint" id="ai-hint" role="status" aria-live="polite"></span>
-        </div>
-      </form>
-      <div class="ai-reqs" id="ai-reqs"></div>
-      <div class="ai-deploy hidden" id="ai-deploy">
-        <div class="ai-pend" id="ai-pend"></div>
-        <div class="ai-row">
+      <div class="deploy">
+        <div class="deploy-pend" id="deploy-pend" role="status" aria-live="polite"></div>
+        <div class="deploy-row hidden" id="deploy-row">
           <button type="button" id="btn-apply" class="primary small" title="Deploy to the Miniserver with lox config push, then commit and push to git">Apply to Miniserver</button>
           <button type="button" id="btn-discard" class="ghost small" title="Put the module back to the last commit">Discard</button>
         </div>
       </div>
-      <div class="ai-msg hidden" id="ai-msg" role="status" aria-live="polite"></div>
+      <div class="deploy-msg hidden" id="deploy-msg" role="status" aria-live="polite"></div>
     </section>
     <section class="pane" id="hist-pane" aria-labelledby="hist-h">
       <h2 class="pane-title" id="hist-h"><span>History</span>
