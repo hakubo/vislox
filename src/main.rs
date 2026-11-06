@@ -16,6 +16,7 @@ mod reason;
 mod restart;
 mod session;
 mod source;
+mod structure;
 
 use anyhow::{Context, Result};
 use axum::extract::{Query, State};
@@ -92,6 +93,8 @@ struct App {
     views: Mutex<HashMap<(String, String), Arc<String>>>,
     tx: broadcast::Sender<u64>,
     live: Arc<live::Live>,
+    /// The Miniserver's structure file: what the app shows.
+    structure: Arc<structure::Structure>,
     pull: pull::Pull,
     log: log::Log,
     ms: miniserver::Miniserver,
@@ -218,13 +221,26 @@ async fn main() -> Result<()> {
         }
         Arc::new(operate::Operate::new(operate::Settings { off, user }, port))
     };
+    // The structure file comes with live values, or when a user asks for it;
+    // like the status chip, never with --no-live.
+    let structure = structure::Structure::new(
+        if args.no_live {
+            Err("turned off (--no-live)".to_string())
+        } else {
+            found.as_ref().map(|f| f.conn.clone()).map_err(Clone::clone)
+        },
+        found.as_ref().ok().map(|f| f.ms_dir.as_str()),
+    );
+    let live = live::Live::new(feed, live_source);
+    live.share_structure(structure.clone());
     let (tx, _) = broadcast::channel(16);
     let app = Arc::new(App {
         label: src.label.clone(),
         history: Mutex::new(history),
         views: Mutex::new(HashMap::new()),
         tx,
-        live: live::Live::new(feed, live_source),
+        live,
+        structure,
         pull,
         log,
         ms,
@@ -313,6 +329,9 @@ async fn main() -> Result<()> {
         .route("/api/live/retry", axum::routing::post(api_live_retry))
         .route("/api/miniserver", get(api_miniserver))
         .route("/api/log", get(api_log))
+        .route("/api/app", get(api_app))
+        .route("/api/app/load", axum::routing::post(api_app_load))
+        .route("/api/app/icon", get(api_app_icon))
         .route("/api/pull", axum::routing::post(api_pull))
         .route("/api/apply", axum::routing::post(api_apply))
         .route("/api/discard", axum::routing::post(api_discard))
@@ -560,7 +579,17 @@ async fn api_events(
             .event("operate")
             .data(o.operate.info().to_string()))
     });
-    Sse::new(history.merge(actions).merge(operate)).keep_alive(KeepAlive::default())
+    // The structure file: `changed` (the In the app section reads it again),
+    // or `read` again unchanged (only a browser waiting after Apply cares).
+    let app_changed = BroadcastStream::new(app.structure.subscribe()).map(|e| {
+        let what = match e {
+            Ok(structure::Event::Read) => "read",
+            _ => "changed",
+        };
+        Ok(Event::default().event("app").data(what))
+    });
+    Sse::new(history.merge(actions).merge(operate).merge(app_changed))
+        .keep_alive(KeepAlive::default())
 }
 
 /// Requests that make vislox talk to the Miniserver carry an `X-Vislox`
@@ -575,6 +604,70 @@ fn not_from_vislox(headers: &axum::http::HeaderMap) -> Option<Response> {
         )
             .into_response()
     })
+}
+
+/// What the app shows, from the last structure file read (`LoxAPP3.json`).
+async fn api_app(State(app): State<Arc<App>>) -> Response {
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        app.structure.json().to_string(),
+    )
+        .into_response()
+}
+
+/// Read the structure file from the Miniserver now (read-only, with lox's
+/// user). Needs the `X-Vislox` header, so another site cannot make vislox
+/// log in.
+async fn api_app_load(State(app): State<Arc<App>>, headers: axum::http::HeaderMap) -> Response {
+    if let Some(r) = not_from_vislox(&headers) {
+        return r;
+    }
+    match app.structure.load().await {
+        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({ "error": reason::explain(&e) })),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct IconQuery {
+    name: String,
+}
+
+/// An icon the structure file names, from the cache or the Miniserver.
+async fn api_app_icon(State(app): State<Arc<App>>, Query(q): Query<IconQuery>) -> Response {
+    match app.structure.icon(&q.name).await {
+        Ok(bytes) => {
+            let (ty, enc) = structure::icon_type(&bytes);
+            let mut r = (
+                [
+                    (header::CONTENT_TYPE, ty),
+                    // A name keeps its icon.
+                    (header::CACHE_CONTROL, "max-age=86400"),
+                    // The Miniserver's SVG, opened on its own, runs nothing.
+                    (
+                        header::CONTENT_SECURITY_POLICY,
+                        "default-src 'none'; style-src 'unsafe-inline'",
+                    ),
+                    (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+                ],
+                bytes,
+            )
+                .into_response();
+            if let Some(enc) = enc {
+                r.headers_mut().insert(
+                    header::CONTENT_ENCODING,
+                    header::HeaderValue::from_static(enc),
+                );
+            }
+            r
+        }
+        Err(None) => (StatusCode::NOT_FOUND, "not an icon of the structure file").into_response(),
+        Err(Some(e)) => (StatusCode::BAD_GATEWAY, e).into_response(),
+    }
 }
 
 /// A user turned live values on: after a session that stopped (blocked,

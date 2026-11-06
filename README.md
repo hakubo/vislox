@@ -58,6 +58,16 @@ marked so you can review it before you deploy.
   without a value. Those wires are faded ("Dim wires without a value" in the legend turns this off). Values
   show on the current, deployed revision only.
 
+- **In the app**: what a block looks like in the Loxone app. Properties shows whether the config shows it in the
+  app, in which room and category (changes marked old → new; showing, hiding or moving a block to another room or
+  category counts as a change),
+  and, from the Miniserver's structure file (`LoxAPP3.json`), the control type and the icons the app uses. Blocks
+  shown in the app carry a blue phone on the canvas (legend: *in the app*): only they and the periphery have live
+  values, and a block that is not in the app says so. The sidebar tree shows rooms and categories with the app's
+  icons. On the revision the Miniserver runs, a block the config shows that the app lacks, or has in another room
+  or category, gets a warning; after Apply, **Changed by this Apply** runs the same check on the changed blocks
+  (and on removed blocks the app still shows) against the first structure file read after the Apply started.
+
 - **Apply, Sync, Discard** (for a `lox.toml` project, when started with an admin token): edit the project's Lox
   Logic module and compile it with `lox logic`, by hand or with an agent of your own working in the repository
   (see [docs/agent-workflow.md](docs/agent-workflow.md)). The compile shows as the pending revision, so you
@@ -167,6 +177,25 @@ vislox ~/loxone-config/project --admin-token-file ~/.config/vislox/admin-token
   needs credentials for the project's remote. A verified push makes lox point `base` at its download in
   `backups/` (git-ignored); Apply copies that download over the project's base file and points lox.toml back at
   it, so the deployed config stays in git.
+
+### In the app
+
+The structure file (`LoxAPP3.json`) is read, read-only and with lox's user, when live values start (each live
+session reads it anyway), and when a user clicks *Read from the Miniserver* in Properties (`POST /api/app/load`,
+which needs an `X-Vislox` header). vislox never reads it on its own. The last one is kept per Miniserver (serial,
+else address) in `VISLOX_CACHE`, else `$XDG_CACHE_HOME/vislox`, else `~/.cache/vislox`, so the next start has it;
+Properties says when it was read. Reading the same file again only counts the read, so browsers re-render only
+when it changed. Icons are downloaded by the name the structure file gives
+(`IconsFilled/lightbulb.svg`, or an older UUID, fetched as `<uuid>.svg`; SVG comes as text, often gzipped, PNG as
+binary) and cached next to it once they arrived whole: a name keeps its icon, and one name is downloaded once at a
+time. `GET /api/app/icon?name=…` serves only names the structure
+file lists, so it cannot be used to read anything else from the Miniserver. With `--no-live` nothing is read.
+
+The structure file belongs to the config the Miniserver runs: mismatches are shown only on that revision (the
+current one, not *Pending*). The config side (shown, room, category) comes from each block's `<IoData>`, so a
+pending change already shows how it will look.
+
+Not built yet: an *App* view that lists the controls by room the way the app does.
 
 ### Miniserver status
 
@@ -296,6 +325,8 @@ The binary is an `axum` server with the UI embedded (plain JS and SVG, no build 
 - `src/miniserver.rs` checks the Miniserver for the status chip and the preflight before Pull, Apply and Sync
   (`GET /api/miniserver`), including that the serial at the address is the config's, and when its config last
   changed; `src/configdate.rs` finds the same date for the base, in the download it came from.
+- `src/structure.rs` keeps the Miniserver's structure file (`LoxAPP3.json`) for the In the app section
+  (`GET /api/app`), caches it and its icons on disk (`GET /api/app/icon`), and reads it again on request.
 - `src/discover.rs` is Loxone's UDP discovery (`vislox --discover`, and finding a Miniserver whose address
   changed).
 - `src/operate.rs` sends the commands of `--operate` to virtual inputs (`POST /api/operate`, with the admin
