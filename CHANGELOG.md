@@ -14,6 +14,11 @@ published under the same version (see [docker/README.md](docker/README.md)).
   (`<module>/vislox/<page>.loxl`) and runs `lox logic compile`, which mints the block and places it. It shows in
   the pending revision and the Changes list as added, is edited in Properties like any block, and has *Remove*
   until it is deployed. Never deploys (#59).
+- Move blocks: drag a block the module manages on the page (or Alt and an arrow key), snapped to Loxone Config's
+  grid, its wires following. lox keeps a managed block's position in the lockfile, so vislox writes it there and
+  runs `lox logic compile`; the move shows in the pending revision as *moved*, with Revert. *Arrange* lays out a
+  page's managed blocks afresh (`--relayout`). Blocks Loxone Config drew, and input and output references, are
+  not moved: lox writes no position for them. Never deploys (#60).
 - Fixed: Discard failed when the last commit had no lockfile (the first compile writes one), or one was staged
   but not committed. Discard now reads the last commit, never deletes a lock vislox did not write (one not in git
   goes back to how it was before vislox's first edit), and puts everything back when a step fails.

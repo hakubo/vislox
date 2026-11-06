@@ -16,12 +16,14 @@
 
 use crate::blocks::{self, NewBlock, PageFile};
 use loxone_config::connectors::{self, PortDir, PortUnit};
+use loxone_config::layout::GRID;
+use loxone_config::lock::Layout;
 use loxone_config::logic::{ArgItem, Attr, BindingKind, Item, MatchSpec, Module, Value};
 use loxone_config::port_names;
 use loxone_config::xml::Element;
 use loxone_config::{LoxoneDoc, logic};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 /// vislox's own file in the module directory, for the values it claims.
@@ -79,6 +81,15 @@ pub enum Op {
     /// Take out a block added here that is not deployed yet. Its `previous`
     /// is the `add_block` that adds it again.
     RemoveBlock { uuid: String },
+    /// Move a block the module manages (#60): its top left corner to
+    /// (`x`, `y`) on its page, snapped to Loxone Config's grid. lox keeps a
+    /// managed block's position in the lockfile, not in the source, so this
+    /// is written there ([`write_moves`]). Its `previous` is the `move` back.
+    Move { uuid: String, x: i64, y: i64 },
+    /// Lay out the managed blocks of the page with UUID `page` afresh, as
+    /// lox places new blocks (`lox logic compile --relayout`). Its
+    /// `previous` is the list of `move`s that put each block back.
+    Relayout { page: String },
 }
 
 impl Op {
@@ -90,12 +101,13 @@ impl Op {
             | Op::Category { uuid, .. }
             | Op::Param { uuid, .. }
             | Op::Setting { uuid, .. }
-            | Op::RemoveBlock { uuid } => Some(uuid),
-            Op::AddBlock { .. } => None,
+            | Op::RemoveBlock { uuid }
+            | Op::Move { uuid, .. } => Some(uuid),
+            Op::AddBlock { .. } | Op::Relayout { .. } => None,
         }
     }
 
-    /// The value it sets (`None` also for a block op).
+    /// The value it sets (`None` also for a block op or a move).
     pub fn value(&self) -> Option<&str> {
         match self {
             Op::Title { value, .. }
@@ -103,7 +115,10 @@ impl Op {
             | Op::Category { value, .. }
             | Op::Param { value, .. }
             | Op::Setting { value, .. } => value.as_deref(),
-            Op::AddBlock { .. } | Op::RemoveBlock { .. } => None,
+            Op::AddBlock { .. }
+            | Op::RemoveBlock { .. }
+            | Op::Move { .. }
+            | Op::Relayout { .. } => None,
         }
     }
 
@@ -116,7 +131,10 @@ impl Op {
             | Op::Category { value, .. }
             | Op::Param { value, .. }
             | Op::Setting { value, .. } => *value = v,
-            Op::AddBlock { .. } | Op::RemoveBlock { .. } => {}
+            Op::AddBlock { .. }
+            | Op::RemoveBlock { .. }
+            | Op::Move { .. }
+            | Op::Relayout { .. } => {}
         }
         op
     }
@@ -488,7 +506,10 @@ impl Claims {
             Op::Category { .. } => c.attrs.get(&Which::Category).cloned(),
             Op::Param { port, .. } => c.sets.get(port_names::name_of(ty, port)).map(plain),
             Op::Setting { name, .. } => c.sets.get(name).map(plain),
-            Op::AddBlock { .. } | Op::RemoveBlock { .. } => None,
+            Op::AddBlock { .. }
+            | Op::RemoveBlock { .. }
+            | Op::Move { .. }
+            | Op::Relayout { .. } => None,
         }
     }
 
@@ -588,7 +609,7 @@ pub fn apply(
 ) -> Result<Option<String>, String> {
     let uuid = op
         .uuid()
-        .filter(|_| !matches!(op, Op::RemoveBlock { .. }))
+        .filter(|_| !matches!(op, Op::RemoveBlock { .. } | Op::Move { .. }))
         .ok_or_else(|| "not a value".to_string())?;
     let el = find(&doc.xml.root, uuid)
         .ok_or_else(|| format!("no object {uuid} in the pending config"))?;
@@ -675,7 +696,9 @@ pub fn apply(
             };
             (Err(setting.clone()), v)
         }
-        Op::AddBlock { .. } | Op::RemoveBlock { .. } => unreachable!("not a value"),
+        Op::AddBlock { .. } | Op::RemoveBlock { .. } | Op::Move { .. } | Op::Relayout { .. } => {
+            unreachable!("not a value")
+        }
     };
     let claim = claims.0.entry(uuid.to_string()).or_default();
     claim.ty = ty;
@@ -701,12 +724,17 @@ pub fn apply(
 
 // ── vislox's files, and the blocks it adds ──────────────────────────────
 
-/// What the lockfile says about managed blocks: slug → UUID, and the slugs
-/// of its removal tombstones (not to be picked again).
+/// What the lockfile says about managed blocks: slug → UUID, the slugs of
+/// its removal tombstones (not to be picked again), and where the blocks
+/// drawn on a page are.
 #[derive(Default, Clone, Debug)]
 pub struct Lock {
     pub slugs: BTreeMap<String, String>,
     pub tombstones: BTreeSet<String>,
+    /// The blocks lox keeps a position (`layout`) for, so drawn on a page
+    /// (#60): slug → the page it pins them to (`page_uuid`; `None` in a lock
+    /// from before lox pinned pages). Objects of the object tree have none.
+    pub placed: BTreeMap<String, Option<String>>,
 }
 
 impl Lock {
@@ -735,7 +763,27 @@ impl Lock {
                     .collect()
             })
             .unwrap_or_default();
-        Lock { slugs, tombstones }
+        let placed = v
+            .get("objects")
+            .and_then(|o| o.as_object())
+            .map(|o| {
+                o.iter()
+                    .filter(|(_, x)| x.get("layout").is_some_and(|l| l.is_object()))
+                    .map(|(s, x)| {
+                        let page = x
+                            .get("page_uuid")
+                            .and_then(|p| p.as_str())
+                            .map(String::from);
+                        (s.clone(), page)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Lock {
+            slugs,
+            tombstones,
+            placed,
+        }
     }
 
     pub fn slug_of(&self, uuid: &str) -> Option<&str> {
@@ -759,6 +807,21 @@ pub struct Files {
     /// The files there were. [`FILE`] stays once there, empty or not; a
     /// page file goes with its last block.
     pub present: BTreeSet<String>,
+    /// What an edit moves (#60). Not a file of vislox's: lox keeps a managed
+    /// block's position in the lockfile, so it is written there.
+    pub layout: Placement,
+}
+
+/// The positions an edit gives managed blocks, and the pages it lays out
+/// afresh. lox has no Lox Logic statement for a position: it keeps the
+/// rectangle of each block it manages in the lockfile, and takes a move
+/// made in Loxone Config over from the base.
+#[derive(Default, Clone, Debug, PartialEq)]
+pub struct Placement {
+    /// Slug → its new rectangle.
+    pub moves: BTreeMap<String, Layout>,
+    /// The pages to lay out afresh: UUID → the title lox takes (`--relayout`).
+    pub relayout: BTreeMap<String, String>,
 }
 
 /// The name of [`FILE`] in [`DIR`].
@@ -981,6 +1044,8 @@ pub fn apply_op(files: &mut Files, ctx: &Ctx, op: &Op) -> Result<Applied, String
     match op {
         Op::AddBlock { .. } => add_block(files, ctx, op),
         Op::RemoveBlock { uuid } => remove_block(files, ctx, uuid),
+        Op::Move { uuid, x, y } => move_block(files, ctx, uuid, *x, *y),
+        Op::Relayout { page } => relayout(files, ctx, page),
         _ => {
             let uuid = op.uuid().unwrap_or_default();
             match ctx.lock.slug_of(uuid) {
@@ -1188,6 +1253,255 @@ fn remove_block(files: &mut Files, ctx: &Ctx, uuid: &str) -> Result<Applied, Str
     })
 }
 
+// ── moving blocks (#60) ─────────────────────────────────────────────────
+
+/// The farthest a block is moved from the page's origin, in twips: well
+/// past any sheet Loxone Config draws (A0 is about 67 000 wide).
+const MAX_COORD: i64 = 1_000_000;
+
+/// `v` on Loxone Config's grid: it snaps positions to multiples of
+/// [`GRID`] on save.
+pub fn snap(v: i64) -> i64 {
+    (v + GRID / 2).div_euclid(GRID) * GRID
+}
+
+/// The `move` that puts the block `uuid` back where `doc` draws it.
+fn move_back(doc: &LoxoneDoc, uuid: &str) -> Option<Op> {
+    let at = Layout::of_element(find(&doc.xml.root, uuid)?)?;
+    Some(Op::Move {
+        uuid: uuid.to_string(),
+        x: at.px,
+        y: at.py,
+    })
+}
+
+/// Where `base` draws the managed block `slug`, on the page the lock pins it
+/// to: the rectangle lox takes over unless it is superseded.
+fn base_rect(base: &LoxoneDoc, lock: &Lock, slug: &str) -> Option<Layout> {
+    let (page, at) = drawn_at(base, lock.uuid_of(slug)?)?;
+    lock.placed
+        .get(slug)?
+        .as_deref()
+        .is_none_or(|p| p == page)
+        .then_some(at)
+}
+
+/// Move a block the module manages. lox writes the position of the blocks
+/// it manages only; one Loxone Config drew is moved there (or adopted
+/// first, #72).
+fn move_block(files: &mut Files, ctx: &Ctx, uuid: &str, x: i64, y: i64) -> Result<Applied, String> {
+    let el = find(&ctx.doc.xml.root, uuid)
+        .ok_or_else(|| format!("no object {uuid} in the pending config"))?;
+    let name = el.attr_decoded("Title").unwrap_or_default().into_owned();
+    let Some(slug) = ctx.lock.slug_of(uuid) else {
+        return Err(format!(
+            "{name}: lox moves only the blocks the module manages, and this one was drawn in \
+             Loxone Config; move it there"
+        ));
+    };
+    let (Some(now), true) = (Layout::of_element(el), ctx.lock.placed.contains_key(slug)) else {
+        return Err(format!("{name} is not drawn on a page"));
+    };
+    if x.abs() > MAX_COORD || y.abs() > MAX_COORD {
+        return Err(format!("{name}: that is too far off the page"));
+    }
+    // Within a grid step of where the base draws it, lox keeps the base's
+    // rectangle as it is: that is where it goes (Revert, on the grid or
+    // not). Anywhere else: on the grid, and not past the page's top left.
+    let want = Layout::at(x, y, now.w(), now.h());
+    let at = match base_rect(ctx.base, ctx.lock, slug) {
+        Some(b) if b.same_spot(&want) => b,
+        _ => Layout::at(snap(x).max(0), snap(y).max(0), now.w(), now.h()),
+    };
+    files.layout.moves.insert(slug.to_string(), at);
+    Ok(Applied {
+        previous: serde_json::to_value(move_back(ctx.doc, uuid)).unwrap_or_default(),
+        added: None,
+    })
+}
+
+/// The title lox lays the page `page` out by (`--relayout <title>`), or why
+/// it cannot: the base has no such page, another page has its title (lox
+/// would lay out both), or the lock pins no block `doc` draws there to it.
+pub fn relayout_title(
+    base: &LoxoneDoc,
+    doc: &LoxoneDoc,
+    lock: &Lock,
+    page: &str,
+) -> Result<String, String> {
+    let pg = find(&base.xml.root, page)
+        .filter(|e| e.attr("Type") == Some("Page"))
+        .ok_or_else(|| format!("no page {page} in the project's base config"))?;
+    let title = pg.attr_decoded("Title").unwrap_or_default().into_owned();
+    let mut same = Vec::new();
+    pages_titled(&base.xml.root, &title, &mut same);
+    if title.trim().is_empty() || same.len() != 1 {
+        return Err(format!(
+            "lox lays out a page by its title, and {} pages are titled \"{title}\"; rename one in \
+             Loxone Config first",
+            same.len()
+        ));
+    }
+    let drawn_here = |slug: &str| {
+        lock.uuid_of(slug)
+            .and_then(|u| drawn_at(doc, u))
+            .is_some_and(|(q, _)| q == page)
+    };
+    let pinned = |p: Option<&str>| {
+        lock.placed
+            .iter()
+            .any(|(s, q)| q.as_deref() == p && drawn_here(s))
+    };
+    if pinned(Some(page)) {
+        Ok(title)
+    } else if pinned(None) {
+        Err(format!(
+            "{title}: the lockfile does not say which page its blocks are on (an older lox wrote \
+             it); compile the module once with lox logic compile"
+        ))
+    } else {
+        Err(format!(
+            "{title}: the module manages no block on this page, and lox lays out only those"
+        ))
+    }
+}
+
+/// Lay out the page's managed blocks afresh, where their wires want them.
+/// lox moves only the blocks it manages; one wired to a reference the
+/// module does not manage stays beside it.
+fn relayout(files: &mut Files, ctx: &Ctx, page: &str) -> Result<Applied, String> {
+    let title = relayout_title(ctx.base, ctx.doc, ctx.lock, page)?;
+    let back: Vec<Op> = ctx
+        .lock
+        .placed
+        .iter()
+        .filter(|(_, p)| p.as_deref() == Some(page))
+        .filter_map(|(s, _)| move_back(ctx.doc, ctx.lock.uuid_of(s)?))
+        .collect();
+    files.layout.relayout.insert(page.to_string(), title);
+    Ok(Applied {
+        previous: serde_json::to_value(back).unwrap_or_default(),
+        added: None,
+    })
+}
+
+/// The page `uuid` is drawn on in `doc`, and its rectangle there.
+fn drawn_at(doc: &LoxoneDoc, uuid: &str) -> Option<(String, Layout)> {
+    fn walk(el: &Element, page: Option<&str>, uuid: &str) -> Option<(String, Layout)> {
+        let page = if el.attr("Type") == Some("Page") {
+            el.attr("U")
+        } else {
+            page
+        };
+        if el.attr("U") == Some(uuid) {
+            return Some((page?.to_string(), Layout::of_element(el)?));
+        }
+        el.child_elements().find_map(|c| walk(c, page, uuid))
+    }
+    if uuid.is_empty() {
+        return None;
+    }
+    walk(&doc.xml.root, None, uuid)
+}
+
+/// Every object `doc` draws on a page, by UUID: its page and rectangle.
+pub fn drawn(doc: &LoxoneDoc) -> HashMap<String, (String, Layout)> {
+    fn walk(el: &Element, page: Option<&str>, out: &mut HashMap<String, (String, Layout)>) {
+        let page = if el.attr("Type") == Some("Page") {
+            el.attr("U")
+        } else {
+            page
+        };
+        if let (Some(p), Some(u), Some(at)) = (page, el.attr("U"), Layout::of_element(el)) {
+            out.insert(u.to_string(), (p.to_string(), at));
+        }
+        for c in el.child_elements() {
+            walk(c, page, out);
+        }
+    }
+    let mut out = HashMap::new();
+    walk(&doc.xml.root, None, &mut out);
+    out
+}
+
+/// The lockfile `lock` with `moves` written in, the way lox's own placement
+/// leaves a block it moved (`--relayout`): the new rectangle (`layout`),
+/// and the one the base still draws (`superseded_layout`). Without the
+/// latter, the compile would take the base's position back as a move made
+/// in Loxone Config. Once the base draws the block at its new place (after
+/// Apply), lox drops the line itself.
+pub fn write_moves(
+    lock: &[u8],
+    base: &LoxoneDoc,
+    moves: &BTreeMap<String, Layout>,
+) -> Result<Vec<u8>, String> {
+    let mut v: serde_json::Value =
+        serde_json::from_slice(lock).map_err(|e| format!("cannot read the lock: {e}"))?;
+    let shown = drawn(base);
+    for (slug, at) in moves {
+        let obj = v
+            .get_mut("objects")
+            .and_then(|o| o.get_mut(slug))
+            .and_then(|o| o.as_object_mut())
+            .ok_or_else(|| format!("the lock has no block {slug}"))?;
+        let uuid = obj
+            .get("uuid")
+            .and_then(|u| u.as_str())
+            .filter(|u| !u.is_empty())
+            .ok_or_else(|| format!("the lock has no UUID for block {slug}"))?;
+        let page = obj.get("page_uuid").and_then(|p| p.as_str());
+        let superseded = shown
+            .get(uuid)
+            .filter(|(p, _)| page.is_none_or(|q| q == p))
+            .map(|(_, l)| *l)
+            .filter(|l| !l.same_spot(at));
+        obj.insert("layout".into(), serde_json::json!(at));
+        match superseded {
+            Some(l) => obj.insert("superseded_layout".into(), serde_json::json!(l)),
+            None => obj.remove("superseded_layout"),
+        };
+    }
+    let mut out = serde_json::to_vec_pretty(&v).map_err(|e| e.to_string())?;
+    out.push(b'\n');
+    Ok(out)
+}
+
+/// The moves of `place` that lox did not keep: `out` does not draw the
+/// block where it goes (by `lock`'s UUIDs). lox keeps the base's own
+/// rectangle for a move within a grid step of it, so `out` drawing it there
+/// keeps that move too. A move on a page laid out afresh is not checked:
+/// lox places those blocks anew.
+pub fn moves_missed(
+    out: &LoxoneDoc,
+    base: &LoxoneDoc,
+    lock: &Lock,
+    place: &Placement,
+) -> Vec<String> {
+    let relaid = |slug: &str| {
+        lock.placed
+            .get(slug)
+            .and_then(|p| p.as_deref())
+            .is_some_and(|p| place.relayout.contains_key(p))
+    };
+    place
+        .moves
+        .iter()
+        .filter(|(slug, _)| !relaid(slug))
+        .filter(|(slug, at)| {
+            let Some(d) = lock
+                .uuid_of(slug)
+                .and_then(|u| Layout::of_element(find(&out.xml.root, u)?))
+            else {
+                return true;
+            };
+            let base_kept = base_rect(base, lock, slug)
+                .is_some_and(|b| b.same_spot(at) && (d.px, d.py) == (b.px, b.py));
+            (d.px, d.py) != (at.px, at.py) && !base_kept
+        })
+        .map(|(s, _)| s.clone())
+        .collect()
+}
+
 /// A value of a block vislox added: its name, an unwired input's constant,
 /// or a setting lox takes in the declaration (`Formula:`, `Type:`, `At:`, …).
 /// lox has no room or category for a managed block.
@@ -1329,7 +1643,9 @@ pub fn current(doc: &LoxoneDoc, op: &Op) -> Option<String> {
         }
         // A block setting may be stored under another name (`At:` is `Sec=`).
         Op::Setting { name, .. } => decoded(el, connectors::attr_name(ty, name)),
-        Op::AddBlock { .. } | Op::RemoveBlock { .. } => None,
+        Op::AddBlock { .. } | Op::RemoveBlock { .. } | Op::Move { .. } | Op::Relayout { .. } => {
+            None
+        }
     }
 }
 
@@ -1685,6 +2001,12 @@ mod tests {
                 .map(|(s, o)| (s.clone(), o.uuid.clone()))
                 .collect(),
             tombstones: l.removed.values().map(|t| t.slug.clone()).collect(),
+            placed: l
+                .objects
+                .iter()
+                .filter(|(_, o)| o.layout.is_some())
+                .map(|(s, o)| (s.clone(), o.page_uuid.clone()))
+                .collect(),
         }
     }
 
@@ -2064,7 +2386,395 @@ mod tests {
         .unwrap();
         let l = Lock::read(&lock);
         assert_eq!((l.slug_of("U1"), l.uuid_of("a")), (Some("a"), Some("U1")));
+        assert!(l.placed.is_empty());
+        std::fs::write(
+            &lock,
+            r#"{"objects":{"a":{"uuid":"U1","type":"And","page_uuid":"P","layout":{"px":96,"py":192,"px2":960,"py2":768}}}}"#,
+        )
+        .unwrap();
+        assert_eq!(Lock::read(&lock).placed["a"].as_deref(), Some("P"));
         assert!(l.tombstones.contains("b"));
         assert!(Lock::read(&tmp.path().join("none")).slugs.is_empty());
+    }
+
+    /// `lock` with `moves` written in, as the next compile reads it.
+    fn moved(l: &Lockfile, base: &LoxoneDoc, moves: &BTreeMap<String, Layout>) -> Lockfile {
+        serde_json::from_slice(&write_moves(l.to_json().as_bytes(), base, moves).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn a_managed_block_is_moved_through_the_lock() {
+        let d = doc("house.Loxone");
+        let names = BTreeSet::new();
+        let mut files = Files::default();
+        let mut l = Lockfile::default();
+        let lock = lock_of(&l);
+        let ctx = Ctx {
+            doc: &d,
+            lock: &lock,
+            base: &d,
+            deployed: None,
+            names: &names,
+        };
+        apply_op(&mut files, &ctx, &add(OG, "And", Some("Licht"), &[], &[])).unwrap();
+        // Deployed: the base draws it where lox placed it.
+        let base = compile_files(&d, &files, &mut l).unwrap();
+        let uuid = l.objects["vx_and_1"].uuid.clone();
+        let placed = Layout::of_element(find(&base.xml.root, &uuid).unwrap()).unwrap();
+        let lock = lock_of(&l);
+        assert_eq!(lock.placed["vx_and_1"].as_deref(), Some(OG));
+        let ctx = Ctx {
+            doc: &base,
+            lock: &lock,
+            base: &base,
+            deployed: Some(&base),
+            names: &names,
+        };
+        // Snapped to the grid, the size kept; `previous` moves it back.
+        let mut files = Files::from_texts(&files.render()).unwrap();
+        let (x, y) = (placed.px + 2000, placed.py + 1010);
+        let a = apply_op(
+            &mut files,
+            &ctx,
+            &Op::Move {
+                uuid: uuid.clone(),
+                x,
+                y,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::from_value::<Op>(a.previous).unwrap(),
+            Op::Move {
+                uuid: uuid.clone(),
+                x: placed.px,
+                y: placed.py
+            }
+        );
+        let to = files.layout.moves["vx_and_1"];
+        assert_eq!((to.px % GRID, to.py % GRID), (0, 0));
+        assert_eq!((to.px, to.py), (snap(x), snap(y)));
+        assert_eq!((to.w(), to.h()), (placed.w(), placed.h()));
+        // Not a file: vislox's files are as they were.
+        assert_eq!(
+            Files::from_texts(&files.render()).unwrap().pages,
+            files.pages
+        );
+
+        // The lock alone is not enough: lox takes the base's position back
+        // as a move made in Loxone Config.
+        let mut plain = l.clone();
+        plain.objects.get_mut("vx_and_1").unwrap().layout = Some(to);
+        let out = compile_files(&base, &files, &mut plain).unwrap();
+        let at = Layout::of_element(find(&out.xml.root, &uuid).unwrap()).unwrap();
+        assert_eq!((at.px, at.py), (placed.px, placed.py));
+        // With the position the base still shows superseded, the move holds,
+        // and keeps holding on the next compile.
+        let mut l2 = moved(&l, &base, &files.layout.moves);
+        assert_eq!(l2.objects["vx_and_1"].superseded_layout, Some(placed));
+        for _ in 0..2 {
+            let out = compile_files(&base, &files, &mut l2).unwrap();
+            let at = Layout::of_element(find(&out.xml.root, &uuid).unwrap()).unwrap();
+            assert_eq!((at.px, at.py), (to.px, to.py));
+            assert!(moves_missed(&out, &base, &lock_of(&l2), &files.layout).is_empty());
+        }
+        // Once applied, the base draws it there, and lox drops the line.
+        let applied = compile_files(&base, &files, &mut l2).unwrap();
+        compile_files(&applied, &files, &mut l2).unwrap();
+        assert_eq!(l2.objects["vx_and_1"].superseded_layout, None);
+
+        // Back where the base draws it: nothing superseded.
+        let back = Placement {
+            moves: BTreeMap::from([("vx_and_1".to_string(), placed)]),
+            ..Default::default()
+        };
+        let mut l3 = moved(&l2, &base, &back.moves);
+        assert_eq!(l3.objects["vx_and_1"].superseded_layout, None);
+        let out = compile_files(&base, &files, &mut l3).unwrap();
+        assert!(moves_missed(&out, &base, &lock_of(&l3), &back).is_empty());
+        assert!(!moves_missed(&out, &base, &lock_of(&l3), &files.layout).is_empty());
+    }
+
+    #[test]
+    fn only_managed_blocks_on_a_page_are_moved_or_laid_out() {
+        let d = doc("house.Loxone");
+        let names = BTreeSet::new();
+        let mut files = Files::default();
+        let mut l = Lockfile::default();
+        let lock = lock_of(&l);
+        let ctx = Ctx {
+            doc: &d,
+            lock: &lock,
+            base: &d,
+            deployed: None,
+            names: &names,
+        };
+        apply_op(&mut files, &ctx, &add(OG, "And", None, &[], &[])).unwrap();
+        apply_op(&mut files, &ctx, &add(OG, "Or", None, &[], &[])).unwrap();
+        let out = compile_files(&d, &files, &mut l).unwrap();
+        let lock = lock_of(&l);
+        let ctx = Ctx {
+            doc: &out,
+            lock: &lock,
+            base: &d,
+            deployed: None,
+            names: &names,
+        };
+        let err = |op: Op| apply_op(&mut files.clone(), &ctx, &op).unwrap_err();
+        // Drawn in Loxone Config: lox does not move it.
+        let e = err(Op::Move {
+            uuid: DIV.into(),
+            x: 0,
+            y: 0,
+        });
+        assert!(e.contains("drawn in Loxone Config"), "{e}");
+        let and = l.objects["vx_and_1"].uuid.clone();
+        let e = err(Op::Move {
+            uuid: and.clone(),
+            x: 5_000_000,
+            y: 0,
+        });
+        assert!(e.contains("too far"), "{e}");
+        assert!(
+            err(Op::Move {
+                uuid: "nope".into(),
+                x: 0,
+                y: 0
+            })
+            .contains("no object")
+        );
+        // A page without managed blocks has nothing lox lays out.
+        let e = err(Op::Relayout { page: EG.into() });
+        assert!(e.contains("manages no block on this page"), "{e}");
+        assert!(err(Op::Relayout { page: DIV.into() }).contains("no page"));
+        let a = apply_op(&mut files, &ctx, &Op::Relayout { page: OG.into() }).unwrap();
+        assert_eq!(
+            files.layout.relayout,
+            BTreeMap::from([(OG.to_string(), "Obergeschoss".to_string())])
+        );
+        // `previous` puts each block back.
+        let back: Vec<Op> = serde_json::from_value(a.previous).unwrap();
+        assert_eq!(back.len(), 2);
+        assert!(back.iter().all(|o| matches!(o, Op::Move { .. })));
+        assert!(back.iter().any(|o| o.uuid() == Some(and.as_str())));
+    }
+
+    #[test]
+    fn snapping_follows_loxone_configs_grid() {
+        assert_eq!(snap(0), 0);
+        assert_eq!(snap(47), 0);
+        assert_eq!(snap(48), 96);
+        assert_eq!(snap(1000), 960);
+        assert_eq!(snap(-47), 0);
+        assert_eq!(snap(-49), -96);
+    }
+
+    /// `doc` with the element `uuid` drawn at (`px`, `py`), its size kept.
+    fn drawn_moved(doc: &LoxoneDoc, uuid: &str, px: i64, py: i64) -> LoxoneDoc {
+        let at = Layout::of_element(find(&doc.xml.root, uuid).unwrap()).unwrap();
+        let text = String::from_utf8(doc.to_bytes()).unwrap();
+        let line = text
+            .lines()
+            .find(|l| l.contains(&format!("U=\"{uuid}\"")))
+            .unwrap();
+        let new = line
+            .replace(&format!("Px=\"{}\"", at.px), &format!("Px=\"{px}\""))
+            .replace(&format!("Py=\"{}\"", at.py), &format!("Py=\"{py}\""))
+            .replace(
+                &format!("Px2=\"{}\"", at.px2),
+                &format!("Px2=\"{}\"", px + at.w()),
+            )
+            .replace(
+                &format!("Py2=\"{}\"", at.py2),
+                &format!("Py2=\"{}\"", py + at.h()),
+            );
+        LoxoneDoc::parse(text.replace(line, &new).as_bytes()).unwrap()
+    }
+
+    #[test]
+    fn a_block_off_the_grid_is_moved_away_and_back_and_never_past_the_top_left() {
+        let d = doc("house.Loxone");
+        let names = BTreeSet::new();
+        let mut files = Files::default();
+        let mut l = Lockfile::default();
+        let lock = lock_of(&l);
+        let ctx = Ctx {
+            doc: &d,
+            lock: &lock,
+            base: &d,
+            deployed: None,
+            names: &names,
+        };
+        apply_op(&mut files, &ctx, &add(OG, "And", None, &[], &[])).unwrap();
+        let out = compile_files(&d, &files, &mut l).unwrap();
+        let uuid = l.objects["vx_and_1"].uuid.clone();
+        // Deployed off the grid (moved in Loxone Config): lox takes it over.
+        let placed = Layout::of_element(find(&out.xml.root, &uuid).unwrap()).unwrap();
+        let (bx, by) = (placed.px + 4800 + 48, placed.py + 960 + 24);
+        let base = drawn_moved(&out, &uuid, bx, by);
+        let out = compile_files(&base, &files, &mut l).unwrap();
+        assert_eq!(
+            Layout::of_element(find(&out.xml.root, &uuid).unwrap()).map(|a| (a.px, a.py)),
+            Some((bx, by))
+        );
+        let mv = |files: &mut Files, l: &Lockfile, out: &LoxoneDoc, x, y| {
+            let lock = lock_of(l);
+            let ctx = Ctx {
+                doc: out,
+                lock: &lock,
+                base: &base,
+                deployed: Some(&base),
+                names: &names,
+            };
+            files.layout = Placement::default();
+            apply_op(
+                files,
+                &ctx,
+                &Op::Move {
+                    uuid: uuid.clone(),
+                    x,
+                    y,
+                },
+            )
+            .unwrap()
+        };
+        // Away: snapped to the grid.
+        let a = mv(&mut files, &l, &out, bx + 2000, by);
+        assert_eq!(
+            serde_json::from_value::<Op>(a.previous).unwrap(),
+            Op::Move {
+                uuid: uuid.clone(),
+                x: bx,
+                y: by
+            }
+        );
+        let to = files.layout.moves["vx_and_1"];
+        assert_eq!((to.px, to.py), (snap(bx + 2000), snap(by)));
+        let mut l2 = moved(&l, &base, &files.layout.moves);
+        let away = compile_files(&base, &files, &mut l2).unwrap();
+        assert!(moves_missed(&away, &base, &lock_of(&l2), &files.layout).is_empty());
+
+        // Back (Revert): to the deployed position as it is, off the grid; lox
+        // keeps the base's rectangle, and that counts as kept.
+        mv(&mut files, &l2, &away, bx, by);
+        let to = files.layout.moves["vx_and_1"];
+        assert_eq!((to.px, to.py), (bx, by));
+        let mut l3 = moved(&l2, &base, &files.layout.moves);
+        assert_eq!(l3.objects["vx_and_1"].superseded_layout, None);
+        let back = compile_files(&base, &files, &mut l3).unwrap();
+        assert!(moves_missed(&back, &base, &lock_of(&l3), &files.layout).is_empty());
+        // A snapped target within a grid step of it is kept the same way.
+        let near = Placement {
+            moves: BTreeMap::from([(
+                "vx_and_1".to_string(),
+                Layout::at(snap(bx), snap(by), to.w(), to.h()),
+            )]),
+            ..Default::default()
+        };
+        assert!(moves_missed(&back, &base, &lock_of(&l3), &near).is_empty());
+
+        // Never past the page's top left.
+        mv(&mut files, &l3, &back, -500, -10);
+        let to = files.layout.moves["vx_and_1"];
+        assert_eq!((to.px, to.py), (0, 0));
+    }
+
+    #[test]
+    fn only_moves_on_a_page_laid_out_afresh_go_unchecked() {
+        let d = doc("house.Loxone");
+        let names = BTreeSet::new();
+        let mut files = Files::default();
+        let mut l = Lockfile::default();
+        let lock = lock_of(&l);
+        let ctx = Ctx {
+            doc: &d,
+            lock: &lock,
+            base: &d,
+            deployed: None,
+            names: &names,
+        };
+        apply_op(&mut files, &ctx, &add(OG, "And", None, &[], &[])).unwrap();
+        apply_op(&mut files, &ctx, &add(EG, "Or", None, &[], &[])).unwrap();
+        let out = compile_files(&d, &files, &mut l).unwrap();
+        let lock = lock_of(&l);
+        // Neither move is in `out`: only the one on the page not laid out is missed.
+        let far = Layout::at(19200, 9600, 1344, 696);
+        let place = Placement {
+            moves: BTreeMap::from([("vx_and_1".to_string(), far), ("vx_or_1".to_string(), far)]),
+            relayout: BTreeMap::from([(OG.to_string(), "Obergeschoss".to_string())]),
+        };
+        assert_eq!(moves_missed(&out, &d, &lock, &place), ["vx_or_1"]);
+        let none = Placement {
+            relayout: BTreeMap::new(),
+            ..place
+        };
+        assert_eq!(
+            moves_missed(&out, &d, &lock, &none),
+            ["vx_and_1", "vx_or_1"]
+        );
+    }
+
+    #[test]
+    fn a_lock_entry_without_a_uuid_is_refused() {
+        let d = doc("house.Loxone");
+        let moves = BTreeMap::from([("a".to_string(), Layout::at(0, 0, 96, 96))]);
+        for lock in [
+            r#"{"objects":{"a":{"type":"And"}}}"#,
+            r#"{"objects":{"a":{"uuid":"","type":"And"}}}"#,
+        ] {
+            let e = write_moves(lock.as_bytes(), &d, &moves).unwrap_err();
+            assert!(e.contains("no UUID for block a"), "{e}");
+        }
+        let e = write_moves(br#"{"objects":{}}"#, &d, &moves).unwrap_err();
+        assert!(e.contains("no block a"), "{e}");
+    }
+
+    #[test]
+    fn arrange_says_why_a_page_cannot_be_laid_out() {
+        let d = doc("house.Loxone");
+        let names = BTreeSet::new();
+        let mut files = Files::default();
+        let mut l = Lockfile::default();
+        let lock = lock_of(&l);
+        let ctx = Ctx {
+            doc: &d,
+            lock: &lock,
+            base: &d,
+            deployed: None,
+            names: &names,
+        };
+        apply_op(&mut files, &ctx, &add(OG, "And", None, &[], &[])).unwrap();
+        let out = compile_files(&d, &files, &mut l).unwrap();
+        let mut lock = lock_of(&l);
+        assert_eq!(
+            relayout_title(&out, &out, &lock, OG).unwrap(),
+            "Obergeschoss"
+        );
+        assert!(
+            relayout_title(&out, &out, &lock, EG)
+                .unwrap_err()
+                .contains("manages no block")
+        );
+        // A lock from before lox pinned pages.
+        lock.placed.insert("vx_and_1".into(), None);
+        assert!(
+            relayout_title(&out, &out, &lock, OG)
+                .unwrap_err()
+                .contains("older lox")
+        );
+        // Another page with its title.
+        let twice = LoxoneDoc::parse(
+            String::from_utf8(out.to_bytes())
+                .unwrap()
+                .replace("Title=\"Erdgeschoss\"", "Title=\"Obergeschoss\"")
+                .as_bytes(),
+        )
+        .unwrap();
+        let lock = lock_of(&l);
+        assert!(
+            relayout_title(&twice, &twice, &lock, OG)
+                .unwrap_err()
+                .contains("2 pages are titled")
+        );
     }
 }
