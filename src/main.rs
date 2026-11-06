@@ -3,6 +3,7 @@
 
 mod actions;
 mod appcalendar;
+mod backups;
 mod calendar;
 mod configdate;
 mod discover;
@@ -125,6 +126,8 @@ struct App {
     /// Their drift from the deployed revision (see [`CalDrift`]).
     cal_drift: Mutex<Option<CalDrift>>,
     pull: pull::Pull,
+    /// The Miniserver's own backups, read when a user asks.
+    backups: Arc<backups::Backups>,
     log: log::Log,
     monitor: Arc<monitor::Monitor>,
     ms: miniserver::Miniserver,
@@ -274,6 +277,21 @@ async fn main() -> Result<()> {
     });
     let live = live::Live::new(feed, live_source);
     live.share_structure(structure.clone());
+    // The Miniserver's backups (FTP, read-only): like the structure file,
+    // read only when a user asks, and never with --no-live.
+    let backups = Arc::new(backups::Backups::new(
+        if args.no_live {
+            Err("turned off (--no-live)".to_string())
+        } else {
+            found
+                .as_ref()
+                .map(|f| Arc::new(backups::Ftp(f.conn.clone())) as Arc<dyn backups::Port>)
+                .map_err(Clone::clone)
+        },
+        found.as_ref().ok().map(|f| f.ms_dir.as_str()),
+    ));
+    let mut history = history;
+    history.set_backups(backups.entries());
     // The Debug-Monitor, when asked for; --no-live means vislox never talks
     // to the Miniserver.
     let monitor = Arc::new(monitor::Monitor::new(
@@ -318,6 +336,7 @@ async fn main() -> Result<()> {
         calendar,
         cal_drift: Mutex::new(None),
         pull,
+        backups,
         log,
         monitor: monitor.clone(),
         ms,
@@ -433,6 +452,7 @@ async fn main() -> Result<()> {
         .route("/api/monitor/start", axum::routing::post(api_monitor_start))
         .route("/api/monitor/stop", axum::routing::post(api_monitor_stop))
         .route("/api/pull", axum::routing::post(api_pull))
+        .route("/api/backups/read", axum::routing::post(api_backups_read))
         .route("/api/apply", axum::routing::post(api_apply))
         .route("/api/discard", axum::routing::post(api_discard))
         .route("/api/sync", axum::routing::post(api_sync))
@@ -601,6 +621,8 @@ async fn api_history(State(app): State<Arc<App>>) -> impl IntoResponse {
         "version": h.version,
         "pending": pending,
         "history": hist,
+        "backups": h.backup_list(),
+        "ms_backups": app.backups.info(),
         "error": h.last_error,
         "live": app.live.info(),
         "pull": app.pull.info(),
@@ -1112,6 +1134,10 @@ async fn api_pull(State(app): State<Arc<App>>, headers: axum::http::HeaderMap) -
             // The base may have changed: the next check reads its date again.
             app.ms.forget();
             reread_calendar(&app);
+            // Backups read before: the ones saved since come along.
+            if app.backups.listed() {
+                let _ = read_backups(&app);
+            }
             Json(serde_json::json!({ "committed": p.committed })).into_response()
         }
         Err(e) => (
@@ -1120,6 +1146,40 @@ async fn api_pull(State(app): State<Arc<App>>, headers: axum::http::HeaderMap) -
         )
             .into_response(),
     }
+}
+
+/// List the Miniserver's backups and download the new ones, in the
+/// background; the History shows them as they come. Read-only (FTP), with
+/// the same check as Pull, and the `X-Vislox` header.
+async fn api_backups_read(State(app): State<Arc<App>>, headers: axum::http::HeaderMap) -> Response {
+    if let Some(r) = not_from_vislox(&headers) {
+        return r;
+    }
+    if app.backups.why_not().is_none()
+        && let Some(r) = preflight(&app, miniserver::Action::Pull).await
+    {
+        return r;
+    }
+    match read_backups(&app) {
+        Ok(()) => Json(serde_json::json!({ "started": true })).into_response(),
+        Err(e) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": e })),
+        )
+            .into_response(),
+    }
+}
+
+fn read_backups(app: &Arc<App>) -> Result<(), String> {
+    let a = app.clone();
+    app.backups.start(Arc::new(move || {
+        let v = {
+            let mut h = a.history.lock().unwrap();
+            h.set_backups(a.backups.entries());
+            h.touch()
+        };
+        let _ = a.tx.send(v);
+    }))
 }
 
 fn refused((status, msg): actions::Refusal) -> Response {

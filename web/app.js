@@ -71,7 +71,7 @@ function setStatus(text, cls) {
   $("status").className = "status " + (cls || "");
   $("status").title = text;
 }
-function allRevs() { return S.hist ? [...S.hist.pending, ...S.hist.history] : []; }
+function allRevs() { return S.hist ? [...S.hist.pending, ...S.hist.history, ...(S.hist.backups || [])] : []; }
 function revById(id) { return allRevs().find((r) => r.id === id); }
 function lightColor(rgb) {
   const m = /^(\d+),(\d+),(\d+)$/.exec(rgb || "");
@@ -93,6 +93,7 @@ function revInfo(r) {
   const m = /Config backup .*?\(v(\d+)\)/i.exec(r.label);
   if (r.kind === "pending") title = r.current ? "Compiled, not deployed" : "Earlier compile";
   else if (r.kind === "live") title = r.label.replace(/ \(same as an older commit\)/, "");
+  else if (r.kind === "backup") title = r.label;
   else if (m) title = `Backup v${m[1]}`;
   else title = title.replace(/^\[[^\]]+\]\s*/, "");
   const sub = r.kind === "git" ? `${fmtWhen(r.time, true)} · ${r.detail}` : fmtWhen(r.time, true);
@@ -164,6 +165,33 @@ async function loadHistory(fromEvent) {
   else if (fromEvent && newest && newest.id !== prevNewest && !S.follow) setStatus("new revision in History", "live flash");
 }
 
+function revButton(r, newest) {
+  const info = revInfo(r);
+  const b = document.createElement("button");
+  b.type = "button";
+  b.className = `hrev k-${r.kind}` + (r.id === S.rev ? " sel" : "") + (r.id === S.base ? " base" : "") + (r.current ? " current" : "");
+  b.setAttribute("aria-current", r.id === S.rev ? "true" : "false");
+  const also = r.backups?.length ? `\n\nThe Miniserver's backup${r.backups.length > 1 ? "s" : ""} ${r.backups.join(", ")} ${r.backups.length > 1 ? "hold" : "holds"} this config.` : "";
+  b.title = `${r.label}\n${r.detail}\n${new Date(r.time * 1000).toLocaleString()}${also}\n\nClick: view it, compared with the revision before\nShift+click: compare the viewed revision with this one`;
+  const pills = [];
+  if (r.kind === "pending" && r.current) pills.push('<span class="pill pend">would be deployed</span>');
+  if (r.kind !== "pending" && r.current) pills.push('<span class="pill cur">on disk</span>');
+  if (r.kind === "live") pills.push('<span class="pill new">not in git</span>');
+  if (r.kind === "backup") pills.push('<span class="pill ms">not pulled</span>');
+  if (r.backups?.length) pills.push(`<span class="pill ms">Miniserver backup${r.backups.length > 1 ? ` ×${r.backups.length}` : ""}</span>`);
+  if (r.id === S.base) pills.push('<span class="pill">compared with</span>');
+  b.innerHTML = `<span class="node"></span><span class="l1"><span class="lbl">${esc(info.title)}</span></span>
+    <span class="dt">${esc(info.sub)}</span>${pills.length ? `<span class="tags">${pills.join("")}</span>` : ""}`;
+  b.onclick = (ev) => {
+    if (ev.shiftKey) { if (r.id !== S.rev) S.base = r.id; }
+    else { S.rev = r.id; S.base = r.base; }
+    S.follow = !ev.shiftKey && r.id === newest ? S.follow : false;
+    $("chk-follow").checked = S.follow;
+    renderHistory(); renderSelects(); loadView(); writeHash(true);
+  };
+  return b;
+}
+
 function renderHistory() {
   const box = $("hist");
   box.innerHTML = "";
@@ -174,34 +202,64 @@ function renderHistory() {
       h.textContent = title;
       box.appendChild(h);
     }
-    for (const r of list) {
-      const info = revInfo(r);
-      const b = document.createElement("button");
-      b.type = "button";
-      b.className = `hrev k-${r.kind}` + (r.id === S.rev ? " sel" : "") + (r.id === S.base ? " base" : "") + (r.current ? " current" : "");
-      b.setAttribute("aria-current", r.id === S.rev ? "true" : "false");
-      b.title = `${r.label}\n${r.detail}\n${new Date(r.time * 1000).toLocaleString()}\n\nClick: view it, compared with the revision before\nShift+click: compare the viewed revision with this one`;
-      const pills = [];
-      if (r.kind === "pending" && r.current) pills.push('<span class="pill pend">would be deployed</span>');
-      if (r.kind !== "pending" && r.current) pills.push('<span class="pill cur">on disk</span>');
-      if (r.kind === "live") pills.push('<span class="pill new">not in git</span>');
-      if (r.id === S.base) pills.push('<span class="pill">compared with</span>');
-      b.innerHTML = `<span class="node"></span><span class="l1"><span class="lbl">${esc(info.title)}</span></span>
-        <span class="dt">${esc(info.sub)}</span>${pills.length ? `<span class="tags">${pills.join("")}</span>` : ""}`;
-      b.onclick = (ev) => {
-        if (ev.shiftKey) { if (r.id !== S.rev) S.base = r.id; }
-        else { S.rev = r.id; S.base = r.base; }
-        S.follow = !ev.shiftKey && r.id === list[0].id ? S.follow : false;
-        $("chk-follow").checked = S.follow;
-        renderHistory(); renderSelects(); loadView(); writeHash(true);
-      };
-      box.appendChild(b);
-    }
+    for (const r of list) box.appendChild(revButton(r, list[0].id));
   };
   renderOpLog(box);
   if (S.hist.pending.length) { sec("Pending deployment", S.hist.pending); sec("Deployed history", S.hist.history); }
   else sec(null, S.hist.history);
   if (!S.hist.history.length) box.insertAdjacentHTML("beforeend", '<div class="empty">No revisions yet.</div>');
+  renderBackups(box);
+}
+
+// ── the Miniserver's own backups ───────────────────────────────────────
+// Every config the Miniserver loads leaves /prog/sps_<ver>_<stamp>.zip behind. vislox lists and
+// downloads them (FTP, read-only) only when asked, once each; one with the bytes of a Pull shows
+// as that Pull (its "Miniserver backup" pill), the others here, grouped by the Pulls around them.
+let backupsBusy = false, backupsErr = "";
+function renderBackups(box) {
+  const info = S.hist.ms_backups;
+  if (!info?.available) return;
+  const list = S.hist.backups || [];
+  const busy = backupsBusy || info.busy;
+  const h = document.createElement("div");
+  h.className = "hist-sec bk-sec";
+  h.innerHTML = `<span>Miniserver backups</span><button type="button" class="bk-read"${busy ? " disabled" : ""}
+    title="List the backups on the Miniserver (/prog, FTP, read-only) and download the new ones${esc(msWarn("pull"))}">${busy ? "Reading…" : "Read"}</button>`;
+  h.querySelector("button").onclick = readBackups;
+  box.appendChild(h);
+  const p = info.progress;
+  const err = backupsErr || info.error;
+  const note = busy ? (p?.[1] ? `Downloading ${Math.min(p[0] + 1, p[1])} of ${p[1]}…` : "Listing the backups on the Miniserver…")
+    : err ? `Cannot read the backups: ${err}`
+    : info.listed == null ? "The Miniserver keeps a backup of each config it loads. Read lists them and downloads each one once."
+    : `${info.on_miniserver} on the Miniserver, read ${fmtWhen(info.listed, true)}.` + (list.length ? "" : " Each one is a Pull above, or the same as the save before it.");
+  box.insertAdjacentHTML("beforeend", `<div class="bk-note${err && !busy ? " error" : ""}" role="status">${esc(note)}</div>`);
+  const pulls = S.hist.history.some((r) => r.kind === "git");
+  const short = (id) => { const r = revById(id); return r ? revInfo(r).short : id; };
+  let group;
+  for (const r of list) {
+    const key = r.before || "";
+    if (key !== group) {
+      group = key;
+      const t = !pulls ? "On the Miniserver"
+        : !r.before ? "Since the last Pull"
+        : r.after ? `Between ${short(r.after)} and ${short(r.before)}`
+        : `Before ${short(r.before)}`;
+      box.insertAdjacentHTML("beforeend", `<div class="bk-gap">${esc(t)}</div>`);
+    }
+    box.appendChild(revButton(r, null));
+  }
+}
+async function readBackups() {
+  if (backupsBusy) return;
+  backupsBusy = true; backupsErr = ""; renderHistory();
+  try {
+    const r = await fetch("/api/backups/read", { method: "POST", headers: { "X-Vislox": "backups" } });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) backupsErr = j.error || r.statusText;
+  } catch (e) { backupsErr = e.message; }
+  backupsBusy = false;
+  await loadHistory();
 }
 
 function renderSelects() {

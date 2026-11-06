@@ -85,7 +85,7 @@ pub fn cache_root() -> Option<PathBuf> {
 }
 
 /// A file name for a key: letters, digits, `.`, `-` and `_` only.
-fn file_name(key: &str) -> String {
+pub(crate) fn file_name(key: &str) -> String {
     let s: String = key
         .chars()
         .map(|c| {
@@ -120,7 +120,7 @@ fn now_ms() -> i64 {
 
 /// Write `bytes` to `path` whole: a reader never sees half a file. Each
 /// write has a temporary file of its own, so two writers cannot mix.
-fn write_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     static SEQ: AtomicU64 = AtomicU64::new(0);
     if let Some(d) = path.parent() {
         std::fs::create_dir_all(d)?;
