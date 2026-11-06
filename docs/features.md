@@ -171,6 +171,12 @@ sends to the Miniserver see [miniserver.md](miniserver.md).
   pending revision and the Changes list; its Properties edit its name and constants, and *Remove* takes it out
   again until it is deployed.
 
+- **Draw wires** (the same project and token): drag from an output to an input of another block (or the other way
+  round). The ports it may end at light up; one it may not (an output, a text port for a number, an inverted
+  input, a pair already wired) says why. The wire is written into vislox's file of the module and compiled, and
+  shows as added in the pending revision. Drag an end of a wire drawn here to reconnect it; click a wire for its
+  card, with *Delete* (or the Delete key) and *Revert*. A wire Loxone Config drew is removed in Loxone Config.
+
 For a `lox.toml` project:
 
 ```bash

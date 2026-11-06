@@ -1195,12 +1195,14 @@ impl Actions {
         } else {
             Default::default()
         };
+        let drawn = files.claims.1.clone();
         let ctx = edit::Ctx {
             doc: &doc,
             base: &base,
             lock: &lock,
             deployed: deployed.as_ref(),
             names: &names,
+            drawn: &drawn,
         };
         // `removed` lines lox needs no more go first: their slugs are free.
         files.tidy(&lock);
@@ -1587,6 +1589,37 @@ impl Actions {
                 })
             })
             .collect();
+        // The wires vislox's files draw now and in the deployed revision (#61),
+        // by their ends as the page names them.
+        let mut wires: std::collections::BTreeMap<(String, String, String, String), (bool, bool)> =
+            Default::default();
+        for (files, now_side) in [(&now, true), (&was, false)] {
+            for (f, t) in edit::wire_ends(files, &lock) {
+                let [fu, fk] = f;
+                let [tu, tk] = t;
+                let slot = wires.entry((fu, fk, tu, tk)).or_default();
+                if now_side {
+                    slot.0 = true
+                } else {
+                    slot.1 = true
+                }
+            }
+        }
+        let wires: Vec<Value> = wires
+            .into_iter()
+            .map(|((fu, fk, tu, tk), (now, was))| {
+                json!({ "from": [fu, fk], "to": [tu, tk], "now": now, "deployed": was })
+            })
+            .collect();
+        // The wires the rest of the module draws on the config shown, and
+        // why vislox leaves them and Loxone Config's alone: one rule with
+        // `unwire`'s.
+        let module_wires: Vec<Value> = shown
+            .map(|d| edit::module_wires(d, &lock, &now))
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(f, t)| json!({ "from": f, "to": t }))
+            .collect();
         json!({
             "available": state.why.is_none(),
             "reason": state.why,
@@ -1599,6 +1632,12 @@ impl Actions {
             "movable": movable,
             "moves": moves,
             "arrange": arrange,
+            "wires": wires,
+            "module_wires": module_wires,
+            "wire_why": {
+                "module": edit::Owner::Module.why(),
+                "loxone_config": edit::Owner::LoxoneConfig.why(),
+            },
         })
     }
 
@@ -2468,6 +2507,7 @@ echo "{\"objects\":{$objs}}" > "$lock"
             title: Some("Licht".into()),
             params: [("I2".to_string(), "1".to_string())].into(),
             settings: Default::default(),
+            wires: vec![],
         };
         let r = a.edit(&req(vec![add.clone()]), None).await.unwrap();
         let uuid = "aaaaaaa1-0000-0000-ffff504f94000001";
@@ -2587,6 +2627,110 @@ sed '/U="10000006-0000-0060-ffff504f94000001"/s/Px="[0-9-]*" Py="[0-9-]*"/Px="'"
 "#,
         )
         .unwrap();
+    }
+
+    /// A stand-in lox for wires: `logic compile` writes the base, marked
+    /// with a checksum of the wires vislox's file draws, into out (or `--out`).
+    #[cfg(unix)]
+    fn lox_that_wires(tmp: &Path) {
+        std::fs::write(
+            tmp.join("lox"),
+            r#"#!/bin/sh
+echo "$*" >> ../calls.log
+[ "$1 $2" = "logic compile" ] || { echo "unexpected: $*" >&2; exit 2; }
+out=out.Loxone; prev=
+for a in "$@"; do [ "$prev" = --out ] && out=$a; prev=$a; done
+w=$(grep ' <- ' pages/vislox/edits.loxl 2>/dev/null)
+[ -z "$w" ] && { cp base.Loxone "$out"; exit 0; }
+w=$(echo "$w" | cksum | cut -d' ' -f1)
+sed "s/Title=\"Testhaus\"/Title=\"Testhaus $w\"/" base.Loxone > "$out"
+"#,
+        )
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_wire_is_drawn_and_taken_out_in_the_module_never_deployed() {
+        use axum::http::StatusCode;
+        let (tmp, a) = project_for_edits();
+        lox_that_wires(tmp.path());
+        let d = tmp.path().join("project");
+        const OR: &str = "10000009-0000-0090-ffff504f94000001";
+        const AND: &str = "10000004-0000-0040-ffff504f94000001";
+        let end = |u: &str, k: &str| [u.to_string(), k.to_string()];
+        let req = |ops: Vec<edit::Op>| edit::Request {
+            base: blob(&d, "out.Loxone"),
+            ops,
+        };
+        let w = edit::Op::Wire {
+            from: end(DIV, "AQ"),
+            to: end(OR, "I2"),
+        };
+        let r = a.edit(&req(vec![w.clone()]), None).await.unwrap();
+        assert_eq!(r["previous"][0]["op"], "unwire");
+        let file = std::fs::read_to_string(d.join("pages").join(edit::FILE)).unwrap();
+        assert!(
+            file.contains(&format!(
+                "{}.In2 <- {}.AQ\n",
+                edit::slug(OR),
+                edit::slug(DIV)
+            )),
+            "{file}"
+        );
+        let e = edits_of(&a, &d).await;
+        assert_eq!(
+            e["wires"],
+            json!([{ "from": [DIV, "AQ"], "to": [OR, "I2"], "now": true, "deployed": false }])
+        );
+        // The rule the page shares with `unwire`: nothing here is the module's.
+        assert_eq!(e["module_wires"], json!([]));
+        assert!(
+            e["wire_why"]["loxone_config"]
+                .as_str()
+                .unwrap()
+                .contains("remove it in Loxone Config")
+        );
+        // A wire Loxone Config drew is not lox's to take out; nothing changes.
+        let gui = edit::Op::Unwire {
+            from: end(AND, "Q"),
+            to: end(OR, "I1"),
+        };
+        let before = std::fs::read(d.join("out.Loxone")).unwrap();
+        let (code, msg) = a.edit(&req(vec![gui]), None).await.unwrap_err();
+        assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "{msg}");
+        assert!(msg.contains("Drawn in Loxone Config"), "{msg}");
+        assert_eq!(std::fs::read(d.join("out.Loxone")).unwrap(), before);
+        // Reconnected: one request takes it out and draws the new one.
+        let moved = edit::Op::Wire {
+            from: end(DIV, "AQ"),
+            to: end(AND, "I2"),
+        };
+        let un = edit::Op::Unwire {
+            from: end(DIV, "AQ"),
+            to: end(OR, "I2"),
+        };
+        a.edit(&req(vec![un, moved.clone()]), None).await.unwrap();
+        let e = edits_of(&a, &d).await;
+        assert_eq!(
+            e["wires"],
+            json!([{ "from": [DIV, "AQ"], "to": [AND, "I2"], "now": true, "deployed": false }])
+        );
+        // Deleted: the file draws nothing, and the compile has no wire.
+        let un = edit::Op::Unwire {
+            from: end(DIV, "AQ"),
+            to: end(AND, "I2"),
+        };
+        let r = a.edit(&req(vec![un]), None).await.unwrap();
+        assert_eq!(r["previous"][0], serde_json::to_value(&moved).unwrap());
+        let file = std::fs::read_to_string(d.join("pages").join(edit::FILE)).unwrap();
+        assert!(!file.contains("<-") && !file.contains("extern"), "{file}");
+        assert_eq!(edits_of(&a, &d).await["wires"], json!([]));
+        let calls = std::fs::read_to_string(tmp.path().join("calls.log")).unwrap();
+        assert!(
+            calls.lines().all(|l| l.starts_with("logic compile")),
+            "{calls}"
+        );
     }
 
     #[cfg(unix)]
@@ -2731,6 +2875,7 @@ sed '/U="10000006-0000-0060-ffff504f94000001"/s/Px="[0-9-]*" Py="[0-9-]*"/Px="'"
                     title: None,
                     params: Default::default(),
                     settings: Default::default(),
+                    wires: vec![],
                 }],
             },
             None,
@@ -2799,6 +2944,7 @@ sed '/U="10000006-0000-0060-ffff504f94000001"/s/Px="[0-9-]*" Py="[0-9-]*"/Px="'"
                 title: None,
                 params: Default::default(),
                 settings: Default::default(),
+                wires: vec![],
             }],
         };
         a.edit(&add(blob(&d, "out.Loxone")), None).await.unwrap();
@@ -2831,6 +2977,7 @@ sed '/U="10000006-0000-0060-ffff504f94000001"/s/Px="[0-9-]*" Py="[0-9-]*"/Px="'"
                 title: None,
                 params: Default::default(),
                 settings: Default::default(),
+                wires: vec![],
             }],
         };
         a.edit(&req(blob(&d, "out.Loxone")), None).await.unwrap();

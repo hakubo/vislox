@@ -1,8 +1,8 @@
 # Editing in vislox
 
 vislox becomes an editor in steps: edit values (#58), add blocks (#59), move blocks, inputs and outputs (#60),
-make and change connections (#61), and undo and redo (#62). This page is the design they share. #58, #59 and #60
-are built; the rest says where each step plugs in.
+make and change connections (#61), and undo and redo (#62). This page is the design they share. #58 to #61 are
+built; the rest says where each step plugs in.
 
 ## The rules
 
@@ -12,7 +12,8 @@ are built; the rest says where each step plugs in.
   uploads, so a change made only in `out.Loxone` would be lost on Apply, and `base.Loxone` is what the
   Miniserver runs.
 - **vislox writes one place: its own files under the module directory**, `<module>/vislox/`: `edits.loxl` for
-  the values it claims, and one file per page for the blocks it adds (`<module>/vislox/obergeschoss.loxl`).
+  the values it claims and the wires it draws, and one file per page for the blocks it adds
+  (`<module>/vislox/obergeschoss.loxl`).
   The rest of the module is never touched. A module that is one file cannot be edited from vislox.
   The one exception is a move (#60): lox keeps a managed block's position in the lockfile, not in the source,
   so vislox writes it there, the way lox's own `--relayout` does (see *Moving blocks*).
@@ -36,7 +37,9 @@ POST /api/edit
              "params": { "Time": "30" }, "settings": {} },
            { "op": "remove_block", "uuid": "…" },
            { "op": "move", "uuid": "…", "x": 1920, "y": 960 },
-           { "op": "relayout", "page": "<page uuid>" } ] }
+           { "op": "relayout", "page": "<page uuid>" },
+           { "op": "wire",   "from": ["<uuid>", "AQ"], "to": ["<uuid>", "I2"] },
+           { "op": "unwire", "from": ["<uuid>", "Q"],  "to": ["<uuid>", "I1"] } ] }
 ```
 
 - `base` is the git blob id of what the browser showed: the newest compile, or the deployed config when nothing
@@ -47,9 +50,11 @@ POST /api/edit
   UUIDs lox minted (`added: [{ slug, uuid }]`). For a value, `previous` is the value vislox claimed before: the
   op with that value undoes it. For `remove_block` it is the `add_block` that adds the block again; for
   `add_block` it is null, and `remove_block` with the new UUID undoes it. For `move` it is the `move` back to
-  where the block was; for `relayout`, the list of `move`s that put each block back. That is all #62 needs from
-  the server.
-  The history itself can live in the browser.
+  where the block was; for `relayout`, the list of `move`s that put each block back. For `wire` it is the
+  `unwire` of the same ends, and for `unwire` the `wire`. A reconnected wire is one request, `unwire` then `wire`:
+  undone, the reverse list. The ops of one request see each other: `unwire` then `wire` of the same wire is
+  accepted (and changes nothing). `remove_block`'s `add_block` carries the wires the removal took out
+  (`wires`, an empty UUID for the block itself), since lox mints new UUIDs when it is added again. That is all #62 needs from the server. The history itself can live in the browser.
 - All ops of one request are checked first, then written and compiled once. If anything fails, or the request
   goes away mid-compile (a closed tab), the file, the lock and `out.Loxone` are put back as they were.
 - **An edit never takes along someone else's uncompiled changes.** The compile covers the whole module, so
@@ -59,7 +64,7 @@ POST /api/edit
   elsewhere) and compares. A different result refuses the edit with 409, naming the files that changed: compile
   or discard them first.
 
-Later steps add operations to the same list: `wire` and `unwire` (#61).
+Later steps add operations to the same list: undo and redo (#62) replay the `previous` ops.
 
 ## How an op becomes Lox Logic
 
@@ -138,6 +143,54 @@ managed blocks afresh. vislox moves blocks with the same lockfile state lox's ow
   the deployed position as a dashed ghost. Discard puts the lock back with the rest. Apply deploys it: `lox config
   push` compiles with the lockfile, so the move goes along.
 
+## Wires (#61)
+
+A wire is a Lox Logic `<-` statement, `sink.Port <- source.Port`, written into `edits.loxl` after the claims:
+
+```text
+extern vx_10000004_0000_0040_ffff504f94000001 = And(uuid: "10000004-0000-0040-ffff504f94000001")
+extern vx_10000006_0000_0060_ffff504f94000001 = Div(uuid: "10000006-0000-0060-ffff504f94000001")
+
+# Wires drawn in vislox. Deleting a line takes the wire out again.
+vx_10000004_0000_0040_ffff504f94000001.In2 <- vx_10000006_0000_0060_ffff504f94000001.AQ
+vx_and_1.In1 <- vx_10000006_0000_0060_ffff504f94000001.AQ
+```
+
+- `wire` names its ends as the page does: `[object UUID, connector key]`, from an output to an input. vislox
+  writes the ports by their Lox Logic names (`In2` for `I2`).
+- An end Loxone Config drew is an `extern` pinned by UUID, the same one a claimed value uses; one that only a
+  wire needs stays as long as the wire. An end vislox added (#59) is named by its slug: on a block declared in the
+  module, lox folds `<-` into the block's arguments, as if it were written there. A block the rest of the module
+  manages is refused, as for values: it is wired in its own `.loxl` (lox could take the wire here, but vislox's
+  file would then name the module's own slug, and a rename there would break it).
+- lox records each wire it draws onto an extern in the lockfile (`extern_wires`) and takes it out again when the
+  statement goes, leaving the wires Loxone Config drew alone. So `unwire` takes out a wire vislox's file draws,
+  deployed or not, and refuses one Loxone Config drew ("remove it in Loxone Config") or the rest of the module draws.
+- An input may take several wires (Loxone Config ORs or ANDs them, by block). A wire onto an input that already has
+  one adds a second; reconnecting is `unwire` then `wire`, so only a wire vislox drew can be reconnected.
+- Checked before lox sees it, because lox does not check a wire's direction on an extern: the source is an output
+  and the sink an input or parameter (by lox's port table, else by the side Loxone Config draws it on), on two
+  different objects; the pair is not wired yet; the sink is not inverted in Loxone Config (`Inv=`, which lox leaves
+  to Loxone Config); and an input with a constant edited here is cleared first (lox refuses a constant and a wire
+  on one port of a declaration). Both ends must be in the base lox compiles against.
+- Types: Loxone Config wires digital and analog connectors to each other (a value other than 0 is on), but text
+  only to text, and lox does not check it on an extern. vislox takes what a connector carries from what is known:
+  a reference's `Text="true"` or `Analog="true"`; the value of the objects lox mints references for (virtual
+  inputs, sensors and actuators, a memory flag by its `Tp=`); the text connectors of lox's port table (`TQ…`,
+  `OutText`, `Text`, `inText`, `TTS`, `TM`, `TI`); and any other connector of lox's port table as analog by its key
+  (`AQ`, `AI`, …) or digital. A connector none of these knows is *unknown*, and a wire to it is refused rather than
+  guessed. The page sends each port's kind (`kind` on a port) so the browser marks the targets while dragging; the
+  server checks again.
+- Who draws a wire vislox's file does not: the rest of the module, for a wire lox tracks onto an extern
+  (`extern_wires`) or one into a block the module declares, else Loxone Config. `unwire` refuses by this rule, and
+  `GET /api/edits` sends the module's wires (`module_wires`) and both reasons (`wire_why`) so the card says the
+  same.
+- Taking out a block added here takes its wires with it; its undo (`previous`) draws them again.
+- A wire in the file whose end is neither an extern of `edits.loxl` nor a block vislox added (its line deleted by
+  hand) is refused when the files are read, naming the wire: it would break every compile.
+- In the pending revision the Changes list and the canvas show a wire added (green) or removed (red, dashed), as
+  for any compile. Discard drops them with the rest; Apply deploys them (`lox config push` compiles the module).
+
 vislox offers only what lox (v0.83.0, the version `Cargo.lock` and the Docker image pin) can express. What lox
 cannot express is left out, not worked around.
 
@@ -151,7 +204,7 @@ cannot express is left out, not worked around.
 | #59 remove a new block | drop it, `removed slug` | Only one not deployed yet. |
 | #60 move | none: `layout` in the lockfile | Only a block the module manages; snapped to the grid. |
 | #60 arrange | `lox logic compile --relayout <page>` | Lays out the page's managed blocks afresh. |
-| #61 wire | `x.Port <- y.Q` | Adds a wire, and removes one vislox added. A wire Loxone Config drew cannot be removed. |
+| #61 wire | `x.Port <- y.Q` in `edits.loxl` | Adds a wire between objects Loxone Config drew and blocks added here, and removes one vislox drew. A wire Loxone Config drew cannot be removed. |
 
 Blocks the module already manages (they are in the lockfile) are refused: they are edited in their own `.loxl`.
 The blocks vislox added are the exception: their `.loxl` is vislox's.
@@ -170,7 +223,11 @@ The blocks vislox added are the exception: their `.loxl` is vislox's.
   `OutputRef`), a note, a comment. lox never writes their position; they are moved in Loxone Config, or adopted
   first (#72). Arranging lays out only managed blocks, and leaves one wired to a reference the module does not
   manage beside that reference.
-- Removing a wire Loxone Config drew.
+- Removing a wire Loxone Config drew, or reconnecting it: lox takes out only the wires its source draws. Remove it in
+  Loxone Config, then draw it here.
+- Wiring an input Loxone Config inverted (`Inv=`): lox leaves that connector to Loxone Config.
+- A wire to an object on another page is not drawn by dragging (both ends must be on the page shown); lox wires
+  across pages directly, and Loxone Config shows such a wire as a link on both pages.
 - New blocks of some types. vislox offers the page blocks of lox's verified builtin table (`loxl types`) that
   lox creates and that work as placed; a test compiles each one with lox. Not offered:
   - virtual inputs, virtual HTTP, UDP and text inputs, virtual outputs and their commands, Modbus servers,
@@ -180,7 +237,8 @@ The blocks vislox added are the exception: their `.loxl` is vislox's.
   - blocks lox creates but that do nothing until they are set up in Loxone Config: the burglar and smoke alarms,
     the room controller, the irrigation, and the central light and shade blocks (their members are #75);
   - every type outside lox's table (lox refuses it: "Refuse, never guess"), and templates (#83).
-- On a new block: a program's text (`Code:` takes only `file(…)`), a wire or an expression on an input (#61, #82),
+- On a new block: a program's text (`Code:` takes only `file(…)`), a wire when it is added (draw it once it is
+  on the page, #61) or an expression on an input (#82),
   a position when it is added (lox places it; it can be moved after), and a room or category (lox has no claim for them on a managed block). Its settings
   (`Formula:`, `Type:`, `At:`, …) are given when it is added; changing them later is #79.
 - A block on a page whose title an earlier page has, and a new page (#88).
@@ -193,7 +251,7 @@ Each of these plugs in as new op kinds on `POST /api/edit`, written into `<modul
 |---|---|
 | #59 (built) | new blocks (`slug = Type(…)`, `page`), `removed` for one not deployed |
 | #60 (built) | positions of managed blocks (the lockfile's `layout`), `--relayout` |
-| #61 | wires (`<-`) |
+| #61 (built) | wires (`<-`) |
 | #62 | undo and redo |
 | #72 | adopt a block into the module |
 | #73 | Daytimer switching times (`schedule`, `.schedule`) |
@@ -235,6 +293,13 @@ Around the module: #64 (mark managed blocks), #65 (`lox logic check` errors), #6
   with Alt and an arrow key when it is selected (Shift: ten grid steps). It snaps to the grid, its wires follow,
   and the drop is compiled. Properties shows *moved, not deployed* with *Revert* (back to the deployed position),
   and the Deploy pane counts the blocks moved. Dragging any other block pans the page, as before.
+- A wire is drawn by dragging from a port to a port on another block, an output to an input either way round
+  (the newest revision, with editing on). A port's target is the size of its stub; a click on it without a drag
+  selects its block. While dragging, the ports it may end at are blue and those it may not
+  red, with the reason on hover; dropping on one of those says why and sends nothing. The drop is compiled.
+- Clicking a wire opens its card: its ends and kind, and *Delete* (also the Delete key) and the ends to drag
+  elsewhere for a wire vislox drew, *Revert* for one drawn or taken out here and not deployed, or why it cannot be
+  changed here (Loxone Config or the module drew it). The Deploy pane counts the wires drawn and taken out here.
 - *Arrange*, next to *Add block*, lays out the page's managed blocks afresh. It is off, with the reason, where
   the server would refuse it (`arrange` in `GET /api/edits`).
 - A refused move puts the block back where it was. A move that compiled stays drawn even when showing the new
@@ -242,7 +307,10 @@ Around the module: #64 (mark managed blocks), #65 (`lox logic check` errors), #6
 - `GET /api/edits` lists what vislox's files claim now and in the deployed revision, which of it is not
   deployed, the blocks vislox added (`blocks`: slug, UUID, type, page, file, and whether the deployed config has
   it), the other blocks the module manages, the blocks lox can move (`movable`: managed and drawn on a page) and
-  those the pending config draws elsewhere than the deployed one (`moves`: UUID, position, deployed position), and
-  for each page with such a block whether *Arrange* can lay it out (`arrange`: page UUID → null, or why not). It
+  those the pending config draws elsewhere than the deployed one (`moves`: UUID, position, deployed position),
+  for each page with such a block whether *Arrange* can lay it out (`arrange`: page UUID → null, or why not), and
+  the wires vislox's files draw now or drew in the deployed revision (`wires`: `from`, `to`, `now`, `deployed`), the
+  wires the rest of the module draws (`module_wires`), and why vislox leaves those and Loxone Config's alone
+  (`wire_why`). It
   is worked out again only when vislox's files, the lockfile, the deployed or
   the pending config changes (`actions.edit.key`); the browser fetches it only then.
