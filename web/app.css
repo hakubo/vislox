@@ -622,3 +622,33 @@ button.chip { cursor: pointer; } button.chip:hover { border-color: var(--brand);
 .mon-bar .mon-state.error { color: var(--removed); }
 .log li.monitor { border-left-color: var(--sel); }
 .log li .tag { display: inline-block; margin-left: 6px; padding: 0 5px; border-radius: 8px; background: var(--sel-soft); color: var(--sel); font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: .03em; }
+
+/* Schedules (Daytimer, room controller): the config's switching times next to the Miniserver's */
+.sch-note { padding: 6px 10px; color: var(--muted); font-size: 12px; }
+.sch-note.ok { color: var(--added); }
+.sch-note.warn { color: #a15c00; background: var(--changed-bg); }
+.sch-grid { padding: 4px 10px 6px; }
+.sch-axis, .sch-row { display: grid; grid-template-columns: 34% 1fr; gap: 6px; align-items: center; }
+.sch-axis { font-size: 10px; color: var(--faint); }
+.sch-hours { display: flex; justify-content: space-between; }
+.sch-hours i { font-style: normal; }
+.sch-row { padding: 3px 0; border-top: 1px solid var(--line-2); }
+.sch-row.diff { background: var(--changed-bg); box-shadow: inset 3px 0 0 var(--changed-dot); }
+.sch-row.chg .sch-mode { color: var(--changed); font-weight: 600; }
+.sch-mode { font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sch-bars { display: flex; flex-direction: column; gap: 2px; }
+.sch-bar { position: relative; height: 12px; background: repeating-linear-gradient(90deg, var(--panel-2) 0 calc(25% - 1px), var(--line) calc(25% - 1px) 25%); border-radius: 2px; }
+.sch-seg { position: absolute; top: 0; bottom: 0; background: var(--brand); color: #fff; font-size: 9px; line-height: 12px; text-align: center; overflow: hidden; border-radius: 2px; }
+.sch-seg.act { background: repeating-linear-gradient(135deg, var(--brand) 0 4px, var(--brand-strong) 4px 6px); }
+.sch-bar.live .sch-seg { background: var(--sel); }
+.sch-bar.live .sch-seg.act { background: repeating-linear-gradient(135deg, var(--sel) 0 4px, #134a8c 4px 6px); }
+.sch-was { grid-column: 2; font-size: 11px; color: var(--muted); }
+.sch-legend { padding: 0 10px 8px; font-size: 11px; color: var(--muted); }
+.sch-key { display: inline-block; width: 12px; height: 8px; border-radius: 2px; margin: 0 4px 0 8px; vertical-align: 0; }
+.sch-key.cfg { background: var(--brand); margin-left: 0; }
+.sch-key.live { background: var(--sel); }
+.sch-live { padding: 0 5px; border-radius: 8px; background: var(--sel-soft); }
+.sch-live.diff { font-weight: 600; }
+/* A Status block's live text, with the app's icon and colour */
+.status-live { display: flex; align-items: center; gap: 6px; padding: 6px 10px; }
+.status-live .app-ic { margin: 0; width: 20px; height: 20px; }

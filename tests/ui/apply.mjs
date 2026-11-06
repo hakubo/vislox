@@ -31,7 +31,13 @@ mkdirSync(join(dir, "pages"), { recursive: true });
 const git = (...a) => execFileSync("git", ["-C", dir, "-c", "user.name=t", "-c", "user.email=t@example.com", ...a]);
 // The deployed config shows the Divide block in the app.
 const DIV = "10000006-0000-0060-ffff504f94000001";
-const base = readFileSync(fixture, "utf8").replace('<Co K="Input1" Nc="1"', '<IoData Visu="true"/><Co K="Input1" Nc="1"');
+// …and holds a Daytimer, whose Feiertag column the Miniserver runs from 07:00 (edited in the app).
+const TIMER = "10000030-0000-0300-ffff504f94000001";
+const base = readFileSync(fixture, "utf8").replace('<Co K="Input1" Nc="1"', '<IoData Visu="true"/><Co K="Input1" Nc="1"')
+  .replace('<Co K="Q" U="10000009-0000-0093-02ff504f94000001"/>\n\t\t\t</C>', `<Co K="Q" U="10000009-0000-0093-02ff504f94000001"/>\n\t\t\t</C>
+\t\t\t<C Type="DayTimer" V="178" U="${TIMER}" Title="Uhr" Px="960" Py="2880" Px2="3648" Py2="3768" Nio="2" WF="16384" Analog="true" Modes="00000000-0000-0001-1500000000000000">
+\t\t\t\t<Co K="AQ" U="10000030-0000-0302-01ff504f94000001"/><Entry From="390" To="480" V="21"/>
+\t\t\t</C>`);
 writeFileSync(join(dir, "base.Loxone"), base);
 // The pending compile: a rename, the renamed block shown in the app, and the Divide block removed.
 const divBlock = base.match(/\t*<C Type="Div"[\s\S]*?<\/C>\n/)[0];
@@ -93,7 +99,9 @@ const token = join(loxDir, "token");
 writeFileSync(token, "secret\n");
 const TEMP = "10000003-0000-0032-01ff504f94000001";
 const liveFile = join(loxDir, "stream.ndjson");
-writeFileSync(liveFile, JSON.stringify({ control: "Temperatur", state: "value", value: "21.5", uuid: TEMP }) + "\n");
+writeFileSync(liveFile, JSON.stringify({ control: "Temperatur", state: "value", value: "21.5", uuid: TEMP }) + "\n"
+  + JSON.stringify({ control: "Uhr", state: "entriesAndDefaultValue", uuid: TIMER,
+    value: { schedule: true, default: 0, entries: [{ mode: 0, from: 420, to: 480, activate: false, value: 21 }] } }) + "\n");
 
 // The Debug-Monitor's UDP port: a free one; and a frame as the Miniserver sends it (src/monframe.rs).
 const monPort = await new Promise((ok) => { const u = createSocket("udp4"); u.bind(0, "127.0.0.1", () => { const p = u.address().port; u.close(() => ok(p)); }); });
@@ -133,7 +141,8 @@ try {
   page.on("pageerror", (e) => errors.push(e.message));
   page.on("console", (m) => { if (m.type() === "error") errors.push(m.text()); });
   let dialogs = 0, applies = 0;
-  page.on("dialog", (d) => { dialogs++; d.accept(); });
+  const asked = [];
+  page.on("dialog", (d) => { dialogs++; asked.push(d.message()); d.accept(); });
   page.on("request", (r) => { if (r.method() === "POST" && new URL(r.url()).pathname === "/api/apply") applies++; });
   await page.addInitScript(() => localStorage.setItem("vislox.token", "secret"));
   await page.goto(`http://127.0.0.1:${port}/`);
@@ -160,6 +169,11 @@ try {
     await page.waitForSelector("#btn-apply:not([disabled])");
   });
   await step("Apply shows its steps as they happen", async () => {
+    // With live values on, the confirmation names the schedule the Miniserver runs differently.
+    await page.click("#sw-live .track");
+    await page.waitForFunction(() => document.querySelector("#chk-live").checked);
+    // The pending revision shows no values, but they come in.
+    await page.waitForFunction(() => S.live.values.has("10000030-0000-0300-ffff504f94000001"));
     // A double click asks once, and applies once (Apply checks the Miniserver first, then asks).
     await page.dblclick("#btn-apply");
     await page.waitForSelector("#deploy-steps:not(.hidden)");
@@ -171,6 +185,7 @@ try {
   await step("every step ends done", async () => {
     await page.waitForFunction(() => /^Applied/.test(document.querySelector("#deploy-msg")?.textContent || ""), null, { timeout: 20000 });
     assert.equal(dialogs, 1, "one confirmation");
+    assert.match(asked[0], /The Miniserver runs other switching times than this config for:\n  Uhr: Feiertag\n/, asked[0]);
     assert.equal(applies, 1, "one /api/apply request");
     for (const l of ["Download and drift check", "Upload", "Program restarting", "Back online", "New config loaded", "Verified", "Committed", "Pushed to git"]) {
       assert.equal(await state(l), "ok", l);

@@ -173,15 +173,6 @@ fn is_output(ty: &str, key: &str) -> bool {
     }
 }
 
-/// A value as JSON: whole numbers as integers.
-fn number(v: f64) -> Value {
-    if v.fract() == 0.0 && v.abs() < 1e15 {
-        Value::from(v as i64)
-    } else {
-        Value::from(v)
-    }
-}
-
 /// A value with an optional unit (`9.6°`, `0.0kW`, `42 %`) as a number.
 /// Text that only starts with a number (`12:30`, `2026-11-06`) is not one:
 /// the unit may hold no digits.
@@ -200,7 +191,7 @@ fn leading_number(s: &str) -> Option<f64> {
 
 fn plain(v: &Value) -> Value {
     match v {
-        Value::Number(n) => n.as_f64().map(number).unwrap_or(Value::Null),
+        Value::Number(n) => n.as_f64().map(crate::live::number).unwrap_or(Value::Null),
         other => other.clone(),
     }
 }
@@ -258,7 +249,7 @@ pub fn map(b: &Block, ll: &Value) -> Vec<(String, Value, String, String)> {
         };
         let v = match v {
             Value::String(s) => match leading_number(s) {
-                Some(n) => number(n),
+                Some(n) => crate::live::number(n),
                 None if s.is_empty() => return Vec::new(),
                 None => v.clone(),
             },

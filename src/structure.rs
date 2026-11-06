@@ -66,6 +66,7 @@ pub struct Structure {
     loading: tokio::sync::Mutex<()>,
     /// The Miniserver serves few requests at once.
     icon_gate: Semaphore,
+
     /// One download per icon name at a time.
     icon_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
@@ -143,7 +144,8 @@ fn write_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 fn summarize(raw: &Value) -> (Map<String, Value>, HashSet<String>) {
     let mut icons = HashSet::new();
     let mut icon = |v: &Value| -> Value {
-        match v.as_str().filter(|s| !s.is_empty()) {
+        // Only names of the icon shape: anything else is never fetched.
+        match v.as_str().filter(|s| icon_path(s).is_some()) {
             Some(s) => {
                 icons.insert(s.to_string());
                 Value::from(s)
@@ -200,6 +202,54 @@ fn summarize(raw: &Value) -> (Map<String, Value>, HashSet<String>) {
     (out, icons)
 }
 
+/// Folders the Miniserver serves commands, data or files under: an icon
+/// name never starts with one.
+const NOT_ICONS: &[&str] = &[
+    "jdev", "dev", "data", "sys", "prog", "stats", "log", "temp", "update", "web",
+];
+
+/// The request path of an icon name, `None` when the name does not have an
+/// icon's shape, so that no name can be a command (`jdev/sps/io/<uuid>/1.0`):
+/// - `<folder>/<file>.svg` or `.png` (`IconsFilled/lightbulb.svg`): one
+///   folder, letters, digits, `-` and `_` only, and not a folder of
+///   [`NOT_ICONS`];
+/// - an icon UUID (`00000000-0000-0020-2000000000000000`), fetched as
+///   `<uuid>.svg`, or with its `.svg`/`.png`.
+fn icon_path(name: &str) -> Option<String> {
+    let word = |w: &str| {
+        !w.is_empty()
+            && w.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    };
+    let uuid = |u: &str| {
+        let parts: Vec<&str> = u.split('-').collect();
+        parts.iter().map(|p| p.len()).eq([8, 4, 4, 16])
+            && parts
+                .iter()
+                .all(|p| p.chars().all(|c| c.is_ascii_hexdigit()))
+    };
+    if name.len() > 128 {
+        return None;
+    }
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((s, e @ ("svg" | "png"))) => (s, Some(e)),
+        Some(_) => return None,
+        None => (name, None),
+    };
+    match stem.split_once('/') {
+        Some((folder, file))
+            if ext.is_some()
+                && word(folder)
+                && word(file)
+                && !NOT_ICONS.iter().any(|n| folder.eq_ignore_ascii_case(n)) =>
+        {
+            Some(format!("/{name}"))
+        }
+        None if uuid(stem) => Some(format!("/{stem}.{}", ext.unwrap_or("svg"))),
+        _ => None,
+    }
+}
+
 /// The type of an icon the Miniserver sent: SVG comes as text (and is
 /// often gzipped), PNG as binary.
 pub fn icon_type(bytes: &[u8]) -> (&'static str, Option<&'static str>) {
@@ -218,19 +268,32 @@ pub fn icon_whole(bytes: &[u8]) -> bool {
     if bytes.starts_with(b"\x89PNG") {
         return bytes.ends_with(b"IEND\xaeB`\x82");
     }
-    let mut text = Vec::new();
-    let svg: &[u8] = if bytes.starts_with(&[0x1f, 0x8b]) {
-        // Bounded: an icon is small.
-        let mut d = flate2::read::GzDecoder::new(bytes).take(4 << 20);
-        if d.read_to_end(&mut text).is_err() {
-            return false;
+    let text;
+    let svg: &[u8] = match gunzip(bytes) {
+        Some(t) => {
+            text = t;
+            &text
         }
-        &text
-    } else {
-        bytes
+        None => bytes,
     };
     let s = String::from_utf8_lossy(svg);
     s.contains("<svg") && s.trim_end().ends_with("</svg>")
+}
+
+/// A gzipped icon, unpacked; `None` when not gzipped. The Miniserver may
+/// leave out the gzip trailer (its checksum and length) after a whole SVG,
+/// so what was unpacked counts even when the stream ends early; whether
+/// the SVG is whole is checked on the text.
+fn gunzip(bytes: &[u8]) -> Option<Vec<u8>> {
+    if !bytes.starts_with(&[0x1f, 0x8b]) {
+        return None;
+    }
+    let mut text = Vec::new();
+    // Bounded: an icon is small. On an error, `text` keeps what was read.
+    let _ = flate2::read::GzDecoder::new(bytes)
+        .take(4 << 20)
+        .read_to_end(&mut text);
+    Some(text)
 }
 
 impl Structure {
@@ -251,6 +314,7 @@ impl Structure {
             tx,
             loading: tokio::sync::Mutex::new(()),
             icon_gate: Semaphore::new(4),
+
             icon_locks: Mutex::new(HashMap::new()),
         });
         // The last one read, from an earlier run.
@@ -402,9 +466,10 @@ impl Structure {
     /// Miniserver (then cached, if it arrived whole). `Err(None)`: not a
     /// name it lists.
     pub async fn icon(&self, name: &str) -> Result<Vec<u8>, Option<String>> {
-        if !self.summary().1.contains(name) {
+        // Only names the structure file lists, and only of an icon's shape.
+        let Some(file) = icon_path(name).filter(|_| self.summary().1.contains(name)) else {
             return Err(None);
-        }
+        };
         // Names that differ only in characters `file_name` replaces get
         // a hash of their own, so they never share a file.
         let path = self
@@ -433,16 +498,9 @@ impl Structure {
             .acquire()
             .await
             .map_err(|e| Some(e.to_string()))?;
-        let file = if name.rsplit('/').next().is_some_and(|f| f.contains('.')) {
-            name.to_string()
-        } else {
-            format!("{name}.svg")
-        };
         let bytes = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, String> {
             let client = loxone_client::LoxClient::new(conn).map_err(|e| e.to_string())?;
-            client
-                .get_bytes(&format!("/{}", file.trim_start_matches('/')))
-                .map_err(|e| e.to_string())
+            client.get_bytes(&file).map_err(|e| e.to_string())
         })
         .await
         .map_err(|e| Some(e.to_string()))?
@@ -453,6 +511,8 @@ impl Structure {
                 bytes.len()
             )));
         }
+        // Kept and served unpacked: a browser refuses gzip without its trailer.
+        let bytes = gunzip(&bytes).unwrap_or(bytes);
         if let Some(p) = &path {
             let _ = write_file(p, &bytes);
         }
@@ -504,6 +564,81 @@ mod tests {
         assert_eq!(icon_type(&[0x1f, 0x8b, 8]), ("image/svg+xml", Some("gzip")));
         assert_eq!(icon_type(b"\x89PNG\r\n"), ("image/png", None));
         assert_eq!(icon_type(b"<svg/>"), ("image/svg+xml", None));
+    }
+
+    #[test]
+    fn a_gzipped_icon_without_its_trailer_is_whole_when_its_svg_is() {
+        use std::io::Write;
+        let svg = b"<svg xmlns=\"http://www.w3.org/2000/svg\"><rect/></svg>\n";
+        let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        e.write_all(svg).unwrap();
+        let gz = e.finish().unwrap();
+        assert!(icon_whole(&gz));
+        // The Miniserver's way: the 8-byte trailer left out.
+        let cut = &gz[..gz.len() - 8];
+        assert!(icon_whole(cut));
+        assert_eq!(gunzip(cut).unwrap(), svg);
+        // Cut inside the SVG: not whole.
+        assert!(!icon_whole(&gz[..gz.len() / 2]));
+    }
+
+    #[test]
+    fn only_names_of_an_icons_shape_are_fetched() {
+        assert_eq!(
+            icon_path("IconsFilled/battery-full.svg").as_deref(),
+            Some("/IconsFilled/battery-full.svg")
+        );
+        assert_eq!(
+            icon_path("00000000-0000-0020-2000000000000000").as_deref(),
+            Some("/00000000-0000-0020-2000000000000000.svg")
+        );
+        assert_eq!(
+            icon_path("00000000-0000-0020-2000000000000000.png").as_deref(),
+            Some("/00000000-0000-0020-2000000000000000.png")
+        );
+        for bad in [
+            "jdev/sps/io/1b35ac02-03a3-4402-ffff450b2297409e/1.0",
+            "dev/sps/io/x/On",
+            "jdev/sps/io/x.svg",
+            "dev/x.svg",
+            "data/LoxAPP3.json",
+            "sys/x.svg",
+            "prog/sps.svg",
+            "JDEV/x.svg",
+            "IconsFilled/../jdev/x.svg",
+            "IconsFilled//x.svg",
+            "IconsFilled/x.svg?y=1",
+            "IconsFilled/x%2F.svg",
+            "IconsFilled/a/b.svg",
+            "/IconsFilled/x.svg",
+            "IconsFilled/x",
+            "IconsFilled/x.json",
+            "1.0",
+            "",
+        ] {
+            assert_eq!(icon_path(bad), None, "{bad}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_command_in_the_structure_file_is_never_requested() {
+        let (host, hits) = icon_server(HashMap::new()).await;
+        let s = Structure::with_dir(Ok(Connection::new(host, "u", "p")), None);
+        s.set(json!({ "controls": {
+            "a": { "name": "A", "type": "Switch", "defaultIcon": "jdev/sps/io/a/1.0" },
+            "b": { "name": "B", "type": "Switch", "defaultIcon": "dev/sps/io/b/On" },
+            "c": { "name": "C", "type": "Switch", "defaultIcon": "IconsFilled/../jdev/sps/io/c/On" },
+        }}));
+        for name in [
+            "jdev/sps/io/a/1.0",
+            "dev/sps/io/b/On",
+            "IconsFilled/../jdev/sps/io/c/On",
+        ] {
+            assert_eq!(s.icon(name).await, Err(None), "{name}");
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        // Not offered to the browser either.
+        assert!(s.summary().1.is_empty());
     }
 
     #[test]
@@ -713,7 +848,8 @@ mod tests {
         gz.write_all(svg).unwrap();
         let gz = gz.finish().unwrap();
         assert!(icon_whole(&gz));
-        assert!(!icon_whole(&gz[..gz.len() - 6]));
+        // Cut inside the compressed SVG (a missing trailer alone is fine: see below).
+        assert!(!icon_whole(&gz[..gz.len() - 20]));
         assert!(icon_whole(b"\x89PNG\r\n\x1a\n....IEND\xaeB`\x82"));
         assert!(!icon_whole(b"\x89PNG\r\n\x1a\n...."));
     }

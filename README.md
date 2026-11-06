@@ -88,6 +88,16 @@ marked so you can review it before you deploy.
   or category, gets a warning; after Apply, **Changed by this Apply** runs the same check on the changed blocks
   (and on removed blocks the app still shows) against the first structure file read after the Apply started.
 
+- **Schedules, weather and Status blocks**: a Daytimer's switching times (and an Intelligent Room Controller's
+  heating and cooling schedule) show in Properties as a day bar per operating mode, with the default value. A
+  changed schedule reads per mode in the Changes list (*Uhr · schedule, Party: 18:00–23:00 22.5 → 17:00–23:00
+  22.5*). With live values on, the bar of what the Miniserver runs sits under the config's, and modes that differ
+  are marked: on the deployed revision as *changed in the app since this config*, on *Pending* as what Apply would
+  replace. Apply's confirmation lists the schedules it would change that way (`GET /api/schedules?rev=…`), or says that
+  it could not check. A Status block shows its live text
+  with the app's colour (and its icon, when the structure file lists it), and a weather data block's output carries the weather server's current
+  value (with a weather subscription; the Weather Service block lists them all).
+
 - **Apply, Sync, Discard** (for a `lox.toml` project, when started with an admin token): edit the project's Lox
   Logic module and compile it with `lox logic`, by hand or with an agent of your own working in the repository
   (see [docs/agent-workflow.md](docs/agent-workflow.md)). The compile shows as the pending revision, so you
@@ -227,6 +237,31 @@ current one, not *Pending*). The config side (shown, room, category) comes from 
 pending change already shows how it will look.
 
 Not built yet: an *App* view that lists the controls by room the way the app does.
+
+### Schedules
+
+The Miniserver sends each Daytimer's schedule as an event table (its `entriesAndDefaultValue` state, for the
+blocks the app shows): the default value, and per entry the operating mode by its number, from, to,
+need-activate and the value. vislox reads the config's schedule in the same terms (`src/schedule.rs`: the
+`<Entry>` rows of a `DayTimer`, or of a block's `<Timer>`, whose live UUID is its `UUIDTimer=`) and compares them
+per mode. A digital Daytimer's values do not count: the Miniserver sends 0 where the file has 1.
+
+An edit in the app is a *custom change* on the Miniserver (`/sys/custom`) until Loxone Config saves the program; a
+download does not carry it. `lox config push` refuses while one is pending, and with `--discard-custom-changes`
+(Apply asks first) the upload replaces it with the config's switching times. So a schedule marked *changed in the
+app* is lost on the next Apply unless it is taken into the config (in Loxone Config: load from the Miniserver,
+save). Without live values nothing is compared, and Apply's confirmation says so when the pending config has
+schedules.
+
+Weather comes from the weather server's states (`weatherServer` in the structure file, only with a weather
+subscription): its current weather, else the forecast hour that has begun. A `WeatherData` block's `WType=`
+picks the field (1 temperature, 2 dew point, 3 humidity, 4 wind speed, 5 wind direction, 7 solar radiation,
+9 precipitation, 10 weather type, 11 air pressure, 26 perceived temperature); such values are marked computed.
+A Status block's icon is the one its `iconAndColor` state names, shown only when the structure file lists that
+icon: `/api/app/icon` fetches no name a live state (which a user can set in the app) brings in. It fetches only
+names of an icon's shape, `<folder>/<file>.svg` or `.png` (never under `jdev`, `dev`, `data`, `sys`, `prog`, …) or
+an icon UUID (as `<uuid>.svg`), so no name can be a command. Icons the Miniserver sends gzipped without the gzip
+trailer are kept unpacked.
 
 ### Miniserver status
 
@@ -387,6 +422,8 @@ The binary is an `axum` server with the UI embedded (plain JS and SVG, no build 
 - `src/model.rs` turns a revision, plus an optional base, into pages, objects, wires, cross-page links,
   properties and a change list. It uses `loxone_config::diff` and adds its own checks for attributes,
   positions and wires.
+- `src/schedule.rs` reads a Daytimer's (or a room controller's) switching times from the `.Loxone` file, in the
+  terms of the Miniserver's Daytimer event table, for Properties, the change list and the live comparison.
 - `src/calendar.rs` decodes a calendar entry's date from the `.Loxone` file's attributes (as lox's
   `loxone-format.md` documents them: `Mode=` the kind, `From`/`To` days since 2009-01-01, `CalType=` the mode's
   number) and words it. The view carries the decoded date by kind (`calendar.date`), and the config's modes by

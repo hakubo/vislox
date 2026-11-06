@@ -332,7 +332,7 @@ fn trim_num(v: f64, prec: usize) -> String {
 }
 
 /// A state value as JSON: whole numbers as integers (`1`, not `1.0`).
-fn number(v: f64) -> Value {
+pub fn number(v: f64) -> Value {
     if v.fract() == 0.0 && v.abs() < 1e15 {
         Value::from(v as i64)
     } else {
@@ -454,6 +454,25 @@ fn read_structure(structure: &Value) -> Structure {
             json!({ "name": format!("Miniserver · {name}"), "type": "GlobalState", "states": { "value": su } })
         });
     }
+    // The weather server's current weather and forecast (with a weather
+    // subscription), as globals `weather.actual` and `weather.forecast`.
+    for (name, su) in structure["weatherServer"]["states"]
+        .as_object()
+        .into_iter()
+        .flatten()
+    {
+        let Some(su) = su.as_str() else {
+            continue;
+        };
+        globals.insert(format!("weather.{name}"), Value::from(su));
+        owners.entry(su.to_string()).or_insert_with(|| Owner {
+            label: format!("Weather server · {name}"),
+            state: name.clone(),
+            format: None,
+            names: None,
+            queried: false,
+        });
+    }
     Structure {
         owners,
         controls: Value::Object(controls),
@@ -514,8 +533,56 @@ impl Status {
     }
 }
 
-/// A stored value: the value and its text in the control's format.
-type Val = (Value, Option<String>);
+/// A stored value: the value, its text in the control's format, and the
+/// icon a text state names (a Status block's).
+type Val = (Value, Option<String>, Option<String>);
+
+/// A Daytimer's event table as the browser receives it: the default
+/// value, and each entry in the terms of `schedule::Entry`.
+fn daytimer_value(default: f64, entries: &[loxone_client::stream::DaytimerEntry]) -> Value {
+    let entries: Vec<Value> = entries
+        .iter()
+        .map(|e| {
+            json!({ "mode": e.mode, "from": e.from, "to": e.to,
+                    "activate": e.need_activate != 0, "value": number(e.value) })
+        })
+        .collect();
+    json!({ "schedule": true, "default": number(default), "entries": entries })
+}
+
+/// A weather event table as the browser receives it: when the weather
+/// server last updated it (Loxone time: seconds since 2009-01-01), and its
+/// entries (the current weather, or the forecast by the hour).
+fn weather_value(last_update: u32, entries: &[loxone_client::stream::WeatherEntry]) -> Value {
+    let entries: Vec<Value> = entries
+        .iter()
+        .map(|e| {
+            json!({ "time": e.timestamp, "type": e.weather_type,
+                    "windDirection": e.wind_direction, "solarRadiation": e.solar_radiation,
+                    "humidity": e.relative_humidity, "temperature": number(e.temperature),
+                    "perceived": number(e.perceived_temperature), "dewPoint": number(e.dew_point),
+                    "precipitation": number(e.precipitation), "windSpeed": number(e.wind_speed),
+                    "pressure": number(e.barometric_pressure) })
+        })
+        .collect();
+    json!({ "weather": true, "lastUpdate": last_update, "entries": entries })
+}
+
+/// The icon a Status block's text state names: the `icon` of its
+/// `iconAndColor` state's JSON
+/// (`{"icon":"IconsFilled/battery-full.svg","color":"#8DFF70"}`). The
+/// icon UUID of the text event itself is not used: current firmware sends
+/// an index there (`00000223-00ff-0000-0000000000000000`), not an icon.
+fn state_icon(text: &str) -> Option<String> {
+    if !text.trim_start().starts_with('{') {
+        return None;
+    }
+    let v: Value = serde_json::from_str(text).ok()?;
+    v["icon"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+}
 
 struct St {
     status: Status,
@@ -763,9 +830,22 @@ impl Live {
                 let (uuid, val) = match e {
                     StateEvent::ValueState { uuid, value } => {
                         let text = st.owners.get(&uuid).and_then(|o| o.text(value));
-                        (uuid, (number(value), text))
+                        (uuid, (number(value), text, None))
                     }
-                    StateEvent::TextState { uuid, text, .. } => (uuid, (Value::from(text), None)),
+                    StateEvent::TextState { uuid, text, .. } => {
+                        let icon = state_icon(&text);
+                        (uuid, (Value::from(text), None, icon))
+                    }
+                    StateEvent::DaytimerState {
+                        uuid,
+                        default_value,
+                        entries,
+                    } => (uuid, (daytimer_value(default_value, &entries), None, None)),
+                    StateEvent::WeatherState {
+                        uuid,
+                        last_update,
+                        entries,
+                    } => (uuid, (weather_value(last_update, &entries), None, None)),
                     StateEvent::OutOfService => {
                         gone = true;
                         continue;
@@ -1102,7 +1182,7 @@ impl Live {
                     names: None,
                     queried: true,
                 };
-                let val: Val = (value, None);
+                let val: Val = (value, None, None);
                 if st.values.get(&uuid) != Some(&val) {
                     out.insert(uuid.clone(), entry(&val, Some(&owner)));
                     st.values.insert(uuid.clone(), val);
@@ -1275,7 +1355,7 @@ impl Live {
             names: None,
             queried: false,
         };
-        let val: Val = (value, None);
+        let val: Val = (value, None, None);
         let mut st = self.st.lock().unwrap();
         if st.values.get(uuid) != Some(&val) {
             batch.insert(uuid.to_string(), entry(&val, Some(&owner)));
@@ -1295,8 +1375,9 @@ impl Live {
 }
 
 fn entry(v: &Val, owner: Option<&Owner>) -> Value {
-    match owner {
-        Some(o) if o.queried => json!([v.0, v.1, o.label, "queried"]),
+    match (owner, &v.2) {
+        (Some(o), _) if o.queried => json!([v.0, v.1, o.label, "queried"]),
+        (_, Some(icon)) => json!([v.0, v.1, owner.map(|o| o.label.as_str()), null, icon]),
         _ => json!([v.0, v.1, owner.map(|o| o.label.as_str())]),
     }
 }
@@ -1515,6 +1596,85 @@ mod tests {
                 .collect(),
             want: want.iter().map(|w| w.to_string()).collect(),
         }
+    }
+
+    #[test]
+    fn schedules_weather_and_status_icons_become_values() {
+        use loxone_client::stream::{DaytimerEntry, WeatherEntry};
+        let live = Live::new(Feed::Off("test".into()), "test".into());
+        live.load_structure(
+            0,
+            &json!({ "controls": {},
+                     "weatherServer": { "states": { "actual": "w1", "forecast": "w2" } } }),
+        );
+        live.apply(
+            0,
+            vec![
+                StateEvent::DaytimerState {
+                    uuid: "dt".into(),
+                    default_value: 18.0,
+                    entries: vec![DaytimerEntry {
+                        mode: 3,
+                        from: 390,
+                        to: 480,
+                        need_activate: 1,
+                        value: 21.5,
+                    }],
+                },
+                StateEvent::WeatherState {
+                    uuid: "w1".into(),
+                    last_update: 563_000_000,
+                    entries: vec![WeatherEntry {
+                        timestamp: 563_000_000,
+                        weather_type: 2,
+                        wind_direction: 180,
+                        solar_radiation: 300,
+                        relative_humidity: 70,
+                        temperature: 12.5,
+                        perceived_temperature: 11.0,
+                        dew_point: 7.0,
+                        precipitation: 0.0,
+                        wind_speed: 9.0,
+                        barometric_pressure: 1013.0,
+                    }],
+                },
+                StateEvent::TextState {
+                    uuid: "ic".into(),
+                    icon_uuid: "00000223-00ff-0000-0000000000000000".into(),
+                    text: r##"{"icon":"IconsFilled/battery-full.svg","color":"#8DFF70"}"##.into(),
+                },
+                StateEvent::TextState {
+                    uuid: "tx".into(),
+                    icon_uuid: "00000223-00ff-0000-0000000000000000".into(),
+                    text: "Bateria full".into(),
+                },
+            ],
+        );
+        let snap: Value = serde_json::from_str(&live.snapshot_json()).unwrap();
+        let dt = &snap["values"]["dt"][0];
+        assert_eq!(dt["default"], 18);
+        assert_eq!(
+            dt["entries"][0],
+            json!({ "mode": 3, "from": 390, "to": 480, "activate": true, "value": 21.5 })
+        );
+        let w = &snap["values"]["w1"];
+        assert_eq!(w[0]["entries"][0]["temperature"], 12.5);
+        assert_eq!(w[0]["entries"][0]["humidity"], 70);
+        assert_eq!(w[2], "Weather server · actual");
+        assert_eq!(snap["globals"]["weather.forecast"], "w2");
+        // The icon of an `iconAndColor` state comes along; plain text has none.
+        assert_eq!(snap["values"]["ic"][4], "IconsFilled/battery-full.svg");
+        assert_eq!(snap["values"]["tx"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn a_status_icon_comes_from_the_icon_state() {
+        assert_eq!(
+            state_icon(r#"{"icon":"IconsFilled/power-grid.svg"}"#).as_deref(),
+            Some("IconsFilled/power-grid.svg")
+        );
+        assert_eq!(state_icon("Normal"), None);
+        assert_eq!(state_icon(r##"{"color":"#fff"}"##), None);
     }
 
     #[test]

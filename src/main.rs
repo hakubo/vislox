@@ -18,6 +18,7 @@ mod pull;
 mod query;
 mod reason;
 mod restart;
+mod schedule;
 mod session;
 mod source;
 mod structure;
@@ -414,6 +415,7 @@ async fn main() -> Result<()> {
         )
         .route("/api/history", get(api_history))
         .route("/api/view", get(api_view))
+        .route("/api/schedules", get(api_schedules))
         .route("/api/events", get(api_events))
         .route("/api/live", get(api_live))
         .route("/api/live/retry", axum::routing::post(api_live_retry))
@@ -628,6 +630,30 @@ async fn api_view(State(app): State<Arc<App>>, Query(q): Query<ViewQuery>) -> Re
             body.to_string(),
         )
             .into_response(),
+        Err(e) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({ "error": e })),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct RevQuery {
+    rev: String,
+}
+
+/// The blocks with switching times of revision `rev`, for Apply's check
+/// against the schedules the Miniserver runs.
+async fn api_schedules(State(app): State<Arc<App>>, Query(q): Query<RevQuery>) -> Response {
+    let res = tokio::task::spawn_blocking(move || {
+        load(&app, &q.rev).map(|(_, doc)| model::schedules(&doc))
+    })
+    .await
+    .map_err(|e| e.to_string())
+    .and_then(|r| r);
+    match res {
+        Ok(list) => Json(list).into_response(),
         Err(e) => (
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(serde_json::json!({ "error": e })),
