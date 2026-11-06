@@ -253,6 +253,13 @@ try {
     const i = errors.findIndex((e) => e.includes("status of 503"));
     if (i >= 0) errors.splice(i, 1);
   });
+  await step("the Miniserver log says why it cannot be read", async () => {
+    // The stand-in lox here only pulls, so `lox log` fails; the panel says so.
+    await page.click("#log-toggle");
+    await page.waitForFunction(() => /^Cannot read the log: lox log failed: unexpected: log/.test(document.querySelector("#log-msg")?.textContent || ""), null, { timeout: 15000 });
+    await page.click("#log-toggle");
+    await page.waitForSelector("#log-body.hidden", { state: "attached" });
+  });
   await step("keyboard help opens and closes", async () => {
     await page.focus("#canvas");
     await page.keyboard.press("?");

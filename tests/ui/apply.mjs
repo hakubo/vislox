@@ -57,7 +57,18 @@ case "$1 $2" in
     echo "Restarting the program..." >&2; sleep 2
     echo "Downloading the config again to verify..." >&2; sleep 1
     cp out.Loxone base.Loxone
+    touch "${loxDir}/pushed"
     echo "Pushed and verified." >&2 ;;
+  "log -n")
+    echo "2026-11-06 09:00:00.000;Program changed by user 'admin'"
+    echo "2026-11-06 09:00:02.000;PRG start program"
+    echo "2026-11-06 09:05:00.000;Warning 1100, Meter offline, all, MeterAbsUni (Zähler,10000005-0000-0050-ffff504f94000001)"
+    echo "2026-11-06 09:10:00.000;Remote Connect RC Registration done"
+    if [ -f "${loxDir}/pushed" ]; then
+      echo "2026-11-06 10:00:00.000;Program changed by user 'lox'"
+      echo "2026-11-06 10:00:00.000;PRG got restart command; user: lox(127.0.0.1)"
+      echo "2026-11-06 10:00:05.000;Warning 1167, Meter reading decreased, all, MeterAbsUni (Zähler,10000005-0000-0050-ffff504f94000001)"
+    fi ;;
   *) echo "unexpected: $*" >&2; exit 2 ;;
 esac
 `);
@@ -105,6 +116,18 @@ try {
     return li?.className.replace("st-", "");
   }, id);
 
+  await step("the Miniserver log opens and marks what came after the last program change", async () => {
+    await page.waitForSelector("#log-pane:not(.hidden)");
+    await page.click("#log-toggle");
+    await page.waitForSelector("#log li.since");
+    const texts = await page.$$eval("#log li .tx", (n) => n.map((x) => x.textContent));
+    assert.equal(texts[0], "Remote Connect RC Registration done", texts.join(" | "));
+    assert.equal(await page.$$eval("#log li.since", (n) => n.length), 4);
+    assert.match(await page.textContent("#log li.mark"), /The program changed here/);
+    // Closed during the Apply: it is read again when it opens.
+    await page.click("#log-toggle");
+    await page.waitForSelector("#log-body.hidden", { state: "attached" });
+  });
   await step("the compile is pending", async () => {
     await page.waitForSelector("#btn-apply:not([disabled])");
   });
@@ -133,6 +156,22 @@ try {
     assert.match(await page.textContent("#deploy-new"), /Licht oben/);
     await page.waitForFunction(() => document.querySelector("#canvas").classList.contains("live"));
     if (process.env.SHOT) await page.screenshot({ path: process.env.SHOT + "-done.png" });
+  });
+  await step("after Apply the old log marks no block, and opening the panel reads it again", async () => {
+    // The warning read before the Apply is about the old program.
+    assert.equal(await page.evaluate(() => logMarks().size), 0);
+    await page.click("#log-toggle");
+  });
+  await step("after Apply the log shows what the new program logged, linked to its block", async () => {
+    await page.waitForFunction(() => /Warning 1167/.test(document.querySelector("#log li .tx")?.textContent || ""), null, { timeout: 10000 });
+    assert.equal(await page.$$eval("#log li.since", (n) => n.length), 3);
+    assert.equal(await page.textContent("#log-count"), "3 new");
+    assert.match(await page.getAttribute("#log li.warning", "class"), /since/);
+    await page.click('#log li.warning .go:has-text("Zähler")');
+    await page.waitForFunction(() => document.querySelector(".ph-t")?.textContent === "Zähler");
+    // The block carries a mark on the canvas, for the new warning.
+    await page.waitForSelector('#viewport .lbadge.warning');
+    assert.deepEqual(await page.evaluate(() => [...logMarks().values()].map((e) => e.text.slice(0, 12))), ["Warning 1167"]);
   });
   await step("a changed block opens from the list", async () => {
     await page.click('#deploy-new .go:has-text("Licht oben")');

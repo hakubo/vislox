@@ -91,6 +91,12 @@ marked so you can review it before you deploy.
   **Sync from Miniserver**. Apply asks once more and warns in its confirmation. While the page is open it asks for
   the date every minute (the rest of the check every five minutes). An earlier date (an older config restored on
   the Miniserver) is shown in the chip's details, not as a warning.
+- **Miniserver log** (bottom right): the Miniserver's system log, as `lox log` reads it, newest first. It is read
+  when you open the panel, on Refresh, and after an Apply. The entries since the last program change (an Apply, or
+  a save from Loxone Config) are marked, so you see what the new program logged as it started. A line that names a
+  block (warnings carry the UUID of the block that raised them) gets a link that selects that block, and on the
+  deployed revision that block gets a small `!` mark on the canvas. The live Debug-Monitor stream (UDP 7777) is
+  not shown yet: see [docs/debug-monitor.md](docs/debug-monitor.md).
 
 vislox itself never writes to the config: lox and git do, and only on Pull, Apply and Discard. Live values only
 listen. A pull reads from the Miniserver; only Apply writes to it.
@@ -206,6 +212,14 @@ browser, only when a user turns live values off and on (`POST /api/live/retry`).
 A Pull, Apply or Sync that fails with one of these codes shows the same explanation above lox's message. Only
 the Miniserver's own wording counts (`Code 401`, `HTTP 503: /jdev/…`, `close code 4003`); git's `HTTP 403` does not.
 
+The **Miniserver log** runs `lox log -n 300` with the same lox configuration and context as live values
+(`GET /api/log`, which needs an `X-Vislox` header, since lox logs in for it). It only reads. One `lox log` runs
+at a time, and requests that come in while it runs share the next one (its failure too), so none gets a log read
+before it asked. When lox fails, the panel says why and keeps the entries it had. A program change is a
+`Program changed by user` line, with the `PRG got restart command` logged up to 2 s before it; a reboot or a plain
+program restart is not one. After an Apply, the log read before it marks no blocks until it is read again.
+`--no-live` turns it off.
+
 **Pull from Miniserver** runs `lox config pull` (the `lox` on `PATH`, or `--lox <path>`), with the same lox
 configuration and context as live values. It is offered only when lox would commit to the repository vislox
 shows, into the folder of the Miniserver vislox shows (`config_repo` and the serial or address in lox's
@@ -242,6 +256,8 @@ The binary is an `axum` server with the UI embedded (plain JS and SVG, no build 
 - `src/restart.rs` follows the program restart during Apply: out of service, back online, new config loaded.
 - `src/pull.rs` runs `lox config pull` for the Pull button (`POST /api/pull`, which needs an `X-Vislox` header so
   that no other web page can trigger it), then refreshes the history.
+- `src/log.rs` runs `lox log` for the Log panel (`GET /api/log`), splits it into entries, marks the last program
+  change and picks out the UUIDs a line names.
 - `src/miniserver.rs` checks the Miniserver for the status chip and the preflight before Pull, Apply and Sync
   (`GET /api/miniserver`), including that the serial at the address is the config's, and when its config last
   changed; `src/configdate.rs` finds the same date for the base, in the download it came from.

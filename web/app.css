@@ -499,3 +499,30 @@ button.chip { cursor: pointer; } button.chip:hover { border-color: var(--brand);
 .ms-foot { display: flex; align-items: center; gap: 8px; margin-top: 10px; color: var(--faint); }
 .ms-foot .pull-btn { margin-left: auto; }
 @media (max-width: 1100px) { .ms-chip .lbl { display: none; } }
+
+/* ── Miniserver log ────────────────────────────────── */
+#log-pane { flex: none; min-height: 0; border-top: 1px solid var(--line); }
+#log-pane.open { flex: 1 1 40%; }
+#right.compact #log-pane.open { flex: 1 1 50%; }
+.log-toggle { display: inline-flex; align-items: center; gap: 4px; padding: 0; border: none; background: none; font: inherit; color: inherit; text-transform: inherit; letter-spacing: inherit; cursor: pointer; }
+.log-toggle .tw { display: inline-block; width: 10px; font-size: 10px; transition: transform .1s; }
+.log-toggle[aria-expanded="true"] .tw { transform: rotate(90deg); }
+.log-body { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.log-msg { flex: none; margin: 6px 10px 0; padding: 6px 8px; border-radius: 4px; font-size: 12px; background: var(--panel-2); color: var(--muted); word-break: break-word; white-space: pre-line; }
+.log-msg.error { background: var(--removed-bg); color: var(--removed); }
+.log-only { flex: none; display: flex; align-items: center; gap: 6px; padding: 5px 10px; font-size: 12px; color: var(--muted); border-bottom: 1px solid var(--line-2); }
+.log { flex: 1; overflow: auto; margin: 0; padding: 0; list-style: none; font-size: 12px; }
+.log li { padding: 4px 10px 4px 8px; border-bottom: 1px solid var(--line-2); border-left: 3px solid transparent; background: #fff; }
+.log li.since { background: #fbfdf9; border-left-color: var(--brand); }
+.log li .tm { display: block; color: var(--faint); font-variant-numeric: tabular-nums; font-size: 11px; }
+.log li .tx { display: block; white-space: pre-wrap; word-break: break-word; }
+.log li.warning .tx { color: var(--changed); }
+.log li.error .tx { color: var(--removed); }
+.log li.program .tx { font-weight: 600; }
+.log li.flash { background: var(--sel-soft); }
+.log li.mark { padding: 3px 10px; font-size: 11px; font-weight: 600; color: var(--brand-strong); background: var(--brand-soft); border-left-color: var(--brand); }
+.log .go { margin: 2px 4px 0 0; padding: 0 6px; border: 1px solid var(--line); border-radius: 10px; background: #fff; color: var(--sel); font-size: 11px; cursor: pointer; }
+.log .go:hover { border-color: var(--sel); }
+.lbadge circle { fill: #fff; stroke: var(--changed-dot); stroke-width: 2px; vector-effect: non-scaling-stroke; }
+.lbadge.error circle { stroke: var(--removed); }
+.lbadge text { fill: var(--text); font-weight: 700; font-size: 130px; }
