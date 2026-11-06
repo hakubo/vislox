@@ -2513,18 +2513,28 @@ async function editSave() {
   if (!ops.length) { S.edit.msg = "Nothing changed."; renderProps(); return; }
   await editSend(o.uuid, st.rev, ops);
 }
-/** Send the edits; on success show the new pending revision. */
+/** Send the edits; on success show the new pending revision. Returns "ok", "failed" (the server refused
+ *  or did not answer: nothing changed), or "shown" (compiled, but showing the new revision failed). */
 async function editSend(uuid, rev, ops) {
   S.edit.busy = true; S.edit.uuid = uuid; renderProps();
+  let res;
   try {
-    const res = await act("/api/edit", { base: rev.blob, ops });
-    S.edit = { uuid, open: false, draft: {}, bad: {}, busy: false, msg: "Saved and compiled: pending, not deployed. Review it, then Apply or Discard.", err: "" };
-    await editShowNewest(res.blob);
-    if (S.sel === uuid && !S.view?.objects[uuid]) select(null, { noReveal: true });
+    res = await act("/api/edit", { base: rev.blob, ops });
   } catch (err) {
     S.edit.busy = false; S.edit.err = err.message;
     renderProps();
+    return "failed";
   }
+  S.edit = { uuid, open: false, draft: {}, bad: {}, busy: false, msg: "Saved and compiled: pending, not deployed. Review it, then Apply or Discard.", err: "" };
+  try {
+    await editShowNewest(res.blob);
+    if (S.sel === uuid && !S.view?.objects[uuid]) select(null, { noReveal: true });
+  } catch (err) {
+    S.edit.err = `Saved and compiled, but the page could not show it: ${err.message}`;
+    renderProps();
+    return "shown";
+  }
+  return "ok";
 }
 /** Back to the deployed value: claim what the deployed revision claimed, or nothing. */
 async function editRevert(key) {
@@ -2592,6 +2602,9 @@ function mvBegin(o) {
 function mvShift(dx, dy) {
   const o = curPage()?.objects.find((x) => x.uuid === MV.uuid && !x.moved_to);
   if (!o || S.page !== MV.page) return;
+  // Not past the page's top left (a block already there goes no further).
+  dx = Math.max(dx, Math.min(0, -MV.orig.rect[0])); dy = Math.max(dy, Math.min(0, -MV.orig.rect[1]));
+  if (dx === MV.dx && dy === MV.dy && o.rect[0] === MV.orig.rect[0] + dx && o.rect[1] === MV.orig.rect[1] + dy) return;
   MV.dx = dx; MV.dy = dy;
   o.rect = [MV.orig.rect[0] + dx, MV.orig.rect[1] + dy, MV.orig.rect[2], MV.orig.rect[3]];
   o.ports.forEach((q, i) => { q.x = MV.orig.ports[i].x + dx; q.y = MV.orig.ports[i].y + dy; });
@@ -2623,7 +2636,7 @@ window.addEventListener("mousemove", (e) => {
   if (!MV.moved && Math.abs(mx) + Math.abs(my) <= 3) return;
   MV.moved = true;
   const dx = snapG(MV.orig.rect[0] + mx / MV.k) - MV.orig.rect[0], dy = snapG(MV.orig.rect[1] + my / MV.k) - MV.orig.rect[1];
-  if (dx !== MV.dx || dy !== MV.dy) mvShift(dx, dy);
+  mvShift(dx, dy);
 });
 window.addEventListener("mouseup", () => {
   if (!MV?.dragging) return;
@@ -2643,7 +2656,8 @@ function mvNudge([sx, sy], n) {
   if (!o || (MV && (MV.dragging || MV.uuid !== o.uuid)) || (!MV && !moveState(o.uuid))) return false;
   if (!MV) mvBegin(o);
   clearTimeout(MV.timer);
-  mvShift(MV.dx + sx * n * GRID, MV.dy + sy * n * GRID);
+  // On the grid, also from a block Loxone Config left off it.
+  mvShift(snapG(MV.orig.rect[0] + MV.dx + sx * n * GRID) - MV.orig.rect[0], snapG(MV.orig.rect[1] + MV.dy + sy * n * GRID) - MV.orig.rect[1]);
   MV.timer = setTimeout(() => mvSend(MV), 600);
   return true;
 }
@@ -2665,11 +2679,13 @@ async function mvSend(m) {
   MV = null;
   await mvEdit(m.uuid, st.rev, [{ op: "move", uuid: m.uuid, x: m.orig.rect[0] + m.dx, y: m.orig.rect[1] + m.dy }], () => mvUndo(m));
 }
-/** Send move or relayout ops: the reply's pending revision is shown, a refusal in Properties. */
+/** Send move or relayout ops: the reply's pending revision is shown, a refusal in Properties. The drawn
+ *  move is undone only when the edit failed, not when it compiled and showing it failed. */
 async function mvEdit(uuid, rev, ops, undo) {
   S.mvBusy = true; renderAddHud();
+  let out = "ok";
   try {
-    if (uuid) await editSend(uuid, rev, ops);
+    if (uuid) out = await editSend(uuid, rev, ops);
     else {
       const res = await act("/api/edit", { base: rev.blob, ops });
       deployMsg("Laid out and compiled: pending, not deployed. Review it, then Apply or Discard.");
@@ -2681,7 +2697,7 @@ async function mvEdit(uuid, rev, ops, undo) {
     S.mvBusy = false;
     renderAddHud();
   }
-  if (uuid && S.edit.err) undo?.();
+  if (out === "failed") undo?.();
 }
 /** Back to where it is deployed. */
 async function mvRevert(uuid) {
@@ -2692,7 +2708,7 @@ async function mvRevert(uuid) {
 /** "Arrange": lay out the page's managed blocks afresh. */
 async function mvRelayout() {
   const st = addState();
-  if (!st?.ok || S.mvBusy || !mvOnPage(st.page).length) return;
+  if (!st?.ok || S.mvBusy || !mvOnPage(st.page).length || S.edits?.arrange?.[st.page.uuid] !== null) return;
   await mvEdit(null, st.rev, [{ op: "relayout", page: st.page.uuid }]);
 }
 $("btn-relayout").onclick = mvRelayout;
@@ -2736,9 +2752,12 @@ function renderAddHud() {
   b.disabled = !st.ok;
   b.title = st.ok ? `Add a block to ${st.page.title || "this page"} (it is compiled, not deployed)` : st.why;
   const n = st.ok ? mvOnPage(st.page).length : 0;
-  r.disabled = !st.ok || !n || S.mvBusy;
+  // The server says per page whether lox can lay it out (null) or why not.
+  const why = st.ok && n ? S.edits?.arrange?.[st.page.uuid] : undefined;
+  r.disabled = !st.ok || !n || why !== null || S.mvBusy;
   r.title = !st.ok ? st.why
     : !n ? "lox lays out only the blocks the project's module manages, and this page has none"
+    : why !== null ? (why || "lox cannot lay out this page")
     : `Lay out the ${plural(n, "block")} the module manages on this page afresh, as lox places new blocks (it is compiled, not deployed)`;
 }
 async function abOpen() {

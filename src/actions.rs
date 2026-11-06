@@ -637,15 +637,20 @@ impl Actions {
             .project
             .as_deref()
             .and_then(|d| loxone_config::Project::load(&d.join("lox.toml")).ok())
-            .map(|p| edit::Files::texts(&p.module.join(edit::DIR)))
-            .filter(|t| !t.is_empty())
-            .map(|t| {
-                let all: Vec<String> = t
+            .map(|p| {
+                // vislox's files, and the lockfile: which blocks lox can move
+                // comes from it, and lox or a Discard may change it alone.
+                let mut all: Vec<String> = edit::Files::texts(&p.module.join(edit::DIR))
                     .iter()
                     .map(|(n, x)| format!("{n}={}", crate::history::blob_id(x.as_bytes())))
                     .collect();
-                crate::history::blob_id(all.join("\n").as_bytes())
-            });
+                if let Ok(lock) = std::fs::read(&p.lock) {
+                    all.push(format!("lock={}", crate::history::blob_id(&lock)));
+                }
+                all
+            })
+            .filter(|all| !all.is_empty())
+            .map(|all| crate::history::blob_id(all.join("\n").as_bytes()));
         let key = format!(
             "{}:{}:{}",
             file.as_deref().unwrap_or("-"),
@@ -1233,7 +1238,7 @@ impl Actions {
                 .map_err(|e| fail(format!("cannot write {shown_lock}: {e}")))?;
         }
         let mut args = vec!["logic", "compile"];
-        for title in &place.relayout {
+        for title in place.relayout.values() {
             args.extend(["--relayout", title.as_str()]);
         }
         run(&self.s.lox, &args, dir, COMPILE_TIMEOUT)
@@ -1256,11 +1261,11 @@ impl Actions {
         let lock = edit::Lock::read(&p.lock);
         // A move lox did not keep is refused, not shown as done. A page laid
         // out afresh places its blocks anew, moved or not.
-        if !place.moves.is_empty() && place.relayout.is_empty() {
+        if !place.moves.is_empty() {
             let out = std::fs::read(&p.out)
                 .map_err(|e| fail(e.to_string()))
                 .and_then(|b| edit::parse_doc(&b).map_err(fail))?;
-            let missed = edit::moves_missed(&out, &lock, &place.moves);
+            let missed = edit::moves_missed(&out, &base, &lock, place);
             if !missed.is_empty() {
                 return Err(fail(format!(
                     "lox logic compile did not keep the new position of {}",
@@ -1459,12 +1464,15 @@ impl Actions {
         // deployed one, on the same page.
         let mut movable: Vec<&str> = lock.placed.keys().filter_map(|s| lock.uuid_of(s)).collect();
         movable.sort();
-        let moves: Vec<Value> = match (&pending_doc, &deployed_doc) {
+        // One walk per config, not one per block.
+        let pending_at = pending_doc.as_ref().map(edit::drawn);
+        let deployed_at = deployed_doc.as_ref().map(edit::drawn);
+        let moves: Vec<Value> = match (&pending_at, &deployed_at) {
             (Some(pd), Some(dd)) => movable
                 .iter()
                 .filter_map(|u| {
-                    let (now_page, now) = edit::drawn_at(pd, u)?;
-                    let (was_page, was) = edit::drawn_at(dd, u)?;
+                    let (now_page, now) = pd.get(*u)?;
+                    let (was_page, was) = dd.get(*u)?;
                     ((now_page == was_page) && (now.px, now.py) != (was.px, was.py)).then(|| {
                         json!({ "uuid": u, "x": now.px, "y": now.py, "deployed": [was.px, was.py] })
                     })
@@ -1472,6 +1480,22 @@ impl Actions {
                 .collect(),
             _ => Vec::new(),
         };
+        // Whether each page with a movable block can be laid out afresh
+        // (Arrange): page UUID → null, or why not. On the config shown: the
+        // pending one, else the deployed one (lox compiles on its pages).
+        let mut arrange = serde_json::Map::new();
+        let shown = pending_doc.as_ref().or(deployed_doc.as_ref());
+        let shown_at = pending_at.as_ref().or(deployed_at.as_ref());
+        if let (Some(doc), Some(at)) = (shown, shown_at) {
+            let pages: std::collections::BTreeSet<&str> = movable
+                .iter()
+                .filter_map(|u| at.get(*u).map(|(p, _)| p.as_str()))
+                .collect();
+            for page in pages {
+                let why = edit::relayout_title(doc, doc, &lock, page).err();
+                arrange.insert(page.to_string(), json!(why));
+            }
+        }
         let blocks: Vec<Value> = now
             .pages
             .iter()
@@ -1502,6 +1526,7 @@ impl Actions {
             "managed": managed,
             "movable": movable,
             "moves": moves,
+            "arrange": arrange,
         })
     }
 
@@ -2463,6 +2488,20 @@ sed '/U="10000006-0000-0060-ffff504f94000001"/s/Px="[0-9-]*" Py="[0-9-]*"/Px="'"
             (&json!([DIV]), &json!([])),
             "{e}"
         );
+        // Its page can be laid out afresh.
+        assert_eq!(e["arrange"], json!({ EG: null }), "{e}");
+        // The lockfile alone changing (lox, a Discard) changes the key.
+        let key = a.edit_state.lock().unwrap().key.clone();
+        std::fs::write(
+            d.join("logic.lock.json"),
+            lock.replace("\"Div\"", "\"Div\" "),
+        )
+        .unwrap();
+        a.refresh_edit(Some(&blob(&d, "base.Loxone")), None);
+        assert_ne!(a.edit_state.lock().unwrap().key, key);
+        std::fs::write(d.join("logic.lock.json"), &lock).unwrap();
+        a.refresh_edit(Some(&blob(&d, "base.Loxone")), None);
+        assert_eq!(a.edit_state.lock().unwrap().key, key);
 
         // Snapped to the grid; the position the base still draws is
         // superseded, so lox keeps the new one. vislox's files stay as they were.

@@ -345,6 +345,31 @@ try {
     assert.equal(edits.length, n + 1);
     assert.deepEqual(edits[n].ops, [{ op: "move", uuid: FLUR, x: moved.x + 96, y: moved.y }]);
   });
+  await step("nudged past the top of the page, it stops at the edge", async () => {
+    const n = edits.length, r0 = await rev(), x = (await flurNow()).rect[0];
+    for (let i = 0; i < 4; i++) await page.keyboard.press("Alt+Shift+ArrowUp");
+    await flurAt(r0, x, true);
+    assert.equal(edits.length, n + 1);
+    assert.deepEqual(edits[n].ops, [{ op: "move", uuid: FLUR, x, y: 0 }]);
+    assert.equal((await flurNow()).rect[1], 0);
+  });
+  await step("a refused move puts the block back; one compiled but not shown stays", async () => {
+    // Settled: no move in flight, the edit's message shown.
+    const settled = (re) => page.waitForFunction((src) => !MV && !S.mvBusy && new RegExp(src).test(S.edit.err), re.source, { timeout: 10000 });
+    const x = (await flurNow()).rect[0];
+    await page.route("**/api/edit", (r) => r.fulfill({ status: 422, contentType: "application/json", body: JSON.stringify({ error: "refused for the test" }) }), { times: 1 });
+    await page.keyboard.press("Alt+ArrowLeft");
+    await settled(/refused for the test/);
+    assert.equal((await flurNow()).rect[0], x);
+    // Compiled, but showing the new revision fails once: the canvas keeps the move.
+    const r0 = await rev();
+    await page.evaluate(() => { const show = editShowNewest; window.editShowNewest = async () => { window.editShowNewest = show; throw new Error("no history"); }; });
+    await page.keyboard.press("Alt+ArrowLeft");
+    await settled(/could not show it: no history/);
+    assert.equal((await flurNow()).rect[0], x - 96);
+    await page.evaluate(() => editShowNewest());
+    await flurAt(r0, x - 96, true);
+  });
   await step("Revert puts it back where it is deployed", async () => {
     const n = edits.length, r0 = await rev();
     await page.click('#props [data-ed="unmove"]');

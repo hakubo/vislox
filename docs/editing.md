@@ -115,14 +115,18 @@ move made in Loxone Config is taken over from the base. `lox logic compile --rel
 managed blocks afresh. vislox moves blocks with the same lockfile state lox's own placement leaves:
 
 - `move` sets the block's `layout` to the new rectangle: the top left corner snapped to Loxone Config's grid
-  (multiples of 96, as a Loxone Config save writes them), the size kept. When the base still draws the block
+  (multiples of 96, as a Loxone Config save writes them) and not past the page's top left (0, 0), the size kept.
+  A target within a grid step of where the base draws the block is that rectangle as it is, on the grid or not:
+  lox keeps the base's rectangle there, so *Revert* puts a block Loxone Config left off the grid back exactly. When the base still draws the block
   elsewhere on its page, that rectangle goes into `superseded_layout`, the field lox uses to tell a base from
   before its placement from a move made in Loxone Config. Without it, the compile would take the base's position
   back. Once applied, the base draws the block at its new place and lox drops the field itself.
-- After the compile, vislox checks that the pending config draws each moved block where it was put; a move lox
-  did not keep is refused, and the lock and out are put back.
+- After the compile, vislox checks that the pending config draws each moved block where it was put (or, within
+  a grid step of the base's rectangle, there); a move lox did not keep is refused, and the lock and out are put
+  back. A move on a page the same request lays out afresh is not checked: lox places those blocks anew.
 - `relayout` runs `lox logic compile --relayout <page title>`. lox lays out every page with that title, so a page
-  whose title another page has is refused, as is a page with no managed block.
+  whose title another page has is refused, as is a page with no managed block, and one whose blocks a lock from
+  before lox pinned pages (no `page_uuid`) holds.
 - What is moved: the blocks the lockfile manages that are drawn on a page. That is every block added here (#59),
   the module's own blocks, and, once adopted (#72), a block Loxone Config drew. Their values are still edited
   only where they are declared; the position is not in the source, so moving them changes no `.loxl` file.
@@ -229,10 +233,14 @@ Around the module: #64 (mark managed blocks), #65 (`lox logic check` errors), #6
   with Alt and an arrow key when it is selected (Shift: ten grid steps). It snaps to the grid, its wires follow,
   and the drop is compiled. Properties shows *moved, not deployed* with *Revert* (back to the deployed position),
   and the Deploy pane counts the blocks moved. Dragging any other block pans the page, as before.
-- *Arrange*, next to *Add block*, lays out the page's managed blocks afresh. It is off on a page without them.
+- *Arrange*, next to *Add block*, lays out the page's managed blocks afresh. It is off, with the reason, where
+  the server would refuse it (`arrange` in `GET /api/edits`).
+- A refused move puts the block back where it was. A move that compiled stays drawn even when showing the new
+  revision fails; Properties says so.
 - `GET /api/edits` lists what vislox's files claim now and in the deployed revision, which of it is not
   deployed, the blocks vislox added (`blocks`: slug, UUID, type, page, file, and whether the deployed config has
   it), the other blocks the module manages, the blocks lox can move (`movable`: managed and drawn on a page) and
-  those the pending config draws elsewhere than the deployed one (`moves`: UUID, position, deployed position). It
-  is worked out again only when vislox's files, the deployed or
+  those the pending config draws elsewhere than the deployed one (`moves`: UUID, position, deployed position), and
+  for each page with such a block whether *Arrange* can lay it out (`arrange`: page UUID → null, or why not). It
+  is worked out again only when vislox's files, the lockfile, the deployed or
   the pending config changes (`actions.edit.key`); the browser fetches it only then.
