@@ -2293,23 +2293,44 @@ function liveQuerySync(want) {
   S.live.qes = null;
   S.live.qkey = key;
   S.live.qstat = null;
-  if (key) {
-    const es = new EventSource(`/api/live/query?rev=${encodeURIComponent(S.rev)}&page=${encodeURIComponent(S.page)}`);
-    S.live.qes = es;
-    es.addEventListener("ok", (e) => { S.live.qstat = { ...JSON.parse(e.data), planned: true }; renderQueryNote(); });
-    es.addEventListener("refused", (e) => { S.live.qstat = { error: JSON.parse(e.data).error }; es.close(); renderQueryNote(); });
-  }
+  if (key) liveQueryOpen(key);
   renderQueryNote();
+}
+/** Ask for the page's queries (a POST with X-Vislox, so no other site can start them), then hold
+ *  them with the stream for the token it returns. A stream the server no longer knows (it restarted)
+ *  asks again. */
+function liveQueryOpen(key) {
+  const [rev, page] = [S.rev, S.page];
+  fetch("/api/live/query", { method: "POST", headers: { "X-Vislox": "query", "Content-Type": "application/json" }, body: JSON.stringify({ rev, page }) })
+    .then((r) => r.json().then((j) => (r.ok ? j : Promise.reject(new Error(j.error || r.statusText)))))
+    .then((j) => {
+      if (S.live.qkey !== key) return;
+      S.live.qstat = { blocks: j.blocks, planned: true };
+      const es = new EventSource(`/api/live/query?token=${encodeURIComponent(j.token)}`);
+      S.live.qes = es;
+      es.addEventListener("query", (e) => { if (S.live.qes === es) { S.live.qstat = JSON.parse(e.data); renderQueryNote(); } });
+      es.addEventListener("refused", () => {
+        es.close();
+        if (S.live.qes !== es) return;
+        S.live.qes = null;
+        setTimeout(() => { if (S.live.qkey === key && !S.live.qes) liveQueryOpen(key); }, 2000);
+      });
+      renderQueryNote();
+    })
+    .catch((e) => { if (S.live.qkey === key) { S.live.qstat = { error: e.message }; renderQueryNote(); } });
 }
 function renderQueryNote() {
   const n = $("query-note"), q = S.live.qstat;
   const failed = q?.failed || [];
-  n.textContent = !S.live.qkey || !q ? ""
+  const text = !S.live.qkey || !q ? ""
     : q.error ? `not queried: ${q.error}`
     : q.planned ? (q.blocks ? `querying ${q.blocks} block${q.blocks === 1 ? "" : "s"}…` : "no blocks to query here")
-    : (q.blocks ? `${q.answered} of ${q.blocks} queried in ${(q.ms / 1000).toFixed(1)} s` : "nothing left to query: the Miniserver streams the rest")
-      + (failed.length ? ` · ${failed.length} cannot be` : "");
-  n.title = failed.join("\n");
+    : (q.blocks ? `${q.answered} of ${q.blocks} blocks answered` : "nothing to query: the Miniserver streams the rest")
+      + (failed.length ? ` · ${failed.length} cannot be queried` : "");
+  const title = failed.join("\n");
+  // Called on every repaint: touch the DOM only when something changed.
+  if (n.textContent !== text) n.textContent = text;
+  if (n.title !== title) n.title = title;
 }
 
 function liveStart() {
@@ -2318,8 +2339,6 @@ function liveStart() {
   S.live.es = es;
   S.live.status = { state: "connecting" };
   es.addEventListener("status", (e) => { S.live.status = JSON.parse(e.data); renderLiveSwitch(); });
-  // How the block queries went (every round while there is something to query).
-  es.addEventListener("query", (e) => { if (S.live.qkey) { S.live.qstat = JSON.parse(e.data); renderQueryNote(); } });
   es.addEventListener("snapshot", (e) => {
     const d = JSON.parse(e.data);
     S.live.values = new Map(Object.entries(d.values));

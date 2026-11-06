@@ -182,13 +182,19 @@ fn number(v: f64) -> Value {
     }
 }
 
-/// The number at the start of a value with a unit (`9.6°`, `0.0kW`).
+/// A value with an optional unit (`9.6°`, `0.0kW`, `42 %`) as a number.
+/// Text that only starts with a number (`12:30`, `2026-11-06`) is not one:
+/// the unit may hold no digits.
 fn leading_number(s: &str) -> Option<f64> {
     let s = s.trim();
     let end = s
         .char_indices()
         .find(|&(i, c)| !(c.is_ascii_digit() || c == '.' || (i == 0 && (c == '-' || c == '+'))))
         .map_or(s.len(), |(i, _)| i);
+    let unit = &s[end..];
+    if unit.chars().any(|c| c.is_ascii_digit()) || unit.starts_with(['.', ':', '-', '/', ',']) {
+        return None;
+    }
     s[..end].parse().ok()
 }
 
@@ -445,6 +451,16 @@ mod tests {
         assert_eq!(values(&m, json!({"Code": "200", "value": ""})), vec![]);
         assert_eq!(leading_number("-3.5kW"), Some(-3.5));
         assert_eq!(leading_number("on"), None);
+        assert_eq!(leading_number("42 %"), Some(42.0));
+        // Text that starts with a number stays text.
+        for t in ["12:30", "2026-11-06", "1.2.3", "3/4", "1,5"] {
+            assert_eq!(leading_number(t), None, "{t}");
+        }
+        let t = block("TextVar", &["TQ"]);
+        assert_eq!(
+            values(&t, json!({"Code": "200", "value": "12:30"})),
+            vec![("u-TQ".into(), json!("12:30"))]
+        );
     }
 
     #[test]

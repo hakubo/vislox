@@ -31,7 +31,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 /// After the last browser turns live values off, the Miniserver connection
@@ -43,6 +43,24 @@ const LINGER: Duration = Duration::from_secs(10);
 const QUERY_GAP: Duration = Duration::from_millis(50);
 const QUERY_ROUND: Duration = Duration::from_secs(2);
 const QUERY_WAIT: Duration = Duration::from_secs(3);
+/// A block that does not answer this many times in a row is left alone for
+/// [`QUERY_PAUSE`].
+const QUERY_MISSES: u32 = 3;
+const QUERY_PAUSE: Duration = Duration::from_secs(60);
+/// How long a token from [`Live::offer`] waits for its stream.
+const OFFER_TTL: Duration = Duration::from_secs(30);
+
+/// What vislox learnt about querying one block on this connection.
+#[derive(Default, Debug)]
+struct BlockState {
+    /// It answered with an error code (an alarm's `500`): not asked again.
+    failed: Option<String>,
+    /// Timeouts in a row.
+    misses: u32,
+    /// After [`QUERY_MISSES`] timeouts: not asked until then.
+    paused: Option<Instant>,
+    answered: bool,
+}
 
 /// Where live values come from.
 pub enum Feed {
@@ -521,6 +539,10 @@ struct St {
     /// The blocks each browser that asked for it has queried (`query.rs`).
     queries: HashMap<u64, Arc<Vec<query::Block>>>,
     next_query: u64,
+    /// Plans waiting for their stream: token → blocks, when offered.
+    offers: HashMap<String, (Vec<query::Block>, Instant)>,
+    /// Per block, how querying it goes on this connection.
+    blocks: HashMap<String, BlockState>,
     /// Connectors with a queried value → their block.
     queried: HashMap<String, String>,
 }
@@ -533,8 +555,6 @@ pub enum Msg {
     /// Changed values: `{uuid: [value, text, label, kind?] | null}` (null:
     /// the value is gone).
     Values(Arc<String>),
-    /// How block queries went: `{blocks, answered, failed: [[title, why]], ms}`.
-    Query(Arc<String>),
 }
 
 pub struct Live {
@@ -570,6 +590,8 @@ impl Live {
                 stopped: false,
                 queries: HashMap::new(),
                 next_query: 0,
+                offers: HashMap::new(),
+                blocks: HashMap::new(),
                 queried: HashMap::new(),
             }),
             structure: Mutex::new(None),
@@ -895,14 +917,41 @@ impl Live {
         }
     }
 
-    /// A browser shows a page with block queries on: query `blocks` while
-    /// the returned guard lives.
-    pub fn query(self: &Arc<Self>, blocks: Vec<query::Block>) -> Querying {
+    /// A browser asked (with `X-Vislox`) to query `blocks`: a one-use token
+    /// for the stream that holds the queries ([`Live::take`]). Unused tokens
+    /// expire after [`OFFER_TTL`].
+    pub fn offer(&self, blocks: Vec<query::Block>) -> String {
+        use sha1::{Digest, Sha1};
         let mut st = self.st.lock().unwrap();
+        let now = Instant::now();
+        st.offers
+            .retain(|_, (_, t)| now.duration_since(*t) < OFFER_TTL);
+        st.next_query += 1;
+        let mut h = Sha1::new();
+        h.update(format!(
+            "{:?}|{}|{}|{:p}",
+            std::time::SystemTime::now(),
+            st.next_query,
+            std::process::id(),
+            &*st
+        ));
+        let token = hex::encode(h.finalize());
+        st.offers.insert(token.clone(), (blocks, now));
+        token
+    }
+
+    /// The stream for an offered token: query its blocks while the returned
+    /// guard lives. `None` for an unknown, used or expired token.
+    pub fn take(self: &Arc<Self>, token: &str) -> Option<Querying> {
+        let mut st = self.st.lock().unwrap();
+        let (blocks, at) = st.offers.remove(token)?;
+        if at.elapsed() >= OFFER_TTL {
+            return None;
+        }
         st.next_query += 1;
         let id = st.next_query;
         st.queries.insert(id, Arc::new(blocks));
-        Querying(self.clone(), id)
+        Some(Querying(self.clone(), id))
     }
 
     /// A browser left its page: drop the values only it had queried.
@@ -914,6 +963,7 @@ impl Live {
             .values()
             .flat_map(|q| q.iter().map(|b| b.uuid.clone()))
             .collect();
+        st.blocks.retain(|b, _| blocks.contains(b));
         let gone: Vec<String> = st
             .queried
             .iter()
@@ -936,18 +986,27 @@ impl Live {
         }
     }
 
-    /// The blocks to query now: every browser's, once, except those whose
-    /// wanted outputs the Miniserver streams, and those that cannot be.
-    fn to_query(&self, failed: &HashMap<String, String>) -> Vec<query::Block> {
+    /// Whether a block needs querying: one that can be mapped, and whose
+    /// wanted outputs the Miniserver does not stream.
+    fn needs_query(st: &St, b: &query::Block) -> bool {
+        !query::unmapped(&b.ty)
+            && !b
+                .want
+                .iter()
+                .all(|u| st.owners.get(u).is_some_and(|o| !o.queried))
+    }
+
+    /// The blocks to query now: every browser's, once, except those that
+    /// need none, failed, or are paused after not answering.
+    fn to_query(&self, now: Instant) -> Vec<query::Block> {
         let st = self.st.lock().unwrap();
         let mut out: Vec<query::Block> = Vec::new();
         for q in st.queries.values() {
             for b in q.iter() {
-                if failed.contains_key(&b.uuid) || query::unmapped(&b.ty) {
-                    continue;
-                }
-                let streamed = |u: &String| st.owners.get(u).is_some_and(|o| !o.queried);
-                if b.want.iter().all(streamed) {
+                let s = st.blocks.get(&b.uuid);
+                if !Self::needs_query(&st, b)
+                    || s.is_some_and(|s| s.failed.is_some() || s.paused.is_some_and(|t| t > now))
+                {
                     continue;
                 }
                 match out.iter_mut().find(|o| o.uuid == b.uuid) {
@@ -959,20 +1018,77 @@ impl Live {
         out
     }
 
-    fn still_queried(&self, block: &str) -> bool {
-        let st = self.st.lock().unwrap();
+    fn still_queried(st: &St, block: &str) -> bool {
         st.queries
             .values()
             .any(|q| q.iter().any(|b| b.uuid == block))
     }
 
-    /// Store a block's queried outputs; a streamed value always wins.
+    /// How the queries of one browser's page go: `{blocks, answered,
+    /// failed: ["title (type): why"]}`.
+    pub fn query_report(&self, q: &Querying) -> Value {
+        let st = self.st.lock().unwrap();
+        let Some(blocks) = st.queries.get(&q.1) else {
+            return json!({ "blocks": 0, "answered": 0, "failed": [] });
+        };
+        let now = Instant::now();
+        let (mut n, mut answered, mut failed) = (0, 0, Vec::new());
+        for b in blocks.iter().filter(|b| Self::needs_query(&st, b)) {
+            n += 1;
+            let s = st.blocks.get(&b.uuid);
+            if let Some(why) = s.and_then(|s| s.failed.as_ref()) {
+                failed.push(format!("{} ({}): {why}", b.title, b.ty));
+            } else if s.is_some_and(|s| s.paused.is_some_and(|t| t > now)) {
+                failed.push(format!("{} ({}): no answer", b.title, b.ty));
+            } else if s.is_some_and(|s| s.answered) {
+                answered += 1;
+            }
+        }
+        failed.sort();
+        json!({ "blocks": n, "answered": answered, "failed": failed })
+    }
+
+    /// A block's answer (`None`: none within [`QUERY_WAIT`]).
+    fn answer(&self, generation: u64, b: &query::Block, ll: Option<Value>, now: Instant) {
+        {
+            let mut st = self.st.lock().unwrap();
+            if st.generation != generation || !Self::still_queried(&st, &b.uuid) {
+                return;
+            }
+            let s = st.blocks.entry(b.uuid.clone()).or_default();
+            match &ll {
+                None => {
+                    s.misses += 1;
+                    if s.misses >= QUERY_MISSES {
+                        s.misses = 0;
+                        s.paused = Some(now + QUERY_PAUSE);
+                    }
+                    return;
+                }
+                Some(ll) => {
+                    s.misses = 0;
+                    s.paused = None;
+                    if let Some(why) = query::failure(ll) {
+                        s.failed = Some(why);
+                        return;
+                    }
+                    s.answered = true;
+                }
+            }
+        }
+        if let Some(ll) = ll {
+            self.put_queried(generation, b, &ll);
+        }
+    }
+
+    /// Store a block's queried outputs; a streamed value always wins, and an
+    /// answer for a block no page shows any more is dropped.
     fn put_queried(&self, generation: u64, b: &query::Block, ll: &Value) {
         let mapped = query::map(b, ll);
         let mut out = serde_json::Map::new();
         {
             let mut st = self.st.lock().unwrap();
-            if st.generation != generation {
+            if st.generation != generation || !Self::still_queried(&st, &b.uuid) {
                 return;
             }
             for (uuid, value, key, name) in mapped {
@@ -1003,74 +1119,55 @@ impl Live {
     }
 
     /// Query the blocks browsers asked for, in rounds, on the session's
-    /// socket, once the session is live. Runs until the session ends.
+    /// socket, once the session is live. Requests go out every
+    /// [`QUERY_GAP`] without waiting for earlier answers, so a block that
+    /// does not answer holds up no other. Runs until the session ends.
     async fn query_blocks(
         &self,
         generation: u64,
         live: &AtomicBool,
         asked: mpsc::Sender<session::Query>,
     ) {
-        // Blocks that cannot be queried (Code 404, 500): not again this session.
-        let mut failed: HashMap<String, String> = HashMap::new();
+        use futures_util::StreamExt;
+        use futures_util::stream::FuturesUnordered;
+        // What the last connection learnt (failed, paused) is not kept.
+        self.st.lock().unwrap().blocks.clear();
         let mut gap = tokio::time::interval(QUERY_GAP);
         gap.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let mut last_idle = true;
         loop {
             let start = tokio::time::Instant::now();
-            let blocks = if live.load(Ordering::Relaxed) {
-                self.to_query(&failed)
+            let mut todo: std::collections::VecDeque<query::Block> = if live.load(Ordering::Relaxed)
+            {
+                self.to_query(Instant::now()).into()
             } else {
-                Vec::new()
+                Default::default()
             };
-            let (mut sent, mut answered) = (0, 0);
-            for b in &blocks {
-                if !self.still_queried(&b.uuid) {
-                    continue;
-                }
-                gap.tick().await;
-                sent += 1;
-                let (reply, answer) = oneshot::channel();
-                let q = session::Query {
-                    uuid: b.uuid.clone(),
-                    reply,
-                };
-                if asked.send(q).await.is_err() {
-                    return std::future::pending().await;
-                }
-                // No answer in time: asked again next round.
-                if let Ok(Ok(ll)) = tokio::time::timeout(QUERY_WAIT, answer).await {
-                    match query::failure(&ll) {
-                        Some(why) => {
-                            failed.insert(b.uuid.clone(), format!("{} ({}): {why}", b.title, b.ty));
-                        }
-                        None => {
-                            answered += 1;
-                            self.put_queried(generation, b, &ll);
-                        }
+            let idle = todo.is_empty();
+            let mut waiting = FuturesUnordered::new();
+            loop {
+                tokio::select! {
+                    Some((b, ll)) = waiting.next(), if !waiting.is_empty() => {
+                        self.answer(generation, &b, ll, Instant::now());
                     }
+                    _ = gap.tick(), if !todo.is_empty() => {
+                        let b = todo.pop_front().expect("not empty");
+                        if !Self::still_queried(&self.st.lock().unwrap(), &b.uuid) {
+                            continue;
+                        }
+                        let (reply, answer) = oneshot::channel();
+                        let q = session::Query { uuid: b.uuid.clone(), reply };
+                        if asked.send(q).await.is_err() {
+                            return std::future::pending().await;
+                        }
+                        waiting.push(async move {
+                            let ll = tokio::time::timeout(QUERY_WAIT, answer).await.ok().and_then(Result::ok);
+                            (b, ll)
+                        });
+                    }
+                    else => break,
                 }
             }
-            let mut fails: Vec<&String> = failed
-                .iter()
-                .filter(|(u, _)| self.still_queried(u))
-                .map(|(_, why)| why)
-                .collect();
-            fails.sort();
-            let report = json!({
-                "blocks": sent,
-                "answered": answered,
-                "failed": fails,
-                "ms": start.elapsed().as_millis() as u64,
-            })
-            .to_string();
-            // Every round while there is something to query (a browser that
-            // just connected learns it within a round), else once.
-            let idle = blocks.is_empty() && fails.is_empty();
-            if !idle || !last_idle {
-                let _ = self.tx.send(Msg::Query(Arc::new(report)));
-            }
-            last_idle = idle;
-            let wait = if blocks.is_empty() {
+            let wait = if idle {
                 Duration::from_millis(500)
             } else {
                 QUERY_ROUND
@@ -1443,14 +1540,14 @@ mod tests {
             &["f-aq"],
         );
         let streamed = block("v", "VirtualIn", &[("Q", "s1")], &["s1"]);
-        let tab1 = live.query(vec![f.clone(), streamed.clone()]);
-        let tab2 = live.query(vec![f.clone()]);
-        let failed = HashMap::new();
-        let todo: Vec<String> = live.to_query(&failed).into_iter().map(|b| b.uuid).collect();
+        let tab1 = tab(&live, vec![f.clone(), streamed.clone()]);
+        let tab2 = tab(&live, vec![f.clone()]);
+        let todo: Vec<String> = live
+            .to_query(Instant::now())
+            .into_iter()
+            .map(|b| b.uuid)
+            .collect();
         assert_eq!(todo, ["f"]);
-        let mut gone = HashMap::new();
-        gone.insert("f".to_string(), "Code 500".to_string());
-        assert!(live.to_query(&gone).is_empty());
 
         let ll = json!({"Code": "200", "output0": {"name": "R", "nr": 1, "value": 21.5},
                         "output1": {"name": "E", "nr": 2, "value": "ok"}});
@@ -1491,6 +1588,103 @@ mod tests {
             }
             _ => panic!("the browsers learn that the values are gone"),
         }
+        // An answer that comes after the last tab left is dropped.
+        live.answer(0, &f, Some(ll), Instant::now());
+        assert!(!live.st.lock().unwrap().values.contains_key("f-aq"));
+        assert!(rx.try_recv().is_err());
+    }
+
+    fn tab(live: &Arc<Live>, blocks: Vec<query::Block>) -> Querying {
+        let token = live.offer(blocks);
+        live.take(&token).expect("a fresh token")
+    }
+
+    #[test]
+    fn a_query_token_is_good_once() {
+        let live = Live::new(Feed::Off("test".into()), "test".into());
+        let t1 = live.offer(vec![block("a", "Formula", &[("AQ", "a-aq")], &["a-aq"])]);
+        let t2 = live.offer(Vec::new());
+        assert_ne!(t1, t2);
+        assert!(live.take("guess").is_none());
+        let q = live.take(&t1).expect("offered");
+        assert!(live.take(&t1).is_none(), "used");
+        assert_eq!(live.query_report(&q)["blocks"], 1);
+        // An offer nobody takes in time expires.
+        live.st.lock().unwrap().offers.get_mut(&t2).unwrap().1 -= OFFER_TTL;
+        assert!(live.take(&t2).is_none());
+    }
+
+    #[test]
+    fn errors_and_silence_are_reported_per_page() {
+        let live = Live::new(Feed::Off("test".into()), "test".into());
+        let a = block("a", "Formula", &[("AQ", "a-aq")], &["a-aq"]);
+        let b = block("b", "Formula", &[("AQ", "b-aq")], &["b-aq"]);
+        let c = block("c", "Alarm", &[("Q", "c-q")], &["c-q"]);
+        let p1 = tab(&live, vec![a.clone(), c.clone()]);
+        let p2 = tab(&live, vec![b.clone()]);
+        let now = Instant::now();
+        live.answer(0, &c, Some(json!({"Code": "500", "value": ""})), now);
+        for _ in 0..QUERY_MISSES - 1 {
+            live.answer(0, &a, None, now);
+        }
+        // Two misses: still asked.
+        let todo = |at| -> Vec<String> { live.to_query(at).into_iter().map(|b| b.uuid).collect() };
+        assert_eq!(todo(now).len(), 2);
+        live.answer(0, &a, None, now);
+        // The third: paused, and it holds up nothing else.
+        assert_eq!(todo(now), ["b"]);
+        assert_eq!(todo(now + QUERY_PAUSE + Duration::from_secs(1)).len(), 2);
+        let r1 = live.query_report(&p1);
+        assert_eq!(r1["blocks"], 2);
+        assert_eq!(
+            r1["failed"],
+            json!([
+                "Alarm 1 (Alarm): Code 500",
+                "Formula 1 (Formula): no answer"
+            ])
+        );
+        // The other page sees only its own block.
+        live.answer(0, &b, Some(json!({"Code": "200", "value": "1"})), now);
+        assert_eq!(
+            live.query_report(&p2),
+            json!({"blocks": 1, "answered": 1, "failed": []})
+        );
+    }
+
+    #[tokio::test]
+    async fn a_silent_block_holds_up_no_other() {
+        let live = Live::new(Feed::Off("test".into()), "test".into());
+        let silent = block("a", "Formula", &[("AQ", "a-aq")], &["a-aq"]);
+        let quick = block("b", "Formula", &[("AQ", "b-aq")], &["b-aq"]);
+        let _page = tab(&live, vec![silent, quick]);
+        let (asked, mut queries) = mpsc::channel::<session::Query>(1);
+        // The Miniserver: answers b at once, never a.
+        let miniserver = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Some(q) = queries.recv().await {
+                if q.uuid == "b" {
+                    let _ = q.reply.send(
+                        json!({"Code": "200", "output0": {"name": "R", "nr": 1, "value": 4}}),
+                    );
+                } else {
+                    held.push(q);
+                }
+            }
+        });
+        let on = AtomicBool::new(true);
+        let l = live.clone();
+        let started = Instant::now();
+        let run = async move { l.query_blocks(0, &on, asked).await };
+        tokio::select! {
+            () = run => unreachable!(),
+            () = async {
+                while !live.st.lock().unwrap().values.contains_key("b-aq") {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            } => {}
+        }
+        assert!(started.elapsed() < QUERY_WAIT, "b waited for a");
+        miniserver.abort();
     }
 
     fn running(live: &Live) -> bool {

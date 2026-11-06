@@ -57,11 +57,13 @@ marked so you can review it before you deploy.
   - **Query blocks on this page** (in the legend, off by default): vislox asks the Miniserver for the outputs
     of the blocks behind the page's wires that it does not stream (`jdev/sps/io/<uuid>/all`, a read-only
     request), every 2 s, at most 20 requests a second, on the connection live values already use. Wires that
-    pass through references, memory flags and modes are followed to the block that drives them. These
+    pass through references are followed to the first block behind them (a memory flag or a mode answers for
+    itself). These
     values have a dotted outline and green tint and say "queried" in the tooltip: they are up to one round
-    old (a page with more than 40 blocks takes longer than 2 s). The legend says how many blocks answered and
-    which cannot be queried (an alarm or an NFC Code Touch answers `500`). Queries stop when you leave the
-    page, and their values go with them.
+    old (a page with more than 40 blocks takes longer than 2 s). The legend says how many of this page's blocks
+    answered and which cannot be queried (an alarm or an NFC Code Touch answers `500`; a block that does not
+    answer three times in a row is left alone for a minute). Queries stop when you leave the page, and their
+    values go with them.
 
   Without queries, blocks with timing or memory (delays, edge detection, Formula, …) and inputs the app does
   not show stay without a value. Those wires are faded ("Dim wires without a value" in the legend turns this
@@ -258,12 +260,14 @@ inputs, outputs and every other block are refused. The visualization password st
 storage and is never logged. The command log is kept in memory.
 
 The Miniserver connection is opened when a browser turns live values on, and closed shortly after the last
-one turns them off. With **Query blocks on this page**, the browser holds `GET /api/live/query?rev=…&page=…`
-open while it shows the page (only the current, deployed revision), and vislox sends `jdev/sps/io/<uuid>/all`
-for each block the page needs on that same WebSocket, one at a time, at most 20 a second, each block at most
-every 2 s. Blocks whose wanted outputs the Miniserver streams are left out, and so is a block that answers with
-an error code (until the next connection). The values reach every browser with the others on `/api/live`; a
-`query` event there says how the last round went. How an answer maps to connectors is in `src/query.rs`:
+one turns them off. With **Query blocks on this page**, the browser asks for the page's queries with
+`POST /api/live/query` (`{rev, page}`, only the current, deployed revision; it needs the `X-Vislox` header, so
+that no other web page can make vislox send requests), and holds `GET /api/live/query?token=…` open with the
+one-use token it gets while it shows the page. vislox sends `jdev/sps/io/<uuid>/all` for each block the page
+needs on that same WebSocket, at most 20 a second without waiting for earlier answers, each block at most every
+2 s. Blocks whose wanted outputs the Miniserver streams are left out, and so is a block that answers with an
+error code (until the next connection) or does not answer three times in a row (for a minute). The values reach
+every browser with the others on `/api/live`; the page's own stream says how its blocks did (`query` events). How an answer maps to connectors is in `src/query.rs`:
 outputs come in config order (`nr`), under labels that are not the connector keys (`R` and `E` for a Formula's
 `AQ` and `TQ`), so they map by position when the counts match, else by a label that names the key (a meter
 leaves out its weekly totals), else by a table for the types that leave other outputs out (HVAC controller,

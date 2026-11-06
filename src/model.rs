@@ -1776,8 +1776,8 @@ fn live_graph(c: &Ctx) -> LiveGraph {
 const PASS_THROUGH: &[&str] = &["InputRef", "OutputRef", "OutputRefLM", "Constant"];
 
 /// The blocks to query for live values on a page (opt-in): the sources of
-/// the wires that start or end on it, followed through references, memory
-/// flags and modes to the block that produces the value. Each block once,
+/// the wires that start or end on it, followed through references to the
+/// first block that produces the value (a memory flag or a mode counts). Each block once,
 /// in the order its first wire comes up.
 pub fn query_plan(doc: &LoxoneDoc, page: &str) -> Vec<crate::query::Block> {
     let c = Ctx::new(doc);
@@ -1793,6 +1793,8 @@ pub fn query_plan(doc: &LoxoneDoc, page: &str) -> Vec<crate::query::Block> {
         if !on_page(&w.from_port) && !on_page(&w.to_port) {
             continue;
         }
+        // Through references to the first block that can be queried: a
+        // memory flag or a mode answers for itself, so what feeds it is not.
         let mut s = Some(w.from_port.clone());
         for _ in 0..60 {
             let Some(port) = s.take() else {
@@ -1808,6 +1810,7 @@ pub fn query_plan(doc: &LoxoneDoc, page: &str) -> Vec<crate::query::Block> {
                 if !ws.contains(&port) {
                     ws.push(port.clone());
                 }
+                break;
             }
             s = pass.get(&port).cloned();
         }
@@ -1941,6 +1944,43 @@ mod tests {
             .collect();
         assert_eq!(og, [AND]);
         assert!(query_plan(&d, "no-such-page").is_empty());
+    }
+
+    #[test]
+    fn query_plan_stops_at_the_first_block_behind_a_reference() {
+        // Page p shows memory flag m (on page q) through a reference; m is
+        // set by an Or on page q, which p does not need.
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<ControlList Version="1">
+	<C Type="Document" V="1" U="d" Title="T">
+		<C Type="Page" V="1" U="p" Title="P">
+			<C Type="InputRef" V="1" U="r" Title="M" Ref="m" Px="0" Py="0" Px2="10" Py2="10">
+				<Co K="I" U="r-i"><In Input="m-q"/></Co>
+				<Co K="Q" U="r-q"/>
+			</C>
+			<C Type="Not" V="1" U="n" Title="Not" Px="100" Py="0" Px2="200" Py2="100">
+				<Co K="I" U="n-i"><In Input="r-q"/></Co>
+				<Co K="Q" U="n-q"/>
+			</C>
+		</C>
+		<C Type="Page" V="1" U="q" Title="Q">
+			<C Type="Or" V="1" U="o" Title="Or" Px="0" Py="0" Px2="100" Py2="100">
+				<Co K="Q" U="o-q"/>
+			</C>
+			<C Type="Memory" V="1" U="m" Title="Flag" Px="200" Py="0" Px2="300" Py2="100">
+				<Co K="Input" U="m-in"><In Input="o-q"/></Co>
+				<Co K="Q" U="m-q"/>
+			</C>
+		</C>
+	</C>
+</ControlList>"#;
+        let d = doc(xml);
+        let plan: Vec<String> = query_plan(&d, "p").into_iter().map(|b| b.uuid).collect();
+        assert_eq!(plan, ["m"]);
+        // On its own page the Or is queried, as a wire source there.
+        let mut plan: Vec<String> = query_plan(&d, "q").into_iter().map(|b| b.uuid).collect();
+        plan.sort();
+        assert_eq!(plan, ["m", "o"]);
     }
 
     #[test]
