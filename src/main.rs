@@ -6,6 +6,7 @@ mod history;
 mod live;
 mod model;
 mod pull;
+mod running;
 mod source;
 
 use anyhow::{Context, Result};
@@ -32,7 +33,7 @@ use tokio_stream::wrappers::BroadcastStream;
 /// Visualize a Loxone config the way Loxone Config draws it — read-only, live
 /// reloading, with history and changes marked for review.
 #[derive(Parser, Debug)]
-#[command(version, about)]
+#[command(version = VERSION, about)]
 struct Args {
     /// A lox.toml project (or its directory), a .Loxone file, a backup .zip,
     /// or a `lox config init` repository.
@@ -74,6 +75,9 @@ struct Args {
     ai_webhook_file: Option<PathBuf>,
 }
 
+/// `0.2.0 (1a2b3c4)`: the version, and the commit it was built from.
+const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), env!("VISLOX_COMMIT_SUFFIX"));
+
 struct App {
     label: String,
     history: Mutex<History>,
@@ -81,6 +85,7 @@ struct App {
     tx: broadcast::Sender<u64>,
     live: Arc<live::Live>,
     pull: pull::Pull,
+    running: Arc<running::Running>,
     actions: actions::Actions,
 }
 
@@ -89,7 +94,7 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let src = source::Source::resolve(&args.path, args.serial.as_deref())?;
     let history = History::new(src.current.clone(), src.proposed.clone());
-    eprintln!("vislox: watching {}", src.current.display());
+    eprintln!("vislox {VERSION}: watching {}", src.current.display());
     if let Some(p) = &src.proposed {
         eprintln!("vislox: pending changes from {}", p.display());
     }
@@ -138,6 +143,12 @@ async fn main() -> Result<()> {
             }
         }
     };
+    // Which config the Miniserver runs: read from /prog and def.log.
+    let running = Arc::new(running::Running::new(if args.no_live {
+        Err("turned off (--no-live)".into())
+    } else {
+        found.as_ref().map(|f| f.conn.clone()).map_err(Clone::clone)
+    }));
     let (tx, _) = broadcast::channel(16);
     let app = Arc::new(App {
         label: src.label.clone(),
@@ -146,7 +157,9 @@ async fn main() -> Result<()> {
         tx,
         live: live::Live::new(feed, live_source),
         pull,
+        running: running.clone(),
         actions: actions::Actions::new(actions::Settings {
+            running,
             token: args
                 .admin_token_file
                 .as_deref()
@@ -215,6 +228,7 @@ async fn main() -> Result<()> {
         .route("/api/events", get(api_events))
         .route("/api/live", get(api_live))
         .route("/api/pull", axum::routing::post(api_pull))
+        .route("/api/running", get(api_running))
         .route("/api/ai", axum::routing::post(api_ai))
         .route("/api/ai/status", axum::routing::post(api_ai_status))
         .route("/api/apply", axum::routing::post(api_apply))
@@ -327,12 +341,14 @@ async fn api_history(State(app): State<Arc<App>>) -> impl IntoResponse {
     let (pending, hist) = h.list();
     Json(serde_json::json!({
         "label": app.label,
+        "vislox": { "version": env!("CARGO_PKG_VERSION"), "commit": option_env!("VISLOX_COMMIT") },
         "version": h.version,
         "pending": pending,
         "history": hist,
         "error": h.last_error,
         "live": app.live.info(),
         "pull": app.pull.info(),
+        "running": app.running.available(),
         "actions": app.actions.info(),
     }))
 }
@@ -470,6 +486,18 @@ async fn api_pull(State(app): State<Arc<App>>, headers: axum::http::HeaderMap) -
         )
             .into_response(),
     }
+}
+
+#[derive(Deserialize)]
+struct RunningQuery {
+    #[serde(default)]
+    fresh: bool,
+}
+
+/// Which config the Miniserver runs (`/prog` and `def.log`), with warnings.
+/// A failed check is a 200 with `error`, so the page logs no failed request.
+async fn api_running(State(app): State<Arc<App>>, Query(q): Query<RunningQuery>) -> Response {
+    Json(app.running.get(q.fresh).await).into_response()
 }
 
 fn refused((status, msg): actions::Refusal) -> Response {

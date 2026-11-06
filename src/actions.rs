@@ -25,6 +25,8 @@ const REQUEST_TIMEOUT_SECS: i64 = 30 * 60;
 /// `lox config push --force` downloads twice and restarts the program.
 const PUSH_TIMEOUT: Duration = Duration::from_secs(600);
 const GIT_TIMEOUT: Duration = Duration::from_secs(120);
+/// Starts an Apply message whose upload the Miniserver may not run.
+const UNVERIFIED: &str = "Not verified";
 /// Requests kept for the UI.
 const KEEP: usize = 10;
 
@@ -35,6 +37,8 @@ pub struct Settings {
     pub lox: PathBuf,
     /// Where the agent reports back.
     pub status_url: String,
+    /// Which config the Miniserver runs, to verify an Apply by its load.
+    pub running: std::sync::Arc<crate::running::Running>,
 }
 
 pub struct Actions {
@@ -76,6 +80,9 @@ struct Outcome {
     /// `apply` or `discard`
     kind: &'static str,
     ok: bool,
+    /// Done, but not verified: the Miniserver may not run it (`message`
+    /// says why).
+    warn: bool,
     message: String,
     at: i64,
 }
@@ -320,6 +327,7 @@ impl Actions {
         st.last = Some(Outcome {
             kind,
             ok: res.is_ok(),
+            warn: res.as_ref().is_ok_and(|m| m.contains(UNVERIFIED)),
             message: match res {
                 Ok(m) | Err(m) => m.clone(),
             },
@@ -385,10 +393,12 @@ impl Actions {
                 .map(|r| format!("- {}", r.prompt.replace('\n', " ")))
                 .collect()
         };
+        let before = self.s.running.get(true).await;
         let pushed = run(lox, &args, dir, PUSH_TIMEOUT)
             .await
             .map_err(|e| format!("lox config push failed:\n{e}"))?;
         let mut report = vec![last_lines(&pushed, 6)];
+        report.push(self.verify_load(&before).await);
         if let Some(m) = keep_base(dir, &p.base)? {
             report.push(m);
         }
@@ -412,6 +422,34 @@ impl Actions {
             )),
         }
         Ok(report.join("\n"))
+    }
+
+    /// lox verified the newest backup holds the upload; check that the
+    /// Miniserver loaded it too: `sps_new.zip` gone, and a program start in
+    /// def.log that loaded it and runs the newest backup. The log can lag
+    /// the restart a little, so look a few times.
+    async fn verify_load(&self, before: &crate::running::Report) -> String {
+        if !self.s.running.available() {
+            return format!(
+                "{UNVERIFIED}: no Miniserver connection to check which config it runs."
+            );
+        }
+        let mut why = Vec::new();
+        for i in 0..4 {
+            if i > 0 {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+            }
+            let after = self.s.running.get(true).await;
+            why = crate::running::verify_load(before, &after);
+            if why.is_empty() {
+                return format!(
+                    "Loaded: the Miniserver runs {} (def.log, {}).",
+                    after.running.as_deref().unwrap_or("?"),
+                    after.start.as_ref().map(|s| s.at.as_str()).unwrap_or("?")
+                );
+            }
+        }
+        format!("{UNVERIFIED} by load: {}.", why.join("; "))
     }
 
     /// Make the Miniserver's running config the project's base
@@ -837,6 +875,7 @@ mod tests {
             project: project.map(Path::to_path_buf),
             lox: PathBuf::from("lox"),
             status_url: "http://127.0.0.1:1/api/ai/status".into(),
+            running: std::sync::Arc::new(crate::running::Running::new(Err("test".into()))),
         })
     }
 

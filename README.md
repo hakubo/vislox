@@ -64,6 +64,19 @@ marked so you can review it before you deploy.
   merge refuses because the Miniserver holds custom changes no download carries, Sync makes a plain download the
   base instead (rules edited in the app are then not taken over).
 
+- **Which config the Miniserver runs**: under the History title, the program file the Miniserver loaded
+  (e.g. `Runs sps_0274_20261106003351.zip · fw 17.2.10.21`), read from its system log (`def.log`) and the
+  files in `/prog`. `lox config pull` and the verify of `lox config push` take the newest
+  `sps_<ver>_<timestamp>.zip`, but the Miniserver loads by a longer order, so a warning shows when:
+  - `sps_new.zip` is still waiting in `/prog` (an upload that was never loaded);
+  - it runs its emergency config (`Emergency.LoxCC`, after several reboots in a row);
+  - the newest file was skipped because it needs a newer firmware, or it runs another file than the newest.
+
+  Without access to `def.log` (it needs an administrator), the running file is guessed from `/prog`. Click ↻
+  to check again; a check is reused for a minute. Apply also checks **by load**: after the program restart,
+  `sps_new.zip` must be gone and `def.log` must show a start that loaded it and runs the newest backup.
+  Otherwise Apply reports "Applied, but not verified" and why.
+
 vislox itself never writes to the config: lox and git do, and only on Pull, Apply and Discard. Live values only
 listen. A pull reads from the Miniserver; only Apply writes to it.
 
@@ -155,6 +168,8 @@ The binary is an `axum` server with the UI embedded (plain JS and SVG, no build 
 - `src/actions.rs` sends AI requests to the webhook, takes the agent's reports, and runs Apply (`lox config push
   --force`, `git commit`, `git push`), Sync (`lox config merge`, `git commit`, `git push`) and Discard
   (`git checkout` of the module, lock and out).
+- `src/running.rs` reads `/prog` and `def.log` (`/dev/fslist`, `/dev/fsget`, as `lox files` does) for the
+  config the Miniserver runs (`GET /api/running`), and checks an Apply by its load.
 - `src/pull.rs` runs `lox config pull` for the Pull button (`POST /api/pull`, which needs an `X-Vislox` header so
   that no other web page can trigger it), then refreshes the history.
 - `src/live.rs` streams the Miniserver's states with lox's `loxone-client` crate. A wire's source
@@ -177,3 +192,11 @@ VISLOX_BIN=target/release/vislox node tests/ui/smoke.mjs   # drives the UI in he
 ```
 
 CI (`.github/workflows/ci.yml`) runs all of these on every push to `main` and on every pull request.
+
+## Versions
+
+The version is in `Cargo.toml`; changes are listed in [CHANGELOG.md](CHANGELOG.md). `vislox --version` and the
+UI (next to the logo) show it with the commit it was built from. To release, bump the version in
+`Cargo.toml`, move the changelog's *Unreleased* entries under it, merge, then tag the merge commit `vX.Y.Z`
+and push the tag. The Docker workflow publishes the image as `X.Y.Z`, `X.Y` and `latest`, and refuses a tag
+that does not match `Cargo.toml`.

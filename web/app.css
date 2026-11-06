@@ -53,6 +53,7 @@ kbd { display: inline-block; min-width: 18px; padding: 0 4px; border: 1px solid 
 }
 .brand { display: flex; align-items: center; gap: 8px; font-weight: 700; font-size: 16px; letter-spacing: -.01em; color: var(--brand-strong); }
 .brand img { width: 28px; height: 28px; }
+.brand .ver { font-size: 11px; font-weight: 500; color: var(--faint); letter-spacing: 0; }
 .doc { min-width: 0; max-width: 240px; padding-left: 12px; border-left: 1px solid var(--line); }
 .doc-title { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .doc-sub { color: var(--muted); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -429,6 +430,15 @@ button.chip { cursor: pointer; } button.chip:hover { border-color: var(--brand);
 .pull-msg { flex: none; margin: 6px 10px 0; padding: 6px 8px; border-radius: 4px; font-size: 12px; background: var(--brand-soft); color: var(--brand-strong); word-break: break-word; }
 .pull-msg.error { background: var(--removed-bg); color: var(--removed); }
 .pull-msg.info { background: var(--panel-2); color: var(--muted); }
+/* which config the Miniserver runs */
+.ms-run { flex: none; margin: 6px 10px 0; font-size: 12px; color: var(--muted); }
+.ms-run .ms-line { display: flex; align-items: baseline; gap: 6px; min-width: 0; }
+.ms-run .ms-line > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ms-run code { font: 11px ui-monospace, "DejaVu Sans Mono", monospace; color: var(--text); }
+.ms-run .ms-again { flex: none; margin-left: auto; border: 0; background: none; padding: 0 2px; color: var(--muted); cursor: pointer; font-size: 13px; }
+.ms-run .ms-again:hover { color: var(--brand-strong); }
+.ms-run .ms-warn { margin-top: 4px; padding: 4px 8px; border-radius: 4px; background: var(--changed-bg); color: var(--changed); overflow-wrap: anywhere; }
+.ms-run .ms-err { color: var(--faint); }
 .live-pill.computed rect { stroke-dasharray: 4 3; fill: var(--live-computed); }
 .pr .lv.computed, .lg-pill.computed { border-style: dashed; background: var(--live-computed); }
 .pr .lv.const { background: var(--panel-2); border-color: var(--line); }
@@ -461,6 +471,7 @@ button.chip { cursor: pointer; } button.chip:hover { border-color: var(--brand);
 .ai-pend { font-size: 12px; color: var(--changed); font-weight: 600; }
 .ai-msg { margin: 8px 10px 0; padding: 6px 8px; border-radius: 4px; font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; background: var(--brand-soft); color: var(--brand-strong); max-height: 12em; overflow: auto; }
 .ai-msg.error { background: var(--removed-bg); color: var(--removed); }
+.ai-msg.warn { background: var(--changed-bg); color: var(--changed); }
 #ai-pane > :last-child { margin-bottom: 10px; }
 
 /* ── AI request context ───────────────────────────── */
