@@ -85,6 +85,20 @@ const structure = {
 };
 const ICON = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><rect width="16" height="16" fill="#8b6cc4"/></svg>';
 let structureReads = 0;
+// Its calendar entries (jdev/sps/calendargetentries), as the deployed config (the last commit) has
+// them, not the uncommitted edits on disk (Christmas Eve on 26 Dec, Silvester as Mode 5). A test
+// edits them the way the Loxone app would.
+const CAL = (n) => `1000001${n}-0000-01${n}0-ffff504f94000001`;
+let msCalendar = [
+  { uuid: CAL(3), name: "Heiligabend", operatingMode: 0, calMode: 0, startMonth: 12, startDay: 24 },
+  { uuid: CAL(4), name: "Ostermontag", operatingMode: 0, calMode: 1, easterOffset: 1 },
+  { uuid: CAL(5), name: "Sommerferien", operatingMode: 1, calMode: 3, startYear: 2026, startMonth: 7, startDay: 4, endYear: 2026, endMonth: 9, endDay: 5 },
+  { uuid: CAL(6), name: "Heizperiode", operatingMode: 1, calMode: 4, startMonth: 10, startDay: 1, endMonth: 4, endDay: 30 },
+  { uuid: CAL(7), name: "Silvester", operatingMode: -1, calMode: 0, startMonth: 12, startDay: 31 },
+];
+let calendarReads = 0;
+// While set, the stand-in answers calendargetentries with this HTTP status.
+let calendarDown = 0;
 const msPort = await listen(createServer((req, res) => {
   if (req.url.startsWith("/dev/sps/log")) { msMonitor.push(req.url); res.end("ok"); return; }
   if (req.url.toLowerCase() === "/data/loxapp3.json") {
@@ -94,11 +108,13 @@ const msPort = await listen(createServer((req, res) => {
     res.end(JSON.stringify(structure));
     return;
   }
+  if (req.url === "/jdev/sps/calendargetentries" && calendarDown) { calendarReads++; res.writeHead(calendarDown); res.end(); return; }
   if (req.url === "/IconsFilled/kitchen.svg") { res.setHeader("Content-Type", "image/svg+xml"); res.end(ICON); return; }
   const ll = {
     "/jdev/cfg/apiKey": () => ({ control: "dev/cfg/apiKey", Code: "200",
       value: `{'snr': '${msSerial}', 'version':'17.1.7.27', 'key':'00', 'local':true, 'httpsStatus':0}` }),
     "/jdev/sps/LoxAPPversion3": () => ({ control: "dev/sps/LoxAPPversion3", Code: "200", value: msConfigDate }),
+    "/jdev/sps/calendargetentries": () => (calendarReads++, { control: "dev/sps/calendargetentries", Code: "200", value: JSON.stringify(msCalendar) }),
   }[req.url];
   if (!ll) { res.writeHead(404); res.end(); return; }
   res.setHeader("Content-Type", "application/json");
@@ -229,6 +245,11 @@ try {
     await page.click("#props .app-load");
     await page.waitForFunction(() => /ControlMeter/.test(document.querySelector("#props")?.textContent || ""));
     assert.equal(structureReads, 1);
+    // A structure file read also asks for the calendar entries: the same as the config's.
+    for (let t = 0; calendarReads < 1 && t < 50; t++) await page.waitForTimeout(100);
+    assert.equal(calendarReads, 1);
+    await page.waitForFunction(() => S.cal?.entries === 5);
+    assert.equal(await page.$eval("#cal-drift", (n) => n.classList.contains("hidden")), true);
     // The current revision is compared with what the app shows.
     assert.match(await sec(), /in room Keller in the app, Küche in the config/);
     // The room's icon, from the Miniserver, in Properties and in the tree.
@@ -414,7 +435,76 @@ try {
     assert.equal(await page.isVisible("#stale-pull"), true);
     assert.equal(await page.isVisible("#stale-sync"), false);
   });
+  await step("calendar entries edited in the app are not polled for", async () => {
+    // In the app: Easter Monday moves to Good Friday, Silvester goes, a bridge day comes.
+    msCalendar = msCalendar.filter((e) => e.name !== "Silvester").map((e) => e.name === "Ostermontag" ? { ...e, easterOffset: -2 } : e);
+    msCalendar.push({ uuid: "20000001-0000-0001-ffff504f94000001", name: "Brückentag", operatingMode: -1, calMode: 2, startYear: 2026, startMonth: 12, startDay: 24 });
+    await page.waitForTimeout(500);
+    assert.equal(calendarReads, 1);
+    assert.equal(await page.$eval("#cal-drift", (n) => n.classList.contains("hidden")), true);
+  });
+  await step("before Apply, calendar entries edited in the app are read and listed", async () => {
+    // Apply asks for them first (vislox has no admin token here, so ask the way Apply does).
+    await page.evaluate(() => loadCal(true));
+    await page.waitForSelector("#cal-drift:not(.hidden)", { timeout: 10000 });
+    assert.equal(calendarReads, 2);
+    assert.match(await page.textContent("#cal-drift-text"), /^3 calendar entries were changed \(1 added, 1 changed, 1 deleted\) in the Loxone app since the deployed config\./);
+    const items = await page.$$eval("#cal-drift-list li", (n) => n.map((x) => x.textContent));
+    assert.deepEqual(items, [
+      "Ostermontag: when: Easter Monday (Easter +1) → Good Friday (Easter −2)",
+      "Brückentag: added, 24 Dec 2026 · switches on Party",
+      "Silvester: deleted (was Every year on 31 Dec · switches on Party)",
+    ]);
+    assert.equal(await page.isVisible("#cal-drift-pull"), true);
+    // The entry's Properties say so too, on the deployed revision.
+    await page.click('#cal-drift-list .lnk:has-text("Ostermontag")');
+    await page.waitForFunction(() => document.querySelector(".ph-t")?.textContent === "Ostermontag");
+    assert.match(await page.textContent("#props"), /In the appChanged in the app since the deployed config: when: Easter Monday \(Easter \+1\) → Good Friday \(Easter −2\)\. Pull or Sync to take it over\./);
+    await page.click("#ms-chip");
+    assert.match(await page.textContent("#ms-body"), /Calendar entries3 changed in the app/);
+    await page.keyboard.press("Escape");
+  });
+  await step("before Apply, a calendar check that failed says so, and is tried again", async () => {
+    calendarDown = 503;
+    // A good read from the last 2 s would be reused.
+    await page.waitForTimeout(2100);
+    const before = calendarReads;
+    const warn = await page.evaluate(async () => calApplyWarning(await loadCal(true)));
+    assert.equal(warn, "⚠ Couldn't check calendar entries changed in the app: 503, restarting. Applying overwrites any there are.\n\n");
+    assert.equal(calendarReads, before + 1);
+    // The failure is not reused: the next check asks again, and finds the entries.
+    calendarDown = 0;
+    const again = await page.evaluate(async () => calApplyWarning(await loadCal(true)));
+    assert.equal(calendarReads, before + 2);
+    assert.match(again, /^⚠ 3 calendar entries were changed .* Applying overwrites them:\n  Ostermontag: when: /);
+    // vislox itself not answering is a failed check too, not the last answer.
+    const failed = await page.evaluate(async () => {
+      const real = window.fetch;
+      window.fetch = async () => new Response(JSON.stringify({ error: "boom" }), { status: 500 });
+      try { return calApplyWarning(await loadCal(true)); } finally { window.fetch = real; }
+    });
+    assert.equal(failed, "⚠ Couldn't check calendar entries changed in the app: boom. Applying overwrites any there are.\n\n");
+    await page.evaluate(() => loadCal());
+  });
+  await step("an older calendar answer does not replace a newer one", async () => {
+    const kept = await page.evaluate(async () => {
+      const real = window.fetch, waiting = [];
+      window.fetch = () => new Promise((ok) => {
+        const n = waiting.length + 1;
+        waiting.push(() => ok(new Response(JSON.stringify({ available: true, read_at: n, entries: n, drift: [] }))));
+      });
+      try {
+        const first = loadCal(), second = loadCal();
+        waiting[1](); await second;
+        waiting[0](); await first;
+        return S.cal.entries;
+      } finally { window.fetch = real; await loadCal(); }
+    });
+    assert.equal(kept, 2);
+    await page.waitForSelector("#cal-drift:not(.hidden)");
+  });
   await step("pull from the Miniserver commits a new backup and shows it", async () => {
+    const readsBeforePull = calendarReads;
     // From the notice: the same as the History's Pull button.
     await page.click("#stale-pull");
     await page.waitForFunction(() => /^Pulled/.test(document.querySelector("#pull-msg")?.textContent || ""), null, { timeout: 15000 });
@@ -422,6 +512,9 @@ try {
     // The pulled download carries the Miniserver's date: the base is current again.
     await page.waitForSelector("#stale.hidden", { state: "attached", timeout: 10000 });
     await page.waitForSelector("#ms-chip.ok");
+    // Pull reads the calendar entries again.
+    for (let t = 0; calendarReads < readsBeforePull + 1 && t < 50; t++) await page.waitForTimeout(100);
+    assert.equal(calendarReads, readsBeforePull + 1);
   });
   await step("blocked FTP warns on Pull, and the server refuses it", async () => {
     await new Promise((ok) => { ftp.close(ok); for (const s of ftpSockets) s.destroy(); });
