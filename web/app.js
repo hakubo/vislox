@@ -14,7 +14,7 @@ const S = {
   follow: true, marks: true, vp: {}, open: new Set(["__pages"]), chgOff: new Set(),
   objPage: new Map(), pageOf: new Map(), loadSeq: 0, onlyChanged: false, chgIdx: -1,
   closed: new Set(["Advanced"]), dim: true, treeFocus: null, hash: null, applyingHash: false,
-  live: { on: pref("live", false), dim: pref("liveDim", true), es: null, status: null, values: new Map(), controls: {} },
+  live: { on: pref("live", false), dim: pref("liveDim", true), es: null, status: null, values: new Map(), controls: {}, globals: {} },
 };
 function pref(k, d) { try { const v = localStorage.getItem("vislox." + k); return v === null ? d : v === "1"; } catch { return d; } }
 function setPref(k, v) { try { localStorage.setItem("vislox." + k, v ? "1" : "0"); } catch { /* private mode */ } }
@@ -858,7 +858,8 @@ function renderProps() {
     for (const [name, su] of Object.entries(ctl?.states || {})) rows.push(row(name, lvSpan(su)));
     for (const q of o.ports) {
       const inc = q.conns.find((c) => c.dir === "in");
-      const src = inc ? inc.src : q.uuid;
+      // What the block receives: its own value if the Miniserver streams it, else its wire's.
+      const src = inc && !S.live.values.has(q.uuid) ? inc.src : q.uuid;
       if (!inc && !q.conns.length && !liveVal(q.uuid)) continue;
       rows.push(row(q.name, lvSpan(src) + `<span class="lv-of">${inc ? "in" : "out"}</span>`));
     }
@@ -1589,7 +1590,11 @@ function lvFind(u, depth) {
     const st = S.live.controls[ref]?.states || {};
     const k = ["value", "active", "position"].find((k) => typeof st[k] === "string" && S.live.values.has(st[k]));
     if (k) return S.live.values.get(st[k]);
+    const sv = sysVal(ref);
+    if (sv) return sv;
   }
+  const fed = lvFed(u);
+  if (fed) return fed;
   const lc = g.moods?.[u];
   if (lc) {
     // Mood is the number of the active mood; with several active it is not known.
@@ -1606,6 +1611,69 @@ function lvFind(u, depth) {
   }
   return undefined;
 }
+/** Where an input the Miniserver streams is fed: wire source → the inputs it feeds. The value an
+ *  input receives is its wire's value, and that of every reference or memory flag upstream that
+ *  passes it on. Built once per view. */
+function fedIndex() {
+  const v = S.view;
+  if (v._fed) return v._fed;
+  const keyOf = new Map();
+  for (const o of Object.values(v.objects)) for (const q of o.ports) keyOf.set(q.uuid, q.key);
+  const pass = v.live?.pass || {};
+  const idx = new Map();
+  for (const o of Object.values(v.objects)) for (const q of o.ports) {
+    if (q.inv) continue;
+    const srcs = [...new Set(q.conns.filter((c) => c.dir === "in" && c.status !== "removed").map((c) => c.src))];
+    if (!srcs.length) continue;
+    const who = `${autoTitle(o.title) ? prettyType(o.ty) : o.title}.${q.name}`;
+    const digital = srcs.every((s) => !analogKey(keyOf.get(s) || ""));
+    for (const s0 of srcs) {
+      const e = { input: q.uuid, who, multi: srcs.length > 1, digital, analog: analogKey(keyOf.get(s0) || "") };
+      for (let s = s0, i = 0; s && i < 60; s = pass[s], i++) {
+        if (!idx.has(s)) idx.set(s, []);
+        idx.get(s).push(e);
+      }
+    }
+  }
+  return (v._fed = idx);
+}
+/** A wire's value from the input it feeds, when the Miniserver streams that input. */
+function lvFed(u) {
+  for (const e of fedIndex().get(u) || []) {
+    const v = S.live.values.get(e.input);
+    if (!v) continue;
+    const n = lvNum(v);
+    // Several wires into one digital input: it is on when any is, so only off tells them all.
+    if (e.multi) {
+      if (e.digital && n === 0) return [0, null, `${e.who} receives 0 from all its wires`, "computed"];
+      continue;
+    }
+    // A digital input makes any analog value but 0 a 1.
+    if (e.analog && n === 1) continue;
+    return [v[0], v[1], `the value ${e.who} receives`];
+  }
+  return undefined;
+}
+/** Loxone's system variables that follow from the Miniserver's clock and today's sunrise and sunset. */
+const SYS_VARS = {
+  Year: (t) => t.y, Month: (t) => t.mo, Day: (t) => t.d, Hour: (t) => t.h, Minute: (t) => t.mi,
+  Time: (t) => t.min,
+  Daylight: (t) => t.sr === undefined || t.ss === undefined ? undefined : +(t.min >= t.sr && t.min < t.ss),
+};
+function sysVal(uuid) {
+  const ty = S.view?.objects[uuid]?.ty;
+  const f = SYS_VARS[ty];
+  if (!f) return undefined;
+  const gl = S.live.globals || {};
+  const m = /^(\d+)-(\d+)-(\d+) (\d+):(\d+)/.exec(S.live.values.get(gl.miniserverTime)?.[0] || "");
+  if (!m) return undefined;
+  const [y, mo, d, h, mi] = m.slice(1).map(Number);
+  const v = f({ y, mo, d, h, mi, min: h * 60 + mi, sr: lvNum(S.live.values.get(gl.sunrise)), ss: lvNum(S.live.values.get(gl.sunset)) });
+  if (v === undefined) return undefined;
+  return [v, null, `computed by vislox from the Miniserver's clock${ty === "Daylight" ? " and today's sunrise and sunset" : ""}`, "computed"];
+}
+/** Analog connectors, by key (as the server draws analog wires). */
+function analogKey(k) { return /^A[QI]/.test(k) || ["Txt", "TQ", "V", "Pos", "Value", "Temp"].includes(k); }
 const GATE_NAME = { and: "AND", or: "OR", xor: "XOR", not: "NOT", eq: "Equal", ne: "Not equal", gt: "Greater", ge: "Greater or equal",
   lt: "Less", le: "Less or equal", add: "Add", sub: "Subtract", mul: "Multiply", div: "Divide" };
 function lvNum(e) {
@@ -1698,6 +1766,7 @@ function liveStart() {
     const d = JSON.parse(e.data);
     S.live.values = new Map(Object.entries(d.values));
     S.live.controls = d.controls || {};
+    S.live.globals = d.globals || {};
     lvCache = new Map();
     liveQueue(null);
   });
@@ -1719,6 +1788,7 @@ function liveStop() {
   S.live.status = null;
   S.live.values = new Map();
   S.live.controls = {};
+  S.live.globals = {};
   liveQueue(null);
 }
 function setLive(on) {
@@ -1766,6 +1836,26 @@ function liveBuild(p) {
   };
   for (const w of p.wires) pill(w.src, w.points[0][0], w.points[0][1], false, w.from[0]);
   for (const l of p.labels) pill(l.src, l.x, l.y, l.side === "L", l.obj);
+  // Pins with no wire to carry their value, and inputs fed by several wires, show it at the pin
+  // (as Loxone Config's Liveview does): a pill for analog values, the pin's colour for digital ones.
+  for (const o of p.objects) {
+    const info = o.shape !== "tag" && !o.moved_to && S.view.objects[o.uuid];
+    if (!info) continue;
+    const wired = L.wired.get(o.uuid);
+    for (const q of o.ports) {
+      const pi = info.ports.find((r) => r.key === q.key);
+      if (!pi) continue;
+      const left = q.side === "L";
+      const ins = pi.conns.filter((c) => c.dir === "in").length;
+      if (left ? ins === 1 || (!wired?.has(q.key) && q.def != null) : wired?.has(q.key)) continue;
+      const it = get(pi.uuid);
+      it.pin = true;
+      const n = el("rect", { class: `pin-lv${analogKey(q.key) ? " analog" : ""}`, x: left ? q.x - 112 : q.x + 12, y: q.y - 40, width: 100, height: 80, rx: 14 }, L.pills);
+      it.lines.push(n);
+      if (analogKey(q.key)) it.analog = true;
+      pill(pi.uuid, left ? q.x - 112 : q.x + 112, q.y, left, o.uuid);
+    }
+  }
   return idx;
 }
 
@@ -1780,7 +1870,8 @@ function liveApply(ch) {
       n.classList.toggle("lv-has", !!e);
       n.classList.toggle("lv-on", !!e && !n.classList.contains("analog") && liveOn(e));
     }
-    const show = !!e && (it.analog || typeof e[0] === "string");
+    const n = it.pin && lvNum(e);
+    const show = !!e && (it.analog || typeof e[0] === "string" || (it.pin && n !== undefined && n !== 0 && n !== 1));
     const txt = show ? clip(liveText(e), 18) : "";
     for (const pl of it.pills) {
       pl.g.style.display = show ? "" : "none";

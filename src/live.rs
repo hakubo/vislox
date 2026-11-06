@@ -317,10 +317,15 @@ struct Owner {
     state: String,
     /// The control's number format, for its `value` state.
     format: Option<String>,
+    /// Names for the values (the operating modes, for `operatingMode`).
+    names: Option<Arc<HashMap<String, String>>>,
 }
 
 impl Owner {
     fn text(&self, v: f64) -> Option<String> {
+        if let Some(names) = &self.names {
+            return names.get(&format!("{}", v.round() as i64)).cloned();
+        }
         (self.state == "value")
             .then_some(self.format.as_deref())
             .flatten()
@@ -328,9 +333,16 @@ impl Owner {
     }
 }
 
-/// State UUID → owner, and the controls (block UUID → name, type and states)
+/// What the structure file tells: state UUID → owner, the controls (block
+/// UUID → name, type and states) and the global states (name → state UUID)
 /// as the browser receives them.
-fn read_structure(structure: &Value) -> (HashMap<String, Owner>, Value) {
+struct Structure {
+    owners: HashMap<String, Owner>,
+    controls: Value,
+    globals: Value,
+}
+
+fn read_structure(structure: &Value) -> Structure {
     fn add(
         owners: &mut HashMap<String, Owner>,
         controls: &mut serde_json::Map<String, Value>,
@@ -358,6 +370,7 @@ fn read_structure(structure: &Value) -> (HashMap<String, Owner>, Value) {
                         label: format!("{name} · {state}"),
                         state: state.clone(),
                         format: format.clone(),
+                        names: None,
                     },
                 );
                 states.insert(state.clone(), Value::from(su));
@@ -376,7 +389,37 @@ fn read_structure(structure: &Value) -> (HashMap<String, Owner>, Value) {
     for (uuid, ctrl) in structure["controls"].as_object().into_iter().flatten() {
         add(&mut owners, &mut controls, uuid, ctrl, None);
     }
-    (owners, Value::Object(controls))
+    // The Miniserver's own states: its clock, sunrise and sunset, the
+    // operating mode. Some have the UUID of a system variable in the config
+    // (`Sunrise`, `Calendar`), so they also become controls with a `value`.
+    let modes: HashMap<String, String> = structure["operatingModes"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
+        .collect();
+    let modes = Arc::new(modes);
+    let mut globals = serde_json::Map::new();
+    for (name, su) in structure["globalStates"].as_object().into_iter().flatten() {
+        let Some(su) = su.as_str() else {
+            continue;
+        };
+        globals.insert(name.clone(), Value::from(su));
+        owners.entry(su.to_string()).or_insert_with(|| Owner {
+            label: format!("Miniserver · {name}"),
+            state: name.clone(),
+            format: None,
+            names: (name == "operatingMode" && !modes.is_empty()).then(|| modes.clone()),
+        });
+        controls.entry(su.to_string()).or_insert_with(|| {
+            json!({ "name": format!("Miniserver · {name}"), "type": "GlobalState", "states": { "value": su } })
+        });
+    }
+    Structure {
+        owners,
+        controls: Value::Object(controls),
+        globals: Value::Object(globals),
+    }
 }
 
 // ── The hub ─────────────────────────────────────────────────────────────
@@ -398,6 +441,8 @@ struct St {
     owners: HashMap<String, Owner>,
     /// `controls` of the snapshot, serialized.
     controls: Arc<String>,
+    /// `globals` of the snapshot, serialized.
+    globals: Arc<String>,
     clients: usize,
     /// The running Miniserver session: its generation and stop switch.
     run: Option<(u64, watch::Sender<bool>)>,
@@ -445,6 +490,7 @@ impl Live {
                 values: HashMap::new(),
                 owners: HashMap::new(),
                 controls: Arc::new("{}".into()),
+                globals: Arc::new("{}".into()),
                 clients: 0,
                 run: None,
                 generation: 0,
@@ -486,7 +532,8 @@ impl Live {
         serde_json::to_string(&self.status()).unwrap_or_default()
     }
 
-    /// Every value and the controls: `{values: {uuid: [v, text, label]}, controls}`.
+    /// Every value, the controls and the global states:
+    /// `{values: {uuid: [v, text, label]}, controls, globals}`.
     pub fn snapshot_json(&self) -> String {
         let st = self.st.lock().unwrap();
         let values: serde_json::Map<String, Value> = st
@@ -495,9 +542,10 @@ impl Live {
             .map(|(u, v)| (u.clone(), entry(v, st.owners.get(u))))
             .collect();
         format!(
-            "{{\"values\":{},\"controls\":{}}}",
+            "{{\"values\":{},\"controls\":{},\"globals\":{}}}",
             Value::Object(values),
-            st.controls
+            st.controls,
+            st.globals
         )
     }
 
@@ -598,13 +646,14 @@ impl Live {
     }
 
     fn load_structure(&self, generation: u64, structure: &Value) {
-        let (owners, controls) = read_structure(structure);
+        let s = read_structure(structure);
         let mut st = self.st.lock().unwrap();
         if st.generation != generation {
             return;
         }
-        st.owners = owners;
-        st.controls = Arc::new(controls.to_string());
+        st.owners = s.owners;
+        st.controls = Arc::new(s.controls.to_string());
+        st.globals = Arc::new(s.globals.to_string());
         st.values.clear();
         drop(st);
         let _ = self.tx.send(Msg::Snapshot);
@@ -758,6 +807,7 @@ impl Live {
             ),
             state: v["state"].as_str().unwrap_or_default().to_string(),
             format: None,
+            names: None,
         };
         let val: Val = (value, None);
         let mut st = self.st.lock().unwrap();
@@ -818,13 +868,33 @@ mod tests {
             "c2": { "name": "Licht", "type": "LightControllerV2", "states": { "activeMoods": "s3" },
                     "subControls": { "c3": { "name": "Spots", "type": "Switch", "states": { "active": "s4" } } } }
         }});
-        let (owners, controls) = read_structure(&s);
+        let Structure {
+            owners, controls, ..
+        } = read_structure(&s);
         assert_eq!(owners["s1"].label, "Lux · value");
         assert_eq!(owners["s1"].text(22000.0).as_deref(), Some("22000lx"));
         assert_eq!(owners["s2"].text(1.0), None);
         assert_eq!(owners["s4"].label, "Licht / Spots · active");
         assert_eq!(controls["c3"]["states"]["active"], "s4");
         assert_eq!(controls["c1"]["type"], "InfoOnlyAnalog");
+    }
+
+    #[test]
+    fn global_states_are_named_and_the_operating_mode_has_its_name() {
+        let s = json!({
+            "controls": { "c1": { "name": "Lux", "type": "InfoOnlyAnalog", "states": { "value": "s1" } } },
+            "globalStates": { "sunrise": "g1", "operatingMode": "g2", "miniserverTime": "g3" },
+            "operatingModes": { "7": "Friday", "-1": "Alarm" }
+        });
+        let st = read_structure(&s);
+        assert_eq!(st.globals["miniserverTime"], "g3");
+        assert_eq!(st.owners["g1"].label, "Miniserver · sunrise");
+        assert_eq!(st.owners["g1"].text(416.0), None);
+        assert_eq!(st.owners["g2"].text(7.0).as_deref(), Some("Friday"));
+        assert_eq!(st.owners["g2"].text(3.0), None);
+        // A system variable with a global state's UUID gets it as its value.
+        assert_eq!(st.controls["g1"]["states"]["value"], "g1");
+        assert_eq!(st.controls["c1"]["name"], "Lux");
     }
 
     fn write(path: &Path, text: &str) {

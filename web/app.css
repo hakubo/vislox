@@ -405,6 +405,9 @@ button.chip { cursor: pointer; } button.chip:hover { border-color: var(--brand);
 .lg-dim { display: inline-flex; align-items: center; gap: 4px; cursor: pointer; color: var(--text); }
 .live .wire.lv-on, .live .xref-wire.lv-on { stroke: var(--live-on); stroke-width: 3px; }
 .live.live-dim .wire:not(.lv-has):not(.hl), .live.live-dim .xref-wire:not(.lv-has) { opacity: .16; }
+/* A pin with no wire to carry its value: green while a digital one is on. */
+.pin-lv { fill: none; pointer-events: none; }
+.live .pin-lv.lv-on { fill: var(--live-on); }
 .live-pill rect { fill: var(--live-pill); stroke: var(--live-pill-line); stroke-width: 1px; vector-effect: non-scaling-stroke; }
 .live-pill text { font-size: 104px; fill: var(--text); font-variant-numeric: tabular-nums; }
 .live-pill.tick rect { fill: var(--live-tick); }
