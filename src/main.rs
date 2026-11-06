@@ -7,6 +7,7 @@ mod backups;
 mod calendar;
 mod configdate;
 mod discover;
+mod edit;
 mod hardware;
 mod history;
 mod live;
@@ -523,6 +524,8 @@ async fn main() -> Result<()> {
         .route("/api/backups/read", axum::routing::post(api_backups_read))
         .route("/api/apply", axum::routing::post(api_apply))
         .route("/api/discard", axum::routing::post(api_discard))
+        .route("/api/edit", axum::routing::post(api_edit))
+        .route("/api/edits", get(api_edits))
         .route("/api/sync", axum::routing::post(api_sync))
         .route("/api/operate", axum::routing::post(api_operate))
         .with_state(app)
@@ -1467,6 +1470,31 @@ async fn api_discard(State(app): State<Arc<App>>, headers: axum::http::HeaderMap
         Ok(m) => Json(serde_json::json!({ "message": m })).into_response(),
         Err(r) => refused(r),
     }
+}
+
+/// Values edited in Properties: written into the module and compiled, so
+/// they show as the pending revision. Never deploys, and never talks to the
+/// Miniserver (no preflight): only Apply does.
+async fn api_edit(
+    State(app): State<Arc<App>>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<edit::Request>,
+) -> Response {
+    if let Err(r) = app.actions.check(&headers) {
+        return refused(r);
+    }
+    let res = app.actions.edit(&req).await;
+    let a = app.clone();
+    let _ = tokio::task::spawn_blocking(move || refresh(&a)).await;
+    match res {
+        Ok(v) => Json(v).into_response(),
+        Err(r) => refused(r),
+    }
+}
+
+/// What vislox's file of the module claims, and which of it is not deployed.
+async fn api_edits(State(app): State<Arc<App>>) -> Response {
+    Json(app.actions.edits().await).into_response()
 }
 
 /// Make the Miniserver's running config the project's base, commit, push.

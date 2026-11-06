@@ -9,7 +9,8 @@ and deploying it safely.
 
 ## What works today
 
-Everything the agent needs already exists in a `lox.toml` project:
+Everything the agent needs already exists in a `lox.toml` project. (vislox's own edits go into
+`<module>/vislox/`; an agent should leave that directory alone, see [editing.md](editing.md).)
 
 1. Start vislox on the project with an admin token:
    `vislox ~/loxone-config/project --admin-token-file ~/.config/vislox/admin-token`.

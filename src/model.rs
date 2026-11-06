@@ -237,6 +237,9 @@ pub struct ObjInfo {
     /// The device this object is, or belongs to (an input or output).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub device: Option<DeviceInfo>,
+    /// What Properties may edit on it (`edit.rs`), whether or not editing is on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub edit: Option<crate::edit::Caps>,
 }
 
 /// The device an object is, or whose input or output it is.
@@ -1629,6 +1632,7 @@ fn obj_info(
         calendar,
         schedule: None,
         device,
+        edit: if gone { None } else { crate::edit::caps(el) },
         uuid: uuid.to_string(),
         title: c.title(uuid),
         old_title: d.renamed.get(uuid).cloned().flatten(),

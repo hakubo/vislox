@@ -58,3 +58,7 @@ jobs:
         run: node tests/ui/apply.mjs
         env:
           VISLOX_BIN: target/release/vislox
+      - name: Edit test
+        run: node tests/ui/edit.mjs
+        env:
+          VISLOX_BIN: target/release/vislox

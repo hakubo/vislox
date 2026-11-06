@@ -42,7 +42,7 @@ Then open <http://127.0.0.1:7878>. Started without a path or `--ctx` in a direct
 - A Miniserver status chip and a preflight before Pull, Apply and Sync (right serial, FTP and web port reachable,
   config changed since the base, calendar entries changed in the app).
 - The Miniserver log and, opt-in, its Debug-Monitor.
-- For a `lox.toml` project: Apply, Sync and Discard from the browser.
+- For a `lox.toml` project: edit values in Properties, then Apply, Sync and Discard from the browser.
 - Ctrl+K to find any page or block, links that reopen a page, block and revision, and full keyboard use (`?`).
 
 Details: [docs/features.md](docs/features.md).
@@ -94,8 +94,9 @@ commands always use lox's host. Details: [docs/miniserver.md](docs/miniserver.md
 
 ## Safety
 
-By default vislox only reads. It never writes to the config file itself: lox and git do, on Pull, Apply, Sync and
-Discard.
+By default vislox only reads. It never writes to a config file itself: lox and git do, on Pull, Apply, Sync and
+Discard. Editing values writes one file of vislox's own into a project's module, which `lox logic compile` turns
+into the pending config ([docs/editing.md](docs/editing.md)).
 
 Without any opt-in, vislox sends the Miniserver read-only requests: the live value stream, the structure file and
 its icons, the status check, the heating and cooling periods, the calendar entries, the system log (`lox log`),
@@ -110,6 +111,7 @@ Opt-ins:
 |---|---|---|
 | Apply | `--admin-token-file`, then the token in the browser | `lox config push --force`: upload and program restart |
 | Sync, Discard | `--admin-token-file`, then the token | nothing; they change the project and its git repository |
+| Edit values | `--admin-token-file`, then the token | nothing; vislox writes its file in the module and runs `lox logic compile` |
 | Operate virtual inputs | `--operate` with `--admin-token-file` | `jdev/sps/io/<uuid>/<cmd>`, only to `VirtualIn` objects, each confirmed |
 | Query blocks on this page | a toggle in the legend, off by default | read-only `jdev/sps/io/<uuid>/all`, at most 20 a second |
 | Debug-Monitor | `--monitor`, then Start | `dev/sps/log/<address>`: the Miniserver sends its debug output to vislox until Stop or the time limit |
@@ -125,6 +127,7 @@ config's serial, and refuses otherwise. Every request is described in [docs/mini
 - [docs/miniserver.md](docs/miniserver.md): every request to the Miniserver, caching, error codes and retries.
 - [docs/architecture.md](docs/architecture.md): how the code is organised.
 - [docs/debug-monitor.md](docs/debug-monitor.md): the Debug-Monitor, and what was found out about its protocol.
+- [docs/editing.md](docs/editing.md): editing in vislox, how edits reach the module, and what comes next.
 - [docs/agent-workflow.md](docs/agent-workflow.md): changing the config with your own agent (proposal).
 - [docs/program-memory.md](docs/program-memory.md): why vislox does not estimate program memory.
 - [docker/README.md](docker/README.md): the Docker image, Compose and Portainer.
@@ -138,6 +141,7 @@ cargo build --release
 cd tests/ui && npm ci && npx playwright install chromium && cd ../..
 VISLOX_BIN=target/release/vislox node tests/ui/smoke.mjs   # drives the UI in headless Chromium
 VISLOX_BIN=target/release/vislox node tests/ui/apply.mjs   # Apply's steps, with a stand-in lox
+VISLOX_BIN=target/release/vislox node tests/ui/edit.mjs    # editing values, with a stand-in lox
 ```
 
 CI (`.github/workflows/ci.yml`) runs all of these on every push to `main` and every pull request.
