@@ -306,7 +306,7 @@ function renderSelects() {
 // ── view ───────────────────────────────────────────────────────────────
 async function loadView() {
   if (!S.rev) { showMsg("No config found."); return; }
-  const seq = ++S.loadSeq;
+  const seq = ++S.loadSeq, rev = S.rev;
   showMsg("Loading…");
   let v;
   try {
@@ -317,6 +317,7 @@ async function loadView() {
   }
   if (seq !== S.loadSeq) return;
   S.view = v;
+  S.viewRev = rev;
   S.objPage = new Map();
   S.pageOf = new Map(v.pages.map((p) => [p.uuid, p]));
   for (const p of v.pages) for (const o of p.objects) if (!o.moved_to && (!S.objPage.has(o.uuid) || o.status !== "removed")) S.objPage.set(o.uuid, p.uuid);
@@ -506,6 +507,7 @@ function hoverTip(node, html) {
 }
 
 function renderPage() {
+  renderAddHud();
   vpG.innerHTML = "";
   hideTip();
   const p = curPage();
@@ -1198,6 +1200,7 @@ $("props").addEventListener("click", (e) => {
     else if (what === "save") editSave();
     else if (what === "cancel") editClose();
     else if (what === "revert") editRevert(eb.dataset.key);
+    else if (what === "remove") editRemove(S.sel);
     else if (what === "newest") editGoNewest();
     return;
   }
@@ -1608,6 +1611,7 @@ window.addEventListener("keydown", (e) => {
     if (e.key === "Escape") { closePalette(); closeHelp(); }
     return;
   }
+  if (AB.open) { if (e.key === "Escape") abClose(); return; }
   if ((e.ctrlKey || e.metaKey) && (e.key === "k" || e.key === "K")) { e.preventDefault(); openPalette(""); return; }
   if ((e.ctrlKey || e.metaKey) && e.key === "f") { e.preventDefault(); $("tree-filter").focus(); $("tree-filter").select(); return; }
   const tag = e.target.tagName;
@@ -1945,6 +1949,13 @@ function deployMsg(text, error, warn) {
   m.textContent = text || "";
   m.className = "deploy-msg" + (error ? " error" : warn ? " warn" : "") + (text ? "" : " hidden");
 }
+/** “ They include 3 values edited here and 1 block added here.”, or nothing. */
+function editsHere() {
+  const parts = [];
+  if (editsPending().length) parts.push(`${plural(editsPending().length, "value")} edited here`);
+  if (editsAdded().length) parts.push(`${plural(editsAdded().length, "block")} added here`);
+  return parts.length ? ` They include ${parts.join(" and ")}.` : "";
+}
 /** The newest compile, if it differs from what is deployed. */
 function pendingChange() {
   const p = S.hist?.pending?.[0];
@@ -1958,16 +1969,17 @@ function renderActions() {
   const a = S.hist?.actions;
   $("deploy-pane").classList.toggle("hidden", !a?.shown);
   renderStale();
+  renderAddHud();
   if (!a?.shown) return;
   const busy = !!a.running;
   const pend = pendingChange();
   $("deploy-pend").classList.toggle("idle", !pend && !a.running);
   $("deploy-pend").textContent = a.running === "Apply" ? "Deploying to the Miniserver… (download, check, upload, restart, verify)"
-    : a.running === "Edit" ? "Compiling the edited values… (lox logic compile; nothing is deployed)"
+    : a.running === "Edit" ? "Compiling the edit… (lox logic compile; nothing is deployed)"
     : a.running ? `${a.running}…` : pend ? `Compiled changes are pending (${fmtWhen(pend.time)}), not deployed.` +
-      (editsPending().length ? ` They include ${plural(editsPending().length, "value")} edited here.` : "") + " Review them, then apply."
+      editsHere() + " Review them, then apply."
     : !a.apply.available ? `Apply is off: ${a.apply.reason}.`
-    : `Nothing pending. ${a.edit?.available ? "Edit values in Properties, or edit" : "Edit"} the project's module and compile it (lox logic …); the result shows here for review.`;
+    : `Nothing pending. ${a.edit?.available ? "Edit values in Properties, add blocks to a page, or edit" : "Edit"} the project's module and compile it (lox logic …); the result shows here for review.`;
   $("deploy-row").classList.toggle("hidden", !pend && !a.running);
   $("btn-apply").disabled = !a.apply.available || busy || !pend || applyAsking;
   const sync = $("btn-sync");
@@ -2376,8 +2388,10 @@ function editRev() {
   const h = S.hist?.history?.[0];
   return h?.current ? h : null;
 }
-/** The values vislox edited and has not deployed yet, of one object or of all. */
-function editsPending(uuid) { return (S.edits?.claims || []).filter((c) => c.pending && (!uuid || c.uuid === uuid)); }
+/** The blocks added here (#59) that are not deployed yet, or the one with UUID `uuid`. */
+function editsAdded(uuid) { return (S.edits?.blocks || []).filter((b) => b.uuid && !b.deployed && (!uuid || b.uuid === uuid)); }
+/** The values vislox edited and has not deployed yet, of one object or of all; not those of a new block, which is new as a whole. */
+function editsPending(uuid) { return (S.edits?.claims || []).filter((c) => c.pending && (!uuid || c.uuid === uuid) && !editsAdded(c.uuid).length); }
 /** Whether `o` can be edited now: `{ ok }`, or `{ why }` and maybe `{ newest }` to go to. */
 function editState(o) {
   const a = S.hist?.actions;
@@ -2413,6 +2427,11 @@ function editRows(o, row) {
   if (!st) return null;
   const rows = [];
   const mine = S.edit.uuid === o.uuid ? S.edit : null;
+  // A block added here and not deployed: Remove takes it out again.
+  for (const b of editsAdded(o.uuid)) {
+    rows.push(row("Block", `<span class="ed-v">added here</span><span class="ed-tag" title="Declared in ${esc(b.file)} and compiled, not on the Miniserver yet: Apply deploys it, Discard drops it">not deployed</span>` +
+      (st.ok ? '<button type="button" class="ed-btn small" data-ed="remove" title="Take the block out again">Remove</button>' : ""), "pr-chg"));
+  }
   // What was edited here and is not deployed yet, each with a way back.
   for (const c of editsPending(o.uuid)) {
     const v = c.value == null ? '<span class="none-v">back to Loxone Config\'s value</span>' : esc(c.value);
@@ -2439,7 +2458,7 @@ function editRows(o, row) {
       `<button type="button" class="ed-btn small" data-ed="cancel"${mine.busy ? " disabled" : ""}>Cancel</button>` +
       `<span class="ed-msg${mine.err ? " err" : ""}" role="status" aria-live="polite">${esc(mine.err || mine.msg || "Saving compiles the module; nothing is deployed.")}</span></div>`);
   }
-  return { rows, count: editsPending(o.uuid).length };
+  return { rows, count: editsPending(o.uuid).length + editsAdded(o.uuid).length };
 }
 function editOpen(uuid) {
   S.edit = { uuid, open: true, draft: {}, bad: {}, busy: false, msg: "", err: "" };
@@ -2476,9 +2495,10 @@ async function editSave() {
 async function editSend(uuid, rev, ops) {
   S.edit.busy = true; S.edit.uuid = uuid; renderProps();
   try {
-    await act("/api/edit", { base: rev.blob, ops });
+    const res = await act("/api/edit", { base: rev.blob, ops });
     S.edit = { uuid, open: false, draft: {}, bad: {}, busy: false, msg: "Saved and compiled: pending, not deployed. Review it, then Apply or Discard.", err: "" };
-    await editShowNewest();
+    await editShowNewest(res.blob);
+    if (S.sel === uuid && !S.view?.objects[uuid]) select(null, { noReveal: true });
   } catch (err) {
     S.edit.busy = false; S.edit.err = err.message;
     renderProps();
@@ -2491,12 +2511,200 @@ async function editRevert(key) {
   const op = EDIT_ATTR[c.op] ? { op: c.op, uuid: c.uuid } : c.op === "param" ? { op: "param", uuid: c.uuid, port: c.port } : { op: "setting", uuid: c.uuid, name: c.name };
   await editSend(c.uuid, st.rev, [{ ...op, value: c.deployed }]);
 }
-async function editShowNewest() {
+/** Take out a block added here that is not deployed yet. */
+async function editRemove(uuid) {
+  const o = S.view?.objects[uuid], st = o && editState(o);
+  if (!st?.ok || !editsAdded(uuid).length) return;
+  if (!window.confirm(`Remove ${displayTitle(o)}? It was added here and is not deployed.`)) return;
+  await editSend(uuid, st.rev, [{ op: "remove_block", uuid }]);
+}
+/** Show the newest config, once the History has the compile `blob` (its file watcher may lag behind the reply). */
+async function editShowNewest(blob) {
   await loadHistory();
+  for (let i = 0; blob && editRev()?.blob !== blob && i < 40; i++) {
+    await new Promise((ok) => setTimeout(ok, 250));
+    await loadHistory();
+  }
   const r = editRev();
   if (r && S.rev !== r.id) { S.rev = r.id; S.base = r.base || null; renderHistory(); renderSelects(); await loadView(); }
+  // Following, the History's own refresh may have switched to it and still be loading it.
+  else if (r && S.viewRev !== r.id) await loadView();
 }
 function editGoNewest() { S.follow = true; $("chk-follow").checked = true; editShowNewest(); }
+
+// ── adding blocks (#59) ────────────────────────────────────────────────
+// “Add block” on the page picks a type lox can create (GET /api/block-types), then its name and values.
+// The server declares it in a file of vislox's own for the page (<module>/vislox/<page>.loxl) and runs
+// lox logic compile, which mints the block and places it on the page: it shows as the pending revision,
+// and its Properties offer Remove until it is deployed. Adding never deploys: only Apply does.
+S.types = null;
+const AB = { open: false, ty: null, items: [], idx: 0, draft: {}, bad: {}, busy: false, err: "" };
+/** Whether a block can be added to the page shown: `{ ok, rev, page }`, or `{ why }`; null: not offered at all. */
+function addState() {
+  const a = S.hist?.actions, pg = S.view && curPage();
+  if (!a?.shown || !pg || MD.open) return null;
+  if (!a.edit?.available) return { why: `Editing is off: ${a.edit?.reason || "unknown"}.` };
+  const r = editRev();
+  if (!r) return { why: "The config on disk is not in the History yet." };
+  if (S.rev !== r.id) return { why: `Blocks are added on the newest config (${r.kind === "pending" ? "Pending" : "deployed"}).` };
+  if (pg.status === "removed") return { why: "This page is not in the config any more." };
+  if (a.running) return { why: `${a.running} is running.` };
+  return { ok: true, rev: r, page: pg };
+}
+function renderAddHud() {
+  const st = addState(), b = $("btn-add-block");
+  $("hud-add").classList.toggle("hidden", !st);
+  if (!st) return;
+  b.disabled = !st.ok;
+  b.title = st.ok ? `Add a block to ${st.page.title || "this page"} (it is compiled, not deployed)` : st.why;
+}
+async function abOpen() {
+  const st = addState();
+  if (!st?.ok) return;
+  Object.assign(AB, { open: true, ty: null, draft: {}, bad: {}, busy: false, err: "" });
+  $("addblk").classList.remove("hidden");
+  $("ab-page").textContent = `on ${st.page.title || "this page"}`;
+  if (!S.types) {
+    $("ab-body").innerHTML = '<div class="ab-sum">Loading the block types…</div>';
+    try { S.types = (await api("/api/block-types")).types; } catch (err) { $("ab-body").innerHTML = `<div class="ab-sum">${esc(err.message)}</div>`; return; }
+  }
+  abPick("");
+}
+function abClose() {
+  if (AB.busy) return;
+  AB.open = false;
+  $("addblk").classList.add("hidden");
+  $("btn-add-block").focus();
+}
+/** Step one: the types, searched by name, type and purpose. */
+function abPick(q) {
+  AB.ty = null;
+  $("ab-body").innerHTML = `<input id="ab-q" type="text" placeholder="Search block types… (And, Monoflop, timer)" autocomplete="off" spellcheck="false" role="combobox" aria-expanded="true" aria-controls="ab-list" aria-autocomplete="list" aria-label="Block type">
+    <ul id="ab-list" role="listbox" aria-label="Block types"></ul>
+    <div class="pal-foot"><kbd>↑</kbd><kbd>↓</kbd> choose · <kbd>Enter</kbd> pick · <kbd>Esc</kbd> close · only the types lox can create on a page</div>`;
+  const inp = $("ab-q");
+  inp.value = q;
+  inp.addEventListener("input", abList);
+  inp.addEventListener("keydown", (e) => {
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") { abMove(e.key === "ArrowDown" ? 1 : -1); e.preventDefault(); }
+    else if (e.key === "Enter") { abChoose(AB.idx); e.preventDefault(); }
+    else if (e.key === "Escape") { abClose(); e.preventDefault(); }
+  });
+  $("ab-list").addEventListener("click", (e) => { const li = e.target.closest("[data-i]"); if (li) abChoose(+li.dataset.i); });
+  abList();
+  inp.focus();
+}
+function abList() {
+  const q = $("ab-q").value.trim().toLowerCase();
+  const all = S.types.map((t) => ({ t, name: prettyType(t.type) }));
+  AB.items = !q ? all.sort((a, b) => a.name.localeCompare(b.name)) : all.map((it) => {
+    const m = fuzzy(q, it.name) || fuzzy(q, it.t.type);
+    const inSum = (it.t.summary || "").toLowerCase().includes(q);
+    return m ? { ...it, score: m.score + 100, hits: fuzzy(q, it.name)?.hits } : inSum ? { ...it, score: 1 } : null;
+  }).filter(Boolean).sort((a, b) => b.score - a.score);
+  AB.idx = AB.items.length ? 0 : -1;
+  $("ab-list").innerHTML = AB.items.length ? AB.items.map((it, i) => `<li role="option" id="ab-o${i}" data-i="${i}" aria-selected="${i === AB.idx}"><span class="at">${mark(it.name, it.hits)}</span>` +
+    (it.name !== it.t.type ? `<span class="ac">${esc(it.t.type)}</span>` : "") + `<span class="as">${esc(it.t.summary || "")}</span></li>`).join("")
+    : '<li class="sec" role="presentation">No block type matches. Virtual inputs and devices are not added on a page.</li>';
+  $("ab-q").setAttribute("aria-activedescendant", AB.idx >= 0 ? "ab-o0" : "");
+}
+function abMove(d) {
+  if (!AB.items.length) return;
+  AB.idx = Math.max(0, Math.min(AB.items.length - 1, AB.idx + d));
+  $("ab-list").querySelectorAll("[role=option]").forEach((li) => li.setAttribute("aria-selected", +li.dataset.i === AB.idx));
+  $(`ab-o${AB.idx}`)?.scrollIntoView({ block: "nearest" });
+  $("ab-q").setAttribute("aria-activedescendant", `ab-o${AB.idx}`);
+}
+function abChoose(i) {
+  const it = AB.items[i];
+  if (!it) return;
+  Object.assign(AB, { ty: it.t, draft: {}, bad: {}, err: "" });
+  abForm();
+  $("ab-body").querySelector("[data-ab-field]")?.focus();
+}
+/** The fields of a new block of type `t`: [field, label, kind, unit, default, group, choices]. */
+function abFields(t) {
+  const f = [["title", "Name", "text", null, "", "main"]];
+  for (const s of t.settings) f.push([`s:${s.name}`, s.name, s.kind, null, "", "main", s.choices]);
+  for (const p of t.ports.filter((q) => q.dir === "param")) f.push([`p:${p.key}`, p.label ? `${p.name} (${p.label})` : p.name, "number", p.unit, p.default, "main"]);
+  for (const p of t.ports.filter((q) => q.dir === "input")) f.push([`p:${p.key}`, p.label ? `${p.name} (${p.label})` : p.name, "number", p.unit, p.default, "inputs"]);
+  return f;
+}
+/** Step two: its name, settings and values. */
+function abForm() {
+  const t = AB.ty;
+  const field = ([field, label, kind, unit, def, , choices]) => {
+    const v = AB.draft[field] ?? "", bad = AB.bad[field];
+    const id = `ab-${field.replace(/[^\w-]/g, "_")}`;
+    const attrs = `id="${id}" data-ab-field="${esc(field)}"${bad ? ` aria-invalid="true" aria-describedby="${id}-e"` : ""}${AB.busy ? " disabled" : ""}`;
+    const input = kind === "choice" || kind === "on_off"
+      ? `<select ${attrs}><option value="">as Loxone Config places it</option>${(kind === "on_off" ? ["on", "off"] : choices).map((c) => `<option${c === v ? " selected" : ""}>${esc(c)}</option>`).join("")}</select>`
+      : `<input ${attrs} value="${esc(v)}"${kind === "number" ? ` inputmode="decimal" class="num" placeholder="${esc(def)}"` : kind === "time" ? ' class="num" placeholder="HH:MM"' : field === "title" ? ` placeholder="${esc(prettyType(t.type))}"` : ""} autocomplete="off" spellcheck="false">`;
+    return `<div class="pr ed-row"><label class="k" for="${id}">${esc(label)}</label><div class="v">${input}${unit ? `<span class="ed-unit">${esc(unit)}</span>` : ""}${bad ? `<div class="ed-bad" id="${id}-e">${esc(bad)}</div>` : ""}</div></div>`;
+  };
+  const fs = abFields(t), main = fs.filter((f) => f[5] === "main"), inputs = fs.filter((f) => f[5] === "inputs");
+  const inputsOpen = inputs.some((f) => AB.draft[f[0]] || AB.bad[f[0]]);
+  $("ab-body").innerHTML = `<div class="ab-form">
+    <div class="ab-sum"><b>${esc(prettyType(t.type))}</b> <span class="mono">${esc(t.type)}</span>${t.summary ? ` · ${esc(t.summary)}` : ""}${t.docs ? `<a href="${esc(t.docs)}" target="_blank" rel="noopener">Loxone documentation</a>` : ""}</div>
+    ${main.map(field).join("")}
+    ${inputs.length ? `<details${inputsOpen ? " open" : ""}><summary>Constants of the inputs (${inputs.length}): used until something is wired</summary>${inputs.map(field).join("")}</details>` : ""}
+    <div class="ed-bar"><button type="button" class="primary small" data-ab="add"${AB.busy ? " disabled" : ""}>${AB.busy ? "Compiling…" : "Add"}</button>
+      <button type="button" class="ed-btn small" data-ab="back"${AB.busy ? " disabled" : ""}>Other type</button>
+      <span class="ed-msg${AB.err ? " err" : ""}" role="status" aria-live="polite">${esc(AB.err || "Empty values get what Loxone Config places the block with. Adding compiles the module; nothing is deployed.")}</span></div>
+  </div>`;
+}
+$("ab-body").addEventListener("input", (e) => {
+  const f = e.target.closest("[data-ab-field]");
+  if (!f) return;
+  AB.draft[f.dataset.abField] = f.value;
+  delete AB.bad[f.dataset.abField];
+});
+$("ab-body").addEventListener("keydown", (e) => {
+  const f = e.target.closest("[data-ab-field]");
+  if (f && e.key === "Enter" && f.tagName === "INPUT") { e.preventDefault(); abAdd(); }
+  else if (f && e.key === "Escape") { e.preventDefault(); abClose(); }
+});
+$("ab-body").addEventListener("click", (e) => {
+  const b = e.target.closest("[data-ab]");
+  if (b?.dataset.ab === "add") abAdd();
+  else if (b?.dataset.ab === "back") abPick("");
+});
+$("addblk").addEventListener("mousedown", (e) => { if (e.target.id === "addblk") abClose(); });
+$("btn-add-block").onclick = abOpen;
+const AB_TIME = /^\d{1,2}:\d{2}(:\d{2})?$/;
+async function abAdd() {
+  const st = addState(), t = AB.ty;
+  if (!st?.ok || !t || AB.busy) return;
+  const op = { op: "add_block", page: st.page.uuid, type: t.type, params: {}, settings: {} }, bad = {};
+  for (const [field, , kind, , , , choices] of abFields(t)) {
+    const raw = AB.draft[field] ?? "", v = kind === "text" ? raw : raw.trim();
+    if (v === "" && !(kind === "text" && raw !== "")) continue;
+    if (kind === "number" && !EDIT_NUMBER.test(v)) { bad[field] = /,/.test(v) ? "Write a decimal point, not a comma." : "A number, like 12 or -2.5."; continue; }
+    if (kind === "time" && !AB_TIME.test(v)) { bad[field] = "A time of day, like 19:00."; continue; }
+    if (kind === "choice" && !choices.includes(v)) continue;
+    if (field === "title") { if (!v.trim()) bad[field] = "A name, or nothing."; else op.title = v; continue; }
+    const [k, key] = field.split(/:(.*)/s);
+    (k === "p" ? op.params : op.settings)[key] = v;
+  }
+  AB.bad = bad; AB.err = "";
+  if (Object.keys(bad).length) { AB.err = "Fix the marked values."; abForm(); $("ab-body").querySelector('[aria-invalid="true"]')?.focus(); return; }
+  AB.busy = true; abForm();
+  try {
+    const res = await act("/api/edit", { base: st.rev.blob, ops: [op] });
+    AB.busy = false;
+    abClose();
+    await editShowNewest(res.blob);
+    const uuid = res.added?.[0]?.uuid;
+    if (uuid && S.view?.objects[uuid]) {
+      S.edit = { uuid, open: false, draft: {}, bad: {}, busy: false, msg: "Added and compiled: pending, not deployed. Review it, then Apply or Discard.", err: "" };
+      gotoPage(st.page.uuid, { focus: uuid });
+      select(uuid);
+    }
+  } catch (err) {
+    AB.busy = false; AB.err = err.message;
+    if (AB.open) abForm();
+  }
+}
 
 // ── the Miniserver's log ───────────────────────────────────────────────
 // `lox log` on the server: the system log's last lines. What came after the last program change

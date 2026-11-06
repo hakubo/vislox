@@ -163,6 +163,14 @@ sends to the Miniserver see [miniserver.md](miniserver.md).
   not deployed says *not deployed*, with *Revert*; Discard drops them all. Blocks the module manages are edited in
   their own `.loxl`. How it works, and what comes next: [editing.md](editing.md).
 
+- **Add blocks** (the same project and token): *Add block* at the top left of a page lists the block types lox can
+  create on a page, searched by name, type and purpose, with Loxone's description. Pick one, then give it a name,
+  its settings (a Formula's text, a memory flag's type, a PulseAt's time, …) and the constants of its parameters
+  and inputs; what you leave empty gets the value Loxone Config places the block with. *Add* declares it in
+  vislox's file for the page and runs `lox logic compile`, which places the block. It shows as added in the
+  pending revision and the Changes list; its Properties edit its name and constants, and *Remove* takes it out
+  again until it is deployed.
+
 For a `lox.toml` project:
 
 ```bash

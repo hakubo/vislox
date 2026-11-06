@@ -20,6 +20,7 @@ const fixture = join(here, "../fixtures/house.Loxone");
 
 const DIV = "10000006-0000-0060-ffff504f94000001";
 const MONO = "1000000a-0000-00a0-ffff504f94000001";
+const OG = "10000008-0000-0080-ffff504f94000001";
 const KITCHEN = "30000a01-0000-0000-ffff504f94000001", BATH = "30000a02-0000-0000-ffff504f94000001";
 const root = mkdtempSync(join(tmpdir(), "vislox-edit-"));
 const dir = join(root, "project");
@@ -78,6 +79,28 @@ for (const line of src.split("\\n")) {
   const j = out.findIndex((l, n) => n > i && l.includes(\`<Co K="\${key}"\`));
   out[j] = out[j].replace(/ Def="[^"]*"/, "").replace(\`<Co K="\${key}"\`, \`<Co K="\${key}" Def="\${unq(m[3])}"\`);
 }
+// vislox's new blocks: one file per page (page "…"), a declaration per block. Each gets a UUID in the
+// lock (kept by slug across compiles) and is drawn on its page with the constants it is given.
+const lockFile = "logic.lock.json";
+const lock = fs.existsSync(lockFile) ? JSON.parse(fs.readFileSync(lockFile, "utf8")) : { objects: {} };
+const objects = {};
+let n = Object.keys(lock.objects).length;
+for (const f of fs.existsSync("pages/vislox") ? fs.readdirSync("pages/vislox") : []) {
+  if (f === "edits.loxl" || !f.endsWith(".loxl")) continue;
+  let pageAt = -1;
+  for (const line of fs.readFileSync("pages/vislox/" + f, "utf8").split("\\n")) {
+    let m;
+    if ((m = line.match(/^page "(.*)"$/))) { pageAt = out.findIndex((l) => l.includes('Type="Page"') && l.includes(\`Title="\${m[1]}"\`)); continue; }
+    if (!(m = line.match(/^(vx_\\w+) = (\\w+)\\((.*)\\)$/))) continue;
+    const [, slug, ty, rest] = m;
+    const uuid = lock.objects[slug]?.uuid || \`bbbbbbb\${++n}-0000-0000-ffff504f94000001\`;
+    objects[slug] = { uuid, type: ty };
+    const title = rest.match(/^"((?:[^"\\\\]|\\\\.)*)"/);
+    const cos = [...rest.matchAll(/(\\w+): (-?[\\d.]+)/g)].map(([, k, v], i) => \`<Co K="\${KEYS[k] || k}" Def="\${v}" U="\${uuid.slice(0, 9)}0000-00\${i}0-ffff504f94000001"/>\`);
+    out.splice(pageAt + 1, 0, \`\\t\\t\\t<C Type="\${ty}" V="178" U="\${uuid}" Title="\${xml(title ? JSON.parse('"' + title[1] + '"') : slug)}" Px="96" Py="96" Px2="1440" Py2="792" Nio="2">\${cos.join("")}</C>\`);
+  }
+}
+fs.writeFileSync(lockFile, JSON.stringify({ objects }));
 const to = process.argv.indexOf("--out");
 fs.writeFileSync(to > 0 ? process.argv[to + 1] : "out.Loxone", out.join("\\n"));
 `);
@@ -183,6 +206,63 @@ try {
     assert.deepEqual(edits[n].ops, [{ op: "param", uuid: DIV, port: "Input2", value: null }]);
     assert.doesNotMatch(readFileSync(join(dir, "pages/vislox/edits.loxl"), "utf8"), /In2/);
   });
+  await step("Add block offers the types lox can create, and checks values in the browser", async () => {
+    await page.evaluate((u) => gotoPage(u), OG);
+    await page.waitForSelector("#btn-add-block:not([disabled])");
+    await page.click("#btn-add-block");
+    await page.waitForSelector("#ab-q");
+    assert.equal(await page.textContent("#ab-page"), "on Obergeschoss");
+    // Virtual inputs are not blocks of a page.
+    await page.fill("#ab-q", "virtual in");
+    assert.doesNotMatch(await page.textContent("#ab-list"), /VirtualIn\b/);
+    await page.fill("#ab-q", "monofl");
+    assert.match(await page.textContent("#ab-list [aria-selected=true]"), /Monoflop/);
+    await page.press("#ab-q", "Enter");
+    await page.waitForSelector('#ab-body [data-ab-field="title"]');
+    const fields = await page.$$eval("#ab-body [data-ab-field]", (n) => n.map((x) => x.dataset.abField));
+    assert.ok(fields.includes("p:Time") && fields.includes("p:InputTrigger"), fields.join(" "));
+    await page.fill('#ab-body [data-ab-field="title"]', "Nachlauf");
+    await page.fill('#ab-body [data-ab-field="p:Time"]', "1,5");
+    await page.click('#ab-body [data-ab="add"]');
+    await page.waitForSelector('#ab-body [data-ab-field="p:Time"][aria-invalid="true"]');
+    assert.match(await page.textContent("#ab-body .ed-bad"), /decimal point/);
+  });
+  let added;
+  await step("adding compiles it into the pending revision, on the page, not deployed", async () => {
+    const n = edits.length;
+    await page.fill('#ab-body [data-ab-field="p:Time"]', "30");
+    await page.press('#ab-body [data-ab-field="p:Time"]', "Enter");
+    await page.waitForFunction(() => S.sel && S.view?.objects[S.sel]?.title === "Nachlauf", null, { timeout: 10000 });
+    assert.equal(await page.isVisible("#addblk"), false);
+    assert.deepEqual(edits[n].ops, [{ op: "add_block", page: OG, type: "Monoflop", title: "Nachlauf", params: { Time: "30" }, settings: {} }]);
+    added = await page.evaluate(() => S.sel);
+    assert.equal(await page.evaluate((u) => S.objPage.get(u), added), OG);
+    const file = readFileSync(join(dir, "pages/vislox/obergeschoss.loxl"), "utf8");
+    assert.match(file, /^page "Obergeschoss"$/m);
+    assert.match(file, /^vx_monoflop_1 = Monoflop\("Nachlauf", Time: 30\)$/m);
+    await page.waitForFunction(() => /added here/.test(document.querySelector("#props")?.textContent || ""));
+    assert.match(await page.textContent("#props"), /Added and compiled: pending, not deployed/);
+    await page.waitForFunction(() => /1 block added here/.test(document.querySelector("#deploy-pend")?.textContent || ""));
+    const changes = await page.$$eval(".changes .chg", (n) => n.map((x) => x.textContent).join(" | "));
+    assert.match(changes, /Nachlauf/, changes);
+  });
+  await step("a block added here is edited like any other", async () => {
+    await page.click('#props [data-ed="open"]');
+    await page.fill(field("p:Time"), "45");
+    await page.press(field("p:Time"), "Enter");
+    await page.waitForFunction((u) => S.view?.objects[u]?.ports.find((p) => p.key === "Time")?.def === "45", added, { timeout: 10000 });
+    assert.match(readFileSync(join(dir, "pages/vislox/obergeschoss.loxl"), "utf8"), /Time: 45\)$/m);
+  });
+  await step("Remove takes it out again", async () => {
+    const n = edits.length;
+    await page.click('#props [data-ed="remove"]');
+    await page.waitForFunction((u) => S.view && !S.view.objects[u], added, { timeout: 10000 });
+    assert.deepEqual(edits[n].ops, [{ op: "remove_block", uuid: added }]);
+    const file = readFileSync(join(dir, "pages/vislox/obergeschoss.loxl"), "utf8");
+    assert.match(file, /^removed vx_monoflop_1$/m);
+    assert.doesNotMatch(file, /= Monoflop/);
+    await page.waitForFunction(() => !/added here/.test(document.querySelector("#deploy-pend")?.textContent || ""));
+  });
   await step("Discard drops the edits", async () => {
     await page.click("#btn-discard");
     await page.waitForFunction(() => /Nothing pending/.test(document.querySelector("#deploy-pend")?.textContent || ""), null, { timeout: 10000 });
@@ -202,6 +282,7 @@ try {
   console.error("FAILED:", e.message);
   if (errors.length) console.error("browser errors:", errors);
   if (page) console.error("props:", await page.textContent("#props").catch(() => "?"));
+  if (page) console.error("add block:", await page.textContent("#ab-body").catch(() => "?"));
   console.error(log);
 } finally {
   await browser.close();

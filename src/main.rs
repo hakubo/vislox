@@ -4,6 +4,7 @@
 mod actions;
 mod appcalendar;
 mod backups;
+mod blocks;
 mod calendar;
 mod configdate;
 mod discover;
@@ -526,6 +527,7 @@ async fn main() -> Result<()> {
         .route("/api/discard", axum::routing::post(api_discard))
         .route("/api/edit", axum::routing::post(api_edit))
         .route("/api/edits", get(api_edits))
+        .route("/api/block-types", get(api_block_types))
         .route("/api/sync", axum::routing::post(api_sync))
         .route("/api/operate", axum::routing::post(api_operate))
         .with_state(app)
@@ -1513,6 +1515,14 @@ async fn api_edits(State(app): State<Arc<App>>) -> Response {
     .await;
     let (deployed, pending) = revs.unwrap_or((None, None));
     Json(app.actions.edits(deployed, pending).await).into_response()
+}
+
+/// The block types vislox adds on a page, and what lox knows of each (#59).
+/// The same for every project: it comes from the lox vislox is built with.
+async fn api_block_types() -> Response {
+    static TYPES: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
+    let v = tokio::task::spawn_blocking(|| TYPES.get_or_init(blocks::palette).clone()).await;
+    Json(v.unwrap_or_default()).into_response()
 }
 
 /// Tell [`actions::Actions::refresh_edit`] the deployed and the pending
