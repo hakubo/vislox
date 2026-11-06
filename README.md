@@ -42,8 +42,8 @@ Then open <http://127.0.0.1:7878>. Started without a path or `--ctx` in a direct
 - A Miniserver status chip and a preflight before Pull, Apply and Sync (right serial, FTP and web port reachable,
   config changed since the base, calendar entries changed in the app).
 - The Miniserver log and, opt-in, its Debug-Monitor.
-- For a `lox.toml` project: edit values in Properties, add blocks to a page and move the blocks the module manages,
-  then Apply, Sync and Discard from the browser.
+- For a `lox.toml` project: edit values in Properties, add blocks to a page, move the blocks the module manages and
+  draw wires, then Apply, Sync and Discard from the browser.
 - Ctrl+K to find any page or block, links that reopen a page, block and revision, and full keyboard use (`?`).
 
 Details: [docs/features.md](docs/features.md).
@@ -113,7 +113,7 @@ Opt-ins:
 |---|---|---|
 | Apply | `--admin-token-file`, then the token in the browser | `lox config push --force`: upload and program restart |
 | Sync, Discard | `--admin-token-file`, then the token | nothing; they change the project and its git repository |
-| Edit values, add and move blocks | `--admin-token-file`, then the token | nothing; vislox writes its files in the module (and positions in the lockfile) and runs `lox logic compile` |
+| Edit values, add and move blocks, draw wires | `--admin-token-file`, then the token | nothing; vislox writes its files in the module (and positions in the lockfile) and runs `lox logic compile` |
 | Operate virtual inputs | `--operate` with `--admin-token-file` | `jdev/sps/io/<uuid>/<cmd>`, only to `VirtualIn` objects, each confirmed |
 | Query blocks on this page | a toggle in the legend, off by default | read-only `jdev/sps/io/<uuid>/all`, at most 20 a second |
 | Debug-Monitor | `--monitor`, then Start | `dev/sps/log/<address>`: the Miniserver sends its debug output to vislox until Stop or the time limit |

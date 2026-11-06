@@ -166,6 +166,8 @@ pub struct PPort {
     pub def: Option<String>,
     pub inv: bool,
     pub status: &'static str,
+    /// What it carries (#61): a wire joins text only to text.
+    pub kind: Option<crate::edit::Signal>,
 }
 
 #[derive(Serialize)]
@@ -424,13 +426,7 @@ fn side_name(s: Side) -> &'static str {
     }
 }
 
-/// Loxone draws analog connections differently from digital ones; the
-/// connector key is a good tell (`AQ`, `AI`, `AQ1`, `TargetPos`, …).
-fn analog_key(key: &str) -> bool {
-    let k = key.as_bytes();
-    (k.len() >= 2 && k[0] == b'A' && (k[1] == b'Q' || k[1] == b'I'))
-        || matches!(key, "Txt" | "TQ" | "V" | "Pos" | "Value" | "Temp")
-}
+use crate::edit::analog_key;
 
 /// One document, indexed for the view.
 struct Ctx<'a> {
@@ -1312,6 +1308,7 @@ fn page_view(c: &Ctx, old: Option<&Ctx>, uuid: &str, d: &Delta, gone: bool) -> O
                 y,
                 def: pv.and_then(|v| v.def.clone()),
                 inv: pv.is_some_and(|v| v.inv),
+                kind: el.map(|e| crate::edit::signal(e, &p.key)),
                 status: if d.on && d.params.contains_key(&(g.uuid.clone(), p.key.clone())) {
                     CHANGED
                 } else {

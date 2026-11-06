@@ -741,3 +741,20 @@ rect.ghost, line.ghost { fill: #1f6fd10a; stroke: var(--moved); stroke-opacity: 
 .deploy-new .hw-dev.off .why { color: var(--removed); font-weight: 600; }
 #props .pr.pr-hw { box-shadow: inset 3px 0 0 var(--changed-dot); }
 #props .pr.pr-hw .k::after { content: " ⚙"; color: var(--changed); }
+
+/* Wires (#61): port targets, the wire being drawn, and the wire card. */
+.port-hit { fill: transparent; pointer-events: all; cursor: crosshair; }
+.port-hit:hover { fill: rgba(31, 111, 209, .18); }
+.wiring .port-hit.cand { fill: rgba(31, 111, 209, .22); }
+.wiring .port-hit.bad { fill: rgba(198, 40, 40, .12); cursor: not-allowed; }
+.wiring .port-hit.hot { stroke: var(--sel); stroke-width: 2px; vector-effect: non-scaling-stroke; }
+.wiring .port-hit.bad.hot { stroke: var(--removed); }
+.wiring, .wiring * { cursor: crosshair; }
+.wire-draft { fill: none; stroke: var(--sel); stroke-width: 2px; stroke-dasharray: 6 4; vector-effect: non-scaling-stroke; pointer-events: none; }
+.wire-draft.bad { stroke: var(--removed); }
+.wire-end { fill: #fff; stroke: var(--sel); stroke-width: 2px; vector-effect: non-scaling-stroke; cursor: grab; }
+.wcard { position: absolute; z-index: 6; max-width: 340px; background: #fff; color: var(--text); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow); padding: 8px 10px; font-size: 12px; line-height: 1.45; }
+.wcard .wc-head { font-size: 12.5px; }
+.wcard .wc-what, .wcard .wc-note { margin-top: 4px; }
+.wcard .wc-msg.err { color: var(--removed); }
+.wcard .wc-bar { display: flex; gap: 6px; justify-content: flex-end; margin-top: 8px; }

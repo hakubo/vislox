@@ -19,6 +19,12 @@ published under the same version (see [docker/README.md](docker/README.md)).
   runs `lox logic compile`; the move shows in the pending revision as *moved*, with Revert. *Arrange* lays out a
   page's managed blocks afresh (`--relayout`). Blocks Loxone Config drew, and input and output references, are
   not moved: lox writes no position for them. Never deploys (#60).
+- Draw wires: drag from a port to a port on another block (an output to an input), drag an end of a wire drawn
+  here to reconnect it, and click a wire for its card with Delete. vislox writes each wire as `to <- from` into
+  `<module>/vislox/edits.loxl` and runs `lox logic compile`; it shows in the pending revision and the Changes list
+  as added or removed, with Revert. A link Loxone Config would not have (an input to an input, text into a number,
+  an inverted input, a pair already wired) is refused with the reason. A wire Loxone Config drew cannot be taken
+  out: lox removes only the wires its source draws. Never deploys (#61).
 - Fixed: Discard failed when the last commit had no lockfile (the first compile writes one), or one was staged
   but not committed. Discard now reads the last commit, never deletes a lock vislox did not write (one not in git
   goes back to how it was before vislox's first edit), and puts everything back when a step fails.

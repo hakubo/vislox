@@ -1,5 +1,5 @@
-// Browser test for editing values in Properties: a lox.toml project with nothing pending, and a
-// stand-in lox whose `logic compile` writes the values vislox's file claims into out.Loxone. An edit
+// Browser test for editing in vislox (values, new blocks, moves, wires): a lox.toml project with nothing
+// pending, and a stand-in lox whose `logic compile` writes what vislox's files say into out.Loxone. An edit
 // must show as the pending revision, marked as not deployed, with Revert and Discard, and nothing
 // may ever be deployed: the stand-in logs every call and fails on anything but `logic compile`.
 //
@@ -21,6 +21,8 @@ const fixture = join(here, "../fixtures/house.Loxone");
 const DIV = "10000006-0000-0060-ffff504f94000001";
 const MONO = "1000000a-0000-00a0-ffff504f94000001";
 const OG = "10000008-0000-0080-ffff504f94000001";
+const EG = "10000002-0000-0020-ffff504f94000001";
+const AND = "10000004-0000-0040-ffff504f94000001", METER = "10000005-0000-0050-ffff504f94000001";
 // A block the project's module manages (in the lock as `flur`), drawn on the upper floor.
 const FLUR = "1000000b-0000-00b0-ffff504f94000001";
 const KITCHEN = "30000a01-0000-0000-ffff504f94000001", BATH = "30000a02-0000-0000-ffff504f94000001";
@@ -130,6 +132,24 @@ for (const o of Object.values(objects)) {
   const i = out.findIndex((l) => l.includes(\`U="\${o.uuid}"\`));
   const L = o.layout;
   if (i >= 0 && L) out[i] = out[i].replace(/Px="-?\\d+" Py="-?\\d+" Px2="-?\\d+" Py2="-?\\d+"/, \`Px="\${L.px}" Py="\${L.py}" Px2="\${L.px2}" Py2="\${L.py2}"\`);
+}
+// vislox's wires (to.Port <- from.Port) between the objects its externs pin: an <In> in the sink's
+// connector, from the source's connector, as lox draws it.
+const METER_KEYS = { Power: "Pf", ReadingIn: "Mr", Reset: "R", ReadingOffset: "Mro" };
+const coOf = (uuid, name) => {
+  const i = out.findIndex((l) => l.includes(\`U="\${uuid}"\`));
+  for (const k of [name, KEYS[name], METER_KEYS[name], name.replace(/^In(\\d)$/, "I$1")]) {
+    const j = out.findIndex((l, n) => n > i && l.includes(\`<Co K="\${k}"\`));
+    if (j > i && !out.slice(i + 1, j).some((l) => /<C Type=/.test(l))) return j;
+  }
+  return -1;
+};
+for (const line of src.split("\\n")) {
+  const m = line.match(/^(\\w+)\\.(\\w+) <- (\\w+)\\.(\\w+)$/);
+  if (!m) continue;
+  const to = coOf(slugs[m[1]], m[2]), from = coOf(slugs[m[3]], m[4]);
+  const srcU = out[from].match(/U="([^"]+)"/)[1];
+  out[to] = out[to].replace(/\\/>$/, \`><In Input="\${srcU}"/></Co>\`);
 }
 fs.writeFileSync(lockFile, JSON.stringify({ objects }));
 const to = process.argv.indexOf("--out");
@@ -402,6 +422,93 @@ try {
     assert.notEqual(await page.evaluate(() => S.vp[S.page].x), vx);
     assert.equal(edits.length, n);
   });
+  // Wires (#61): drawn by dragging from a port to a port, written as `to <- from` into vislox's file.
+  const portBox = async (uuid, key) => {
+    const b = await page.locator(`#canvas .port-hit[data-port="${uuid}|${key}"]`).boundingBox();
+    return [b.x + b.width / 2, b.y + b.height / 2];
+  };
+  const dragTo = async ([x0, y0], [x1, y1]) => {
+    await page.mouse.move(x0, y0);
+    await page.mouse.down();
+    await page.mouse.move((x0 + x1) / 2, (y0 + y1) / 2, { steps: 6 });
+    await page.mouse.move(x1, y1, { steps: 6 });
+    await page.mouse.up();
+  };
+  // A wire's ends as the page draws it, once the newest pending revision shows it (or not).
+  const wireShown = (from, to, there) => page.waitForFunction(([f, t, there]) => S.viewRev === S.rev && S.rev?.startsWith("pending:") && !S.wrBusy &&
+    curPage()?.wires.some((w) => w.from.join() === f.join() && w.to.join() === t.join() && w.status !== "removed") === there, [from, to, there], { timeout: 10000 });
+  /** Click a wire: its hit path, halfway along it (port targets drawn over a wire's ends may cover the
+   *  point a mouse would hit, so the click goes to the path itself, mouse down and up first). */
+  const clickWire = async (from, to) => {
+    await page.waitForFunction(() => document.querySelector("#canvas .port-hit") && !S.wrBusy, null, { timeout: 10000 });
+    await page.evaluate(([f, t]) => {
+      const line = [...document.querySelectorAll("#canvas path.wire")].find((l) => l.dataset.f === f[0] && l.dataset.t === t[0] && !l.classList.contains("d-removed"));
+      const hit = line.nextElementSibling, len = hit.getTotalLength(), pt = hit.getPointAtLength(len / 2);
+      const m = hit.getScreenCTM();
+      const at = { bubbles: true, clientX: m.a * pt.x + m.e, clientY: m.d * pt.y + m.f };
+      for (const t of ["mousedown", "mouseup", "click"]) hit.dispatchEvent(new MouseEvent(t, at));
+    }, [from, to]);
+    await page.waitForSelector("#wcard:not(.hidden) .wc-head");
+  };
+  const wireFile = () => existsSync(join(dir, "pages/vislox/edits.loxl")) ? readFileSync(join(dir, "pages/vislox/edits.loxl"), "utf8") : "";
+  let target;
+  await step("a wire is drawn by dragging from an output to an input, and shows as pending", async () => {
+    await page.evaluate(([pg, u]) => { gotoPage(pg); focusObj(u, 0.05); }, [EG, DIV]);
+    await page.waitForSelector(`#canvas .port-hit[data-port="${DIV}|AQ"]`);
+    const n = edits.length;
+    await dragTo(await portBox(DIV, "AQ"), await portBox(AND, "I2"));
+    await wireShown([DIV, "AQ"], [AND, "I2"], true);
+    assert.deepEqual(edits[n].ops, [{ op: "wire", from: [DIV, "AQ"], to: [AND, "I2"] }]);
+    assert.match(wireFile(), /^vx_10000004_0000_0040_ffff504f94000001\.In2 <- vx_10000006_0000_0060_ffff504f94000001\.AQ$/m);
+    await waitText("#deploy-pend", /1 wire drawn here/);
+    await waitText(".changes", /\+Teiler\.AQ → O1001\.In2/);
+    await page.waitForFunction(() => curPage().wires.some((w) => w.status === "added"));
+  });
+  await step("a link Loxone Config would not have is refused in the browser, with the reason", async () => {
+    const n = edits.length;
+    // The AND gate already feeds the meter.
+    await dragTo(await portBox(AND, "Q"), await portBox(METER, "Pf"));
+    await waitText("#wcard .wc-msg.err", /already wired/);
+    // An output onto an output is not even a target.
+    assert.equal(await page.locator(`#canvas .port-hit[data-port="${METER}|Pf"]`).count(), 1);
+    assert.equal(edits.length, n);
+    await page.keyboard.press("Escape");
+    await page.waitForSelector("#wcard.hidden", { state: "attached" });
+  });
+  await step("a wire Loxone Config drew says so, and offers no Delete", async () => {
+    await clickWire([AND, "Q"], [METER, "Pf"]);
+    await waitText("#wcard", /Drawn in Loxone Config/);
+    assert.equal(await page.locator('#wcard [data-wc="unwire"]').count(), 0);
+    await page.click('#wcard [data-wc="close"]');
+  });
+  await step("an end of a wire drawn here is dragged to another input: reconnected in one edit", async () => {
+    await clickWire([DIV, "AQ"], [AND, "I2"]);
+    await waitText("#wcard", /drawn here\s*not deployed/);
+    // An unwired input of the meter that the page draws.
+    target = await page.evaluate((u) => {
+      const o = curPage().objects.find((o) => o.uuid === u), wired = L.wired.get(u);
+      return o.ports.find((q) => q.side === "L" && !wired?.has(q.key)).key;
+    }, METER);
+    const n = edits.length;
+    const h = await page.locator('#canvas .wire-end[data-end="to"]').boundingBox();
+    await dragTo([h.x + h.width / 2, h.y + h.height / 2], await portBox(METER, target));
+    await wireShown([DIV, "AQ"], [METER, target], true);
+    assert.deepEqual(edits[n].ops, [
+      { op: "unwire", from: [DIV, "AQ"], to: [AND, "I2"] },
+      { op: "wire", from: [DIV, "AQ"], to: [METER, target] },
+    ]);
+    await wireShown([DIV, "AQ"], [AND, "I2"], false);
+    assert.doesNotMatch(wireFile(), /In2 <-/);
+  });
+  await step("Delete takes a wire drawn here out again", async () => {
+    await clickWire([DIV, "AQ"], [METER, target]);
+    const n = edits.length;
+    await page.keyboard.press("Delete");
+    await wireShown([DIV, "AQ"], [METER, target], false);
+    assert.deepEqual(edits[n].ops, [{ op: "unwire", from: [DIV, "AQ"], to: [METER, target] }]);
+    assert.doesNotMatch(wireFile(), /<-/);
+    await page.waitForFunction(() => !/wire/.test(document.querySelector("#deploy-pend")?.textContent || ""));
+  });
   await step("Discard drops the edits", async () => {
     await page.click("#btn-discard");
     await page.waitForFunction(() => /Nothing pending/.test(document.querySelector("#deploy-pend")?.textContent || ""), null, { timeout: 10000 });
@@ -422,6 +529,7 @@ try {
   if (errors.length) console.error("browser errors:", errors);
   if (page) console.error("props:", await page.textContent("#props").catch(() => "?"));
   if (page) console.error("add block:", await page.textContent("#ab-body").catch(() => "?"));
+  if (page) console.error("wire card:", await page.textContent("#wcard").catch(() => "?"), "| deploy:", await page.textContent("#deploy-msg").catch(() => "?"));
   console.error(log);
 } finally {
   await browser.close();
