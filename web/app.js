@@ -643,7 +643,9 @@ function wrapWords(text, n, max) {
 function portName(o, key) { return o?.ports.find((q) => q.key === key)?.name || key; }
 
 function wrapObj(parent, o, cls) {
-  const g = el("g", { class: `${cls}${o.status ? " d-" + o.status : ""}${o.moved_to ? " ghosted" : ""}${o.uuid === S.sel ? " sel" : ""}`, "data-uuid": o.moved_to ? "" : o.uuid }, parent);
+  const movable = !o.moved_to && !!moveState(o.uuid);
+  const g = el("g", { class: `${cls}${o.status ? " d-" + o.status : ""}${o.moved_to ? " ghosted" : ""}${o.uuid === S.sel ? " sel" : ""}${movable ? " movable" : ""}`, "data-uuid": o.moved_to ? "" : o.uuid }, parent);
+  if (movable) g.addEventListener("mousedown", (e) => mvStart(e, o));
   g.addEventListener("click", (e) => {
     e.stopPropagation();
     if (drag?.moved) return;
@@ -1201,6 +1203,7 @@ $("props").addEventListener("click", (e) => {
     else if (what === "cancel") editClose();
     else if (what === "revert") editRevert(eb.dataset.key);
     else if (what === "remove") editRemove(S.sel);
+    else if (what === "unmove") mvRevert(S.sel);
     else if (what === "newest") editGoNewest();
     return;
   }
@@ -1616,6 +1619,7 @@ window.addEventListener("keydown", (e) => {
   if ((e.ctrlKey || e.metaKey) && e.key === "f") { e.preventDefault(); $("tree-filter").focus(); $("tree-filter").select(); return; }
   const tag = e.target.tagName;
   if (tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA") { if (e.key === "Escape") e.target.blur(); return; }
+  if (e.altKey && !e.ctrlKey && !e.metaKey && MV_KEYS[e.key] && mvNudge(MV_KEYS[e.key], e.shiftKey ? 10 : 1)) { e.preventDefault(); return; }
   if (e.ctrlKey || e.metaKey || e.altKey) return;
   const inTree = e.target.id === "tree", inTabs = e.target.closest?.("#tab-list");
   // The Operating modes view takes the arrows (years) and Esc; the hidden page is not panned or zoomed.
@@ -1954,6 +1958,7 @@ function editsHere() {
   const parts = [];
   if (editsPending().length) parts.push(`${plural(editsPending().length, "value")} edited here`);
   if (editsAdded().length) parts.push(`${plural(editsAdded().length, "block")} added here`);
+  if (editsMoved().length) parts.push(`${plural(editsMoved().length, "block")} moved here`);
   return parts.length ? ` They include ${parts.join(" and ")}.` : "";
 }
 /** The newest compile, if it differs from what is deployed. */
@@ -2399,7 +2404,7 @@ function editState(o) {
   const a = S.hist?.actions;
   if (!a?.shown || !o.edit) return null;
   if (!a.edit?.available) return { why: `Editing is off: ${a.edit?.reason || "unknown"}.` };
-  if (S.edits?.managed?.includes(o.uuid)) return { why: "The project's module manages this block: change it in its .loxl file." };
+  if (S.edits?.managed?.includes(o.uuid)) return { why: "The project's module manages this block: change its values in its .loxl file." };
   const r = editRev();
   if (!r) return { why: "The config on disk is not in the History yet." };
   if (S.rev !== r.id) return { why: `Edits are made on the newest config (${r.kind === "pending" ? "Pending" : "deployed"}).`, newest: r };
@@ -2434,9 +2439,10 @@ function editFields(o) {
   return f;
 }
 function editRows(o, row) {
+  const mv = moveRows(o, row);
   const st = editState(o);
-  if (!st) return null;
-  const rows = [];
+  if (!st) return mv.rows.length ? mv : null;
+  const rows = [...mv.rows];
   const mine = S.edit.uuid === o.uuid ? S.edit : null;
   // A block added here and not deployed: Remove takes it out again.
   for (const b of editsAdded(o.uuid)) {
@@ -2471,7 +2477,7 @@ function editRows(o, row) {
       `<button type="button" class="ed-btn small" data-ed="cancel"${mine.busy ? " disabled" : ""}>Cancel</button>` +
       `<span class="ed-msg${mine.err ? " err" : ""}" role="status" aria-live="polite">${esc(mine.err || mine.msg || "Saving compiles the module; nothing is deployed.")}</span></div>`);
   }
-  return { rows, count: editsPending(o.uuid).length + editsAdded(o.uuid).length };
+  return { rows, count: editsPending(o.uuid).length + editsAdded(o.uuid).length + mv.count };
 }
 function editOpen(uuid) {
   S.edit = { uuid, open: true, draft: {}, bad: {}, busy: false, msg: "", err: "" };
@@ -2548,6 +2554,162 @@ async function editShowNewest(blob) {
 }
 function editGoNewest() { S.follow = true; $("chk-follow").checked = true; editShowNewest(); }
 
+// ── moving blocks (#60) ────────────────────────────────────────────────
+// A block the project's module manages is moved by dragging it (or Alt + an arrow key), snapped to
+// Loxone Config's grid; its wires follow. lox keeps such a block's position in the lockfile, so the
+// server writes it there and compiles (docs/editing.md): the move shows as the pending revision, marked
+// "moved", with Revert. lox writes no position for a block Loxone Config drew: those stay put.
+// "Arrange" lays out the page's managed blocks afresh (lox logic compile --relayout).
+const GRID = 96; // Loxone Config snaps positions to multiples of 96 on save
+const MV_KEYS = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] };
+let MV = null; // the move being dragged or nudged: { uuid, orig, wires, labels, dx, dy, … }
+S.mvBusy = false;
+/** The blocks moved here and not deployed yet, or the one with UUID `uuid`; not those added here, which are new as a whole. */
+function editsMoved(uuid) { return (S.edits?.moves || []).filter((m) => (!uuid || m.uuid === uuid) && !editsAdded(m.uuid).length); }
+/** Whether the block `uuid` can be moved now: `{ rev }`, else null. */
+function moveState(uuid) {
+  const a = S.hist?.actions;
+  if (!a?.shown || !a.edit?.available || a.running || MD.open || S.mvBusy) return null;
+  if (!S.edits?.movable?.includes(uuid)) return null;
+  const r = editRev();
+  return r && S.rev === r.id ? { rev: r } : null;
+}
+/** The blocks of page `p` that lox can move. */
+function mvOnPage(p) { return p.objects.filter((o) => !o.moved_to && S.edits?.movable?.includes(o.uuid)); }
+const snapG = (v) => Math.round(v / GRID) * GRID;
+/** Begin moving `o`: keep where it and its wires are, to draw them shifted. */
+function mvBegin(o) {
+  const p = curPage();
+  const cp = (v) => JSON.parse(JSON.stringify(v));
+  MV = {
+    uuid: o.uuid, page: S.page, dx: 0, dy: 0,
+    orig: { rect: [...o.rect], ports: cp(o.ports) },
+    wires: p.wires.filter((w) => w.from[0] === o.uuid || w.to[0] === o.uuid).map((w) => [w, cp(w.points)]),
+    labels: p.labels.filter((l) => l.obj === o.uuid).map((l) => [l, l.x, l.y]),
+  };
+}
+/** Draw the block shifted by (dx, dy), its wires following: a wire leaves it straight, then turns halfway. */
+function mvShift(dx, dy) {
+  const o = curPage()?.objects.find((x) => x.uuid === MV.uuid && !x.moved_to);
+  if (!o || S.page !== MV.page) return;
+  MV.dx = dx; MV.dy = dy;
+  o.rect = [MV.orig.rect[0] + dx, MV.orig.rect[1] + dy, MV.orig.rect[2], MV.orig.rect[3]];
+  o.ports.forEach((q, i) => { q.x = MV.orig.ports[i].x + dx; q.y = MV.orig.ports[i].y + dy; });
+  for (const [w, pts] of MV.wires) {
+    const a = [...pts[0]], b = [...pts[pts.length - 1]];
+    if (w.from[0] === MV.uuid) { a[0] += dx; a[1] += dy; }
+    if (w.to[0] === MV.uuid) { b[0] += dx; b[1] += dy; }
+    const mx = snapG((a[0] + b[0]) / 2);
+    w.points = dx || dy ? [a, [mx, a[1]], [mx, b[1]], b] : pts;
+  }
+  for (const [l, x, y] of MV.labels) { l.x = x + dx; l.y = y + dy; }
+  renderPage();
+}
+function mvStart(e, o) {
+  if (e.button !== 0) return;
+  const st = moveState(o.uuid);
+  if (!st) return;
+  e.stopPropagation();
+  e.preventDefault();
+  if (MV) return;
+  mvBegin(o);
+  Object.assign(MV, { x0: e.clientX, y0: e.clientY, k: S.vp[S.page]?.k || 1, dragging: true, moved: false });
+  svg.classList.add("moving");
+  hideTip();
+}
+window.addEventListener("mousemove", (e) => {
+  if (!MV?.dragging) return;
+  const mx = e.clientX - MV.x0, my = e.clientY - MV.y0;
+  if (!MV.moved && Math.abs(mx) + Math.abs(my) <= 3) return;
+  MV.moved = true;
+  const dx = snapG(MV.orig.rect[0] + mx / MV.k) - MV.orig.rect[0], dy = snapG(MV.orig.rect[1] + my / MV.k) - MV.orig.rect[1];
+  if (dx !== MV.dx || dy !== MV.dy) mvShift(dx, dy);
+});
+window.addEventListener("mouseup", () => {
+  if (!MV?.dragging) return;
+  svg.classList.remove("moving");
+  const m = MV;
+  m.dragging = false;
+  // A drag is not a click on the block.
+  if (m.moved) drag = { moved: true };
+  if (!m.moved) { MV = null; return; }
+  // Selected, as in Loxone Config: Properties shows the move, or why lox refused it.
+  if (S.sel !== m.uuid) select(m.uuid, { noReveal: true });
+  mvSend(m);
+});
+/** Alt + an arrow key: move the selected block a grid step (Shift: ten), sent once the keys rest. */
+function mvNudge([sx, sy], n) {
+  const o = S.sel && curPage()?.objects.find((x) => x.uuid === S.sel && !x.moved_to);
+  if (!o || (MV && (MV.dragging || MV.uuid !== o.uuid)) || (!MV && !moveState(o.uuid))) return false;
+  if (!MV) mvBegin(o);
+  clearTimeout(MV.timer);
+  mvShift(MV.dx + sx * n * GRID, MV.dy + sy * n * GRID);
+  MV.timer = setTimeout(() => mvSend(MV), 600);
+  return true;
+}
+/** Put the block back where the page had it. */
+function mvUndo(m) {
+  if (MV === m) MV = null;
+  const o = S.pageOf.get(m.page)?.objects.find((x) => x.uuid === m.uuid && !x.moved_to);
+  if (!o) return;
+  o.rect = m.orig.rect; o.ports.forEach((q, i) => { q.x = m.orig.ports[i].x; q.y = m.orig.ports[i].y; });
+  for (const [w, pts] of m.wires) w.points = pts;
+  for (const [l, x, y] of m.labels) { l.x = x; l.y = y; }
+  if (S.page === m.page) renderPage();
+}
+/** Send the move; the block stays where it was dropped while lox compiles. */
+async function mvSend(m) {
+  if (MV !== m) return;
+  const st = moveState(m.uuid);
+  if (!st || (!m.dx && !m.dy)) { mvUndo(m); return; }
+  MV = null;
+  await mvEdit(m.uuid, st.rev, [{ op: "move", uuid: m.uuid, x: m.orig.rect[0] + m.dx, y: m.orig.rect[1] + m.dy }], () => mvUndo(m));
+}
+/** Send move or relayout ops: the reply's pending revision is shown, a refusal in Properties. */
+async function mvEdit(uuid, rev, ops, undo) {
+  S.mvBusy = true; renderAddHud();
+  try {
+    if (uuid) await editSend(uuid, rev, ops);
+    else {
+      const res = await act("/api/edit", { base: rev.blob, ops });
+      deployMsg("Laid out and compiled: pending, not deployed. Review it, then Apply or Discard.");
+      await editShowNewest(res.blob);
+    }
+  } catch (err) {
+    deployMsg(err.message, true);
+  } finally {
+    S.mvBusy = false;
+    renderAddHud();
+  }
+  if (uuid && S.edit.err) undo?.();
+}
+/** Back to where it is deployed. */
+async function mvRevert(uuid) {
+  const m = editsMoved(uuid)[0], st = m && moveState(uuid);
+  if (!st) return;
+  await mvEdit(uuid, st.rev, [{ op: "move", uuid, x: m.deployed[0], y: m.deployed[1] }]);
+}
+/** "Arrange": lay out the page's managed blocks afresh. */
+async function mvRelayout() {
+  const st = addState();
+  if (!st?.ok || S.mvBusy || !mvOnPage(st.page).length) return;
+  await mvEdit(null, st.rev, [{ op: "relayout", page: st.page.uuid }]);
+}
+$("btn-relayout").onclick = mvRelayout;
+/** The Position rows of Properties: a move not deployed, with Revert; how to move a block. */
+function moveRows(o, row) {
+  const out = { rows: [], count: 0 };
+  if (!S.edits?.movable?.includes(o.uuid) || !S.hist?.actions?.edit?.available) return out;
+  const st = moveState(o.uuid), m = editsMoved(o.uuid)[0];
+  if (m) {
+    out.count = 1;
+    out.rows.push(row("Position", `<span class="ed-v">moved</span><span class="ed-tag" title="Saved into the module's lockfile and compiled, not on the Miniserver yet: Apply deploys it, Discard drops it">not deployed</span>` +
+      (st ? '<button type="button" class="ed-btn small" data-ed="unmove" title="Back to where it is deployed">Revert</button>' : ""), "pr-chg"));
+  }
+  if (st && o.page === S.page) out.rows.push('<div class="ed-note">Drag the block on the page to move it, or press Alt and an arrow key (with Shift: ten steps). It snaps to Loxone Config\'s grid.</div>');
+  return out;
+}
+
 // ── adding blocks (#59) ────────────────────────────────────────────────
 // “Add block” on the page picks a type lox can create (GET /api/block-types), then its name and values.
 // The server declares it in a file of vislox's own for the page (<module>/vislox/<page>.loxl) and runs
@@ -2568,11 +2730,16 @@ function addState() {
   return { ok: true, rev: r, page: pg };
 }
 function renderAddHud() {
-  const st = addState(), b = $("btn-add-block");
+  const st = addState(), b = $("btn-add-block"), r = $("btn-relayout");
   $("hud-add").classList.toggle("hidden", !st);
   if (!st) return;
   b.disabled = !st.ok;
   b.title = st.ok ? `Add a block to ${st.page.title || "this page"} (it is compiled, not deployed)` : st.why;
+  const n = st.ok ? mvOnPage(st.page).length : 0;
+  r.disabled = !st.ok || !n || S.mvBusy;
+  r.title = !st.ok ? st.why
+    : !n ? "lox lays out only the blocks the project's module manages, and this page has none"
+    : `Lay out the ${plural(n, "block")} the module manages on this page afresh, as lox places new blocks (it is compiled, not deployed)`;
 }
 async function abOpen() {
   const st = addState();

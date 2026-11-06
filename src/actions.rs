@@ -1221,7 +1221,22 @@ impl Actions {
             let _ = std::fs::remove_dir(&dir_path);
         }
         edit::check_module(&p.module).map_err(bad)?;
-        run(&self.s.lox, &["logic", "compile"], dir, COMPILE_TIMEOUT)
+        // A move goes into the lockfile, where lox keeps a managed block's
+        // position (docs/editing.md); Undo puts the lock back on failure.
+        let place = &files.layout;
+        if !place.moves.is_empty() {
+            let shown_lock = p.lock.strip_prefix(&p.root).unwrap_or(&p.lock).display();
+            let bytes = std::fs::read(&p.lock)
+                .map_err(|e| fail(format!("cannot read {shown_lock}: {e}")))?;
+            let moved = edit::write_moves(&bytes, &base, &place.moves).map_err(bad)?;
+            std::fs::write(&p.lock, moved)
+                .map_err(|e| fail(format!("cannot write {shown_lock}: {e}")))?;
+        }
+        let mut args = vec!["logic", "compile"];
+        for title in &place.relayout {
+            args.extend(["--relayout", title.as_str()]);
+        }
+        run(&self.s.lox, &args, dir, COMPILE_TIMEOUT)
             .await
             .map_err(|e| {
                 bad(format!(
@@ -1239,6 +1254,20 @@ impl Actions {
             })?;
         // The UUIDs lox minted for the new blocks.
         let lock = edit::Lock::read(&p.lock);
+        // A move lox did not keep is refused, not shown as done. A page laid
+        // out afresh places its blocks anew, moved or not.
+        if !place.moves.is_empty() && place.relayout.is_empty() {
+            let out = std::fs::read(&p.out)
+                .map_err(|e| fail(e.to_string()))
+                .and_then(|b| edit::parse_doc(&b).map_err(fail))?;
+            let missed = edit::moves_missed(&out, &lock, &place.moves);
+            if !missed.is_empty() {
+                return Err(fail(format!(
+                    "lox logic compile did not keep the new position of {}",
+                    missed.join(", ")
+                )));
+            }
+        }
         let added: Vec<Value> = added
             .iter()
             .map(|s| json!({ "slug": s, "uuid": lock.uuid_of(s) }))
@@ -1425,6 +1454,24 @@ impl Actions {
             .map(|(_, u)| u.clone())
             .collect();
         managed.sort();
+        // The blocks lox can move (#60): those it manages that are drawn on a
+        // page, and of them those the pending config draws elsewhere than the
+        // deployed one, on the same page.
+        let mut movable: Vec<&str> = lock.placed.keys().filter_map(|s| lock.uuid_of(s)).collect();
+        movable.sort();
+        let moves: Vec<Value> = match (&pending_doc, &deployed_doc) {
+            (Some(pd), Some(dd)) => movable
+                .iter()
+                .filter_map(|u| {
+                    let (now_page, now) = edit::drawn_at(pd, u)?;
+                    let (was_page, was) = edit::drawn_at(dd, u)?;
+                    ((now_page == was_page) && (now.px, now.py) != (was.px, was.py)).then(|| {
+                        json!({ "uuid": u, "x": now.px, "y": now.py, "deployed": [was.px, was.py] })
+                    })
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
         let blocks: Vec<Value> = now
             .pages
             .iter()
@@ -1453,6 +1500,8 @@ impl Actions {
             "claims": claims,
             "blocks": blocks,
             "managed": managed,
+            "movable": movable,
+            "moves": moves,
         })
     }
 
@@ -2356,6 +2405,138 @@ echo "{\"objects\":{$objs}}" > logic.lock.json
         let calls = std::fs::read_to_string(tmp.path().join("calls.log")).unwrap();
         assert!(
             calls.lines().all(|l| l.starts_with("logic compile")),
+            "{calls}"
+        );
+    }
+
+    /// A stand-in lox for moves: it draws the Divide block, which the
+    /// module manages (as `teiler`), where the lock's `layout` puts it, and
+    /// keeps what it was handed. It does not keep a block put at x 9600, and
+    /// `--relayout` puts it at the page's corner.
+    #[cfg(unix)]
+    fn lox_that_places(tmp: &Path) {
+        std::fs::write(
+            tmp.join("lox"),
+            r#"#!/bin/sh
+echo "$*" >> ../calls.log
+[ "$1 $2" = "logic compile" ] || { echo "unexpected: $*" >&2; exit 2; }
+cp logic.lock.json ../lock-seen.json
+px=$(sed -n '/"layout"/,/}/s/.*"px": \(-\{0,1\}[0-9]*\).*/\1/p' logic.lock.json | head -1)
+py=$(sed -n '/"layout"/,/}/s/.*"py": \(-\{0,1\}[0-9]*\).*/\1/p' logic.lock.json | head -1)
+case "$*" in *--relayout*) px=96; py=96 ;; esac
+[ "$px" = 9600 ] && px=4032
+sed '/U="10000006-0000-0060-ffff504f94000001"/s/Px="[0-9-]*" Py="[0-9-]*"/Px="'"$px"'" Py="'"$py"'"/' base.Loxone > out.Loxone
+"#,
+        )
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_managed_block_is_moved_in_the_lock_never_deployed() {
+        use axum::http::StatusCode;
+        let (tmp, a) = project_for_edits();
+        lox_that_places(tmp.path());
+        let d = tmp.path().join("project");
+        const EG: &str = "10000002-0000-0020-ffff504f94000001";
+        std::fs::write(d.join("pages/main.loxl"), "# the module\n").unwrap();
+        let lock = format!(
+            r#"{{"objects":{{"teiler":{{"uuid":"{DIV}","type":"Div","page_uuid":"{EG}","layout":{{"px":4032,"py":2880,"px2":5376,"py2":3576}}}}}}}}"#
+        );
+        std::fs::write(d.join("logic.lock.json"), &lock).unwrap();
+        // Compiled after the module's files: nothing uncompiled.
+        let base = std::fs::read(d.join("base.Loxone")).unwrap();
+        std::fs::write(d.join("out.Loxone"), base).unwrap();
+        sh(&d, "git add -A && git commit -qm managed");
+        let req = |ops: Vec<edit::Op>| edit::Request {
+            base: blob(&d, "out.Loxone"),
+            ops,
+        };
+        let mv = |x, y| edit::Op::Move {
+            uuid: DIV.into(),
+            x,
+            y,
+        };
+        let e = edits_of(&a, &d).await;
+        assert_eq!(
+            (&e["movable"], &e["moves"]),
+            (&json!([DIV]), &json!([])),
+            "{e}"
+        );
+
+        // Snapped to the grid; the position the base still draws is
+        // superseded, so lox keeps the new one. vislox's files stay as they were.
+        let r = a.edit(&req(vec![mv(1930, 1000)]), None).await.unwrap();
+        assert_eq!(
+            r["previous"],
+            json!([{ "op": "move", "uuid": DIV, "x": 4032, "y": 2880 }])
+        );
+        let seen: Value =
+            serde_json::from_slice(&std::fs::read(tmp.path().join("lock-seen.json")).unwrap())
+                .unwrap();
+        let t = &seen["objects"]["teiler"];
+        assert_eq!(
+            (&t["layout"], &t["superseded_layout"]),
+            (
+                &json!({ "px": 1920, "py": 960, "px2": 3264, "py2": 1656 }),
+                &json!({ "px": 4032, "py": 2880, "px2": 5376, "py2": 3576 })
+            )
+        );
+        assert!(!d.join("pages/vislox").exists());
+        let out = std::fs::read_to_string(d.join("out.Loxone")).unwrap();
+        assert!(out.contains(r#"Title="O1002" Px="1920" Py="960""#));
+        let e = edits_of(&a, &d).await;
+        assert_eq!(
+            e["moves"],
+            json!([{ "uuid": DIV, "x": 1920, "y": 960, "deployed": [4032, 2880] }])
+        );
+
+        // Back where it is deployed: nothing superseded, nothing moved.
+        a.edit(&req(vec![mv(4032, 2880)]), None).await.unwrap();
+        let seen: Value =
+            serde_json::from_slice(&std::fs::read(tmp.path().join("lock-seen.json")).unwrap())
+                .unwrap();
+        assert_eq!(seen["objects"]["teiler"].get("superseded_layout"), None);
+        assert_eq!(edits_of(&a, &d).await["moves"], json!([]));
+
+        // A move lox does not keep is refused, and the lock and out are put back.
+        let (lock_before, out_before) = (
+            std::fs::read(d.join("logic.lock.json")).unwrap(),
+            std::fs::read(d.join("out.Loxone")).unwrap(),
+        );
+        let (code, msg) = a.edit(&req(vec![mv(9600, 0)]), None).await.unwrap_err();
+        assert_eq!(code, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            msg.contains("did not keep the new position of teiler"),
+            "{msg}"
+        );
+        assert_eq!(
+            std::fs::read(d.join("logic.lock.json")).unwrap(),
+            lock_before
+        );
+        assert_eq!(std::fs::read(d.join("out.Loxone")).unwrap(), out_before);
+
+        // Laid out afresh: lox is asked by the page's title; previous moves it back.
+        let r = a
+            .edit(&req(vec![edit::Op::Relayout { page: EG.into() }]), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            r["previous"],
+            json!([[{ "op": "move", "uuid": DIV, "x": 4032, "y": 2880 }]])
+        );
+        // Only compiles: nothing was deployed.
+        let calls = std::fs::read_to_string(tmp.path().join("calls.log")).unwrap();
+        assert!(
+            calls.lines().all(|l| l.starts_with("logic compile")),
+            "{calls}"
+        );
+        assert!(
+            calls
+                .lines()
+                .last()
+                .unwrap()
+                .ends_with("--relayout Erdgeschoss"),
             "{calls}"
         );
     }

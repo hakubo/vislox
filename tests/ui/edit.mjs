@@ -21,6 +21,8 @@ const fixture = join(here, "../fixtures/house.Loxone");
 const DIV = "10000006-0000-0060-ffff504f94000001";
 const MONO = "1000000a-0000-00a0-ffff504f94000001";
 const OG = "10000008-0000-0080-ffff504f94000001";
+// A block the project's module manages (in the lock as `flur`), drawn on the upper floor.
+const FLUR = "1000000b-0000-00b0-ffff504f94000001";
 const KITCHEN = "30000a01-0000-0000-ffff504f94000001", BATH = "30000a02-0000-0000-ffff504f94000001";
 const root = mkdtempSync(join(tmpdir(), "vislox-edit-"));
 const dir = join(root, "project");
@@ -33,6 +35,11 @@ const base = readFileSync(fixture, "utf8").replace('<Co K="Q" U="10000009-0000-0
 \t\t\t\t<Co K="InputTrigger" U="1000000a-0000-00a1-00ff504f94000001"/>
 \t\t\t\t<Co K="Time" Def="2" U="1000000a-0000-00a2-01ff504f94000001"/>
 \t\t\t\t<Co K="Q" U="1000000a-0000-00a3-02ff504f94000001"/>
+\t\t\t</C>
+\t\t\t<C Type="And" V="178" U="${FLUR}" Title="Flur" Px="7104" Py="2880" Px2="8448" Py2="3576" Cl="141,255,112" Nio="3" WF="16384">
+\t\t\t\t<Co K="I1" U="1000000b-0000-00b1-00ff504f94000001"/>
+\t\t\t\t<Co K="I2" U="1000000b-0000-00b2-01ff504f94000001"/>
+\t\t\t\t<Co K="Q" U="1000000b-0000-00b3-02ff504f94000001"/>
 \t\t\t</C>`)
   // Two rooms; the Divide block is shown in the app, in the kitchen.
   .replace('\t\t<C Type="Page" V="178" U="10000002', `\t\t<C Type="Place" V="178" U="${KITCHEN}" Title="Küche"/>
@@ -43,12 +50,18 @@ writeFileSync(join(dir, "base.Loxone"), base);
 writeFileSync(join(dir, "out.Loxone"), base);
 writeFileSync(join(dir, "lox.toml"), 'base = "base.Loxone"\nmodule = "pages"\nout = "out.Loxone"\n');
 writeFileSync(join(dir, "pages", "README"), "the module\n");
+writeFileSync(join(dir, "pages", "flur.loxl"), "# The module's own source (the stand-in lox reads only vislox's files).\n");
+const FLUR_AT = { px: 7104, py: 2880, px2: 8448, py2: 3576 };
+writeFileSync(join(dir, "logic.lock.json"), JSON.stringify({ objects: { flur: { uuid: FLUR, type: "And", page_uuid: OG, layout: FLUR_AT } } }));
+// Compiled after the module's files: nothing is uncompiled.
+writeFileSync(join(dir, "out.Loxone"), base);
 git("init", "-q");
 git("add", "-A");
 git("commit", "-q", "-m", "Deployed");
 
 // The stand-in lox. `logic compile` reads vislox's claims (extern …(uuid: "…"), x.title = "…",
-// x.Port = n) and writes them into a copy of the base, as lox would.
+// x.Port = n) and writes them into a copy of the base, as lox would. It draws every block of the lock
+// where its `layout` says, and `--relayout <page>` lines that page's blocks up along the top.
 const loxDir = mkdtempSync(join(tmpdir(), "vislox-lox-"));
 const calls = join(loxDir, "calls.log");
 const fakeLox = join(loxDir, "lox");
@@ -94,11 +107,29 @@ for (const f of fs.existsSync("pages/vislox") ? fs.readdirSync("pages/vislox") :
     if (!(m = line.match(/^(vx_\\w+) = (\\w+)\\((.*)\\)$/))) continue;
     const [, slug, ty, rest] = m;
     const uuid = lock.objects[slug]?.uuid || \`bbbbbbb\${++n}-0000-0000-ffff504f94000001\`;
-    objects[slug] = { uuid, type: ty };
+    const page_uuid = out[pageAt].match(/U="([^"]+)"/)[1];
+    objects[slug] = { uuid, type: ty, page_uuid, layout: lock.objects[slug]?.layout || { px: 96, py: 96, px2: 1440, py2: 792 } };
     const title = rest.match(/^"((?:[^"\\\\]|\\\\.)*)"/);
     const cos = [...rest.matchAll(/(\\w+): (-?[\\d.]+)/g)].map(([, k, v], i) => \`<Co K="\${KEYS[k] || k}" Def="\${v}" U="\${uuid.slice(0, 9)}0000-00\${i}0-ffff504f94000001"/>\`);
     out.splice(pageAt + 1, 0, \`\\t\\t\\t<C Type="\${ty}" V="178" U="\${uuid}" Title="\${xml(title ? JSON.parse('"' + title[1] + '"') : slug)}" Px="96" Py="96" Px2="1440" Py2="792" Nio="2">\${cos.join("")}</C>\`);
   }
+}
+// The blocks the rest of the module manages stay in the lock.
+for (const [s, o] of Object.entries(lock.objects)) if (!s.startsWith("vx_")) objects[s] = o;
+const relayout = process.argv.flatMap((a, i) => process.argv[i - 1] === "--relayout" ? [a] : []);
+let col = 0;
+for (const o of Object.values(objects)) {
+  const pg = out.find((l) => l.includes('Type="Page"') && l.includes(\`U="\${o.page_uuid}"\`));
+  if (!pg || !relayout.some((t) => pg.includes(\`Title="\${t}"\`))) continue;
+  const w = o.layout.px2 - o.layout.px, h = o.layout.py2 - o.layout.py;
+  const x = 9600 + 1920 * col++;
+  o.superseded_layout = o.layout;
+  o.layout = { px: x, py: 960, px2: x + w, py2: 960 + h };
+}
+for (const o of Object.values(objects)) {
+  const i = out.findIndex((l) => l.includes(\`U="\${o.uuid}"\`));
+  const L = o.layout;
+  if (i >= 0 && L) out[i] = out[i].replace(/Px="-?\\d+" Py="-?\\d+" Px2="-?\\d+" Py2="-?\\d+"/, \`Px="\${L.px}" Py="\${L.py}" Px2="\${L.px2}" Py2="\${L.py2}"\`);
 }
 fs.writeFileSync(lockFile, JSON.stringify({ objects }));
 const to = process.argv.indexOf("--out");
@@ -264,6 +295,87 @@ try {
     assert.match(file, /^removed vx_monoflop_1$/m);
     assert.doesNotMatch(file, /= Monoflop/);
     await page.waitForFunction(() => !/added here/.test(document.querySelector("#deploy-pend")?.textContent || ""));
+  });
+  // Moving (#60): lox keeps a managed block's position in the lock; vislox writes it there and compiles.
+  const flurNow = () => page.evaluate((u) => curPage()?.objects.find((o) => o.uuid === u && !o.moved_to), FLUR);
+  const flurLock = () => JSON.parse(readFileSync(join(dir, "logic.lock.json"), "utf8")).objects.flur;
+  // A newer pending revision than `since`, once it is shown and draws the block at `x`, marked moved or not
+  // (while a move is sent, the page already draws the block where it was dropped).
+  const rev = () => page.evaluate(() => S.rev);
+  const flurAt = (since, x, moved) => page.waitForFunction(([u, since, x, moved]) => {
+    const o = curPage()?.objects.find((o) => o.uuid === u && !o.moved_to);
+    return S.rev !== since && S.viewRev === S.rev && S.rev?.startsWith("pending:") && !MV && !S.mvBusy &&
+      o?.rect[0] === x && (o.status === "moved") === moved;
+  }, [FLUR, since, x, moved], { timeout: 10000 });
+  let moved;
+  await step("a block the module manages is dragged on the page, snapped to the grid, and shows as moved", async () => {
+    // In the middle of the canvas, where nothing covers it.
+    await page.evaluate(([pg, u]) => { gotoPage(pg); focusObj(u, 0.05); }, [OG, FLUR]);
+    const g = page.locator(`#canvas g.movable[data-uuid="${FLUR}"]`).first();
+    await g.waitFor();
+    const n = edits.length, r0 = await rev();
+    const box = await g.boundingBox();
+    const [cx, cy] = [box.x + box.width / 2, box.y + box.height / 2];
+    await page.mouse.move(cx, cy);
+    await page.mouse.down();
+    await page.mouse.move(cx + 80, cy + 50, { steps: 8 });
+    await page.mouse.up();
+    await page.waitForFunction((k) => document.querySelectorAll("#props .ed-tag").length > 0 && S.sel === k, FLUR, { timeout: 10000 });
+    assert.equal(edits.length, n + 1);
+    const op = edits[n].ops[0];
+    assert.equal(op.op, "move");
+    assert.equal(op.uuid, FLUR);
+    assert.ok(op.x % 96 === 0 && op.y % 96 === 0 && (op.x !== 7104 || op.y !== 2880), JSON.stringify(op));
+    moved = op;
+    await flurAt(r0, op.x, true);
+    assert.equal((await flurNow()).rect[1], op.y);
+    // In the lock, with the position the base still draws superseded; vislox's files claim nothing of it.
+    const l = flurLock();
+    assert.deepEqual([l.layout.px, l.layout.py, l.layout.px2 - l.layout.px], [op.x, op.y, 8448 - 7104]);
+    assert.equal(l.superseded_layout.px, 7104);
+    assert.doesNotMatch(readFileSync(join(dir, "pages/vislox/edits.loxl"), "utf8"), /1000000b/);
+    await waitText("#props", /Position\s*moved\s*not deployed/);
+    await waitText("#deploy-pend", /1 block moved here/);
+    await page.waitForSelector("#canvas .ghost");
+  });
+  await step("Alt and an arrow key nudge it one grid step", async () => {
+    const n = edits.length, r0 = await rev();
+    await page.keyboard.press("Alt+ArrowRight");
+    await flurAt(r0, moved.x + 96, true);
+    assert.equal(edits.length, n + 1);
+    assert.deepEqual(edits[n].ops, [{ op: "move", uuid: FLUR, x: moved.x + 96, y: moved.y }]);
+  });
+  await step("Revert puts it back where it is deployed", async () => {
+    const n = edits.length, r0 = await rev();
+    await page.click('#props [data-ed="unmove"]');
+    await flurAt(r0, 7104, false);
+    assert.deepEqual(edits[n].ops, [{ op: "move", uuid: FLUR, x: 7104, y: 2880 }]);
+    assert.equal(flurLock().superseded_layout, undefined);
+    await page.waitForFunction(() => !/moved here/.test(document.querySelector("#deploy-pend")?.textContent || ""));
+  });
+  await step("Arrange lays out the page's managed blocks afresh", async () => {
+    const n = edits.length, r0 = await rev();
+    await page.waitForSelector("#btn-relayout:not([disabled])");
+    await page.click("#btn-relayout");
+    await flurAt(r0, 9600, true);
+    assert.deepEqual(edits[n].ops, [{ op: "relayout", page: OG }]);
+    assert.match(readFileSync(calls, "utf8"), /^logic compile --relayout Obergeschoss$/m);
+  });
+  await step("a block Loxone Config drew is not moved: dragging it pans the page", async () => {
+    await page.evaluate(([pg, u]) => { gotoPage(pg); focusObj(u, 0.05); }, ["10000002-0000-0020-ffff504f94000001", DIV]);
+    const g = page.locator(`#canvas g[data-uuid="${DIV}"]`).first();
+    await g.waitFor();
+    assert.equal(await page.locator(`#canvas g.movable[data-uuid="${DIV}"]`).count(), 0);
+    // A page without managed blocks has nothing to arrange.
+    assert.equal(await page.isDisabled("#btn-relayout"), true);
+    const n = edits.length, vx = await page.evaluate(() => S.vp[S.page].x);
+    const box = await g.boundingBox();
+    await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+    await page.mouse.down();
+    await page.mouse.move(box.x + box.width / 2 + 80, box.y + box.height / 2, { steps: 8 });
+    await page.mouse.up();
+    assert.notEqual(await page.evaluate(() => S.vp[S.page].x), vx);
+    assert.equal(edits.length, n);
   });
   await step("Discard drops the edits", async () => {
     await page.click("#btn-discard");
