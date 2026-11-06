@@ -42,11 +42,13 @@ writeFileSync(liveFile, liveLine("Temperatur", "value", "21.5", TEMP) + liveLine
 // A stand-in Miniserver for the status chip and the preflight: jdev/cfg/apiKey
 // over HTTP, and an FTP server that only greets (vislox reads the greeting).
 const listen = (srv) => new Promise((ok) => srv.listen(0, "127.0.0.1", () => ok(srv.address().port)));
+// `msSerial` is what it reports; a test swaps it for another Miniserver's.
+let msSerial = "50:4F:94:00:00:01";
 const msPort = await listen(createServer((req, res) => {
   if (req.url !== "/jdev/cfg/apiKey") { res.writeHead(404); res.end(); return; }
   res.setHeader("Content-Type", "application/json");
   res.end(JSON.stringify({ LL: { control: "dev/cfg/apiKey", Code: "200",
-    value: "{'snr': '50:4F:94:00:00:01', 'version':'17.1.7.27', 'key':'00', 'local':true, 'httpsStatus':0}" } }));
+    value: `{'snr': '${msSerial}', 'version':'17.1.7.27', 'key':'00', 'local':true, 'httpsStatus':0}` } }));
 }));
 const ftpSockets = new Set();
 const ftp = createTcpServer((s) => { ftpSockets.add(s); s.on("close", () => ftpSockets.delete(s)); s.on("error", () => {}); s.end("220 fake FTP\r\n"); });
@@ -152,8 +154,34 @@ try {
     await page.click("#ms-chip");
     await page.waitForSelector("#ms-pop:not(.hidden)");
     assert.match(await page.textContent("#ms-body"), /FTP \(port \d+\) answers: 220 fake FTP/);
+    assert.match(await page.textContent("#ms-body"), /Config belongs to504F94000001 \(the repository folder\) ✓/);
     await page.keyboard.press("Escape");
     await page.waitForSelector("#ms-pop.hidden", { state: "attached" });
+  });
+  await step("another Miniserver at the address: Pull warns, and the server refuses it", async () => {
+    msSerial = "50:4F:94:99:99:99";
+    // "Check again" reuses a check from the last 2 s.
+    await page.waitForTimeout(2100);
+    await page.click("#ms-chip");
+    await page.click("#ms-recheck");
+    await page.waitForSelector("#ms-chip.bad");
+    assert.equal(await page.textContent("#ms-lbl"), "Wrong Miniserver (504F94999999)");
+    assert.match(await page.textContent("#ms-body"), /Pull, Apply, Sync would fail: this is not the Miniserver of this config/);
+    assert.match(await page.textContent("#ms-body"), /Config belongs to504F94000001 \(the repository folder\) ✗ not this one/);
+    // The button stays on (the cause may clear); its tooltip warns.
+    assert.equal(await page.$eval("#btn-pull", (b) => b.disabled), false);
+    assert.match(await page.getAttribute("#btn-pull", "title"), /The last check found: this is not the Miniserver of this config/);
+    const r = await page.evaluate(() => fetch("/api/pull", { method: "POST", headers: { "X-Vislox": "pull" } }).then(async (r) => [r.status, (await r.json()).error]));
+    assert.equal(r[0], 503);
+    assert.match(r[1], /^Cannot pull: this is not the Miniserver of this config: 127\.0\.0\.1 reports serial 504F94999999, but the config belongs to 504F94000001/);
+    const i = errors.findIndex((e) => e.includes("status of 503"));
+    if (i >= 0) errors.splice(i, 1);
+    // The right one is back: Pull works again.
+    msSerial = "50:4F:94:00:00:01";
+    await page.waitForTimeout(2100);
+    await page.click("#ms-recheck");
+    await page.waitForSelector("#ms-chip.ok");
+    await page.keyboard.press("Escape");
   });
   await step("pull from the Miniserver commits a new backup and shows it", async () => {
     await page.click("#btn-pull");

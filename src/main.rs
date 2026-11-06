@@ -2,6 +2,7 @@
 //! `loxone-config` manage, with live reload, history and change review.
 
 mod actions;
+mod discover;
 mod history;
 mod live;
 mod miniserver;
@@ -39,9 +40,11 @@ use tokio_stream::wrappers::BroadcastStream;
 #[command(version, about)]
 struct Args {
     /// A lox.toml project (or its directory), a .Loxone file, a backup .zip,
-    /// or a `lox config init` repository.
-    #[arg(default_value = ".")]
-    path: PathBuf,
+    /// or a `lox config init` repository. Default: the current directory.
+    path: Option<PathBuf>,
+    /// List the Miniservers on the local network (UDP discovery), then exit.
+    #[arg(long)]
+    discover: bool,
     /// In a config repository with several Miniservers: which one.
     #[arg(long)]
     serial: Option<String>,
@@ -88,7 +91,24 @@ struct App {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    let src = source::Source::resolve(&args.path, args.serial.as_deref())?;
+    if args.discover {
+        let found = tokio::task::spawn_blocking(|| discover::search(discover::WAIT)).await?;
+        println!("{}", discover::describe(&found));
+        return Ok(());
+    }
+    let path = args.path.clone().unwrap_or_else(|| PathBuf::from("."));
+    let src = match source::Source::resolve(&path, args.serial.as_deref()) {
+        Ok(s) => s,
+        // Started without a path in a directory with no config: say which
+        // Miniservers there are, so the user can pick one.
+        Err(e) if offer_discovery(&e, &args) => {
+            eprintln!("vislox: {e:#}\nvislox: looking for Miniservers on the local network…");
+            let found = tokio::task::spawn_blocking(|| discover::search(discover::WAIT)).await?;
+            eprintln!("{}", discover::describe(&found));
+            std::process::exit(2);
+        }
+        Err(e) => return Err(e),
+    };
     let history = History::new(src.current.clone(), src.proposed.clone());
     eprintln!("vislox: watching {}", src.current.display());
     if let Some(p) = &src.proposed {
@@ -97,7 +117,7 @@ async fn main() -> Result<()> {
     if let Some(root) = history.git_root() {
         eprintln!("vislox: history from git repository {}", root.display());
     }
-    let start = src.current.parent().unwrap_or(&args.path).to_path_buf();
+    let start = src.current.parent().unwrap_or(&path).to_path_buf();
     let found = live::find_miniserver(&start, src.miniserver.as_deref(), args.ctx.as_deref());
     if let (Some(_), Err(why)) = (&args.ctx, &found) {
         anyhow::bail!("{why}");
@@ -149,7 +169,8 @@ async fn main() -> Result<()> {
         },
         src.current.clone(),
         src.proposed.clone(),
-    );
+    )
+    .expecting(expected_serial(&src, found.as_ref().ok()));
     let (tx, _) = broadcast::channel(16);
     let app = Arc::new(App {
         label: src.label.clone(),
@@ -267,6 +288,44 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Whether a failed start lists the Miniservers on the LAN: only when
+/// vislox was started without a path or context in a directory that holds
+/// no config at all, and may talk to the Miniserver (not `--no-live`).
+/// Other errors (several Miniservers, a wrong `--serial`, a broken lox.toml)
+/// say what to fix themselves.
+fn offer_discovery(e: &anyhow::Error, args: &Args) -> bool {
+    args.path.is_none()
+        && args.ctx.is_none()
+        && !args.no_live
+        && e.downcast_ref::<source::NoConfig>().is_some()
+}
+
+/// The serial of the Miniserver the config belongs to: the repository's
+/// `<serial>` folder, else lox.toml's `serial`, else the lox context's.
+fn expected_serial(
+    src: &source::Source,
+    found: Option<&live::Found>,
+) -> Option<miniserver::Expected> {
+    let ctx = found.and_then(|f| f.ctx.clone());
+    let at = |serial: &str, from: String| miniserver::Expected {
+        serial: discover::norm_serial(serial),
+        from,
+        ctx: ctx.clone(),
+    };
+    if let Some(ms) = src.miniserver.as_deref().filter(|m| discover::is_serial(m)) {
+        return Some(at(ms, "the repository folder".into()));
+    }
+    if let Some(serial) = &src.serial {
+        return Some(at(serial, "lox.toml".into()));
+    }
+    let f = found?;
+    let from = match &f.ctx {
+        Some(c) => format!("lox context {c}"),
+        None => "lox's configuration".into(),
+    };
+    f.serial.as_deref().map(|s| at(s, from))
 }
 
 /// Ctrl+C, or SIGTERM where there is one (`kill`, systemd, docker stop).
@@ -621,5 +680,59 @@ async fn api_sync(State(app): State<Arc<App>>, headers: axum::http::HeaderMap) -
     match res {
         Ok(m) => Json(serde_json::json!({ "message": m })).into_response(),
         Err((status, msg)) => refused((status, reason::explain(&msg))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(cli: &[&str]) -> Args {
+        Args::parse_from(std::iter::once("vislox").chain(cli.iter().copied()))
+    }
+
+    #[test]
+    fn only_a_directory_without_any_config_lists_the_lan() {
+        let empty = tempfile::tempdir().unwrap();
+        let none = source::Source::resolve(empty.path(), None).unwrap_err();
+        assert!(offer_discovery(&none, &args(&[])));
+        // A path, a context or --no-live: no broadcast.
+        assert!(!offer_discovery(&none, &args(&["."])));
+        assert!(!offer_discovery(&none, &args(&["--ctx", "home"])));
+        assert!(!offer_discovery(&none, &args(&["--no-live"])));
+
+        // Several Miniservers, a wrong --serial, a broken lox.toml: the error says it.
+        let repo = tempfile::tempdir().unwrap();
+        for serial in ["504F94000001", "504F94000002"] {
+            std::fs::create_dir(repo.path().join(serial)).unwrap();
+            std::fs::write(repo.path().join(serial).join("config.Loxone"), "x").unwrap();
+        }
+        let several = source::Source::resolve(repo.path(), None).unwrap_err();
+        assert!(!offer_discovery(&several, &args(&[])));
+        let wrong = source::Source::resolve(repo.path(), Some("FFFF")).unwrap_err();
+        assert!(!offer_discovery(&wrong, &args(&["--serial", "FFFF"])));
+        let broken = tempfile::tempdir().unwrap();
+        std::fs::write(broken.path().join("lox.toml"), "base = [").unwrap();
+        let broken = source::Source::resolve(broken.path(), None).unwrap_err();
+        assert!(!offer_discovery(&broken, &args(&[])));
+    }
+
+    #[test]
+    fn a_project_s_serial_comes_from_its_lox_toml() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        std::fs::write(d.join("base.Loxone"), "x").unwrap();
+        std::fs::create_dir(d.join("pages")).unwrap();
+        std::fs::write(
+            d.join("lox.toml"),
+            "base = \"base.Loxone\"\nmodule = \"pages\"\nout = \"out.Loxone\"\nserial = \"504f94000001\"\n",
+        )
+        .unwrap();
+        let src = source::Source::resolve(d, None).unwrap();
+        let e = expected_serial(&src, None).unwrap();
+        assert_eq!(
+            (e.serial.as_str(), e.from.as_str()),
+            ("504F94000001", "lox.toml")
+        );
     }
 }

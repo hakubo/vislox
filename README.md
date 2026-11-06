@@ -77,6 +77,12 @@ marked so you can review it before you deploy.
   stay on, since the cause may clear; their tooltip warns about what the last check found. A config saved with a
   different Loxone Config version than the firmware, an expired TLS certificate or token, a remote connection,
   no free live-update slot and a status reply that cannot be read are shown as warnings.
+- **The right Miniserver**: the preflight also checks that the Miniserver at lox's address has the serial the
+  config belongs to, so Pull, Apply and Sync never talk to another device that DHCP gave the address to, or to
+  the wrong context of a repository with several Miniservers. Another serial makes the preflight refuse all
+  three and name both serials. When the address does not answer, or another Miniserver answers there, a
+  discovery broadcast looks for the serial on the local network, and the reason names its new address and the
+  `lox setup set --host …` command that points lox at it (with lox's scheme and port).
 
 vislox itself never writes to the config: lox and git do, and only on Pull, Apply and Discard. Live values only
 listen. A pull reads from the Miniserver; only Apply writes to it.
@@ -90,7 +96,11 @@ vislox ~/loxone-config          # a `lox config init` repository (<serial>/confi
 vislox ./my-project             # a lox.toml project: base vs compiled out.Loxone
 vislox config.Loxone            # one .Loxone file, or a backup .zip
 vislox ~/loxone-config --serial 504F94AABBCC   # several Miniservers in one repository
+vislox --discover               # list the Miniservers on the local network
 ```
+
+Started without a path or `--ctx` in a directory with no config (and without `--no-live`), vislox lists the
+Miniservers on the local network and how to set one up with lox.
 
 Or with Docker, which bundles git and lox (see [docker/README.md](docker/README.md)):
 
@@ -137,6 +147,17 @@ is named `lox-cli`). A check is reused for up to a minute for the chip (`GET /ap
 check started in the last 2 s), and for 10 s before Pull, Apply and Sync, so that retrying an Apply does not
 check each time.
 With `--no-live` nothing is checked.
+
+The serial the config belongs to is, in this order: the repository's `<serial>` folder, `serial` in lox.toml, the
+lox context's `serial` (`lox setup set --serial`). Without one, nothing is compared (the chip says which
+Miniserver answers). The serial at the address comes from `jdev/cfg/apiKey`, which also works across VLANs and
+routers; a reply that cannot be read does not count as another serial. Only when there is a serial to look for,
+and the address does not answer or answers with another serial, does vislox send Loxone's UDP discovery
+broadcast (one `0x00` byte to port 7070; Miniservers answer to port 7071 with name, address, serial, firmware
+and the date of the loaded program). A search is reused for a minute. Port 7071 is shared with other listeners
+(`SO_REUSEADDR`); when it still cannot be bound, the chip and `--discover` say so, since replies are then
+missed. Broadcasts stay in the local network: they do not cross VLANs or routers, Remote Connect, or Docker's
+default bridge network.
 
 Not shown yet: the token's rights (Config, FTP, program restart) and whether the password is weak. The
 Miniserver reports them only at login (`tokenRights`, `unsecurePass`), and lox does not keep them.
@@ -203,7 +224,9 @@ The binary is an `axum` server with the UI embedded (plain JS and SVG, no build 
 - `src/pull.rs` runs `lox config pull` for the Pull button (`POST /api/pull`, which needs an `X-Vislox` header so
   that no other web page can trigger it), then refreshes the history.
 - `src/miniserver.rs` checks the Miniserver for the status chip and the preflight before Pull, Apply and Sync
-  (`GET /api/miniserver`).
+  (`GET /api/miniserver`), including that the serial at the address is the config's.
+- `src/discover.rs` is Loxone's UDP discovery (`vislox --discover`, and finding a Miniserver whose address
+  changed).
 - `src/live.rs` streams the Miniserver's states with lox's `loxone-client` crate. A wire's source
   connector has the UUID of the state it carries, so the browser matches values to wires by UUID. Values
   reach the browser on `/api/live` (server-sent events).
