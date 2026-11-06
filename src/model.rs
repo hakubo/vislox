@@ -216,12 +216,24 @@ pub struct SchedInfo {
     pub analog: bool,
     pub default: Option<f64>,
     /// The columns, one per operating mode.
-    pub modes: Vec<CalMode>,
+    pub cols: Vec<SchedCol>,
     pub entries: Vec<schedule::Entry>,
     /// The compared revision's entries, when they differ.
     pub old_entries: Option<Vec<schedule::Entry>>,
     /// Those of the compared revision's columns that this one lacks.
-    pub old_modes: Vec<CalMode>,
+    pub old_cols: Vec<SchedCol>,
+}
+
+/// A schedule's column: the operating mode its `Modes=` UUID names.
+#[derive(Serialize)]
+pub struct SchedCol {
+    /// The UUID, as entries name their column (`schedule::Entry::col`).
+    pub col: String,
+    /// The mode's `Mode=` number; `None` when the UUID names no `Mode`.
+    pub number: Option<i64>,
+    pub title: String,
+    /// The `Mode` object.
+    pub target: Option<Target>,
 }
 
 /// A calendar entry, decoded (see `calendar.rs`).
@@ -539,20 +551,17 @@ impl<'a> Ctx<'a> {
         }
     }
 
-    /// A mode by its `Mode=` number, as a calendar entry names it.
-    fn mode_by_number(&self, number: Option<i64>) -> CalMode {
-        let target = number
-            .and_then(|n| self.modes.get(&n))
-            .map(|m| self.target(m, None));
-        let title = match (&target, number) {
-            (Some(t), _) => t.title.clone(),
-            (None, Some(n)) => format!("Mode {n} (not in this config)"),
-            (None, None) => "a column with no operating mode".into(),
-        };
-        CalMode {
+    /// A schedule's column `col`: the `Mode` object its UUID names.
+    fn sched_col(&self, col: &str) -> SchedCol {
+        let number = self.mode_number(col);
+        SchedCol {
+            col: col.to_string(),
             number,
-            title,
-            target,
+            title: match number {
+                Some(_) => self.title(col),
+                None => format!("{col} (no operating mode in this config)"),
+            },
+            target: number.map(|_| self.target(col, None)),
         }
     }
 
@@ -1499,7 +1508,7 @@ fn changes(view: &mut View, nc: &Ctx, oc: &Ctx, d: &Delta) {
             });
         }
         if let Some(si) = view.objects.get(&u).and_then(|o| o.schedule.as_ref()) {
-            for text in schedule_changes(&nc.title(&u), si, nc) {
+            for text in schedule_changes(&nc.title(&u), si) {
                 v.push(Change {
                     kind: "attr",
                     text,
@@ -1702,56 +1711,77 @@ fn same_mode(a: &CalMode, b: &CalMode) -> bool {
 /// given; `None` when it has none.
 fn sched_info(c: &Ctx, old: Option<&Ctx>, uuid: &str) -> Option<SchedInfo> {
     let t = c.timer(uuid)?;
-    let entries: Vec<schedule::Entry> = t.entries.iter().map(|(_, e)| *e).collect();
-    let column = |ctx: &Ctx, m: &str| match ctx.mode_number(m) {
-        Some(n) => ctx.mode_by_number(Some(n)),
-        None => CalMode {
-            number: None,
-            title: format!("{m} (no operating mode in this config)"),
-            target: None,
-        },
-    };
-    let modes: Vec<CalMode> = t.modes.iter().map(|m| column(c, m)).collect();
-    let (mut old_entries, mut old_modes) = (None, Vec::new());
-    if let Some(ot) = old.and_then(|o| o.timer(uuid)) {
-        let oe: Vec<schedule::Entry> = ot.entries.iter().map(|(_, e)| *e).collect();
-        if !schedule::changed_modes(&oe, &entries).is_empty() {
-            old_entries = Some(oe);
+    let cols = t.modes.iter().map(|m| c.sched_col(m)).collect();
+    let (mut old_entries, mut old_cols) = (None, Vec::new());
+    if let Some(o) = old
+        && let Some(ot) = o.timer(uuid)
+    {
+        if !schedule::changed_cols(&ot.entries, &t.entries, t.analog).is_empty() {
+            old_entries = Some(ot.entries);
         }
-        let o = old.expect("old");
-        old_modes = ot
+        old_cols = ot
             .modes
             .iter()
             .filter(|m| !t.modes.contains(m))
-            .map(|m| column(o, m))
+            .map(|m| o.sched_col(m))
             .collect();
     }
     Some(SchedInfo {
         state: t.state,
         analog: t.analog,
         default: t.default,
-        modes,
-        entries,
+        cols,
+        entries: t.entries,
         old_entries,
-        old_modes,
+        old_cols,
     })
 }
 
-/// A schedule's changed switching times, per operating mode, as the
-/// change list reads them: *Uhr · schedule, Monday: 06:30–08:00 →
-/// 06:00–08:00*.
-fn schedule_changes(title: &str, si: &SchedInfo, c: &Ctx) -> Vec<String> {
+/// A block with switching times, for Apply's check against the live
+/// schedules (`/api/schedules`): only what that needs, not a whole view.
+#[derive(Serialize)]
+pub struct SchedBlock {
+    pub uuid: String,
+    pub title: String,
+    pub ty: String,
+    pub schedule: SchedInfo,
+}
+
+/// Every block of `doc` with switching times.
+pub fn schedules(doc: &LoxoneDoc) -> Vec<SchedBlock> {
+    let c = Ctx::new(doc);
+    c.order
+        .iter()
+        .filter_map(|u| {
+            Some(SchedBlock {
+                schedule: sched_info(&c, None, u)?,
+                uuid: u.clone(),
+                title: c.title(u),
+                ty: c.ty(u),
+            })
+        })
+        .collect()
+}
+
+/// A schedule's changed switching times, per column, as the change list
+/// reads them: *Uhr · schedule, Monday: 06:30–08:00 → 06:00–08:00*.
+fn schedule_changes(title: &str, si: &SchedInfo) -> Vec<String> {
     let Some(old) = &si.old_entries else {
         return Vec::new();
     };
-    schedule::changed_modes(old, &si.entries)
+    schedule::changed_cols(old, &si.entries, si.analog)
         .into_iter()
-        .map(|m| {
+        .map(|col| {
+            let name = si
+                .cols
+                .iter()
+                .chain(&si.old_cols)
+                .find(|c| c.col == col)
+                .map_or(col.as_str(), |c| c.title.as_str());
             format!(
-                "{title} · schedule, {}: {} → {}",
-                c.mode_by_number(m).title,
-                schedule::line(&schedule::of_mode(old, m), si.analog),
-                schedule::line(&schedule::of_mode(&si.entries, m), si.analog)
+                "{title} · schedule, {name}: {} → {}",
+                schedule::line(&schedule::of_col(old, &col), si.analog),
+                schedule::line(&schedule::of_col(&si.entries, &col), si.analog)
             )
         })
         .collect()
@@ -2635,7 +2665,7 @@ mod tests {
         let si = v.objects[TIMER].schedule.as_ref().expect("a schedule");
         assert_eq!(si.state, TIMER);
         assert_eq!(si.default, Some(18.0));
-        let titles: Vec<&str> = si.modes.iter().map(|m| m.title.as_str()).collect();
+        let titles: Vec<&str> = si.cols.iter().map(|m| m.title.as_str()).collect();
         assert_eq!(titles, ["Feiertag", "Party"]);
         assert_eq!(si.entries[1].mode, Some(-1));
         assert!(si.old_entries.is_none());
@@ -2656,6 +2686,15 @@ mod tests {
             ["Uhr · schedule, Party: 18:00–23:00 22.5 → 17:00–23:00 22.5"],
             "{texts:?}"
         );
+    }
+
+    #[test]
+    fn schedules_lists_only_blocks_with_switching_times() {
+        let d = doc(&with_timer("<Entry From=\"390\" To=\"480\" V=\"21\"/>"));
+        let s = schedules(&d);
+        assert_eq!(s.len(), 1);
+        assert_eq!((s[0].uuid.as_str(), s[0].title.as_str()), (TIMER, "Uhr"));
+        assert_eq!(s[0].schedule.entries.len(), 1);
     }
 
     #[test]

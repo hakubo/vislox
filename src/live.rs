@@ -332,7 +332,7 @@ fn trim_num(v: f64, prec: usize) -> String {
 }
 
 /// A state value as JSON: whole numbers as integers (`1`, not `1.0`).
-fn number(v: f64) -> Value {
+pub fn number(v: f64) -> Value {
     if v.fract() == 0.0 && v.abs() < 1e15 {
         Value::from(v as i64)
     } else {
@@ -821,7 +821,6 @@ impl Live {
     fn apply(&self, generation: u64, events: Vec<StateEvent>) {
         let mut out = serde_json::Map::new();
         let mut gone = false;
-        let mut icons = Vec::new();
         {
             let mut st = self.st.lock().unwrap();
             if st.generation != generation {
@@ -835,9 +834,6 @@ impl Live {
                     }
                     StateEvent::TextState { uuid, text, .. } => {
                         let icon = state_icon(&text);
-                        if let Some(i) = &icon {
-                            icons.push(i.clone());
-                        }
                         (uuid, (Value::from(text), None, icon))
                     }
                     StateEvent::DaytimerState {
@@ -861,12 +857,6 @@ impl Live {
                     st.values.insert(uuid, val);
                 }
             }
-        }
-        // A Status block's icon may be shown: `/api/app/icon` serves it.
-        if !icons.is_empty()
-            && let Some(s) = self.structure.lock().unwrap().clone()
-        {
-            s.allow_icons(icons);
         }
         if !out.is_empty() {
             let _ = self

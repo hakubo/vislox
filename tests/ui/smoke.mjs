@@ -35,9 +35,9 @@ writeFileSync(cfg, readFileSync(cfg, "utf8")
   .replace('<Co K="Pf" Nc="1"', `<IoData Visu="true" Pr="${ROOM}"/><Co K="Pf" Nc="1"`)
   // A Daytimer on the upper floor, with columns Feiertag (0) and Party (-1).
   .replace('<Co K="Q" U="10000009-0000-0093-02ff504f94000001"/>\n\t\t\t</C>', `<Co K="Q" U="10000009-0000-0093-02ff504f94000001"/>\n\t\t\t</C>
-\t\t\t<C Type="DayTimer" V="178" U="${TIMER}" Title="Uhr" Px="960" Py="2880" Px2="3648" Py2="3768" Nio="2" WF="16384" Analog="true" DefValue="18" Modes="00000000-0000-0001-1500000000000000,10000011-0000-0110-ffff504f94000001">
+\t\t\t<C Type="DayTimer" V="178" U="${TIMER}" Title="Uhr" Px="960" Py="2880" Px2="3648" Py2="3768" Nio="2" WF="16384" Analog="true" DefValue="18" Modes="00000000-0000-0001-1500000000000000,10000011-0000-0110-ffff504f94000001,00000000-0000-0002-1500000000000000">
 \t\t\t\t<Co K="Mode" U="10000030-0000-0301-00ff504f94000001"/><Co K="AQ" U="10000030-0000-0302-01ff504f94000001"/>
-\t\t\t\t<Entry From="390" To="480" V="21"/><Entry From="1080" To="1380" Ix="1" V="22.5"/>
+\t\t\t\t<Entry From="390" To="480" V="21"/><Entry From="1080" To="1380" Ix="1" V="22.5"/><Entry From="600" To="660" Ix="2" V="5"/>
 \t\t\t</C>`));
 git("add", ".");
 git("commit", "-q", "-m", "[504F94000001] Config backup 2026-11-01 10:00:00 (v1)");
@@ -49,6 +49,9 @@ edit('Month="12" Day="24"', 'Month="12" Day="26"');
 // … and one whose date no longer decodes (a kind of date vislox does not know).
 edit('CalType="-1" Month="12" Day="31"', 'CalType="-1" Mode="5" Month="12" Day="31"');
 edit('<Entry From="1080" To="1380" Ix="1"', '<Entry From="1020" To="1380" Ix="1"');
+// The Urlaub column goes, with its entry: a column only the compared revision has.
+edit(',00000000-0000-0002-1500000000000000">', '">');
+edit('<Entry From="600" To="660" Ix="2" V="5"/>', '');
 
 // Live values as `lox stream -o json --initial` writes them: the fixture's
 // temperature (an analog output) and its AND gate (a digital one).
@@ -376,13 +379,21 @@ try {
     const sec = () => page.$$eval("#props section", (s) => s.find((x) => x.querySelector(".ps-h")?.dataset.sec === "Schedule")?.textContent || "");
     assert.match(await sec(), /Turn on live values to compare/);
     assert.match(await sec(), /was 18:00–23:00 22\.5/);
+    // A column the compared revision alone has still gets its row, with what it was.
+    assert.ok(changes.includes("Uhr · schedule, Urlaub: 10:00–11:00 5 → no entries"), changes.join(" | "));
+    assert.match(await sec(), /Urlaubwas 10:00–11:00 5/);
     await page.click("#sw-live .track");
     await page.waitForFunction(() => document.querySelector("#props .sch-row.diff"));
     // Party is the same on both sides; Feiertag was changed in the app.
     assert.match(await sec(), /Changed in the app since this config \(Feiertag\)/);
     assert.match(await sec(), /Miniserver: 07:00–08:00 21/);
     assert.equal(await page.$$eval("#props .sch-row.diff", (r) => r.length), 1);
-    assert.equal(await page.$$eval("#props .sch-bar.live", (r) => r.length), 2);
+    assert.equal(await page.$$eval("#props .sch-bar.live", (r) => r.length), 3);
+    // A new event table from the Miniserver updates the section in place.
+    appendFileSync(liveFile, liveLine("Uhr", "entriesAndDefaultValue", { ...schedule, entries: [
+      { mode: 0, from: 390, to: 480, activate: false, value: 21 }, { mode: -1, from: 1020, to: 1380, activate: false, value: 22.5 }] }, TIMER));
+    await page.waitForFunction(() => /The Miniserver runs the same switching times/.test(document.querySelector('#props .ps-b[data-body="Schedule"]')?.textContent || ""));
+    assert.equal(await page.$$eval("#props .sch-row.diff", (r) => r.length), 0);
     await page.click("#sw-live .track");
     await page.waitForFunction(() => !document.querySelector("#canvas").classList.contains("live"));
   });

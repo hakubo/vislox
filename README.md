@@ -93,8 +93,9 @@ marked so you can review it before you deploy.
   changed schedule reads per mode in the Changes list (*Uhr · schedule, Party: 18:00–23:00 22.5 → 17:00–23:00
   22.5*). With live values on, the bar of what the Miniserver runs sits under the config's, and modes that differ
   are marked: on the deployed revision as *changed in the app since this config*, on *Pending* as what Apply would
-  replace. Apply's confirmation lists the schedules it would change that way. A Status block shows its live text
-  with the icon and colour the app shows, and a weather data block's output carries the weather server's current
+  replace. Apply's confirmation lists the schedules it would change that way (`GET /api/schedules?rev=…`), or says that
+  it could not check. A Status block shows its live text
+  with the app's colour (and its icon, when the structure file lists it), and a weather data block's output carries the weather server's current
   value (with a weather subscription; the Weather Service block lists them all).
 
 - **Apply, Sync, Discard** (for a `lox.toml` project, when started with an admin token): edit the project's Lox
@@ -249,8 +250,11 @@ Weather comes from the weather server's states (`weatherServer` in the structure
 subscription): its current weather, else the forecast hour that has begun. A `WeatherData` block's `WType=`
 picks the field (1 temperature, 2 dew point, 3 humidity, 4 wind speed, 5 wind direction, 7 solar radiation,
 9 precipitation, 10 weather type, 11 air pressure, 26 perceived temperature); such values are marked computed.
-A Status block's icon is the one its `iconAndColor` state names; `/api/app/icon` serves those names as well
-(plain names only), and icons the Miniserver sends gzipped without the gzip trailer are kept unpacked.
+A Status block's icon is the one its `iconAndColor` state names, shown only when the structure file lists that
+icon: `/api/app/icon` fetches no name a live state (which a user can set in the app) brings in. It fetches only
+names of an icon's shape, `<folder>/<file>.svg` or `.png` (never under `jdev`, `dev`, `data`, `sys`, `prog`, …) or
+an icon UUID (as `<uuid>.svg`), so no name can be a command. Icons the Miniserver sends gzipped without the gzip
+trailer are kept unpacked.
 
 ### Miniserver status
 

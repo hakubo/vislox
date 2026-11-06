@@ -24,11 +24,15 @@
 use loxone_config::xml::Element;
 use serde::Serialize;
 
-/// One switching time: in operating mode `mode` (its `Mode=` number;
-/// `None` when the file's column names no `Mode` object), from `from` to
-/// `to` minutes of the day, value `value`.
-#[derive(Serialize, Clone, Copy, PartialEq, Debug)]
+/// One switching time: in column `col` (the operating mode's UUID the
+/// file names; `#<n>` for an index past the `Modes=` list), which is
+/// operating mode `mode` (its `Mode=` number; `None` when the column names
+/// no `Mode` object), from `from` to `to` minutes of the day, value
+/// `value`. Columns, not mode numbers, tell entries apart: two columns that
+/// name no mode stay two.
+#[derive(Serialize, Clone, PartialEq, Debug)]
 pub struct Entry {
+    pub col: String,
     pub mode: Option<i64>,
     pub from: u32,
     pub to: u32,
@@ -47,8 +51,7 @@ pub struct Timer {
     pub default: Option<f64>,
     /// The columns: operating-mode UUIDs.
     pub modes: Vec<String>,
-    /// Entries, by column index into `modes`.
-    pub entries: Vec<(usize, Entry)>,
+    pub entries: Vec<Entry>,
 }
 
 fn num<T: std::str::FromStr>(el: &Element, name: &str) -> Option<T> {
@@ -78,14 +81,15 @@ pub fn read(el: &Element, uuid: &str, mode_number: impl Fn(&str) -> Option<i64>)
         .filter(|c| c.name == "Entry")
         .map(|e| {
             let ix: usize = num(e, "Ix").unwrap_or(0);
-            let entry = Entry {
-                mode: modes.get(ix).and_then(|m| mode_number(m)),
+            let col = modes.get(ix).cloned();
+            Entry {
+                mode: col.as_deref().and_then(&mode_number),
+                col: col.unwrap_or_else(|| format!("#{ix}")),
                 from: num(e, "From").unwrap_or(0),
                 to: num(e, "To").unwrap_or(0),
                 value: num(e, "V").unwrap_or(0.0),
                 activate: e.attr("NeedActivate") == Some("true"),
-            };
-            (ix, entry)
+            }
         })
         .collect();
     Some(Timer {
@@ -102,19 +106,19 @@ pub fn clock(min: u32) -> String {
     format!("{:02}:{:02}", min / 60, min % 60)
 }
 
-/// One mode's entries in one line, in time order: `06:30–08:00 21.5,
-/// 17:00–22:00 21.5 (activate)`; `analog` adds each entry's value.
+/// Entries in one line, in the order given: `06:30–08:00 21.5,
+/// 17:00–22:00 21.5 (activate)`; `analog` adds each entry's value (a
+/// digital timer's is always on).
 pub fn line(entries: &[Entry], analog: bool) -> String {
-    let mut es: Vec<&Entry> = entries.iter().collect();
-    es.sort_by_key(|e| (e.from, e.to));
-    if es.is_empty() {
+    if entries.is_empty() {
         return "no entries".into();
     }
-    es.iter()
+    entries
+        .iter()
         .map(|e| {
             let mut s = format!("{}–{}", clock(e.from), clock(e.to));
             if analog {
-                s.push_str(&format!(" {}", trim(e.value)));
+                s.push_str(&format!(" {}", crate::live::number(e.value)));
             }
             if e.activate {
                 s.push_str(" (activate)");
@@ -125,17 +129,9 @@ pub fn line(entries: &[Entry], analog: bool) -> String {
         .join(", ")
 }
 
-fn trim(v: f64) -> String {
-    if v.fract() == 0.0 && v.abs() < 1e15 {
-        format!("{}", v as i64)
-    } else {
-        format!("{v}")
-    }
-}
-
-/// The entries of mode `mode`, in time order.
-pub fn of_mode(entries: &[Entry], mode: Option<i64>) -> Vec<Entry> {
-    let mut v: Vec<Entry> = entries.iter().filter(|e| e.mode == mode).copied().collect();
+/// The entries of column `col`, in time order.
+pub fn of_col(entries: &[Entry], col: &str) -> Vec<Entry> {
+    let mut v: Vec<Entry> = entries.iter().filter(|e| e.col == col).cloned().collect();
     v.sort_by(|a, b| {
         (a.from, a.to)
             .cmp(&(b.from, b.to))
@@ -144,18 +140,25 @@ pub fn of_mode(entries: &[Entry], mode: Option<i64>) -> Vec<Entry> {
     v
 }
 
-/// The modes, in first-seen order, whose entries differ between `a` and
-/// `b` (order within a mode does not count).
-pub fn changed_modes(a: &[Entry], b: &[Entry]) -> Vec<Option<i64>> {
-    let mut modes: Vec<Option<i64>> = Vec::new();
+/// The columns, in first-seen order, whose entries differ between `a` and
+/// `b` (order within a column does not count; a digital timer's values do
+/// not either, as [`line`] does not show them).
+pub fn changed_cols(a: &[Entry], b: &[Entry], analog: bool) -> Vec<String> {
+    let mut cols: Vec<&str> = Vec::new();
     for e in a.iter().chain(b) {
-        if !modes.contains(&e.mode) {
-            modes.push(e.mode);
+        if !cols.contains(&e.col.as_str()) {
+            cols.push(&e.col);
         }
     }
-    modes
-        .into_iter()
-        .filter(|m| of_mode(a, *m) != of_mode(b, *m))
+    let key = |es: &[Entry], c: &str| -> Vec<(u32, u32, Option<u64>, bool)> {
+        of_col(es, c)
+            .iter()
+            .map(|e| (e.from, e.to, analog.then(|| e.value.to_bits()), e.activate))
+            .collect()
+    };
+    cols.into_iter()
+        .filter(|c| key(a, c) != key(b, c))
+        .map(String::from)
         .collect()
 }
 
@@ -206,6 +209,7 @@ mod tests {
                <Entry To=\"1440\" V=\"40\"/>\
                <Entry From=\"390\" To=\"480\" Ix=\"1\" NeedActivate=\"true\" V=\"45.5\"/>\
                <Entry From=\"60\" To=\"120\" Ix=\"2\" V=\"1\"/>\
+               <Entry From=\"60\" To=\"120\" Ix=\"7\" V=\"1\"/>\
              </C>"
         ));
         let t = read(first(&d, "DayTimer"), "dt", mode_number).expect("a timer");
@@ -213,34 +217,21 @@ mod tests {
         assert!(t.analog);
         assert_eq!(t.default, Some(38.0));
         assert_eq!(t.modes.len(), 3);
-        let es: Vec<Entry> = t.entries.iter().map(|(_, e)| *e).collect();
+        let es = &t.entries;
         assert_eq!(
-            es[0],
-            Entry {
-                mode: Some(3),
-                from: 0,
-                to: 1440,
-                value: 40.0,
-                activate: false
-            }
+            (es[0].col.as_str(), es[0].mode, es[0].from, es[0].to),
+            (MON, Some(3), 0, 1440)
         );
         assert_eq!(
-            es[1],
-            Entry {
-                mode: Some(4),
-                from: 390,
-                to: 480,
-                value: 45.5,
-                activate: true
-            }
+            (es[1].mode, es[1].value, es[1].activate),
+            (Some(4), 45.5, true)
         );
-        // A column that names no mode has no number.
-        assert_eq!(es[2].mode, None);
-        assert_eq!(
-            line(&of_mode(&es, Some(4)), true),
-            "06:30–08:00 45.5 (activate)"
-        );
-        assert_eq!(line(&of_mode(&es, Some(3)), false), "00:00–24:00");
+        // A column that names no mode has no number, but keeps its UUID;
+        // an index past the list is a column of its own.
+        assert_eq!((es[2].col.as_str(), es[2].mode), ("x", None));
+        assert_eq!((es[3].col.as_str(), es[3].mode), ("#7", None));
+        assert_eq!(line(&of_col(es, TUE), true), "06:30–08:00 45.5 (activate)");
+        assert_eq!(line(&of_col(es, MON), false), "00:00–24:00");
         assert_eq!(line(&[], false), "no entries");
     }
 
@@ -254,25 +245,55 @@ mod tests {
         let t = read(first(&d, "HeatIRoomController2"), "irc", mode_number).expect("a timer");
         assert_eq!(t.state, "irc-timer");
         assert_eq!(t.default, Some(0.0));
-        assert_eq!(t.entries[0].1.mode, Some(4));
+        assert_eq!(t.entries[0].mode, Some(4));
         assert!(read(first(&d, "And"), "and", mode_number).is_none());
     }
 
-    #[test]
-    fn only_modes_whose_entries_differ_count_as_changed() {
-        let e = |mode, from, to| Entry {
-            mode: Some(mode),
+    fn e(col: &str, from: u32, to: u32, value: f64) -> Entry {
+        Entry {
+            col: col.into(),
+            mode: None,
             from,
             to,
-            value: 1.0,
+            value,
             activate: false,
-        };
-        let a = [e(3, 390, 480), e(3, 1000, 1100), e(4, 0, 1440)];
+        }
+    }
+
+    #[test]
+    fn only_columns_whose_entries_differ_count_as_changed() {
+        let a = [
+            e(MON, 390, 480, 1.0),
+            e(MON, 1000, 1100, 1.0),
+            e(TUE, 0, 1440, 1.0),
+        ];
         // Same entries of Monday in another order; Tuesday changed.
-        let b = [e(3, 1000, 1100), e(3, 390, 480), e(4, 0, 1380)];
-        assert_eq!(changed_modes(&a, &b), vec![Some(4)]);
-        assert!(changed_modes(&a, &a).is_empty());
-        // A mode only one side has.
-        assert_eq!(changed_modes(&a, &a[..2]), vec![Some(4)]);
+        let b = [
+            e(MON, 1000, 1100, 1.0),
+            e(MON, 390, 480, 1.0),
+            e(TUE, 0, 1380, 1.0),
+        ];
+        assert_eq!(changed_cols(&a, &b, true), vec![TUE]);
+        assert!(changed_cols(&a, &a, true).is_empty());
+        // A column only one side has.
+        assert_eq!(changed_cols(&a, &a[..2], true), vec![TUE]);
+    }
+
+    #[test]
+    fn two_columns_without_a_mode_stay_apart() {
+        // An entry moves from one unknown column to another: both changed.
+        let a = [e("x", 60, 120, 1.0)];
+        let b = [e("y", 60, 120, 1.0)];
+        assert_eq!(changed_cols(&a, &b, true), vec!["x", "y"]);
+        assert_eq!(line(&of_col(&b, "x"), false), "no entries");
+    }
+
+    #[test]
+    fn a_digital_timers_value_is_no_change() {
+        // Not shown for a digital timer, so not a change either.
+        let a = [e(MON, 390, 480, 1.0)];
+        let b = [e(MON, 390, 480, 0.0)];
+        assert!(changed_cols(&a, &b, false).is_empty());
+        assert_eq!(changed_cols(&a, &b, true), vec![MON]);
     }
 }

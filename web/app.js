@@ -874,6 +874,7 @@ function calTip(cal) {
   return `${cal.when ?? "Date cannot be read"} · switches on ${cal.mode.title}`;
 }
 
+const propRow = (k, v, cls) => `<div class="pr ${cls || ""}"><div class="k">${esc(k)}</div><div class="v">${v}</div></div>`;
 function renderProps() {
   const box = $("props");
   const o = S.sel && S.view?.objects[S.sel];
@@ -888,7 +889,7 @@ function renderProps() {
   const chg = (oldV, newV, changed) => (marks && changed ? `<span class="old">${esc(oldV ?? "—")}</span><span class="new">${esc(newV ?? "—")}</span>` : val(newV));
   const sections = [];
   const section = (name, rows, count) => { if (rows.length) sections.push({ name, rows, count }); };
-  const row = (k, v, cls) => `<div class="pr ${cls || ""}"><div class="k">${esc(k)}</div><div class="v">${v}</div></div>`;
+  const row = propRow;
 
   const opT = opTarget(o);
   if (opT) section("Operate", [opControls(opT)]);
@@ -905,10 +906,7 @@ function renderProps() {
     }
     section("Live values", rows.length ? rows : [`<div class="empty">The Miniserver sends no values for this block.</div>`], rows.length);
   }
-  const stat = statusRows(o, row);
-  if (stat) section("Status", stat);
-  if (o.schedule) section("Schedule", scheduleRows(o, row, marks), o.schedule.modes.length);
-  if (o.ty === "WeatherServer") { const w = weatherRows(row); if (w) section("Weather", w.rows, w.count); }
+  for (const sec of liveSections(o, row, marks)) section(sec.name, sec.rows, sec.count);
   const cal = o.calendar;
   if (cal) {
     const modeV = (m) => (m.target ? linkTarget(m.target) : `<span class="none-v">${esc(m.title)}</span>`);
@@ -977,7 +975,7 @@ function renderProps() {
     <div class="ph-s">${esc(prettyType(o.ty))}</div>${renamed}${facts.length ? `<div class="ph-facts">${facts.join("")}</div>` : ""}</div>` +
     sections.map((s) => {
       const open = !S.closed.has(s.name) || (s.name === "Advanced" && rawChanged);
-      return `<section><button type="button" class="ps-h" aria-expanded="${open}" data-sec="${esc(s.name)}">${esc(s.name)}${s.count ? `<span class="count">${s.count}</span>` : ""}</button><div class="ps-b"${open ? "" : " hidden"}>${s.rows.join("")}</div></section>`;
+      return `<section><button type="button" class="ps-h" aria-expanded="${open}" data-sec="${esc(s.name)}">${esc(s.name)}${s.count ? `<span class="count">${s.count}</span>` : ""}</button><div class="ps-b" data-body="${esc(s.name)}"${open ? "" : " hidden"}>${s.rows.join("")}</div></section>`;
     }).join("");
 }
 $("props").addEventListener("keydown", (e) => {
@@ -1814,12 +1812,13 @@ $("btn-apply").onclick = async () => {
 };
 /** For Apply's confirmation: the schedules on the Miniserver the pending config would change. */
 async function pendingScheduleText(pend) {
-  let v = S.rev === pend.id ? S.view : null;
-  try { v ||= await api(`/api/view?rev=${encodeURIComponent(pend.id)}&base=`); } catch { return ""; }
-  const any = Object.values(v.objects).some((o) => o.schedule && o.status !== "removed");
-  if (!any) return "";
+  let blocks;
+  try { blocks = await api(`/api/schedules?rev=${encodeURIComponent(pend.id)}`); } catch (e) {
+    return `⚠ The switching times could not be compared with the Miniserver's (${e.message}): edits made in the app may be replaced.\n\n`;
+  }
+  if (!blocks.length) return "";
   if (!liveStreaming()) return "Live values are off, so the switching times were not compared with the Miniserver's (edits in the app).\n\n";
-  const c = scheduleConflicts(v);
+  const c = scheduleConflicts(blocks);
   return c.length ? `⚠ The Miniserver runs other switching times than this config for:\n  ${c.join("\n  ")}\nApplying replaces them with the config's (an edit in the app among them).\n\n` : "";
 }
 async function apply() {
@@ -2384,7 +2383,11 @@ function liveTip(src) {
 }
 function lvSpan(u) {
   const e = liveVal(u);
-  return (e?.[4] ? appIcon(e[4]) : "") + `<span class="lv${e ? "" : " none"}${e?.[3] ? " " + e[3] : ""}" data-lv="${esc(u)}"${e?.[2] ? ` title="${esc(e[2])}"` : ""}>${e ? esc(clip(liveText(e), 40)) : "no value"}</span>`;
+  return `<span class="lv${e ? "" : " none"}${e?.[3] ? " " + e[3] : ""}" data-lv="${esc(u)}"${e?.[2] ? ` title="${esc(e[2])}"` : ""}>${lvInner(e)}</span>`;
+}
+/** What a value span holds: the icon its state names (a Status block's), and the value. */
+function lvInner(e) {
+  return e ? lvIcon(e) + esc(clip(liveText(e), 40)) : "no value";
 }
 
 // ── schedules, weather and Status blocks ─────────────────────────────────
@@ -2399,101 +2402,112 @@ function liveSchedule(si) {
   return v && typeof v === "object" && v.schedule ? v : undefined;
 }
 function hhmm(m) { return `${String(Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`; }
-/** An entry for comparing. A digital timer's value does not count: the Miniserver sends 0 where the file has 1. */
-const schedKey = (e, analog) => `${e.from}-${e.to}-${analog ? +e.value : ""}-${!!e.activate}`;
-const schedOf = (es, mode) => es.filter((e) => e.mode === mode).sort((a, b) => a.from - b.from || a.to - b.to);
-/** The modes whose entries differ between `a` and `b`. */
-function schedDiff(a, b, analog) {
-  const modes = [...new Set([...a, ...b].map((e) => e.mode))];
-  const key = (es, m) => schedOf(es, m).map((e) => schedKey(e, analog)).join("|");
-  return modes.filter((m) => key(a, m) !== key(b, m));
-}
-function schedVal(v) { return String(Number.isInteger(+v) ? +v : +(+v).toFixed(2)); }
+/** A number as live values write it. */
+const numText = (v) => liveText([+v]);
+const byTime = (a, b) => a.from - b.from || a.to - b.to;
+/** Entries for comparing. A digital timer's value does not count: the Miniserver sends 0 where the file has 1. */
+const schedKey = (es, analog) => es.map((e) => `${e.from}-${e.to}-${analog ? +e.value : ""}-${!!e.activate}`).join("|");
 function schedLine(es, analog) {
-  return es.length ? es.map((e) => `${hhmm(e.from)}–${hhmm(e.to)}${analog ? " " + schedVal(e.value) : ""}${e.activate ? " (activate)" : ""}`).join(", ") : "no entries";
+  return es.length ? es.map((e) => `${hhmm(e.from)}–${hhmm(e.to)}${analog ? " " + numText(e.value) : ""}${e.activate ? " (activate)" : ""}`).join(", ") : "no entries";
 }
-/** How the config's schedule and the Miniserver's differ: the modes, and the default value. */
+/** One row per column: the config's columns, then the compared revision's, then any column only entries name,
+ *  then the Miniserver's modes no column has. A column's entries are those that name it (by UUID, so columns
+ *  without a mode stay apart); the Miniserver's are matched by the column's mode number. */
+function schedRows(si, live) {
+  const rows = [], seen = new Set();
+  const add = (col, c) => { if (!seen.has(col)) { seen.add(col); rows.push({ col, title: c?.title ?? col, target: c?.target, number: c?.number ?? null }); } };
+  for (const c of si.cols) add(c.col, c);
+  for (const c of si.old_cols || []) add(c.col, c);
+  for (const e of [...si.entries, ...(si.old_entries || [])]) add(e.col, { title: `${e.col} (no operating mode in this config)` });
+  const numbers = new Set(rows.map((r) => r.number).filter((n) => n != null));
+  for (const e of live?.entries || []) if (!numbers.has(e.mode)) { numbers.add(e.mode); rows.push({ col: null, title: `Mode ${e.mode}`, number: e.mode, liveOnly: true }); }
+  for (const r of rows) {
+    r.mine = r.col == null ? [] : si.entries.filter((e) => e.col === r.col).sort(byTime);
+    r.old = si.old_entries && r.col != null ? si.old_entries.filter((e) => e.col === r.col).sort(byTime) : null;
+    r.theirs = live && r.number != null ? live.entries.filter((e) => e.mode === r.number).sort(byTime) : null;
+    r.differs = !!r.theirs && schedKey(r.mine, si.analog) !== schedKey(r.theirs, si.analog);
+    r.changed = !!r.old && schedKey(r.old, si.analog) !== schedKey(r.mine, si.analog);
+  }
+  return rows;
+}
+/** How the config's schedule and the Miniserver's differ: the rows, and the default value. */
 function schedCompare(si, live) {
-  const modes = schedDiff(si.entries, live.entries, si.analog);
+  const rows = schedRows(si, live);
   const defDiff = si.analog && si.default != null && live.default != null && +si.default !== +live.default;
-  return { modes, defDiff, same: !modes.length && !defDiff };
-}
-function schedModeTitle(si, n) {
-  const m = si.modes.find((m) => m.number === n) || si.old_modes?.find((m) => m.number === n);
-  return m ? m.title : n == null ? "a column with no operating mode" : `Mode ${n}`;
+  const what = rows.filter((r) => r.differs).map((r) => r.title);
+  if (defDiff) what.push("default value");
+  return { rows, defDiff, what: what.join(", "), same: !what.length };
 }
 /** One day as a bar: each entry a segment over the hours, its value in the tooltip. */
 function schedBar(es, si, cls) {
   const segs = es.map((e) => {
     const l = (e.from / 1440) * 100, w = Math.max(((e.to - e.from) / 1440) * 100, 0.4);
-    const tip = `${hhmm(e.from)}–${hhmm(e.to)}${si.analog ? " · " + schedVal(e.value) : ""}${e.activate ? " · needs activation" : ""}`;
-    return `<span class="sch-seg${e.activate ? " act" : ""}" style="left:${l.toFixed(2)}%;width:${w.toFixed(2)}%" title="${esc(tip)}">${si.analog && w > 9 ? esc(schedVal(e.value)) : ""}</span>`;
+    const tip = `${hhmm(e.from)}–${hhmm(e.to)}${si.analog ? " · " + numText(e.value) : ""}${e.activate ? " · needs activation" : ""}`;
+    return `<span class="sch-seg${e.activate ? " act" : ""}" style="left:${l.toFixed(2)}%;width:${w.toFixed(2)}%" title="${esc(tip)}">${si.analog && w > 9 ? esc(numText(e.value)) : ""}</span>`;
   }).join("");
   return `<div class="sch-bar ${cls}" title="${esc(schedLine(es, si.analog))}">${segs}</div>`;
 }
 function scheduleRows(o, row, marks) {
   const si = o.schedule;
   const live = liveStreaming() ? liveSchedule(si) : undefined;
-  const cmp = live && schedCompare(si, live);
-  const changedHere = new Set(marks && si.old_entries ? schedDiff(si.old_entries, si.entries, true) : []);
+  const cmp = live ? schedCompare(si, live) : null;
+  const rows = schedRows(si, live);
   const r = revById(S.rev);
-  const rows = [];
+  const out = [];
   // What the comparison means on this revision.
   let note;
   if (!S.live.on) note = `<div class="sch-note">Turn on live values to compare with the switching times the Miniserver runs.</div>`;
   else if (!live) note = `<div class="sch-note">The Miniserver sends no schedule for this block${liveStreaming() ? " (only blocks shown in the app have one)" : ""}.</div>`;
   else if (cmp.same) note = `<div class="sch-note ok">The Miniserver runs the same switching times.</div>`;
-  else if (r?.kind === "pending") note = `<div class="sch-note warn">⚠ The Miniserver runs other switching times (${esc(schedWhat(si, cmp))}). Apply would replace them with this config's.</div>`;
-  else if (r?.current) note = `<div class="sch-note warn">⚠ Changed in the app since this config (${esc(schedWhat(si, cmp))}). An edit in the app is a custom change until Loxone Config saves the program: Apply refuses while one is pending, and replaces it with the config's switching times when you allow that.</div>`;
-  else note = `<div class="sch-note warn">The Miniserver runs other switching times than this revision (${esc(schedWhat(si, cmp))}).</div>`;
-  rows.push(note);
+  else if (r?.kind === "pending") note = `<div class="sch-note warn">⚠ The Miniserver runs other switching times (${esc(cmp.what)}). Apply would replace them with this config's.</div>`;
+  else if (r?.current) note = `<div class="sch-note warn">⚠ Changed in the app since this config (${esc(cmp.what)}). An edit in the app is a custom change until Loxone Config saves the program: Apply refuses while one is pending, and replaces it with the config's switching times when you allow that.</div>`;
+  else note = `<div class="sch-note warn">The Miniserver runs other switching times than this revision (${esc(cmp.what)}).</div>`;
+  out.push(note);
   if (si.analog && (si.default != null || live)) {
     const differs = cmp?.defDiff;
-    rows.push(row("Default value", `${si.default != null ? esc(schedVal(si.default)) : '<span class="none-v">—</span>'}${live ? ` <span class="sch-live${differs ? " diff" : ""}" title="The Miniserver's">${esc(schedVal(live.default))}</span>` : ""}`, differs ? "pr-chg" : ""));
+    out.push(row("Default value", `${si.default != null ? esc(numText(si.default)) : '<span class="none-v">—</span>'}${live ? ` <span class="sch-live${differs ? " diff" : ""}" title="The Miniserver's">${esc(numText(live.default))}</span>` : ""}`, differs ? "pr-chg" : ""));
   }
-  const modes = si.modes.map((m) => m.number);
-  for (const e of [...(live?.entries || []), ...si.entries]) if (!modes.includes(e.mode)) modes.push(e.mode);
-  rows.push(`<div class="sch-grid"><div class="sch-axis"><span></span><span class="sch-hours"><i>0</i><i>6</i><i>12</i><i>18</i><i>24 h</i></span></div>` + modes.map((n) => {
-    const mine = schedOf(si.entries, n), theirs = live ? schedOf(live.entries, n) : null;
-    const differs = cmp?.modes.includes(n);
-    const m = si.modes.find((x) => x.number === n);
-    const name = m?.target ? `<button type="button" class="lnk" data-go="${esc(m.target.uuid)}" data-page="${esc(m.target.page || "")}" title="${esc(m.title)}">${esc(m.title)}</button>` : `<span title="${esc(schedModeTitle(si, n))}">${esc(schedModeTitle(si, n))}</span>`;
-    const was = changedHere.has(n) ? `<div class="sch-was">was ${esc(schedLine(schedOf(si.old_entries, n), si.analog))}</div>` : "";
-    return `<div class="sch-row${differs ? " diff" : ""}${changedHere.has(n) ? " chg" : ""}"><div class="sch-mode">${name}</div><div class="sch-bars">${schedBar(mine, si, "cfg")}${theirs ? schedBar(theirs, si, "live") : ""}</div>${was}${differs ? `<div class="sch-was">Miniserver: ${esc(schedLine(theirs, si.analog))}</div>` : ""}</div>`;
+  out.push(`<div class="sch-grid"><div class="sch-axis"><span></span><span class="sch-hours"><i>0</i><i>6</i><i>12</i><i>18</i><i>24 h</i></span></div>` + rows.map((x) => {
+    const name = x.target ? `<button type="button" class="lnk" data-go="${esc(x.target.uuid)}" data-page="${esc(x.target.page || "")}" title="${esc(x.title)}">${esc(x.title)}</button>` : `<span title="${esc(x.title)}">${esc(x.title)}</span>`;
+    const chg = marks && x.changed;
+    const was = chg ? `<div class="sch-was">was ${esc(schedLine(x.old, si.analog))}</div>` : "";
+    return `<div class="sch-row${x.differs ? " diff" : ""}${chg ? " chg" : ""}"><div class="sch-mode">${name}</div><div class="sch-bars">${schedBar(x.mine, si, "cfg")}${x.theirs ? schedBar(x.theirs, si, "live") : ""}</div>${was}${x.differs ? `<div class="sch-was">Miniserver: ${esc(schedLine(x.theirs, si.analog))}</div>` : ""}</div>`;
   }).join("") + `</div>`);
-  if (live) rows.push(`<div class="sch-legend"><span class="sch-key cfg"></span>this config <span class="sch-key live"></span>the Miniserver</div>`);
-  return rows;
+  if (live) out.push(`<div class="sch-legend"><span class="sch-key cfg"></span>this config <span class="sch-key live"></span>the Miniserver</div>`);
+  return out;
 }
-function schedWhat(si, cmp) {
-  const parts = cmp.modes.map((n) => schedModeTitle(si, n));
-  if (cmp.defDiff) parts.push("default value");
-  return parts.join(", ");
-}
-/** The schedules a pending config would change on the Miniserver: those whose live entries differ. */
-function scheduleConflicts(view) {
+/** The schedules (`/api/schedules` of a revision) whose live entries differ: what Apply would replace. */
+function scheduleConflicts(blocks) {
   const out = [];
-  for (const o of Object.values(view?.objects || {})) {
-    const si = o.schedule;
-    const live = si && o.status !== "removed" && liveSchedule(si);
+  for (const b of blocks) {
+    const live = liveSchedule(b.schedule);
     if (!live) continue;
-    const cmp = schedCompare(si, live);
-    if (!cmp.same) out.push(`${autoTitle(o.title) ? prettyType(o.ty) : o.title}: ${schedWhat(si, cmp)}`);
+    const cmp = schedCompare(b.schedule, live);
+    if (!cmp.same) out.push(`${autoTitle(b.title) ? prettyType(b.ty) : b.title}: ${cmp.what}`);
   }
   return out;
 }
 
-/** The weather server's current weather: its `actual` state, else the forecast's hour that has begun. */
+/** The Miniserver's clock as Loxone time (seconds since 2009-01-01 in its local time), from its
+ *  `miniserverTime` state; undefined until that came. */
+function msLoxTime() {
+  const m = /^(\d+)-(\d+)-(\d+) (\d+):(\d+)(?::(\d+))?/.exec(S.live.values.get(S.live.globals?.miniserverTime)?.[0] || "");
+  if (!m) return undefined;
+  const [y, mo, d, h, mi, sec] = m.slice(1).map((x) => Number(x || 0));
+  return (Date.UTC(y, mo - 1, d, h, mi, sec) - Date.UTC(2009, 0, 1)) / 1000;
+}
+/** The weather server's current weather: its `actual` state, else the forecast's hour that has begun on the
+ *  Miniserver's clock (its timestamps are in the Miniserver's local time, not the browser's). */
 function weatherNow() {
   const gl = S.live.globals || {};
   const tab = (k) => { const v = S.live.values.get(gl[k])?.[0]; return v && v.weather && v.entries?.length ? v : null; };
   const a = tab("weather.actual");
-  if (a) return { entry: a.entries[0], what: "current weather", table: a };
+  if (a) return { entry: a.entries[0], what: "current weather" };
   const f = tab("weather.forecast");
-  if (!f) return null;
-  // Loxone time: seconds since 2009-01-01, the Miniserver's local time.
-  const now = (Date.now() - Date.UTC(2009, 0, 1)) / 1000 - new Date().getTimezoneOffset() * 60;
+  const now = msLoxTime();
+  if (!f || now === undefined) return null;
   const past = f.entries.filter((e) => e.time <= now);
-  return { entry: past.length ? past[past.length - 1] : f.entries[0], what: "forecast for this hour", table: f };
+  return past.length ? { entry: past[past.length - 1], what: "forecast for this hour" } : null;
 }
 /** A weather data block's `WType=` → the field of a weather entry, and what it is. */
 const WEATHER_FIELDS = {
@@ -2507,20 +2521,59 @@ function weatherRows(row) {
   const w = weatherNow();
   if (!w) return { rows: [`<div class="empty">The Miniserver sends no weather (it needs a weather subscription).</div>`], count: 0 };
   const rows = [row("From", esc(w.what))];
-  for (const [k, label] of Object.values(WEATHER_FIELDS)) if (w.entry[k] !== undefined) rows.push(row(label, `<span class="lv computed">${esc(schedVal(w.entry[k]))}</span>`));
+  for (const [k, label] of Object.values(WEATHER_FIELDS)) if (w.entry[k] !== undefined) rows.push(row(label, `<span class="lv computed">${esc(numText(w.entry[k]))}</span>`));
   return { rows, count: rows.length - 1 };
 }
 
-/** A Status block (the app's TextState): its live text with the icon and colour the Miniserver gives. */
-function statusRows(o, row) {
+/** The icon names the structure file lists: only those are shown (and `/api/app/icon` serves no other). */
+function appIconNames() {
+  const a = S.app;
+  if (!a) return new Set();
+  if (appIconNames.app === a) return appIconNames.set;
+  const set = new Set();
+  for (const k of ["rooms", "cats", "controls"]) for (const x of Object.values(a[k] || {})) if (x.image) set.add(x.image);
+  appIconNames.app = a; appIconNames.set = set;
+  return set;
+}
+/** A live value's icon (e[4]), when the structure file knows it. */
+function lvIcon(e) { return e?.[4] && appIconNames().has(e[4]) ? appIcon(e[4]) : ""; }
+/** A Status block (the app's TextState): its live text with the icon and colour the Miniserver gives. The icon
+ *  shows when the structure file lists it; else its colour. */
+function statusRows(o) {
   if (!liveHere()) return null;
   const st = S.live.controls[o.uuid]?.states || {};
   if (!st.textAndIcon) return null;
   const text = S.live.values.get(st.textAndIcon);
-  let ic = text?.[4] || null, color = null;
-  try { const j = JSON.parse(S.live.values.get(st.iconAndColor)?.[0] || "null"); ic = j?.icon || ic; color = j?.color || null; } catch { /* not JSON */ }
+  let ic = null, color = null;
+  try { const j = JSON.parse(S.live.values.get(st.iconAndColor)?.[0] || "null"); ic = j?.icon || null; color = j?.color || null; } catch { /* not JSON */ }
+  const icon = ic && appIconNames().has(ic) ? appIcon(ic) : "";
   const sw = color && /^#[0-9a-f]{3,8}$/i.test(color) ? `<span class="swatch" style="background:${color}" title="${esc(color)}"></span>` : "";
-  return [`<div class="status-live">${ic ? appIcon(ic) : ""}${sw}<span>${text ? esc(liveText(text)) : '<span class="none-v">no value</span>'}</span></div>`];
+  return [`<div class="status-live">${icon}${sw}<span>${text ? esc(liveText(text)) : '<span class="none-v">no value</span>'}</span></div>`];
+}
+
+/** The Properties sections built from live values other than a connector's: they are rebuilt when one of the
+ *  states they read (`deps`) changes. */
+function liveSections(o, row, marks) {
+  const out = [];
+  const st = S.live.controls[o.uuid]?.states || {};
+  const stat = statusRows(o);
+  if (stat) out.push({ name: "Status", rows: stat, deps: [st.textAndIcon, st.iconAndColor] });
+  if (o.schedule) out.push({ name: "Schedule", rows: scheduleRows(o, row, marks), count: o.schedule.cols.length, deps: [o.schedule.state] });
+  if (o.ty === "WeatherServer") {
+    const w = weatherRows(row), gl = S.live.globals || {};
+    if (w) out.push({ name: "Weather", rows: w.rows, count: w.count, deps: [gl["weather.actual"], gl["weather.forecast"], gl.miniserverTime] });
+  }
+  return out;
+}
+function liveSectionsRefresh(ch) {
+  const o = S.sel && S.view?.objects[S.sel];
+  if (!o || !ch) return;
+  const marks = S.marks && S.view.compared;
+  for (const sec of liveSections(o, propRow, marks)) {
+    if (!sec.deps.some((d) => d && ch.has(d))) continue;
+    const body = document.querySelector(`#props .ps-b[data-body="${CSS.escape(sec.name)}"]`);
+    if (body) body.innerHTML = sec.rows.join("");
+  }
 }
 
 function renderLiveSwitch() {
@@ -2741,13 +2794,14 @@ function liveApply(ch) {
   }
   document.querySelectorAll("#props [data-lv], #deploy-new [data-lv]").forEach((n) => {
     const e = liveVal(n.dataset.lv);
-    const txt = e ? clip(liveText(e), 40) : "no value";
-    const changed = n.textContent !== txt;
-    n.textContent = txt;
+    const html = lvInner(e);
+    const changed = n.innerHTML !== html;
+    if (changed) n.innerHTML = html;
     n.className = "lv" + (e ? "" : " none") + (e?.[3] ? " " + e[3] : "");
     n.title = e?.[2] || "";
     if (ch && e && changed) flash(n);
   });
+  liveSectionsRefresh(ch);
   modesLive();
 }
 function flash(n) {
