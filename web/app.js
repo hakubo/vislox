@@ -1335,11 +1335,10 @@ function renderPull() {
   const b = $("btn-pull");
   // A config repository without a usable lox setup still gets the button, disabled, to say why.
   b.classList.toggle("hidden", !info.shown);
-  const blk = msBlocked();
-  b.disabled = pulling || !info.available || !!blk;
+  b.disabled = pulling || !info.available;
   b.classList.toggle("busy", pulling);
   b.querySelector(".lbl").textContent = pulling ? "Pulling…" : "Pull from Miniserver";
-  b.title = !info.available ? `Cannot pull: ${info.reason}` : blk ? `Cannot pull: ${blk}` : "Download the Miniserver's current config and commit it (lox config pull)";
+  b.title = !info.available ? `Cannot pull: ${info.reason}` : "Download the Miniserver's current config and commit it (lox config pull)" + msWarn("pull");
 }
 function pullMsg(text, cls) {
   const m = $("pull-msg");
@@ -1372,7 +1371,10 @@ $("pull-msg").onclick = () => pullMsg("");
 // The server checks the Miniserver lox talks to (its web port, FTP, the unauthenticated
 // jdev/cfg/apiKey, lox's token) and refuses Pull, Apply and Sync when they could not work.
 S.ms = null;
-function msBlocked() { return S.ms?.available ? S.ms.blocked || "" : ""; }
+// What the last check found against an action. It only warns: the server checks again when the
+// button is clicked, so a cause that has cleared does not keep the button off.
+function msBlocked(what) { return S.ms?.available ? S.ms.blocked?.[what] || "" : ""; }
+function msWarn(what) { const b = msBlocked(what); return b ? `\n\n⚠ The last check found: ${b}. It is checked again when you click.` : ""; }
 async function loadMs(fresh) {
   try { S.ms = await api("/api/miniserver" + (fresh ? "?fresh=1" : "")); } catch { return; }
   renderMs(); renderPull(); renderActions();
@@ -1381,10 +1383,12 @@ function renderMs() {
   const m = S.ms, chip = $("ms-chip");
   chip.classList.toggle("hidden", !m?.available);
   if (!m?.available) { closeMsPop(); return; }
-  const state = m.blocked ? "bad" : m.warnings.length ? "warn" : "ok";
+  const blocked = ["pull", "apply", "sync"].filter((w) => m.blocked?.[w]);
+  const why = [...new Set(blocked.map((w) => m.blocked[w]))];
+  const state = blocked.length ? "bad" : m.warnings.length ? "warn" : "ok";
   chip.className = "ms-chip " + state;
   $("ms-lbl").textContent = m.reachable ? [m.serial, m.firmware].filter(Boolean).join(" · ") || "Miniserver" : "Miniserver unreachable";
-  chip.title = m.blocked ? `Miniserver: ${m.blocked}`
+  chip.title = why.length ? `Miniserver: ${why.join("\n")}`
     : `Miniserver ${m.serial || ""} at ${m.host}` + (m.warnings.length ? `\n${m.warnings.join("\n")}` : "");
   const tls = { on: "available", none: "none", expired: "certificate expired", unknown: "unknown" }[m.tls] || "unknown";
   const tok = m.tokenValidUntil ? new Date(m.tokenValidUntil * 1000).toLocaleString([], { ...MONTH, year: "numeric", hour: "2-digit", minute: "2-digit" }) + (m.tokenValidUntil * 1000 < Date.now() ? " (expired)" : "") : "no token yet";
@@ -1397,7 +1401,7 @@ function renderMs() {
         + row("Live-update slot", m.eventSlots == null ? "" : m.eventSlots ? "free" : "none free") : ""}
       ${row("lox's token valid until", tok)}</dl>
     ${m.checks.map((c) => `<div class="chk ${c.ok ? "ok" : "bad"}"><span class="dot" aria-hidden="true"></span><span><b>${esc(c.name)}</b> <span class="d">${esc(c.ok ? (c.detail === "answers" ? "answers" : "answers: " + c.detail) : c.detail)}</span></span></div>`).join("")}
-    ${m.blocked ? `<div class="blocked">Pull, Apply and Sync are off: ${esc(m.blocked)}</div>` : ""}
+    ${why.map((y) => `<div class="blocked">${esc(blocked.filter((w) => m.blocked[w] === y).map((w) => w[0].toUpperCase() + w.slice(1)).join(", "))} would fail: ${esc(y)}</div>`).join("")}
     ${m.warnings.length ? `<ul class="warns">${m.warnings.map((w) => `<li>${esc(w)}</li>`).join("")}</ul>` : ""}`;
   $("ms-when").textContent = "Checked " + new Date(m.checked * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
 }
@@ -1462,25 +1466,23 @@ function renderActions() {
   if (!a?.shown) return;
   const busy = !!a.running;
   const pend = pendingChange();
-  const blk = msBlocked();
   $("deploy-pend").classList.toggle("idle", !pend && !a.running);
   $("deploy-pend").textContent = a.running === "Apply" ? "Deploying to the Miniserver… (download, check, upload, restart, verify)"
     : a.running ? `${a.running}…` : pend ? `Compiled changes are pending (${fmtWhen(pend.time)}). Review them, then apply.`
     : !a.apply.available ? `Apply is off: ${a.apply.reason}.`
     : "Nothing pending. Edit the project's module and compile it (lox logic …); the result shows here for review.";
   $("deploy-row").classList.toggle("hidden", !pend && !a.running);
-  $("btn-apply").disabled = !a.apply.available || busy || !pend || !!blk;
+  $("btn-apply").disabled = !a.apply.available || busy || !pend;
   const sync = $("btn-sync");
-  sync.disabled = !a.apply.available || busy || !!pend || !!blk;
+  sync.disabled = !a.apply.available || busy || !!pend;
   sync.classList.toggle("busy", a.running === "Sync");
   sync.querySelector(".lbl").textContent = a.running === "Sync" ? "Syncing…" : "Sync from Miniserver";
   sync.title = !a.apply.available ? `Cannot sync: ${a.apply.reason}`
-    : blk ? `Cannot sync: ${blk}`
     : pend ? "Apply or discard the pending changes first"
-    : "Make the Miniserver's running config the project's base (lox config merge), then commit and push";
+    : "Make the Miniserver's running config the project's base (lox config merge), then commit and push" + msWarn("sync");
   $("btn-discard").disabled = !a.apply.available || busy || !pend;
-  $("btn-apply").title = !a.apply.available ? `Cannot apply: ${a.apply.reason}` : blk ? `Cannot apply: ${blk}`
-    : "Deploy to the Miniserver with lox config push, then commit and push to git";
+  $("btn-apply").title = !a.apply.available ? `Cannot apply: ${a.apply.reason}`
+    : "Deploy to the Miniserver with lox config push, then commit and push to git" + msWarn("apply");
   renderSteps(a);
   const last = a.last;
   if (last && last.at !== renderActions.shownAt) {

@@ -160,23 +160,24 @@ try {
     await page.waitForFunction(() => /^Pulled/.test(document.querySelector("#pull-msg")?.textContent || ""), null, { timeout: 15000 });
     await page.waitForFunction(() => [...document.querySelectorAll(".hrev .lbl")].some((n) => n.textContent === "Backup v2"), null, { timeout: 10000 });
   });
-  await step("blocked FTP turns Pull off and says so", async () => {
+  await step("blocked FTP warns on Pull, and the server refuses it", async () => {
     await new Promise((ok) => { ftp.close(ok); for (const s of ftpSockets) s.destroy(); });
     // "Check again" reuses a check from the last 2 s (the pull just ran one).
     await page.waitForTimeout(2500);
     await page.click("#ms-chip");
     await page.click("#ms-recheck");
     await page.waitForSelector("#ms-chip.bad");
-    assert.ok(await page.$eval("#btn-pull", (b) => b.disabled));
-    assert.match(await page.getAttribute("#btn-pull", "title"), /^Cannot pull: FTP \(port \d+\) is blocked between this host and the Miniserver/);
-    // The server refuses as well, whatever the page shows.
-    const r = await page.evaluate(() => fetch("/api/pull", { method: "POST", headers: { "X-Vislox": "pull" } }).then(async (r) => [r.status, (await r.json()).error]));
-    assert.equal(r[0], 503);
-    assert.match(r[1], /^Cannot pull: FTP/);
+    assert.match(await page.textContent("#ms-body"), /Pull, Apply, Sync would fail: FTP \(port \d+\) is blocked/);
+    await page.keyboard.press("Escape");
+    // The button stays on (the cause may clear); its tooltip warns.
+    assert.equal(await page.$eval("#btn-pull", (b) => b.disabled), false);
+    assert.match(await page.getAttribute("#btn-pull", "title"), /The last check found: FTP \(port \d+\) is blocked between this host and the Miniserver/);
+    // Clicking it, the server checks and refuses with the reason.
+    await page.click("#btn-pull");
+    await page.waitForFunction(() => /^Cannot pull: FTP \(port \d+\) is blocked/.test(document.querySelector("#pull-msg")?.textContent || ""), null, { timeout: 15000 });
     // The browser logs that refusal; it is the one expected here.
     const i = errors.findIndex((e) => e.includes("status of 503"));
     if (i >= 0) errors.splice(i, 1);
-    await page.keyboard.press("Escape");
   });
   await step("keyboard help opens and closes", async () => {
     await page.focus("#canvas");

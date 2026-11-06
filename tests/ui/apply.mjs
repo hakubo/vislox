@@ -6,10 +6,13 @@
 //   VISLOX_BIN=target/release/vislox node tests/ui/apply.mjs
 //
 // Nothing here talks to a Miniserver: lox is a script, and the lox
-// configuration points at a closed port, so vislox does not follow the
-// restart itself (the unit tests in src/restart.rs and src/actions.rs do).
+// configuration points at a port that drops every connection, so vislox does
+// not follow the restart itself (the unit tests in src/restart.rs and
+// src/actions.rs do). The port takes connections, and a stand-in FTP server
+// greets, so that the preflight before Apply passes.
 import { chromium } from "playwright";
 import { spawn, execFileSync } from "node:child_process";
+import { createServer as createTcpServer } from "node:net";
 import { mkdtempSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
@@ -36,10 +39,14 @@ git("commit", "-q", "-m", "Deployed");
 git("remote", "add", "origin", join(root, "remote.git"));
 git("push", "-q", "-u", "origin", "HEAD");
 
-// A lox configuration at a closed port, so no real Miniserver is reached.
+// A lox configuration at a port that drops every connection, so no real
+// Miniserver is reached, and an FTP server that only greets.
+const listen = (srv) => new Promise((ok) => srv.listen(0, "127.0.0.1", () => ok(srv.address().port)));
+const webPort = await listen(createTcpServer((s) => s.destroy()));
+const ftpPort = await listen(createTcpServer((s) => { s.on("error", () => {}); s.end("220 fake FTP\r\n"); }));
 const loxDir = mkdtempSync(join(tmpdir(), "vislox-lox-"));
 const loxConfig = join(loxDir, "config.yaml");
-writeFileSync(loxConfig, "host: 127.0.0.1:9\nuser: u\npass: p\nserial: 504F94000001\n");
+writeFileSync(loxConfig, `host: 127.0.0.1:${webPort}\nuser: u\npass: p\nserial: 504F94000001\n`);
 const fakeLox = join(loxDir, "lox");
 writeFileSync(fakeLox, `#!/bin/sh
 case "$1 $2" in
@@ -66,7 +73,7 @@ const server = spawn(bin, [dir, "--listen", `127.0.0.1:${port}`, "--lox", fakeLo
   stdio: ["ignore", "ignore", "pipe"],
   // Apply commits: a runner without a git identity needs one.
   env: {
-    ...process.env, LOX_CONFIG: loxConfig,
+    ...process.env, LOX_CONFIG: loxConfig, VISLOX_FTP_PORT: String(ftpPort),
     GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@example.com", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@example.com",
   },
 });

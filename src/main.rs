@@ -507,9 +507,10 @@ async fn api_miniserver(State(app): State<Arc<App>>, Query(q): Query<MsQuery>) -
 }
 
 /// Refuse Pull, Apply and Sync when the Miniserver cannot be reached the
-/// way lox needs it (its web port, FTP), with the reason.
-async fn preflight(app: &App, what: &str) -> Option<Response> {
-    let why = app.ms.preflight().await.err()?;
+/// way lox needs it (FTP; for Apply also its web port), with the reason.
+async fn preflight(app: &App, what: miniserver::Action) -> Option<Response> {
+    let why = app.ms.preflight(what).await.err()?;
+    let what = format!("{what:?}").to_lowercase();
     Some(
         (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -533,8 +534,10 @@ async fn api_pull(State(app): State<Arc<App>>, headers: axum::http::HeaderMap) -
         )
             .into_response();
     }
+    // A pull already running refuses at once, without a check.
     if app.pull.why_not().is_none()
-        && let Some(r) = preflight(&app, "pull").await
+        && !app.pull.busy()
+        && let Some(r) = preflight(&app, miniserver::Action::Pull).await
     {
         return r;
     }
@@ -565,8 +568,8 @@ async fn api_apply(
     if let Err(r) = app.actions.check(&headers) {
         return refused(r);
     }
-    if app.actions.info()["apply"]["available"] == true
-        && let Some(r) = preflight(&app, "apply").await
+    if app.actions.wants_miniserver()
+        && let Some(r) = preflight(&app, miniserver::Action::Apply).await
     {
         return r;
     }
@@ -607,8 +610,8 @@ async fn api_sync(State(app): State<Arc<App>>, headers: axum::http::HeaderMap) -
     if let Err(r) = app.actions.check(&headers) {
         return refused(r);
     }
-    if app.actions.info()["apply"]["available"] == true
-        && let Some(r) = preflight(&app, "sync").await
+    if app.actions.wants_miniserver()
+        && let Some(r) = preflight(&app, miniserver::Action::Sync).await
     {
         return r;
     }

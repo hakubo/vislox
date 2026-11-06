@@ -2,13 +2,15 @@
 //!
 //! Everything here only reads, and nothing logs in:
 //! - a TCP connect to the HTTP(S) port lox talks to (443, or the port in
-//!   lox's `host`),
-//! - `jdev/cfg/apiKey`, which the Miniserver answers without a login: serial,
-//!   firmware version, TLS state (`httpsStatus`), whether it sees this host
-//!   as local, and (on some versions) whether a live-update slot is free,
+//!   lox's `host`). Apply needs it: lox restarts the program over HTTP(S),
 //! - a TCP connect to FTP (port 21) and its greeting. lox does Pull, Apply
 //!   and Sync over FTP, and live values only need the HTTP port, so a
 //!   firewall can leave live values working while Pull and Apply fail,
+//! - `jdev/cfg/apiKey`, which the Miniserver answers without a login: serial,
+//!   firmware version, TLS state (`httpsStatus`), whether it sees this host
+//!   as local, and (on some versions) whether a live-update slot is free.
+//!   Its format is not documented in full, so it only informs: a reply that
+//!   cannot be read is a warning and never blocks anything,
 //! - when lox's token expires (its `token.json`, shared with lox on purpose:
 //!   vislox requests no token of its own).
 //!
@@ -29,18 +31,40 @@ use tokio::net::TcpStream;
 const TIMEOUT: Duration = Duration::from_secs(4);
 /// "Check again" from the page (no token needed) reuses a check this recent.
 const MIN_AGE: Duration = Duration::from_secs(2);
+/// Pull, Apply and Sync reuse a check this recent, so that the retries of an
+/// Apply (after the user allows something) do not check again each time.
+const PREFLIGHT_AGE: Duration = Duration::from_secs(10);
 /// A check this old is redone for the status chip.
 const MAX_AGE: Duration = Duration::from_secs(60);
 
+/// What needs the Miniserver, and so a preflight.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Action {
+    Pull,
+    Apply,
+    Sync,
+}
+
+impl Action {
+    fn key(self) -> &'static str {
+        match self {
+            Action::Pull => "pull",
+            Action::Apply => "apply",
+            Action::Sync => "sync",
+        }
+    }
+}
+
 pub struct Miniserver {
     target: Result<Target, String>,
+    /// The last check: when it started, and what it found.
     last: Mutex<Option<(Instant, Arc<Value>)>>,
     probing: tokio::sync::Mutex<()>,
 }
 
 struct Target {
     conn: Connection,
-    /// The address without scheme and port.
+    /// The address to connect to: no scheme, port or IPv6 brackets.
     addr: String,
     http_port: u16,
     ftp_port: u16,
@@ -90,8 +114,9 @@ impl Miniserver {
         }
     }
 
-    /// The status, checked again when older than `max_age`.
-    pub async fn status(&self, max_age: Duration) -> Arc<Value> {
+    /// The status, checked again when the last check started more than
+    /// `max_age` ago.
+    async fn status(&self, max_age: Duration) -> Arc<Value> {
         let t = match &self.target {
             Ok(t) => t,
             Err(why) => return Arc::new(json!({ "available": false, "reason": why })),
@@ -102,20 +127,21 @@ impl Miniserver {
                 .lock()
                 .unwrap()
                 .as_ref()
-                .filter(|(at, _)| ok(*at))
+                .filter(|(started, _)| ok(*started))
                 .map(|(_, v)| v.clone())
         };
-        if let Some(v) = reuse(&|at| at.elapsed() < max_age) {
+        if let Some(v) = reuse(&|started| started.elapsed() < max_age) {
             return v;
         }
-        // One check at a time: whoever waited gets the check that ran
-        // meanwhile, which started after it asked.
+        // One check at a time. Whoever waited may take a check that ran
+        // meanwhile, but only one that started after it asked.
         let _one = self.probing.lock().await;
-        if let Some(v) = reuse(&|at| at >= asked) {
+        if let Some(v) = reuse(&|started| started >= asked) {
             return v;
         }
+        let started = Instant::now();
         let v = Arc::new(probe(t).await);
-        *self.last.lock().unwrap() = Some((Instant::now(), v.clone()));
+        *self.last.lock().unwrap() = Some((started, v.clone()));
         v
     }
 
@@ -129,19 +155,22 @@ impl Miniserver {
         self.status(MIN_AGE).await
     }
 
-    /// Before Pull, Apply and Sync: check again, and say why not when the
-    /// Miniserver cannot be reached the way lox needs it. Without a
-    /// connection to check (`--no-live`, no lox configuration), lox finds out.
-    pub async fn preflight(&self) -> Result<(), String> {
-        let v = self.status(Duration::ZERO).await;
-        match v["blocked"].as_str() {
+    /// Before Pull, Apply and Sync: check (again, unless a check started
+    /// in the last few seconds), and say why not when the Miniserver cannot
+    /// be reached the way lox needs it for `what`. Without a connection to
+    /// check (`--no-live`, no lox configuration), lox finds out.
+    pub async fn preflight(&self, what: Action) -> Result<(), String> {
+        let v = self.status(PREFLIGHT_AGE).await;
+        match v["blocked"][what.key()].as_str() {
             Some(why) => Err(why.to_string()),
             None => Ok(()),
         }
     }
 }
 
-/// `https://host:port/` → (`host`, port); the port defaults by scheme.
+/// `https://host:port/` → (address, port); the port defaults by scheme, and
+/// an IPv6 address loses its brackets (`[::1]` → `::1`) so it can be
+/// connected to.
 fn split_host(host: &str) -> (String, u16) {
     let (rest, default) = if let Some(r) = host.strip_prefix("http://") {
         (r, 80)
@@ -149,10 +178,18 @@ fn split_host(host: &str) -> (String, u16) {
         (host.strip_prefix("https://").unwrap_or(host), 443)
     };
     let rest = rest.split('/').next().unwrap_or(rest);
+    if let Some(v6) = rest.strip_prefix('[')
+        && let Some((addr, after)) = v6.split_once(']')
+    {
+        let port = after
+            .strip_prefix(':')
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(default);
+        return (addr.to_string(), port);
+    }
     match rest.rsplit_once(':') {
-        Some((h, p)) if !h.contains(':') || h.ends_with(']') => {
-            (h.to_string(), p.parse().unwrap_or(default))
-        }
+        // A bare IPv6 address has more than one colon: no port.
+        Some((h, p)) if !h.contains(':') => (h.to_string(), p.parse().unwrap_or(default)),
         _ => (rest.to_string(), default),
     }
 }
@@ -162,10 +199,13 @@ fn split_host(host: &str) -> (String, u16) {
 fn parse_api_key(body: &str) -> Result<ApiKey, String> {
     let v: Value = serde_json::from_str(body).map_err(|_| "not a Miniserver reply".to_string())?;
     let ll = &v["LL"];
-    let code = ll["Code"]
-        .as_str()
-        .map(String::from)
-        .or_else(|| ll["code"].as_i64().map(|c| c.to_string()))
+    let code = [&ll["Code"], &ll["code"]]
+        .into_iter()
+        .find_map(|c| match c {
+            Value::String(s) => Some(s.clone()),
+            Value::Number(n) => Some(n.to_string()),
+            _ => None,
+        })
         .unwrap_or_default();
     if code != "200" {
         return Err(format!("the Miniserver answered {code}"));
@@ -250,9 +290,15 @@ async fn ftp_greeting(addr: &str, port: u16) -> Result<String, String> {
 }
 
 async fn api_key(conn: &Connection) -> Result<ApiKey, String> {
+    // As lox's own client: no certificate check unless asked for, and no
+    // redirect to another host (a Gen 2 Miniserver sends local HTTP to its
+    // *.dyndns.loxonecloud.com name).
     let client = reqwest::Client::builder()
         .timeout(TIMEOUT)
         .danger_accept_invalid_certs(!conn.verify_ssl)
+        .redirect(loxone_client::LoxClient::same_origin_redirect_policy(
+            &conn.host,
+        ))
         .build()
         .map_err(|e| e.to_string())?;
     let r = client
@@ -277,15 +323,18 @@ fn read_version(path: &PathBuf) -> Option<String> {
 async fn probe(t: &Target) -> Value {
     let (web, ftp) = tokio::join!(
         async {
-            connect(&t.addr, t.http_port).await?;
-            api_key(&t.conn).await
+            match connect(&t.addr, t.http_port).await {
+                Ok(_) => (Ok(()), Some(api_key(&t.conn).await)),
+                Err(e) => (Err(e), None),
+            }
         },
         ftp_greeting(&t.addr, t.ftp_port),
     );
-    let token = TokenStore::load_for(&t.conn).map(|ts| ts.valid_until as i64);
-    let (current, proposed) = (t.current.clone(), t.proposed.clone());
-    let (cfg_current, cfg_pending) = tokio::task::spawn_blocking(move || {
+    let (web, key) = web;
+    let (conn, current, proposed) = (t.conn.clone(), t.current.clone(), t.proposed.clone());
+    let (token, cfg_current, cfg_pending) = tokio::task::spawn_blocking(move || {
         (
+            TokenStore::load_for(&conn).map(|ts| ts.valid_until as i64),
             read_version(&current),
             proposed.as_ref().and_then(read_version),
         )
@@ -298,6 +347,7 @@ async fn probe(t: &Target) -> Value {
         http_port: t.http_port,
         ftp_port: t.ftp_port,
         web,
+        key,
         ftp,
         token,
         now: chrono::Utc::now().timestamp(),
@@ -311,7 +361,10 @@ struct Report<'a> {
     addr: &'a str,
     http_port: u16,
     ftp_port: u16,
-    web: Result<ApiKey, String>,
+    /// Whether the web port takes a connection.
+    web: Result<(), String>,
+    /// `jdev/cfg/apiKey`, when the web port took the connection.
+    key: Option<Result<ApiKey, String>>,
     ftp: Result<String, String>,
     /// When lox's token expires (Unix seconds).
     token: Option<i64>,
@@ -321,10 +374,10 @@ struct Report<'a> {
 }
 
 /// The status as the UI shows it: what was checked, what blocks Pull, Apply
-/// and Sync, and what only deserves a warning.
+/// and Sync (each only by what it needs: FTP, and for Apply the web port),
+/// and what only deserves a warning.
 fn report(r: Report) -> Value {
     let mut warnings: Vec<String> = Vec::new();
-    let mut blocked: Option<String> = None;
     let scheme = if r.host.starts_with("http://") {
         "HTTP"
     } else {
@@ -334,28 +387,39 @@ fn report(r: Report) -> Value {
     let ftp_name = format!("FTP (port {})", r.ftp_port);
     let checks = json!([
         { "name": web_name, "ok": r.web.is_ok(),
-          "detail": match &r.web { Ok(_) => "answers".to_string(), Err(e) => e.clone() } },
+          "detail": match &r.web { Ok(()) => "answers".to_string(), Err(e) => e.clone() } },
         { "name": ftp_name, "ok": r.ftp.is_ok(),
           "detail": match &r.ftp { Ok(g) => g.clone(), Err(e) => e.clone() } },
     ]);
-    let key = r.web.as_ref().ok();
-    if let Err(e) = &r.web {
-        blocked = Some(format!(
-            "the Miniserver does not answer at {} ({}: {e})",
-            r.host, web_name
-        ));
-    }
-    if let Err(e) = &r.ftp {
-        let why = format!(
+    let no_ftp = r.ftp.as_ref().err().map(|e| {
+        format!(
             "{ftp_name} is blocked between this host and the Miniserver ({e}). Pull, Apply and \
              Sync copy the config over FTP: allow TCP 21 and 20 to {}",
             r.addr
-        );
-        // The FTP reason is the useful one when only FTP fails.
-        if blocked.is_none() {
-            blocked = Some(why);
+        )
+    });
+    let no_web = r.web.as_ref().err().map(|e| {
+        format!(
+            "the Miniserver does not answer at {} ({web_name}: {e}). Apply restarts its program \
+             over {scheme}",
+            r.host
+        )
+    });
+    let blocked = json!({
+        "pull": no_ftp,
+        "sync": no_ftp,
+        "apply": no_web.clone().or(no_ftp.clone()),
+    });
+    let key = match &r.key {
+        Some(Ok(k)) => Some(k),
+        Some(Err(e)) => {
+            warnings.push(format!(
+                "The Miniserver answers, but its status (jdev/cfg/apiKey) could not be read: {e}."
+            ));
+            None
         }
-    }
+        None => None,
+    };
     if let Some(k) = key {
         match k.https_status {
             Some(2) => warnings.push("The Miniserver's TLS certificate has expired.".into()),
@@ -409,7 +473,7 @@ fn report(r: Report) -> Value {
         "available": true,
         "checked": r.now,
         "host": r.host,
-        "reachable": key.is_some(),
+        "reachable": r.web.is_ok(),
         "serial": key.and_then(|k| k.serial.clone()),
         "firmware": key.and_then(|k| k.version.clone()),
         "tls": tls,
@@ -446,6 +510,12 @@ mod tests {
                 .unwrap_err()
                 .contains("401")
         );
+        // A numeric code is read too.
+        let numeric = REAL.replace(r#""Code": "200""#, r#""Code": 200"#);
+        assert_eq!(
+            parse_api_key(&numeric).unwrap().serial.as_deref(),
+            Some("504F94A0E454")
+        );
     }
 
     #[test]
@@ -457,7 +527,22 @@ mod tests {
         assert_eq!(split_host("http://ms.local/"), ("ms.local".into(), 80));
         assert_eq!(split_host("https://ms:8443"), ("ms".into(), 8443));
         assert_eq!(split_host("127.0.0.1:9"), ("127.0.0.1".into(), 9));
-        assert_eq!(split_host("https://[::1]:444"), ("[::1]".into(), 444));
+        // IPv6: without brackets, so that it can be connected to.
+        assert_eq!(split_host("https://[::1]:444"), ("::1".into(), 444));
+        assert_eq!(split_host("http://[fe80::1]/"), ("fe80::1".into(), 80));
+        assert_eq!(split_host("fe80::1"), ("fe80::1".into(), 443));
+    }
+
+    #[tokio::test]
+    async fn an_ipv6_host_can_be_connected_to() {
+        // Where the machine has no IPv6 loopback, there is nothing to test.
+        let Ok(l) = tokio::net::TcpListener::bind("[::1]:0").await else {
+            return;
+        };
+        let port = l.local_addr().unwrap().port();
+        let (addr, p) = split_host(&format!("http://[::1]:{port}"));
+        assert_eq!(p, port);
+        assert!(connect(&addr, p).await.is_ok());
     }
 
     #[test]
@@ -479,7 +564,8 @@ mod tests {
             addr: "192.168.1.120",
             http_port: 443,
             ftp_port: 21,
-            web: parse_api_key(REAL),
+            web: Ok(()),
+            key: Some(parse_api_key(REAL)),
             ftp: Ok("220 Welcome".into()),
             token: Some(2_000),
             now: 1_000,
@@ -491,7 +577,10 @@ mod tests {
     #[test]
     fn a_healthy_miniserver_blocks_nothing() {
         let v = report(base());
-        assert_eq!(v["blocked"], Value::Null);
+        assert_eq!(
+            v["blocked"],
+            json!({ "pull": null, "apply": null, "sync": null })
+        );
         assert_eq!(v["warnings"], json!([]));
         assert_eq!(v["serial"], "504F94A0E454");
         assert_eq!(v["tls"], "on");
@@ -504,30 +593,63 @@ mod tests {
             ftp: Err("Connection refused (os error 111)".into()),
             ..base()
         });
-        let why = v["blocked"].as_str().unwrap();
-        assert!(
-            why.starts_with("FTP (port 21) is blocked between this host and the Miniserver"),
-            "{why}"
-        );
-        assert!(why.contains("192.168.1.120"), "{why}");
+        for what in ["pull", "apply", "sync"] {
+            let why = v["blocked"][what].as_str().unwrap();
+            assert!(
+                why.starts_with("FTP (port 21) is blocked between this host and the Miniserver"),
+                "{why}"
+            );
+            assert!(why.contains("192.168.1.120"), "{why}");
+        }
         // Live values still work: the Miniserver itself answers.
         assert_eq!(v["reachable"], true);
     }
 
     #[test]
-    fn an_unreachable_miniserver_is_named_first() {
+    fn a_closed_web_port_blocks_only_apply() {
         let v = report(Report {
-            web: Err("no answer within 4 s".into()),
-            ftp: Err("no answer within 4 s".into()),
+            web: Err("Connection refused".into()),
+            key: None,
             ..base()
         });
         assert!(
-            v["blocked"]
+            v["blocked"]["apply"]
                 .as_str()
                 .unwrap()
                 .starts_with("the Miniserver does not answer at https://192.168.1.120")
         );
+        // Pull and Sync only need FTP.
+        assert_eq!(v["blocked"]["pull"], Value::Null);
+        assert_eq!(v["blocked"]["sync"], Value::Null);
+        assert_eq!(v["reachable"], false);
         assert_eq!(v["serial"], Value::Null);
+    }
+
+    #[test]
+    fn an_unreadable_status_reply_only_warns() {
+        // An apostrophe in a value breaks the single-quote reading; a reply
+        // that cannot be read must not stop anything.
+        let odd = REAL.replace("'certTLD':'com'", "'name':'Olek's house'");
+        for key in [parse_api_key(&odd), Err("HTTP 404 Not Found".to_string())] {
+            assert!(key.is_err());
+            let v = report(Report {
+                key: Some(key),
+                ..base()
+            });
+            assert_eq!(
+                v["blocked"],
+                json!({ "pull": null, "apply": null, "sync": null })
+            );
+            assert_eq!(v["reachable"], true);
+            assert!(
+                v["warnings"][0]
+                    .as_str()
+                    .unwrap()
+                    .contains("jdev/cfg/apiKey) could not be read"),
+                "{}",
+                v["warnings"]
+            );
+        }
     }
 
     #[test]
@@ -536,7 +658,7 @@ mod tests {
             .replace("'httpsStatus':1", "'httpsStatus':2, 'hasEventSlots':false")
             .replace("'local':true", "'local':false");
         let v = report(Report {
-            web: parse_api_key(&reply),
+            key: Some(parse_api_key(&reply)),
             token: Some(500),
             cfg_current: Some("17.2.10.3".into()),
             cfg_pending: Some("17.1.7.27".into()),
@@ -548,7 +670,11 @@ mod tests {
             .iter()
             .map(|w| w.as_str().unwrap())
             .collect();
-        assert_eq!(v["blocked"], Value::Null, "warnings never block");
+        assert_eq!(
+            v["blocked"],
+            json!({ "pull": null, "apply": null, "sync": null }),
+            "warnings never block"
+        );
         assert!(w.iter().any(|w| w.contains("certificate has expired")));
         assert!(w.iter().any(|w| w.contains("remote")));
         assert!(w.iter().any(|w| w.contains("live-update slot")));
@@ -564,6 +690,74 @@ mod tests {
     async fn without_a_connection_nothing_is_checked() {
         let ms = Miniserver::new(Err("turned off".into()), PathBuf::new(), None);
         assert_eq!(ms.chip().await["available"], false);
-        assert!(ms.preflight().await.is_ok());
+        assert!(ms.preflight(Action::Apply).await.is_ok());
+    }
+
+    /// A stand-in Miniserver on the loopback: a web port that closes every
+    /// connection, and an FTP server that greets after `delay` and counts.
+    async fn stand_in(delay: Duration) -> (Miniserver, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let web = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ftp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (web_port, ftp_port) = (
+            web.local_addr().unwrap().port(),
+            ftp.local_addr().unwrap().port(),
+        );
+        tokio::spawn(async move {
+            while let Ok((s, _)) = web.accept().await {
+                drop(s);
+            }
+        });
+        let count = Arc::new(AtomicUsize::new(0));
+        let c = count.clone();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = ftp.accept().await {
+                c.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    let _ = s.write_all(b"220 hi\r\n").await;
+                });
+            }
+        });
+        let ms = Miniserver {
+            target: Ok(Target {
+                conn: Connection::new(format!("http://127.0.0.1:{web_port}"), "u", "p"),
+                addr: "127.0.0.1".into(),
+                http_port: web_port,
+                ftp_port,
+                current: PathBuf::from("/nonexistent"),
+                proposed: None,
+            }),
+            last: Mutex::new(None),
+            probing: tokio::sync::Mutex::new(()),
+        };
+        (ms, count)
+    }
+
+    #[tokio::test]
+    async fn a_new_check_does_not_take_one_that_started_before_it_was_asked_for() {
+        use std::sync::atomic::Ordering;
+        let (ms, count) = stand_in(Duration::from_millis(300)).await;
+        let ms = Arc::new(ms);
+        let first = tokio::spawn({
+            let ms = ms.clone();
+            async move { ms.status(Duration::ZERO).await }
+        });
+        // The first check is under way (FTP has not greeted yet)…
+        while count.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // …so a check asked for now must run on its own.
+        let v = ms.status(Duration::ZERO).await;
+        first.await.unwrap();
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+        // The web port took the connection; its status reply is unreadable,
+        // which only warns.
+        assert_eq!(v["reachable"], true);
+        assert_eq!(v["blocked"]["apply"], Value::Null);
+        // A recent check is reused by the chip and by the preflight.
+        ms.chip().await;
+        assert!(ms.preflight(Action::Pull).await.is_ok());
+        assert_eq!(count.load(Ordering::SeqCst), 2);
     }
 }

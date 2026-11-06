@@ -71,11 +71,12 @@ marked so you can review it before you deploy.
   firmware) with a green, amber or red dot. Click it for the details: address, local or remote, TLS, whether a
   live-update slot is free, when lox's token expires, which Loxone Config version the deployed and pending
   configs were saved with, and whether its web port and FTP (port 21) answer. Before Pull, Apply and Sync, and on
-  start, vislox checks again. When the Miniserver does not answer, or FTP is blocked (Pull, Apply and Sync copy the
-  config over FTP, and live values only need the web port, so a firewall can block one and not the other), the
-  buttons are greyed out with the reason in the tooltip, and the server refuses them too. A config saved with a
-  different Loxone Config version than the firmware, an expired TLS certificate or token, a remote connection
-  and no free live-update slot are shown as warnings.
+  start, vislox checks again, and refuses what could not work, with the reason: Pull, Apply and Sync when FTP is
+  blocked (they copy the config over FTP, and live values only need the web port, so a firewall can block one and
+  not the other), Apply also when the web port does not answer (lox restarts the program over it). The buttons
+  stay on, since the cause may clear; their tooltip warns about what the last check found. A config saved with a
+  different Loxone Config version than the firmware, an expired TLS certificate or token, a remote connection,
+  no free live-update slot and a status reply that cannot be read are shown as warnings.
 
 vislox itself never writes to the config: lox and git do, and only on Pull, Apply and Discard. Live values only
 listen. A pull reads from the Miniserver; only Apply writes to it.
@@ -129,9 +130,12 @@ vislox ~/loxone-config/project --admin-token-file ~/.config/vislox/admin-token
 
 The status chip and the preflight only read, and never log in: a TCP connect to the web port in lox's `host`
 (443 by default) and to FTP (21), then FTP's greeting, and `jdev/cfg/apiKey`, which the Miniserver answers
-without a login. The token's expiry comes from lox's `token.json`. vislox uses lox's token on purpose and
+without a login, and only informs (serial, firmware, TLS, local, slots): the request follows no redirect to
+another host, as lox's own client. The token's expiry comes from lox's `token.json`. vislox uses lox's token on purpose and
 requests none of its own, so it does not show up as a client of its own in the Miniserver's token list (lox's
-is named `lox-cli`). A check is reused for up to a minute (`GET /api/miniserver`, `?fresh=1` checks at once).
+is named `lox-cli`). A check is reused for up to a minute for the chip (`GET /api/miniserver`; `?fresh=1` checks again unless a
+check started in the last 2 s), and for 10 s before Pull, Apply and Sync, so that retrying an Apply does not
+check each time.
 With `--no-live` nothing is checked.
 
 Not shown yet: the token's rights (Config, FTP, program restart) and whether the password is weak. The
