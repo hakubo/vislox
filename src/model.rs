@@ -30,6 +30,18 @@ pub struct View {
     pub compared: bool,
     /// How values flow where the Miniserver streams none (live values).
     pub live: LiveGraph,
+    /// The operating modes calendar entries can switch on, in document
+    /// order (the Operating modes view).
+    pub modes: Vec<ModeInfo>,
+}
+
+/// An operating mode (`Mode`), by the number calendar entries name it with.
+#[derive(Serialize)]
+pub struct ModeInfo {
+    pub uuid: String,
+    /// Its `Mode=` number (absent: 0, the holiday mode).
+    pub number: i64,
+    pub title: String,
 }
 
 /// What the browser needs to give a wire a live value the Miniserver does
@@ -202,7 +214,9 @@ pub struct CalInfo {
     /// The date in the compared revision, when both revisions' dates
     /// decode and differ.
     pub old_when: Option<String>,
-    /// That date by kind.
+    /// That date by kind; also when only the compared revision's date
+    /// decodes (then without `old_when`), so that views of the year can
+    /// show the days the entry no longer has.
     pub old_date: Option<EntryDate>,
     /// The operating mode it switches on.
     pub mode: CalMode,
@@ -874,6 +888,7 @@ pub fn build(new: &LoxoneDoc, old: Option<&LoxoneDoc>, title: &str) -> View {
     }
 
     view.live = live_graph(&nc);
+    view.modes = modes(&nc);
     view.tree = tree(&nc, oc.as_ref(), &d);
     if d.on {
         changes(&mut view, &nc, oc.as_ref().unwrap(), &d);
@@ -1542,14 +1557,17 @@ fn changes(view: &mut View, nc: &Ctx, oc: &Ctx, d: &Delta) {
 fn cal_info(c: &Ctx, old: Option<&Ctx>, uuid: &str) -> Option<CalInfo> {
     let date = c.entry_date(uuid)?;
     let mode = c.entry_mode(uuid);
-    let (mut old_date, mut old_mode) = (None, None);
+    let (mut old_date, mut old_mode, mut old_when) = (None, None, None);
     if let Some(o) = old
         && let Some(od) = o.entry_date(uuid)
     {
-        if let (Ok(a), Ok(b)) = (&od, &date)
-            && a != b
-        {
-            old_date = Some(*a);
+        match (&od, &date) {
+            (Ok(a), Ok(b)) if a != b => {
+                old_date = Some(*a);
+                old_when = Some(a.text());
+            }
+            (Ok(a), Err(_)) => old_date = Some(*a),
+            _ => {}
         }
         let om = o.entry_mode(uuid);
         if !same_mode(&om, &mode) {
@@ -1560,11 +1578,27 @@ fn cal_info(c: &Ctx, old: Option<&Ctx>, uuid: &str) -> Option<CalInfo> {
         when: date.as_ref().ok().map(EntryDate::text),
         why: date.as_ref().err().cloned(),
         date: date.ok(),
-        old_when: old_date.map(|d| d.text()),
+        old_when,
         old_date,
         mode,
         old_mode,
     })
+}
+
+/// The modes of `c` that calendar entries can name, in document order; a
+/// mode whose number an earlier one already has is never switched on.
+fn modes(c: &Ctx) -> Vec<ModeInfo> {
+    let number: HashMap<&str, i64> = c.modes.iter().map(|(n, u)| (u.as_str(), *n)).collect();
+    c.order
+        .iter()
+        .filter_map(|u| {
+            Some(ModeInfo {
+                number: *number.get(u.as_str())?,
+                title: c.title(u),
+                uuid: u.clone(),
+            })
+        })
+        .collect()
 }
 
 /// Whether two revisions' modes of an entry are the same mode: the same
@@ -2375,6 +2409,20 @@ mod tests {
         assert!(cal(&v, XMAS).old_when.is_none() && cal(&v, XMAS).old_mode.is_none());
         // Other objects have no calendar.
         assert!(v.objects[AND].calendar.is_none());
+        // The modes, in document order, by number.
+        let modes: Vec<(i64, &str, &str)> = v
+            .modes
+            .iter()
+            .map(|m| (m.number, m.title.as_str(), m.uuid.as_str()))
+            .collect();
+        assert_eq!(
+            modes,
+            [
+                (0, "Feiertag", HOLIDAY),
+                (1, "Urlaub", "00000000-0000-0002-1500000000000000"),
+                (-1, "Party", PARTY),
+            ]
+        );
     }
 
     #[test]
@@ -2498,7 +2546,13 @@ mod tests {
             "{:?}",
             texts(&v)
         );
-        assert!(cal(&v, NYE).old_when.is_none() && cal(&v, NYE).old_date.is_none());
+        // The year view still gets the old date, to show the days it no
+        // longer has; the change list and Properties do not.
+        assert!(cal(&v, NYE).old_when.is_none());
+        assert_eq!(
+            cal(&v, NYE).old_date,
+            Some(EntryDate::Fixed { month: 12, day: 31 })
+        );
     }
 
     #[test]
@@ -2559,6 +2613,9 @@ mod tests {
         let v = build(&doc(&src), None, "");
         assert_eq!(cal(&v, XMAS).mode.title, "Feiertag");
         assert_eq!(cal(&v, XMAS).mode.target.as_ref().unwrap().uuid, HOLIDAY);
+        // … and is not a mode of the year view.
+        assert!(!v.modes.iter().any(|m| m.title == "Kaputt"));
+        assert_eq!(v.modes[0].uuid, HOLIDAY);
     }
 
     #[test]

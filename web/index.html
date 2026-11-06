@@ -92,6 +92,27 @@
         <label class="lg-dim live-only" id="lg-query" title="Ask the Miniserver every 2 s for the outputs of the blocks behind this page's wires that it does not stream (read-only requests, at most 20 a second)"><input type="checkbox" id="chk-live-query"> Query blocks on this page</label><span class="lg-note lg-qnote live-only" id="query-note"></span>
       </div>
       <div id="minimap" class="hud minimap" aria-hidden="true"><svg id="mm"><g id="mm-objs"></g><rect id="mm-view"/></svg></div>
+      <section id="modes" class="modes hidden" aria-labelledby="md-title">
+        <header class="md-head">
+          <h2 id="md-title" tabindex="-1">Operating modes</h2>
+          <div class="md-years" role="group" aria-label="Year">
+            <button type="button" id="md-prev" title="Previous year (←)" aria-label="Previous year">‹</button>
+            <span id="md-year" aria-live="polite"></span>
+            <button type="button" id="md-next" title="Next year (→)" aria-label="Next year">›</button>
+          </div>
+          <button type="button" id="md-today" class="ghost small">This year</button>
+          <div class="spacer"></div>
+          <button type="button" id="md-close" class="icon-btn" title="Back to the page (Esc)" aria-label="Close the Operating modes view">×</button>
+        </header>
+        <div class="md-legend" id="md-legend" role="group" aria-label="Modes"></div>
+        <div class="md-body">
+          <div class="md-grid" id="md-grid" role="img"></div>
+          <div class="md-side">
+            <h3>Calendar entries <span class="count" id="md-count"></span></h3>
+            <ul class="md-list" id="md-list"></ul>
+          </div>
+        </div>
+      </section>
     </div>
     <nav id="tabs" aria-label="Pages">
       <button id="btn-pages" class="pages-btn" type="button" title="All pages (Ctrl+K)">
@@ -202,6 +223,7 @@
       <dt>Double-click</dt><dd>Zoom to a block · follow a reference to its page</dd>
       <dt>Shift + click history</dt><dd>Compare the viewed revision with that one</dd>
       <dt><kbd>L</kbd></dt><dd>Live values on / off</dd>
+      <dt><kbd>←</kbd> <kbd>→</kbd></dt><dd>In Operating modes: previous / next year</dd>
     </dl>
     <button type="button" class="primary" id="help-close">Close</button>
   </div>
@@ -209,5 +231,6 @@
 
 <div id="tooltip" class="tooltip hidden" role="tooltip"></div>
 <script src="/app.js"></script>
+<script src="/modes.js"></script>
 </body>
 </html>
