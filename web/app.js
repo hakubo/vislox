@@ -915,7 +915,7 @@ function renderProps() {
       ...(() => {
         const d = calDriftOf(o.uuid);
         if (!d) return [];
-        const what = d.kind === "deleted" ? "Deleted in the app. Pull or Sync to take that over." : `Changed in the app: ${d.changes.join("; ")}. Pull or Sync to take it over.`;
+        const what = d.kind === "deleted" ? "Deleted in the app since the deployed config. Pull or Sync to take that over." : `Changed in the app since the deployed config: ${d.changes.join("; ")}. Pull or Sync to take it over.`;
         return [row("In the app", `<span class="cal-app">${esc(what)}</span>`, "pr-chg")];
       })(),
     ]);
@@ -1568,13 +1568,15 @@ async function loadCal(fresh) {
 /** The entries the app changed, against the deployed revision. */
 function calDrift(c = S.cal) { return c?.available && Array.isArray(c.drift) ? c.drift : []; }
 /** How entry `uuid` was changed in the app, when it was and the deployed revision is viewed. */
-function calDriftOf(uuid) { return viewingDeployed() ? calDrift().find((d) => d.uuid === uuid) : undefined; }
+// The drift is against the deployed config (`S.cal.rev`: the last commit, not an edit on disk); it
+// shows on that revision and on what the file on disk holds now.
+function calDriftOf(uuid) { return S.rev === S.cal?.rev || viewingDeployed() ? calDrift().find((d) => d.uuid === uuid) : undefined; }
 function calDriftText(c = S.cal) {
   const d = calDrift(c);
   if (!d.length) return "";
   const n = d.length;
   const by = ["added", "changed", "deleted"].map((k) => [k, d.filter((x) => x.kind === k).length]).filter(([, c]) => c);
-  return `${n} calendar ${n === 1 ? "entry was" : "entries were"} ${by.length === 1 ? by[0][0] : `changed (${by.map(([k, c]) => `${c} ${k}`).join(", ")})`} in the Loxone app. The base vislox shows does not have ${n === 1 ? "it" : "them"}.`;
+  return `${n} calendar ${n === 1 ? "entry was" : "entries were"} ${by.length === 1 ? by[0][0] : `changed (${by.map(([k, c]) => `${c} ${k}`).join(", ")})`} in the Loxone app since the deployed config.`;
 }
 /** What Apply's confirmation says about the calendar entries, from the read just before it:
  * the entries the app changed, or that they could not be checked. A Miniserver that refuses

@@ -1184,8 +1184,20 @@ async fn api_calendar(
     }
 }
 
+/// The revision the app's calendar edits are compared with: the deployed
+/// config. That is the newest commit of the watched file (the last Pull,
+/// Apply or Sync), not an uncommitted edit on disk, which the Miniserver
+/// does not run; without git, the file on disk. Never a pending compile.
+fn deployed_for_calendar(hist: Vec<history::Revision>) -> Option<history::Revision> {
+    let i = hist
+        .iter()
+        .position(|r| r.kind == "git")
+        .or_else(|| hist.iter().position(|r| r.current))?;
+    hist.into_iter().nth(i)
+}
+
 /// The last read of the Miniserver's calendar entries against the deployed
-/// revision (the current one that is not pending). Blocking: it may parse
+/// revision ([`deployed_for_calendar`]). Blocking: it may parse
 /// that revision.
 fn calendar_drift(app: &App) -> Result<Arc<serde_json::Value>, String> {
     let Some(read) = app.calendar.last() else {
@@ -1206,7 +1218,7 @@ fn calendar_drift(app: &App) -> Result<Arc<serde_json::Value>, String> {
     let rev = {
         let h = app.history.lock().unwrap();
         let (_, hist) = h.list();
-        hist.into_iter().find(|r| r.current)
+        deployed_for_calendar(hist)
     };
     let Some(rev) = rev else {
         return Ok(Arc::new(serde_json::json!({
@@ -1330,6 +1342,85 @@ mod tests {
 
     fn args(cli: &[&str]) -> Args {
         Args::parse_from(std::iter::once("vislox").chain(cli.iter().copied()))
+    }
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let ok = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+            .args(["-c", "commit.gpgsign=false"])
+            .args(args)
+            .output()
+            .expect("git runs")
+            .status
+            .success();
+        assert!(ok, "git {args:?}");
+    }
+
+    #[test]
+    fn calendar_drift_is_against_the_deployed_commit_not_an_edit_on_disk() {
+        let fixture = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/house.Loxone"
+        ))
+        .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().canonicalize().unwrap();
+        let file = repo.join("config.Loxone");
+        git(&repo, &["init", "-q"]);
+        std::fs::write(&file, &fixture).unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "deployed"]);
+        // Uncommitted: Silvester gets a date vislox cannot read, and a
+        // pending compile moves Christmas Eve.
+        let silvester = r#"CalType="-1" Month="12" Day="31""#;
+        assert!(fixture.contains(silvester));
+        std::fs::write(
+            &file,
+            fixture.replace(silvester, r#"CalType="-1" Mode="5" Month="12" Day="31""#),
+        )
+        .unwrap();
+        let out = repo.join("out.Loxone");
+        std::fs::write(&out, fixture.replace(r#"Day="24""#, r#"Day="26""#)).unwrap();
+        let mut h = History::new(file.clone(), Some(out));
+        h.refresh_git();
+        h.poll_files();
+        let (pending, hist) = h.list();
+        assert_eq!(pending.len(), 1);
+        assert!(hist[0].current && hist[0].kind == "live");
+
+        let rev = deployed_for_calendar(hist).unwrap();
+        assert_eq!(rev.kind, "git");
+        let bytes = h.content(&rev.blob).unwrap();
+        let doc = LoxoneDoc::parse(&bytes).unwrap();
+        let (entries, modes) = calendar::of_doc(&doc);
+        // The Miniserver runs the commit: its entries show no drift.
+        let app: Vec<_> = entries.clone();
+        assert!(calendar::drift(&entries, &app, &modes).is_empty());
+        let s = entries.iter().find(|e| e.name == "Silvester").unwrap();
+        assert_eq!(
+            s.date,
+            Ok(calendar::EntryDate::Fixed { month: 12, day: 31 })
+        );
+        // Deleted in the app, it reads with the deployed date.
+        let without: Vec<_> = app.into_iter().filter(|e| e.name != "Silvester").collect();
+        assert_eq!(
+            calendar::drift(&entries, &without, &modes)[0].what,
+            "Every year on 31 Dec · switches on Party"
+        );
+
+        // Without git: the file on disk, never the pending compile.
+        let plain = tempfile::tempdir().unwrap();
+        let f = plain.path().join("config.Loxone");
+        std::fs::write(&f, &fixture).unwrap();
+        let o = plain.path().join("out.Loxone");
+        std::fs::write(&o, "pending").unwrap();
+        let mut h = History::new(f, Some(o));
+        h.poll_files();
+        let (_, hist) = h.list();
+        let rev = deployed_for_calendar(hist).unwrap();
+        assert!(rev.current && rev.kind == "live");
     }
 
     #[test]

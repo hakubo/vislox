@@ -85,11 +85,12 @@ const structure = {
 };
 const ICON = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><rect width="16" height="16" fill="#8b6cc4"/></svg>';
 let structureReads = 0;
-// Its calendar entries (jdev/sps/calendargetentries), as the config on disk has them. A test
+// Its calendar entries (jdev/sps/calendargetentries), as the deployed config (the last commit) has
+// them, not the uncommitted edits on disk (Christmas Eve on 26 Dec, Silvester as Mode 5). A test
 // edits them the way the Loxone app would.
 const CAL = (n) => `1000001${n}-0000-01${n}0-ffff504f94000001`;
 let msCalendar = [
-  { uuid: CAL(3), name: "Heiligabend", operatingMode: 0, calMode: 0, startMonth: 12, startDay: 26 },
+  { uuid: CAL(3), name: "Heiligabend", operatingMode: 0, calMode: 0, startMonth: 12, startDay: 24 },
   { uuid: CAL(4), name: "Ostermontag", operatingMode: 0, calMode: 1, easterOffset: 1 },
   { uuid: CAL(5), name: "Sommerferien", operatingMode: 1, calMode: 3, startYear: 2026, startMonth: 7, startDay: 4, endYear: 2026, endMonth: 9, endDay: 5 },
   { uuid: CAL(6), name: "Heizperiode", operatingMode: 1, calMode: 4, startMonth: 10, startDay: 1, endMonth: 4, endDay: 30 },
@@ -447,7 +448,7 @@ try {
     await page.evaluate(() => loadCal(true));
     await page.waitForSelector("#cal-drift:not(.hidden)", { timeout: 10000 });
     assert.equal(calendarReads, 2);
-    assert.match(await page.textContent("#cal-drift-text"), /^3 calendar entries were changed \(1 added, 1 changed, 1 deleted\) in the Loxone app\. The base vislox shows does not have them\./);
+    assert.match(await page.textContent("#cal-drift-text"), /^3 calendar entries were changed \(1 added, 1 changed, 1 deleted\) in the Loxone app since the deployed config\./);
     const items = await page.$$eval("#cal-drift-list li", (n) => n.map((x) => x.textContent));
     assert.deepEqual(items, [
       "Ostermontag: when: Easter Monday (Easter +1) → Good Friday (Easter −2)",
@@ -458,7 +459,7 @@ try {
     // The entry's Properties say so too, on the deployed revision.
     await page.click('#cal-drift-list .lnk:has-text("Ostermontag")');
     await page.waitForFunction(() => document.querySelector(".ph-t")?.textContent === "Ostermontag");
-    assert.match(await page.textContent("#props"), /In the appChanged in the app: when: Easter Monday \(Easter \+1\) → Good Friday \(Easter −2\)\. Pull or Sync to take it over\./);
+    assert.match(await page.textContent("#props"), /In the appChanged in the app since the deployed config: when: Easter Monday \(Easter \+1\) → Good Friday \(Easter −2\)\. Pull or Sync to take it over\./);
     await page.click("#ms-chip");
     assert.match(await page.textContent("#ms-body"), /Calendar entries3 changed in the app/);
     await page.keyboard.press("Escape");

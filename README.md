@@ -285,7 +285,8 @@ date, 3 one period, 4 a range every year, 5 a weekday of the month; the file's `
 entries are compared by their decoded dates, never by raw numbers: one date is a period of one day, and
 `operatingMode` is the file's `CalType=`. A date vislox cannot read on either side (`calMode` 5, which the file
 format does not document) is not compared; its name and mode still are. The comparison is with the deployed
-revision (the current one that is not pending).
+config: the newest commit of the watched file (the last Pull, Apply or Sync), not an uncommitted edit on disk or a
+pending compile; without git, the file on disk.
 
 Not verified yet: whether `lox config merge` (Sync) takes over entries edited in the app, or refuses because the
 base and the download differ in more than rules (Sync then makes the plain download the base). The notice offers
