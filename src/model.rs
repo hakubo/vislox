@@ -3,6 +3,7 @@
 //! tree, and — when a base revision is given — what changed against it.
 
 use crate::calendar::{self, EntryDate};
+use crate::hardware;
 use crate::schedule;
 use loxone_config::diff::{self, DocDiff};
 use loxone_config::doc::{LoxoneDoc, PortView, WireView, ports};
@@ -34,6 +35,31 @@ pub struct View {
     /// The operating modes calendar entries can switch on, in document
     /// order (the Operating modes view).
     pub modes: Vec<ModeInfo>,
+    /// The devices the compared change reconfigures: added, removed,
+    /// replaced (another serial) or with settings that reach the device.
+    pub hardware: Vec<HwDevice>,
+}
+
+/// A device a change reconfigures (see [`crate::hardware`]).
+#[derive(Serialize, Clone, Debug)]
+pub struct HwDevice {
+    pub uuid: String,
+    pub title: String,
+    /// `Touch Tree`, `AI Extension`, …
+    pub kind: String,
+    /// The device type on the bus (`0x8003`), when known.
+    pub code: Option<String>,
+    /// `added`, `removed`, `replaced` (another serial), `paired` (a serial
+    /// where there was none), `unpaired` (its serial cleared) or `changed`.
+    pub how: &'static str,
+    /// Its serial (an Air device's `IP=`) in the compared revision, as
+    /// [`crate::discover::norm_serial`] writes it; for a removed device, the
+    /// one it had.
+    pub serial: Option<String>,
+    pub old_serial: Option<String>,
+    /// Whether `serial` can be looked for on the bus (`lox extensions`): a
+    /// real serial, not an Air device's MAC-derived address.
+    pub check: bool,
 }
 
 /// An operating mode (`Mode`), by the number calendar entries name it with.
@@ -95,6 +121,8 @@ pub struct Stats {
     pub moved: usize,
     pub wires_added: usize,
     pub wires_removed: usize,
+    /// Devices the change reconfigures.
+    pub devices: usize,
 }
 
 #[derive(Serialize)]
@@ -206,6 +234,26 @@ pub struct ObjInfo {
     pub calendar: Option<CalInfo>,
     /// The switching times of a Daytimer, or of a block that holds one.
     pub schedule: Option<SchedInfo>,
+    /// The device this object is, or belongs to (an input or output).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device: Option<DeviceInfo>,
+}
+
+/// The device an object is, or whose input or output it is.
+#[derive(Serialize, Debug)]
+pub struct DeviceInfo {
+    pub uuid: String,
+    pub title: String,
+    pub kind: String,
+    pub code: Option<String>,
+    pub serial: Option<String>,
+    /// The object is the device itself, not one of its inputs or outputs.
+    pub own: bool,
+    /// What to know about this kind of device (Room Comfort Sensor: CO2 burn-in).
+    pub note: Option<&'static str>,
+    /// How the compared change reconfigures the device, if it does
+    /// ([`HwDevice::how`]).
+    pub how: Option<&'static str>,
 }
 
 /// A schedule, as the viewed config stores it (see `schedule.rs`).
@@ -303,6 +351,12 @@ pub struct AttrInfo {
     pub value: Option<String>,
     pub old: Option<String>,
     pub changed: bool,
+    /// What the setting does on the device, from the per-device tables.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hint: Option<&'static str>,
+    /// Its change reconfigures the device.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub hw: bool,
 }
 
 #[derive(Serialize)]
@@ -343,6 +397,9 @@ pub struct Change {
     pub text: String,
     pub obj: Option<String>,
     pub page: Option<String>,
+    /// The device this change reconfigures (the "hardware" filter).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hw: Option<String>,
 }
 
 fn rect(l: &Layout) -> [i64; 4] {
@@ -597,6 +654,38 @@ impl<'a> Ctx<'a> {
             .map(|_| self.title(id))
             .unwrap_or_else(|| id.to_string())
     }
+
+    /// The device `uuid` is, or whose input or output it is (the nearest
+    /// enclosing extension, Tree or Air device; not the Miniserver).
+    fn device_of(&self, uuid: &str) -> Option<String> {
+        let mut cur = uuid;
+        loop {
+            let el = self.el(cur)?;
+            let ty = el.attr("Type").unwrap_or("");
+            if hardware::is_device(ty) {
+                return Some(cur.to_string());
+            }
+            if matches!(ty, "LoxLIVE" | "Page" | "Document") {
+                return None;
+            }
+            cur = self.parent.get(cur)?;
+        }
+    }
+
+    fn tree_type(&self, dev: &str) -> Option<&'a str> {
+        self.el(dev).and_then(|e| e.attr("TreeType"))
+    }
+
+    fn dev_kind(&self, dev: &str) -> (String, Option<String>) {
+        hardware::kind(&self.ty(dev), self.tree_type(dev))
+    }
+
+    /// A device's serial (an Air device's `IP=`).
+    fn serial(&self, dev: &str) -> Option<String> {
+        self.el(dev)
+            .and_then(|e| e.attr(hardware::identity(&self.ty(dev))))
+            .map(String::from)
+    }
 }
 
 /// Loxone Config lets the user hide unused connectors, and saves the block
@@ -744,6 +833,10 @@ struct Delta {
     schedule: HashSet<String>,
     /// Objects whose app settings changed: shown or not, room, category.
     in_app: HashSet<String>,
+    /// Devices the change reconfigures → how ([`HwDevice::how`]).
+    hw: HashMap<String, &'static str>,
+    /// (object, attribute) changes that reach a device.
+    hw_attrs: HashSet<(String, String)>,
 }
 
 impl Delta {
@@ -892,6 +985,9 @@ pub fn build(new: &LoxoneDoc, old: Option<&LoxoneDoc>, title: &str) -> View {
         (Some(oc), Some(od)) => delta(&nc, oc, &diff::diff(od, new)),
         _ => Delta::default(),
     };
+    if let Some(oc) = oc.as_ref().filter(|_| d.on) {
+        hw_delta(&nc, oc, &mut d);
+    }
     // Calendar entries, decoded once: their changes mark them changed.
     let mut cals: HashMap<String, CalInfo> = HashMap::new();
     for u in &nc.order {
@@ -976,9 +1072,90 @@ pub fn build(new: &LoxoneDoc, old: Option<&LoxoneDoc>, title: &str) -> View {
     view.modes = modes(&nc);
     view.tree = tree(&nc, oc.as_ref(), &d);
     if d.on {
-        changes(&mut view, &nc, oc.as_ref().unwrap(), &d);
+        let oc = oc.as_ref().unwrap();
+        changes(&mut view, &nc, oc, &d);
+        view.hardware = hw_devices(&nc, oc, &d);
+        view.stats.devices = view.hardware.len();
     }
     view
+}
+
+/// The devices `new` reconfigures compared with `old` (`view.hardware`),
+/// without building the rest of the view: for Apply's confirmation.
+pub fn hardware(new: &LoxoneDoc, old: &LoxoneDoc) -> Vec<HwDevice> {
+    let (nc, oc) = (Ctx::new(new), Ctx::new(old));
+    let mut d = delta(&nc, &oc, &diff::diff(old, new));
+    hw_delta(&nc, &oc, &mut d);
+    hw_devices(&nc, &oc, &d)
+}
+
+/// Which devices the change reconfigures, and with which attributes.
+fn hw_delta(nc: &Ctx, oc: &Ctx, d: &mut Delta) {
+    let is_dev = |c: &Ctx, u: &str| c.device_of(u).as_deref() == Some(u);
+    for u in &d.added {
+        if is_dev(nc, u) {
+            d.hw.insert(u.clone(), ADDED);
+        }
+    }
+    for u in &d.removed {
+        if is_dev(oc, u) {
+            d.hw.insert(u.clone(), REMOVED);
+        }
+    }
+    for (u, ch) in &d.attrs {
+        let Some(dev) = nc.device_of(u) else { continue };
+        let dty = nc.ty(&dev);
+        let (tree, oty, own) = (nc.tree_type(&dev), nc.ty(u), dev == *u);
+        for (n, ..) in ch {
+            if !hardware::reconfigures(&dty, tree, &oty, own, n) {
+                continue;
+            }
+            d.hw_attrs.insert((u.clone(), n.clone()));
+            let how = if own && n == hardware::identity(&dty) {
+                hardware::identity_change(oc.serial(u).as_deref(), nc.serial(u).as_deref())
+            } else {
+                CHANGED
+            };
+            // The identity's change says more than a setting's.
+            let e = d.hw.entry(dev.clone()).or_insert(how);
+            if how != CHANGED {
+                *e = how;
+            }
+        }
+    }
+}
+
+/// The devices of [`hw_delta`], in document order (removed ones last).
+fn hw_devices(nc: &Ctx, oc: &Ctx, d: &Delta) -> Vec<HwDevice> {
+    let mut v: Vec<(usize, HwDevice)> =
+        d.hw.iter()
+            .map(|(u, how)| {
+                let c = if *how == REMOVED { oc } else { nc };
+                let (kind, code) = c.dev_kind(u);
+                let pos = if *how == REMOVED {
+                    nc.order.len() + oc.order.iter().position(|o| o == u).unwrap_or(0)
+                } else {
+                    c.order.iter().position(|o| o == u).unwrap_or(0)
+                };
+                let norm = |s: Option<String>| s.map(|s| crate::discover::norm_serial(&s));
+                let serial = norm(c.serial(u));
+                let dev = HwDevice {
+                    check: c.ty(u) != hardware::AIR && !hardware::unpaired(serial.as_deref()),
+                    uuid: u.clone(),
+                    title: c.title(u),
+                    kind,
+                    code,
+                    how,
+                    serial,
+                    old_serial: matches!(*how, "replaced" | "unpaired")
+                        .then(|| norm(oc.serial(u)))
+                        .flatten(),
+                };
+                (pos, dev)
+            })
+            .collect();
+    v.sort_by_key(|(p, _)| *p);
+    v.into_iter().map(|(_, d)| d).collect()
 }
 
 fn page_view(c: &Ctx, old: Option<&Ctx>, uuid: &str, d: &Delta, gone: bool) -> Option<Page> {
@@ -1216,6 +1393,12 @@ fn obj_info(
     let el = c.el(uuid).expect("indexed object");
     let ty = c.ty(uuid);
     let attr_changes = d.attrs.get(uuid);
+    let dev = c.device_of(uuid);
+    let hint = |name: &str| {
+        dev.as_ref()
+            .and_then(|dv| hardware::hint(&c.ty(dv), c.tree_type(dv), &ty, dv == uuid, name))
+    };
+    let hw = |name: &str| !gone && d.hw_attrs.contains(&(uuid.to_string(), name.to_string()));
     let mut attrs: Vec<AttrInfo> = attrs_of(el)
         .into_iter()
         .map(|(name, value)| {
@@ -1223,6 +1406,8 @@ fn obj_info(
             AttrInfo {
                 old: ch.and_then(|(_, o, _)| o.clone()),
                 changed: ch.is_some(),
+                hint: hint(&name),
+                hw: hw(&name),
                 name,
                 value: Some(value),
             }
@@ -1236,10 +1421,25 @@ fn obj_info(
                     value: None,
                     old: o.clone(),
                     changed: true,
+                    hint: hint(n),
+                    hw: hw(n),
                 });
             }
         }
     }
+    let device = dev.map(|dv| {
+        let (kind, code) = c.dev_kind(&dv);
+        DeviceInfo {
+            title: c.title(&dv),
+            serial: c.serial(&dv),
+            own: dv == uuid,
+            note: hardware::note(&c.ty(&dv), c.tree_type(&dv)),
+            how: d.hw.get(&dv).copied().filter(|_| d.on),
+            uuid: dv,
+            kind,
+            code,
+        }
+    });
     let mut port_infos = Vec::new();
     for p in ports(el) {
         let mut conns = Vec::new();
@@ -1303,6 +1503,7 @@ fn obj_info(
     ObjInfo {
         calendar,
         schedule: None,
+        device,
         uuid: uuid.to_string(),
         title: c.title(uuid),
         old_title: d.renamed.get(uuid).cloned().flatten(),
@@ -1440,6 +1641,7 @@ fn changes(view: &mut View, nc: &Ctx, oc: &Ctx, d: &Delta) {
             kind: ADDED,
             text: name(nc, &u),
             page: page_for(&u),
+            hw: d.hw.contains_key(&u).then(|| u.clone()),
             obj: Some(u),
         });
     }
@@ -1452,6 +1654,7 @@ fn changes(view: &mut View, nc: &Ctx, oc: &Ctx, d: &Delta) {
             kind: REMOVED,
             text: name(oc, &u),
             page: page_for(&u),
+            hw: d.hw.contains_key(&u).then(|| u.clone()),
             obj: Some(u),
         });
     }
@@ -1470,6 +1673,7 @@ fn changes(view: &mut View, nc: &Ctx, oc: &Ctx, d: &Delta) {
                 text: format!("{from} → {}", nc.title(&u)),
                 page: page_for(&u),
                 obj: Some(u.clone()),
+                hw: None,
             });
         }
         let ty = nc.ty(&u);
@@ -1491,6 +1695,7 @@ fn changes(view: &mut View, nc: &Ctx, oc: &Ctx, d: &Delta) {
                 ),
                 page: page_for(&u),
                 obj: Some(u.clone()),
+                hw: None,
             });
         }
         let (lines, covered) = view
@@ -1505,6 +1710,7 @@ fn changes(view: &mut View, nc: &Ctx, oc: &Ctx, d: &Delta) {
                 text,
                 page: page_for(&u),
                 obj: Some(u.clone()),
+                hw: None,
             });
         }
         if let Some(si) = view.objects.get(&u).and_then(|o| o.schedule.as_ref()) {
@@ -1514,22 +1720,40 @@ fn changes(view: &mut View, nc: &Ctx, oc: &Ctx, d: &Delta) {
                     text,
                     page: page_for(&u),
                     obj: Some(u.clone()),
+                    hw: None,
                 });
             }
         }
         if let Some(a) = d.attrs.get(&u) {
             for (n, o, new) in a.iter().filter(|(n, ..)| !covered.contains(&n.as_str())) {
+                let hw = d
+                    .hw_attrs
+                    .contains(&(u.clone(), n.clone()))
+                    .then(|| nc.device_of(&u))
+                    .flatten();
+                let identity =
+                    hw.as_deref() == Some(u.as_str()) && *n == hardware::identity(&nc.ty(&u));
+                let text = if identity {
+                    let (kind, code) = nc.dev_kind(&u);
+                    format!(
+                        "{} · device {}: {}{}, {} {} → {}",
+                        nc.title(&u),
+                        hardware::identity_change(o.as_deref(), new.as_deref()),
+                        code.map(|c| format!("{c} ")).unwrap_or_default(),
+                        kind,
+                        if n == "IP" { "address" } else { "serial" },
+                        o.as_deref().unwrap_or("—"),
+                        new.as_deref().unwrap_or("—")
+                    )
+                } else {
+                    attr_change_text(&nc.title(&u), &nc.ty(&u), n, o.as_deref(), new.as_deref())
+                };
                 v.push(Change {
                     kind: "attr",
-                    text: attr_change_text(
-                        &nc.title(&u),
-                        &nc.ty(&u),
-                        n,
-                        o.as_deref(),
-                        new.as_deref(),
-                    ),
+                    text,
                     page: page_for(&u),
                     obj: Some(u.clone()),
+                    hw,
                 });
             }
         }
@@ -1569,6 +1793,7 @@ fn changes(view: &mut View, nc: &Ctx, oc: &Ctx, d: &Delta) {
                 text: format!("{} · {}", nc.title(&u), parts.join(", ")),
                 page: page_for(&u),
                 obj: Some(u.clone()),
+                hw: None,
             });
         }
         // Said above, with the names, for what has an `<IoData>`.
@@ -1578,6 +1803,7 @@ fn changes(view: &mut View, nc: &Ctx, oc: &Ctx, d: &Delta) {
                 text: format!("{} · room/category binding", nc.title(&u)),
                 page: page_for(&u),
                 obj: Some(u.clone()),
+                hw: None,
             });
         }
     }
@@ -1607,6 +1833,7 @@ fn changes(view: &mut View, nc: &Ctx, oc: &Ctx, d: &Delta) {
             text: wire_text(nc, w),
             page: wire_page(nc, w),
             obj: wire_obj(nc, w),
+            hw: None,
         });
     }
     let mut wr: Vec<_> = d.wires_removed.iter().collect();
@@ -1618,6 +1845,7 @@ fn changes(view: &mut View, nc: &Ctx, oc: &Ctx, d: &Delta) {
             text: wire_text(oc, w),
             page: wire_page(oc, w),
             obj: wire_obj(oc, w),
+            hw: None,
         });
     }
     let mut moved: Vec<_> = d
@@ -1641,6 +1869,7 @@ fn changes(view: &mut View, nc: &Ctx, oc: &Ctx, d: &Delta) {
             text,
             page: page_for(&u),
             obj: Some(u),
+            hw: None,
         });
     }
     view.changes = v;
@@ -2876,6 +3105,243 @@ mod tests {
         // … and is not a mode of the year view.
         assert!(!v.modes.iter().any(|m| m.title == "Kaputt"));
         assert_eq!(v.modes[0].uuid, HOLIDAY);
+    }
+
+    const HW: &str = include_str!("../tests/fixtures/hardware.Loxone");
+    const TOUCH: &str = "20000003-0000-0030-ffff504f94000002";
+    const TOUCH_TEMP: &str = "20000003-0000-0031-ffff504f94000002";
+    const COMFORT: &str = "20000004-0000-0040-ffff504f94000002";
+    const AIEXT: &str = "20000005-0000-0050-ffff504f94000002";
+    const AIEXT_IN: &str = "20000005-0000-0051-ffff504f94000002";
+    const MS_IN: &str = "20000001-0000-0011-ffff504f94000002";
+    const DIEXT: &str = "20000006-0000-0060-ffff504f94000002";
+
+    fn hw_edited(edits: &[(&str, &str)]) -> String {
+        let mut s = HW.to_string();
+        for (from, to) in edits {
+            assert_eq!(
+                s.matches(from).count(),
+                1,
+                "edit target `{from}` must be unique"
+            );
+            s = s.replacen(from, to, 1);
+        }
+        s
+    }
+
+    #[test]
+    fn devices_and_their_inputs_know_their_device() {
+        let v = build(&doc(HW), None, "t");
+        let t = v.objects[TOUCH].device.as_ref().unwrap();
+        assert_eq!(
+            (t.kind.as_str(), t.code.as_deref()),
+            ("Touch Tree", Some("0x8003"))
+        );
+        assert_eq!(t.serial.as_deref(), Some("B03B368A"));
+        assert!(t.own && t.how.is_none());
+        // An input belongs to its device; the Miniserver's own input to none.
+        let i = v.objects[TOUCH_TEMP].device.as_ref().unwrap();
+        assert!(!i.own && i.uuid == TOUCH);
+        assert!(v.objects[MS_IN].device.is_none());
+        // The Room Comfort Sensor says what to know about its CO2.
+        let c = v.objects[COMFORT].device.as_ref().unwrap();
+        assert!(c.note.unwrap().contains("burn-in"));
+        // Tooltips from the per-device tables, on the settings matched to them.
+        let hint = |u: &str, n: &str| {
+            v.objects[u]
+                .attrs
+                .iter()
+                .find(|a| a.name == n)
+                .unwrap()
+                .hint
+        };
+        assert!(hint(TOUCH, "AC").unwrap().contains("beeps"));
+        assert!(hint(COMFORT, "SSC").unwrap().contains("Send interval"));
+        assert!(
+            hint(AIEXT_IN, "MinChange")
+                .unwrap()
+                .contains("AI Extension")
+        );
+        assert!(hint(MS_IN, "MinChange").is_none());
+        assert!(hint(TOUCH_TEMP, "MinChange").is_none());
+        assert!(v.hardware.is_empty() && v.stats.devices == 0);
+    }
+
+    #[test]
+    fn changes_that_reach_a_device_are_hardware() {
+        let new = hw_edited(&[
+            // A Touch's audible acknowledgement, an AI Extension input's threshold,
+            ("AC=\"1\"", "AC=\"0\""),
+            (
+                "Title=\"Füllstand\" Nio=\"2\" WF=\"16384\" Analog=\"true\" SourceValHigh=\"10\" DestValHigh=\"10\" MaxVal=\"10\" MinChange=\"0.25\"",
+                "Title=\"Füllstand\" Nio=\"2\" WF=\"16384\" Analog=\"true\" SourceValHigh=\"10\" DestValHigh=\"10\" MaxVal=\"10\" MinChange=\"0.5\"",
+            ),
+            // … and what stays in the Miniserver: a device's board position,
+            // an input's name, the Miniserver's own input.
+            ("SwitchBoardPos=\"3\"", "SwitchBoardPos=\"4\""),
+            ("Title=\"Klingel\"", "Title=\"Türklingel\""),
+            (
+                "Title=\"Spannung Miniserver\" Nio=\"2\" WF=\"16384\" Analog=\"true\" SourceValHigh=\"10\" DestValHigh=\"10\" MaxVal=\"10\" MinChange=\"0.25\"",
+                "Title=\"Spannung Miniserver\" Nio=\"2\" WF=\"16384\" Analog=\"true\" SourceValHigh=\"10\" DestValHigh=\"10\" MaxVal=\"10\" MinChange=\"0.5\"",
+            ),
+        ]);
+        let v = build(&doc(&new), Some(&doc(HW)), "t");
+        let hw: Vec<_> = v
+            .hardware
+            .iter()
+            .map(|d| (d.uuid.as_str(), d.how))
+            .collect();
+        assert_eq!(hw, [(TOUCH, "changed"), (AIEXT, "changed")]);
+        assert_eq!(v.stats.devices, 2);
+        let line = |t: &str| {
+            v.changes
+                .iter()
+                .find(|c| c.text.contains(t))
+                .unwrap_or_else(|| panic!("{t}"))
+        };
+        assert_eq!(line("AC: 1 → 0").hw.as_deref(), Some(TOUCH));
+        assert_eq!(
+            line("Füllstand · MinChange: 0.25 → 0.5").hw.as_deref(),
+            Some(AIEXT)
+        );
+        assert!(line("SwitchBoardPos").hw.is_none());
+        assert!(line("Spannung Miniserver · MinChange").hw.is_none());
+        assert!(line("Türklingel").hw.is_none());
+        // Properties: the device says how, the setting that reaches it is marked.
+        assert_eq!(
+            v.objects[TOUCH].device.as_ref().unwrap().how,
+            Some("changed")
+        );
+        assert_eq!(
+            v.objects[TOUCH_TEMP].device.as_ref().unwrap().how,
+            Some("changed")
+        );
+        assert!(
+            v.objects[TOUCH]
+                .attrs
+                .iter()
+                .find(|a| a.name == "AC")
+                .unwrap()
+                .hw
+        );
+        assert!(v.objects[DIEXT].device.as_ref().unwrap().how.is_none());
+    }
+
+    #[test]
+    fn another_serial_is_a_replaced_device() {
+        let new = hw_edited(&[("Serial=\"B03B368A\"", "Serial=\"B03B9999\"")]);
+        let v = build(&doc(&new), Some(&doc(HW)), "t");
+        let d = &v.hardware[0];
+        assert_eq!((d.uuid.as_str(), d.how), (TOUCH, "replaced"));
+        assert_eq!(d.serial.as_deref(), Some("B03B9999"));
+        assert_eq!(d.old_serial.as_deref(), Some("B03B368A"));
+        let c = v.changes.iter().find(|c| c.hw.is_some()).unwrap();
+        assert_eq!(
+            c.text,
+            "Touch Küche · device replaced: 0x8003 Touch Tree, serial B03B368A → B03B9999"
+        );
+    }
+
+    #[test]
+    fn a_newer_loxone_config_save_reconfigures_no_device() {
+        // Every object's `V=` bumped, and attributes not matched to a device's block changed.
+        let new = HW
+            .replace("V=\"178\"", "V=\"179\"")
+            .replace("PG=\"\" AC=", "PG=\"7\" AC=");
+        let v = build(&doc(&new), Some(&doc(HW)), "t");
+        assert!(v.changes.iter().any(|c| c.text.contains("V: 178 → 179")));
+        assert!(v.hardware.is_empty(), "{:?}", v.hardware);
+        assert!(v.changes.iter().all(|c| c.hw.is_none()));
+    }
+
+    #[test]
+    fn a_cleared_serial_unpairs_the_device_and_a_first_one_pairs_it() {
+        // The Touch's serial removed: still a device, now unpaired.
+        let cleared = hw_edited(&[(" Serial=\"B03B368A\"", "")]);
+        let v = build(&doc(&cleared), Some(&doc(HW)), "t");
+        let d = &v.hardware[0];
+        assert_eq!((d.uuid.as_str(), d.how), (TOUCH, "unpaired"));
+        assert_eq!(
+            (d.serial.as_deref(), d.old_serial.as_deref()),
+            (None, Some("B03B368A"))
+        );
+        assert!(!d.check);
+        assert!(
+            v.changes
+                .iter()
+                .any(|c| c.hw.is_some() && c.text.contains("device unpaired"))
+        );
+        assert!(v.objects[TOUCH].device.is_some());
+        // Added offline (00000000), then found: paired, not replaced.
+        let offline = hw_edited(&[("Serial=\"B03B368A\"", "Serial=\"00000000\"")]);
+        let v = build(&doc(HW), Some(&doc(&offline)), "t");
+        let d = &v.hardware[0];
+        assert_eq!((d.how, d.serial.as_deref()), ("paired", Some("B03B368A")));
+        assert!(d.check && d.old_serial.is_none());
+        let c = v.changes.iter().find(|c| c.hw.is_some()).unwrap();
+        assert_eq!(
+            c.text,
+            "Touch Küche · device paired: 0x8003 Touch Tree, serial 00000000 → B03B368A"
+        );
+    }
+
+    #[test]
+    fn a_serial_outside_the_buses_is_no_device() {
+        // An Intercom (its Serial= is a MAC) added under the Miniserver.
+        let intercom = "20000008-0000-0080-ffff504f94000002";
+        let new = hw_edited(&[(
+            "\t\t\t<C Type=\"LoxTree\"",
+            &format!(
+                "\t\t\t<C Type=\"IntercomDevice\" V=\"178\" U=\"{intercom}\" Title=\"Haustür\" Serial=\"504F94D00001\"/>\n\t\t\t<C Type=\"LoxTree\""
+            ),
+        )]);
+        let v = build(&doc(&new), Some(&doc(HW)), "t");
+        assert!(v.objects[intercom].device.is_none());
+        assert!(v.hardware.is_empty(), "{:?}", v.hardware);
+        assert!(
+            v.changes
+                .iter()
+                .find(|c| c.kind == "added")
+                .unwrap()
+                .hw
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn adding_or_removing_a_device_is_hardware() {
+        // The Room Comfort Sensor removed, a second DI Extension added.
+        let new = hw_edited(&[
+            (
+                "\t\t\t\t\t<C Type=\"TreeDevice\" TId=\"RoomsensorTree\" V=\"178\" U=\"20000004-0000-0040-ffff504f94000002\" Title=\"Raumklima Bad\" WF=\"16384\" Serial=\"B0100001\" Installation=\"\" SubType=\"32784\" TreeType=\"32784\" PG=\"\" SSC=\"900\"/>\n",
+                "",
+            ),
+            (
+                "\t\t</C>\n\t\t<C Type=\"Page\"",
+                "\t\t\t<C Type=\"LoxDigin\" V=\"178\" U=\"20000007-0000-0070-ffff504f94000002\" Title=\"DI Extension 2\" WF=\"16384\" Serial=\"14000002\" Installation=\"\" SwitchBoard=\"Verteiler\">\n\t\t\t\t<C Type=\"DigitalIn\" IName=\"I1\" V=\"178\" U=\"20000007-0000-0071-ffff504f94000002\" Title=\"Tür\" Nio=\"2\" WF=\"16400\" MinTime=\"10\" Idx=\"-1\"/>\n\t\t\t</C>\n\t\t</C>\n\t\t<C Type=\"Page\"",
+            ),
+        ]);
+        let v = build(&doc(&new), Some(&doc(HW)), "t");
+        let hw: Vec<_> = v
+            .hardware
+            .iter()
+            .map(|d| (d.title.as_str(), d.how))
+            .collect();
+        assert_eq!(
+            hw,
+            [("DI Extension 2", "added"), ("Raumklima Bad", "removed")]
+        );
+        let added = v.changes.iter().find(|c| c.kind == "added").unwrap();
+        assert_eq!(
+            added.hw.as_deref(),
+            Some("20000007-0000-0070-ffff504f94000002")
+        );
+        let removed = v.changes.iter().find(|c| c.kind == "removed").unwrap();
+        assert_eq!(removed.hw.as_deref(), Some(COMFORT));
+        assert_eq!(
+            v.objects[COMFORT].device.as_ref().unwrap().kind,
+            "Room Comfort Sensor Tree"
+        );
     }
 
     #[test]

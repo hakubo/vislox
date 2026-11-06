@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-/// `lox log` that takes longer than this has hung.
+/// A `lox` read that takes longer than this has hung.
 const TIMEOUT: Duration = Duration::from_secs(30);
 /// How many lines to ask for.
 pub const LINES: usize = 300;
@@ -24,63 +24,121 @@ pub const LINES: usize = 300;
 const PAIR: chrono::TimeDelta = chrono::TimeDelta::seconds(2);
 
 pub struct Log {
-    cmd: Result<Cmd, String>,
-    host: String,
-    /// The last answer (a failure too), and when its `lox log` started.
-    last: Mutex<Option<(Instant, Value)>>,
-    running: tokio::sync::Mutex<()>,
+    read: LoxRead,
 }
 
-struct Cmd {
+/// A read-only `lox` command run with vislox's lox configuration and
+/// context: the Log panel's `lox log`, and `lox extensions` for the devices
+/// on the bus ([`crate::hardware`]).
+pub(crate) struct LoxCmd {
     lox: PathBuf,
     ctx: Option<String>,
     /// lox looks for a project-local config from here, as vislox did.
     cwd: PathBuf,
 }
 
-impl Log {
-    pub fn new(lox: &Path, off: Option<&str>, found: Result<&Found, &String>, start: &Path) -> Log {
-        let host = found.map(|f| f.conn.host.clone()).unwrap_or_default();
-        let cmd = (|| {
-            if let Some(why) = off {
-                return Err(why.to_string());
-            }
-            let f = found.map_err(|e| format!("no lox configuration: {e}"))?;
-            let lox = crate::pull::which(lox).ok_or_else(|| {
-                format!(
-                    "`{}` not found (install lox, or pass --lox <path>)",
-                    lox.display()
-                )
-            })?;
-            Ok(Cmd {
-                lox,
-                ctx: f.ctx.clone(),
-                cwd: start.to_path_buf(),
-            })
-        })();
-        Log {
-            cmd,
-            host,
+impl LoxCmd {
+    pub(crate) fn new(
+        lox: &Path,
+        off: Option<&str>,
+        found: Result<&Found, &String>,
+        start: &Path,
+    ) -> Result<LoxCmd, String> {
+        if let Some(why) = off {
+            return Err(why.to_string());
+        }
+        let f = found.map_err(|e| format!("no lox configuration: {e}"))?;
+        let lox = crate::pull::which(lox).ok_or_else(|| {
+            format!(
+                "`{}` not found (install lox, or pass --lox <path>)",
+                lox.display()
+            )
+        })?;
+        Ok(LoxCmd {
+            lox,
+            ctx: f.ctx.clone(),
+            cwd: start.to_path_buf(),
+        })
+    }
+
+    /// `lox [--ctx …] <args>`, its standard output; `what` names it in errors.
+    async fn run(&self, args: &[&str], what: &str) -> Result<String, String> {
+        let mut c = tokio::process::Command::new(&self.lox);
+        if let Some(ctx) = &self.ctx {
+            c.args(["--ctx", ctx]);
+        }
+        c.args(args)
+            .current_dir(
+                self.cwd
+                    .ancestors()
+                    .find(|d| d.is_dir())
+                    .unwrap_or(&self.cwd),
+            )
+            .env("NO_COLOR", "1")
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true);
+        let out = tokio::time::timeout(TIMEOUT, crate::pull::output_retrying(&mut c))
+            .await
+            .map_err(|_| format!("{what} took longer than {} s", TIMEOUT.as_secs()))?
+            .map_err(|e| format!("cannot run {}: {e}", self.lox.display()))?;
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let msg = [stderr.trim(), stdout.trim()]
+                .into_iter()
+                .find(|m| !m.is_empty())
+                .unwrap_or("no output");
+            return Err(format!("{what} failed: {msg}"));
+        }
+        Ok(stdout)
+    }
+}
+
+/// One `lox` read at a time: requests that come in while one runs share
+/// the next, so two tabs, or a refresh during an Apply, do not each ask the
+/// Miniserver (or each wait out its timeout when it is down), and none gets
+/// an answer that was read before it asked.
+pub(crate) struct LoxRead {
+    cmd: Result<LoxCmd, String>,
+    host: String,
+    /// The last answer (a failure too), and when its read started.
+    last: Mutex<Option<(Instant, Value)>>,
+    running: tokio::sync::Mutex<()>,
+}
+
+impl LoxRead {
+    pub(crate) fn new(
+        lox: &Path,
+        off: Option<&str>,
+        found: Result<&Found, &String>,
+        start: &Path,
+    ) -> LoxRead {
+        LoxRead {
+            cmd: LoxCmd::new(lox, off, found, start),
+            host: found.map(|f| f.conn.host.clone()).unwrap_or_default(),
             last: Mutex::new(None),
             running: tokio::sync::Mutex::new(()),
         }
     }
 
-    /// For `/api/history`: whether there is a log to show, and why not.
-    pub fn info(&self) -> Value {
+    /// Whether there is anything to read, and why not.
+    pub(crate) fn info(&self) -> Value {
         match &self.cmd {
             Ok(_) => json!({ "available": true, "host": self.host }),
             Err(why) => json!({ "available": false, "reason": why }),
         }
     }
 
-    /// The log, read after this request came in. A failure is part of the
-    /// answer (`error`), with the entries of the last read that worked.
-    /// One `lox log` at a time: requests that come in while one runs share
-    /// the next, so two tabs, or a refresh during an Apply, do not each ask
-    /// the Miniserver (or each wait out its timeout when it is down), and
-    /// none gets a log that was read before it asked.
-    pub async fn fetch(&self) -> Value {
+    /// `lox <args>`, read after this request came in, turned into an answer
+    /// by `ok`. A failure is part of the answer (`error`, `failed`), with
+    /// the rest of the last answer that worked, else `empty`.
+    pub(crate) async fn fetch(
+        &self,
+        args: &[&str],
+        what: &str,
+        ok: impl FnOnce(&str) -> Result<Value, String>,
+        empty: Value,
+    ) -> Value {
         let cmd = match &self.cmd {
             Ok(c) => c,
             Err(why) => return json!({ "available": false, "reason": why }),
@@ -94,18 +152,12 @@ impl Log {
         }
         let started = Instant::now();
         let now = chrono::Utc::now().timestamp();
-        let v = match run(cmd).await {
-            Ok(text) => {
-                let entries = parse(&text);
-                let since = last_program_change(&entries);
-                json!({
-                    "available": true,
-                    "host": self.host,
-                    "fetched": now,
-                    "lines": LINES,
-                    "since": since,
-                    "entries": entries,
-                })
+        let v = match cmd.run(args, what).await.and_then(|t| ok(&t)) {
+            Ok(mut v) => {
+                v["available"] = json!(true);
+                v["host"] = json!(self.host);
+                v["fetched"] = json!(now);
+                v
             }
             Err(e) => {
                 let mut v = self
@@ -114,9 +166,12 @@ impl Log {
                     .unwrap()
                     .as_ref()
                     .map(|(_, v)| v.clone())
-                    .unwrap_or_else(
-                        || json!({ "available": true, "host": self.host, "entries": [] }),
-                    );
+                    .unwrap_or_else(|| {
+                        let mut v = empty;
+                        v["available"] = json!(true);
+                        v["host"] = json!(self.host);
+                        v
+                    });
                 v["error"] = json!(crate::reason::explain(&e));
                 v["failed"] = json!(now);
                 v
@@ -127,30 +182,34 @@ impl Log {
     }
 }
 
-async fn run(cmd: &Cmd) -> Result<String, String> {
-    let mut c = tokio::process::Command::new(&cmd.lox);
-    if let Some(ctx) = &cmd.ctx {
-        c.args(["--ctx", ctx]);
+impl Log {
+    pub fn new(lox: &Path, off: Option<&str>, found: Result<&Found, &String>, start: &Path) -> Log {
+        Log {
+            read: LoxRead::new(lox, off, found, start),
+        }
     }
-    c.args(["log", "-n", &LINES.to_string(), "--no-color", "--no-header"])
-        .current_dir(cmd.cwd.ancestors().find(|d| d.is_dir()).unwrap_or(&cmd.cwd))
-        .env("NO_COLOR", "1")
-        .stdin(std::process::Stdio::null())
-        .kill_on_drop(true);
-    let out = tokio::time::timeout(TIMEOUT, crate::pull::output_retrying(&mut c))
-        .await
-        .map_err(|_| format!("lox log took longer than {} s", TIMEOUT.as_secs()))?
-        .map_err(|e| format!("cannot run {}: {e}", cmd.lox.display()))?;
-    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        let msg = [stderr.trim(), stdout.trim()]
-            .into_iter()
-            .find(|m| !m.is_empty())
-            .unwrap_or("no output");
-        return Err(format!("lox log failed: {msg}"));
+
+    /// For `/api/history`: whether there is a log to show, and why not.
+    pub fn info(&self) -> Value {
+        self.read.info()
     }
-    Ok(stdout)
+
+    /// The log, read after this request came in (see [`LoxRead::fetch`]).
+    pub async fn fetch(&self) -> Value {
+        let lines = LINES.to_string();
+        self.read
+            .fetch(
+                &["log", "-n", &lines, "--no-color", "--no-header"],
+                "lox log",
+                |text| {
+                    let entries = parse(text);
+                    let since = last_program_change(&entries);
+                    Ok(json!({ "lines": LINES, "since": since, "entries": entries }))
+                },
+                json!({ "entries": [] }),
+            )
+            .await
+    }
 }
 
 /// One line of the log.

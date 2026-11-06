@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ControlList Version="1" NextObj="100" NextConst="1" NextNote="1" NextMem="1">
+	<C Type="Document" V="17010727" U="20000000-0000-0001-ffff504f94000002" Title="Gerätehaus" ConfigVersion="17010727" PaperFormat="2">
+		<C Type="LoxLIVE" V="178" U="20000001-0000-0010-ffff504f94000002" Title="Miniserver" WF="16400" Serial="504F94000002" Installation="" SwitchBoard="">
+			<C Type="VoltageIn" IName="AI1" V="178" U="20000001-0000-0011-ffff504f94000002" Title="Spannung Miniserver" Nio="2" WF="16384" Analog="true" SourceValHigh="10" DestValHigh="10" MaxVal="10" MinChange="0.25" MinTime="1000" Idx="-1">
+				<Co K="AQ" U="20000001-0000-0012-00ff504f94000002"/>
+			</C>
+			<C Type="LoxTree" V="178" U="20000002-0000-0020-ffff504f94000002" Title="Tree Extension" WF="16384" Serial="13000001" Installation="" SwitchBoard="Verteiler" HwVersion="2">
+				<C Type="LoxCaption" V="178" U="20000002-0000-0021-ffff504f94000002" Title="Linker Strang" CaptionType="2">
+					<C Type="TreeDevice" TId="TouchTree" V="178" U="20000003-0000-0030-ffff504f94000002" Title="Touch Küche" WF="16384" Serial="B03B368A" Installation="" SubType="32771" TreeType="32771" PG="" AC="1">
+						<C Type="TreeAsensor" IName="AI1" V="178" U="20000003-0000-0031-ffff504f94000002" Title="Temperatur Küche" Nio="2" WF="16400" Analog="true" MinVal="-40" MaxVal="125" MinChange="0.25" MinTime="1000" Idx="1">
+							<Co K="AQ" U="20000003-0000-0032-00ff504f94000002"/>
+						</C>
+					</C>
+					<C Type="TreeDevice" TId="RoomsensorTree" V="178" U="20000004-0000-0040-ffff504f94000002" Title="Raumklima Bad" WF="16384" Serial="B0100001" Installation="" SubType="32784" TreeType="32784" PG="" SSC="900"/>
+				</C>
+			</C>
+			<C Type="LoxAin" V="178" U="20000005-0000-0050-ffff504f94000002" Title="AI Extension" WF="16384" Serial="19000001" Installation="" SwitchBoard="Verteiler" SwitchBoardRow="1" SwitchBoardPos="3">
+				<C Type="VoltageIn" IName="AI1" V="178" U="20000005-0000-0051-ffff504f94000002" Title="Füllstand" Nio="2" WF="16384" Analog="true" SourceValHigh="10" DestValHigh="10" MaxVal="10" MinChange="0.25" MinTime="1000" Idx="-1">
+					<Co K="AQ" U="20000005-0000-0052-00ff504f94000002"/>
+				</C>
+			</C>
+			<C Type="LoxDigin" V="178" U="20000006-0000-0060-ffff504f94000002" Title="DI Extension" WF="16384" Serial="14000001" Installation="" SwitchBoard="Verteiler">
+				<C Type="DigitalIn" IName="I1" V="178" U="20000006-0000-0061-ffff504f94000002" Title="Klingel" Nio="2" WF="16400" MinTime="10" Idx="-1">
+					<Co K="Q" U="20000006-0000-0062-00ff504f94000002"/>
+				</C>
+			</C>
+		</C>
+		<C Type="Page" V="178" U="20000010-0000-0100-ffff504f94000002" Title="Seite" WF="16384"/>
+	</C>
+</ControlList>

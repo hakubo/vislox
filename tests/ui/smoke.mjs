@@ -31,6 +31,18 @@ copyFileSync(fixture, cfg);
 // The meter is shown in the app, in the kitchen (a room of its own config).
 const TIMER = "10000030-0000-0300-ffff504f94000001";
 const METER = "10000005-0000-0050-ffff504f94000001", ROOM = "10000020-0000-00a1-ffff504f94000001", CELLAR = "10000021-0000-00a1-ffff504f94000001";
+// Hardware: a Room Comfort Sensor Tree on a Tree Extension, and an AI Extension with one input.
+const COMFORT = "20000004-0000-0040-ffff504f94000001", AI_IN = "20000005-0000-0051-ffff504f94000001";
+const hardware = `\t\t<C Type="LoxLIVE" V="178" U="20000001-0000-0010-ffff504f94000001" Title="Miniserver" Serial="504F94000001">
+\t\t\t<C Type="LoxTree" V="178" U="20000002-0000-0020-ffff504f94000001" Title="Tree Extension" Serial="13000001">
+\t\t\t\t<C Type="TreeDevice" V="178" U="${COMFORT}" Title="Raumklima Bad" Serial="B0100001" SubType="32784" TreeType="32784" SSC="900"/>
+\t\t\t</C>
+\t\t\t<C Type="LoxAin" V="178" U="20000005-0000-0050-ffff504f94000001" Title="AI Extension" Serial="19000001">
+\t\t\t\t<C Type="VoltageIn" IName="AI1" V="178" U="${AI_IN}" Title="Füllstand" Analog="true" MinChange="0.25" MinTime="1000"/>
+\t\t\t</C>
+\t\t</C>
+\t</C>
+</ControlList>`;
 writeFileSync(cfg, readFileSync(cfg, "utf8")
   .replace('<C Type="Page" V="178" U="10000002', `<C Type="Place" V="178" U="${ROOM}" Title="Küche"/>\n\t\t<C Type="Page" V="178" U="10000002`)
   .replace('<Co K="Pf" Nc="1"', `<IoData Visu="true" Pr="${ROOM}"/><Co K="Pf" Nc="1"`)
@@ -39,7 +51,8 @@ writeFileSync(cfg, readFileSync(cfg, "utf8")
 \t\t\t<C Type="DayTimer" V="178" U="${TIMER}" Title="Uhr" Px="960" Py="2880" Px2="3648" Py2="3768" Nio="2" WF="16384" Analog="true" DefValue="18" Modes="00000000-0000-0001-1500000000000000,10000011-0000-0110-ffff504f94000001,00000000-0000-0002-1500000000000000">
 \t\t\t\t<Co K="Mode" U="10000030-0000-0301-00ff504f94000001"/><Co K="AQ" U="10000030-0000-0302-01ff504f94000001"/>
 \t\t\t\t<Entry From="390" To="480" V="21"/><Entry From="1080" To="1380" Ix="1" V="22.5"/><Entry From="600" To="660" Ix="2" V="5"/>
-\t\t\t</C>`));
+\t\t\t</C>`)
+  .replace("\t</C>\n</ControlList>", hardware));
 git("add", ".");
 git("commit", "-q", "-m", "[504F94000001] Config backup 2026-11-01 10:00:00 (v1)");
 // The Miniserver's own backups, as vislox caches them once downloaded (src/backups.rs): one with
@@ -70,6 +83,9 @@ edit('<Entry From="1080" To="1380" Ix="1"', '<Entry From="1020" To="1380" Ix="1"
 // The Urlaub column goes, with its entry: a column only the compared revision has.
 edit(',00000000-0000-0002-1500000000000000">', '">');
 edit('<Entry From="600" To="660" Ix="2" V="5"/>', '');
+// Hardware: the sensor's send interval and the AI input's threshold.
+edit('SSC="900"', 'SSC="600"');
+edit('MinChange="0.25" MinTime="1000"/>', 'MinChange="0.5" MinTime="1000"/>');
 
 // Live values as `lox stream -o json --initial` writes them: the fixture's
 // temperature (an analog output) and its AND gate (a digital one).
@@ -164,6 +180,9 @@ const loxConfig = join(loxDir, "config.yaml");
 writeFileSync(loxConfig, `host: http://127.0.0.1:${msPort}\nuser: u\npass: p\nserial: 504F94000001\nconfig_repo: ${repo}\n`);
 const fakeLox = join(loxDir, "lox");
 writeFileSync(fakeLox, `#!/bin/sh
+if [ "$*" = "extensions -o json --no-color" ]; then
+  echo '[{"name":"Raumklima Bad","online":true,"serial":"B0100001","type":"Tree Device"}]'; exit 0
+fi
 [ "$*" = "config pull --quiet" ] || { echo "unexpected: $*" >&2; exit 2; }
 sed -i 's/Title="Temperatur"/Title="Temperatur Wohnen"/' "${cfg}"
 cp "${backup}.new" "${backup}"
@@ -261,6 +280,33 @@ try {
     // The mode is a link to the Mode object.
     await page.click('#props .lnk:has-text("Feiertag")');
     await page.waitForFunction(() => document.querySelector(".ph-t")?.textContent === "Feiertag");
+  });
+  await step("changes that reconfigure a device are hardware, with what their settings do there", async () => {
+    await page.waitForSelector(".chg-filter .pill.hw");
+    assert.equal(await page.textContent(".chg-filter .pill.hw"), "hardware 2");
+    await page.click(".chg-filter .pill.hw");
+    const shown = await page.$$eval(".changes .chg .t", (n) => n.map((x) => x.textContent));
+    assert.deepEqual(shown, ["Raumklima Bad · SSC: 900 → 600", "Füllstand · MinChange: 0.25 → 0.5"]);
+    assert.equal(await page.$$eval(".changes .chg .hw-tag", (n) => n.length), 2);
+    await page.click('.changes .chg:has-text("Raumklima Bad")');
+    await page.waitForFunction(() => document.querySelector(".ph-t")?.textContent === "Raumklima Bad");
+    const props = await page.textContent("#props");
+    assert.match(props, /⚙ hardware/);
+    assert.match(props, /KindRoom Comfort Sensor Tree 0x8010/);
+    assert.match(props, /Send interval900600/);
+    assert.match(props, /burn-in/);
+    assert.match(await page.getAttribute('#props .k.hinted:has-text("Send interval")', "title"), /the device stores minutes/);
+    // An input of the AI Extension: its device, and its threshold's tooltip.
+    await page.click('.changes .chg:has-text("Füllstand")');
+    await page.waitForFunction(() => document.querySelector(".ph-t")?.textContent === "Füllstand");
+    assert.match(await page.textContent("#props"), /KindAI Extension 0x19DeviceAI Extension/);
+    assert.match(await page.getAttribute('#props .k.hinted:has-text("Threshold")', "title"), /only sends a new value/);
+    await page.click(".chg-filter .pill.hw");
+    assert.ok((await page.$$(".changes .chg")).length > 2);
+    // The devices on the bus, read with lox (only with the X-Vislox header).
+    const bus = [(await fetch(url + "api/hardware")).status, await (await fetch(url + "api/hardware", { headers: { "X-Vislox": "t" } })).json()];
+    assert.equal(bus[0], 403);
+    assert.deepEqual(bus[1].devices, [{ name: "Raumklima Bad", serial: "B0100001", online: true, type: "Tree Device", parent: null }]);
   });
   await step("In the app: the config's settings, then what the Miniserver's app shows", async () => {
     await page.keyboard.press("Control+k");
