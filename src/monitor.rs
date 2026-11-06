@@ -636,6 +636,13 @@ mod tests {
 
     const MS: &str = "192.168.1.120";
 
+    /// A test that hangs fails instead.
+    async fn within<F: std::future::Future>(f: F) -> F::Output {
+        tokio::time::timeout(std::time::Duration::from_secs(30), f)
+            .await
+            .expect("the test took longer than 30 s")
+    }
+
     #[test]
     fn off_unless_asked_for() {
         let f = found("http://127.0.0.1");
@@ -787,55 +794,61 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_stop_keeps_the_start_and_the_time_limit_tries_again() {
-        let fake = Arc::new(Fake::default());
-        let m = with_fake(fake.clone(), Duration::from_millis(50));
-        m.start().await.unwrap();
-        assert!(m.started());
-        // Stop by hand fails: still started, with the reason.
-        *fake.fail.lock().unwrap() = 1;
-        assert!(m.stop().await.is_err());
-        assert!(m.started());
-        assert!(
-            m.info()["error"]
-                .as_str()
-                .unwrap()
-                .starts_with("Stop failed")
-        );
-        // The time limit stops it; its first two tries fail, the third works.
-        *fake.fail.lock().unwrap() = 2;
-        for _ in 0..200 {
-            if !m.started() {
-                break;
+        within(async {
+            let fake = Arc::new(Fake::default());
+            let m = with_fake(fake.clone(), Duration::from_millis(50));
+            m.start().await.unwrap();
+            assert!(m.started());
+            // Stop by hand fails: still started, with the reason.
+            *fake.fail.lock().unwrap() = 1;
+            assert!(m.stop().await.is_err());
+            assert!(m.started());
+            assert!(
+                m.info()["error"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("Stop failed")
+            );
+            // The time limit stops it; its first two tries fail, the third works.
+            *fake.fail.lock().unwrap() = 2;
+            for _ in 0..200 {
+                if !m.started() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert!(!m.started(), "{}", m.info());
-        assert_eq!(
-            *fake.calls.lock().unwrap(),
-            [
-                "dev/sps/log/192.168.1.82",
-                "dev/sps/log",
-                "dev/sps/log",
-                "dev/sps/log",
-                "dev/sps/log"
-            ]
-        );
-        assert!(m.info()["error"].is_null());
+            assert!(!m.started(), "{}", m.info());
+            assert_eq!(
+                *fake.calls.lock().unwrap(),
+                [
+                    "dev/sps/log/192.168.1.82",
+                    "dev/sps/log",
+                    "dev/sps/log",
+                    "dev/sps/log",
+                    "dev/sps/log"
+                ]
+            );
+            assert!(m.info()["error"].is_null());
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn a_stop_or_new_start_cancels_the_old_time_limit() {
-        let fake = Arc::new(Fake::default());
-        let m = with_fake(fake.clone(), Duration::from_millis(40));
-        m.start().await.unwrap();
-        m.stop().await.unwrap();
-        m.start().await.unwrap();
-        tokio::time::sleep(Duration::from_millis(25)).await;
-        // The first Start's limit has run out, the second's not yet.
-        assert!(m.started());
-        tokio::time::sleep(Duration::from_millis(60)).await;
-        assert!(!m.started());
-        assert_eq!(fake.calls.lock().unwrap().len(), 4);
+        within(async {
+            let fake = Arc::new(Fake::default());
+            let m = with_fake(fake.clone(), Duration::from_millis(40));
+            m.start().await.unwrap();
+            m.stop().await.unwrap();
+            m.start().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            // The first Start's limit has run out, the second's not yet.
+            assert!(m.started());
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            assert!(!m.started());
+            assert_eq!(fake.calls.lock().unwrap().len(), 4);
+        })
+        .await;
     }
 
     #[test]
@@ -851,11 +864,16 @@ mod tests {
                 }
             })
         };
+        // At most 100 snapshots, spread over the sending: each holds up to
+        // 500 lines, so taking them as fast as possible grows without bound
+        // while the sender is starved (as on a busy CI runner).
         let mut taken = Vec::new();
-        while !sender.is_finished() {
+        while !sender.is_finished() && taken.len() < 100 {
             taken.push(m.subscribe());
+            std::thread::sleep(Duration::from_micros(200));
         }
         sender.join().unwrap();
+        assert!(!taken.is_empty());
         for (mut rx, snap) in taken {
             let mut seen: std::collections::HashSet<String> = snap
                 .as_array()
@@ -876,40 +894,43 @@ mod tests {
 
     #[tokio::test]
     async fn the_listener_takes_frames_and_reports_counts() {
-        // Bind on a free port; the Miniserver is 127.0.0.1.
-        let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        let port = probe.local_addr().unwrap().port();
-        drop(probe);
-        let f = found("http://127.0.0.1:1");
-        let s = Settings {
-            port,
-            advertise: None,
-            minutes: 60,
-        };
-        let m = Arc::new(Monitor::new(Ok(s), Ok(&f), None));
-        let (mut rx, _) = m.subscribe();
-        m.spawn();
-        // Listening, and the Miniserver's address looked up.
-        while m.info()["listening"]["ok"] != true || m.server_xml("504F94A0E454").is_none() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        let s = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        s.send_to(&frame(5, 1, 0, 0, &string("hello"), 1), ("127.0.0.1", port))
-            .await
-            .unwrap();
-        // The line at once, then the new count within a second.
-        let mut line = false;
-        loop {
-            match rx.recv().await {
-                Ok(Msg::Lines(l)) => line = l.contains("hello"),
-                Ok(Msg::Info) if line && m.info()["packets"] == 1 => break,
-                _ => {}
+        within(async {
+            // Bind on a free port; the Miniserver is 127.0.0.1.
+            let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let port = probe.local_addr().unwrap().port();
+            drop(probe);
+            let f = found("http://127.0.0.1:1");
+            let s = Settings {
+                port,
+                advertise: None,
+                minutes: 60,
+            };
+            let m = Arc::new(Monitor::new(Ok(s), Ok(&f), None));
+            let (mut rx, _) = m.subscribe();
+            m.spawn();
+            // Listening, and the Miniserver's address looked up.
+            while m.info()["listening"]["ok"] != true || m.server_xml("504F94A0E454").is_none() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-        }
-        assert!(
-            m.server_xml("504F94A0E454")
-                .unwrap()
-                .contains("/dev/udp/127.0.0.1/")
-        );
+            let s = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            s.send_to(&frame(5, 1, 0, 0, &string("hello"), 1), ("127.0.0.1", port))
+                .await
+                .unwrap();
+            // The line at once, then the new count within a second.
+            let mut line = false;
+            loop {
+                match rx.recv().await {
+                    Ok(Msg::Lines(l)) => line = l.contains("hello"),
+                    Ok(Msg::Info) if line && m.info()["packets"] == 1 => break,
+                    _ => {}
+                }
+            }
+            assert!(
+                m.server_xml("504F94A0E454")
+                    .unwrap()
+                    .contains("/dev/udp/127.0.0.1/")
+            );
+        })
+        .await;
     }
 }
