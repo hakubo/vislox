@@ -34,6 +34,16 @@ marked so you can review it before you deploy.
   outlined green and days it removes red (amber for both), so a timespan in the wrong year stands out. An entry whose date no longer decodes shows its old days as removed. Easter
   comes from the Gregorian computus; a yearly range that ends before it starts runs across New Year. Weekday
   entries (*the last Monday of May*) are not decoded yet, so they are not on the calendar.
+- **Heating and cooling periods** (live values on): the Miniserver's heating and cooling periods, which Intelligent
+  Room Controllers and the Climate Controller use to decide whether to heat or cool. They are set in the app's
+  operating-mode settings, not in the config, so vislox reads them from the Miniserver
+  (`jdev/sps/calendargetheatperiod` and `calendargetcoolperiod`, read-only) once each time the live connection
+  opens, which includes after the program restart of a deploy. The Operating modes view shows *Heating period: 1 Oct –
+  30 Apr · Cooling period: 1 Mar – 7 Sep* with a chip each (it hides or shows the period's days), marks their days
+  with a red and a blue bar, and says whether today is in either period. An Intelligent Room Controller's or Climate
+  Controller's Properties list the same under *Heating and cooling*, with a link to the year. A period the
+  Miniserver does not give (another code, no answer, or an answer that is not `MM-DD/MM-DD`) says why. Not with
+  `--live-from`.
 - **History** (right): every revision, newest first:
   - *Pending*: the compiled `out.Loxone` of a `lox.toml` project, compared with the deployed `base`.
     This is what `lox config push` would apply.
@@ -167,7 +177,8 @@ marked so you can review it before you deploy.
   one, none, or cannot be checked, nothing is sent.
 
 vislox itself never writes to the config: lox and git do, and only on Pull, Apply and Discard. Live values only
-listen, unless you turn on **Query blocks on this page**, which sends read-only requests. A pull reads from the
+listen, apart from two read-only requests for the heating and cooling periods each time they connect, unless you
+turn on **Query blocks on this page**, which sends read-only requests. A pull reads from the
 Miniserver; only Apply writes to it, and with `--operate`, commands to virtual inputs.
 
 ## Run
@@ -342,7 +353,9 @@ inputs, outputs and every other block are refused. The visualization password st
 storage and is never logged. The command log is kept in memory.
 
 The Miniserver connection is opened when a browser turns live values on, and closed shortly after the last
-one turns them off. With **Query blocks on this page**, the browser asks for the page's queries with
+one turns them off. Each time it opens, vislox asks for the heating and cooling periods on it
+(`jdev/sps/calendargetheatperiod`, `jdev/sps/calendargetcoolperiod`), once, and sends them to the browsers with
+the live values (`periods` on `/api/live`). With **Query blocks on this page**, the browser asks for the page's queries with
 `POST /api/live/query` (`{rev, page}`, only the current, deployed revision; it needs the `X-Vislox` header, so
 that no other web page can make vislox send requests), and holds `GET /api/live/query?token=…` open with the
 one-use token it gets while it shows the page. vislox sends `jdev/sps/io/<uuid>/all` for each block the page
@@ -428,7 +441,8 @@ The binary is an `axum` server with the UI embedded (plain JS and SVG, no build 
   `loxone-format.md` documents them: `Mode=` the kind, `From`/`To` days since 2009-01-01, `CalType=` the mode's
   number) and words it. The view carries the decoded date by kind (`calendar.date`), and the config's modes by
   number (`modes`), for `web/modes.js`, the Operating modes view, which lays the dates out on a year. It
-  also decodes the entries of `calendargetentries` and compares them with a config's (`calendar::drift`).
+  also decodes the entries of `calendargetentries` and compares them with a config's (`calendar::drift`), and
+  the Miniserver's heating and cooling periods (`Season`, `MM-DD/MM-DD`) into the same yearly range.
 - `src/appcalendar.rs` reads the Miniserver's calendar entries (`calendargetentries`) when live values start,
   after Pull, Apply and Sync and before Apply, for the *changed in the app* notice (`GET /api/calendar`).
 - `src/actions.rs` runs Apply (`lox config push --force`, `git commit`, `git push`), Sync (`lox config merge`,
@@ -454,7 +468,8 @@ The binary is an `axum` server with the UI embedded (plain JS and SVG, no build 
   connector has the UUID of the state it carries, so the browser matches values to wires by UUID. Values
   reach the browser on `/api/live` (server-sent events). `src/query.rs` maps a queried block's answer to its
   connectors, and `model::query_plan` picks the blocks a page needs.
-- `src/session.rs` is one WebSocket session (connect, log in, subscribe, stream, and the opt-in block queries),
+- `src/session.rs` is one WebSocket session (connect, log in, subscribe, stream, the opt-in block queries and the
+  heating and cooling periods),
   built from `loxone-client`'s parts so that it keeps the Miniserver's close code. `src/reason.rs` turns close and response codes into a
   reason, a plain sentence and a backoff.
 - File changes are noticed with `notify`. Git is polled every 3 s. Browsers get a server-sent event and

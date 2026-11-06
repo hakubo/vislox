@@ -19,6 +19,12 @@
 //! The decoded date is serialized for the browser as well, so that views
 //! of the year (which days a mode is on) can work from it without
 //! decoding the attributes again.
+//!
+//! The Miniserver's heating and cooling periods are not in the file: they
+//! are set in the app's operating-mode settings, and read with
+//! `jdev/sps/calendargetheatperiod` / `calendargetcoolperiod` (the
+//! datasheet's "Commands"), which answer `MM-DD/MM-DD`, e.g. `10-15/04-15`.
+//! [`Season`] decodes such an answer into a range every year.
 
 use chrono::{Days, NaiveDate};
 use loxone_config::xml::Element;
@@ -227,6 +233,85 @@ impl EntryDate {
     pub fn same_kind(&self, other: &EntryDate) -> bool {
         std::mem::discriminant(self) == std::mem::discriminant(other)
     }
+}
+
+/// The request for the heating period, and for the cooling period. Any user
+/// with visualization rights may send them; they change nothing.
+pub const HEAT_PERIOD: &str = "jdev/sps/calendargetheatperiod";
+pub const COOL_PERIOD: &str = "jdev/sps/calendargetcoolperiod";
+
+/// The heating or cooling period, as the Miniserver answered its request:
+/// the range every year (`date`, and `text` as it reads: *15 Oct – 15 Apr*),
+/// or why there is none (`why`). `value` is the answer as sent.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Season {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub date: Option<EntryDate>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub why: Option<String>,
+    pub value: String,
+}
+
+impl Season {
+    /// From the `LL` object of the Miniserver's answer; `None`: no answer
+    /// came.
+    pub fn from_reply(ll: Option<&serde_json::Value>) -> Season {
+        let Some(ll) = ll else {
+            return Season::why(String::new(), "the Miniserver did not answer".into());
+        };
+        let value = match &ll["value"] {
+            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::Null => String::new(),
+            v => v.to_string(),
+        };
+        let code = match &ll["Code"] {
+            serde_json::Value::String(s) => s.trim().parse::<i64>().ok(),
+            v => v.as_i64(),
+        };
+        if code != Some(200) {
+            let code = code.map_or_else(|| "none".to_string(), |c| c.to_string());
+            return Season::why(value, format!("the Miniserver refused it (Code {code})"));
+        }
+        match season(&value) {
+            Ok(d) => Season {
+                text: Some(d.short()),
+                date: Some(d),
+                why: None,
+                value,
+            },
+            Err(e) => Season::why(value, e),
+        }
+    }
+
+    fn why(value: String, why: String) -> Season {
+        Season {
+            date: None,
+            text: None,
+            why: Some(why),
+            value,
+        }
+    }
+}
+
+/// `MM-DD/MM-DD` as a range every year (it runs across New Year when the
+/// end comes before the start, as a heating period does).
+pub fn season(value: &str) -> Result<EntryDate, String> {
+    let day = |s: &str| -> Option<(u32, u32)> {
+        let (m, d) = s.trim().split_once('-')?;
+        let (m, d) = (m.parse::<i64>().ok()?, d.parse::<i64>().ok()?);
+        is_day_of_year(m, d).then_some((m as u32, d as u32))
+    };
+    let bad = || format!("“{value}” is not two days of the year (MM-DD/MM-DD)");
+    let (a, b) = value.split_once('/').ok_or_else(bad)?;
+    let ((month, day1), (month2, day2)) = (day(a).ok_or_else(bad)?, day(b).ok_or_else(bad)?);
+    Ok(EntryDate::Yearly {
+        month,
+        day: day1,
+        month2,
+        day2,
+    })
 }
 
 /// The `Mode=` number of the operating mode an entry switches on.
@@ -631,6 +716,64 @@ mod tests {
         assert_eq!(mode_number(None), Some(0));
         assert_eq!(mode_number(Some("-5")), Some(-5));
         assert_eq!(mode_number(Some("x")), None);
+    }
+
+    #[test]
+    fn the_periods_read_as_ranges_every_year() {
+        // As a real Miniserver answers (firmware 17).
+        let heat: serde_json::Value = serde_json::from_str(
+            r#"{"control": "dev/sps/calendargetheatperiod", "value": "10-01/04-30", "Code": "200"}"#,
+        )
+        .unwrap();
+        let s = Season::from_reply(Some(&heat));
+        assert_eq!(
+            s.date,
+            Some(EntryDate::Yearly {
+                month: 10,
+                day: 1,
+                month2: 4,
+                day2: 30
+            })
+        );
+        assert_eq!(s.text.as_deref(), Some("1 Oct – 30 Apr"));
+        assert_eq!(
+            serde_json::to_string(&s).unwrap(),
+            r#"{"date":{"kind":"yearly","month":10,"day":1,"month2":4,"day2":30},"text":"1 Oct – 30 Apr","value":"10-01/04-30"}"#
+        );
+        assert_eq!(season("5-15/9-15").unwrap().short(), "15 May – 15 Sep");
+        assert_eq!(season("02-29/03-01").unwrap().short(), "29 Feb – 1 Mar");
+        // What cannot be read says why, with the answer.
+        for bad in [
+            "",
+            "10-01",
+            "13-01/04-30",
+            "10-01/02-30",
+            "a-b/c-d",
+            "00-00/00-00",
+        ] {
+            assert_eq!(
+                season(bad).unwrap_err(),
+                format!("“{bad}” is not two days of the year (MM-DD/MM-DD)")
+            );
+        }
+        let refused: serde_json::Value = serde_json::from_str(
+            r#"{"control": "dev/sps/calendargetcoolperiod", "value": "", "Code": "403"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            Season::from_reply(Some(&refused)).why.as_deref(),
+            Some("the Miniserver refused it (Code 403)")
+        );
+        // A numeric Code counts too.
+        let num: serde_json::Value =
+            serde_json::from_str(r#"{"value": "05-15/09-15", "Code": 200}"#).unwrap();
+        assert!(Season::from_reply(Some(&num)).date.is_some());
+        let none = Season::from_reply(None);
+        assert_eq!(none.why.as_deref(), Some("the Miniserver did not answer"));
+        assert_eq!(
+            serde_json::to_string(&none).unwrap(),
+            r#"{"why":"the Miniserver did not answer","value":""}"#
+        );
     }
 
     #[test]

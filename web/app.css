@@ -652,3 +652,16 @@ button.chip { cursor: pointer; } button.chip:hover { border-color: var(--brand);
 /* A Status block's live text, with the app's icon and colour */
 .status-live { display: flex; align-items: center; gap: 6px; padding: 6px 10px; }
 .status-live .app-ic { margin: 0; width: 20px; height: 20px; }
+/* The heating and cooling periods (live): a bar along the bottom of their days. */
+:root { --heat: #e03131; --cool: #1971c2; }
+.md-d { position: relative; }
+.md-d.md-heat::after, .md-d.md-cool::after { content: ""; position: absolute; left: 2px; right: 2px; bottom: 1px; height: 3px; border-radius: 2px; pointer-events: none; }
+.md-d.md-heat::after { background: var(--heat); }
+.md-d.md-cool::after { background: var(--cool); }
+.md-d.md-heat.md-cool::after { background: linear-gradient(to right, var(--heat) 50%, var(--cool) 50%); }
+.md-psw { display: inline-block; width: 12px; height: 4px; border-radius: 2px; margin-right: 5px; vertical-align: middle; flex: none; }
+.md-psw.heat { background: var(--heat); } .md-psw.cool { background: var(--cool); }
+.md-psep { width: 1px; align-self: stretch; background: var(--line); margin: 0 6px; }
+.md-pchip.none { opacity: .7; cursor: default; }
+.md-ptoday { color: var(--muted); font-size: 12px; margin-left: 4px; }
+.pr-note { color: var(--muted); font-size: 12px; padding: 4px 0 2px; }
