@@ -49,10 +49,6 @@ if [ -n "${VISLOX_ADMIN_TOKEN:-}" ]; then
     printf '%s' "$VISLOX_ADMIN_TOKEN" > "$secrets/admin-token"
     set -- "$@" --admin-token-file "$secrets/admin-token"
 fi
-if [ -n "${VISLOX_AI_WEBHOOK:-}" ]; then
-    printf '%s' "$VISLOX_AI_WEBHOOK" > "$secrets/ai-webhook"
-    set -- "$@" --ai-webhook-file "$secrets/ai-webhook"
-fi
 unset VISLOX_ADMIN_TOKEN VISLOX_AI_WEBHOOK LOX_PASS
 
 # Follow the repository's remote: changes pushed elsewhere show up in History.

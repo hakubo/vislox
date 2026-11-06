@@ -29,9 +29,9 @@
 //! vislox reads `/prog` and `def.log` over HTTP (`/dev/fslist`,
 //! `/dev/fsget`), the way `lox files` does: it only reads.
 
-use loxone_client::{Connection, LoxClient};
+use loxone_client::Connection;
 use serde::Serialize;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// A check that takes longer than this has hung (an unreachable host).
@@ -310,7 +310,8 @@ pub fn assess(
 
 /// Ask the Miniserver (blocking: three HTTP requests).
 pub fn check(conn: &Connection) -> Report {
-    let client = match LoxClient::new(conn.clone()) {
+    // Checks the certificate when the route says so (`tls.rs`).
+    let client = match crate::tls::lox_client(conn) {
         Ok(c) => c,
         Err(e) => return Report::failed(e.to_string()),
     };
@@ -338,13 +339,14 @@ pub fn check(conn: &Connection) -> Report {
 
 /// The running config, checked on demand and kept for a minute.
 pub struct Running {
-    conn: Result<Connection, String>,
+    /// The route vislox's own clients use (`route.rs`).
+    conn: Result<Arc<crate::route::Handle>, String>,
     last: Mutex<Option<(Instant, Report)>>,
     one: tokio::sync::Mutex<()>,
 }
 
 impl Running {
-    pub fn new(conn: Result<Connection, String>) -> Running {
+    pub fn new(conn: Result<Arc<crate::route::Handle>, String>) -> Running {
         Running {
             conn,
             last: Mutex::new(None),
@@ -360,7 +362,7 @@ impl Running {
     /// `fresh`).
     pub async fn get(&self, fresh: bool) -> Report {
         let conn = match &self.conn {
-            Ok(c) => c.clone(),
+            Ok(h) => h.conn(),
             Err(e) => return Report::failed(e.clone()),
         };
         let _one = self.one.lock().await;

@@ -61,6 +61,11 @@ impl Pull {
         }
     }
 
+    /// A pull is running.
+    pub fn busy(&self) -> bool {
+        self.running.try_lock().is_err()
+    }
+
     pub fn why_not(&self) -> Option<&str> {
         self.cmd.as_ref().err().map(String::as_str)
     }
@@ -160,7 +165,9 @@ fn check(
 /// Linux, a file just written can still be held open for writing by a child
 /// another thread forked at that moment, and executing it fails until that
 /// child execs.
-async fn output_retrying(c: &mut tokio::process::Command) -> std::io::Result<std::process::Output> {
+pub(crate) async fn output_retrying(
+    c: &mut tokio::process::Command,
+) -> std::io::Result<std::process::Output> {
     let mut tries = 0;
     loop {
         match c.output().await {
@@ -174,7 +181,7 @@ async fn output_retrying(c: &mut tokio::process::Command) -> std::io::Result<std
 }
 
 /// `name` as a path, or looked up on `PATH`.
-fn which(name: &Path) -> Option<PathBuf> {
+pub(crate) fn which(name: &Path) -> Option<PathBuf> {
     if name.components().count() > 1 {
         return name.is_file().then(|| name.to_path_buf());
     }
@@ -207,6 +214,7 @@ mod tests {
             ctx: Some("home".into()),
             config_repo: repo.map(Path::to_path_buf),
             ms_dir: ms_dir.into(),
+            serial: None,
         }
     }
 

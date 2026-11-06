@@ -11,10 +11,11 @@ const K100 = 0.1;
 const $ = (id) => document.getElementById(id);
 const S = {
   hist: null, view: null, rev: null, base: null, page: null, sel: null,
-  follow: true, marks: true, vp: {}, open: new Set(["__pages"]), chgOff: new Set(),
+  follow: true, marks: true, vp: {}, open: new Set(["__pages"]), chgOff: new Set(), chgHw: false,
   objPage: new Map(), pageOf: new Map(), loadSeq: 0, onlyChanged: false, chgIdx: -1,
   closed: new Set(["Advanced"]), dim: true, treeFocus: null, hash: null, applyingHash: false,
-  live: { on: pref("live", false), dim: pref("liveDim", true), es: null, status: null, values: new Map(), controls: {}, globals: {} },
+  app: null, appBusy: false, appErr: "", applyReads: 0, deployed: null,
+  live: { on: pref("live", false), dim: pref("liveDim", true), query: pref("liveQuery", false), qes: null, qkey: "", qstat: null, es: null, status: null, values: new Map(), controls: {}, globals: {}, periods: null },
 };
 function pref(k, d) { try { const v = localStorage.getItem("vislox." + k); return v === null ? d : v === "1"; } catch { return d; } }
 function setPref(k, v) { try { localStorage.setItem("vislox." + k, v ? "1" : "0"); } catch { /* private mode */ } }
@@ -70,7 +71,7 @@ function setStatus(text, cls) {
   $("status").className = "status " + (cls || "");
   $("status").title = text;
 }
-function allRevs() { return S.hist ? [...S.hist.pending, ...S.hist.history] : []; }
+function allRevs() { return S.hist ? [...S.hist.pending, ...S.hist.history, ...(S.hist.backups || [])] : []; }
 function revById(id) { return allRevs().find((r) => r.id === id); }
 function lightColor(rgb) {
   const m = /^(\d+),(\d+),(\d+)$/.exec(rgb || "");
@@ -92,6 +93,7 @@ function revInfo(r) {
   const m = /Config backup .*?\(v(\d+)\)/i.exec(r.label);
   if (r.kind === "pending") title = r.current ? "Compiled, not deployed" : "Earlier compile";
   else if (r.kind === "live") title = r.label.replace(/ \(same as an older commit\)/, "");
+  else if (r.kind === "backup") title = r.label;
   else if (m) title = `Backup v${m[1]}`;
   else title = title.replace(/^\[[^\]]+\]\s*/, "");
   const sub = r.kind === "git" ? `${fmtWhen(r.time, true)} · ${r.detail}` : fmtWhen(r.time, true);
@@ -101,7 +103,7 @@ function revInfo(r) {
 // ── URL state: #page=…&sel=…&rev=…&base=… ─────────────────────────────
 function readHash() {
   const h = new URLSearchParams(location.hash.slice(1));
-  return { page: h.get("page"), sel: h.get("sel"), rev: h.get("rev"), base: h.get("base") };
+  return { page: h.get("page"), sel: h.get("sel"), rev: h.get("rev"), base: h.get("base"), view: h.get("view") };
 }
 function writeHash(push) {
   if (S.applyingHash) return;
@@ -110,6 +112,7 @@ function writeHash(push) {
   if (S.sel) h.set("sel", S.sel);
   if (!S.follow && S.rev) h.set("rev", S.rev);
   if (!S.follow && S.base) h.set("base", S.base);
+  if (MD.open) h.set("view", "modes");
   const s = "#" + h.toString();
   if (s === location.hash) return;
   if (push) history.pushState(null, "", s); else history.replaceState(null, "", s);
@@ -124,6 +127,7 @@ window.addEventListener("popstate", async () => {
     } else {
       if (h.page && h.page !== S.page) gotoPage(h.page);
       select(h.sel || null, { noReveal: false });
+      if (h.view === "modes") modesOpen({ quiet: true }); else modesClose(true);
     }
   } finally { S.applyingHash = false; }
 });
@@ -157,12 +161,46 @@ async function loadHistory(fromEvent) {
   renderLiveSwitch();
   renderPull();
   renderActions();
+  renderLog();
   if (fromEvent) {
     setStatus("updated " + new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }), "live flash");
     setTimeout(() => setStatus("live", "live"), 2500);
   }
   if (changed || !S.view) await loadView();
   else if (fromEvent && newest && newest.id !== prevNewest && !S.follow) setStatus("new revision in History", "live flash");
+}
+
+function revButton(r, newest) {
+  const info = revInfo(r);
+  const b = document.createElement("button");
+  b.type = "button";
+  b.className = `hrev k-${r.kind}` + (r.id === S.rev ? " sel" : "") + (r.id === S.base ? " base" : "") + (r.current ? " current" : "") + (r.current && r.kind !== "pending" && r.kind !== "backup" ? " deployed" : "");
+  b.setAttribute("aria-current", r.id === S.rev ? "true" : "false");
+  const deployed = r.current && r.kind !== "pending" && r.kind !== "backup";
+  const also = r.backups?.length ? `\n\nThe Miniserver's backup${r.backups.length > 1 ? "s" : ""} ${r.backups.join(", ")} ${r.backups.length > 1 ? "hold" : "holds"} this config.` : "";
+  b.title = `${r.label}\n${r.detail}\n${new Date(r.time * 1000).toLocaleString()}${also}` +
+    (deployed ? "\n\nThis is the config on the Miniserver." : "") +
+    `\n\nClick: show it\nShift+click: compare what you see with it${r.id === S.base ? " (again: stop comparing)" : ""}`;
+  const pills = [];
+  if (r.kind === "pending" && r.current) pills.push('<span class="pill pend">would be deployed</span>');
+  if (deployed) pills.push('<span class="pill cur">on Miniserver</span>');
+  if (r.kind === "live") pills.push('<span class="pill new">not in git</span>');
+  if (r.kind === "backup") pills.push('<span class="pill ms">not pulled</span>');
+  if (r.same_as) pills.push(`<span class="pill">same as ${esc(revById(r.same_as) ? revInfo(revById(r.same_as)).title : r.same_as)}</span>`);
+  if (r.backups?.length) pills.push(`<span class="pill ms">Miniserver backup${r.backups.length > 1 ? ` ×${r.backups.length}` : ""}</span>`);
+  if (r.id === S.base) pills.push('<span class="pill">compared with</span>');
+  b.innerHTML = `<span class="node"></span><span class="l1"><span class="lbl">${esc(info.title)}</span></span>
+    <span class="dt">${esc(info.sub)}</span>${pills.length ? `<span class="tags">${pills.join("")}</span>` : ""}`;
+  b.onclick = (ev) => {
+    if (ev.shiftKey) {
+      if (r.id === S.rev) return;
+      S.base = r.id === S.base ? null : r.id;
+    } else { S.rev = r.id; S.base = null; }
+    S.follow = !ev.shiftKey && r.id === newest ? S.follow : false;
+    $("chk-follow").checked = S.follow;
+    renderHistory(); renderSelects(); loadView(); writeHash(true);
+  };
+  return b;
 }
 
 function renderHistory() {
@@ -175,33 +213,82 @@ function renderHistory() {
       h.textContent = title;
       box.appendChild(h);
     }
-    for (const r of list) {
-      const info = revInfo(r);
-      const b = document.createElement("button");
-      b.type = "button";
-      b.className = `hrev k-${r.kind}` + (r.id === S.rev ? " sel" : "") + (r.id === S.base ? " base" : "") + (r.current ? " current" : "");
-      b.setAttribute("aria-current", r.id === S.rev ? "true" : "false");
-      b.title = `${r.label}\n${r.detail}\n${new Date(r.time * 1000).toLocaleString()}\n\nClick: view it, compared with the revision before\nShift+click: compare the viewed revision with this one`;
-      const pills = [];
-      if (r.kind === "pending" && r.current) pills.push('<span class="pill pend">would be deployed</span>');
-      if (r.kind !== "pending" && r.current) pills.push('<span class="pill cur">on disk</span>');
-      if (r.kind === "live") pills.push('<span class="pill new">not in git</span>');
-      if (r.id === S.base) pills.push('<span class="pill">compared with</span>');
-      b.innerHTML = `<span class="node"></span><span class="l1"><span class="lbl">${esc(info.title)}</span></span>
-        <span class="dt">${esc(info.sub)}</span>${pills.length ? `<span class="tags">${pills.join("")}</span>` : ""}`;
-      b.onclick = (ev) => {
-        if (ev.shiftKey) { if (r.id !== S.rev) S.base = r.id; }
-        else { S.rev = r.id; S.base = r.base; }
-        S.follow = !ev.shiftKey && r.id === list[0].id ? S.follow : false;
-        $("chk-follow").checked = S.follow;
-        renderHistory(); renderSelects(); loadView(); writeHash(true);
-      };
-      box.appendChild(b);
-    }
+    for (const r of list) box.appendChild(revButton(r, list[0].id));
   };
+  renderOpLog(box);
   if (S.hist.pending.length) { sec("Pending deployment", S.hist.pending); sec("Deployed history", S.hist.history); }
   else sec(null, S.hist.history);
   if (!S.hist.history.length) box.insertAdjacentHTML("beforeend", '<div class="empty">No revisions yet.</div>');
+  renderBackups(box);
+}
+
+// ── the Miniserver's own backups ───────────────────────────────────────
+// Every config the Miniserver loads leaves /prog/sps_<ver>_<stamp>.zip behind. vislox lists and
+// downloads them (FTP, read-only) only when asked, once each; one with the bytes of a Pull shows
+// as that Pull (its "Miniserver backup" pill), the others here, grouped by the Pulls around them.
+let backupsBusy = false;
+// A Read the server refused, with the state it refused in: once that state moves on (a read ran,
+// from here or after a Pull), the newer state counts.
+let backupsErr = null;
+function backupsState(info) { return `${info?.listed}|${info?.busy}|${info?.error}`; }
+function renderBackups(box) {
+  const info = S.hist.ms_backups;
+  const list = S.hist.backups || [];
+  const broken = info?.broken || [];
+  if (!info || (!info.available && !list.length && !broken.length)) return;
+  if (backupsErr && backupsErr.state !== backupsState(info)) backupsErr = null;
+  const busy = backupsBusy || info.busy;
+  const h = document.createElement("div");
+  h.className = "hist-sec bk-sec";
+  const tip = info.available ? `List the backups on the Miniserver (/prog, FTP, read-only) and download the new ones${msWarn("pull")}` : `Cannot read the backups: ${info.reason}`;
+  h.innerHTML = `<span>Miniserver backups</span><button type="button" class="bk-read"${busy || !info.available ? " disabled" : ""}
+    title="${esc(tip)}">${busy ? "Reading…" : "Read"}</button>`;
+  h.querySelector("button").onclick = readBackups;
+  box.appendChild(h);
+  const p = info.progress;
+  const err = backupsErr?.text || info.error;
+  const note = info.stuck ? `${info.error || "An FTP call took too long"}. Waiting for its FTP session to end before the next read.`
+    : busy ? (p?.[1] ? `Downloading ${Math.min(p[0] + 1, p[1])} of ${p[1]}…` : "Listing the backups on the Miniserver…")
+    : err ? `Cannot read the backups: ${err}`
+    : !info.available ? `Downloaded before. Not read now: ${info.reason}.`
+    : info.listed == null ? "The Miniserver keeps a backup of each config it loads. Read lists them and downloads each one once."
+    : `${info.on_miniserver} on the Miniserver, read ${fmtWhen(info.listed, true)}.` + (list.length ? "" : " Each one is a Pull above, or the same as the save before it.");
+  box.insertAdjacentHTML("beforeend", `<div class="bk-note${(err && !busy) || info.stuck ? " error" : ""}" role="status">${esc(note)}</div>`);
+  const pulls = S.hist.history.some((r) => r.kind === "git");
+  const short = (id) => { const r = revById(id); return r ? revInfo(r).short : id; };
+  let group;
+  for (const r of list) {
+    const key = r.before || "";
+    if (key !== group) {
+      group = key;
+      const t = !pulls ? "On the Miniserver"
+        : !r.before ? "Since the last Pull"
+        : r.after ? `Between ${short(r.after)} and ${short(r.before)}`
+        : `Before ${short(r.before)}`;
+      box.insertAdjacentHTML("beforeend", `<div class="bk-gap">${esc(t)}</div>`);
+    }
+    box.appendChild(revButton(r, null));
+  }
+  if (broken.length) {
+    box.insertAdjacentHTML("beforeend", `<div class="bk-gap">Could not be read (tried again on the next Read)</div>` +
+      broken.map((b) => `<div class="bk-broken" title="${esc(b.file)}"><span class="l1">Miniserver backup v${esc(String(b.version))} · ${esc(fmtStamp(b.stamp))}</span>
+        <span class="dt">${esc(b.error)}</span></div>`).join(""));
+  }
+}
+/** `YYYYMMDDHHMMSS` (the Miniserver's local time) as `2026-11-05 23:55`. */
+function fmtStamp(s) { return s.length >= 12 ? `${s.slice(0, 4)}-${s.slice(4, 6)}-${s.slice(6, 8)} ${s.slice(8, 10)}:${s.slice(10, 12)}` : s; }
+async function readBackups() {
+  if (backupsBusy) return;
+  backupsBusy = true; backupsErr = null; renderHistory();
+  let text = "";
+  try {
+    const r = await fetch("/api/backups/read", { method: "POST", headers: { "X-Vislox": "backups" } });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) text = j.error || r.statusText;
+  } catch (e) { text = e.message; }
+  backupsBusy = false;
+  if (text) backupsErr = { text, state: backupsState(S.hist?.ms_backups) };
+  await loadHistory();
 }
 
 function renderSelects() {
@@ -254,6 +341,10 @@ async function loadView() {
   renderPage();
   renderProps();
   if (S.sel) applyFocus();
+  // A link or Back/Forward says whether the view is open; a reload of the revision keeps it as it is.
+  if (h?.view === "modes") modesOpen({ quiet: true });
+  else if (h) modesClose(true);
+  else renderModes();
   writeHash(false);
 }
 function renderLegend() {
@@ -303,12 +394,15 @@ $("tab-list").addEventListener("keydown", (e) => {
 });
 function gotoPage(uuid, opts) {
   if (!uuid || !S.pageOf.has(uuid)) return;
+  // Going to a page leaves the Operating modes view.
+  const left = MD.open;
+  modesClose(true);
   if (S.page !== uuid) {
     S.page = uuid;
     renderTabs(); renderPage();
     if (S.sel) applyFocus();
     writeHash(true);
-  }
+  } else if (left) writeHash(true);
   if (opts && opts.focus) focusObj(opts.focus, opts.zoom);
 }
 function stepPage(d) {
@@ -437,17 +531,20 @@ function renderPage() {
   }
   for (const l of p.labels) wire(l.obj, l.port);
   const objByUuid = new Map(p.objects.map((o) => [o.uuid, o]));
+  const logged = logMarks();
+  S.log.drawn = marksKey(logged);
 
-  for (const w of p.wires) {
-    const pts = w.points.map((q) => q.join(",")).join(" ");
-    const line = el("polyline", { class: `wire${w.analog ? " analog" : ""}${w.status ? " d-" + w.status : ""}`, points: pts, "data-f": w.from[0], "data-t": w.to[0], "data-src": w.src }, L.wires);
-    const hit = el("polyline", { class: "wire-hit", points: pts }, L.wires);
+  const hops = wireHops(p.wires);
+  p.wires.forEach((w, wi) => {
+    const d = wirePath(hops[wi]);
+    const line = el("path", { class: `wire${w.analog ? " analog" : ""}${w.status ? " d-" + w.status : ""}`, d, "data-f": w.from[0], "data-t": w.to[0], "data-src": w.src }, L.wires);
+    const hit = el("path", { class: "wire-hit", d }, L.wires);
     const fo = objByUuid.get(w.from[0]), to = objByUuid.get(w.to[0]);
     hoverTip(hit, () => `<b>${esc(fo ? displayTitle(fo) : "")}</b>.${esc(portName(fo, w.from[1]))} → <b>${esc(to ? displayTitle(to) : "")}</b>.${esc(portName(to, w.to[1]))}<br><span class="tm">${w.analog ? "analog" : "digital"}${w.status ? " · " + w.status : ""}</span>${liveTip(w.src)}`);
     hit.addEventListener("mouseenter", () => line.classList.add("hl"));
     hit.addEventListener("mouseleave", () => line.classList.remove("hl"));
     hit.addEventListener("click", (e) => { e.stopPropagation(); if (!drag?.moved) select(w.to[0]); });
-  }
+  });
 
   const stack = new Map();
   for (const l of p.labels) {
@@ -461,6 +558,7 @@ function renderPage() {
     if (o.shape === "tag") drawTag(L.objs, o, p);
     else drawBlock(L.objs, o);
     if (o.status && S.view.compared) drawBadge(L.badges, o);
+    if (logged.has(o.uuid)) drawLogBadge(L.badges, o, logged.get(o.uuid));
     if (o.moved_to) {
       const g = el("g", { class: "xref ghost-note" }, L.badges);
       const t = el("text", { class: "pg", x: o.rect[0], y: o.rect[1] + o.rect[3] + 160 }, g, `→ moved to page “${o.moved_to.page_title}”`);
@@ -473,7 +571,6 @@ function renderPage() {
       el("line", { class: "ghost-line ghost", x1: x + w / 2, y1: y + h / 2, x2: o.rect[0] + o.rect[2] / 2, y2: o.rect[1] + o.rect[3] / 2 }, L.ghost);
     }
   }
-  renderAiCtx();
   L.live = liveBuild(p);
   liveApply(null);
   renderMinimap();
@@ -543,12 +640,10 @@ function wrapWords(text, n, max) {
 function portName(o, key) { return o?.ports.find((q) => q.key === key)?.name || key; }
 
 function wrapObj(parent, o, cls) {
-  const g = el("g", { class: `${cls}${o.status ? " d-" + o.status : ""}${o.moved_to ? " ghosted" : ""}${o.uuid === S.sel ? " sel" : ""}${aiCtx.blocks.has(o.uuid) ? " ai-ctx" : ""}`, "data-uuid": o.moved_to ? "" : o.uuid }, parent);
+  const g = el("g", { class: `${cls}${o.status ? " d-" + o.status : ""}${o.moved_to ? " ghosted" : ""}${o.uuid === S.sel ? " sel" : ""}`, "data-uuid": o.moved_to ? "" : o.uuid }, parent);
   g.addEventListener("click", (e) => {
     e.stopPropagation();
     if (drag?.moved) return;
-    // Alt+click: add the block to (or drop it from) the AI request's context.
-    if (e.altKey && aiCtxOn() && !o.moved_to) { toggleAiCtx(o.uuid); return; }
     select(o.uuid);
   });
   g.addEventListener("dblclick", (e) => {
@@ -569,6 +664,82 @@ function objTip(o) {
   if (o.ty === "Text") parts.push(esc(clip(noteText(o), 300)).replace(/\n/g, "<br>"));
   if (o.status) parts.push(`<i>${o.status}</i>`);
   return parts.join("<br>");
+}
+
+/** Wire corners are rounded with this radius (page units; a port row is 192). */
+const WIRE_R = 64;
+/** A wire hops over another wire's vertical run with a half circle of this radius. */
+const HOP_R = 36;
+
+/** Each wire's points without repeats or straight-through corners, and where its
+ *  horizontal runs cross another wire's vertical run: `{ pts, hops: Map(segment → [x…]) }`. */
+function wireHops(wires) {
+  const clean = wires.map((w) => {
+    const out = [];
+    for (const q of w.points) {
+      const a = out[out.length - 1], b = out[out.length - 2];
+      if (a && a[0] === q[0] && a[1] === q[1]) continue;
+      if (a && b && ((b[0] === a[0] && a[0] === q[0]) || (b[1] === a[1] && a[1] === q[1]))) out.pop();
+      out.push(q);
+    }
+    return out;
+  });
+  const verts = [];
+  clean.forEach((pts, wi) => {
+    for (let i = 0; i + 1 < pts.length; i++) {
+      const [a, b] = [pts[i], pts[i + 1]];
+      if (a[0] === b[0]) verts.push({ wi, x: a[0], y0: Math.min(a[1], b[1]), y1: Math.max(a[1], b[1]) });
+    }
+  });
+  return clean.map((pts, wi) => {
+    const hops = new Map();
+    for (let i = 0; i + 1 < pts.length; i++) {
+      const [a, b] = [pts[i], pts[i + 1]];
+      if (a[1] !== b[1]) continue;
+      const y = a[1], x0 = Math.min(a[0], b[0]), x1 = Math.max(a[0], b[0]);
+      // Clear of the corners, so a hop never runs into a bend.
+      const pad = WIRE_R + HOP_R;
+      const xs = [];
+      for (const v of verts) {
+        if (v.wi === wi || wires[v.wi].src === wires[wi].src) continue;
+        if (v.x > x0 + pad && v.x < x1 - pad && y > v.y0 + HOP_R && y < v.y1 - HOP_R) xs.push(v.x);
+      }
+      if (!xs.length) continue;
+      xs.sort((p, q) => (b[0] > a[0] ? p - q : q - p));
+      // Hops closer than a hop's width merge into one.
+      const merged = [];
+      for (const x of xs) if (!merged.length || Math.abs(x - merged[merged.length - 1]) >= 2 * HOP_R + 8) merged.push(x);
+      hops.set(i, merged);
+    }
+    return { pts, hops };
+  });
+}
+
+/** An SVG path for a wire: rounded corners, a half-circle hop at each crossing. */
+function wirePath({ pts, hops }) {
+  const n = pts.length;
+  const len = (i) => Math.abs(pts[i + 1][0] - pts[i][0]) + Math.abs(pts[i + 1][1] - pts[i][1]);
+  // The radius at corner i, at most half of either leg.
+  const r = (i) => (i <= 0 || i >= n - 1 ? 0 : Math.min(WIRE_R, len(i - 1) / 2, len(i) / 2));
+  const toward = (p, q, d) => {
+    const dx = Math.sign(q[0] - p[0]), dy = Math.sign(q[1] - p[1]);
+    return [p[0] + dx * d, p[1] + dy * d];
+  };
+  let d = `M${pts[0][0]},${pts[0][1]}`;
+  for (let i = 0; i + 1 < n; i++) {
+    const a = pts[i], b = pts[i + 1];
+    const dir = Math.sign(b[0] - a[0]);
+    for (const x of hops.get(i) || []) {
+      d += `L${x - dir * HOP_R},${a[1]}A${HOP_R},${HOP_R} 0 0 ${dir > 0 ? 1 : 0} ${x + dir * HOP_R},${a[1]}`;
+    }
+    const e = toward(b, a, r(i + 1));
+    d += `L${e[0]},${e[1]}`;
+    if (i + 2 < n) {
+      const s = toward(b, pts[i + 2], r(i + 1));
+      d += `Q${b[0]},${b[1]} ${s[0]},${s[1]}`;
+    }
+  }
+  return d;
 }
 
 /** Loxone Config 16 port stubs: a small grey tab on the block edge. The wire ends under it. */
@@ -661,6 +832,15 @@ function drawBlock(parent, o) {
     }
     drawPins(g, o, 7);
   }
+  if (S.view.objects[o.uuid]?.app?.shown) drawAppBadge(g, x, y + h);
+}
+/** A small phone at the block's lower left: the block is shown in the app. */
+function drawAppBadge(g, x, y) {
+  const b = el("g", { class: "abadge" }, g);
+  el("title", {}, b, "Shown in the app: the Miniserver sends its live values");
+  el("circle", { cx: x, cy: y, r: 100 }, b);
+  el("rect", { x: x - 38, y: y - 62, width: 76, height: 124, rx: 14 }, b);
+  el("line", { x1: x - 14, y1: y + 40, x2: x + 14, y2: y + 40 }, b);
 }
 
 /** Analog references get a black "#" chip, digital ones a ring, as in Loxone Config 16. */
@@ -721,7 +901,7 @@ function drawXref(parent, l, n) {
   L.xrefs.push({ x: bx, y, text: label, page: t.page_title || "" });
   const analog = /^A[QI]/.test(l.port) || /^A[QI]/.test(t.port || "");
   const wx = left ? bx + LABEL_W : bx;
-  el("polyline", { class: `xref-wire${analog ? " analog" : ""}${l.status ? " d-" + l.status : ""}`, "data-f": l.obj, "data-src": l.src, points: `${l.x},${l.y} ${(l.x + wx) / 2},${l.y} ${(l.x + wx) / 2},${y} ${wx},${y}` }, g);
+  el("path", { class: `xref-wire${analog ? " analog" : ""}${l.status ? " d-" + l.status : ""}`, "data-f": l.obj, "data-src": l.src, d: wirePath(wireHops([{ points: [[l.x, l.y], [(l.x + wx) / 2, l.y], [(l.x + wx) / 2, y], [wx, y]] }])[0]) }, g);
   const top = y - ROW / 2, rx = ROW / 2;
   el("rect", { class: "bar", x: bx, y: top, width: LABEL_W, height: ROW, rx, ry: rx }, g);
   // The link icon in its own pill at the wired end, like Loxone Config's connection references.
@@ -743,6 +923,16 @@ function drawBadge(parent, o) {
   const cx = o.rect[0] + o.rect[2], cy = o.rect[1];
   el("circle", { cx, cy, r: 110, fill: col }, g);
   el("text", { x: cx, y: cy + 52, "text-anchor": "middle" }, g, sym);
+}
+
+/** A block the Miniserver's log named since the last program change: a small mark on its top-left corner. */
+function drawLogBadge(parent, o, e) {
+  const g = el("g", { class: "lbadge " + e.kind }, parent);
+  const cx = o.rect[0], cy = o.rect[1];
+  el("circle", { cx, cy, r: 100 }, g);
+  el("text", { x: cx, y: cy + 46, "text-anchor": "middle" }, g, "!");
+  hoverTip(g, () => `<b>Miniserver log</b> ${esc(e.at)}<br>${esc(e.text)}`);
+  g.addEventListener("click", (ev) => { ev.stopPropagation(); if (!drag?.moved) openLog(e); });
 }
 
 function followTarget(t) {
@@ -816,6 +1006,7 @@ function select(uuid, opts) {
   if (uuid) vpG.querySelectorAll(`[data-uuid="${CSS.escape(uuid)}"]`).forEach((n) => n.classList.add("sel"));
   applyFocus();
   renderProps();
+  renderModes();
   if (!opts || !opts.noReveal) revealInTree(uuid);
   writeHash(false);
 }
@@ -841,6 +1032,13 @@ function linkTarget(t) {
   return `<button type="button" class="lnk" data-go="${esc(t.uuid)}" data-page="${esc(t.page || "")}">${esc(name)}${t.port ? "." + esc(t.port) : ""}</button>${where ? `<span class="where">${esc(where)}</span>` : ""}`;
 }
 
+/** A calendar entry in one line, for a tooltip: “Every year on 24 Dec · switches on Holiday”. */
+function calTip(cal) {
+  if (!cal) return "";
+  return `${cal.when ?? "Date cannot be read"} · switches on ${cal.mode.title}`;
+}
+
+const propRow = (k, v, cls, tip) => `<div class="pr ${cls || ""}"><div class="k${tip ? " hinted" : ""}"${tip ? ` title="${esc(tip)}"` : ""}>${esc(k)}</div><div class="v">${v}</div></div>`;
 function renderProps() {
   const box = $("props");
   const o = S.sel && S.view?.objects[S.sel];
@@ -855,8 +1053,10 @@ function renderProps() {
   const chg = (oldV, newV, changed) => (marks && changed ? `<span class="old">${esc(oldV ?? "—")}</span><span class="new">${esc(newV ?? "—")}</span>` : val(newV));
   const sections = [];
   const section = (name, rows, count) => { if (rows.length) sections.push({ name, rows, count }); };
-  const row = (k, v, cls) => `<div class="pr ${cls || ""}"><div class="k">${esc(k)}</div><div class="v">${v}</div></div>`;
+  const row = propRow;
 
+  const opT = opTarget(o);
+  if (opT) section("Operate", [opControls(opT)]);
   if (liveHere()) {
     const rows = [];
     const ctl = S.live.controls[o.uuid];
@@ -870,8 +1070,41 @@ function renderProps() {
     }
     section("Live values", rows.length ? rows : [`<div class="empty">The Miniserver sends no values for this block.</div>`], rows.length);
   }
+  for (const sec of liveSections(o, row, marks)) section(sec.name, sec.rows, sec.count);
+  const cal = o.calendar;
+  if (cal) {
+    const modeV = (m) => (m.target ? linkTarget(m.target) : `<span class="none-v">${esc(m.title)}</span>`);
+    const when = cal.when == null ? `<span class="none-v">Cannot read: ${esc(cal.why || "unknown")}. See Advanced.</span>` : esc(cal.when);
+    section("Calendar entry", [
+      row("When", marks && cal.old_when != null ? `<span class="old">${esc(cal.old_when)}</span><span class="new">${when}</span>` : when, marks && cal.old_when != null ? "pr-chg" : ""),
+      row("Switches on", marks && cal.old_mode ? `<span class="old">${esc(cal.old_mode.title)}</span><span class="new">${modeV(cal.mode)}</span>` : modeV(cal.mode), marks && cal.old_mode ? "pr-chg" : ""),
+      ...(() => {
+        const d = calDriftOf(o.uuid);
+        if (!d) return [];
+        const what = d.kind === "deleted" ? "Deleted in the app since the deployed config. Pull or Sync to take that over." : `Changed in the app since the deployed config: ${d.changes.join("; ")}. Pull or Sync to take it over.`;
+        return [row("In the app", `<span class="cal-app">${esc(what)}</span>`, "pr-chg")];
+      })(),
+    ]);
+  }
+  const periods = mdPeriodRows(o, row);
+  if (periods) section("Heating and cooling", periods);
+  const inApp = appRows(o, row, chg, marks);
+  if (inApp) section("In the app", inApp.rows, inApp.count);
   const note = o.ty === "Text" ? o.attrs.find((a) => a.name === "Text") : null;
   if (note) section("Note", [`<div class="note-p${marks && note.changed ? " pr-chg" : ""}">${marks && note.changed ? chg(note.old, note.value, true) : esc(note.value || "")}</div>`]);
+  const dv = o.device;
+  if (dv) {
+    const rows = [row("Kind", esc(dv.kind) + (dv.code ? ` <span class="mono none-v">${esc(dv.code)}</span>` : ""))];
+    if (!dv.own) rows.push(row("Device", `<button type="button" class="lnk" data-go="${esc(dv.uuid)}">${esc(dv.title)}</button>`));
+    else if (!o.attrs.some((a) => a.hint && /^(Serial|IP)$/.test(a.name))) rows.push(row("Serial", val(dv.serial)));
+    if (marks && dv.how) rows.push(row("This change", `<span class="hw-how">${esc(HW_HOW[dv.how] || dv.how)}</span>`, "pr-chg"));
+    // The settings matched to the device's own configuration, with what they do there.
+    for (const a of o.attrs.filter((x) => x.hint)) {
+      rows.push(row(HW_LABEL[a.name] || a.name, marks && a.changed ? chg(a.old, a.value, true) : val(a.value), marks && a.changed ? (a.hw ? "pr-chg pr-hw" : "pr-chg") : "", a.hint));
+    }
+    if (dv.note) rows.push(`<div class="note-p hw-note">${esc(dv.note)}</div>`);
+    section("Device", rows);
+  }
   const params = o.ports.filter((q) => q.def != null || q.def_changed || q.inv)
     .map((q) => row(q.name + (q.inv ? " (inverted)" : ""), chg(q.old_def, q.def, q.def_changed), marks && q.def_changed ? "pr-chg" : ""));
   section("Parameters", params, params.length);
@@ -908,7 +1141,7 @@ function renderProps() {
     else if (marks && a.changed) v = chg(a.old, a.value, true);
     else if (a.value && a.value.length > 160) v = `<span class="long">${esc(a.value)}</span><button type="button" class="more">Show all</button>`;
     else v = val(a.value);
-    return row(a.name, v, marks && a.changed ? (a.value == null ? "pr-rem" : "pr-chg") : "");
+    return row(a.name, v, marks && a.changed ? (a.value == null ? "pr-rem" : "pr-chg") : "", a.hint);
   });
   const rawChanged = marks && o.attrs.some((a) => a.changed);
   section("Advanced", raw, raw.length);
@@ -919,20 +1152,25 @@ function renderProps() {
   if (o.room) facts.push(`<span class="chip" title="Room">⌂ ${esc(o.room)}</span>`);
   if (o.category) facts.push(`<span class="chip" title="Category">◆ ${esc(o.category)}</span>`);
   if (o.target) facts.push(`<span class="chip" title="Mirrors">↪ ${linkTarget(o.target)}</span>`);
+  if (marks && dv?.how) facts.push(`<span class="chip hw" title="${esc(HW_HOW[dv.how] || dv.how)}">⚙ hardware</span>`);
   const title = autoTitle(o.title) ? prettyType(o.ty) : o.title;
   if (note) S.closed.delete("Note");
   const st = marks && o.status ? ` <span class="st ${o.status}">${o.status}</span>` : "";
   const renamed = marks && o.old_title ? `<div class="ph-s"><span class="old">${esc(o.old_title)}</span>→ <span class="new">${esc(o.title)}</span></div>` : "";
-  box.innerHTML = `<div class="ph"><div class="ph-top">${color && /^\d+,\d+,\d+$/.test(color) && color !== "0,0,0" ? `<span class="swatch" style="background:rgb(${esc(color)})"></span>` : ""}<span class="ph-t">${esc(title)}</span>${st}${aiCtxOn() && o.page ? `<button type="button" class="ai-ctx-btn${aiCtx.blocks.has(o.uuid) ? " on" : ""}" data-ctx="${esc(o.uuid)}" title="Send this block with the next AI request (Alt+click on the canvas)">${aiCtx.blocks.has(o.uuid) ? "✓ In AI context" : "＋ AI context"}</button>` : ""}</div>
+  box.innerHTML = `<div class="ph"><div class="ph-top">${color && /^\d+,\d+,\d+$/.test(color) && color !== "0,0,0" ? `<span class="swatch" style="background:rgb(${esc(color)})"></span>` : ""}<span class="ph-t">${esc(title)}</span>${st}</div>
     <div class="ph-s">${esc(prettyType(o.ty))}</div>${renamed}${facts.length ? `<div class="ph-facts">${facts.join("")}</div>` : ""}</div>` +
     sections.map((s) => {
       const open = !S.closed.has(s.name) || (s.name === "Advanced" && rawChanged);
-      return `<section><button type="button" class="ps-h" aria-expanded="${open}" data-sec="${esc(s.name)}">${esc(s.name)}${s.count ? `<span class="count">${s.count}</span>` : ""}</button><div class="ps-b"${open ? "" : " hidden"}>${s.rows.join("")}</div></section>`;
+      return `<section><button type="button" class="ps-h" aria-expanded="${open}" data-sec="${esc(s.name)}">${esc(s.name)}${s.count ? `<span class="count">${s.count}</span>` : ""}</button><div class="ps-b" data-body="${esc(s.name)}"${open ? "" : " hidden"}>${s.rows.join("")}</div></section>`;
     }).join("");
 }
+$("props").addEventListener("keydown", (e) => {
+  const i = e.target.closest(".op input");
+  if (i && e.key === "Enter") { e.preventDefault(); operate(i.dataset.opUuid, i.value); }
+});
 $("props").addEventListener("click", (e) => {
-  const cb = e.target.closest("[data-ctx]");
-  if (cb) { toggleAiCtx(cb.dataset.ctx); return; }
+  const ob = e.target.closest("[data-op]");
+  if (ob) { operate(ob.dataset.opUuid, ob.dataset.op === "set" ? ob.closest(".op").querySelector("input").value : ob.dataset.op); return; }
   const h = e.target.closest(".ps-h");
   if (h) {
     const open = h.getAttribute("aria-expanded") !== "true";
@@ -941,6 +1179,7 @@ $("props").addEventListener("click", (e) => {
     open ? S.closed.delete(h.dataset.sec) : S.closed.add(h.dataset.sec);
     return;
   }
+  if (e.target.closest(".app-load")) { loadAppFromMs(); return; }
   const c = e.target.closest(".copy");
   if (c) { copyText(c.dataset.copy).then(() => { c.textContent = "Copied"; setTimeout(() => (c.textContent = "Copy"), 1200); }); return; }
   const m = e.target.closest(".more");
@@ -951,10 +1190,24 @@ $("props").addEventListener("click", (e) => {
   select(a.dataset.go);
 });
 
+/** How a change reconfigures a device (`device.how`, `hardware[].how`). */
+const HW_HOW = {
+  added: "Added: the Miniserver configures this device once it finds it on the bus",
+  removed: "Removed: the Miniserver no longer configures this device",
+  replaced: "Device replaced: another serial is another physical device",
+  paired: "Paired: the config now names this device's serial, so the Miniserver configures the device with it",
+  unpaired: "Unpaired: the config no longer names a serial, so no physical device gets this configuration",
+  changed: "Reconfigures the device: the Miniserver sends it a new configuration, which the device stores",
+};
+const HW_LABEL = { AC: "Audible acknowledgement", SSC: "Send interval", MinChange: "Threshold", MinTime: "Minimal time between sends", AverageTime: "Mean value time", TreeType: "Device type", SubType: "Device subtype", HwVersion: "Hardware version" };
+
 // ── tree ───────────────────────────────────────────────────────────────
 const ICON = { Pages: ["#4f7fc4", "▦"], Page: ["#4f7fc4", "P"], Refs: ["#8a908a", "⇄"], Place: ["#8b6cc4", "R"], Category: ["#b5891f", "C"],
   VirtualIn: ["#0f8fb0", "V"], VirtualOut: ["#0f8fb0", "V"], InputRef: ["#8a908a", "→"], OutputRef: ["#8a908a", "←"], Memory: ["#6b726b", "M"], User: ["#6b726b", "U"] };
 function icon(n) {
+  // Rooms and categories get the app's icon, once the structure file is read.
+  const place = (n.ty === "Place" || n.ty === "Category") && (n.ty === "Place" ? S.app?.rooms : S.app?.cats)?.[n.uuid];
+  if (place?.image) return `<span class="tn-ic app" aria-hidden="true">${appIcon(place.image)}</span>`;
   const [c, t] = ICON[n.ty] || (n.children.length ? ["#a7ada7", "▤"] : ["#4ea432", "•"]);
   return `<span class="tn-ic" style="background:${c}" aria-hidden="true">${t}</span>`;
 }
@@ -997,9 +1250,11 @@ function renderTree() {
     const badge = cnt && !n.status ? `<span class="badge changed" aria-label="${cnt} changes">${cnt}</span>` : "";
     const name = autoTitle(n.title) && n.ty !== "Page" ? prettyType(n.ty) : n.title;
     const ty = extra ?? (!kids && name !== prettyType(n.ty) ? prettyType(n.ty) : "");
+    const tipText = calTip(S.view.objects[n.uuid]?.calendar);
+    const year = MODES_FOLDERS.has(n.ty) ? '<button type="button" class="tn-year" data-modes tabindex="-1" title="Operating modes: a year calendar of when each mode is on">Year</button>' : "";
     const num = n.ty === "Page" || n.ty === "Refs" ? `<span class="tn-n">${n.ty === "Page" ? treeChildren(n).reduce((a, c) => a + (c.synthetic ? 0 : 1), 0) : n.children.length}</span>` : "";
-    return `<div class="tn-row ${marks ? n.status : ""}${n.uuid === S.sel ? " sel" : ""}${n.uuid === S.treeFocus ? " kfocus" : ""}" role="treeitem" aria-level="${depth + 1}"${kids ? ` aria-expanded="${open}"` : ""} aria-selected="${n.uuid === S.sel}" data-uuid="${esc(n.uuid)}" style="padding-left:${4 + depth * 14}px">` +
-      `<span class="tn-tw${open ? " open" : ""}" aria-hidden="true">${kids ? "▶" : ""}</span>${icon(n)}<span class="tn-t">${esc(name)}</span>${ty ? `<span class="tn-ty">${esc(ty)}</span>` : ""}${badge}${num}</div>`;
+    return `<div class="tn-row ${marks ? n.status : ""}${n.uuid === S.sel ? " sel" : ""}${n.uuid === S.treeFocus ? " kfocus" : ""}" role="treeitem" aria-level="${depth + 1}"${kids ? ` aria-expanded="${open}"` : ""} aria-selected="${n.uuid === S.sel}" data-uuid="${esc(n.uuid)}"${tipText ? ` title="${esc(tipText)}"` : ""} style="padding-left:${4 + depth * 14}px">` +
+      `<span class="tn-tw${open ? " open" : ""}" aria-hidden="true">${kids ? "▶" : ""}</span>${icon(n)}<span class="tn-t">${esc(name)}</span>${ty ? `<span class="tn-ty">${esc(ty)}</span>` : ""}${year}${badge}${num}</div>`;
   };
   if (q) {
     const out = [];
@@ -1046,6 +1301,8 @@ function nodeById(uuid) {
   if (S.view) treeRoots().forEach(walk);
   return found;
 }
+/** The Calendar and Operating modes folders have a button that opens the year view of the modes. */
+const MODES_FOLDERS = new Set(["CalendarCaption", "ModeCaption"]);
 function activateNode(uuid) {
   const n = nodeById(uuid);
   if (!n) return;
@@ -1065,10 +1322,12 @@ $("tree").addEventListener("click", (e) => {
   if (!row) return;
   const uuid = row.dataset.uuid;
   S.treeFocus = uuid;
+  if (e.target.closest("[data-modes]")) { modesOpen(); return; }
   if (e.target.closest(".tn-tw") && row.hasAttribute("aria-expanded")) { toggleNode(uuid); return; }
   activateNode(uuid);
 });
 $("tree").addEventListener("dblclick", (e) => {
+  if (e.target.closest("[data-modes]")) return;
   const row = e.target.closest(".tn-row");
   if (row && row.hasAttribute("aria-expanded")) toggleNode(row.dataset.uuid);
 });
@@ -1108,7 +1367,7 @@ $("tree-filter").addEventListener("input", renderTree);
 
 // ── changes ────────────────────────────────────────────────────────────
 const KIND = { added: ["+", "added"], removed: ["−", "removed"], renamed: ["~", "renamed"], param: ["~", "parameters"], attr: ["~", "settings"], "wire+": ["+", "wires added"], "wire-": ["−", "wires removed"], moved: ["↔", "moved"] };
-function shownChanges() { return (S.view?.changes || []).filter((c) => !S.chgOff.has(c.kind)); }
+function shownChanges() { return (S.view?.changes || []).filter((c) => !S.chgOff.has(c.kind) && (!S.chgHw || c.hw)); }
 function renderChanges() {
   const v = S.view, box = $("changes"), filt = $("chg-filter");
   box.innerHTML = ""; filt.innerHTML = "";
@@ -1139,6 +1398,19 @@ function renderChanges() {
     p.onclick = () => { S.chgOff.has(k) ? S.chgOff.delete(k) : S.chgOff.add(k); S.chgIdx = -1; renderChanges(); };
     filt.appendChild(p);
   }
+  // Changes that reconfigure a device (an extension, a Tree or Air device): pressed, only those show.
+  const hwCount = v.changes.filter((c) => c.hw).length;
+  if (!hwCount) S.chgHw = false;
+  if (hwCount) {
+    const p = document.createElement("button");
+    p.type = "button";
+    p.className = "pill hw";
+    p.setAttribute("aria-pressed", String(S.chgHw));
+    p.textContent = `hardware ${hwCount}`;
+    p.title = `Show only the changes that reconfigure a device (${plural(v.stats.devices, "device")}): the Miniserver sends it a new configuration, which it stores itself`;
+    p.onclick = () => { S.chgHw = !S.chgHw; S.chgIdx = -1; renderChanges(); };
+    filt.appendChild(p);
+  }
   if (!v.changes.length) { box.innerHTML = '<div class="empty">No differences between these revisions.</div>'; return; }
   const list = shownChanges().slice(0, 2000);
   list.forEach((c, i) => {
@@ -1147,7 +1419,7 @@ function renderChanges() {
     d.className = "chg" + (i === S.chgIdx ? " cur" : "");
     d.setAttribute("role", "listitem");
     const where = c.page ? S.pageOf.get(c.page)?.title : c.obj ? v.objects[c.obj]?.path : "";
-    d.innerHTML = `<span class="k ${esc(c.kind)}" aria-label="${esc(KIND[c.kind]?.[1] || c.kind)}">${KIND[c.kind]?.[0] || "~"}</span><span class="x"><span class="t">${esc(c.text)}</span>${where ? `<span class="p">${esc(where)}</span>` : ""}</span>`;
+    d.innerHTML = `<span class="k ${esc(c.kind)}" aria-label="${esc(KIND[c.kind]?.[1] || c.kind)}">${KIND[c.kind]?.[0] || "~"}</span><span class="x"><span class="t">${esc(c.text)}</span>${where ? `<span class="p">${esc(where)}</span>` : ""}</span>${c.hw ? '<span class="hw-tag" title="Reconfigures a device">hardware</span>' : ""}`;
     d.onclick = () => gotoChange(i);
     box.appendChild(d);
   });
@@ -1218,13 +1490,20 @@ function renderPalette() {
     if (o.moved_to || o.shape === "tag") continue;
     blocks.push({ kind: "block", title: displayTitle(o), meta: `${prettyType(o.ty)} · ${p.title}`, page: p.uuid, uuid: o.uuid });
   }
+  // Views match a whole word they start with (“mod”, “calendar”), not any subsequence, and come after
+  // pages and blocks, so that a short query still opens the best page or block.
+  const views = mdEntries().length || v.modes.length ? [{ kind: "view", title: "Operating modes", meta: "year calendar of the calendar entries", names: ["operating modes", "modes", "calendar"] }] : [];
   let items;
-  if (!q) items = [{ sec: "Pages" }, ...pages];
+  if (!q) items = [{ sec: "Pages" }, ...pages, ...(views.length ? [{ sec: "Views" }, ...views] : [])];
   else {
     const score = (it) => { const m = fuzzy(q, it.title); return m ? { ...it, score: m.score + (it.kind === "page" ? 50 : 0), hits: m.hits } : null; };
     const ps = pages.map(score).filter(Boolean).sort((a, b) => b.score - a.score).slice(0, 12);
     const bs = blocks.map(score).filter(Boolean).sort((a, b) => b.score - a.score).slice(0, 40);
-    items = [...(ps.length ? [{ sec: "Pages" }, ...ps] : []), ...(bs.length ? [{ sec: "Blocks" }, ...bs] : [])];
+    const vs = views.filter((it) => it.names.some((w) => w.startsWith(q))).map((it) => {
+      const at = it.title.toLowerCase().indexOf(q);
+      return { ...it, hits: at >= 0 ? [[at, at + q.length]] : [] };
+    });
+    items = [...(ps.length ? [{ sec: "Pages" }, ...ps] : []), ...(bs.length ? [{ sec: "Blocks" }, ...bs] : []), ...(vs.length ? [{ sec: "Views" }, ...vs] : [])];
   }
   pal.items = items;
   pal.idx = items.findIndex((x) => !x.sec);
@@ -1248,6 +1527,7 @@ function palOpen(i) {
   const it = pal.items[i];
   if (!it || it.sec) return;
   closePalette();
+  if (it.kind === "view") { modesOpen(); return; }
   if (it.kind === "page") { gotoPage(it.page); select(null, { noReveal: true }); }
   else { gotoPage(it.page, { focus: it.uuid }); select(it.uuid); }
   svg.focus({ preventScroll: true });
@@ -1281,11 +1561,13 @@ $("sel-base").onchange = (e) => { S.base = e.target.value || null; S.follow = fa
 $("chk-changes").onchange = (e) => {
   S.marks = e.target.checked;
   if (!S.view) return;
-  renderLegend(); renderTabs(); renderTree(); renderPage(); renderProps(); applyFocus();
+  renderLegend(); renderTabs(); renderTree(); renderPage(); renderProps(); applyFocus(); renderModes();
 };
 $("chk-live").onchange = (e) => setLive(e.target.checked);
 $("chk-live-dim").checked = S.live.dim;
 $("chk-live-dim").onchange = (e) => { S.live.dim = e.target.checked; setPref("liveDim", S.live.dim); renderLiveSwitch(); };
+$("chk-live-query").checked = S.live.query;
+$("chk-live-query").onchange = (e) => { S.live.query = e.target.checked; setPref("liveQuery", S.live.query); renderLiveSwitch(); };
 $("chk-dim").onchange = (e) => { S.dim = e.target.checked; renderPage(); applyFocus(); };
 $("chk-follow").onchange = (e) => { S.follow = e.target.checked; if (S.follow) { S.rev = null; loadHistory(); } writeHash(false); };
 
@@ -1300,6 +1582,8 @@ window.addEventListener("keydown", (e) => {
   if (tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA") { if (e.key === "Escape") e.target.blur(); return; }
   if (e.ctrlKey || e.metaKey || e.altKey) return;
   const inTree = e.target.id === "tree", inTabs = e.target.closest?.("#tab-list");
+  // The Operating modes view takes the arrows (years) and Esc; the hidden page is not panned or zoomed.
+  if (!inTree && !inTabs && modesKey(e)) return;
   const step = e.shiftKey ? 240 : 60;
   switch (e.key) {
     case "+": case "=": zoomCenter(1.25); break;
@@ -1348,7 +1632,8 @@ function renderPull() {
   b.disabled = pulling || !info.available;
   b.classList.toggle("busy", pulling);
   b.querySelector(".lbl").textContent = pulling ? "Pulling…" : "Pull from Miniserver";
-  b.title = info.available ? "Download the Miniserver's current config and commit it (lox config pull)" : `Cannot pull: ${info.reason}`;
+  b.title = !info.available ? `Cannot pull: ${info.reason}` : "Download the Miniserver's current config and commit it (lox config pull)" + msWarn("pull");
+  renderStale();
 }
 function pullMsg(text, cls) {
   const m = $("pull-msg");
@@ -1373,7 +1658,7 @@ async function pull() {
   } catch (e) {
     pullMsg(e.message, "error");
   } finally {
-    pulling = false; renderPull();
+    pulling = false; renderPull(); loadMs(true);
   }
 }
 $("btn-pull").onclick = pull;
@@ -1410,9 +1695,196 @@ function renderRunning() {
 $("ms-run").addEventListener("click", (e) => { if (e.target.closest(".ms-again")) loadRunning(true); });
 $("pull-msg").onclick = () => pullMsg("");
 
-// ── change with AI, apply, discard ─────────────────────────────────────
-// A prompt goes to an AI agent (webhook) that edits the lox.toml project's module and compiles it;
-// the compile shows as the pending revision. Apply deploys it (lox config push) and pushes to git.
+// ── the Miniserver: status chip and preflight ──────────────────────────
+// The server checks the Miniserver lox talks to (its web port, FTP, the unauthenticated
+// jdev/cfg/apiKey, lox's token) and refuses Pull, Apply and Sync when they could not work.
+S.ms = null;
+// What the last check found against an action. It only warns: the server checks again when the
+// button is clicked, so a cause that has cleared does not keep the button off.
+function msBlocked(what) { return S.ms?.available ? S.ms.blocked?.[what] || "" : ""; }
+function msWarn(what) { const b = msBlocked(what); return b ? `\n\n⚠ The last check found: ${b}. It is checked again when you click.` : ""; }
+// `fresh`: check again now; `poll`: the regular poll, which asks only for the config dates again.
+async function loadMs(fresh, poll) {
+  try { S.ms = await api("/api/miniserver" + (fresh ? "?fresh=1" : poll ? "?poll=1" : "")); } catch { return; }
+  renderMs(); renderPull(); renderActions();
+}
+function renderMs() {
+  const m = S.ms, chip = $("ms-chip");
+  chip.classList.toggle("hidden", !m?.available);
+  if (!m?.available) { closeMsPop(); return; }
+  const blocked = ["pull", "apply", "sync"].filter((w) => m.blocked?.[w]);
+  const why = [...new Set(blocked.map((w) => m.blocked[w]))];
+  const state = blocked.length ? "bad" : m.warnings.length ? "warn" : "ok";
+  chip.className = "ms-chip " + state;
+  $("ms-lbl").textContent = m.identity === "wrong" ? `Wrong Miniserver (${m.serial})`
+    : (m.reachable ? [m.serial, m.firmware].filter(Boolean).join(" · ") || "Miniserver" : "Miniserver unreachable")
+      + (m.route?.kind === "remote" ? " · Remote Connect" : "");
+  chip.title = why.length ? `Miniserver: ${why.join("\n")}`
+    : `Miniserver ${m.serial || ""} at ${m.host}` + (m.warnings.length ? `\n${m.warnings.join("\n")}` : "");
+  const tls = { on: "available", none: "none", expired: "certificate expired", unknown: "unknown" }[m.tls] || "unknown";
+  const tok = m.tokenValidUntil ? new Date(m.tokenValidUntil * 1000).toLocaleString([], { ...MONTH, year: "numeric", hour: "2-digit", minute: "2-digit" }) + (m.tokenValidUntil * 1000 < Date.now() ? " (expired)" : "") : "no token yet";
+  const row = (k, v) => v == null || v === "" ? "" : `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`;
+  // How vislox reaches it (route.rs): its CloudDNS name, Remote Connect, or lox's host as it is.
+  const r = m.route;
+  const route = r && ({ clouddns: "local, under its CloudDNS name", remote: "Remote Connect", local: "lox's host" }[r.kind]
+    + (r.url.startsWith("https://") ? (r.verified ? " · certificate checked" : " · certificate not checked") : " · no TLS"));
+  $("ms-body").innerHTML = `<h3>Miniserver</h3><dl>
+      ${row("Address", m.host)}${row("Route", route)}${r && r.url !== r.loxHost ? row("lox's host (Pull, Apply, Sync)", r.loxHost || "none (a serial only)") : ""}
+      ${r?.note && r.verified ? row("Why", r.note) : ""}${row("Serial", m.serial)}
+      ${m.expected ? row("Config belongs to", `${m.expected.serial} (${m.expected.from})` + ({ confirmed: " ✓", wrong: " ✗ not this one" }[m.identity] || "")) : ""}
+      ${row("Firmware", m.firmware)}
+      ${row("Deployed config", m.config?.deployed && `Loxone Config ${m.config.deployed}`)}
+      ${row("Pending config", m.config?.pending && `Loxone Config ${m.config.pending}`)}
+      ${row("Config last changed", m.configDate?.error ? `can't tell (${m.configDate.error})`
+        : m.configDate?.miniserver && msDate(m.configDate.miniserver) + ({ after: " (after the base)", before: " (before the base: an older config runs)" }[m.configDate.order] || ""))}
+      ${row("Base taken at", m.configDate?.base && msDate(m.configDate.base))}
+      ${row("Calendar entries", !S.cal?.available || (!S.cal.read_at && !S.cal.failed) ? "" : S.cal.error ? `can't tell (${S.cal.error})`
+        : calDrift().length ? `${calDrift().length} changed in the app` : `${S.cal.entries}, as in the deployed config`)}
+      ${m.reachable ? row("Connection", m.local === false ? "remote" : m.local ? "local" : "unknown") + row("TLS", tls)
+        + row("Live-update slot", m.eventSlots == null ? "" : m.eventSlots ? "free" : "none free") : ""}
+      ${row("lox's token valid until", tok)}
+      ${(() => { const st = S.mon?.info?.stats; return st ? row("Load (Debug-Monitor)", `CPU ${Math.round(st.cpu)} % · heap ${st.heapKb} of ${st.maxKb} kB` + (st.linkErrors ? ` · ${st.linkErrors} Link errors` : "")) : ""; })()}</dl>
+    ${m.checks.map((c) => `<div class="chk ${c.ok ? "ok" : "bad"}"><span class="dot" aria-hidden="true"></span><span><b>${esc(c.name)}</b> <span class="d">${esc(c.ok ? (c.detail === "answers" ? "answers" : "answers: " + c.detail) : c.detail)}</span></span></div>`).join("")}
+    ${m.discovered?.length ? `<div class="chk"><span><b>On the local network</b> <span class="d">${m.discovered.map((d) => esc(`${d.serial} at ${d.ip} (${d.firmware})`)).join(", ")}</span></span></div>` : ""}
+    ${m.discoveryNote ? `<div class="chk bad"><span class="dot" aria-hidden="true"></span><span><b>Discovery</b> <span class="d">${esc(m.discoveryNote)}</span></span></div>` : ""}
+    ${why.map((y) => `<div class="blocked">${esc(blocked.filter((w) => m.blocked[w] === y).map((w) => w[0].toUpperCase() + w.slice(1)).join(", "))} would fail: ${esc(y)}</div>`).join("")}
+    ${m.warnings.length ? `<ul class="warns">${m.warnings.map((w) => `<li>${esc(w)}</li>`).join("")}</ul>` : ""}`;
+  renderStale();
+  $("ms-when").textContent = "Checked " + new Date(m.checked * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
+// The Miniserver's config changed after the base (LoxAPPversion3 against the date in the
+// download the base came from): someone saved from Loxone Config, or the like.
+/** "2026-11-06 14:32:10" (the Miniserver's local time) → "14:32" today, else "2026-11-06 14:32". */
+function msDate(t) {
+  const m = /^(\d{4})-(\d\d)-(\d\d) (\d\d):(\d\d)/.exec(t || "");
+  if (!m) return t || "";
+  const d = new Date();
+  const today = +m[1] === d.getFullYear() && +m[2] === d.getMonth() + 1 && +m[3] === d.getDate();
+  return today ? `${m[4]}:${m[5]}` : `${m[1]}-${m[2]}-${m[3]} ${m[4]}:${m[5]}`;
+}
+function staleText() {
+  const c = S.ms?.available && S.ms.configDate;
+  return c?.changed ? `The Miniserver's config changed at ${msDate(c.miniserver)}, after the base vislox shows (taken at ${msDate(c.base)}).` : "";
+}
+function renderStale() {
+  renderCalDrift();
+  const text = staleText();
+  $("stale").classList.toggle("hidden", !text);
+  if (!text) return;
+  const pullOk = !!S.hist?.pull?.available;
+  const a = S.hist?.actions;
+  const syncOk = !!a?.shown && !!a.apply?.available && !pendingChange() && !a.running;
+  $("stale-text").textContent = text + (pullOk || syncOk ? " Take it in before you change anything:" : " Changes made now start from an old base.");
+  $("stale-text").title = `Miniserver: ${S.ms.configDate.miniserver} · base: ${S.ms.configDate.base}`;
+  $("stale-pull").classList.toggle("hidden", !pullOk);
+  $("stale-pull").disabled = pulling;
+  $("stale-sync").classList.toggle("hidden", !syncOk);
+  $("stale-row").classList.toggle("hidden", !pullOk && !syncOk);
+}
+$("stale-pull").onclick = () => $("btn-pull").click();
+$("stale-sync").onclick = () => $("btn-sync").click();
+
+// ── calendar entries changed in the Loxone app ─────────────────────────
+// The server reads the Miniserver's entries (calendargetentries, admin only) when live values
+// start, after Pull, Apply and Sync, and before Apply, and compares them with the deployed
+// revision. Without admin rights nothing shows.
+S.cal = null;
+// Requests can answer out of order: only the newest one's answer is kept.
+S.calSeq = 0;
+/** Ask for the drift (`fresh`: have the server read the Miniserver again first). Returns this
+ * request's answer; a failed request is an answer too (`failed`, with `error`), never the last one. */
+async function loadCal(fresh) {
+  const seq = ++S.calSeq;
+  let c;
+  try {
+    const r = await fetch("/api/calendar" + (fresh ? "?fresh=1" : ""), { headers: fresh ? { "X-Vislox": "calendar" } : {} });
+    const j = await r.json().catch(() => ({}));
+    c = r.ok ? j : { available: true, failed: true, error: j.error || r.statusText || `HTTP ${r.status}` };
+  } catch (e) {
+    c = { available: true, failed: true, error: e.message || "vislox did not answer" };
+  }
+  if (seq !== S.calSeq) return c;
+  S.cal = c;
+  renderCalDrift();
+  if (S.ms) renderMs();
+  if (S.view && S.sel && S.view.objects[S.sel]?.calendar) renderProps();
+  return c;
+}
+/** The entries the app changed, against the deployed revision. */
+function calDrift(c = S.cal) { return c?.available && Array.isArray(c.drift) ? c.drift : []; }
+/** How entry `uuid` was changed in the app, when it was and the deployed revision is viewed. */
+// The drift is against the deployed config (`S.cal.rev`: the last commit, not an edit on disk); it
+// shows on that revision and on what the file on disk holds now.
+function calDriftOf(uuid) { return S.rev === S.cal?.rev || viewingDeployed() ? calDrift().find((d) => d.uuid === uuid) : undefined; }
+function calDriftText(c = S.cal) {
+  const d = calDrift(c);
+  if (!d.length) return "";
+  const n = d.length;
+  const by = ["added", "changed", "deleted"].map((k) => [k, d.filter((x) => x.kind === k).length]).filter(([, c]) => c);
+  return `${n} calendar ${n === 1 ? "entry was" : "entries were"} ${by.length === 1 ? by[0][0] : `changed (${by.map(([k, c]) => `${c} ${k}`).join(", ")})`} in the Loxone app since the deployed config.`;
+}
+/** What Apply's confirmation says about the calendar entries, from the read just before it:
+ * the entries the app changed, or that they could not be checked. A Miniserver that refuses
+ * (no admin rights) is skipped quietly. */
+function calApplyWarning(c) {
+  if (!c?.available) return "";
+  if (c.error && !c.refused) return `⚠ Couldn't check calendar entries changed in the app: ${c.error}. Applying overwrites any there are.\n\n`;
+  const d = calDrift(c);
+  if (!d.length) return "";
+  return `⚠ ${calDriftText(c)} Applying overwrites ${d.length === 1 ? "it" : "them"}:\n${d.map((x) => `  ${x.name}: ${x.kind === "changed" ? x.changes.join("; ") : x.kind}`).join("\n")}\n\n`;
+}
+function calDriftLine(d) {
+  const has = !!S.view?.objects[d.uuid];
+  const name = has ? `<button type="button" class="lnk" data-go="${esc(d.uuid)}">${esc(d.name)}</button>` : `<b>${esc(d.name)}</b>`;
+  if (d.kind === "added") return `${name}: added, ${esc(d.what)}`;
+  if (d.kind === "deleted") return `${name}: deleted (was ${esc(d.what)})`;
+  return `${name}: ${esc(d.changes.join("; "))}`;
+}
+function renderCalDrift() {
+  const text = calDriftText();
+  $("cal-drift").classList.toggle("hidden", !text);
+  if (!text) return;
+  const pullOk = !!S.hist?.pull?.available;
+  const a = S.hist?.actions;
+  const syncOk = !!a?.shown && !!a.apply?.available && !pendingChange() && !a.running;
+  $("cal-drift-text").textContent = text + (pullOk || syncOk ? " Take them over before you change anything:" : " An Apply would overwrite them.");
+  $("cal-drift-text").title = S.cal.read_at ? `Read from the Miniserver ${new Date(S.cal.read_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}` : "";
+  $("cal-drift-list").innerHTML = calDrift().map((d) => `<li>${calDriftLine(d)}</li>`).join("");
+  $("cal-drift-pull").classList.toggle("hidden", !pullOk);
+  $("cal-drift-pull").disabled = pulling;
+  $("cal-drift-sync").classList.toggle("hidden", !syncOk);
+  $("cal-drift-row").classList.toggle("hidden", !pullOk && !syncOk);
+}
+$("cal-drift-pull").onclick = () => $("btn-pull").click();
+$("cal-drift-sync").onclick = () => $("btn-sync").click();
+$("cal-drift-list").addEventListener("click", (e) => {
+  const g = e.target.closest("[data-go]");
+  if (!g) return;
+  const u = g.dataset.go, pg = S.view?.objects[u]?.page;
+  if (pg) gotoPage(pg, { focus: u });
+  select(u);
+});
+function closeMsPop() { $("ms-pop").classList.add("hidden"); $("ms-chip").setAttribute("aria-expanded", "false"); }
+$("ms-chip").onclick = () => {
+  const open = $("ms-pop").classList.toggle("hidden") === false;
+  $("ms-chip").setAttribute("aria-expanded", String(open));
+  if (open) loadMs();
+};
+$("ms-recheck").onclick = async () => {
+  const b = $("ms-recheck");
+  b.disabled = true; b.textContent = "Checking…";
+  await loadMs(true);
+  b.disabled = false; b.textContent = "Check again";
+};
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && !$("ms-pop").classList.contains("hidden")) { closeMsPop(); $("ms-chip").focus(); e.stopPropagation(); }
+}, true);
+document.addEventListener("click", (e) => { if (!e.target.closest(".ms-wrap")) closeMsPop(); });
+
+// ── apply, sync, discard ───────────────────────────────────────────────
+// Whoever edits the lox.toml project's module and compiles it (a person, or an agent working in the
+// repository), the compile shows as the pending revision. Apply deploys it (lox config push) and
+// pushes to git; Sync makes the Miniserver's running config the base; Discard drops the compile.
 function adminToken(ask) {
   let t = "";
   try { t = localStorage.getItem("vislox.token") || ""; } catch { /* private mode */ }
@@ -1427,74 +1899,19 @@ async function act(path, body) {
   if (!t) throw new Error("Changes need the admin token.");
   const r = await fetch(path, {
     method: "POST",
-    headers: { "Content-Type": "application/json", "X-Vislox-Token": t },
+    headers: { "Content-Type": "application/json", "X-Vislox-Token": t, "X-Vislox": "act" },
     body: JSON.stringify(body || {}),
   });
   const j = await r.json().catch(() => ({}));
   if (r.status === 401) try { localStorage.removeItem("vislox.token"); } catch { /* private mode */ }
+  if (j.preflight || /apply|sync/.test(path)) loadMs(true);
   if (!r.ok) { const e = new Error(j.error || r.statusText); e.data = j; throw e; }
   return j;
 }
-// What goes along with an AI request: the page on screen (unless removed) and the blocks the
-// user picked (Properties' "＋ AI context", or Alt+click on the canvas).
-const aiCtx = { blocks: new Map(), skipPage: null };
-function aiCtxOn() { return !!S.hist?.actions?.shown && !!S.hist.actions.ai.available; }
-function blockInfo(uuid) {
-  const o = S.view?.objects[uuid];
-  if (!o) return null;
-  return { uuid, title: autoTitle(o.title) ? prettyType(o.ty) : o.title, ty: o.ty, page: S.pageOf.get(o.page)?.title || "" };
-}
-function toggleAiCtx(uuid) {
-  if (aiCtx.blocks.has(uuid)) aiCtx.blocks.delete(uuid);
-  else { const b = blockInfo(uuid); if (!b) return; if (aiCtx.blocks.size >= 20) { aiMsg("At most 20 blocks go with a request.", true); return; } aiCtx.blocks.set(uuid, b); }
-  renderAiCtx(); markAiCtx(); renderProps();
-}
-function markAiCtx() {
-  vpG.querySelectorAll(".ai-ctx").forEach((n) => n.classList.remove("ai-ctx"));
-  for (const u of aiCtx.blocks.keys()) vpG.querySelectorAll(`[data-uuid="${CSS.escape(u)}"]`).forEach((n) => n.classList.add("ai-ctx"));
-}
-function aiCtxPayload() {
-  const p = curPage();
-  return {
-    page: p && aiCtx.skipPage !== p.uuid ? { uuid: p.uuid, title: p.title || "" } : null,
-    blocks: [...aiCtx.blocks.values()],
-  };
-}
-function renderAiCtx() {
-  const box = $("ai-ctx");
-  if (!box) return;
-  const p = curPage();
-  const chips = [];
-  if (p && aiCtx.skipPage !== p.uuid) chips.push(`<span class="ai-chip page" title="The page you are on goes with the request">▦ ${esc(p.title || "page")}<button type="button" data-drop-page aria-label="Don't send the page">×</button></span>`);
-  for (const b of aiCtx.blocks.values()) chips.push(`<span class="ai-chip" title="${esc(b.ty)} on ${esc(b.page)}"><button type="button" class="go" data-go-ctx="${esc(b.uuid)}">${esc(b.title)}</button><button type="button" data-drop="${esc(b.uuid)}" aria-label="Remove ${esc(b.title)}">×</button></span>`);
-  box.innerHTML = chips.join("") + `<span class="ai-ctx-hint">${aiCtx.blocks.size ? "" : "Add blocks: Alt+click on the canvas, or ＋ AI context in Properties"}</span>`;
-}
-$("ai-ctx").addEventListener("click", (e) => {
-  const d = e.target.closest("[data-drop]");
-  if (d) { toggleAiCtx(d.dataset.drop); return; }
-  if (e.target.closest("[data-drop-page]")) { aiCtx.skipPage = curPage()?.uuid || null; renderAiCtx(); return; }
-  const g = e.target.closest("[data-go-ctx]");
-  if (g) { const u = g.dataset.goCtx; const pg = S.view?.objects[u]?.page; if (pg) gotoPage(pg, { focus: u }); select(u); }
-});
-/** "page Sypialnia · 2 blocks" from the context text the agent got. */
-function ctxSummary(t) {
-  const page = /page "([^"]*)" \(uuid/.exec(t)?.[1];
-  const n = t.split("\n").filter((l) => l.startsWith("- ")).length;
-  const parts = [];
-  if (page) parts.push(`page ${page}`);
-  if (n) parts.push(`${n} block${n === 1 ? "" : "s"}`);
-  return parts.length ? "with " + parts.join(", ") : "";
-}
-/** Re-read the AI / Apply state (it changes outside revisions). */
-async function refreshActions() {
-  if (!S.hist) return;
-  try { S.hist.actions = (await api("/api/history")).actions; } catch { return; }
-  renderActions();
-}
-function aiMsg(text, error, warn) {
-  const m = $("ai-msg");
+function deployMsg(text, error, warn) {
+  const m = $("deploy-msg");
   m.textContent = text || "";
-  m.className = "ai-msg" + (error ? " error" : warn ? " warn" : "") + (text ? "" : " hidden");
+  m.className = "deploy-msg" + (error ? " error" : warn ? " warn" : "") + (text ? "" : " hidden");
 }
 /** The newest compile, if it differs from what is deployed. */
 function pendingChange() {
@@ -1502,71 +1919,373 @@ function pendingChange() {
   const base = p && revById(p.base);
   return p && base && p.blob !== base.blob ? p : null;
 }
+// One Apply at a time: from the click until the confirmation is answered (and the request sent),
+// a second click does nothing.
+let applyAsking = false;
 function renderActions() {
   const a = S.hist?.actions;
-  $("ai-pane").classList.toggle("hidden", !a?.shown);
+  $("deploy-pane").classList.toggle("hidden", !a?.shown);
+  renderStale();
   if (!a?.shown) return;
-  const working = a.requests.some((r) => r.state === "sent" || r.state === "working");
-  const busy = working || !!a.running;
-  $("ai-prompt").disabled = !a.ai.available;
-  $("ai-send").disabled = !a.ai.available || busy;
-  renderAiCtx();
-  $("ai-hint").textContent = !a.ai.available ? a.ai.reason : a.running ? `${a.running} is running…` : working ? "The AI is working on it…" : "";
-  $("ai-reqs").innerHTML = a.requests.slice(0, 4).map((r) => `<div class="ai-req st-${esc(r.state.replace(/ /g, "-"))}">
-      <div class="top"><span class="st">${esc(r.state)}</span><span class="p">${esc(r.prompt)}</span><span class="t">${esc(fmtWhen(r.updated))}</span></div>
-      ${r.context ? `<div class="c" title="${esc(r.context)}">${esc(ctxSummary(r.context))}</div>` : ""}
-      ${r.summary ? `<div class="s">${esc(r.summary)}</div>` : ""}</div>`).join("");
+  const busy = !!a.running;
   const pend = pendingChange();
-  $("ai-deploy").classList.toggle("hidden", !pend && !a.running);
-  $("ai-pend").textContent = a.running === "Apply" ? "Deploying to the Miniserver… (download, check, upload, restart, verify)"
-    : a.running ? `${a.running}…` : pend ? `Compiled changes are pending (${fmtWhen(pend.time)}). Review them, then apply.` : "";
-  $("btn-apply").disabled = !a.apply.available || busy || !pend;
+  $("deploy-pend").classList.toggle("idle", !pend && !a.running);
+  $("deploy-pend").textContent = a.running === "Apply" ? "Deploying to the Miniserver… (download, check, upload, restart, verify)"
+    : a.running ? `${a.running}…` : pend ? `Compiled changes are pending (${fmtWhen(pend.time)}). Review them, then apply.`
+    : !a.apply.available ? `Apply is off: ${a.apply.reason}.`
+    : "Nothing pending. Edit the project's module and compile it (lox logic …); the result shows here for review.";
+  $("deploy-row").classList.toggle("hidden", !pend && !a.running);
+  $("btn-apply").disabled = !a.apply.available || busy || !pend || applyAsking;
   const sync = $("btn-sync");
   sync.disabled = !a.apply.available || busy || !!pend;
   sync.classList.toggle("busy", a.running === "Sync");
   sync.querySelector(".lbl").textContent = a.running === "Sync" ? "Syncing…" : "Sync from Miniserver";
   sync.title = !a.apply.available ? `Cannot sync: ${a.apply.reason}`
     : pend ? "Apply or discard the pending changes first"
-    : "Make the Miniserver's running config the project's base (lox config merge), then commit and push";
+    : "Make the Miniserver's running config the project's base (lox config merge), then commit and push" + msWarn("sync");
   $("btn-discard").disabled = !a.apply.available || busy || !pend;
-  $("btn-apply").title = a.apply.available ? "Deploy to the Miniserver with lox config push, then commit and push to git" : `Cannot apply: ${a.apply.reason}`;
+  $("btn-apply").title = !a.apply.available ? `Cannot apply: ${a.apply.reason}`
+    : "Deploy to the Miniserver with lox config push, then commit and push to git" + msWarn("apply");
+  renderSteps(a);
   const last = a.last;
   if (last && last.at !== renderActions.shownAt) {
     renderActions.shownAt = last.at;
     const head = { apply: [last.warn ? "Applied, but not verified.\n" : "Applied.\n", "Apply failed.\n"], sync: ["", "Sync failed.\n"], discard: ["", "Discard failed.\n"] }[last.kind] || ["", ""];
-    aiMsg(head[last.ok ? 0 : 1] + last.message, !last.ok, last.ok && last.warn);
+    deployMsg(head[last.ok ? 0 : 1] + last.message, !last.ok, last.ok && last.warn);
+    // What the new program logged as it started.
+    if (last.kind === "apply") logStale();
     if (last.kind !== "discard" && S.hist?.running) loadRunning(true);
   }
 }
-$("ai-form").addEventListener("submit", async (e) => {
-  e.preventDefault();
-  const text = $("ai-prompt").value.trim();
-  if (!text) return;
-  $("ai-send").disabled = true;
-  aiMsg("");
+/** Apply's steps as they happen: lox's progress, and what vislox sees of the program restart. */
+function renderSteps(a) {
+  const box = $("deploy-steps"), p = a.progress;
+  box.classList.toggle("hidden", !p);
+  clearTimeout(renderSteps.tick);
+  if (!p) return;
+  const icon = { wait: "·", run: "●", ok: "✓", skip: "–", fail: "✕" };
+  const nowS = Date.now() / 1000;
+  const secs = (s) => s.at == null ? "" : s.state === "run" ? `${Math.max(0, Math.round(nowS - s.at))} s` : s.end != null && s.end - s.at >= 1 ? `${s.end - s.at} s` : "";
+  box.innerHTML = p.steps.map((s) => `<li class="st-${esc(s.state)}"${s.state === "run" ? ' aria-current="step"' : ""}>` +
+    `<span class="ic" aria-label="${esc(s.state)}">${icon[s.state] || "·"}</span><span class="l">${esc(s.label)}</span><span class="t">${esc(secs(s))}</span>` +
+    (s.detail ? `<span class="d">${esc(s.detail)}</span>` : "") + "</li>").join("");
+  // The running step's clock.
+  if (a.running === "Apply") renderSteps.tick = setTimeout(() => renderSteps(S.hist?.actions || a), 1000);
+}
+/** After an Apply: view the deployed revision compared with the one it replaced, with live values,
+ *  and list what changed with each block's first value. */
+async function showDeployed() {
+  await loadHistory();
+  const d = S.hist?.actions?.last?.deployed;
+  if (!d) return;
+  const hist = S.hist.history;
+  const rev = hist.find((r) => r.blob === d.after);
+  if (!rev) return;
+  const prev = d.before && d.before !== d.after ? hist.find((r) => r.blob === d.before) : null;
+  S.rev = rev.id;
+  S.base = prev?.id || rev.base;
+  if (rev !== hist[0]) { S.follow = false; $("chk-follow").checked = false; }
+  renderHistory(); renderSelects();
+  await loadView();
+  writeHash(true);
+  if (S.hist.live?.available && !S.live.on) setLive(true, false); // not a retry after a stop
+  // What this Apply changed, kept: the view may change before the box does.
+  const v = S.view, seen = new Set(), rows = [], objs = {};
+  for (const c of v?.compared ? v.changes : []) {
+    if (!c.obj || seen.has(c.obj) || !v.objects[c.obj]) continue;
+    seen.add(c.obj);
+    rows.push(c);
+    objs[c.obj] = v.objects[c.obj];
+  }
+  // Removed devices are gone from the bus on purpose.
+  S.deployed = { rows, objs, hw: (v?.compared ? v.hardware || [] : []).filter((x) => x.how !== "removed") };
+  renderDeployed();
+  watchBus(S.deployed);
+}
+// ── hardware ───────────────────────────────────────────────────────────
+// A change to an extension or a device object reconfigures hardware: the Miniserver sends the device a
+// new configuration, which the device stores. `view.hardware` lists those devices. The devices on the bus
+// come from `lox extensions` (GET /api/hardware, read-only): before Apply, a new serial that is not on the
+// bus is a warning; after Apply, the reconfigured devices show whether they are online.
+function hwInfo() { return S.hist?.hardware || { available: false }; }
+/** The devices on the bus; with `ms`, gives up after that long (a hung lox must not block Apply's dialog). */
+async function loadBus(ms) {
+  const ctl = new AbortController(), t = ms && setTimeout(() => ctl.abort(), ms);
+  let r;
+  try { r = await fetch("/api/hardware", { headers: { "X-Vislox": "hardware" }, signal: ctl.signal }); } catch (e) {
+    throw new Error(e.name === "AbortError" ? `no answer within ${ms / 1000} s` : e.message);
+  } finally { clearTimeout(t); }
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error || r.statusText);
+  if (j.available === false) throw new Error(j.reason || "the bus cannot be read");
+  if (j.error) throw new Error(j.error);
+  return j.devices || [];
+}
+/** A device of `view.hardware` on the bus. The server writes serials as the bus list does; a device
+ *  whose serial cannot be looked for (`check` false: not paired yet, or an Air device, whose `IP=` is no
+ *  bus serial) is matched by name, and only to show its state, never to warn that it is missing. */
+function onBus(d, bus) {
+  return d.check ? bus.find((b) => b.serial === d.serial) : bus.find((b) => b.name === d.title);
+}
+/** What is on the Miniserver now: the newest revision that is not a compile. Both Apply's confirmation and
+ *  the after-Apply list compare with it, so they count the same devices. */
+function deployedRev() { return S.hist?.history.find((r) => r.current) || null; }
+/** How long Apply's confirmation waits for the device list and the bus, together, before it asks anyway
+ *  (and says the bus check did not finish). */
+const HW_WAIT = 6000;
+/** The devices the pending change reconfigures, and, for new serials, whether they are on the bus. */
+async function pendingHardware(pend) {
+  const base = deployedRev()?.id || pend.base || "";
+  const until = Date.now() + HW_WAIT;
+  let devs;
   try {
-    await act("/api/ai", { prompt: text, context: aiCtxPayload() });
-    aiCtx.blocks.clear();
-    renderAiCtx(); markAiCtx();
-    $("ai-prompt").value = "";
-    await refreshActions();
-  } catch (err) {
-    aiMsg(err.message, true);
-  } finally { renderActions(); }
-});
-$("ai-prompt").addEventListener("keydown", (e) => {
-  if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); $("ai-form").requestSubmit(); }
+    const ctl = new AbortController(), t = setTimeout(() => ctl.abort(), HW_WAIT);
+    try {
+      const r = await fetch(`/api/hardware/changes?rev=${encodeURIComponent(pend.id)}&base=${encodeURIComponent(base)}`, { signal: ctl.signal });
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.error || r.statusText);
+      devs = j.devices || [];
+    } finally { clearTimeout(t); }
+  } catch (e) { return { error: e.name === "AbortError" ? `no answer within ${HW_WAIT / 1000} s` : e.message, devs: [] }; }
+  const fresh = devs.filter((d) => (d.how === "added" || d.how === "replaced" || d.how === "paired") && d.check);
+  if (!fresh.length || !hwInfo().available) return { devs, fresh: [] };
+  try {
+    const bus = await loadBus(Math.max(1000, until - Date.now()));
+    return { devs, fresh, missing: fresh.filter((d) => !onBus(d, bus)) };
+  } catch (e) { return { devs, fresh, busError: e.message }; }
+}
+function hwLine(d) {
+  const what = d.how === "replaced" || d.how === "unpaired" ? `${d.how}, serial ${d.old_serial || "—"} → ${d.serial || "—"}`
+    : d.how === "paired" ? `paired, serial ${d.serial || "—"}` : d.how === "changed" ? "settings" : d.how;
+  return `  ${d.title} (${d.kind}): ${what}`;
+}
+/** Apply's confirmation: "This reconfigures 3 devices", and new serials that are not on the bus. */
+function hwApplyText(hw) {
+  if (!hw) return "";
+  if (hw.error) return `Could not check which devices this reconfigures: ${hw.error}\n\n`;
+  if (!hw.devs.length) return "";
+  const n = hw.devs.length;
+  let t = `This reconfigures ${plural(n, "device")}: ${n === 1 ? "it stores" : "they store"} the new configuration, and a device can drop offline while it does.\n` +
+    hw.devs.slice(0, 8).map(hwLine).join("\n") + (n > 8 ? `\n  and ${n - 8} more` : "") + "\n\n";
+  if (hw.missing?.length) {
+    t = `⚠ Not on the bus (lox extensions does not list ${hw.missing.length === 1 ? "it" : "them"}): ` +
+      hw.missing.map((d) => `${d.title} (${d.kind}), serial ${d.serial}`).join("; ") +
+      `. Until that device is connected, its inputs and outputs do not work.\n\n` + t;
+  } else if (hw.busError) {
+    t = `The new serials were not checked against the bus (lox extensions: ${hw.busError}).\n\n` + t;
+  }
+  return t;
+}
+/** After Apply: ask the bus for the reconfigured devices' online state now and for a few minutes. */
+const BUS_EVERY = 15000, BUS_FOR = 180000;
+async function watchBus(d) {
+  if (!d.hw.length || !hwInfo().available) return;
+  d.bus = { at: 0, devices: null, error: "", offline: new Map(), until: Date.now() + BUS_FOR };
+  while (S.deployed === d) {
+    try {
+      const bus = await loadBus();
+      if (S.deployed !== d) return;
+      d.bus.devices = bus; d.bus.error = ""; d.bus.at = Date.now();
+      for (const x of d.hw) { const b = onBus(x, bus); if (b && !b.online && !d.bus.offline.has(x.uuid)) d.bus.offline.set(x.uuid, d.bus.at); }
+    } catch (e) { if (S.deployed !== d) return; d.bus.error = e.message; }
+    renderDeployed();
+    if (Date.now() >= d.bus.until) return;
+    await new Promise((ok) => setTimeout(ok, BUS_EVERY));
+  }
+}
+function deployedHardware(d) {
+  if (!d.hw?.length) return "";
+  const b = d.bus;
+  const rows = d.hw.slice(0, 12).map((x) => {
+    const on = b?.devices ? onBus(x, b.devices) : null;
+    const was = b?.offline.get(x.uuid);
+    const state = !b ? "" : !b.devices ? (b.error ? "" : "checking…") : !on ? (x.check ? "not on the bus" : "—") : on.online ? (was ? `online (was offline at ${new Date(was).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })})` : "online") : "offline";
+    const bad = b?.devices && ((!on && x.check) || (on && !on.online) || was);
+    return `<div class="pr hw-dev${bad ? " off" : ""}"><span class="k">${esc(x.how === "changed" ? "settings" : x.how)}</span>` +
+      `<button type="button" class="go" data-go="${esc(x.uuid)}" title="${esc(x.kind)}">${esc(x.title)}</button><span class="why">${esc(state)}</span></div>`;
+  }).join("");
+  const note = !hwInfo().available ? `The bus cannot be read: ${hwInfo().reason || "no lox"}.`
+    : b?.error ? `Cannot read the bus: ${b.error}`
+    : b && Date.now() < b.until ? "Checked every 15 s for 3 minutes (lox extensions)." : b ? "Checked with lox extensions." : "";
+  return `<div class="h">Reconfigured devices</div>${rows}` + (d.hw.length > 12 ? `<div class="note">and ${d.hw.length - 12} more</div>` : "") + (note ? `<div class="note">${esc(note)}</div>` : "");
+}
+/** The changed blocks of the deployed revision, each with a link and its first live value. */
+function renderDeployed() {
+  const box = $("deploy-new"), d = S.deployed;
+  const rows = (d?.rows || []).filter((c) => c.kind !== "removed");
+  const check = d ? deployedAppCheck(d) : "";
+  const hw = d ? deployedHardware(d) : "";
+  box.classList.toggle("hidden", !rows.length && !check && !hw);
+  if (!rows.length && !check && !hw) { box.innerHTML = ""; return; }
+  const shown = rows.slice(0, 12).map((c) => {
+    const o = d.objs[c.obj];
+    const q = o.ports.find((p) => p.conns.some((x) => x.dir === "out")) || o.ports[0];
+    const name = autoTitle(o.title) ? prettyType(o.ty) : o.title;
+    return `<div class="pr"><span class="k ${esc(c.kind)}">${esc(KIND[c.kind]?.[1] || c.kind)}</span>` +
+      `<button type="button" class="go" data-go="${esc(c.obj)}" title="${esc(o.path || "")}">${esc(name)}</button>${q ? lvSpan(q.uuid) : ""}</div>`;
+  }).join("");
+  box.innerHTML = `<div class="h">Changed by this Apply<button type="button" class="x" aria-label="Close">×</button></div>${shown}` +
+    (rows.length > 12 ? `<div class="note">and ${rows.length - 12} more in Changes</div>` : "") +
+    (rows.length ? '<div class="note">Values fill in as the Miniserver sends them; the canvas marks every change.</div>' : "") + hw + check;
+}
+/** After Apply: blocks the new config shows in the app that the Miniserver's new structure file lacks, or has
+ *  elsewhere, and removed blocks it still shows. */
+function deployedAppCheck(d) {
+  const a = S.app;
+  const objs = Object.values(d.objs).filter((o) => o.status === "removed" ? o.app?.shown || a?.controls?.[o.uuid] : o.app && (o.app.shown || a?.controls?.[o.uuid]));
+  if (!objs.length) return "";
+  // The server counts the structure files it read: one read after Apply started is the new config's.
+  if (!awaitedAppRead()) {
+    // A live session with the Miniserver reads the new structure file itself.
+    const viaLive = S.live.on && /^https?:/.test(S.hist?.live?.source || "");
+    const why = a?.available && viaLive ? "Waiting for the Miniserver's new structure file…" : "";
+    const btn = a?.available && !viaLive ? `<button type="button" class="app-load lnk">Read what the app shows now</button>` : "";
+    return why || btn ? `<div class="note">${esc(why)}${btn}</div>` : "";
+  }
+  const bad = objs.map((o) => [o, appIssues(o)]).filter(([, i]) => i.length);
+  if (!bad.length) return `<div class="note">The app shows these blocks as the config says.</div>`;
+  return `<div class="h warn-h">In the app</div>` + bad.map(([o, issues]) =>
+    `<div class="pr app-warn"><span class="k">⚠</span><button type="button" class="go" data-go="${esc(o.uuid)}">${esc(autoTitle(o.title) ? prettyType(o.ty) : o.title)}</button><span class="why">${esc(issues.join("; "))}</span></div>`).join("");
+}
+
+// ── in the app ─────────────────────────────────────────────────────────
+// The Miniserver's structure file (LoxAPP3.json) lists what the app shows:
+// controls (by block UUID) with their type, room, category and icon.
+// vislox reads it with live values, or when asked; never on its own.
+
+function awaitedAppRead() { return !!S.app?.loaded && (S.app.reads ?? 0) > S.applyReads; }
+async function loadApp() {
+  try { S.app = await api("/api/app"); } catch { return; }
+  renderTree();
+  if (S.view) { renderProps(); renderPage(); if (S.sel) applyFocus(); }
+  if (S.deployed) renderDeployed();
+}
+async function loadAppFromMs() {
+  if (S.appBusy) return;
+  S.appBusy = true; S.appErr = ""; renderProps();
+  try {
+    const r = await fetch("/api/app/load", { method: "POST", headers: { "X-Vislox": "app" } });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) S.appErr = j.error || r.statusText;
+  } catch (e) { S.appErr = e.message; }
+  S.appBusy = false;
+  await loadApp();
+}
+function appIcon(name) {
+  return name ? `<img class="app-ic" src="/api/app/icon?name=${encodeURIComponent(name)}" alt="" loading="lazy" onerror="this.remove()">` : "";
+}
+/** The viewed revision is what the Miniserver runs (its config can be compared with the app). */
+function viewingDeployed() {
+  const r = revById(S.rev);
+  return !!r && !!r.current && r.kind !== "pending";
+}
+/** Where the config and the app disagree about block `o`, in words. */
+function appIssues(o) {
+  const a = S.app, ctl = a?.controls?.[o.uuid], cfg = o.app;
+  if (!a?.loaded || !cfg) return [];
+  // Removed from the config: only the app still showing it is wrong.
+  if (o.status === "removed") return ctl && !ctl.parent ? ["removed, but still in the app"] : [];
+  const out = [];
+  const name = (m, id) => m?.[id]?.name || id;
+  if (cfg.shown && !ctl) out.push("not in the app");
+  if (!cfg.shown && ctl && !ctl.parent) out.push("still in the app");
+  if (cfg.shown && ctl && !ctl.parent) {
+    if (cfg.room_id && ctl.room && cfg.room_id !== ctl.room) out.push(`in room ${name(a.rooms, ctl.room)} in the app, ${cfg.room || cfg.room_id} in the config`);
+    if (cfg.category_id && ctl.cat && cfg.category_id !== ctl.cat) out.push(`in category ${name(a.cats, ctl.cat)} in the app, ${cfg.category || cfg.category_id} in the config`);
+  }
+  return out;
+}
+/** Rows of the In the app section: the config's visualization settings, then what the Miniserver's app shows. */
+function appRows(o, row, chg, marks) {
+  const a = S.app, ctl = a?.loaded ? a.controls?.[o.uuid] : null, cfg = o.app, old = o.app_old;
+  if (!cfg && !ctl) return null;
+  const rows = [];
+  const changed = marks && o.app_changed;
+  const yn = (v) => (v == null ? null : v ? "Yes" : "No");
+  const place = (m, id, title) => {
+    const p = id && a?.[m]?.[id];
+    return `${p ? appIcon(p.image) : ""}${esc(title || p?.name || id || "")}`;
+  };
+  if (cfg) {
+    const c = (k) => changed && (old?.[k] ?? null) !== (cfg[k] ?? null);
+    rows.push(row("Shown", c("shown") ? chg(yn(old?.shown ?? false), yn(cfg.shown), true) : esc(yn(cfg.shown)), c("shown") ? "pr-chg" : ""));
+    const pl = (label, m, k, idk) => {
+      if (!cfg[idk] && !(changed && old?.[idk])) return;
+      const ch = c(idk);
+      rows.push(row(label, ch ? chg(old?.[k] ?? old?.[idk], cfg[k] ?? cfg[idk], true) : place(m, cfg[idk], cfg[k]), ch ? "pr-chg" : ""));
+    };
+    pl("Room", "rooms", "room", "room_id");
+    pl("Category", "cats", "category", "category_id");
+  }
+  if (a?.loaded) {
+    if (ctl) {
+      rows.push(row("Control", `${appIcon(ctl.image)}${esc(prettyType(ctl.type) || "—")}` + (ctl.name && ctl.name !== o.title ? ` <span class="none-v">as “${esc(ctl.name)}”</span>` : "")));
+      if (ctl.parent) rows.push(row("Part of", esc(a.controls[ctl.parent]?.name || ctl.parent)));
+      if (!cfg) {
+        if (ctl.room) rows.push(row("Room", place("rooms", ctl.room)));
+        if (ctl.cat) rows.push(row("Category", place("cats", ctl.cat)));
+      }
+    }
+    const issues = viewingDeployed() ? appIssues(o) : [];
+    for (const i of issues) rows.push(`<div class="app-note warn">⚠ The Miniserver's app: ${esc(i)}.</div>`);
+    if (!ctl && !(cfg?.shown && issues.length)) rows.push('<div class="app-note">Not in the app, so the Miniserver sends no live values for it. Only blocks shown in the app, and the periphery, carry live values.</div>');
+    const when = a.fetched ? fmtWhen(a.fetched) : "";
+    rows.push(`<div class="app-note">What the app shows comes from the Miniserver's structure file (LoxAPP3.json)${a.lastModified ? `, saved ${esc(a.lastModified)}` : ""}, read ${esc(when)}${a.from === "cache" ? " by an earlier run of vislox" : ""}${viewingDeployed() ? "" : ". It belongs to the running config, not to this revision"}.` +
+      (a.available ? ` <button type="button" class="app-load lnk"${S.appBusy ? " disabled" : ""}>${S.appBusy ? "Reading…" : "Read again"}</button>` : "") + "</div>");
+  } else if (a?.available) {
+    rows.push(`<div class="app-note">The control type, icons and live values come from the Miniserver's structure file (LoxAPP3.json). It is read with live values, or now: <button type="button" class="app-load lnk"${S.appBusy ? " disabled" : ""}>${S.appBusy ? "Reading…" : "Read from the Miniserver"}</button></div>`);
+  }
+  const err = S.appErr || a?.error;
+  if (err) rows.push(`<div class="app-note warn">${esc(err)}</div>`);
+  return { rows, count: 0 };
+}
+$("deploy-new").addEventListener("click", (e) => {
+  if (e.target.closest(".x")) { $("deploy-new").classList.add("hidden"); S.deployed = null; return; }
+  if (e.target.closest(".app-load")) { loadAppFromMs(); return; }
+  const g = e.target.closest("[data-go]");
+  if (!g) return;
+  const u = g.dataset.go, pg = S.view?.objects[u]?.page;
+  if (pg) gotoPage(pg, { focus: u });
+  select(u);
 });
 $("btn-apply").onclick = async () => {
+  if (applyAsking) return;
+  applyAsking = true;
+  $("btn-apply").disabled = true;
+  try { await apply(); } finally { applyAsking = false; renderActions(); }
+};
+/** For Apply's confirmation: the schedules on the Miniserver the pending config would change. */
+async function pendingScheduleText(pend) {
+  let blocks;
+  try { blocks = await api(`/api/schedules?rev=${encodeURIComponent(pend.id)}`); } catch (e) {
+    return `⚠ The switching times could not be compared with the Miniserver's (${e.message}): edits made in the app may be replaced.\n\n`;
+  }
+  if (!blocks.length) return "";
+  if (!liveStreaming()) return "Live values are off, so the switching times were not compared with the Miniserver's (edits in the app).\n\n";
+  const c = scheduleConflicts(blocks);
+  return c.length ? `⚠ The Miniserver runs other switching times than this config for:\n  ${c.join("\n  ")}\nApplying replaces them with the config's (an edit in the app among them).\n\n` : "";
+}
+async function apply() {
   const pend = pendingChange();
   if (!pend) return;
-  if (!window.confirm("Deploy the pending changes to the Miniserver?\n\nlox config push uploads the config and restarts the Miniserver's program (a few seconds), " +
+  // Ask the Miniserver once more whether its config changed after the base, and for the
+  // calendar entries edited in the app.
+  const [, calNow, hw] = await Promise.all([loadMs(true), loadCal(true), pendingHardware(pend)]);
+  const stale = staleText();
+  const sched = await pendingScheduleText(pend);
+  if (!window.confirm((stale ? `⚠ ${stale} Applying overwrites what changed there since.\n\n` : "") + sched +
+    calApplyWarning(calNow) + hwApplyText(hw) +
+    "Deploy the pending changes to the Miniserver?\n\nlox config push uploads the config and restarts the Miniserver's program (a few seconds), " +
     "checks that it runs exactly the compiled config, then vislox commits and pushes to git.")) return;
-  aiMsg("");
+  deployMsg("");
+  $("deploy-new").classList.add("hidden");
+  S.deployed = null;
+  // The structure file the server reads after this is the new config's.
+  try { S.applyReads = (await api("/api/app")).reads ?? 0; } catch { S.applyReads = S.app?.reads ?? 0; }
   // lox refuses some pushes until the user allows them; ask, then retry with that allowed.
   const opts = {};
   for (let tries = 0; tries < 3; tries++) {
-    try { await act("/api/apply", opts); return; } catch (err) {
+    try { await act("/api/apply", opts); await showDeployed(); return; } catch (err) {
       const h = err.data?.hints || {};
       if (h.accept_version && !opts.accept_version && window.confirm(
         `This config was saved by a newer Loxone Config (version ${h.accept_version}) than the project last compiled with.\n\n` +
@@ -1580,25 +2299,357 @@ $("btn-apply").onclick = async () => {
         "\n\nDelete them and apply?")) {
         opts.discard_custom_changes = true; continue;
       }
-      aiMsg(err.message, true);
+      deployMsg(err.message, true);
       return;
     }
   }
-};
+}
 $("btn-sync").onclick = async () => {
-  aiMsg("");
-  try { const j = await act("/api/sync"); aiMsg(j.message); } catch (err) { aiMsg(err.message, true); }
+  deployMsg("");
+  try { const j = await act("/api/sync"); deployMsg(j.message); } catch (err) { deployMsg(err.message, true); }
 };
 $("btn-discard").onclick = async () => {
   if (!window.confirm("Discard the pending changes? The module, lock and compiled config go back to the last commit.")) return;
-  aiMsg("");
-  try { const j = await act("/api/discard"); aiMsg(j.message); } catch (err) { aiMsg(err.message, true); }
+  deployMsg("");
+  try { const j = await act("/api/discard"); deployMsg(j.message); } catch (err) { deployMsg(err.message, true); }
+};
+
+// ── the Miniserver's log ───────────────────────────────────────────────
+// `lox log` on the server: the system log's last lines. What came after the last program change
+// (an Apply, or a save from Loxone Config) is marked; lines that name a block's UUID link to it.
+// `stale`: an Apply ran since the log was read, so it describes the program before. `staleSeq` counts
+// Applies, so that only a read that started after the last one clears it.
+S.log = { open: pref("logOpen", false), data: null, loading: false, again: false, stale: false, staleSeq: 0, drawn: "", onlySince: pref("logSince", false) };
+function logInfo() { return S.hist?.log || { available: false }; }
+/** The entries since the last program change; all of them when the lines hold none. */
+function logRecent() {
+  const d = S.log.data;
+  const sys = d?.entries ? d.entries.slice(d.since ?? 0) : [];
+  // Debug-Monitor lines since the last program change in the system log.
+  const after = d?.entries && d.since != null ? d.entries[d.since].at : "";
+  return [...sys, ...S.mon.lines.filter((e) => e.at >= after)];
+}
+/** UUID (a block's, or one of its ports') → the block it belongs to. */
+function logTargets() {
+  const v = S.view;
+  if (!v) return new Map();
+  if (logTargets.view === v) return logTargets.map;
+  const m = new Map();
+  for (const [u, o] of Object.entries(v.objects)) {
+    m.set(u.toLowerCase(), u);
+    for (const q of o.ports || []) if (q.uuid) m.set(String(q.uuid).toLowerCase(), u);
+  }
+  logTargets.view = v; logTargets.map = m;
+  return m;
+}
+/** Blocks named in the log since the last program change, with the newest line about each. Only on the
+ *  deployed revision: the log is about what runs. */
+function logMarks() {
+  const r = revById(S.rev);
+  if ((!S.log.data && !S.mon.lines.length) || S.log.stale || !r?.current || r.kind === "pending") return new Map();
+  const t = logTargets(), m = new Map();
+  for (const e of logRecent()) for (const u of e.uuids || []) { const b = t.get(u); if (b) m.set(b, e); }
+  return m;
+}
+function renderLog() {
+  const info = logInfo(), mon = monInfo(), pane = $("log-pane");
+  pane.classList.toggle("hidden", !info.available && !mon.available);
+  if (!info.available && !mon.available) return;
+  if (mon.available) monConnect();
+  renderMonBar();
+  const open = S.log.open;
+  pane.classList.toggle("open", open);
+  $("log-toggle").setAttribute("aria-expanded", String(open));
+  $("log-body").classList.toggle("hidden", !open);
+  const b = $("btn-log");
+  b.classList.toggle("hidden", !open || !info.available);
+  b.disabled = S.log.loading;
+  b.classList.toggle("busy", S.log.loading);
+  b.querySelector(".lbl").textContent = S.log.loading ? "Reading…" : "Refresh";
+  const d = S.log.data;
+  const recent = d?.entries && d.since != null && !S.log.stale ? d.entries.length - d.since : null;
+  $("log-count").textContent = recent ? `${recent} new` : "";
+  $("log-count").title = recent ? `${plural(recent, "entry")} since the last program change` : "";
+  const msg = $("log-msg");
+  const text = !info.available ? `No system log: ${info.reason}.` : d?.error ? `Cannot read the log: ${d.error}` : !d ? (S.log.loading ? "Reading the log (lox log)…" : "")
+    : S.log.stale ? (S.log.loading ? "Read before the last Apply; reading it again…" : "Read before the last Apply. Refresh to read it again.")
+    : d.since == null ? `No program change in the last ${d.lines} lines.` : "";
+  msg.textContent = text;
+  msg.className = "log-msg" + (d?.error ? " error" : "") + (text ? "" : " hidden");
+  $("log-only-w").classList.toggle("hidden", !d || d.since == null);
+  $("chk-log-since").checked = S.log.onlySince;
+  const list = $("log");
+  const entries = d?.entries || [], since = d?.since ?? null;
+  const from = S.log.onlySince && since != null ? since : 0;
+  const rows = [];
+  // The Debug-Monitor's lines, live, above the system log.
+  for (let i = S.mon.lines.length - 1; i >= 0; i--) rows.push(monRow(S.mon.lines[i]));
+  for (let i = entries.length - 1; i >= from; i--) {
+    const e = entries[i];
+    const links = logLinks(e);
+    rows.push(`<li class="${esc(e.kind)}${since != null && i >= since ? " since" : ""}" data-i="${i}"><span class="tm">${esc(e.at)}</span><span class="tx">${esc(e.text)}</span>${links}</li>`);
+    if (i === since) rows.push(`<li class="mark">▲ The program changed here (Apply, or a save from Loxone Config)</li>`);
+  }
+  list.innerHTML = rows.join("") || (d && !d.error ? '<li class="tx">The log is empty.</li>' : "");
+  if (open && !d && !S.log.loading && info.available) loadLog();
+}
+function marksKey(m) { return [...m].map(([u, e]) => `${u} ${e.at} ${e.text}`).join("\n"); }
+/** Redraw the page when the blocks' log marks are not what it shows. */
+function redrawMarks() {
+  if (S.view && marksKey(logMarks()) !== S.log.drawn) { renderPage(); applyFocus(); }
+}
+/** After an Apply: the log read before is about the old program. Hide its marks; read it again now if
+ *  the panel is open, else when it opens. */
+function logStale() {
+  S.log.stale = true; S.log.staleSeq++;
+  if (S.log.open) loadLog();
+  renderLog(); redrawMarks();
+}
+/** Links to the blocks a log line names. */
+function logLinks(e) {
+  const t = logTargets();
+  return (e.uuids || []).map((u) => t.get(u)).filter((u, j, a) => u && a.indexOf(u) === j).map((u) => {
+    const o = S.view.objects[u];
+    return `<button type="button" class="go" data-go="${esc(u)}" title="${esc(o.path || "")}">${esc(autoTitle(o.title) ? prettyType(o.ty) : o.title)}</button>`;
+  }).join("");
+}
+/** A Debug-Monitor line; `_k` is its number in this browser, which stays when older lines drop off. */
+function monRow(e) {
+  return `<li class="${esc(e.kind)} monitor since" data-m="${e._k}"><span class="tm">${esc(e.at)}<span class="tag">monitor</span></span><span class="tx">${esc(e.text)}</span>${logLinks(e)}</li>`;
+}
+async function loadLog() {
+  if (!logInfo().available) return;
+  // One read at a time; a request during one (an Apply that finished) runs after it.
+  if (S.log.loading) { S.log.again = true; return; }
+  const seq = S.log.staleSeq;
+  S.log.loading = true; renderLog();
+  try {
+    const r = await fetch("/api/log", { headers: { "X-Vislox": "log" } });
+    const j = await r.json().catch(() => ({}));
+    S.log.data = r.ok ? j : { ...(S.log.data || {}), error: j.error || r.statusText };
+    if (!S.log.data.error && seq === S.log.staleSeq) S.log.stale = false;
+  } catch (e) {
+    S.log.data = { ...(S.log.data || {}), error: e.message };
+  } finally {
+    S.log.loading = false;
+    renderLog();
+    redrawMarks();
+    if (S.log.again) { S.log.again = false; loadLog(); }
+  }
+}
+function setLogOpen(open) {
+  S.log.open = open; setPref("logOpen", open);
+  renderLog();
+  if (open && S.log.stale) loadLog();
+}
+/** From a block's log mark: open the log and show that line. */
+function openLog(e) {
+  if (!S.log.open) setLogOpen(true);
+  // A Debug-Monitor line, or one of the system log's (whose read may have failed).
+  const i = e._k ? -1 : (S.log.data?.entries || []).indexOf(e);
+  const li = e._k ? $("log").querySelector(`li[data-m="${e._k}"]`) : i >= 0 ? $("log").querySelector(`li[data-i="${i}"]`) : null;
+  if (!li) return;
+  li.scrollIntoView({ block: "nearest" });
+  li.classList.add("flash");
+  setTimeout(() => li.classList.remove("flash"), 2000);
+}
+$("log-toggle").onclick = () => setLogOpen(!S.log.open);
+$("btn-log").onclick = () => loadLog();
+$("chk-log-since").onchange = (e) => { S.log.onlySince = e.target.checked; setPref("logSince", S.log.onlySince); renderLog(); };
+$("log").addEventListener("click", (e) => {
+  const g = e.target.closest("[data-go]");
+  if (!g) return;
+  const u = g.dataset.go, pg = S.view?.objects[u]?.page;
+  if (pg) gotoPage(pg, { focus: u });
+  select(u);
+});
+
+// ── the Debug-Monitor ──────────────────────────────────────────────────
+// With `--monitor`, vislox listens for the Miniserver's debug output (UDP). Start asks the Miniserver to
+// send it (dev/sps/log/<vislox>), Stop ends it; the lines arrive on /api/monitor.
+S.mon = { es: null, info: null, lines: [], busy: false, msg: "", fresh: true, seq: 0, marksT: null };
+function monInfo() { return S.mon.info || S.hist?.monitor || { available: false }; }
+function monConnect() {
+  if (S.mon.es) return;
+  const es = new EventSource("/api/monitor");
+  S.mon.es = es;
+  es.addEventListener("info", (e) => { S.mon.info = JSON.parse(e.data); renderMonBar(); renderMs(); });
+  const add = (list, reset) => {
+    for (const e of list) e._k = ++S.mon.seq;
+    if (reset) {
+      S.mon.lines = list;
+      if (S.log.open) renderLog();
+    } else {
+      const all = [...S.mon.lines, ...list], gone = all.slice(0, Math.max(0, all.length - 500));
+      S.mon.lines = all.slice(-500);
+      // Only the new rows, on top; lines that dropped off go. A closed panel draws all when it opens.
+      if (S.log.open) {
+        const box = $("log");
+        box.querySelector(":scope > li.tx")?.remove();
+        box.insertAdjacentHTML("afterbegin", list.slice().reverse().map(monRow).join(""));
+        for (const e of gone) box.querySelector(`li[data-m="${e._k}"]`)?.remove();
+      }
+    }
+    // The blocks' marks, at most twice a second.
+    if (!S.mon.marksT) S.mon.marksT = setTimeout(() => { S.mon.marksT = null; redrawMarks(); }, 500);
+  };
+  // Each (re)connect starts with every line kept: replace, then append.
+  es.onopen = () => { S.mon.fresh = true; };
+  es.addEventListener("lines", (e) => { add(JSON.parse(e.data), S.mon.fresh); S.mon.fresh = false; });
+  es.addEventListener("reset", (e) => add(JSON.parse(e.data), true));
+}
+function renderMonBar() {
+  const m = monInfo(), bar = $("mon-bar");
+  bar.classList.toggle("hidden", !m.available);
+  if (!m.available) return;
+  const st = $("mon-state"), b = $("btn-mon");
+  const on = !!m.until;
+  const until = on ? new Date(m.until * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "";
+  const listen = m.listening && !m.listening.ok ? m.listening.error : "";
+  st.textContent = S.mon.msg || listen || m.error || (on ? `Debug-Monitor on until ${until} · ${plural(m.packets, "packet")}`
+    : `Debug-Monitor: listening on UDP ${m.port}` + (m.packets ? ` · ${plural(m.packets, "packet")}` : "") +
+      (m.ignored ? ` · ${m.ignored} from other addresses (${m.ignoredFrom}) dropped` : ""));
+  st.className = "mon-state" + (on ? " on" : "") + (listen || m.error ? " error" : "");
+  b.disabled = S.mon.busy || !!listen;
+  b.querySelector(".lbl").textContent = S.mon.busy ? "…" : on ? "Stop" : "Start";
+  b.title = on ? "Ask the Miniserver to stop sending its debug output (dev/sps/log)"
+    : `Ask the Miniserver to send its debug output to ${m.dest || "this host"}:${m.port} for ${m.minutes} min (dev/sps/log/<address>)`;
+}
+$("btn-mon").onclick = async () => {
+  const on = !!monInfo().until;
+  if (!on && !window.confirm("Ask the Miniserver to send its debug output to vislox?\n\nThis is what Loxone Config's Debug Information does. " +
+    "Nothing in the config changes and the program does not restart. vislox stops it again with Stop, when it exits, or after the time limit.")) return;
+  S.mon.busy = true; S.mon.msg = ""; renderMonBar();
+  try {
+    const r = await fetch(on ? "/api/monitor/stop" : "/api/monitor/start", { method: "POST", headers: { "X-Vislox": "monitor" } });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) S.mon.msg = j.error || r.statusText;
+  } catch (e) { S.mon.msg = e.message; }
+  finally { S.mon.busy = false; renderMonBar(); setTimeout(() => { S.mon.msg = ""; renderMonBar(); }, 10000); }
 };
 
 // ── live values ────────────────────────────────────────────────────────
 // The Miniserver streams a value per state UUID; a wire's source connector
 // has the UUID of the state it carries. Logic blocks the app does not see
 // stream nothing, so their wires have no value.
+
+// ── operate inputs ─────────────────────────────────────────────────────
+// Opt-in (vislox --operate, with the admin token): Pulse, On/Off or a value for a virtual input,
+// to test a change the way Loxone Config's Liveview does. Only virtual inputs of the deployed
+// config, only with live values on, and every command is confirmed first.
+const opRes = new Map(); // input uuid → { text, cls }
+const opWait = new Map(); // input uuid → { head, states: Set, timer }: one per input waiting for its update
+function opOn() { return !!S.hist?.operate?.available && liveHere(); }
+/** The virtual input a block operates: itself, or the one an input reference mirrors. */
+function opTarget(o) {
+  if (!opOn()) return null;
+  const t = o.ty === "VirtualIn" ? o : o.ty === "InputRef" && o.target?.ty === "VirtualIn" ? S.view.objects[o.target.uuid] : null;
+  return t && t.status !== "removed" ? t : null;
+}
+function opAttr(t, k) { return t.attrs.find((a) => a.name === k)?.value; }
+function opControls(t) {
+  const analog = opAttr(t, "Analog") === "true";
+  const secured = !!S.live.controls[t.uuid]?.secured;
+  const u = esc(t.uuid);
+  const b = (cmd, label, tip) => `<button type="button" class="ghost small" data-op="${cmd}" data-op-uuid="${u}" title="${esc(tip)}">${label}</button>`;
+  let ctl;
+  if (analog) {
+    const checks = opAttr(t, "EnVal") === "true";
+    const min = checks ? opAttr(t, "MinVal") : null, max = checks ? opAttr(t, "MaxVal") : null;
+    ctl = `<input type="number" step="any" data-op-uuid="${u}" aria-label="Value for ${esc(t.title)}"${min != null ? ` min="${esc(min)}"` : ""}${max != null ? ` max="${esc(max)}"` : ""}>` +
+      b("set", "Set", "Send this value to the virtual input");
+  } else {
+    ctl = b("pulse", "Pulse", "On for a moment, then off") + b("on", "On", "Switch the virtual input on") + b("off", "Off", "Switch the virtual input off");
+  }
+  const r = opRes.get(t.uuid);
+  return `<div class="op">${secured ? '<span class="op-lock" title="This block has a visualization password: vislox asks for it once per session">🔒</span>' : ""}` +
+    `<span class="op-what">${esc(t.title)} <span class="tm">${analog ? "analog" : "digital"} virtual input${t.uuid !== S.sel ? " (mirrored)" : ""}</span></span>` +
+    `<div class="op-ctl">${ctl}</div>` +
+    `<div class="op-res${r ? " " + r.cls : ""}" role="status" aria-live="polite">${r ? esc(r.text) : "Sends a command to the Miniserver."}</div></div>`;
+}
+function opShow(uuid, text, cls) {
+  opRes.set(uuid, { text, cls });
+  $("props").querySelectorAll(".op-res").forEach((n) => {
+    if (n.closest(".op")?.querySelector(`[data-op-uuid="${CSS.escape(uuid)}"]`)) { n.textContent = text; n.className = "op-res " + cls; }
+  });
+}
+function visuPassword(ask) {
+  let p = "";
+  try { p = sessionStorage.getItem("vislox.visu") || ""; } catch { /* private mode */ }
+  if (!p && ask) {
+    p = window.prompt("This block has a visualization password. Enter it (kept for this browser session only):") || "";
+    if (p) try { sessionStorage.setItem("vislox.visu", p); } catch { /* private mode */ }
+  }
+  return p;
+}
+async function operate(uuid, cmd) {
+  const t = S.view?.objects[uuid];
+  if (!t || !opOn()) return;
+  cmd = String(cmd ?? "").trim();
+  if (!cmd) { opShow(uuid, "Enter a value first.", "err"); return; }
+  const what = { pulse: "Pulse", on: "On", off: "Off" }[cmd] || `the value ${cmd}`;
+  if (!window.confirm(`Send "${what}" to the virtual input "${t.title}" on the Miniserver?\n\nThis runs on the real installation: the logic it feeds reacts.`)) return;
+  const secured = !!S.live.controls[uuid]?.secured;
+  const body = { uuid, cmd };
+  if (secured) {
+    body.visu_password = visuPassword(true);
+    if (!body.visu_password) { opShow(uuid, "Not sent: the block needs its visualization password.", "err"); return; }
+  }
+  opShow(uuid, "Sending…", "busy");
+  let r;
+  try { r = await act("/api/operate", body); }
+  catch (e) {
+    // Only a password the Miniserver refused is forgotten; a key that expired, a block that refused
+    // the command or a network error leave it.
+    if (e.data?.badPassword) try { sessionStorage.removeItem("vislox.visu"); } catch { /* private mode */ }
+    opShow(uuid, e.message.startsWith("not sent") ? e.message[0].toUpperCase() + e.message.slice(1) : "Not sent: " + e.message, "err");
+    return;
+  }
+  const head = r.code == null ? `Sent, ${r.note}` : `Code ${r.code} (${r.note})`;
+  if (r.code !== 200) { opShow(uuid, head, "err"); return; }
+  // The answer's value is not reliable; the state update that follows is (Communicating with the Miniserver, p. 14).
+  const states = new Set(Object.values(S.live.controls[uuid]?.states || {}).filter((x) => typeof x === "string"));
+  for (const q of t.ports) states.add(q.uuid);
+  opExpect(uuid, head, states);
+}
+/** Wait for `uuid`'s state update (any of `states`); each input waits on its own. */
+function opExpect(uuid, head, states, ms = 3000) {
+  clearTimeout(opWait.get(uuid)?.timer);
+  const timer = setTimeout(() => {
+    if (opWait.get(uuid)?.timer !== timer) return;
+    opWait.delete(uuid);
+    opShow(uuid, `${head} · no state update came back (the input is not streamed to the app, or its value did not change)`, "warn");
+  }, ms);
+  opWait.set(uuid, { head, states, timer });
+  opShow(uuid, `${head} · waiting for the state update…`, "busy");
+}
+/** A `values` event: did an input we just operated report back? */
+function opSeen(d) {
+  for (const [uuid, w] of [...opWait]) {
+    const k = Object.keys(d).find((k) => w.states.has(k));
+    if (!k) continue;
+    clearTimeout(w.timer);
+    opWait.delete(uuid);
+    opShow(uuid, `${w.head} · state update: ${liveText(d[k])}`, "ok");
+  }
+}
+function renderOpLog(box) {
+  const all = S.hist?.operate?.log || [];
+  const ent = (e) => `<div class="op-ent${e.sent && e.code === 200 ? "" : " err"}" title="${esc(`${new Date(e.time * 1000).toLocaleString()}\n${e.uuid}`)}">
+      <span class="l1"><b>${esc(e.cmd)}</b> → ${esc(e.title)}${e.secured ? " 🔒" : ""}</span>
+      <span class="dt">${esc(fmtWhen(e.time))} · ${e.sent ? (e.code == null ? esc(e.note) : `code ${e.code} ${esc(e.note)}`) : `not sent: ${esc(e.note)}`}</span></div>`;
+  // Commands that went out, and, apart, requests that failed before theirs could.
+  for (const [sent, title, key] of [[true, "Commands sent to inputs", "opLogOpen"], [false, "Not sent", "opNotOpen"]]) {
+    const log = all.filter((e) => !!e.sent === sent);
+    if (!log.length) continue;
+    const d = document.createElement("details");
+    d.className = "op-log";
+    d.open = !!S[key];
+    d.ontoggle = () => (S[key] = d.open);
+    d.innerHTML = `<summary class="hist-sec">${title} <span class="count">${log.length}</span></summary>` + log.map(ent).join("");
+    box.appendChild(d);
+  }
+}
 
 /** Live values belong to what runs on the Miniserver: the current, deployed revision. */
 function liveHere() {
@@ -1608,7 +2659,7 @@ function liveHere() {
 /** A connector's value: streamed by the Miniserver, passed on by a reference or a memory flag,
  *  a constant in the config, or computed from a simple gate's inputs (`view.live`).
  *  Entries are `[value, text, label, kind]`; kind is "const" or "computed" for values the
- *  Miniserver did not send. Cached until the next change. */
+ *  Miniserver did not send, and "queried" for values vislox asked a block for (opt-in). Cached until the next change. */
 let lvCache = new Map();
 function liveVal(uuid) { return liveHere() ? lvResolve(uuid, 0) : undefined; }
 function lvResolve(u, depth) {
@@ -1641,6 +2692,11 @@ function lvFind(u, depth) {
     let ids;
     try { ids = JSON.parse(S.live.values.get(su)?.[0]); } catch { ids = null; }
     if (Array.isArray(ids) && ids.length === 1) return [ids[0], null, "the lighting controller's active mood", "computed"];
+  }
+  if (g.weather && u in g.weather) {
+    const w = weatherNow();
+    const f = WEATHER_FIELDS[g.weather[u]];
+    if (w && f && w.entry[f[0]] !== undefined) return [w.entry[f[0]], null, `the weather server's ${w.what} (${f[1]})`, "computed"];
   }
   if (g.consts && u in g.consts) return [g.consts[u], null, "constant in the config", "const"];
   const gate = g.gates?.[u];
@@ -1760,6 +2816,8 @@ function gateEval(g, depth) {
 function liveText(e) {
   const [v, t] = e;
   if (t) return t;
+  // A Daytimer's or the weather server's event table: shown in its own section.
+  if (v && typeof v === "object") return v.schedule ? `schedule (${v.entries.length} ${v.entries.length === 1 ? "entry" : "entries"})` : v.weather ? "weather (see Weather)" : JSON.stringify(v);
   if (typeof v === "number") return String(Number.isInteger(v) ? v : +v.toFixed(2));
   return String(v ?? "");
 }
@@ -1771,7 +2829,197 @@ function liveTip(src) {
 }
 function lvSpan(u) {
   const e = liveVal(u);
-  return `<span class="lv${e ? "" : " none"}${e?.[3] ? " " + e[3] : ""}" data-lv="${esc(u)}"${e?.[2] ? ` title="${esc(e[2])}"` : ""}>${e ? esc(clip(liveText(e), 40)) : "no value"}</span>`;
+  return `<span class="lv${e ? "" : " none"}${e?.[3] ? " " + e[3] : ""}" data-lv="${esc(u)}"${e?.[2] ? ` title="${esc(e[2])}"` : ""}>${lvInner(e)}</span>`;
+}
+/** What a value span holds: the icon its state names (a Status block's), and the value. */
+function lvInner(e) {
+  return e ? lvIcon(e) + esc(clip(liveText(e), 40)) : "no value";
+}
+
+// ── schedules, weather and Status blocks ─────────────────────────────────
+// A Daytimer's switching times (and an Intelligent Room Controller's) as the config stores them, next to
+// the event table the Miniserver streams for it: what runs now, edits made in the app included.
+
+/** Live values come in from the Miniserver (on any revision: a schedule is compared with each). */
+function liveStreaming() { return S.live.on && !!S.live.es; }
+/** The Miniserver's schedule for `si` (`{default, entries}`), when it streams one. */
+function liveSchedule(si) {
+  const v = S.live.values.get(si.state)?.[0];
+  return v && typeof v === "object" && v.schedule ? v : undefined;
+}
+function hhmm(m) { return `${String(Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`; }
+/** A number as live values write it. */
+const numText = (v) => liveText([+v]);
+const byTime = (a, b) => a.from - b.from || a.to - b.to;
+/** Entries for comparing. A digital timer's value does not count: the Miniserver sends 0 where the file has 1. */
+const schedKey = (es, analog) => es.map((e) => `${e.from}-${e.to}-${analog ? +e.value : ""}-${!!e.activate}`).join("|");
+function schedLine(es, analog) {
+  return es.length ? es.map((e) => `${hhmm(e.from)}–${hhmm(e.to)}${analog ? " " + numText(e.value) : ""}${e.activate ? " (activate)" : ""}`).join(", ") : "no entries";
+}
+/** One row per column: the config's columns, then the compared revision's, then any column only entries name,
+ *  then the Miniserver's modes no column has. A column's entries are those that name it (by UUID, so columns
+ *  without a mode stay apart); the Miniserver's are matched by the column's mode number. */
+function schedRows(si, live) {
+  const rows = [], seen = new Set();
+  const add = (col, c) => { if (!seen.has(col)) { seen.add(col); rows.push({ col, title: c?.title ?? col, target: c?.target, number: c?.number ?? null }); } };
+  for (const c of si.cols) add(c.col, c);
+  for (const c of si.old_cols || []) add(c.col, c);
+  for (const e of [...si.entries, ...(si.old_entries || [])]) add(e.col, { title: `${e.col} (no operating mode in this config)` });
+  const numbers = new Set(rows.map((r) => r.number).filter((n) => n != null));
+  for (const e of live?.entries || []) if (!numbers.has(e.mode)) { numbers.add(e.mode); rows.push({ col: null, title: `Mode ${e.mode}`, number: e.mode, liveOnly: true }); }
+  for (const r of rows) {
+    r.mine = r.col == null ? [] : si.entries.filter((e) => e.col === r.col).sort(byTime);
+    r.old = si.old_entries && r.col != null ? si.old_entries.filter((e) => e.col === r.col).sort(byTime) : null;
+    r.theirs = live && r.number != null ? live.entries.filter((e) => e.mode === r.number).sort(byTime) : null;
+    r.differs = !!r.theirs && schedKey(r.mine, si.analog) !== schedKey(r.theirs, si.analog);
+    r.changed = !!r.old && schedKey(r.old, si.analog) !== schedKey(r.mine, si.analog);
+  }
+  return rows;
+}
+/** How the config's schedule and the Miniserver's differ: the rows, and the default value. */
+function schedCompare(si, live) {
+  const rows = schedRows(si, live);
+  const defDiff = si.analog && si.default != null && live.default != null && +si.default !== +live.default;
+  const what = rows.filter((r) => r.differs).map((r) => r.title);
+  if (defDiff) what.push("default value");
+  return { rows, defDiff, what: what.join(", "), same: !what.length };
+}
+/** One day as a bar: each entry a segment over the hours, its value in the tooltip. */
+function schedBar(es, si, cls) {
+  const segs = es.map((e) => {
+    const l = (e.from / 1440) * 100, w = Math.max(((e.to - e.from) / 1440) * 100, 0.4);
+    const tip = `${hhmm(e.from)}–${hhmm(e.to)}${si.analog ? " · " + numText(e.value) : ""}${e.activate ? " · needs activation" : ""}`;
+    return `<span class="sch-seg${e.activate ? " act" : ""}" style="left:${l.toFixed(2)}%;width:${w.toFixed(2)}%" title="${esc(tip)}">${si.analog && w > 9 ? esc(numText(e.value)) : ""}</span>`;
+  }).join("");
+  return `<div class="sch-bar ${cls}" title="${esc(schedLine(es, si.analog))}">${segs}</div>`;
+}
+function scheduleRows(o, row, marks) {
+  const si = o.schedule;
+  const live = liveStreaming() ? liveSchedule(si) : undefined;
+  const cmp = live ? schedCompare(si, live) : null;
+  const rows = schedRows(si, live);
+  const r = revById(S.rev);
+  const out = [];
+  // What the comparison means on this revision.
+  let note;
+  if (!S.live.on) note = `<div class="sch-note">Turn on live values to compare with the switching times the Miniserver runs.</div>`;
+  else if (!live) note = `<div class="sch-note">The Miniserver sends no schedule for this block${liveStreaming() ? " (only blocks shown in the app have one)" : ""}.</div>`;
+  else if (cmp.same) note = `<div class="sch-note ok">The Miniserver runs the same switching times.</div>`;
+  else if (r?.kind === "pending") note = `<div class="sch-note warn">⚠ The Miniserver runs other switching times (${esc(cmp.what)}). Apply would replace them with this config's.</div>`;
+  else if (r?.current) note = `<div class="sch-note warn">⚠ Changed in the app since this config (${esc(cmp.what)}). An edit in the app is a custom change until Loxone Config saves the program: Apply refuses while one is pending, and replaces it with the config's switching times when you allow that.</div>`;
+  else note = `<div class="sch-note warn">The Miniserver runs other switching times than this revision (${esc(cmp.what)}).</div>`;
+  out.push(note);
+  if (si.analog && (si.default != null || live)) {
+    const differs = cmp?.defDiff;
+    out.push(row("Default value", `${si.default != null ? esc(numText(si.default)) : '<span class="none-v">—</span>'}${live ? ` <span class="sch-live${differs ? " diff" : ""}" title="The Miniserver's">${esc(numText(live.default))}</span>` : ""}`, differs ? "pr-chg" : ""));
+  }
+  out.push(`<div class="sch-grid"><div class="sch-axis"><span></span><span class="sch-hours"><i>0</i><i>6</i><i>12</i><i>18</i><i>24 h</i></span></div>` + rows.map((x) => {
+    const name = x.target ? `<button type="button" class="lnk" data-go="${esc(x.target.uuid)}" data-page="${esc(x.target.page || "")}" title="${esc(x.title)}">${esc(x.title)}</button>` : `<span title="${esc(x.title)}">${esc(x.title)}</span>`;
+    const chg = marks && x.changed;
+    const was = chg ? `<div class="sch-was">was ${esc(schedLine(x.old, si.analog))}</div>` : "";
+    return `<div class="sch-row${x.differs ? " diff" : ""}${chg ? " chg" : ""}"><div class="sch-mode">${name}</div><div class="sch-bars">${schedBar(x.mine, si, "cfg")}${x.theirs ? schedBar(x.theirs, si, "live") : ""}</div>${was}${x.differs ? `<div class="sch-was">Miniserver: ${esc(schedLine(x.theirs, si.analog))}</div>` : ""}</div>`;
+  }).join("") + `</div>`);
+  if (live) out.push(`<div class="sch-legend"><span class="sch-key cfg"></span>this config <span class="sch-key live"></span>the Miniserver</div>`);
+  return out;
+}
+/** The schedules (`/api/schedules` of a revision) whose live entries differ: what Apply would replace. */
+function scheduleConflicts(blocks) {
+  const out = [];
+  for (const b of blocks) {
+    const live = liveSchedule(b.schedule);
+    if (!live) continue;
+    const cmp = schedCompare(b.schedule, live);
+    if (!cmp.same) out.push(`${autoTitle(b.title) ? prettyType(b.ty) : b.title}: ${cmp.what}`);
+  }
+  return out;
+}
+
+/** The Miniserver's clock as Loxone time (seconds since 2009-01-01 in its local time), from its
+ *  `miniserverTime` state; undefined until that came. */
+function msLoxTime() {
+  const m = /^(\d+)-(\d+)-(\d+) (\d+):(\d+)(?::(\d+))?/.exec(S.live.values.get(S.live.globals?.miniserverTime)?.[0] || "");
+  if (!m) return undefined;
+  const [y, mo, d, h, mi, sec] = m.slice(1).map((x) => Number(x || 0));
+  return (Date.UTC(y, mo - 1, d, h, mi, sec) - Date.UTC(2009, 0, 1)) / 1000;
+}
+/** The weather server's current weather: its `actual` state, else the forecast's hour that has begun on the
+ *  Miniserver's clock (its timestamps are in the Miniserver's local time, not the browser's). */
+function weatherNow() {
+  const gl = S.live.globals || {};
+  const tab = (k) => { const v = S.live.values.get(gl[k])?.[0]; return v && v.weather && v.entries?.length ? v : null; };
+  const a = tab("weather.actual");
+  if (a) return { entry: a.entries[0], what: "current weather" };
+  const f = tab("weather.forecast");
+  const now = msLoxTime();
+  if (!f || now === undefined) return null;
+  const past = f.entries.filter((e) => e.time <= now);
+  return past.length ? { entry: past[past.length - 1], what: "forecast for this hour" } : null;
+}
+/** A weather data block's `WType=` → the field of a weather entry, and what it is. */
+const WEATHER_FIELDS = {
+  1: ["temperature", "temperature"], 2: ["dewPoint", "dew point"], 3: ["humidity", "relative humidity"],
+  4: ["windSpeed", "wind speed"], 5: ["windDirection", "wind direction"], 7: ["solarRadiation", "solar radiation"],
+  9: ["precipitation", "precipitation"], 10: ["type", "weather type"], 11: ["pressure", "air pressure"],
+  26: ["perceived", "perceived temperature"],
+};
+function weatherRows(row) {
+  if (!liveHere()) return null;
+  const w = weatherNow();
+  if (!w) return { rows: [`<div class="empty">The Miniserver sends no weather (it needs a weather subscription).</div>`], count: 0 };
+  const rows = [row("From", esc(w.what))];
+  for (const [k, label] of Object.values(WEATHER_FIELDS)) if (w.entry[k] !== undefined) rows.push(row(label, `<span class="lv computed">${esc(numText(w.entry[k]))}</span>`));
+  return { rows, count: rows.length - 1 };
+}
+
+/** The icon names the structure file lists: only those are shown (and `/api/app/icon` serves no other). */
+function appIconNames() {
+  const a = S.app;
+  if (!a) return new Set();
+  if (appIconNames.app === a) return appIconNames.set;
+  const set = new Set();
+  for (const k of ["rooms", "cats", "controls"]) for (const x of Object.values(a[k] || {})) if (x.image) set.add(x.image);
+  appIconNames.app = a; appIconNames.set = set;
+  return set;
+}
+/** A live value's icon (e[4]), when the structure file knows it. */
+function lvIcon(e) { return e?.[4] && appIconNames().has(e[4]) ? appIcon(e[4]) : ""; }
+/** A Status block (the app's TextState): its live text with the icon and colour the Miniserver gives. The icon
+ *  shows when the structure file lists it; else its colour. */
+function statusRows(o) {
+  if (!liveHere()) return null;
+  const st = S.live.controls[o.uuid]?.states || {};
+  if (!st.textAndIcon) return null;
+  const text = S.live.values.get(st.textAndIcon);
+  let ic = null, color = null;
+  try { const j = JSON.parse(S.live.values.get(st.iconAndColor)?.[0] || "null"); ic = j?.icon || null; color = j?.color || null; } catch { /* not JSON */ }
+  const icon = ic && appIconNames().has(ic) ? appIcon(ic) : "";
+  const sw = color && /^#[0-9a-f]{3,8}$/i.test(color) ? `<span class="swatch" style="background:${color}" title="${esc(color)}"></span>` : "";
+  return [`<div class="status-live">${icon}${sw}<span>${text ? esc(liveText(text)) : '<span class="none-v">no value</span>'}</span></div>`];
+}
+
+/** The Properties sections built from live values other than a connector's: they are rebuilt when one of the
+ *  states they read (`deps`) changes. */
+function liveSections(o, row, marks) {
+  const out = [];
+  const st = S.live.controls[o.uuid]?.states || {};
+  const stat = statusRows(o);
+  if (stat) out.push({ name: "Status", rows: stat, deps: [st.textAndIcon, st.iconAndColor] });
+  if (o.schedule) out.push({ name: "Schedule", rows: scheduleRows(o, row, marks), count: o.schedule.cols.length, deps: [o.schedule.state] });
+  if (o.ty === "WeatherServer") {
+    const w = weatherRows(row), gl = S.live.globals || {};
+    if (w) out.push({ name: "Weather", rows: w.rows, count: w.count, deps: [gl["weather.actual"], gl["weather.forecast"], gl.miniserverTime] });
+  }
+  return out;
+}
+function liveSectionsRefresh(ch) {
+  const o = S.sel && S.view?.objects[S.sel];
+  if (!o || !ch) return;
+  const marks = S.marks && S.view.compared;
+  for (const sec of liveSections(o, propRow, marks)) {
+    if (!sec.deps.some((d) => d && ch.has(d))) continue;
+    const body = document.querySelector(`#props .ps-b[data-body="${CSS.escape(sec.name)}"]`);
+    if (body) body.innerHTML = sec.rows.join("");
+  }
 }
 
 function renderLiveSwitch() {
@@ -1786,13 +3034,68 @@ function renderLiveSwitch() {
   const here = liveHere();
   const st = S.live.status || { state: "connecting" };
   const ls = $("live-state");
-  ls.textContent = !here ? "other revision" : { live: "", connecting: "connecting…", idle: "connecting…", offline: "offline", ended: "input ended", off: "off" }[st.state] ?? st.state;
+  // A known reason (close or response code) names itself: "blocked", "firmware update", …
+  ls.textContent = !here ? "other revision" : st.label || ({ live: "", connecting: "connecting…", idle: "connecting…", offline: "offline", stopped: "stopped", ended: "input ended", off: "off" }[st.state] ?? st.state);
   ls.className = "live-state st-" + (here ? st.state : "elsewhere");
   ls.title = [st.detail, info.source && `from ${info.source}`].filter(Boolean).join("\n");
   $("legend").classList.toggle("live", on);
-  $("live-note").textContent = on && !here ? "Live values show on the current, deployed revision only" : "";
+  // With a known reason, its plain sentence (the detail's first line) says what to do.
+  $("live-note").textContent = on && !here ? "Live values show on the current, deployed revision only"
+    : on && st.reason && st.state !== "live" ? (st.detail || "").split("\n")[0] : "";
   svg.classList.toggle("live", here);
   svg.classList.toggle("live-dim", here && S.live.dim);
+  $("lg-query").classList.toggle("hidden", !info.query);
+  liveQuerySync(here && info.query && S.live.query);
+  modesLive();
+}
+
+/** Opt-in block queries (`/api/live/query`): the server queries the blocks behind the wires of the
+ *  page on screen while this stream is open; their values come on `/api/live`, marked "queried". */
+function liveQuerySync(want) {
+  const key = want && S.page ? `${S.rev}|${S.page}` : "";
+  if (key === S.live.qkey) { renderQueryNote(); return; }
+  S.live.qes?.close();
+  S.live.qes = null;
+  S.live.qkey = key;
+  S.live.qstat = null;
+  if (key) liveQueryOpen(key);
+  renderQueryNote();
+}
+/** Ask for the page's queries (a POST with X-Vislox, so no other site can start them), then hold
+ *  them with the stream for the token it returns. A stream the server no longer knows (it restarted)
+ *  asks again. */
+function liveQueryOpen(key) {
+  const [rev, page] = [S.rev, S.page];
+  fetch("/api/live/query", { method: "POST", headers: { "X-Vislox": "query", "Content-Type": "application/json" }, body: JSON.stringify({ rev, page }) })
+    .then((r) => r.json().then((j) => (r.ok ? j : Promise.reject(new Error(j.error || r.statusText)))))
+    .then((j) => {
+      if (S.live.qkey !== key) return;
+      S.live.qstat = { blocks: j.blocks, planned: true };
+      const es = new EventSource(`/api/live/query?token=${encodeURIComponent(j.token)}`);
+      S.live.qes = es;
+      es.addEventListener("query", (e) => { if (S.live.qes === es) { S.live.qstat = JSON.parse(e.data); renderQueryNote(); } });
+      es.addEventListener("refused", () => {
+        es.close();
+        if (S.live.qes !== es) return;
+        S.live.qes = null;
+        setTimeout(() => { if (S.live.qkey === key && !S.live.qes) liveQueryOpen(key); }, 2000);
+      });
+      renderQueryNote();
+    })
+    .catch((e) => { if (S.live.qkey === key) { S.live.qstat = { error: e.message }; renderQueryNote(); } });
+}
+function renderQueryNote() {
+  const n = $("query-note"), q = S.live.qstat;
+  const failed = q?.failed || [];
+  const text = !S.live.qkey || !q ? ""
+    : q.error ? `not queried: ${q.error}`
+    : q.planned ? (q.blocks ? `querying ${q.blocks} block${q.blocks === 1 ? "" : "s"}…` : "no blocks to query here")
+    : (q.blocks ? `${q.answered} of ${q.blocks} blocks answered` : "nothing to query: the Miniserver streams the rest")
+      + (failed.length ? ` · ${failed.length} cannot be queried` : "");
+  const title = failed.join("\n");
+  // Called on every repaint: touch the DOM only when something changed.
+  if (n.textContent !== text) n.textContent = text;
+  if (n.title !== title) n.title = title;
 }
 
 function liveStart() {
@@ -1800,18 +3103,31 @@ function liveStart() {
   const es = new EventSource("/api/live");
   S.live.es = es;
   S.live.status = { state: "connecting" };
-  es.addEventListener("status", (e) => { S.live.status = JSON.parse(e.data); renderLiveSwitch(); });
+  es.addEventListener("status", (e) => {
+    S.live.status = JSON.parse(e.data);
+    renderLiveSwitch();
+    // A climate block's Properties say why the periods are not there yet.
+    if (!S.live.periods && mdClimate(S.view?.objects[S.sel])) renderProps();
+  });
   es.addEventListener("snapshot", (e) => {
     const d = JSON.parse(e.data);
     S.live.values = new Map(Object.entries(d.values));
     S.live.controls = d.controls || {};
     S.live.globals = d.globals || {};
+    S.live.periods = d.periods || null;
     lvCache = new Map();
     liveQueue(null);
   });
+  // The heating and cooling periods, as each Miniserver connection reads them (null until asked).
+  es.addEventListener("periods", (e) => {
+    S.live.periods = JSON.parse(e.data);
+    if (mdClimate(S.view?.objects[S.sel])) renderProps();
+    modesLive();
+  });
   es.addEventListener("values", (e) => {
     const d = JSON.parse(e.data);
-    for (const k in d) S.live.values.set(k, d[k]);
+    for (const k in d) if (d[k] === null) S.live.values.delete(k); else S.live.values.set(k, d[k]);
+    opSeen(Object.fromEntries(Object.entries(d).filter(([, v]) => v !== null)));
     lvCache = new Map();
     liveQueue(Object.keys(d));
   });
@@ -1828,12 +3144,20 @@ function liveStop() {
   S.live.values = new Map();
   S.live.controls = {};
   S.live.globals = {};
+  S.live.periods = null;
   liveQueue(null);
 }
-function setLive(on) {
+// Turned on by the user (the switch, L): let the server try again after it stopped (blocked,
+// login refused). A reload or a reconnecting stream never does, so it cannot lengthen a block.
+function setLive(on, retry = true) {
   S.live.on = on;
   setPref("live", on);
-  if (on) liveStart(); else liveStop();
+  if (on && !retry) liveStart();
+  else if (on) {
+    fetch("/api/live/retry", { method: "POST", headers: { "X-Vislox": "live" } })
+      .catch(() => {})
+      .finally(() => { if (S.live.on) liveStart(); });
+  } else liveStop();
   renderLiveSwitch();
 }
 
@@ -1915,6 +3239,7 @@ function liveApply(ch) {
     for (const pl of it.pills) {
       pl.g.style.display = show ? "" : "none";
       pl.g.classList.toggle("computed", e?.[3] === "computed");
+      pl.g.classList.toggle("queried", e?.[3] === "queried");
       if (!show) continue;
       if (pl.t.textContent !== txt) {
         const was = pl.t.textContent;
@@ -1926,15 +3251,17 @@ function liveApply(ch) {
       }
     }
   }
-  $("props").querySelectorAll("[data-lv]").forEach((n) => {
+  document.querySelectorAll("#props [data-lv], #deploy-new [data-lv]").forEach((n) => {
     const e = liveVal(n.dataset.lv);
-    const txt = e ? clip(liveText(e), 40) : "no value";
-    const changed = n.textContent !== txt;
-    n.textContent = txt;
+    const html = lvInner(e);
+    const changed = n.innerHTML !== html;
+    if (changed) n.innerHTML = html;
     n.className = "lv" + (e ? "" : " none") + (e?.[3] ? " " + e[3] : "");
     n.title = e?.[2] || "";
     if (ch && e && changed) flash(n);
   });
+  liveSectionsRefresh(ch);
+  modesLive();
 }
 function flash(n) {
   n.classList.remove("tick");
@@ -1949,9 +3276,22 @@ function connect() {
   const es = new EventSource("/api/events");
   // Changes while the stream was down (or before it opened) are not replayed: catch up.
   es.onopen = () => { setStatus("live", "live"); if (S.hist) loadHistory(); };
-  es.addEventListener("history", () => loadHistory(true));
+  // A new deployed revision may have taken over the app's calendar edits.
+  es.addEventListener("history", () => { loadHistory(true); loadCal(); });
+  // `changed`: re-read it. `read` again unchanged: only an Apply waiting for a read cares.
+  es.addEventListener("app", (e) => { if (e.data !== "read" || (S.deployed && !awaitedAppRead())) loadApp(); });
   es.addEventListener("actions", (e) => { if (S.hist) { S.hist.actions = JSON.parse(e.data); renderActions(); } });
+  es.addEventListener("calendar", () => loadCal());
+  es.addEventListener("operate", (e) => { if (S.hist) { S.hist.operate = JSON.parse(e.data); renderHistory(); } });
   es.onerror = () => setStatus("disconnected — retrying", "error");
 }
 S.hash = readHash();
 loadHistory().then(connect);
+loadMs();
+loadApp();
+loadCal();
+// The chip stays roughly current while the page is open.
+// Every minute, to notice a config saved on the Miniserver: the server asks only for its config
+// date again (reused for half a minute, so several tabs still ask once), and the full check every
+// five minutes.
+setInterval(() => { if (!document.hidden) loadMs(false, true); }, 60 * 1000);

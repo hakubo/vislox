@@ -2,9 +2,12 @@
 //! wires and off-page links, a properties record per object, the project
 //! tree, and — when a base revision is given — what changed against it.
 
+use crate::calendar::{self, EntryDate};
+use crate::hardware;
+use crate::schedule;
 use loxone_config::diff::{self, DocDiff};
 use loxone_config::doc::{LoxoneDoc, PortView, WireView, ports};
-use loxone_config::layout::{GeoObject, Layout, PageGeometry, ROW, Shape, Side};
+use loxone_config::layout::{GRID, GeoObject, Layout, PageGeometry, ROW, Shape, Side};
 use loxone_config::port_names;
 use loxone_config::xml::Element;
 use serde::Serialize;
@@ -29,6 +32,43 @@ pub struct View {
     pub compared: bool,
     /// How values flow where the Miniserver streams none (live values).
     pub live: LiveGraph,
+    /// The operating modes calendar entries can switch on, in document
+    /// order (the Operating modes view).
+    pub modes: Vec<ModeInfo>,
+    /// The devices the compared change reconfigures: added, removed,
+    /// replaced (another serial) or with settings that reach the device.
+    pub hardware: Vec<HwDevice>,
+}
+
+/// A device a change reconfigures (see [`crate::hardware`]).
+#[derive(Serialize, Clone, Debug)]
+pub struct HwDevice {
+    pub uuid: String,
+    pub title: String,
+    /// `Touch Tree`, `AI Extension`, …
+    pub kind: String,
+    /// The device type on the bus (`0x8003`), when known.
+    pub code: Option<String>,
+    /// `added`, `removed`, `replaced` (another serial), `paired` (a serial
+    /// where there was none), `unpaired` (its serial cleared) or `changed`.
+    pub how: &'static str,
+    /// Its serial (an Air device's `IP=`) in the compared revision, as
+    /// [`crate::discover::norm_serial`] writes it; for a removed device, the
+    /// one it had.
+    pub serial: Option<String>,
+    pub old_serial: Option<String>,
+    /// Whether `serial` can be looked for on the bus (`lox extensions`): a
+    /// real serial, not an Air device's MAC-derived address.
+    pub check: bool,
+}
+
+/// An operating mode (`Mode`), by the number calendar entries name it with.
+#[derive(Serialize)]
+pub struct ModeInfo {
+    pub uuid: String,
+    /// Its `Mode=` number (absent: 0, the holiday mode).
+    pub number: i64,
+    pub title: String,
 }
 
 /// What the browser needs to give a wire a live value the Miniserver does
@@ -50,6 +90,9 @@ pub struct LiveGraph {
     /// A lighting controller's Mood output → the controller, whose app
     /// control streams its active moods.
     pub moods: BTreeMap<String, String>,
+    /// A weather data block's output → the weather field it gives (its
+    /// `WType=`), read from the Miniserver's weather states.
+    pub weather: BTreeMap<String, i64>,
 }
 
 #[derive(Serialize)]
@@ -78,6 +121,8 @@ pub struct Stats {
     pub moved: usize,
     pub wires_added: usize,
     pub wires_removed: usize,
+    /// Devices the change reconfigures.
+    pub devices: usize,
 }
 
 #[derive(Serialize)]
@@ -175,11 +220,129 @@ pub struct ObjInfo {
     pub path: String,
     pub room: Option<String>,
     pub category: Option<String>,
+    /// How the block shows in the app (its `<IoData>`), if it can.
+    pub app: Option<InApp>,
+    /// The compared revision's, when it differs.
+    pub app_old: Option<InApp>,
+    pub app_changed: bool,
     pub attrs: Vec<AttrInfo>,
     pub ports: Vec<PortInfo>,
     /// Ref tags that mirror this object: (page uuid, ref object uuid).
     pub mirrored_by: Vec<[String; 2]>,
     pub target: Option<Target>,
+    /// A calendar entry's date and operating mode, decoded.
+    pub calendar: Option<CalInfo>,
+    /// The switching times of a Daytimer, or of a block that holds one.
+    pub schedule: Option<SchedInfo>,
+    /// The device this object is, or belongs to (an input or output).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device: Option<DeviceInfo>,
+}
+
+/// The device an object is, or whose input or output it is.
+#[derive(Serialize, Debug)]
+pub struct DeviceInfo {
+    pub uuid: String,
+    pub title: String,
+    pub kind: String,
+    pub code: Option<String>,
+    pub serial: Option<String>,
+    /// The object is the device itself, not one of its inputs or outputs.
+    pub own: bool,
+    /// What to know about this kind of device (Room Comfort Sensor: CO2 burn-in).
+    pub note: Option<&'static str>,
+    /// How the compared change reconfigures the device, if it does
+    /// ([`HwDevice::how`]).
+    pub how: Option<&'static str>,
+}
+
+/// A schedule, as the viewed config stores it (see `schedule.rs`).
+#[derive(Serialize)]
+pub struct SchedInfo {
+    /// The UUID the Miniserver streams the live schedule under.
+    pub state: String,
+    pub analog: bool,
+    pub default: Option<f64>,
+    /// The columns, one per operating mode.
+    pub cols: Vec<SchedCol>,
+    pub entries: Vec<schedule::Entry>,
+    /// The compared revision's entries, when they differ.
+    pub old_entries: Option<Vec<schedule::Entry>>,
+    /// Those of the compared revision's columns that this one lacks.
+    pub old_cols: Vec<SchedCol>,
+}
+
+/// A schedule's column: the operating mode its `Modes=` UUID names.
+#[derive(Serialize)]
+pub struct SchedCol {
+    /// The UUID, as entries name their column (`schedule::Entry::col`).
+    pub col: String,
+    /// The mode's `Mode=` number; `None` when the UUID names no `Mode`.
+    pub number: Option<i64>,
+    pub title: String,
+    /// The `Mode` object.
+    pub target: Option<Target>,
+}
+
+/// A calendar entry, decoded (see `calendar.rs`).
+#[derive(Serialize)]
+pub struct CalInfo {
+    /// The date as one line; `None` when it cannot be decoded.
+    pub when: Option<String>,
+    /// Why the date cannot be decoded.
+    pub why: Option<String>,
+    /// The date by kind, for views of the year.
+    pub date: Option<EntryDate>,
+    /// The date in the compared revision, when both revisions' dates
+    /// decode and differ.
+    pub old_when: Option<String>,
+    /// That date by kind; also when only the compared revision's date
+    /// decodes (then without `old_when`), so that views of the year can
+    /// show the days the entry no longer has.
+    pub old_date: Option<EntryDate>,
+    /// The operating mode it switches on.
+    pub mode: CalMode,
+    /// The mode in the compared revision, when it is another one.
+    pub old_mode: Option<CalMode>,
+}
+
+#[derive(Serialize)]
+pub struct CalMode {
+    /// Its `Mode=` number (`CalType=`); `None` when that cannot be read.
+    pub number: Option<i64>,
+    pub title: String,
+    /// The `Mode` object, when the config has one with that number.
+    pub target: Option<Target>,
+}
+
+/// The raw visualization settings of a block's `<IoData>`: `Visu`, and the
+/// room (`Pr`) and category (`Cr`) UUIDs. Cheap: no titles looked up.
+#[derive(PartialEq, Clone, Copy)]
+struct IoKey<'a> {
+    shown: bool,
+    room: Option<&'a str>,
+    category: Option<&'a str>,
+}
+
+fn io_key(el: &Element) -> Option<IoKey<'_>> {
+    let io = el.child_elements().find(|c| c.name == "IoData")?;
+    let id = |a: &str| io.attr(a).filter(|v| !v.is_empty());
+    Some(IoKey {
+        shown: io.attr("Visu") == Some("true"),
+        room: id("Pr"),
+        category: id("Cr"),
+    })
+}
+
+/// A block's visualization settings, as Loxone Config shows them: shown in
+/// the app or not (`Visu`), and its room (`Pr`) and category (`Cr`).
+#[derive(Serialize, Clone, PartialEq, Debug)]
+pub struct InApp {
+    pub shown: bool,
+    pub room: Option<String>,
+    pub room_id: Option<String>,
+    pub category: Option<String>,
+    pub category_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -188,6 +351,12 @@ pub struct AttrInfo {
     pub value: Option<String>,
     pub old: Option<String>,
     pub changed: bool,
+    /// What the setting does on the device, from the per-device tables.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hint: Option<&'static str>,
+    /// Its change reconfigures the device.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub hw: bool,
 }
 
 #[derive(Serialize)]
@@ -228,6 +397,9 @@ pub struct Change {
     pub text: String,
     pub obj: Option<String>,
     pub page: Option<String>,
+    /// The device this change reconfigures (the "hardware" filter).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hw: Option<String>,
 }
 
 fn rect(l: &Layout) -> [i64; 4] {
@@ -277,6 +449,8 @@ struct Ctx<'a> {
     order: Vec<String>,
     /// Ports with at least one wire.
     wired: HashSet<String>,
+    /// Operating mode `Mode=` number (absent: 0) → its UUID.
+    modes: HashMap<i64, String>,
 }
 
 impl<'a> Ctx<'a> {
@@ -292,6 +466,7 @@ impl<'a> Ctx<'a> {
             mirrors: HashMap::new(),
             order: Vec::new(),
             wired: HashSet::new(),
+            modes: HashMap::new(),
         };
         c.wired = c
             .wires
@@ -325,6 +500,17 @@ impl<'a> Ctx<'a> {
             for p in ports(child) {
                 self.port_owner
                     .insert(p.uuid.clone(), (uuid.to_string(), p.key.clone()));
+            }
+            // Absent is 0, the holiday mode; a number that cannot be read
+            // is no number, and must not take the holiday mode's place.
+            let number = match child.attr("Mode") {
+                None => Some(0),
+                Some(v) => v.trim().parse().ok(),
+            };
+            if ty == "Mode"
+                && let Some(n) = number
+            {
+                self.modes.entry(n).or_insert_with(|| uuid.to_string());
             }
             let is_page = ty == "Page";
             if is_page {
@@ -395,15 +581,110 @@ impl<'a> Ctx<'a> {
         Some(self.target(owner, Some(key)))
     }
 
-    /// Title of the Place/Category an `<IoData>` binding names.
-    fn binding(&self, el: &Element, attr: &str) -> Option<String> {
-        let io = el.child_elements().find(|c| c.name == "IoData")?;
-        let id = io.attr(attr)?;
-        Some(
-            self.el(id)
-                .map(|_| self.title(id))
-                .unwrap_or_else(|| id.to_string()),
-        )
+    /// A calendar entry's date, decoded; `None` when not an entry.
+    fn entry_date(&self, uuid: &str) -> Option<Result<EntryDate, String>> {
+        let el = self
+            .el(uuid)
+            .filter(|e| e.attr("Type") == Some(calendar::ENTRY))?;
+        Some(EntryDate::from_attrs(|n| el.attr(n)))
+    }
+
+    /// The operating mode a calendar entry switches on.
+    fn entry_mode(&self, uuid: &str) -> CalMode {
+        let raw = self.el(uuid).and_then(|e| e.attr(calendar::MODE_ATTR));
+        let number = calendar::mode_number(raw);
+        let target = number
+            .and_then(|n| self.modes.get(&n))
+            .map(|m| self.target(m, None));
+        let title = match (&target, number) {
+            (Some(t), _) => t.title.clone(),
+            (None, Some(n)) => format!("Mode {n} (not in this config)"),
+            (None, None) => format!("{} “{}”", calendar::MODE_ATTR, raw.unwrap_or("")),
+        };
+        CalMode {
+            number,
+            title,
+            target,
+        }
+    }
+
+    /// A schedule's column `col`: the `Mode` object its UUID names.
+    fn sched_col(&self, col: &str) -> SchedCol {
+        let number = self.mode_number(col);
+        SchedCol {
+            col: col.to_string(),
+            number,
+            title: match number {
+                Some(_) => self.title(col),
+                None => format!("{col} (no operating mode in this config)"),
+            },
+            target: number.map(|_| self.target(col, None)),
+        }
+    }
+
+    /// The `Mode=` number of the `Mode` object `uuid` (absent: 0).
+    fn mode_number(&self, uuid: &str) -> Option<i64> {
+        let el = self.el(uuid).filter(|e| e.attr("Type") == Some("Mode"))?;
+        match el.attr("Mode") {
+            None => Some(0),
+            Some(v) => v.trim().parse().ok(),
+        }
+    }
+
+    /// The switching times of block `uuid`, when it has them.
+    fn timer(&self, uuid: &str) -> Option<schedule::Timer> {
+        schedule::read(self.el(uuid)?, uuid, |m| self.mode_number(m))
+    }
+
+    /// The block's visualization settings, from its `<IoData>` child.
+    fn in_app(&self, el: &Element) -> Option<InApp> {
+        let k = io_key(el)?;
+        Some(InApp {
+            shown: k.shown,
+            room: k.room.map(|r| self.place_title(r)),
+            room_id: k.room.map(String::from),
+            category: k.category.map(|c| self.place_title(c)),
+            category_id: k.category.map(String::from),
+        })
+    }
+
+    /// Title of the Place/Category a binding names, else its UUID.
+    fn place_title(&self, id: &str) -> String {
+        self.el(id)
+            .map(|_| self.title(id))
+            .unwrap_or_else(|| id.to_string())
+    }
+
+    /// The device `uuid` is, or whose input or output it is (the nearest
+    /// enclosing extension, Tree or Air device; not the Miniserver).
+    fn device_of(&self, uuid: &str) -> Option<String> {
+        let mut cur = uuid;
+        loop {
+            let el = self.el(cur)?;
+            let ty = el.attr("Type").unwrap_or("");
+            if hardware::is_device(ty) {
+                return Some(cur.to_string());
+            }
+            if matches!(ty, "LoxLIVE" | "Page" | "Document") {
+                return None;
+            }
+            cur = self.parent.get(cur)?;
+        }
+    }
+
+    fn tree_type(&self, dev: &str) -> Option<&'a str> {
+        self.el(dev).and_then(|e| e.attr("TreeType"))
+    }
+
+    fn dev_kind(&self, dev: &str) -> (String, Option<String>) {
+        hardware::kind(&self.ty(dev), self.tree_type(dev))
+    }
+
+    /// A device's serial (an Air device's `IP=`).
+    fn serial(&self, dev: &str) -> Option<String> {
+        self.el(dev)
+            .and_then(|e| e.attr(hardware::identity(&self.ty(dev))))
+            .map(String::from)
     }
 }
 
@@ -525,6 +806,125 @@ fn route(
     ]
 }
 
+/// Wires that share a vertical run cannot be told apart, and a run through a
+/// block hides behind it. Move the vertical run of each plain route (out,
+/// across, in) to a free lane between its ends: clear of blocks and of other
+/// wires' runs, as near the middle as it can. Wires from one source share
+/// their run, so they branch like a tree.
+fn untangle(wires: &mut [PWire], blocks: &[[i64; 4]]) {
+    const LANE: i64 = GRID / 2;
+    const REACH: i64 = 24;
+    struct Run {
+        wires: Vec<usize>,
+        lo: i64,
+        hi: i64,
+        y0: i64,
+        y1: i64,
+        x1: i64,
+        ya: i64,
+    }
+    // Vertical runs already placed: (x, y0, y1).
+    let mut taken: Vec<(i64, i64, i64)> = Vec::new();
+    let mut runs: Vec<Run> = Vec::new();
+    let mut by_src: HashMap<(String, i64, i64), usize> = HashMap::new();
+    for (i, w) in wires.iter().enumerate() {
+        let p = &w.points;
+        if p.len() != 4 {
+            // Loop routes keep their runs; others steer clear of them.
+            for s in p.windows(2).filter(|s| s[0][0] == s[1][0]) {
+                taken.push((s[0][0], s[0][1].min(s[1][1]), s[0][1].max(s[1][1])));
+            }
+            continue;
+        }
+        let ([x1, ya], [x2, yb]) = (p[0], p[3]);
+        let k = (w.src.clone(), x1, ya);
+        let r = *by_src.entry(k).or_insert_with(|| {
+            runs.push(Run {
+                wires: Vec::new(),
+                lo: x1 + 2 * LANE,
+                hi: i64::MAX,
+                y0: ya,
+                y1: ya,
+                x1,
+                ya,
+            });
+            runs.len() - 1
+        });
+        let r = &mut runs[r];
+        r.wires.push(i);
+        r.hi = r.hi.min(x2 - 2 * LANE);
+        r.y0 = r.y0.min(yb);
+        r.y1 = r.y1.max(yb);
+    }
+    // A segment's cost: the blocks it runs through.
+    let through = |x0: i64, y0: i64, x1: i64, y1: i64| -> i64 {
+        let (x0, x1) = (x0.min(x1), x0.max(x1));
+        let (y0, y1) = (y0.min(y1), y0.max(y1));
+        blocks
+            .iter()
+            .filter(|b| {
+                x0 < b[0] + b[2] && b[0] < x1 && y0 < b[1] + b[3] && b[1] < y1 || {
+                    // A line on the block's edge counts as through it.
+                    (x0 == x1 && b[0] <= x0 && x0 <= b[0] + b[2] && y0 < b[1] + b[3] && b[1] < y1)
+                        || (y0 == y1
+                            && b[1] <= y0
+                            && y0 <= b[1] + b[3]
+                            && x0 < b[0] + b[2]
+                            && b[0] < x1)
+                }
+            })
+            .count() as i64
+    };
+    // Tightest first: they have the fewest lanes to choose from.
+    let mut order: Vec<usize> = (0..runs.len()).collect();
+    order.sort_by_key(|&r| (runs[r].hi - runs[r].lo, runs[r].x1, runs[r].ya));
+    for r in order {
+        let run = &runs[r];
+        if run.hi < run.lo {
+            continue;
+        }
+        let mid = (run.lo + run.hi) / 2;
+        let mut best = (i64::MAX, mid);
+        for k in 0..=2 * REACH {
+            // 0, +1, −1, +2, −2, …: nearest the middle first.
+            let off = if k % 2 == 1 { (k + 1) / 2 } else { -(k / 2) };
+            let x = mid + off * LANE;
+            if x < run.lo || x > run.hi {
+                continue;
+            }
+            let mut cost = off.abs();
+            cost += 1000 * through(x, run.y0, x, run.y1);
+            for &i in &run.wires {
+                let [_, yb] = wires[i].points[3];
+                let x2 = wires[i].points[3][0];
+                // The horizontal legs, inset so the blocks at either end do not count.
+                cost +=
+                    1000 * (through(run.x1 + 1, run.ya, x, run.ya) + through(x, yb, x2 - 1, yb));
+            }
+            cost += 200
+                * taken
+                    .iter()
+                    .filter(|&&(tx, t0, t1)| (tx - x).abs() < LANE && t0 <= run.y1 && run.y0 <= t1)
+                    .count() as i64;
+            if cost < best.0 {
+                best = (cost, x);
+            }
+            if cost == 0 {
+                break;
+            }
+        }
+        let x = best.1;
+        for &i in &run.wires {
+            let p = &mut wires[i].points;
+            p[1][0] = x;
+            p[2][0] = x;
+        }
+        if run.y0 != run.y1 {
+            taken.push((x, run.y0, run.y1));
+        }
+    }
+}
+
 /// One changed attribute: (name, old value, new value).
 type AttrDelta = (String, Option<String>, Option<String>);
 
@@ -545,6 +945,17 @@ struct Delta {
     wires_added: HashSet<(String, String)>,
     wires_removed: HashSet<(String, String)>,
     placements: HashSet<String>,
+    /// Calendar entries whose decoded date or operating mode changed,
+    /// also when only the `Mode` object they name did.
+    calendar: HashSet<String>,
+    /// Blocks whose switching times changed.
+    schedule: HashSet<String>,
+    /// Objects whose app settings changed: shown or not, room, category.
+    in_app: HashSet<String>,
+    /// Devices the change reconfigures → how ([`HwDevice::how`]).
+    hw: HashMap<String, &'static str>,
+    /// (object, attribute) changes that reach a device.
+    hw_attrs: HashSet<(String, String)>,
 }
 
 impl Delta {
@@ -558,6 +969,9 @@ impl Delta {
         } else if self.renamed.contains_key(uuid)
             || self.attrs.contains_key(uuid)
             || self.placements.contains(uuid)
+            || self.calendar.contains(uuid)
+            || self.schedule.contains(uuid)
+            || self.in_app.contains(uuid)
             || self.params.keys().any(|(o, _)| o == uuid)
         {
             CHANGED
@@ -645,6 +1059,17 @@ fn delta(new: &Ctx, old: &Ctx, d: &DocDiff) -> Delta {
         if !ch.is_empty() {
             x.attrs.insert(u.clone(), ch);
         }
+        // A block without `<IoData>` reads as one not shown, in no room.
+        let key = |el| {
+            io_key(el).unwrap_or(IoKey {
+                shown: false,
+                room: None,
+                category: None,
+            })
+        };
+        if key(nel) != key(oel) {
+            x.in_app.insert(u.clone());
+        }
         let (np, op): (Vec<PortView>, Vec<PortView>) = (ports(nel), ports(oel));
         for p in &np {
             let od = op
@@ -675,10 +1100,48 @@ fn k_title_changed(a: &BTreeMap<String, String>, b: &BTreeMap<String, String>) -
 pub fn build(new: &LoxoneDoc, old: Option<&LoxoneDoc>, title: &str) -> View {
     let nc = Ctx::new(new);
     let oc = old.map(Ctx::new);
-    let d = match (&oc, old) {
+    let mut d = match (&oc, old) {
         (Some(oc), Some(od)) => delta(&nc, oc, &diff::diff(od, new)),
         _ => Delta::default(),
     };
+    if let Some(oc) = oc.as_ref().filter(|_| d.on) {
+        hw_delta(&nc, oc, &mut d);
+    }
+    // Calendar entries, decoded once: their changes mark them changed.
+    let mut cals: HashMap<String, CalInfo> = HashMap::new();
+    for u in &nc.order {
+        if let Some(ci) = cal_info(&nc, oc.as_ref().filter(|_| d.on), u) {
+            if ci.old_when.is_some() || ci.old_mode.is_some() {
+                d.calendar.insert(u.clone());
+            }
+            cals.insert(u.clone(), ci);
+        }
+    }
+    if let Some(oc) = &oc {
+        for u in oc.order.iter().filter(|u| !nc.els.contains_key(*u)) {
+            if let Some(ci) = cal_info(oc, None, u) {
+                cals.insert(u.clone(), ci);
+            }
+        }
+    }
+
+    // Switching times, decoded once: a changed one marks its block changed.
+    let mut scheds: HashMap<String, SchedInfo> = HashMap::new();
+    for u in &nc.order {
+        if let Some(si) = sched_info(&nc, oc.as_ref().filter(|_| d.on), u) {
+            if si.old_entries.is_some() {
+                d.schedule.insert(u.clone());
+            }
+            scheds.insert(u.clone(), si);
+        }
+    }
+    if let Some(oc) = &oc {
+        for u in oc.order.iter().filter(|u| !nc.els.contains_key(*u)) {
+            if let Some(si) = sched_info(oc, None, u) {
+                scheds.insert(u.clone(), si);
+            }
+        }
+    }
 
     let mut view = View {
         title: title.to_string(),
@@ -708,24 +1171,110 @@ pub fn build(new: &LoxoneDoc, old: Option<&LoxoneDoc>, title: &str) -> View {
 
     // Properties of every object.
     for u in &nc.order {
-        view.objects
-            .insert(u.clone(), obj_info(&nc, oc.as_ref(), u, &d, false));
+        let ci = cals.remove(u);
+        let mut o = obj_info(&nc, oc.as_ref(), u, &d, false, ci);
+        o.schedule = scheds.remove(u);
+        view.objects.insert(u.clone(), o);
     }
     if let Some(oc) = &oc {
         for u in &oc.order {
             if !nc.els.contains_key(u) {
-                view.objects
-                    .insert(u.clone(), obj_info(oc, None, u, &d, true));
+                let ci = cals.remove(u);
+                let mut o = obj_info(oc, None, u, &d, true, ci);
+                o.schedule = scheds.remove(u);
+                view.objects.insert(u.clone(), o);
             }
         }
     }
 
     view.live = live_graph(&nc);
+    view.modes = modes(&nc);
     view.tree = tree(&nc, oc.as_ref(), &d);
     if d.on {
-        changes(&mut view, &nc, oc.as_ref().unwrap(), &d);
+        let oc = oc.as_ref().unwrap();
+        changes(&mut view, &nc, oc, &d);
+        view.hardware = hw_devices(&nc, oc, &d);
+        view.stats.devices = view.hardware.len();
     }
     view
+}
+
+/// The devices `new` reconfigures compared with `old` (`view.hardware`),
+/// without building the rest of the view: for Apply's confirmation.
+pub fn hardware(new: &LoxoneDoc, old: &LoxoneDoc) -> Vec<HwDevice> {
+    let (nc, oc) = (Ctx::new(new), Ctx::new(old));
+    let mut d = delta(&nc, &oc, &diff::diff(old, new));
+    hw_delta(&nc, &oc, &mut d);
+    hw_devices(&nc, &oc, &d)
+}
+
+/// Which devices the change reconfigures, and with which attributes.
+fn hw_delta(nc: &Ctx, oc: &Ctx, d: &mut Delta) {
+    let is_dev = |c: &Ctx, u: &str| c.device_of(u).as_deref() == Some(u);
+    for u in &d.added {
+        if is_dev(nc, u) {
+            d.hw.insert(u.clone(), ADDED);
+        }
+    }
+    for u in &d.removed {
+        if is_dev(oc, u) {
+            d.hw.insert(u.clone(), REMOVED);
+        }
+    }
+    for (u, ch) in &d.attrs {
+        let Some(dev) = nc.device_of(u) else { continue };
+        let dty = nc.ty(&dev);
+        let (tree, oty, own) = (nc.tree_type(&dev), nc.ty(u), dev == *u);
+        for (n, ..) in ch {
+            if !hardware::reconfigures(&dty, tree, &oty, own, n) {
+                continue;
+            }
+            d.hw_attrs.insert((u.clone(), n.clone()));
+            let how = if own && n == hardware::identity(&dty) {
+                hardware::identity_change(oc.serial(u).as_deref(), nc.serial(u).as_deref())
+            } else {
+                CHANGED
+            };
+            // The identity's change says more than a setting's.
+            let e = d.hw.entry(dev.clone()).or_insert(how);
+            if how != CHANGED {
+                *e = how;
+            }
+        }
+    }
+}
+
+/// The devices of [`hw_delta`], in document order (removed ones last).
+fn hw_devices(nc: &Ctx, oc: &Ctx, d: &Delta) -> Vec<HwDevice> {
+    let mut v: Vec<(usize, HwDevice)> =
+        d.hw.iter()
+            .map(|(u, how)| {
+                let c = if *how == REMOVED { oc } else { nc };
+                let (kind, code) = c.dev_kind(u);
+                let pos = if *how == REMOVED {
+                    nc.order.len() + oc.order.iter().position(|o| o == u).unwrap_or(0)
+                } else {
+                    c.order.iter().position(|o| o == u).unwrap_or(0)
+                };
+                let norm = |s: Option<String>| s.map(|s| crate::discover::norm_serial(&s));
+                let serial = norm(c.serial(u));
+                let dev = HwDevice {
+                    check: c.ty(u) != hardware::AIR && !hardware::unpaired(serial.as_deref()),
+                    uuid: u.clone(),
+                    title: c.title(u),
+                    kind,
+                    code,
+                    how,
+                    serial,
+                    old_serial: matches!(*how, "replaced" | "unpaired")
+                        .then(|| norm(oc.serial(u)))
+                        .flatten(),
+                };
+                (pos, dev)
+            })
+            .collect();
+    v.sort_by_key(|(p, _)| *p);
+    v.into_iter().map(|(_, d)| d).collect()
 }
 
 fn page_view(c: &Ctx, old: Option<&Ctx>, uuid: &str, d: &Delta, gone: bool) -> Option<Page> {
@@ -916,6 +1465,12 @@ fn page_view(c: &Ctx, old: Option<&Ctx>, uuid: &str, d: &Delta, gone: bool) -> O
         }
     }
     let _ = geo.labels; // recomputed above with their targets
+    let blocks: Vec<[i64; 4]> = objects
+        .iter()
+        .filter(|o| o.status != REMOVED && o.moved_to.is_none())
+        .map(|o| o.rect)
+        .collect();
+    untangle(&mut wires, &blocks);
 
     let old_title = old
         .filter(|_| d.renamed.contains_key(uuid))
@@ -952,10 +1507,23 @@ fn page_view(c: &Ctx, old: Option<&Ctx>, uuid: &str, d: &Delta, gone: bool) -> O
     })
 }
 
-fn obj_info(c: &Ctx, old: Option<&Ctx>, uuid: &str, d: &Delta, gone: bool) -> ObjInfo {
+fn obj_info(
+    c: &Ctx,
+    old: Option<&Ctx>,
+    uuid: &str,
+    d: &Delta,
+    gone: bool,
+    calendar: Option<CalInfo>,
+) -> ObjInfo {
     let el = c.el(uuid).expect("indexed object");
     let ty = c.ty(uuid);
     let attr_changes = d.attrs.get(uuid);
+    let dev = c.device_of(uuid);
+    let hint = |name: &str| {
+        dev.as_ref()
+            .and_then(|dv| hardware::hint(&c.ty(dv), c.tree_type(dv), &ty, dv == uuid, name))
+    };
+    let hw = |name: &str| !gone && d.hw_attrs.contains(&(uuid.to_string(), name.to_string()));
     let mut attrs: Vec<AttrInfo> = attrs_of(el)
         .into_iter()
         .map(|(name, value)| {
@@ -963,6 +1531,8 @@ fn obj_info(c: &Ctx, old: Option<&Ctx>, uuid: &str, d: &Delta, gone: bool) -> Ob
             AttrInfo {
                 old: ch.and_then(|(_, o, _)| o.clone()),
                 changed: ch.is_some(),
+                hint: hint(&name),
+                hw: hw(&name),
                 name,
                 value: Some(value),
             }
@@ -976,10 +1546,25 @@ fn obj_info(c: &Ctx, old: Option<&Ctx>, uuid: &str, d: &Delta, gone: bool) -> Ob
                     value: None,
                     old: o.clone(),
                     changed: true,
+                    hint: hint(n),
+                    hw: hw(n),
                 });
             }
         }
     }
+    let device = dev.map(|dv| {
+        let (kind, code) = c.dev_kind(&dv);
+        DeviceInfo {
+            title: c.title(&dv),
+            serial: c.serial(&dv),
+            own: dv == uuid,
+            note: hardware::note(&c.ty(&dv), c.tree_type(&dv)),
+            how: d.hw.get(&dv).copied().filter(|_| d.on),
+            uuid: dv,
+            kind,
+            code,
+        }
+    });
     let mut port_infos = Vec::new();
     for p in ports(el) {
         let mut conns = Vec::new();
@@ -1034,15 +1619,27 @@ fn obj_info(c: &Ctx, old: Option<&Ctx>, uuid: &str, d: &Delta, gone: bool) -> Ob
         });
     }
     let status = if gone { REMOVED } else { d.status(uuid) };
+    let app = c.in_app(el);
+    let app_old = old
+        .filter(|_| d.on)
+        .and_then(|o| o.el(uuid).map(|e| o.in_app(e)));
+    let app_changed = app_old.as_ref().is_some_and(|o| *o != app);
+    let app_old = app_old.flatten();
     ObjInfo {
+        calendar,
+        schedule: None,
+        device,
         uuid: uuid.to_string(),
         title: c.title(uuid),
         old_title: d.renamed.get(uuid).cloned().flatten(),
         status,
         page: c.page_of.get(uuid).cloned(),
         path: c.path(uuid),
-        room: c.binding(el, "Pr"),
-        category: c.binding(el, "Cr"),
+        room: app.as_ref().and_then(|a| a.room.clone()),
+        category: app.as_ref().and_then(|a| a.category.clone()),
+        app_changed: app_changed && !gone,
+        app_old: app_old.filter(|_| app_changed && !gone),
+        app,
         attrs,
         ports: port_infos,
         mirrored_by: c.mirrors.get(uuid).cloned().unwrap_or_default(),
@@ -1169,6 +1766,7 @@ fn changes(view: &mut View, nc: &Ctx, oc: &Ctx, d: &Delta) {
             kind: ADDED,
             text: name(nc, &u),
             page: page_for(&u),
+            hw: d.hw.contains_key(&u).then(|| u.clone()),
             obj: Some(u),
         });
     }
@@ -1181,6 +1779,7 @@ fn changes(view: &mut View, nc: &Ctx, oc: &Ctx, d: &Delta) {
             kind: REMOVED,
             text: name(oc, &u),
             page: page_for(&u),
+            hw: d.hw.contains_key(&u).then(|| u.clone()),
             obj: Some(u),
         });
     }
@@ -1199,6 +1798,7 @@ fn changes(view: &mut View, nc: &Ctx, oc: &Ctx, d: &Delta) {
                 text: format!("{from} → {}", nc.title(&u)),
                 page: page_for(&u),
                 obj: Some(u.clone()),
+                hw: None,
             });
         }
         let ty = nc.ty(&u);
@@ -1220,30 +1820,115 @@ fn changes(view: &mut View, nc: &Ctx, oc: &Ctx, d: &Delta) {
                 ),
                 page: page_for(&u),
                 obj: Some(u.clone()),
+                hw: None,
             });
         }
-        if let Some(a) = d.attrs.get(&u) {
-            for (n, o, new) in a {
+        let (lines, covered) = view
+            .objects
+            .get(&u)
+            .and_then(|o| o.calendar.as_ref())
+            .map(|ci| calendar_changes(&nc.title(&u), ci))
+            .unwrap_or_default();
+        for text in lines {
+            v.push(Change {
+                kind: "attr",
+                text,
+                page: page_for(&u),
+                obj: Some(u.clone()),
+                hw: None,
+            });
+        }
+        if let Some(si) = view.objects.get(&u).and_then(|o| o.schedule.as_ref()) {
+            for text in schedule_changes(&nc.title(&u), si) {
                 v.push(Change {
                     kind: "attr",
-                    text: attr_change_text(
-                        &nc.title(&u),
-                        &nc.ty(&u),
-                        n,
-                        o.as_deref(),
-                        new.as_deref(),
-                    ),
+                    text,
                     page: page_for(&u),
                     obj: Some(u.clone()),
+                    hw: None,
                 });
             }
         }
-        if d.placements.contains(&u) {
+        if let Some(a) = d.attrs.get(&u) {
+            for (n, o, new) in a.iter().filter(|(n, ..)| !covered.contains(&n.as_str())) {
+                let hw = d
+                    .hw_attrs
+                    .contains(&(u.clone(), n.clone()))
+                    .then(|| nc.device_of(&u))
+                    .flatten();
+                let identity =
+                    hw.as_deref() == Some(u.as_str()) && *n == hardware::identity(&nc.ty(&u));
+                let text = if identity {
+                    let (kind, code) = nc.dev_kind(&u);
+                    format!(
+                        "{} · device {}: {}{}, {} {} → {}",
+                        nc.title(&u),
+                        hardware::identity_change(o.as_deref(), new.as_deref()),
+                        code.map(|c| format!("{c} ")).unwrap_or_default(),
+                        kind,
+                        if n == "IP" { "address" } else { "serial" },
+                        o.as_deref().unwrap_or("—"),
+                        new.as_deref().unwrap_or("—")
+                    )
+                } else {
+                    attr_change_text(&nc.title(&u), &nc.ty(&u), n, o.as_deref(), new.as_deref())
+                };
+                v.push(Change {
+                    kind: "attr",
+                    text,
+                    page: page_for(&u),
+                    obj: Some(u.clone()),
+                    hw,
+                });
+            }
+        }
+        if d.in_app.contains(&u) {
+            let side = |c: &Ctx| c.el(&u).and_then(|e| c.in_app(e));
+            let (o, n) = (side(oc), side(nc));
+            let shown = |a: &Option<InApp>| a.as_ref().is_some_and(|a| a.shown);
+            let mut parts = Vec::new();
+            if shown(&o) != shown(&n) {
+                parts.push(if shown(&n) {
+                    "now shown in the app".to_string()
+                } else {
+                    "no longer shown in the app".to_string()
+                });
+            }
+            let place = |a: &Option<InApp>, room: bool| {
+                a.as_ref().and_then(|a| {
+                    if room {
+                        a.room.clone()
+                    } else {
+                        a.category.clone()
+                    }
+                })
+            };
+            for (what, room) in [("room", true), ("category", false)] {
+                let (a, b) = (place(&o, room), place(&n, room));
+                if a != b {
+                    parts.push(format!(
+                        "{what}: {} → {}",
+                        a.as_deref().unwrap_or("—"),
+                        b.as_deref().unwrap_or("—")
+                    ));
+                }
+            }
+            v.push(Change {
+                kind: "attr",
+                text: format!("{} · {}", nc.title(&u), parts.join(", ")),
+                page: page_for(&u),
+                obj: Some(u.clone()),
+                hw: None,
+            });
+        }
+        // Said above, with the names, for what has an `<IoData>`.
+        if d.placements.contains(&u) && !d.in_app.contains(&u) {
             v.push(Change {
                 kind: "attr",
                 text: format!("{} · room/category binding", nc.title(&u)),
                 page: page_for(&u),
                 obj: Some(u.clone()),
+                hw: None,
             });
         }
     }
@@ -1273,6 +1958,7 @@ fn changes(view: &mut View, nc: &Ctx, oc: &Ctx, d: &Delta) {
             text: wire_text(nc, w),
             page: wire_page(nc, w),
             obj: wire_obj(nc, w),
+            hw: None,
         });
     }
     let mut wr: Vec<_> = d.wires_removed.iter().collect();
@@ -1284,6 +1970,7 @@ fn changes(view: &mut View, nc: &Ctx, oc: &Ctx, d: &Delta) {
             text: wire_text(oc, w),
             page: wire_page(oc, w),
             obj: wire_obj(oc, w),
+            hw: None,
         });
     }
     let mut moved: Vec<_> = d
@@ -1307,9 +1994,176 @@ fn changes(view: &mut View, nc: &Ctx, oc: &Ctx, d: &Delta) {
             text,
             page: page_for(&u),
             obj: Some(u),
+            hw: None,
         });
     }
     view.changes = v;
+}
+
+/// A calendar entry of `c`, decoded, compared with `old` when given;
+/// `None` when not an entry. A date counts as changed only when both
+/// revisions' dates decode: an attribute change that leaves either one
+/// undecodable stays a raw attribute change.
+fn cal_info(c: &Ctx, old: Option<&Ctx>, uuid: &str) -> Option<CalInfo> {
+    let date = c.entry_date(uuid)?;
+    let mode = c.entry_mode(uuid);
+    let (mut old_date, mut old_mode, mut old_when) = (None, None, None);
+    if let Some(o) = old
+        && let Some(od) = o.entry_date(uuid)
+    {
+        match (&od, &date) {
+            (Ok(a), Ok(b)) if a != b => {
+                old_date = Some(*a);
+                old_when = Some(a.text());
+            }
+            (Ok(a), Err(_)) => old_date = Some(*a),
+            _ => {}
+        }
+        let om = o.entry_mode(uuid);
+        if !same_mode(&om, &mode) {
+            old_mode = Some(om);
+        }
+    }
+    Some(CalInfo {
+        when: date.as_ref().ok().map(EntryDate::text),
+        why: date.as_ref().err().cloned(),
+        date: date.ok(),
+        old_when,
+        old_date,
+        mode,
+        old_mode,
+    })
+}
+
+/// The modes of `c` that calendar entries can name, in document order; a
+/// mode whose number an earlier one already has is never switched on.
+fn modes(c: &Ctx) -> Vec<ModeInfo> {
+    let number: HashMap<&str, i64> = c.modes.iter().map(|(n, u)| (u.as_str(), *n)).collect();
+    c.order
+        .iter()
+        .filter_map(|u| {
+            Some(ModeInfo {
+                number: *number.get(u.as_str())?,
+                title: c.title(u),
+                uuid: u.clone(),
+            })
+        })
+        .collect()
+}
+
+/// Whether two revisions' modes of an entry are the same mode: the same
+/// `Mode` object, else the same number.
+fn same_mode(a: &CalMode, b: &CalMode) -> bool {
+    match (&a.target, &b.target) {
+        (Some(x), Some(y)) => x.uuid == y.uuid,
+        (None, None) => a.number == b.number,
+        _ => false,
+    }
+}
+
+/// The switching times of block `uuid` in `c`, compared with `old` when
+/// given; `None` when it has none.
+fn sched_info(c: &Ctx, old: Option<&Ctx>, uuid: &str) -> Option<SchedInfo> {
+    let t = c.timer(uuid)?;
+    let cols = t.modes.iter().map(|m| c.sched_col(m)).collect();
+    let (mut old_entries, mut old_cols) = (None, Vec::new());
+    if let Some(o) = old
+        && let Some(ot) = o.timer(uuid)
+    {
+        if !schedule::changed_cols(&ot.entries, &t.entries, t.analog).is_empty() {
+            old_entries = Some(ot.entries);
+        }
+        old_cols = ot
+            .modes
+            .iter()
+            .filter(|m| !t.modes.contains(m))
+            .map(|m| o.sched_col(m))
+            .collect();
+    }
+    Some(SchedInfo {
+        state: t.state,
+        analog: t.analog,
+        default: t.default,
+        cols,
+        entries: t.entries,
+        old_entries,
+        old_cols,
+    })
+}
+
+/// A block with switching times, for Apply's check against the live
+/// schedules (`/api/schedules`): only what that needs, not a whole view.
+#[derive(Serialize)]
+pub struct SchedBlock {
+    pub uuid: String,
+    pub title: String,
+    pub ty: String,
+    pub schedule: SchedInfo,
+}
+
+/// Every block of `doc` with switching times.
+pub fn schedules(doc: &LoxoneDoc) -> Vec<SchedBlock> {
+    let c = Ctx::new(doc);
+    c.order
+        .iter()
+        .filter_map(|u| {
+            Some(SchedBlock {
+                schedule: sched_info(&c, None, u)?,
+                uuid: u.clone(),
+                title: c.title(u),
+                ty: c.ty(u),
+            })
+        })
+        .collect()
+}
+
+/// A schedule's changed switching times, per column, as the change list
+/// reads them: *Uhr · schedule, Monday: 06:30–08:00 → 06:00–08:00*.
+fn schedule_changes(title: &str, si: &SchedInfo) -> Vec<String> {
+    let Some(old) = &si.old_entries else {
+        return Vec::new();
+    };
+    schedule::changed_cols(old, &si.entries, si.analog)
+        .into_iter()
+        .map(|col| {
+            let name = si
+                .cols
+                .iter()
+                .chain(&si.old_cols)
+                .find(|c| c.col == col)
+                .map_or(col.as_str(), |c| c.title.as_str());
+            format!(
+                "{title} · schedule, {name}: {} → {}",
+                schedule::line(&schedule::of_col(old, &col), si.analog),
+                schedule::line(&schedule::of_col(&si.entries, &col), si.analog)
+            )
+        })
+        .collect()
+}
+
+/// A calendar entry's changed date and mode, as the change list reads
+/// them (*Christmas · when: 24 Dec → 26 Dec*, *· switches on: Holiday →
+/// Party*), and the attributes those lines stand for: those the old and
+/// the new kind of date read, and `CalType`. Any other changed attribute
+/// is left to the raw lines.
+fn calendar_changes(title: &str, ci: &CalInfo) -> (Vec<String>, Vec<&'static str>) {
+    let (mut lines, mut covered) = (Vec::new(), Vec::new());
+    if let (Some(old), Some(new)) = (&ci.old_date, &ci.date) {
+        lines.push(format!(
+            "{title} · when: {}",
+            calendar::change_text(old, new)
+        ));
+        covered.extend_from_slice(old.attrs());
+        covered.extend_from_slice(new.attrs());
+    }
+    if let Some(om) = &ci.old_mode {
+        lines.push(format!(
+            "{title} · switches on: {} → {}",
+            om.title, ci.mode.title
+        ));
+        covered.push(calendar::MODE_ATTR);
+    }
+    (lines, covered)
 }
 
 /// One changed attribute, for the change list. Long or multi-line text
@@ -1441,6 +2295,15 @@ fn live_graph(c: &Ctx) -> LiveGraph {
                     }
                 }
             }
+            // A weather data block gives one field of the weather server's
+            // current weather.
+            "WeatherData" => {
+                if let (Some(p), Some(Ok(w))) =
+                    (by("AQ"), el.attr("WType").map(|w| w.trim().parse()))
+                {
+                    g.weather.insert(p.uuid.clone(), w);
+                }
+            }
             "LightController2" => {
                 if let (Some(p), Some(u)) = (by("Scene"), el.attr("U")) {
                     g.moods.insert(p.uuid.clone(), u.to_string());
@@ -1480,9 +2343,121 @@ fn live_graph(c: &Ctx) -> LiveGraph {
     g
 }
 
+/// Reference-like types: they pass on another connector's value, so the
+/// block behind them is queried instead (`live_graph`'s `pass`). Constants
+/// are in the config.
+const PASS_THROUGH: &[&str] = &["InputRef", "OutputRef", "OutputRefLM", "Constant"];
+
+/// The blocks to query for live values on a page (opt-in): the sources of
+/// the wires that start or end on it, followed through references to the
+/// first block that produces the value (a memory flag or a mode counts). Each block once,
+/// in the order its first wire comes up.
+pub fn query_plan(doc: &LoxoneDoc, page: &str) -> Vec<crate::query::Block> {
+    let c = Ctx::new(doc);
+    let pass = live_graph(&c).pass;
+    let on_page = |port: &str| {
+        c.port_owner
+            .get(port)
+            .is_some_and(|(o, _)| c.page_of.get(o).map(String::as_str) == Some(page))
+    };
+    let mut order: Vec<String> = Vec::new();
+    let mut want: HashMap<String, Vec<String>> = HashMap::new();
+    for w in &c.wires {
+        if !on_page(&w.from_port) && !on_page(&w.to_port) {
+            continue;
+        }
+        // Through references to the first block that can be queried: a
+        // memory flag or a mode answers for itself, so what feeds it is not.
+        let mut s = Some(w.from_port.clone());
+        for _ in 0..60 {
+            let Some(port) = s.take() else {
+                break;
+            };
+            if let Some((owner, _)) = c.port_owner.get(&port)
+                && !PASS_THROUGH.contains(&c.ty(owner).as_str())
+            {
+                let ws = want.entry(owner.clone()).or_insert_with(|| {
+                    order.push(owner.clone());
+                    Vec::new()
+                });
+                if !ws.contains(&port) {
+                    ws.push(port.clone());
+                }
+                break;
+            }
+            s = pass.get(&port).cloned();
+        }
+    }
+    order
+        .into_iter()
+        .filter_map(|u| {
+            let el = c.el(&u)?;
+            let ty = c.ty(&u);
+            Some(crate::query::Block {
+                ports: ports(el)
+                    .into_iter()
+                    .map(|p| {
+                        let name = port_names::name_of(&ty, &p.key).to_string();
+                        (p.key, p.uuid, name)
+                    })
+                    .collect(),
+                want: want.remove(&u).unwrap_or_default(),
+                title: c.title(&u),
+                uuid: u,
+                ty,
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn z_wire(src: &str, a: (i64, i64), b: (i64, i64)) -> PWire {
+        let xm = (a.0 + b.0) / 2;
+        PWire {
+            from: [src.into(), "Q".into()],
+            to: ["sink".into(), "I1".into()],
+            points: vec![[a.0, a.1], [xm, a.1], [xm, b.1], [b.0, b.1]],
+            analog: false,
+            status: "",
+            src: src.into(),
+        }
+    }
+
+    #[test]
+    fn wires_from_different_sources_take_separate_lanes() {
+        let mut w = vec![
+            z_wire("a", (0, 0), (2000, 1000)),
+            z_wire("b", (0, 500), (2000, 1500)),
+        ];
+        untangle(&mut w, &[]);
+        let (xa, xb) = (w[0].points[1][0], w[1].points[1][0]);
+        assert!((xa - xb).abs() >= GRID / 2, "{xa} vs {xb}");
+        for w in &w {
+            assert_eq!(w.points[1][0], w.points[2][0]);
+        }
+    }
+
+    #[test]
+    fn wires_from_one_source_share_their_lane() {
+        let mut w = vec![
+            z_wire("a", (0, 0), (2000, 1000)),
+            z_wire("a", (0, 0), (3000, 1500)),
+        ];
+        untangle(&mut w, &[]);
+        assert_eq!(w[0].points[1][0], w[1].points[1][0]);
+    }
+
+    #[test]
+    fn a_lane_avoids_blocks() {
+        let mut w = vec![z_wire("a", (0, 0), (2000, 1000))];
+        // A block across the middle of the gap.
+        untangle(&mut w, &[[800, -200, 400, 1400]]);
+        let x = w[0].points[1][0];
+        assert!(!(800..=1200).contains(&x), "{x}");
+    }
 
     const HOUSE: &str = include_str!("../tests/fixtures/house.Loxone");
     const AND: &str = "10000004-0000-0040-ffff504f94000001";
@@ -1492,6 +2467,13 @@ mod tests {
     const OR: &str = "10000009-0000-0090-ffff504f94000001";
     const PAGE_EG: &str = "10000002-0000-0020-ffff504f94000001";
     const PAGE_OG: &str = "10000008-0000-0080-ffff504f94000001";
+    const XMAS: &str = "10000013-0000-0130-ffff504f94000001";
+    const EASTER: &str = "10000014-0000-0140-ffff504f94000001";
+    const SUMMER: &str = "10000015-0000-0150-ffff504f94000001";
+    const HEATING: &str = "10000016-0000-0160-ffff504f94000001";
+    const NYE: &str = "10000017-0000-0170-ffff504f94000001";
+    const HOLIDAY: &str = "00000000-0000-0001-1500000000000000";
+    const PARTY: &str = "10000011-0000-0110-ffff504f94000001";
 
     fn doc(src: &str) -> LoxoneDoc {
         LoxoneDoc::parse(src.as_bytes()).expect("fixture parses")
@@ -1547,6 +2529,76 @@ mod tests {
         let div = &g.gates["10000006-0000-0063-02ff504f94000001"];
         assert_eq!(div.op, "div");
         assert_eq!(div.ins[1].def, Some(1000.0));
+    }
+
+    #[test]
+    fn query_plan_takes_the_blocks_behind_a_pages_wires() {
+        let d = doc(HOUSE);
+        let plan = query_plan(&d, PAGE_EG);
+        let blocks: Vec<(&str, &str)> = plan
+            .iter()
+            .map(|b| (b.ty.as_str(), b.uuid.as_str()))
+            .collect();
+        // The reference is followed to the virtual input it shows; the And
+        // feeds the meter and a block on the other page.
+        assert_eq!(
+            blocks,
+            [
+                ("VirtualIn", "10000001-0000-0010-ffff504f94000001"),
+                ("And", AND),
+            ]
+        );
+        assert_eq!(plan[0].want, ["10000001-0000-0011-00ff504f94000001"]);
+        let and = &plan[1];
+        assert_eq!(and.want, ["10000004-0000-0043-02ff504f94000001"]);
+        assert_eq!(
+            and.ports.iter().map(|p| p.0.as_str()).collect::<Vec<_>>(),
+            ["I1", "I2", "Q"]
+        );
+        // The other page's wire comes from the And on the first.
+        let og: Vec<String> = query_plan(&d, PAGE_OG)
+            .into_iter()
+            .map(|b| b.uuid)
+            .collect();
+        assert_eq!(og, [AND]);
+        assert!(query_plan(&d, "no-such-page").is_empty());
+    }
+
+    #[test]
+    fn query_plan_stops_at_the_first_block_behind_a_reference() {
+        // Page p shows memory flag m (on page q) through a reference; m is
+        // set by an Or on page q, which p does not need.
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<ControlList Version="1">
+	<C Type="Document" V="1" U="d" Title="T">
+		<C Type="Page" V="1" U="p" Title="P">
+			<C Type="InputRef" V="1" U="r" Title="M" Ref="m" Px="0" Py="0" Px2="10" Py2="10">
+				<Co K="I" U="r-i"><In Input="m-q"/></Co>
+				<Co K="Q" U="r-q"/>
+			</C>
+			<C Type="Not" V="1" U="n" Title="Not" Px="100" Py="0" Px2="200" Py2="100">
+				<Co K="I" U="n-i"><In Input="r-q"/></Co>
+				<Co K="Q" U="n-q"/>
+			</C>
+		</C>
+		<C Type="Page" V="1" U="q" Title="Q">
+			<C Type="Or" V="1" U="o" Title="Or" Px="0" Py="0" Px2="100" Py2="100">
+				<Co K="Q" U="o-q"/>
+			</C>
+			<C Type="Memory" V="1" U="m" Title="Flag" Px="200" Py="0" Px2="300" Py2="100">
+				<Co K="Input" U="m-in"><In Input="o-q"/></Co>
+				<Co K="Q" U="m-q"/>
+			</C>
+		</C>
+	</C>
+</ControlList>"#;
+        let d = doc(xml);
+        let plan: Vec<String> = query_plan(&d, "p").into_iter().map(|b| b.uuid).collect();
+        assert_eq!(plan, ["m"]);
+        // On its own page the Or is queried, as a wire source there.
+        let mut plan: Vec<String> = query_plan(&d, "q").into_iter().map(|b| b.uuid).collect();
+        plan.sort();
+        assert_eq!(plan, ["m", "o"]);
     }
 
     #[test]
@@ -1693,6 +2745,88 @@ mod tests {
     }
 
     #[test]
+    fn the_app_side_comes_from_iodata_and_showing_it_is_a_change() {
+        const CAT: &str = "10000010-0000-00b1-ffff504f94000001";
+        let meter = "<Co K=\"Pf\" Nc=\"1\" U=\"10000005-0000-0051-00ff504f94000001\">";
+        let cat = format!(
+            "<C Type=\"Category\" V=\"178\" U=\"{CAT}\" Title=\"Energie\"/>\n\t\t<C Type=\"Page\" V=\"178\" U=\"10000002"
+        );
+        let with = |visu: &str| {
+            edited(&[
+                ("<C Type=\"Page\" V=\"178\" U=\"10000002", &cat),
+                (
+                    meter,
+                    &format!("<IoData Visu=\"{visu}\" Pr=\"\" Cr=\"{CAT}\"/>{meter}"),
+                ),
+            ])
+        };
+        let (base, new) = (doc(&with("false")), doc(&with("true")));
+        let plain = build(&base, None, "");
+        let a = plain.objects[METER].app.as_ref().expect("IoData");
+        assert!(!a.shown);
+        assert_eq!(a.category.as_deref(), Some("Energie"));
+        assert_eq!(a.category_id.as_deref(), Some(CAT));
+        assert_eq!(a.room_id, None);
+        assert!(!plain.objects[METER].app_changed);
+        assert!(plain.objects[DIV].app.is_none());
+
+        let v = build(&new, Some(&base), "");
+        let m = &v.objects[METER];
+        assert!(m.app.as_ref().unwrap().shown);
+        assert!(m.app_changed);
+        assert!(!m.app_old.as_ref().unwrap().shown);
+        assert_eq!(obj(page(&v, PAGE_EG), METER).status, CHANGED);
+        assert!(
+            v.changes
+                .iter()
+                .any(|c| c.text == "Zähler · now shown in the app"),
+            "{:?}",
+            v.changes.iter().map(|c| &c.text).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn moving_a_block_to_another_room_or_category_is_a_change() {
+        const R1: &str = "10000020-0000-00a1-ffff504f94000001";
+        const R2: &str = "10000021-0000-00a1-ffff504f94000001";
+        const CAT: &str = "10000010-0000-00b1-ffff504f94000001";
+        let meter = "<Co K=\"Pf\" Nc=\"1\" U=\"10000005-0000-0051-00ff504f94000001\">";
+        let places = format!(
+            "<C Type=\"Place\" V=\"178\" U=\"{R1}\" Title=\"Küche\"/><C Type=\"Place\" V=\"178\" U=\"{R2}\" Title=\"Keller\"/><C Type=\"Category\" V=\"178\" U=\"{CAT}\" Title=\"Energie\"/>\n\t\t<C Type=\"Page\" V=\"178\" U=\"10000002"
+        );
+        let with = |io: &str| {
+            edited(&[
+                ("<C Type=\"Page\" V=\"178\" U=\"10000002", &places),
+                (meter, &format!("{io}{meter}")),
+            ])
+        };
+        let base = doc(&with(&format!("<IoData Visu=\"true\" Pr=\"{R1}\"/>")));
+        let moved = doc(&with(&format!(
+            "<IoData Visu=\"true\" Pr=\"{R2}\" Cr=\"{CAT}\"/>"
+        )));
+        let v = build(&moved, Some(&base), "");
+        assert_eq!(obj(page(&v, PAGE_EG), METER).status, CHANGED);
+        let m = &v.objects[METER];
+        assert!(m.app_changed);
+        assert_eq!(m.app_old.as_ref().unwrap().room.as_deref(), Some("Küche"));
+        assert_eq!(m.room.as_deref(), Some("Keller"));
+        let texts: Vec<&str> = v.changes.iter().map(|c| c.text.as_str()).collect();
+        assert!(
+            texts.contains(&"Zähler · room: Küche → Keller, category: — → Energie"),
+            "{texts:?}"
+        );
+        // Said once, with the names: not again as a bare binding change.
+        assert!(
+            !texts.iter().any(|t| t.contains("room/category binding")),
+            "{texts:?}"
+        );
+
+        // The same settings: no change.
+        let same = build(&base, Some(&base), "");
+        assert_eq!(obj(page(&same, PAGE_EG), METER).status, "");
+    }
+
+    #[test]
     fn comparing_marks_every_kind_of_change() {
         let base = doc(HOUSE);
         let new = doc(&edited(&[
@@ -1824,6 +2958,559 @@ mod tests {
             moved.text.contains("Erdgeschoss → Obergeschoss"),
             "{}",
             moved.text
+        );
+    }
+
+    fn cal<'a>(v: &'a View, uuid: &str) -> &'a CalInfo {
+        v.objects[uuid].calendar.as_ref().expect("calendar entry")
+    }
+
+    #[test]
+    fn calendar_entries_read_as_dates_and_modes() {
+        let v = build(&doc(HOUSE), None, "");
+        let when = |u| cal(&v, u).when.as_deref().unwrap().to_string();
+        let mode = |u| cal(&v, u).mode.title.clone();
+        assert_eq!(when(XMAS), "Every year on 24 Dec");
+        assert_eq!(when(EASTER), "Easter Monday (Easter +1)");
+        assert_eq!(when(SUMMER), "4 Jul 2026 – 5 Sep 2026");
+        assert_eq!(when(HEATING), "Every year 1 Oct – 30 Apr");
+        assert_eq!(when(NYE), "Every year on 31 Dec");
+        // No CalType: the holiday mode, 0.
+        assert_eq!(mode(XMAS), "Feiertag");
+        assert_eq!(cal(&v, XMAS).mode.number, Some(0));
+        let to = cal(&v, XMAS)
+            .mode
+            .target
+            .as_ref()
+            .expect("link to the mode");
+        assert_eq!(to.uuid, HOLIDAY);
+        assert_eq!(to.path.as_deref(), Some("Betriebsmodi"));
+        assert_eq!(mode(SUMMER), "Urlaub");
+        // A user mode, by its negative number.
+        assert_eq!(mode(NYE), "Party");
+        assert_eq!(cal(&v, NYE).mode.target.as_ref().unwrap().uuid, PARTY);
+        // Not compared: nothing old.
+        assert!(cal(&v, XMAS).old_when.is_none() && cal(&v, XMAS).old_mode.is_none());
+        // Other objects have no calendar.
+        assert!(v.objects[AND].calendar.is_none());
+        // The modes, in document order, by number.
+        let modes: Vec<(i64, &str, &str)> = v
+            .modes
+            .iter()
+            .map(|m| (m.number, m.title.as_str(), m.uuid.as_str()))
+            .collect();
+        assert_eq!(
+            modes,
+            [
+                (0, "Feiertag", HOLIDAY),
+                (1, "Urlaub", "00000000-0000-0002-1500000000000000"),
+                (-1, "Party", PARTY),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_undecodable_entry_says_why_and_keeps_its_attributes() {
+        let v = build(
+            &doc(&edited(&[(
+                "Title=\"Silvester\" Nio=\"2\" WF=\"16384\" CalType=\"-1\"",
+                "Title=\"Silvester\" Nio=\"2\" WF=\"16384\" CalType=\"-7\" Mode=\"5\"",
+            )])),
+            None,
+            "",
+        );
+        let c = cal(&v, NYE);
+        assert_eq!(c.when, None);
+        assert_eq!(
+            c.why.as_deref(),
+            Some("Mode 5 is a kind of date vislox does not know")
+        );
+        // A deleted mode leaves its number behind.
+        assert_eq!(c.mode.title, "Mode -7 (not in this config)");
+        assert!(c.mode.target.is_none());
+        assert!(
+            v.objects[NYE]
+                .attrs
+                .iter()
+                .any(|a| a.name == "Mode" && a.value.as_deref() == Some("5"))
+        );
+    }
+
+    /// The fixture with a Daytimer on the upper floor, columns Feiertag
+    /// (0) and Party (-1), and `entries` as its `<Entry>` rows.
+    fn with_timer(entries: &str) -> String {
+        let timer = format!(
+            "<C Type=\"DayTimer\" V=\"178\" U=\"10000020-0000-0200-ffff504f94000001\" Title=\"Uhr\" \
+             Px=\"960\" Py=\"2880\" Px2=\"3648\" Py2=\"3768\" Nio=\"2\" WF=\"16384\" Analog=\"true\" \
+             DefValue=\"18\" Modes=\"{HOLIDAY},{PARTY}\">\
+             <Co K=\"Mode\" U=\"10000020-0000-0201-00ff504f94000001\"/>\
+             <Co K=\"AQ\" U=\"10000020-0000-0202-01ff504f94000001\"/>{entries}</C>\n\t\t</C>\n\t</C>\n</ControlList>"
+        );
+        let mut s = HOUSE.to_string();
+        let end = "\n\t\t</C>\n\t</C>\n</ControlList>";
+        assert!(s.trim_end().ends_with(end.trim_start_matches('\n')));
+        let at = s.rfind(end).expect("end of the upper floor");
+        s.replace_range(at.., &timer);
+        s
+    }
+    const TIMER: &str = "10000020-0000-0200-ffff504f94000001";
+
+    #[test]
+    fn a_daytimer_shows_its_schedule_and_its_changes_per_mode() {
+        let base = doc(&with_timer(
+            "<Entry From=\"390\" To=\"480\" V=\"21\"/><Entry From=\"1080\" To=\"1380\" Ix=\"1\" V=\"22.5\"/>",
+        ));
+        let v = build(&base, None, "");
+        let si = v.objects[TIMER].schedule.as_ref().expect("a schedule");
+        assert_eq!(si.state, TIMER);
+        assert_eq!(si.default, Some(18.0));
+        let titles: Vec<&str> = si.cols.iter().map(|m| m.title.as_str()).collect();
+        assert_eq!(titles, ["Feiertag", "Party"]);
+        assert_eq!(si.entries[1].mode, Some(-1));
+        assert!(si.old_entries.is_none());
+        // Other blocks have none.
+        assert!(v.objects[AND].schedule.is_none());
+
+        // Party's evening moves; Feiertag stays.
+        let new = doc(&with_timer(
+            "<Entry From=\"390\" To=\"480\" V=\"21\"/><Entry From=\"1020\" To=\"1380\" Ix=\"1\" V=\"22.5\"/>",
+        ));
+        let v = build(&new, Some(&base), "");
+        let o = &v.objects[TIMER];
+        assert_eq!(o.status, "changed");
+        assert!(o.schedule.as_ref().unwrap().old_entries.is_some());
+        let texts: Vec<&str> = v.changes.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            ["Uhr · schedule, Party: 18:00–23:00 22.5 → 17:00–23:00 22.5"],
+            "{texts:?}"
+        );
+    }
+
+    #[test]
+    fn schedules_lists_only_blocks_with_switching_times() {
+        let d = doc(&with_timer("<Entry From=\"390\" To=\"480\" V=\"21\"/>"));
+        let s = schedules(&d);
+        assert_eq!(s.len(), 1);
+        assert_eq!((s[0].uuid.as_str(), s[0].title.as_str()), (TIMER, "Uhr"));
+        assert_eq!(s[0].schedule.entries.len(), 1);
+    }
+
+    #[test]
+    fn weather_data_blocks_give_their_field_of_the_weather() {
+        let src = edited(&[(
+            "\t\t<C Type=\"ModeCaption\"",
+            "\t\t<C Type=\"WeatherServer\" V=\"178\" U=\"10000021-0000-0210-ffff504f94000001\" Title=\"Wetter\">\
+             <C Type=\"WeatherData\" V=\"178\" U=\"10000021-0000-0211-ffff504f94000001\" Title=\"Temperatur\" Nio=\"1\" WType=\"1\">\
+             <Co K=\"AQ\" U=\"10000021-0000-0212-00ff504f94000001\"/></C></C>\n\t\t<C Type=\"ModeCaption\"",
+        )]);
+        let v = build(&doc(&src), None, "");
+        assert_eq!(
+            v.live.weather.get("10000021-0000-0212-00ff504f94000001"),
+            Some(&1)
+        );
+    }
+
+    #[test]
+    fn a_changed_calendar_entry_reads_as_dates_and_modes() {
+        let base = doc(HOUSE);
+        let new = doc(&edited(&[
+            // 24 Dec → 26 Dec
+            ("Month=\"12\" Day=\"24\"", "Month=\"12\" Day=\"26\""),
+            // Holiday → Party
+            (
+                "Title=\"Ostermontag\" Nio=\"2\" WF=\"16384\"",
+                "Title=\"Ostermontag\" Nio=\"2\" WF=\"16384\" CalType=\"-1\"",
+            ),
+            // another kind: a period → one fixed day
+            ("CalType=\"1\" Mode=\"3\"", "CalType=\"1\""),
+            // an attribute the kind does not read: no date change
+            (
+                "Month=\"10\" Day=\"1\" Month2=\"4\" Day2=\"30\" WeekDayInMonth=\"1\"",
+                "Month=\"10\" Day=\"1\" Month2=\"4\" Day2=\"30\" WeekDayInMonth=\"1\" EasterOffset=\"3\"",
+            ),
+        ]));
+        let v = build(&new, Some(&base), "");
+        let texts: Vec<&str> = v.changes.iter().map(|c| c.text.as_str()).collect();
+        assert!(
+            texts.contains(&"Heiligabend · when: 24 Dec → 26 Dec"),
+            "{texts:?}"
+        );
+        assert!(
+            texts.contains(&"Ostermontag · switches on: Feiertag → Party"),
+            "{texts:?}"
+        );
+        assert!(
+            texts.contains(&"Sommerferien · when: 4 Jul 2026 – 5 Sep 2026 → Every year on 1 Jan"),
+            "{texts:?}"
+        );
+        // The decoded lines stand for the raw ones …
+        assert!(
+            !texts.iter().any(|t| t.starts_with("Heiligabend · Day")),
+            "{texts:?}"
+        );
+        assert!(!texts.iter().any(|t| t.contains("CalType")), "{texts:?}");
+        // … but an attribute that changed no date stays raw.
+        assert!(
+            texts.contains(&"Heizperiode · EasterOffset: — → 3"),
+            "{texts:?}"
+        );
+
+        let x = cal(&v, XMAS);
+        assert_eq!(x.when.as_deref(), Some("Every year on 26 Dec"));
+        assert_eq!(x.old_when.as_deref(), Some("Every year on 24 Dec"));
+        assert!(x.old_mode.is_none());
+        let e = cal(&v, EASTER);
+        assert!(e.old_when.is_none());
+        assert_eq!(
+            e.old_mode.as_ref().map(|m| m.title.as_str()),
+            Some("Feiertag")
+        );
+        assert_eq!(e.mode.title, "Party");
+        assert!(cal(&v, HEATING).old_when.is_none());
+    }
+
+    #[test]
+    fn an_entry_that_does_not_decode_keeps_its_raw_changes() {
+        let undecodable = |m: &str| {
+            edited(&[(
+                "CalType=\"-1\" Month=\"12\"",
+                &format!("CalType=\"-1\" Mode=\"{m}\" Month=\"12\""),
+            )])
+        };
+        let texts =
+            |v: &View| -> Vec<String> { v.changes.iter().map(|c| c.text.clone()).collect() };
+        // Err → Err with another reason: the raw Mode line, no date change.
+        let v = build(&doc(&undecodable("6")), Some(&doc(&undecodable("5"))), "");
+        assert!(
+            texts(&v).contains(&"Silvester · Mode: 5 → 6".to_string()),
+            "{:?}",
+            texts(&v)
+        );
+        assert!(
+            !texts(&v).iter().any(|t| t.contains("when:")),
+            "{:?}",
+            texts(&v)
+        );
+        assert!(cal(&v, NYE).old_when.is_none());
+        // Ok → Err: the same.
+        let v = build(&doc(&undecodable("5")), Some(&doc(HOUSE)), "");
+        assert!(
+            texts(&v).contains(&"Silvester · Mode: — → 5".to_string()),
+            "{:?}",
+            texts(&v)
+        );
+        assert!(
+            !texts(&v).iter().any(|t| t.contains("when:")),
+            "{:?}",
+            texts(&v)
+        );
+        // The year view still gets the old date, to show the days it no
+        // longer has; the change list and Properties do not.
+        assert!(cal(&v, NYE).old_when.is_none());
+        assert_eq!(
+            cal(&v, NYE).old_date,
+            Some(EntryDate::Fixed { month: 12, day: 31 })
+        );
+    }
+
+    #[test]
+    fn a_date_change_hides_only_the_attributes_its_kind_reads() {
+        let v = build(
+            &doc(&edited(&[(
+                "Month=\"12\" Day=\"24\" Month2=\"1\" Day2=\"1\" WeekDayInMonth=\"1\"",
+                "Month=\"12\" Day=\"26\" Month2=\"1\" Day2=\"1\" WeekDayInMonth=\"2\"",
+            )])),
+            Some(&doc(HOUSE)),
+            "",
+        );
+        let texts: Vec<&str> = v.changes.iter().map(|c| c.text.as_str()).collect();
+        assert!(
+            texts.contains(&"Heiligabend · when: 24 Dec → 26 Dec"),
+            "{texts:?}"
+        );
+        assert!(!texts.contains(&"Heiligabend · Day: 24 → 26"), "{texts:?}");
+        // A fixed date does not read WeekDayInMonth.
+        assert!(
+            texts.contains(&"Heiligabend · WeekDayInMonth: 1 → 2"),
+            "{texts:?}"
+        );
+    }
+
+    #[test]
+    fn a_renumbered_mode_shows_in_the_sidebar_and_the_change_list() {
+        // Party becomes -2; the entry's CalType -1 now names no mode.
+        let v = build(
+            &doc(&edited(&[(
+                "WF=\"147456\" Mode=\"-1\"",
+                "WF=\"147456\" Mode=\"-2\"",
+            )])),
+            Some(&doc(HOUSE)),
+            "",
+        );
+        let c = cal(&v, NYE);
+        assert_eq!(c.old_mode.as_ref().map(|m| m.title.as_str()), Some("Party"));
+        assert_eq!(c.mode.title, "Mode -1 (not in this config)");
+        assert_eq!(v.objects[NYE].status, CHANGED);
+        let texts: Vec<&str> = v.changes.iter().map(|c| c.text.as_str()).collect();
+        assert!(
+            texts.contains(&"Silvester · switches on: Party → Mode -1 (not in this config)"),
+            "{texts:?}"
+        );
+        // Entries of other modes are untouched.
+        assert!(cal(&v, XMAS).old_mode.is_none());
+        assert_eq!(v.objects[XMAS].status, "");
+    }
+
+    #[test]
+    fn a_mode_number_that_cannot_be_read_is_not_the_holiday_mode() {
+        // Listed before the holiday mode, "x" would otherwise take number 0.
+        let src = edited(&[(
+            "\t\t\t<C Type=\"Mode\" V=\"178\" U=\"00000000-0000-0001-1500000000000000\"",
+            "\t\t\t<C Type=\"Mode\" V=\"178\" U=\"10000018-0000-0180-ffff504f94000001\" Title=\"Kaputt\" Mode=\"x\"/>\n\t\t\t<C Type=\"Mode\" V=\"178\" U=\"00000000-0000-0001-1500000000000000\"",
+        )]);
+        let v = build(&doc(&src), None, "");
+        assert_eq!(cal(&v, XMAS).mode.title, "Feiertag");
+        assert_eq!(cal(&v, XMAS).mode.target.as_ref().unwrap().uuid, HOLIDAY);
+        // … and is not a mode of the year view.
+        assert!(!v.modes.iter().any(|m| m.title == "Kaputt"));
+        assert_eq!(v.modes[0].uuid, HOLIDAY);
+    }
+
+    const HW: &str = include_str!("../tests/fixtures/hardware.Loxone");
+    const TOUCH: &str = "20000003-0000-0030-ffff504f94000002";
+    const TOUCH_TEMP: &str = "20000003-0000-0031-ffff504f94000002";
+    const COMFORT: &str = "20000004-0000-0040-ffff504f94000002";
+    const AIEXT: &str = "20000005-0000-0050-ffff504f94000002";
+    const AIEXT_IN: &str = "20000005-0000-0051-ffff504f94000002";
+    const MS_IN: &str = "20000001-0000-0011-ffff504f94000002";
+    const DIEXT: &str = "20000006-0000-0060-ffff504f94000002";
+
+    fn hw_edited(edits: &[(&str, &str)]) -> String {
+        let mut s = HW.to_string();
+        for (from, to) in edits {
+            assert_eq!(
+                s.matches(from).count(),
+                1,
+                "edit target `{from}` must be unique"
+            );
+            s = s.replacen(from, to, 1);
+        }
+        s
+    }
+
+    #[test]
+    fn devices_and_their_inputs_know_their_device() {
+        let v = build(&doc(HW), None, "t");
+        let t = v.objects[TOUCH].device.as_ref().unwrap();
+        assert_eq!(
+            (t.kind.as_str(), t.code.as_deref()),
+            ("Touch Tree", Some("0x8003"))
+        );
+        assert_eq!(t.serial.as_deref(), Some("B03B368A"));
+        assert!(t.own && t.how.is_none());
+        // An input belongs to its device; the Miniserver's own input to none.
+        let i = v.objects[TOUCH_TEMP].device.as_ref().unwrap();
+        assert!(!i.own && i.uuid == TOUCH);
+        assert!(v.objects[MS_IN].device.is_none());
+        // The Room Comfort Sensor says what to know about its CO2.
+        let c = v.objects[COMFORT].device.as_ref().unwrap();
+        assert!(c.note.unwrap().contains("burn-in"));
+        // Tooltips from the per-device tables, on the settings matched to them.
+        let hint = |u: &str, n: &str| {
+            v.objects[u]
+                .attrs
+                .iter()
+                .find(|a| a.name == n)
+                .unwrap()
+                .hint
+        };
+        assert!(hint(TOUCH, "AC").unwrap().contains("beeps"));
+        assert!(hint(COMFORT, "SSC").unwrap().contains("Send interval"));
+        assert!(
+            hint(AIEXT_IN, "MinChange")
+                .unwrap()
+                .contains("AI Extension")
+        );
+        assert!(hint(MS_IN, "MinChange").is_none());
+        assert!(hint(TOUCH_TEMP, "MinChange").is_none());
+        assert!(v.hardware.is_empty() && v.stats.devices == 0);
+    }
+
+    #[test]
+    fn changes_that_reach_a_device_are_hardware() {
+        let new = hw_edited(&[
+            // A Touch's audible acknowledgement, an AI Extension input's threshold,
+            ("AC=\"1\"", "AC=\"0\""),
+            (
+                "Title=\"Füllstand\" Nio=\"2\" WF=\"16384\" Analog=\"true\" SourceValHigh=\"10\" DestValHigh=\"10\" MaxVal=\"10\" MinChange=\"0.25\"",
+                "Title=\"Füllstand\" Nio=\"2\" WF=\"16384\" Analog=\"true\" SourceValHigh=\"10\" DestValHigh=\"10\" MaxVal=\"10\" MinChange=\"0.5\"",
+            ),
+            // … and what stays in the Miniserver: a device's board position,
+            // an input's name, the Miniserver's own input.
+            ("SwitchBoardPos=\"3\"", "SwitchBoardPos=\"4\""),
+            ("Title=\"Klingel\"", "Title=\"Türklingel\""),
+            (
+                "Title=\"Spannung Miniserver\" Nio=\"2\" WF=\"16384\" Analog=\"true\" SourceValHigh=\"10\" DestValHigh=\"10\" MaxVal=\"10\" MinChange=\"0.25\"",
+                "Title=\"Spannung Miniserver\" Nio=\"2\" WF=\"16384\" Analog=\"true\" SourceValHigh=\"10\" DestValHigh=\"10\" MaxVal=\"10\" MinChange=\"0.5\"",
+            ),
+        ]);
+        let v = build(&doc(&new), Some(&doc(HW)), "t");
+        let hw: Vec<_> = v
+            .hardware
+            .iter()
+            .map(|d| (d.uuid.as_str(), d.how))
+            .collect();
+        assert_eq!(hw, [(TOUCH, "changed"), (AIEXT, "changed")]);
+        assert_eq!(v.stats.devices, 2);
+        let line = |t: &str| {
+            v.changes
+                .iter()
+                .find(|c| c.text.contains(t))
+                .unwrap_or_else(|| panic!("{t}"))
+        };
+        assert_eq!(line("AC: 1 → 0").hw.as_deref(), Some(TOUCH));
+        assert_eq!(
+            line("Füllstand · MinChange: 0.25 → 0.5").hw.as_deref(),
+            Some(AIEXT)
+        );
+        assert!(line("SwitchBoardPos").hw.is_none());
+        assert!(line("Spannung Miniserver · MinChange").hw.is_none());
+        assert!(line("Türklingel").hw.is_none());
+        // Properties: the device says how, the setting that reaches it is marked.
+        assert_eq!(
+            v.objects[TOUCH].device.as_ref().unwrap().how,
+            Some("changed")
+        );
+        assert_eq!(
+            v.objects[TOUCH_TEMP].device.as_ref().unwrap().how,
+            Some("changed")
+        );
+        assert!(
+            v.objects[TOUCH]
+                .attrs
+                .iter()
+                .find(|a| a.name == "AC")
+                .unwrap()
+                .hw
+        );
+        assert!(v.objects[DIEXT].device.as_ref().unwrap().how.is_none());
+    }
+
+    #[test]
+    fn another_serial_is_a_replaced_device() {
+        let new = hw_edited(&[("Serial=\"B03B368A\"", "Serial=\"B03B9999\"")]);
+        let v = build(&doc(&new), Some(&doc(HW)), "t");
+        let d = &v.hardware[0];
+        assert_eq!((d.uuid.as_str(), d.how), (TOUCH, "replaced"));
+        assert_eq!(d.serial.as_deref(), Some("B03B9999"));
+        assert_eq!(d.old_serial.as_deref(), Some("B03B368A"));
+        let c = v.changes.iter().find(|c| c.hw.is_some()).unwrap();
+        assert_eq!(
+            c.text,
+            "Touch Küche · device replaced: 0x8003 Touch Tree, serial B03B368A → B03B9999"
+        );
+    }
+
+    #[test]
+    fn a_newer_loxone_config_save_reconfigures_no_device() {
+        // Every object's `V=` bumped, and attributes not matched to a device's block changed.
+        let new = HW
+            .replace("V=\"178\"", "V=\"179\"")
+            .replace("PG=\"\" AC=", "PG=\"7\" AC=");
+        let v = build(&doc(&new), Some(&doc(HW)), "t");
+        assert!(v.changes.iter().any(|c| c.text.contains("V: 178 → 179")));
+        assert!(v.hardware.is_empty(), "{:?}", v.hardware);
+        assert!(v.changes.iter().all(|c| c.hw.is_none()));
+    }
+
+    #[test]
+    fn a_cleared_serial_unpairs_the_device_and_a_first_one_pairs_it() {
+        // The Touch's serial removed: still a device, now unpaired.
+        let cleared = hw_edited(&[(" Serial=\"B03B368A\"", "")]);
+        let v = build(&doc(&cleared), Some(&doc(HW)), "t");
+        let d = &v.hardware[0];
+        assert_eq!((d.uuid.as_str(), d.how), (TOUCH, "unpaired"));
+        assert_eq!(
+            (d.serial.as_deref(), d.old_serial.as_deref()),
+            (None, Some("B03B368A"))
+        );
+        assert!(!d.check);
+        assert!(
+            v.changes
+                .iter()
+                .any(|c| c.hw.is_some() && c.text.contains("device unpaired"))
+        );
+        assert!(v.objects[TOUCH].device.is_some());
+        // Added offline (00000000), then found: paired, not replaced.
+        let offline = hw_edited(&[("Serial=\"B03B368A\"", "Serial=\"00000000\"")]);
+        let v = build(&doc(HW), Some(&doc(&offline)), "t");
+        let d = &v.hardware[0];
+        assert_eq!((d.how, d.serial.as_deref()), ("paired", Some("B03B368A")));
+        assert!(d.check && d.old_serial.is_none());
+        let c = v.changes.iter().find(|c| c.hw.is_some()).unwrap();
+        assert_eq!(
+            c.text,
+            "Touch Küche · device paired: 0x8003 Touch Tree, serial 00000000 → B03B368A"
+        );
+    }
+
+    #[test]
+    fn a_serial_outside_the_buses_is_no_device() {
+        // An Intercom (its Serial= is a MAC) added under the Miniserver.
+        let intercom = "20000008-0000-0080-ffff504f94000002";
+        let new = hw_edited(&[(
+            "\t\t\t<C Type=\"LoxTree\"",
+            &format!(
+                "\t\t\t<C Type=\"IntercomDevice\" V=\"178\" U=\"{intercom}\" Title=\"Haustür\" Serial=\"504F94D00001\"/>\n\t\t\t<C Type=\"LoxTree\""
+            ),
+        )]);
+        let v = build(&doc(&new), Some(&doc(HW)), "t");
+        assert!(v.objects[intercom].device.is_none());
+        assert!(v.hardware.is_empty(), "{:?}", v.hardware);
+        assert!(
+            v.changes
+                .iter()
+                .find(|c| c.kind == "added")
+                .unwrap()
+                .hw
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn adding_or_removing_a_device_is_hardware() {
+        // The Room Comfort Sensor removed, a second DI Extension added.
+        let new = hw_edited(&[
+            (
+                "\t\t\t\t\t<C Type=\"TreeDevice\" TId=\"RoomsensorTree\" V=\"178\" U=\"20000004-0000-0040-ffff504f94000002\" Title=\"Raumklima Bad\" WF=\"16384\" Serial=\"B0100001\" Installation=\"\" SubType=\"32784\" TreeType=\"32784\" PG=\"\" SSC=\"900\"/>\n",
+                "",
+            ),
+            (
+                "\t\t</C>\n\t\t<C Type=\"Page\"",
+                "\t\t\t<C Type=\"LoxDigin\" V=\"178\" U=\"20000007-0000-0070-ffff504f94000002\" Title=\"DI Extension 2\" WF=\"16384\" Serial=\"14000002\" Installation=\"\" SwitchBoard=\"Verteiler\">\n\t\t\t\t<C Type=\"DigitalIn\" IName=\"I1\" V=\"178\" U=\"20000007-0000-0071-ffff504f94000002\" Title=\"Tür\" Nio=\"2\" WF=\"16400\" MinTime=\"10\" Idx=\"-1\"/>\n\t\t\t</C>\n\t\t</C>\n\t\t<C Type=\"Page\"",
+            ),
+        ]);
+        let v = build(&doc(&new), Some(&doc(HW)), "t");
+        let hw: Vec<_> = v
+            .hardware
+            .iter()
+            .map(|d| (d.title.as_str(), d.how))
+            .collect();
+        assert_eq!(
+            hw,
+            [("DI Extension 2", "added"), ("Raumklima Bad", "removed")]
+        );
+        let added = v.changes.iter().find(|c| c.kind == "added").unwrap();
+        assert_eq!(
+            added.hw.as_deref(),
+            Some("20000007-0000-0070-ffff504f94000002")
+        );
+        let removed = v.changes.iter().find(|c| c.kind == "removed").unwrap();
+        assert_eq!(removed.hw.as_deref(), Some(COMFORT));
+        assert_eq!(
+            v.objects[COMFORT].device.as_ref().unwrap().kind,
+            "Room Comfort Sensor Tree"
         );
     }
 

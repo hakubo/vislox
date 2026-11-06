@@ -14,6 +14,19 @@ published under the same version (see [docker/README.md](docker/README.md)).
   loaded. Otherwise Apply says "Applied, but not verified" and why (#28).
 - vislox has a version: `vislox --version` and the UI show it with the commit it was built from. A release tag
   must match `Cargo.toml`.
+- Apply follows the program restart step by step, then shows the change running (#35).
+- Miniserver status chip, and a preflight before Pull, Apply and Sync that checks the serial (#36, #37), and a
+  notice when the config changed after the base (#39).
+- Verified TLS under the CloudDNS name, and Remote Connect (#52).
+- History: the Miniserver's own backups between Pulls (#53).
+- Changes that reconfigure hardware, with the device settings explained (#54).
+- Miniserver log panel (#40) and, opt-in, its Debug-Monitor (#46).
+- Live values: opt-in queries for the blocks behind a page's wires (#45), clearer close codes and back-off (#34).
+- What the Loxone app shows (#43), calendar entries and operating modes as a year calendar (#41, #47, #48),
+  Daytimer schedules and weather (#50), heating and cooling periods (#51).
+- Operate virtual inputs from the canvas (opt-in: `--operate`) (#42).
+- Softer wires and clearer history clicks (#56); a shorter README with details in `docs/` (#57).
+- Removed: the experimental Change with AI section (#33).
 
 ## 0.1.0
 

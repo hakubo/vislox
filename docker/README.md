@@ -38,11 +38,24 @@ With Docker Compose or a Portainer stack, use [`compose.yml`](compose.yml) and s
 | `VISLOX_GIT_PULL_SECONDS` | Fast-forward `/data/repo` from its remote this often, so commits pushed elsewhere show up in History. Skipped while there are uncommitted changes. `0` turns it off. Compose default: `60`. |
 | `VISLOX_PATH` | What to view: a `lox.toml` project, a `lox config init` repository, a `.Loxone` file or a backup `.zip`. Default: `/data/repo` if it exists, else `/data`. |
 | `LOX_HOST`, `LOX_USER`, `LOX_PASS`, `LOX_SERIAL`, `LOX_VERIFY_SSL` | The Miniserver, written to lox's `~/.lox/config.yaml`. Needed for live values, Pull, Sync and Apply. |
-| `VISLOX_ADMIN_TOKEN` | Turns on Apply, Discard, Sync and the AI box, which ask for this token. |
-| `VISLOX_AI_WEBHOOK` | URL that AI requests are posted to. |
+| `LOX_CONFIG_REPO` | lox's `config_repo`: the repository `lox config pull` commits to. Pull is offered only when it is the one vislox shows. |
+| `VISLOX_ADMIN_TOKEN` | Turns on Apply, Discard and Sync, which ask for this token. |
 | `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL` | Who commits for Apply and Sync. |
 | `VISLOX_ARGS` | More `vislox` arguments, e.g. `--no-pull` or `--serial 504F94AABBCC`. |
+| `VISLOX_LISTEN` | The address vislox listens on inside the container (default `0.0.0.0:7878`). |
+| `VISLOX_ROUTE` | How vislox reaches the Miniserver: `auto` (default), `local` or `remote` (see [Route, TLS and Remote Connect](../docs/miniserver.md#route-tls-and-remote-connect)). Not in `compose.yml`: add it under `environment`. |
 | `VISLOX_PORT` | Host port (compose only, default `7878`). |
+| `VISLOX_MONITOR` | `1` turns on the Debug-Monitor (default off): vislox listens for the Miniserver's debug output on UDP, and the Log panel can start and stop it. |
+| `VISLOX_MONITOR_IP` | The Docker host's LAN address (e.g. `192.168.1.82`): where the Miniserver sends the Debug-Monitor. Needed in Docker, since vislox would otherwise name the container's own address. |
+| `VISLOX_MONITOR_PORT` | The UDP port, published by compose as `<port>/udp` (default `7777`, the Miniserver's Debug-Monitor port). |
+| `VISLOX_MONITOR_MINUTES` | How long a Start lasts before vislox stops it (default `60`). |
+| `VISLOX_MONITOR_STRINGS` | A copy of the Miniserver's string table (`ENG.xml`) inside the container, for Debug-Monitor lines sent as a string ID. Not in `compose.yml`: add it under `environment`. |
+
+The Debug-Monitor needs the UDP port published (compose does it: `7777:7777/udp`); Docker's default bridge network
+gets no UDP in otherwise. vislox keeps only packets from the Miniserver's address. If the Log panel says packets from
+another address (like `172.17.0.1`) were dropped, Docker rewrote the sender: run the container with
+`network_mode: host` instead. To turn the Debug-Monitor off again, click **Stop** (or let the time limit end it), then
+set `VISLOX_MONITOR` back to `0`.
 
 ## Portainer, kept up to date
 

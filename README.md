@@ -2,196 +2,145 @@
 
 # vislox
 
-A read-only, Loxone Config-style view of the Miniserver configs that
-[lox](https://github.com/discostu105/lox) and its `loxone-config` crate manage. You see the logic pages
-the way Loxone Config draws them. The view reloads when the config file changes, and every change is
-marked so you can review it before you deploy.
+vislox shows a Loxone Miniserver config in the browser the way Loxone Config draws it, and marks every change
+so you can review it before you deploy. It works with the configs that [lox](https://github.com/discostu105/lox)
+manages, reloads when the file changes, and is read-only unless you turn on Apply or `--operate`.
 
-- **Pages as tabs**: one sheet tab per logic page along the bottom, as in Loxone Config. Each tab shows how
-  many changes it holds.
-- **Blocks, refs and wires** in the Loxone Config 16 look: rounded blocks with a coloured header, grey port
-  stubs, constants beside unwired inputs, and pill-shaped references with their address and an analog (`#`) or
-  digital (◉) mark. Block footprints, port rows and wire routing come from
-  `loxone_config::layout`, the same geometry `lox` uses to place blocks. Input and output refs show as
-  reference bars with their short address (`VI1`, `AQ1`, …).
-- **Links between pages**: when a wire's far end is on another page, the port gets a reference bar with
-  the far block, its port and its page. Click it to go to that page. Double-click a ref tag to go to the
-  block it mirrors.
-- **Sidebar with the block's configuration**: the periphery and page tree (filter with Ctrl+F), and the
-  selected block's properties: name, type, page, room, category, connections (each one a link),
-  parameters and raw attributes.
-- **History** (right): every revision, newest first:
-  - *Pending*: the compiled `out.Loxone` of a `lox.toml` project, compared with the deployed `base`.
-    This is what `lox config push` would apply.
-  - *Changed on disk*: snapshots taken while vislox runs, whenever the file changes.
-  - *Git commits*: the file's history, e.g. from `lox config pull`.
-  - **Pull from Miniserver** (in a `lox config init` repository): runs `lox config pull`, which downloads the
-    Miniserver's current config and commits it when it changed. The new backup appears at once.
-- **Change review**: added (green), changed (amber), removed (red, dashed ghost) and moved (blue, ghost at
-  the old place) blocks. Wires and parameters are marked too: changed values show old → new in the
-  properties. The Changes list can be filtered by kind, and clicking an entry jumps to it.
-- **Readable at every zoom**: zoomed out, each block shows only its name, at a readable size. From about 80 %
-  the full detail appears. Gates show their operation (`AND`, `Less`, `Divide`) instead of Loxone's automatic names
-  (`O208698`); a named gate keeps its operation in grey, as Loxone Config 16 shows it. Selecting a block highlights its wires and neighbours and dims the rest.
-- **Navigation**: Ctrl+K finds any page or block. There is a minimap, a "Changed pages only" filter, and links
-  (`#page=…&sel=…&rev=…`) that reopen the same page, block and revision. The browser's Back button works.
-- **Keyboard**: the tree, tabs and canvas all work from the keyboard; press `?` for the shortcuts.
+## Quick start
 
-- **Live values** (toggle in the toolbar, or `L`): the Miniserver's current values on the wires, as in
-  Loxone Config's Liveview. Digital wires that are on turn green, and analog and text values are written at
-  the wire's source and flash when they change. The selected block's states and port values are listed in
-  the sidebar. The Miniserver only streams what the app sees (visualized blocks and the periphery). vislox
-  fills in more:
-  - input and output references and memory flags carry the value of what feeds them, as do modes and
-    unscaled system variables set through an output reference, and constants show their value from the
-    config;
-  - simple stateless gates (AND, OR, XOR, NOT, comparisons, Add, Subtract, Multiply, Divide) are computed
-    from their inputs, and a lighting controller's Mood output from its active mood. Computed values have a
-    dashed outline and say so in the tooltip.
-
-  Blocks with timing or memory (delays, edge detection, Formula, …) and inputs the app does not show stay
-  without a value. Those wires are faded ("Dim wires without a value" in the legend turns this off). Values
-  show on the current, deployed revision only.
-
-- **Change with AI, then Apply** (for a `lox.toml` project, when started with an admin token): describe a change
-  in words. vislox sends it to a webhook, where an AI agent edits the project's Lox Logic module with `lox logic`
-  and compiles it. The result shows as the pending revision, so you review it like any compile. **Apply** deploys
-  it with `lox config push --force` (download, drift check, upload, program restart, verify), then commits the
-  project and pushes it to its git remote. The page you are on goes with the request, and so do blocks you pick
-  (Alt+click on the canvas, or **＋ AI context** in Properties), so the agent knows where to look. **Discard** puts the module back to the last commit. **Sync from
-  Miniserver** makes what the Miniserver runs now the project's base (`lox config merge`: changes saved from
-  Loxone Config, rules edited in the app), then commits and pushes; it waits until nothing is pending. When
-  merge refuses because the Miniserver holds custom changes no download carries, Sync makes a plain download the
-  base instead (rules edited in the app are then not taken over).
-
-- **Which config the Miniserver runs**: under the History title, the program file the Miniserver loaded
-  (e.g. `Runs sps_0274_20261106003351.zip · fw 17.2.10.21`), read from its system log (`def.log`) and the
-  files in `/prog`. `lox config pull` and the verify of `lox config push` take the newest
-  `sps_<ver>_<timestamp>.zip`, but the Miniserver loads by a longer order, so a warning shows when:
-  - `sps_new.zip` is still waiting in `/prog` (an upload that was never loaded);
-  - it runs its emergency config (`Emergency.LoxCC`, after several reboots in a row);
-  - the newest file was skipped because it needs a newer firmware, or it runs another file than the newest.
-
-  Without access to `def.log` (it needs an administrator), the running file is guessed from `/prog`. Click ↻
-  to check again; a check is reused for a minute. Apply also checks **by load**: after the program restart,
-  `sps_new.zip` must be gone and `def.log` must show a start that loaded it and runs the newest backup.
-  Otherwise Apply reports "Applied, but not verified" and why.
-
-vislox itself never writes to the config: lox and git do, and only on Pull, Apply and Discard. Live values only
-listen. A pull reads from the Miniserver; only Apply writes to it.
-
-## Run
-
-```bash
-cargo install --path .          # or: cargo run --release -- <path>
-
-vislox ~/loxone-config          # a `lox config init` repository (<serial>/config.Loxone)
-vislox ./my-project             # a lox.toml project: base vs compiled out.Loxone
-vislox config.Loxone            # one .Loxone file, or a backup .zip
-vislox ~/loxone-config --serial 504F94AABBCC   # several Miniservers in one repository
-```
-
-Or with Docker, which bundles git and lox (see [docker/README.md](docker/README.md)):
+With Docker (the image bundles git and lox; see [docker/README.md](docker/README.md) for all settings):
 
 ```bash
 docker run -d -p 7878:7878 -v ~/loxone-config:/data/repo ghcr.io/hakubo/vislox:main
 ```
 
-Then open <http://127.0.0.1:7878> (`--listen` changes the address, and `--open` launches the browser).
-
-Live values use the Miniserver connection of `lox` (`lox setup set …`), found the way lox finds it:
-`LOX_CONFIG`, a project's `.lox/config.yaml`, then `~/.lox/config.yaml`. With several contexts, vislox picks
-the one for the Miniserver it shows (a repository's `<serial>` or `192_168_1_77` folder), else the active one.
+From source (Rust 1.91 or later; `lox` on `PATH` for live values, Pull, Apply and Sync):
 
 ```bash
-vislox ~/loxone-config --ctx home      # pick a lox context
-vislox ~/loxone-config --no-live       # never connect to the Miniserver
-lox stream -o json --initial --reconnect | vislox ~/loxone-config --live-from -   # values from lox
-vislox config.Loxone --live-from recorded.ndjson   # replay a recording (followed as it grows)
+cargo install --path .
+vislox ~/loxone-config          # a `lox config init` repository (<serial>/config.Loxone)
+vislox ./my-project             # a lox.toml project: deployed base vs compiled out.Loxone
+vislox config.Loxone            # one .Loxone file, or a backup .zip
+vislox --discover               # list the Miniservers on the local network
 ```
 
-### Change with AI and Apply
+Then open <http://127.0.0.1:7878>. Started without a path or `--ctx` in a directory with no config (and without
+`--no-live`), vislox lists the Miniservers on the network and how to set one up with lox.
 
-For a `lox.toml` project:
+## Features
 
-```bash
-vislox ~/loxone-config/project --admin-token-file ~/.config/vislox/admin-token \
-       --ai-webhook-file ~/.config/vislox/ai-webhook
-```
+- Logic pages as tabs, with blocks, references and wires in the Loxone Config 16 look, using lox's own layout.
+- Change review: added, changed, removed and moved blocks, wires and parameters, against any earlier revision.
+- History: the pending compile, snapshots taken while vislox runs, git commits, Pull from Miniserver, and the
+  Miniserver's own backups of each save from Loxone Config.
+- Which config the Miniserver runs (from `def.log` and `/prog`), with a warning when an upload is still waiting,
+  it runs its emergency config, or the newest file was skipped; Apply checks that its upload loaded.
+- Live values on the wires, as in Loxone Config's Liveview, with opt-in queries for blocks the app does not see.
+- Properties for the selected block: connections, parameters, Daytimer schedules, calendar entries, what the
+  Loxone app shows, and the hardware a change reconfigures.
+- Operating modes as a year calendar, with the heating and cooling periods.
+- A Miniserver status chip and a preflight before Pull, Apply and Sync (right serial, FTP and web port reachable,
+  config changed since the base, calendar entries changed in the app).
+- The Miniserver log and, opt-in, its Debug-Monitor.
+- For a `lox.toml` project: Apply, Sync and Discard from the browser.
+- Ctrl+K to find any page or block, links that reopen a page, block and revision, and full keyboard use (`?`).
 
-- `--admin-token-file`: a file holding a passphrase. The AI box, Apply and Discard ask for it once per browser
-  (`X-Vislox-Token`). Without it they are off; viewing needs no token.
-- `--ai-webhook-file`: a file holding the URL that requests are POSTed to, as JSON: `id`, `key`, `prompt`,
-  `context` (plain lines naming the page on screen and the picked blocks, with their UUIDs), `project` and
-  `status_url`. The agent behind it reports back by POSTing `{"id", "key", "state": "working" |
-  "done" | "failed", "summary"}` to `status_url`; the key authorizes only that request. A request that never
-  reports back is given up after 30 minutes.
-- The agent should only edit and compile (`lox logic …`). Deploying is Apply's job, and Apply needs the token.
-- Apply commits with the change summary as the subject (`lox logic diff --summary`) and the AI requests in the
-  body, then runs `git push`, which needs credentials for the project's remote. A verified push makes lox point
-  `base` at its download in `backups/` (git-ignored); Apply copies that download over the project's base file and
-  points lox.toml back at it, so the deployed config stays in git.
+Details: [docs/features.md](docs/features.md).
 
-The Miniserver connection is opened when a browser turns live values on, and closed shortly after the last
-one turns them off.
+## Configuration
 
-**Pull from Miniserver** runs `lox config pull` (the `lox` on `PATH`, or `--lox <path>`), with the same lox
-configuration and context as live values. It is offered only when lox would commit to the repository vislox
-shows, into the folder of the Miniserver vislox shows (`config_repo` and the serial or address in lox's
-configuration). Otherwise the button is greyed out and its tooltip says why. `--no-pull` hides it.
+vislox uses lox's Miniserver connection (`lox setup set …`), found the way lox finds it: `LOX_CONFIG`, a
+project's `.lox/config.yaml`, then `~/.lox/config.yaml`. With several contexts it picks the one for the
+Miniserver it shows (the repository's `<serial>` or `192_168_1_77` folder), else the active one.
 
-| Input | Click | Shift+click |
+| Flag | Environment | |
 |---|---|---|
-| History entry | view it, compared with the entry before it | compare the viewed revision with this one |
+| `[PATH]` | | A lox.toml project (or its directory), a `.Loxone` file, a backup `.zip`, or a `lox config init` repository. Default: the current directory. |
+| `--serial <SERIAL>` | | In a repository with several Miniservers: which one. |
+| `--listen <ADDR>` | | Address to serve the UI on. Default `127.0.0.1:7878`. |
+| `--open` | | Open the UI in the default browser. |
+| `--discover` | | List the Miniservers on the local network (UDP discovery), then exit. |
+| `--ctx <NAME>` | | The lox context for live values. |
+| `--route <auto\|local\|remote>` | `VISLOX_ROUTE` | How vislox reaches the Miniserver. `auto` (default): its CloudDNS name with the certificate checked, else lox's host, else Remote Connect. `local` never uses Remote Connect; `remote` always does. |
+| `--no-live` | | Never connect to the Miniserver: no live values, status checks, log, structure file or backups reads. |
+| `--live-from <FILE>` | | Live values from a file (or `-` for stdin) of `lox stream -o json --initial` lines, e.g. a recording. |
+| `--no-pull` | | Hide *Pull from Miniserver*. |
+| `--lox <PATH>` | | The lox binary. Default `lox`. |
+| `--admin-token-file <FILE>` | | A file holding the passphrase that Apply, Sync and Discard ask for. Without it they are off. |
+| `--operate` | | Let the browser send commands to virtual inputs. Needs `--admin-token-file` and live values from the Miniserver. |
+| `--monitor` | `VISLOX_MONITOR=1` | Receive the Miniserver's Debug-Monitor (UDP). |
+| `--monitor-port <PORT>` | `VISLOX_MONITOR_PORT` | Its UDP port. Default `7777`. |
+| `--monitor-ip <IPV4>` | `VISLOX_MONITOR_IP` | The address the Miniserver sends it to. Default: this host's address on the route to the Miniserver. |
+| `--monitor-minutes <N>` | `VISLOX_MONITOR_MINUTES` | How long a Start lasts. Default `60`. |
+| `--monitor-strings <FILE>` | `VISLOX_MONITOR_STRINGS` | The Miniserver's string table (`ENG.xml`), for lines sent as a string ID. |
+| | `LOX_CONFIG` | lox's config file, as lox reads it. |
+| | `VISLOX_CACHE` | Cache for the structure file, icons and backups. Default `$XDG_CACHE_HOME/vislox`, else `~/.cache/vislox`. |
 
-The *Viewing* and *compared with* menus in the toolbar pick any pair of revisions. Pick *nothing* to see
-a revision without change marks. *Follow latest* jumps to each new revision as it appears.
+```bash
+vislox ~/loxone-config --serial 504F94AABBCC --ctx home    # one Miniserver of several, with a named lox context
+lox stream -o json --initial --reconnect | vislox ~/loxone-config --live-from -   # live values from lox
+vislox config.Loxone --live-from recorded.ndjson           # replay a recording (followed as it grows)
+```
 
-Keys:
-- `Ctrl+K`: go to a page or block. `Ctrl+F`: filter the tree. `?`: list all shortcuts.
-- `[` / `]`: previous / next change. PageUp / PageDown: switch pages.
-- Arrow keys: pan. `+` / `-` / `0` / `1`: zoom in, zoom out, fit, 100 %.
-- Esc: clear the selection.
+The Docker image takes its own variables (git URL, lox credentials, admin token, …): see
+[docker/README.md](docker/README.md).
 
-With the mouse, drag to pan and scroll to zoom.
+### TLS and Remote Connect
 
-## How it works
+With the Miniserver's serial known, vislox connects to a local Gen 2 Miniserver under its CloudDNS name and checks
+its certificate. Away from home it goes through Loxone's Remote Connect (firmware 17.0 and later), where live
+values and the status chip work but Pull, Apply and Sync are refused (FTP does not pass the relay). lox's own
+commands always use lox's host. Details: [docs/miniserver.md](docs/miniserver.md#route-tls-and-remote-connect).
 
-The binary is an `axum` server with the UI embedded (plain JS and SVG, no build step).
+## Safety
 
-- `src/source.rs` resolves the path into the watched files.
-- `src/history.rs` keeps revisions keyed by git blob id. A live snapshot and the commit with the same
-  bytes therefore match, and git content is read with `git cat-file` only when needed.
-- `src/model.rs` turns a revision, plus an optional base, into pages, objects, wires, cross-page links,
-  properties and a change list. It uses `loxone_config::diff` and adds its own checks for attributes,
-  positions and wires.
-- `src/actions.rs` sends AI requests to the webhook, takes the agent's reports, and runs Apply (`lox config push
-  --force`, `git commit`, `git push`), Sync (`lox config merge`, `git commit`, `git push`) and Discard
-  (`git checkout` of the module, lock and out).
-- `src/running.rs` reads `/prog` and `def.log` (`/dev/fslist`, `/dev/fsget`, as `lox files` does) for the
-  config the Miniserver runs (`GET /api/running`), and checks an Apply by its load.
-- `src/pull.rs` runs `lox config pull` for the Pull button (`POST /api/pull`, which needs an `X-Vislox` header so
-  that no other web page can trigger it), then refreshes the history.
-- `src/live.rs` streams the Miniserver's states with lox's `loxone-client` crate. A wire's source
-  connector has the UUID of the state it carries, so the browser matches values to wires by UUID. Values
-  reach the browser on `/api/live` (server-sent events).
-- File changes are noticed with `notify`. Git is polled every 3 s. Browsers get a server-sent event and
-  reload.
+By default vislox only reads. It never writes to the config file itself: lox and git do, on Pull, Apply, Sync and
+Discard.
 
-`docs/reference/` holds the Loxone Config screenshots the look is based on (see `SOURCES.md`). They are
-copyright Loxone and are for internal reference only.
+Without any opt-in, vislox sends the Miniserver read-only requests: the live value stream, the structure file and
+its icons, the status check, the heating and cooling periods, the calendar entries, the system log (`lox log`),
+the devices on the bus (`lox extensions`), which program file it runs (the `/prog` listing and `def.log`), and
+the backup list and downloads (FTP) when you click *Read*. Pull
+runs `lox config pull`, which downloads the config. When lox's address does not answer (or with
+`--route remote`), vislox asks Loxone's `connect.loxonecloud.com` for the Miniserver's Remote Connect relay. `--no-live` stops all of these except Pull.
+
+Opt-ins:
+
+| What | Turned on by | Sends to the Miniserver |
+|---|---|---|
+| Apply | `--admin-token-file`, then the token in the browser | `lox config push --force`: upload and program restart |
+| Sync, Discard | `--admin-token-file`, then the token | nothing; they change the project and its git repository |
+| Operate virtual inputs | `--operate` with `--admin-token-file` | `jdev/sps/io/<uuid>/<cmd>`, only to `VirtualIn` objects, each confirmed |
+| Query blocks on this page | a toggle in the legend, off by default | read-only `jdev/sps/io/<uuid>/all`, at most 20 a second |
+| Debug-Monitor | `--monitor`, then Start | `dev/sps/log/<address>`: the Miniserver sends its debug output to vislox until Stop or the time limit |
+
+Only Apply and operate commands change the Miniserver's program or its state.
+
+Before Pull, Apply, Sync and each operate command, vislox checks that the Miniserver at lox's address has the
+config's serial, and refuses otherwise. Every request is described in [docs/miniserver.md](docs/miniserver.md).
+
+## Documentation
+
+- [docs/features.md](docs/features.md): every feature in detail, and the keyboard shortcuts.
+- [docs/miniserver.md](docs/miniserver.md): every request to the Miniserver, caching, error codes and retries.
+- [docs/architecture.md](docs/architecture.md): how the code is organised.
+- [docs/debug-monitor.md](docs/debug-monitor.md): the Debug-Monitor, and what was found out about its protocol.
+- [docs/agent-workflow.md](docs/agent-workflow.md): changing the config with your own agent (proposal).
+- [docs/program-memory.md](docs/program-memory.md): why vislox does not estimate program memory.
+- [docker/README.md](docker/README.md): the Docker image, Compose and Portainer.
 
 ## Development
 
 ```bash
 cargo fmt --check && cargo clippy --all-targets -- -D warnings
-cargo test                                   # model, history, source; fixture: tests/fixtures/house.Loxone
+cargo test
 cargo build --release
 cd tests/ui && npm ci && npx playwright install chromium && cd ../..
 VISLOX_BIN=target/release/vislox node tests/ui/smoke.mjs   # drives the UI in headless Chromium
+VISLOX_BIN=target/release/vislox node tests/ui/apply.mjs   # Apply's steps, with a stand-in lox
 ```
 
-CI (`.github/workflows/ci.yml`) runs all of these on every push to `main` and on every pull request.
+CI (`.github/workflows/ci.yml`) runs all of these on every push to `main` and every pull request.
 
 ## Versions
 
@@ -200,3 +149,7 @@ UI (next to the logo) show it with the commit it was built from. To release, bum
 `Cargo.toml`, move the changelog's *Unreleased* entries under it, merge, then tag the merge commit `vX.Y.Z`
 and push the tag. The Docker workflow publishes the image as `X.Y.Z`, `X.Y` and `latest`, and refuses a tag
 that does not match `Cargo.toml`.
+
+## Licence
+
+[MIT](LICENSE)
