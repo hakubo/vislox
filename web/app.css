@@ -542,3 +542,15 @@ button.chip { cursor: pointer; } button.chip:hover { border-color: var(--brand);
 .op-ent { display: flex; flex-direction: column; padding: 4px 12px; border-bottom: 1px solid var(--line-2); font-size: 12px; }
 .op-ent .dt { color: var(--muted); font-size: 11px; }
 .op-ent.err .l1 { color: var(--removed); }
+
+/* In the app (LoxAPP3.json) */
+.abadge circle { fill: #2f6fb3; stroke: #fff; stroke-width: 1.5px; vector-effect: non-scaling-stroke; }
+.abadge rect, .abadge line { fill: none; stroke: #fff; stroke-width: 16px; }
+.lg.in-app::before { border-color: #2f6fb3; background: #2f6fb3; border-radius: 50%; }
+.app-ic { width: 16px; height: 16px; vertical-align: -3px; margin-right: 4px; }
+.tn-ic.app { background: transparent; }
+.tn-ic.app .app-ic { margin: 0; }
+.app-note { padding: 3px 12px; color: var(--muted); font-size: 12px; }
+.app-note.warn, .app-warn .k { color: #a15c00; }
+.app-warn .why { grid-column: 2; color: var(--muted); font-size: 12px; }
+.app-load { margin-left: 2px; }

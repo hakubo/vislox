@@ -14,6 +14,7 @@ const S = {
   follow: true, marks: true, vp: {}, open: new Set(["__pages"]), chgOff: new Set(),
   objPage: new Map(), pageOf: new Map(), loadSeq: 0, onlyChanged: false, chgIdx: -1,
   closed: new Set(["Advanced"]), dim: true, treeFocus: null, hash: null, applyingHash: false,
+  app: null, appBusy: false, appErr: "", applyAt: 0,
   live: { on: pref("live", false), dim: pref("liveDim", true), es: null, status: null, values: new Map(), controls: {}, globals: {} },
 };
 function pref(k, d) { try { const v = localStorage.getItem("vislox." + k); return v === null ? d : v === "1"; } catch { return d; } }
@@ -658,6 +659,15 @@ function drawBlock(parent, o) {
     }
     drawPins(g, o, 7);
   }
+  if (S.view.objects[o.uuid]?.app?.shown) drawAppBadge(g, x, y + h);
+}
+/** A small phone at the block's lower left: the block is shown in the app. */
+function drawAppBadge(g, x, y) {
+  const b = el("g", { class: "abadge" }, g);
+  el("title", {}, b, "Shown in the app: the Miniserver sends its live values");
+  el("circle", { cx: x, cy: y, r: 100 }, b);
+  el("rect", { x: x - 38, y: y - 62, width: 76, height: 124, rx: 14 }, b);
+  el("line", { x1: x - 14, y1: y + 40, x2: x + 14, y2: y + 40 }, b);
 }
 
 /** Analog references get a black "#" chip, digital ones a ring, as in Loxone Config 16. */
@@ -894,6 +904,8 @@ function renderProps() {
       row("Switches on", marks && cal.old_mode ? `<span class="old">${esc(cal.old_mode.title)}</span><span class="new">${modeV(cal.mode)}</span>` : modeV(cal.mode), marks && cal.old_mode ? "pr-chg" : ""),
     ]);
   }
+  const inApp = appRows(o, row, chg, marks);
+  if (inApp) section("In the app", inApp.rows, inApp.count);
   const note = o.ty === "Text" ? o.attrs.find((a) => a.name === "Text") : null;
   if (note) section("Note", [`<div class="note-p${marks && note.changed ? " pr-chg" : ""}">${marks && note.changed ? chg(note.old, note.value, true) : esc(note.value || "")}</div>`]);
   const params = o.ports.filter((q) => q.def != null || q.def_changed || q.inv)
@@ -969,6 +981,7 @@ $("props").addEventListener("click", (e) => {
     open ? S.closed.delete(h.dataset.sec) : S.closed.add(h.dataset.sec);
     return;
   }
+  if (e.target.closest(".app-load")) { loadAppFromMs(); return; }
   const c = e.target.closest(".copy");
   if (c) { copyText(c.dataset.copy).then(() => { c.textContent = "Copied"; setTimeout(() => (c.textContent = "Copy"), 1200); }); return; }
   const m = e.target.closest(".more");
@@ -983,6 +996,9 @@ $("props").addEventListener("click", (e) => {
 const ICON = { Pages: ["#4f7fc4", "▦"], Page: ["#4f7fc4", "P"], Refs: ["#8a908a", "⇄"], Place: ["#8b6cc4", "R"], Category: ["#b5891f", "C"],
   VirtualIn: ["#0f8fb0", "V"], VirtualOut: ["#0f8fb0", "V"], InputRef: ["#8a908a", "→"], OutputRef: ["#8a908a", "←"], Memory: ["#6b726b", "M"], User: ["#6b726b", "U"] };
 function icon(n) {
+  // Rooms and categories get the app's icon, once the structure file is read.
+  const place = (n.ty === "Place" || n.ty === "Category") && (n.ty === "Place" ? S.app?.rooms : S.app?.cats)?.[n.uuid];
+  if (place?.image) return `<span class="tn-ic app" aria-hidden="true">${appIcon(place.image)}</span>`;
   const [c, t] = ICON[n.ty] || (n.children.length ? ["#a7ada7", "▤"] : ["#4ea432", "•"]);
   return `<span class="tn-ic" style="background:${c}" aria-hidden="true">${t}</span>`;
 }
@@ -1631,10 +1647,117 @@ function renderDeployed() {
   }).join("");
   box.innerHTML = `<div class="h">Changed by this Apply<button type="button" class="x" aria-label="Close">×</button></div>${shown}` +
     (rows.length > 12 ? `<div class="note">and ${rows.length - 12} more in Changes</div>` : "") +
-    '<div class="note">Values fill in as the Miniserver sends them; the canvas marks every change.</div>';
+    '<div class="note">Values fill in as the Miniserver sends them; the canvas marks every change.</div>' + deployedAppCheck(rows);
+}
+/** After Apply: blocks the new config shows in the app that the Miniserver's new structure file lacks, or has elsewhere. */
+function deployedAppCheck(rows) {
+  const a = S.app;
+  const objs = rows.map((c) => S.view.objects[c.obj]).filter((o) => o.app && (o.app.shown || a?.controls?.[o.uuid]));
+  if (!objs.length) return "";
+  if (!a?.loaded || !a.fetched || a.fetched < S.applyAt) {
+    // A live session with the Miniserver reads the new structure file itself.
+    const viaLive = S.live.on && /^https?:/.test(S.hist?.live?.source || "");
+    const why = a?.available && viaLive ? "Waiting for the Miniserver's new structure file…" : "";
+    const btn = a?.available && !viaLive ? `<button type="button" class="app-load lnk">Read what the app shows now</button>` : "";
+    return why || btn ? `<div class="note">${esc(why)}${btn}</div>` : "";
+  }
+  const bad = objs.map((o) => [o, appIssues(o)]).filter(([, i]) => i.length);
+  if (!bad.length) return `<div class="note">The app shows these blocks as the config says.</div>`;
+  return `<div class="h warn-h">In the app</div>` + bad.map(([o, issues]) =>
+    `<div class="pr app-warn"><span class="k">⚠</span><button type="button" class="go" data-go="${esc(o.uuid)}">${esc(autoTitle(o.title) ? prettyType(o.ty) : o.title)}</button><span class="why">${esc(issues.join("; "))}</span></div>`).join("");
+}
+
+// ── in the app ─────────────────────────────────────────────────────────
+// The Miniserver's structure file (LoxAPP3.json) lists what the app shows:
+// controls (by block UUID) with their type, room, category and icon.
+// vislox reads it with live values, or when asked; never on its own.
+
+async function loadApp() {
+  try { S.app = await api("/api/app"); } catch { return; }
+  renderTree();
+  if (S.view) { renderProps(); renderPage(); if (S.sel) applyFocus(); }
+  if (!$("deploy-new").classList.contains("hidden")) renderDeployed();
+}
+async function loadAppFromMs() {
+  if (S.appBusy) return;
+  S.appBusy = true; S.appErr = ""; renderProps();
+  try {
+    const r = await fetch("/api/app/load", { method: "POST", headers: { "X-Vislox": "app" } });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) S.appErr = j.error || r.statusText;
+  } catch (e) { S.appErr = e.message; }
+  S.appBusy = false;
+  await loadApp();
+}
+function appIcon(name) {
+  return name ? `<img class="app-ic" src="/api/app/icon?name=${encodeURIComponent(name)}" alt="" loading="lazy" onerror="this.remove()">` : "";
+}
+/** The viewed revision is what the Miniserver runs (its config can be compared with the app). */
+function viewingDeployed() {
+  const r = revById(S.rev);
+  return !!r && !!r.current && r.kind !== "pending";
+}
+/** Where the config and the app disagree about block `o`, in words. */
+function appIssues(o) {
+  const a = S.app, ctl = a?.controls?.[o.uuid], cfg = o.app;
+  if (!a?.loaded || !cfg) return [];
+  const out = [];
+  const name = (m, id) => m?.[id]?.name || id;
+  if (cfg.shown && !ctl) out.push("not in the app");
+  if (!cfg.shown && ctl && !ctl.parent) out.push("still in the app");
+  if (cfg.shown && ctl && !ctl.parent) {
+    if (cfg.room_id && ctl.room && cfg.room_id !== ctl.room) out.push(`in room ${name(a.rooms, ctl.room)} in the app, ${cfg.room || cfg.room_id} in the config`);
+    if (cfg.category_id && ctl.cat && cfg.category_id !== ctl.cat) out.push(`in category ${name(a.cats, ctl.cat)} in the app, ${cfg.category || cfg.category_id} in the config`);
+  }
+  return out;
+}
+/** Rows of the In the app section: the config's visualization settings, then what the Miniserver's app shows. */
+function appRows(o, row, chg, marks) {
+  const a = S.app, ctl = a?.loaded ? a.controls?.[o.uuid] : null, cfg = o.app, old = o.app_old;
+  if (!cfg && !ctl) return null;
+  const rows = [];
+  const changed = marks && o.app_changed;
+  const yn = (v) => (v == null ? null : v ? "Yes" : "No");
+  const place = (m, id, title) => {
+    const p = id && a?.[m]?.[id];
+    return `${p ? appIcon(p.image) : ""}${esc(title || p?.name || id || "")}`;
+  };
+  if (cfg) {
+    const c = (k) => changed && (old?.[k] ?? null) !== (cfg[k] ?? null);
+    rows.push(row("Shown", c("shown") ? chg(yn(old?.shown ?? false), yn(cfg.shown), true) : esc(yn(cfg.shown)), c("shown") ? "pr-chg" : ""));
+    const pl = (label, m, k, idk) => {
+      if (!cfg[idk] && !(changed && old?.[idk])) return;
+      const ch = c(idk);
+      rows.push(row(label, ch ? chg(old?.[k] ?? old?.[idk], cfg[k] ?? cfg[idk], true) : place(m, cfg[idk], cfg[k]), ch ? "pr-chg" : ""));
+    };
+    pl("Room", "rooms", "room", "room_id");
+    pl("Category", "cats", "category", "category_id");
+  }
+  if (a?.loaded) {
+    if (ctl) {
+      rows.push(row("Control", `${appIcon(ctl.image)}${esc(prettyType(ctl.type) || "—")}` + (ctl.name && ctl.name !== o.title ? ` <span class="none-v">as “${esc(ctl.name)}”</span>` : "")));
+      if (ctl.parent) rows.push(row("Part of", esc(a.controls[ctl.parent]?.name || ctl.parent)));
+      if (!cfg) {
+        if (ctl.room) rows.push(row("Room", place("rooms", ctl.room)));
+        if (ctl.cat) rows.push(row("Category", place("cats", ctl.cat)));
+      }
+    }
+    const issues = viewingDeployed() ? appIssues(o) : [];
+    for (const i of issues) rows.push(`<div class="app-note warn">⚠ The Miniserver's app: ${esc(i)}.</div>`);
+    if (!ctl && !(cfg?.shown && issues.length)) rows.push('<div class="app-note">Not in the app, so the Miniserver sends no live values for it. Only blocks shown in the app, and the periphery, carry live values.</div>');
+    const when = a.fetched ? fmtWhen(a.fetched) : "";
+    rows.push(`<div class="app-note">What the app shows comes from the Miniserver's structure file (LoxAPP3.json)${a.lastModified ? `, saved ${esc(a.lastModified)}` : ""}, read ${esc(when)}${a.from === "cache" ? " by an earlier run of vislox" : ""}${viewingDeployed() ? "" : ". It belongs to the running config, not to this revision"}.` +
+      (a.available ? ` <button type="button" class="app-load lnk"${S.appBusy ? " disabled" : ""}>${S.appBusy ? "Reading…" : "Read again"}</button>` : "") + "</div>");
+  } else if (a?.available) {
+    rows.push(`<div class="app-note">The control type, icons and live values come from the Miniserver's structure file (LoxAPP3.json). It is read with live values, or now: <button type="button" class="app-load lnk"${S.appBusy ? " disabled" : ""}>${S.appBusy ? "Reading…" : "Read from the Miniserver"}</button></div>`);
+  }
+  const err = S.appErr || a?.error;
+  if (err) rows.push(`<div class="app-note warn">${esc(err)}</div>`);
+  return { rows, count: 0 };
 }
 $("deploy-new").addEventListener("click", (e) => {
   if (e.target.closest(".x")) { $("deploy-new").classList.add("hidden"); return; }
+  if (e.target.closest(".app-load")) { loadAppFromMs(); return; }
   const g = e.target.closest("[data-go]");
   if (!g) return;
   const u = g.dataset.go, pg = S.view?.objects[u]?.page;
@@ -1658,6 +1781,8 @@ async function apply() {
     "checks that it runs exactly the compiled config, then vislox commits and pushes to git.")) return;
   deployMsg("");
   $("deploy-new").classList.add("hidden");
+  // The structure file read after this is the new config's.
+  S.applyAt = Date.now();
   // lox refuses some pushes until the user allows them; ask, then retry with that allowed.
   const opts = {};
   for (let tries = 0; tries < 3; tries++) {
@@ -2307,6 +2432,7 @@ function connect() {
   // Changes while the stream was down (or before it opened) are not replayed: catch up.
   es.onopen = () => { setStatus("live", "live"); if (S.hist) loadHistory(); };
   es.addEventListener("history", () => loadHistory(true));
+  es.addEventListener("app", () => loadApp());
   es.addEventListener("actions", (e) => { if (S.hist) { S.hist.actions = JSON.parse(e.data); renderActions(); } });
   es.addEventListener("operate", (e) => { if (S.hist) { S.hist.operate = JSON.parse(e.data); renderHistory(); } });
   es.onerror = () => setStatus("disconnected — retrying", "error");
@@ -2314,6 +2440,7 @@ function connect() {
 S.hash = readHash();
 loadHistory().then(connect);
 loadMs();
+loadApp();
 // The chip stays roughly current while the page is open.
 // Every minute, to notice a config saved on the Miniserver: the server asks only for its config
 // date again (reused for half a minute, so several tabs still ask once), and the full check every

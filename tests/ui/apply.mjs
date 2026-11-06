@@ -28,8 +28,9 @@ const dir = join(root, "project");
 mkdirSync(join(dir, "pages"), { recursive: true });
 const git = (...a) => execFileSync("git", ["-C", dir, "-c", "user.name=t", "-c", "user.email=t@example.com", ...a]);
 copyFileSync(fixture, join(dir, "base.Loxone"));
-// The pending compile: a rename.
-writeFileSync(join(dir, "out.Loxone"), readFileSync(fixture, "utf8").replace('Title="Licht OG"', 'Title="Licht oben"'));
+// The pending compile: a rename, and the renamed block shown in the app.
+writeFileSync(join(dir, "out.Loxone"), readFileSync(fixture, "utf8").replace('Title="Licht OG"', 'Title="Licht oben"')
+  .replace('<Co K="I1" Nc="1" U="10000009', '<IoData Visu="true"/><Co K="I1" Nc="1" U="10000009'));
 writeFileSync(join(dir, "lox.toml"), 'base = "base.Loxone"\nmodule = "pages"\nout = "out.Loxone"\n');
 writeFileSync(join(dir, "pages", "main.lox"), "# module\n");
 execFileSync("git", ["init", "-q", "--bare", join(root, "remote.git")]);
@@ -84,7 +85,7 @@ const server = spawn(bin, [dir, "--listen", `127.0.0.1:${port}`, "--lox", fakeLo
   stdio: ["ignore", "ignore", "pipe"],
   // Apply commits: a runner without a git identity needs one.
   env: {
-    ...process.env, LOX_CONFIG: loxConfig, VISLOX_FTP_PORT: String(ftpPort),
+    ...process.env, LOX_CONFIG: loxConfig, VISLOX_FTP_PORT: String(ftpPort), VISLOX_CACHE: join(root, "cache"),
     GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@example.com", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@example.com",
   },
 });
@@ -156,6 +157,11 @@ try {
     assert.match(await page.textContent("#deploy-new"), /Licht oben/);
     await page.waitForFunction(() => document.querySelector("#canvas").classList.contains("live"));
     if (process.env.SHOT) await page.screenshot({ path: process.env.SHOT + "-done.png" });
+  });
+  await step("a block the Apply shows in the app offers to check the app", async () => {
+    // Live values come from a file here, so the new structure file is read only when asked.
+    await page.waitForSelector("#deploy-new .app-load");
+    assert.match(await page.textContent("#deploy-new"), /Read what the app shows now/);
   });
   await step("after Apply the old log marks no block, and opening the panel reads it again", async () => {
     // The warning read before the Apply is about the old program.

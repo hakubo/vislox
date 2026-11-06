@@ -519,6 +519,8 @@ pub struct Live {
     pub source: String,
     tx: broadcast::Sender<Msg>,
     st: Mutex<St>,
+    /// Told each structure file a session reads (the In the app section).
+    structure: Mutex<Option<Arc<crate::structure::Structure>>>,
 }
 
 impl Live {
@@ -543,11 +545,17 @@ impl Live {
                 generation: 0,
                 stopped: false,
             }),
+            structure: Mutex::new(None),
         });
         if let Feed::Ndjson(path) = &live.feed {
             tokio::spawn(live.clone().run_ndjson(path.clone()));
         }
         live
+    }
+
+    /// Hand each structure file a session reads to `s` as well.
+    pub fn share_structure(&self, s: Arc<crate::structure::Structure>) {
+        *self.structure.lock().unwrap() = Some(s);
     }
 
     /// For `/api/history`: whether live values can be had, and from where.
@@ -731,6 +739,9 @@ impl Live {
     }
 
     fn load_structure(&self, generation: u64, structure: &Value) {
+        if let Some(s) = self.structure.lock().unwrap().clone() {
+            s.set(structure);
+        }
         let s = read_structure(structure);
         let mut st = self.st.lock().unwrap();
         if st.generation != generation {

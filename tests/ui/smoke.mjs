@@ -26,6 +26,11 @@ git("init", "-q");
 mkdirSync(join(repo, "504F94000001"));
 const cfg = join(repo, "504F94000001", "config.Loxone");
 copyFileSync(fixture, cfg);
+// The meter is shown in the app, in the kitchen (a room of its own config).
+const METER = "10000005-0000-0050-ffff504f94000001", ROOM = "10000020-0000-00a1-ffff504f94000001", CELLAR = "10000021-0000-00a1-ffff504f94000001";
+writeFileSync(cfg, readFileSync(cfg, "utf8")
+  .replace('<C Type="Page" V="178" U="10000002', `<C Type="Place" V="178" U="${ROOM}" Title="Küche"/>\n\t\t<C Type="Page" V="178" U="10000002`)
+  .replace('<Co K="Pf" Nc="1"', `<IoData Visu="true" Pr="${ROOM}"/><Co K="Pf" Nc="1"`));
 git("add", ".");
 git("commit", "-q", "-m", "[504F94000001] Config backup 2026-11-01 10:00:00 (v1)");
 // Uncommitted edits: a rename, a parameter and a calendar entry's date.
@@ -64,7 +69,24 @@ let msConfigDate = "2026-11-01 10:00:00";
 const listen = (srv) => new Promise((ok) => srv.listen(0, "127.0.0.1", () => ok(srv.address().port)));
 // `msSerial` is what it reports; a test swaps it for another Miniserver's.
 let msSerial = "50:4F:94:00:00:01";
+// Its structure file puts the meter in the cellar, not the kitchen the config names.
+const structure = {
+  lastModified: "2026-11-01 10:00:00", msInfo: { serialNr: "504F94000001", msName: "Testhaus" },
+  rooms: { [ROOM]: { name: "Küche", image: "IconsFilled/kitchen.svg" }, [CELLAR]: { name: "Keller", image: "IconsFilled/kitchen.svg" } },
+  cats: {},
+  controls: { [METER]: { name: "Zähler", type: "Meter", room: CELLAR, defaultIcon: null, states: {} } },
+};
+const ICON = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><rect width="16" height="16" fill="#8b6cc4"/></svg>';
+let structureReads = 0;
 const msPort = await listen(createServer((req, res) => {
+  if (req.url.toLowerCase() === "/data/loxapp3.json") {
+    if (!req.headers.authorization) { res.writeHead(401); res.end(); return; }
+    structureReads++;
+    res.setHeader("Content-Type", "application/json");
+    res.end(JSON.stringify(structure));
+    return;
+  }
+  if (req.url === "/IconsFilled/kitchen.svg") { res.setHeader("Content-Type", "image/svg+xml"); res.end(ICON); return; }
   const ll = {
     "/jdev/cfg/apiKey": () => ({ control: "dev/cfg/apiKey", Code: "200",
       value: `{'snr': '${msSerial}', 'version':'17.1.7.27', 'key':'00', 'local':true, 'httpsStatus':0}` }),
@@ -96,7 +118,7 @@ chmodSync(fakeLox, 0o755);
 const port = 7900 + Math.floor(Math.random() * 90);
 const server = spawn(bin, [repo, "--listen", `127.0.0.1:${port}`, "--live-from", liveFile, "--lox", fakeLox], {
   stdio: ["ignore", "ignore", "pipe"],
-  env: { ...process.env, LOX_CONFIG: loxConfig, VISLOX_FTP_PORT: String(ftpPort) },
+  env: { ...process.env, LOX_CONFIG: loxConfig, VISLOX_FTP_PORT: String(ftpPort), VISLOX_CACHE: mkdtempSync(join(tmpdir(), "vislox-cache-")) },
 });
 let log = "";
 server.stderr.on("data", (d) => (log += d));
@@ -167,6 +189,33 @@ try {
     // The mode is a link to the Mode object.
     await page.click('#props .lnk:has-text("Feiertag")');
     await page.waitForFunction(() => document.querySelector(".ph-t")?.textContent === "Feiertag");
+  });
+  await step("In the app: the config's settings, then what the Miniserver's app shows", async () => {
+    await page.keyboard.press("Control+k");
+    await page.keyboard.type("zähler");
+    await page.keyboard.press("Enter");
+    await page.waitForFunction(() => document.querySelector(".ph-t")?.textContent === "Zähler");
+    const sec = () => page.$$eval("#props section", (s) => s.find((x) => x.querySelector(".ps-h")?.dataset.sec === "In the app")?.textContent || "");
+    assert.match(await sec(), /ShownYes/);
+    assert.match(await sec(), /RoomKüche/);
+    // A blue phone on the block, and an entry in the legend.
+    assert.ok(await page.$(`#viewport [data-uuid="${METER}"] .abadge, #viewport .abadge`));
+    assert.match(await page.textContent("#legend"), /in the app/);
+    // vislox reads the structure file only when asked (live values come from a file here).
+    assert.equal(structureReads, 0);
+    await page.click("#props .app-load");
+    await page.waitForFunction(() => /ControlMeter/.test(document.querySelector("#props")?.textContent || ""));
+    assert.equal(structureReads, 1);
+    // The current revision is compared with what the app shows.
+    assert.match(await sec(), /in room Keller in the app, Küche in the config/);
+    // The room's icon, from the Miniserver, in Properties and in the tree.
+    await page.waitForFunction(() => [...document.querySelectorAll("#props img.app-ic")].some((i) => i.complete && i.naturalWidth > 0));
+    await page.waitForFunction(() => [...document.querySelectorAll("#tree .tn-ic.app img")].some((i) => i.complete && i.naturalWidth > 0));
+    // Icons are only fetched for names the structure file lists.
+    const other = await page.evaluate(() => fetch("/api/app/icon?name=jdev/cfg/apiKey").then((r) => r.status));
+    assert.equal(other, 404);
+    const i = errors.findIndex((e) => e.includes("status of 404"));
+    if (i >= 0) errors.splice(i, 1);
   });
   await step("live values go on the wires and follow the stream", async () => {
     await page.click('.tab:has-text("Erdgeschoss")');

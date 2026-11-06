@@ -176,6 +176,11 @@ pub struct ObjInfo {
     pub path: String,
     pub room: Option<String>,
     pub category: Option<String>,
+    /// How the block shows in the app (its `<IoData>`), if it can.
+    pub app: Option<InApp>,
+    /// The compared revision's, when it differs.
+    pub app_old: Option<InApp>,
+    pub app_changed: bool,
     pub attrs: Vec<AttrInfo>,
     pub ports: Vec<PortInfo>,
     /// Ref tags that mirror this object: (page uuid, ref object uuid).
@@ -212,6 +217,17 @@ pub struct CalMode {
     pub title: String,
     /// The `Mode` object, when the config has one with that number.
     pub target: Option<Target>,
+}
+
+/// A block's visualization settings, as Loxone Config shows them: shown in
+/// the app or not (`Visu`), and its room (`Pr`) and category (`Cr`).
+#[derive(Serialize, Clone, PartialEq, Debug)]
+pub struct InApp {
+    pub shown: bool,
+    pub room: Option<String>,
+    pub room_id: Option<String>,
+    pub category: Option<String>,
+    pub category_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -468,6 +484,19 @@ impl<'a> Ctx<'a> {
         }
     }
 
+    /// The block's visualization settings, from its `<IoData>` child.
+    fn in_app(&self, el: &Element) -> Option<InApp> {
+        let io = el.child_elements().find(|c| c.name == "IoData")?;
+        let id = |a: &str| io.attr(a).filter(|v| !v.is_empty()).map(String::from);
+        Some(InApp {
+            shown: io.attr("Visu") == Some("true"),
+            room: self.binding(el, "Pr"),
+            room_id: id("Pr"),
+            category: self.binding(el, "Cr"),
+            category_id: id("Cr"),
+        })
+    }
+
     /// Title of the Place/Category an `<IoData>` binding names.
     fn binding(&self, el: &Element, attr: &str) -> Option<String> {
         let io = el.child_elements().find(|c| c.name == "IoData")?;
@@ -621,6 +650,8 @@ struct Delta {
     /// Calendar entries whose decoded date or operating mode changed,
     /// also when only the `Mode` object they name did.
     calendar: HashSet<String>,
+    /// Objects shown in the app now and not before, or the other way round.
+    visu: HashSet<String>,
 }
 
 impl Delta {
@@ -635,6 +666,7 @@ impl Delta {
             || self.attrs.contains_key(uuid)
             || self.placements.contains(uuid)
             || self.calendar.contains(uuid)
+            || self.visu.contains(uuid)
             || self.params.keys().any(|(o, _)| o == uuid)
         {
             CHANGED
@@ -721,6 +753,10 @@ fn delta(new: &Ctx, old: &Ctx, d: &DocDiff) -> Delta {
         }
         if !ch.is_empty() {
             x.attrs.insert(u.clone(), ch);
+        }
+        let shown = |c: &Ctx, el: &Element| c.in_app(el).is_some_and(|a| a.shown);
+        if shown(new, nel) != shown(old, oel) {
+            x.visu.insert(u.clone());
         }
         let (np, op): (Vec<PortView>, Vec<PortView>) = (ports(nel), ports(oel));
         for p in &np {
@@ -1137,6 +1173,12 @@ fn obj_info(
         });
     }
     let status = if gone { REMOVED } else { d.status(uuid) };
+    let app = c.in_app(el);
+    let app_old = old
+        .filter(|_| d.on)
+        .and_then(|o| o.el(uuid).map(|e| o.in_app(e)));
+    let app_changed = app_old.as_ref().is_some_and(|o| *o != app);
+    let app_old = app_old.flatten();
     ObjInfo {
         calendar,
         uuid: uuid.to_string(),
@@ -1147,6 +1189,9 @@ fn obj_info(
         path: c.path(uuid),
         room: c.binding(el, "Pr"),
         category: c.binding(el, "Cr"),
+        app_changed: app_changed && !gone,
+        app_old: app_old.filter(|_| app_changed && !gone),
+        app,
         attrs,
         ports: port_infos,
         mirrored_by: c.mirrors.get(uuid).cloned().unwrap_or_default(),
@@ -1355,6 +1400,26 @@ fn changes(view: &mut View, nc: &Ctx, oc: &Ctx, d: &Delta) {
                     obj: Some(u.clone()),
                 });
             }
+        }
+        if d.visu.contains(&u) {
+            let shown = nc
+                .el(&u)
+                .and_then(|e| nc.in_app(e))
+                .is_some_and(|a| a.shown);
+            v.push(Change {
+                kind: "attr",
+                text: format!(
+                    "{} · {}",
+                    nc.title(&u),
+                    if shown {
+                        "now shown in the app"
+                    } else {
+                        "no longer shown in the app"
+                    }
+                ),
+                page: page_for(&u),
+                obj: Some(u.clone()),
+            });
         }
         if d.placements.contains(&u) {
             v.push(Change {
@@ -1882,6 +1947,47 @@ mod tests {
             .find(|p| p.key == "Input2")
             .expect("Input2");
         assert_eq!(input2.def.as_deref(), Some("1000"));
+    }
+
+    #[test]
+    fn the_app_side_comes_from_iodata_and_showing_it_is_a_change() {
+        const CAT: &str = "10000010-0000-00b1-ffff504f94000001";
+        let meter = "<Co K=\"Pf\" Nc=\"1\" U=\"10000005-0000-0051-00ff504f94000001\">";
+        let cat = format!(
+            "<C Type=\"Category\" V=\"178\" U=\"{CAT}\" Title=\"Energie\"/>\n\t\t<C Type=\"Page\" V=\"178\" U=\"10000002"
+        );
+        let with = |visu: &str| {
+            edited(&[
+                ("<C Type=\"Page\" V=\"178\" U=\"10000002", &cat),
+                (
+                    meter,
+                    &format!("<IoData Visu=\"{visu}\" Pr=\"\" Cr=\"{CAT}\"/>{meter}"),
+                ),
+            ])
+        };
+        let (base, new) = (doc(&with("false")), doc(&with("true")));
+        let plain = build(&base, None, "");
+        let a = plain.objects[METER].app.as_ref().expect("IoData");
+        assert!(!a.shown);
+        assert_eq!(a.category.as_deref(), Some("Energie"));
+        assert_eq!(a.category_id.as_deref(), Some(CAT));
+        assert_eq!(a.room_id, None);
+        assert!(!plain.objects[METER].app_changed);
+        assert!(plain.objects[DIV].app.is_none());
+
+        let v = build(&new, Some(&base), "");
+        let m = &v.objects[METER];
+        assert!(m.app.as_ref().unwrap().shown);
+        assert!(m.app_changed);
+        assert!(!m.app_old.as_ref().unwrap().shown);
+        assert_eq!(obj(page(&v, PAGE_EG), METER).status, CHANGED);
+        assert!(
+            v.changes
+                .iter()
+                .any(|c| c.text == "Zähler · now shown in the app"),
+            "{:?}",
+            v.changes.iter().map(|c| &c.text).collect::<Vec<_>>()
+        );
     }
 
     #[test]
