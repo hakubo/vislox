@@ -102,7 +102,7 @@ function revInfo(r) {
 // ── URL state: #page=…&sel=…&rev=…&base=… ─────────────────────────────
 function readHash() {
   const h = new URLSearchParams(location.hash.slice(1));
-  return { page: h.get("page"), sel: h.get("sel"), rev: h.get("rev"), base: h.get("base") };
+  return { page: h.get("page"), sel: h.get("sel"), rev: h.get("rev"), base: h.get("base"), view: h.get("view") };
 }
 function writeHash(push) {
   if (S.applyingHash) return;
@@ -111,6 +111,7 @@ function writeHash(push) {
   if (S.sel) h.set("sel", S.sel);
   if (!S.follow && S.rev) h.set("rev", S.rev);
   if (!S.follow && S.base) h.set("base", S.base);
+  if (MD.open) h.set("view", "modes");
   const s = "#" + h.toString();
   if (s === location.hash) return;
   if (push) history.pushState(null, "", s); else history.replaceState(null, "", s);
@@ -125,6 +126,7 @@ window.addEventListener("popstate", async () => {
     } else {
       if (h.page && h.page !== S.page) gotoPage(h.page);
       select(h.sel || null, { noReveal: false });
+      if (h.view === "modes") modesOpen({ quiet: true }); else modesClose(true);
     }
   } finally { S.applyingHash = false; }
 });
@@ -252,6 +254,7 @@ async function loadView() {
   renderPage();
   renderProps();
   if (S.sel) applyFocus();
+  if (h?.view === "modes") modesOpen({ quiet: true }); else renderModes();
   writeHash(false);
 }
 function renderLegend() {
@@ -301,12 +304,15 @@ $("tab-list").addEventListener("keydown", (e) => {
 });
 function gotoPage(uuid, opts) {
   if (!uuid || !S.pageOf.has(uuid)) return;
+  // Going to a page leaves the Operating modes view.
+  const left = MD.open;
+  modesClose(true);
   if (S.page !== uuid) {
     S.page = uuid;
     renderTabs(); renderPage();
     if (S.sel) applyFocus();
     writeHash(true);
-  }
+  } else if (left) writeHash(true);
   if (opts && opts.focus) focusObj(opts.focus, opts.zoom);
 }
 function stepPage(d) {
@@ -833,6 +839,7 @@ function select(uuid, opts) {
   if (uuid) vpG.querySelectorAll(`[data-uuid="${CSS.escape(uuid)}"]`).forEach((n) => n.classList.add("sel"));
   applyFocus();
   renderProps();
+  renderModes();
   if (!opts || !opts.noReveal) revealInTree(uuid);
   writeHash(false);
 }
@@ -1041,7 +1048,7 @@ function renderTree() {
     const badge = cnt && !n.status ? `<span class="badge changed" aria-label="${cnt} changes">${cnt}</span>` : "";
     const name = autoTitle(n.title) && n.ty !== "Page" ? prettyType(n.ty) : n.title;
     const ty = extra ?? (!kids && name !== prettyType(n.ty) ? prettyType(n.ty) : "");
-    const tipText = calTip(S.view.objects[n.uuid]?.calendar);
+    const tipText = calTip(S.view.objects[n.uuid]?.calendar) || (MODES_FOLDERS.has(n.ty) ? "Opens the Operating modes view: a year calendar of when each mode is on" : "");
     const num = n.ty === "Page" || n.ty === "Refs" ? `<span class="tn-n">${n.ty === "Page" ? treeChildren(n).reduce((a, c) => a + (c.synthetic ? 0 : 1), 0) : n.children.length}</span>` : "";
     return `<div class="tn-row ${marks ? n.status : ""}${n.uuid === S.sel ? " sel" : ""}${n.uuid === S.treeFocus ? " kfocus" : ""}" role="treeitem" aria-level="${depth + 1}"${kids ? ` aria-expanded="${open}"` : ""} aria-selected="${n.uuid === S.sel}" data-uuid="${esc(n.uuid)}"${tipText ? ` title="${esc(tipText)}"` : ""} style="padding-left:${4 + depth * 14}px">` +
       `<span class="tn-tw${open ? " open" : ""}" aria-hidden="true">${kids ? "▶" : ""}</span>${icon(n)}<span class="tn-t">${esc(name)}</span>${ty ? `<span class="tn-ty">${esc(ty)}</span>` : ""}${badge}${num}</div>`;
@@ -1091,9 +1098,12 @@ function nodeById(uuid) {
   if (S.view) treeRoots().forEach(walk);
   return found;
 }
+/** The Calendar and Operating modes folders open the year view of the modes. */
+const MODES_FOLDERS = new Set(["CalendarCaption", "ModeCaption"]);
 function activateNode(uuid) {
   const n = nodeById(uuid);
   if (!n) return;
+  if (MODES_FOLDERS.has(n.ty)) { S.open.add(uuid); S.treeFocus = uuid; renderTree(); modesOpen(); return; }
   if (n.synthetic || (n.children.length && n.ty !== "Page" && !S.view.objects[uuid])) { toggleNode(uuid); return; }
   if (S.pageOf.has(uuid)) { gotoPage(uuid); S.open.add(uuid); select(null, { noReveal: true }); S.treeFocus = uuid; renderTree(); return; }
   const pg = S.objPage.get(uuid);
@@ -1263,13 +1273,15 @@ function renderPalette() {
     if (o.moved_to || o.shape === "tag") continue;
     blocks.push({ kind: "block", title: displayTitle(o), meta: `${prettyType(o.ty)} · ${p.title}`, page: p.uuid, uuid: o.uuid });
   }
+  const views = mdEntries().length || v.modes.length ? [{ kind: "view", title: "Operating modes", meta: "year calendar of the calendar entries", keys: "operating modes calendar year holidays" }] : [];
   let items;
-  if (!q) items = [{ sec: "Pages" }, ...pages];
+  if (!q) items = [...(views.length ? [{ sec: "Views" }, ...views] : []), { sec: "Pages" }, ...pages];
   else {
     const score = (it) => { const m = fuzzy(q, it.title); return m ? { ...it, score: m.score + (it.kind === "page" ? 50 : 0), hits: m.hits } : null; };
     const ps = pages.map(score).filter(Boolean).sort((a, b) => b.score - a.score).slice(0, 12);
     const bs = blocks.map(score).filter(Boolean).sort((a, b) => b.score - a.score).slice(0, 40);
-    items = [...(ps.length ? [{ sec: "Pages" }, ...ps] : []), ...(bs.length ? [{ sec: "Blocks" }, ...bs] : [])];
+    const vs = views.filter((it) => it.keys.split(" ").some((w) => w.startsWith(q) || q.startsWith(w)) || fuzzy(q, it.title)).map((it) => ({ ...it, hits: fuzzy(q, it.title)?.hits }));
+    items = [...(vs.length ? [{ sec: "Views" }, ...vs] : []), ...(ps.length ? [{ sec: "Pages" }, ...ps] : []), ...(bs.length ? [{ sec: "Blocks" }, ...bs] : [])];
   }
   pal.items = items;
   pal.idx = items.findIndex((x) => !x.sec);
@@ -1293,6 +1305,7 @@ function palOpen(i) {
   const it = pal.items[i];
   if (!it || it.sec) return;
   closePalette();
+  if (it.kind === "view") { modesOpen(); return; }
   if (it.kind === "page") { gotoPage(it.page); select(null, { noReveal: true }); }
   else { gotoPage(it.page, { focus: it.uuid }); select(it.uuid); }
   svg.focus({ preventScroll: true });
@@ -1326,7 +1339,7 @@ $("sel-base").onchange = (e) => { S.base = e.target.value || null; S.follow = fa
 $("chk-changes").onchange = (e) => {
   S.marks = e.target.checked;
   if (!S.view) return;
-  renderLegend(); renderTabs(); renderTree(); renderPage(); renderProps(); applyFocus();
+  renderLegend(); renderTabs(); renderTree(); renderPage(); renderProps(); applyFocus(); renderModes();
 };
 $("chk-live").onchange = (e) => setLive(e.target.checked);
 $("chk-live-dim").checked = S.live.dim;
@@ -1360,7 +1373,7 @@ window.addEventListener("keydown", (e) => {
     case "?": openHelp(); break;
     case "l": case "L": if (S.hist?.live?.available) setLive(!S.live.on); break;
     case "/": openPalette(""); break;
-    case "Escape": select(null, { noReveal: true }); break;
+    case "Escape": if (MD.open) modesClose(); else select(null, { noReveal: true }); break;
     case "ArrowLeft": if (inTree || inTabs) return; pan(step, 0); break;
     case "ArrowRight": if (inTree || inTabs) return; pan(-step, 0); break;
     case "ArrowUp": if (inTree) return; pan(0, step); break;
@@ -2282,6 +2295,7 @@ function renderLiveSwitch() {
   svg.classList.toggle("live-dim", here && S.live.dim);
   $("lg-query").classList.toggle("hidden", !info.query);
   liveQuerySync(here && info.query && S.live.query);
+  modesLive();
 }
 
 /** Opt-in block queries (`/api/live/query`): the server queries the blocks behind the wires of the
@@ -2482,6 +2496,7 @@ function liveApply(ch) {
     n.title = e?.[2] || "";
     if (ch && e && changed) flash(n);
   });
+  modesLive();
 }
 function flash(n) {
   n.classList.remove("tick");

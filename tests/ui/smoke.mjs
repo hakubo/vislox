@@ -44,7 +44,9 @@ edit('Month="12" Day="24"', 'Month="12" Day="26"');
 const TEMP = "10000003-0000-0032-01ff504f94000001", GATE = "10000004-0000-0043-02ff504f94000001";
 const liveFile = join(mkdtempSync(join(tmpdir(), "vislox-live-")), "stream.ndjson");
 const liveLine = (control, state, value, uuid) => JSON.stringify({ control, state, value, uuid }) + "\n";
-writeFileSync(liveFile, liveLine("Temperatur", "value", "21.5", TEMP) + liveLine("AND", "active", "1", GATE));
+// The holiday mode (Feiertag) is on: its Q.
+const HOLIDAY_Q = "00000000-0000-0001-1500000000000002";
+writeFileSync(liveFile, liveLine("Temperatur", "value", "21.5", TEMP) + liveLine("AND", "active", "1", GATE) + liveLine("Feiertag", "active", "1", HOLIDAY_Q));
 
 // A download as lox keeps it next to config.Loxone (backup.zip): only its
 // LoxAPP3.json matters here, for when the config last changed (stored, not deflated).
@@ -216,6 +218,69 @@ try {
     assert.equal(other, 404);
     const i = errors.findIndex((e) => e.includes("status of 404"));
     if (i >= 0) errors.splice(i, 1);
+  });
+  await step("Operating modes: a year calendar of the calendar entries", async () => {
+    // From Ctrl+K.
+    await page.keyboard.press("Control+k");
+    await page.keyboard.type("operating");
+    await page.keyboard.press("Enter");
+    await page.waitForSelector("#modes:not(.hidden)");
+    assert.match(page.url(), /view=modes/);
+    // Easter Sunday, Gregorian computus.
+    assert.deepEqual(await page.evaluate(() => [2024, 2025, 2026, 2038, 2285].map(easterSunday)), [[3, 31], [4, 20], [4, 5], [4, 25], [3, 22]]);
+    await page.evaluate(() => { MD.year = 2026; renderModes(); });
+    const cls = (m, d, y = 2026) => page.evaluate(([y, m, d]) => document.querySelector(`#md-grid [data-day="${mdDay(y, m, d)}"]`)?.className ?? "", [y, m, d]);
+    const bg = (m, d) => page.evaluate(([m, d]) => document.querySelector(`#md-grid [data-day="${mdDay(2026, m, d)}"]`)?.getAttribute("style") ?? "", [m, d]);
+    assert.match(await cls(4, 6), /md-on/, "Easter Monday 2026 is 6 Apr");
+    // 6 Apr has two modes (Easter Monday's Feiertag, Heizperiode's Urlaub): both colours.
+    assert.match(await bg(4, 6), /linear-gradient/);
+    assert.doesNotMatch(await bg(4, 5), /linear-gradient/);
+    // Heizperiode runs across New Year (1 Oct – 30 Apr).
+    assert.match(await cls(1, 15), /md-on/);
+    assert.match(await cls(4, 30), /md-on/);
+    assert.doesNotMatch(await cls(5, 1), /md-on/);
+    assert.match(await cls(10, 1), /md-on/);
+    // Sommerferien (4 Jul – 5 Sep 2026) and Heizperiode switch on the same mode, Urlaub; Silvester Party.
+    assert.match(await cls(7, 4), /md-on/);
+    assert.match(await cls(9, 5), /md-on/);
+    assert.doesNotMatch(await cls(9, 6), /md-on/);
+    assert.notEqual(await bg(12, 31), await bg(7, 4), "Party and Urlaub have their own colours");
+    assert.equal(await bg(1, 15), await bg(7, 4));
+    // The uncommitted edit moved Heiligabend from 24 to 26 Dec.
+    assert.match(await cls(12, 26), /md-add/);
+    assert.match(await cls(12, 24), /md-rem/);
+    // Hovering a day lists its entries.
+    await page.hover(`#md-grid [data-day="${await page.evaluate(() => mdDay(2026, 12, 24))}"]`);
+    assert.match(await page.textContent("#tooltip"), /24 Dec 2026.*Heiligabend · Feiertag removed/);
+    // The list has every entry with its date and mode; clicking one selects it.
+    const list = await page.$$eval("#md-list .md-e", (n) => n.map((x) => x.textContent));
+    assert.equal(list.length, 5, list.join(" | "));
+    assert.ok(list.some((t) => /Ostermontag.*Easter Monday \(Easter \+1\).*Feiertag · 6 Apr 2026/.test(t)), list.join(" | "));
+    await page.click('#md-list .md-e:has-text("Ostermontag")');
+    await page.waitForFunction(() => document.querySelector(".ph-t")?.textContent === "Ostermontag");
+    assert.match(await cls(4, 6), /md-hl/);
+    assert.ok(await page.isVisible("#modes"), "the view stays open");
+    // Another year: the summer holidays of 2026 are not in 2025.
+    await page.click("#md-prev");
+    assert.equal(await page.textContent("#md-year"), "2025");
+    assert.doesNotMatch(await cls(7, 4, 2025), /md-on/);
+    assert.ok((await page.textContent("#md-list")).includes("Feiertag · 21 Apr 2025"), "Easter Monday 2025 is 21 Apr");
+    // Live values: the modes that are on now.
+    assert.equal(await page.$$eval(".md-chip.live", (n) => n.length), 0);
+    await page.click("#sw-live .track");
+    await page.waitForSelector('.md-chip.live:has-text("Feiertag")');
+    assert.match(await page.textContent(".md-chip.live"), /on now/);
+    await page.click("#sw-live .track");
+    await page.waitForFunction(() => !document.querySelector(".md-chip.live"));
+    // Esc goes back to the page; the Calendar folder in the tree opens the view again.
+    await page.focus("#md-title");
+    await page.keyboard.press("Escape");
+    await page.waitForSelector("#modes.hidden", { state: "attached" });
+    assert.doesNotMatch(page.url(), /view=modes/);
+    await page.click('.tn-row:has-text("Betriebszeiten")');
+    await page.waitForSelector("#modes:not(.hidden)");
+    await page.click("#md-close");
+    await page.waitForSelector("#modes.hidden", { state: "attached" });
   });
   await step("live values go on the wires and follow the stream", async () => {
     await page.click('.tab:has-text("Erdgeschoss")');

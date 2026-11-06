@@ -316,6 +316,10 @@ async fn main() -> Result<()> {
             get(|| async { asset("text/javascript", include_str!("../web/app.js")) }),
         )
         .route(
+            "/modes.js",
+            get(|| async { asset("text/javascript", include_str!("../web/modes.js")) }),
+        )
+        .route(
             "/app.css",
             get(|| async { asset("text/css", include_str!("../web/app.css")) }),
         )
