@@ -696,7 +696,9 @@ try {
     assert.match(await page.textContent(".bk-gap"), /^Between Backup v1 · .* and Backup v2 · /);
     const b = await page.waitForSelector(".hrev.k-backup");
     assert.match(await b.textContent(), /Miniserver backup v15/);
+    // A click shows it; the Changes pane offers the comparison with the save before it.
     await b.click();
+    await page.click("#cmp-prev");
     await page.waitForFunction(() => [...document.querySelectorAll(".changes .chg .t")].some((n) => n.textContent.includes("Licht OG → Licht Flur")));
     assert.match(await page.$eval("#sel-base", (s) => s.selectedOptions[0].textContent), /^Backup v1/);
     assert.match(page.url(), /rev=backup%3Asps_15_20261101120000\.zip/);

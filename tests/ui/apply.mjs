@@ -188,7 +188,10 @@ try {
     await page.waitForSelector("#btn-apply:not([disabled])");
   });
   await step("the pending Touch replacement is a hardware change", async () => {
+    // A click shows the compile; compare it with the deployed config from the Changes pane.
     await page.click('.hrev.k-pending');
+    await page.click("#cmp-prev");
+    await page.waitForSelector(".hrev.k-pending.sel");
     await page.waitForSelector(".chg-filter .pill.hw");
     assert.equal(await page.textContent(".chg-filter .pill.hw"), "hardware 2");
     await page.click(".chg-filter .pill.hw");
