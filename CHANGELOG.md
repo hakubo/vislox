@@ -5,6 +5,12 @@ published under the same version (see [docker/README.md](docker/README.md)).
 
 ## Unreleased
 
+- Edit values in Properties (a `lox.toml` project, with the admin token): a block's name, room and category, the
+  constant of an unwired input, and the settings of a physical input or output or a device. vislox writes them
+  into its own file of the module (`<module>/vislox/edits.loxl`) and runs `lox logic compile`; they show as the
+  pending revision, marked *not deployed*, with Revert. Editing never deploys (#58, see `docs/editing.md`).
+- Fixed: Discard and the operate buttons ignored mouse clicks.
+
 ## 0.2.0
 
 - Which config the Miniserver runs: the program file it loaded, from `def.log` and `/prog`, under the History

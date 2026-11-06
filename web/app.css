@@ -294,7 +294,7 @@ button.chip { cursor: pointer; } button.chip:hover { border-color: var(--brand);
 .marks-on .ghosted .body, .marks-on .ghosted .bar { stroke-dasharray: 6 4; }
 .marks-off .halo, .marks-off .ghost, .marks-off .dbadge, .marks-off .pin-chg, .marks-off .ghost-note { display: none; }
 .marks-off .d-removed, .marks-off .wire.d-removed, .marks-off .xref.d-removed, .marks-off .ghosted { display: none; }
-.ghost { fill: #1f6fd10a; stroke: var(--moved); stroke-opacity: .45; stroke-width: 1.2px; stroke-dasharray: 4 5; vector-effect: non-scaling-stroke; pointer-events: none; }
+rect.ghost, line.ghost { fill: #1f6fd10a; stroke: var(--moved); stroke-opacity: .45; stroke-width: 1.2px; stroke-dasharray: 4 5; vector-effect: non-scaling-stroke; pointer-events: none; }
 .ghost-line { stroke: var(--moved); stroke-opacity: .4; stroke-width: 1px; stroke-dasharray: 2 4; vector-effect: non-scaling-stroke; }
 .dbadge circle { stroke: #fff; stroke-width: 1.5px; vector-effect: non-scaling-stroke; }
 .dbadge text { fill: #fff; font-weight: 700; font-size: 150px; }
@@ -572,6 +572,23 @@ button.chip { cursor: pointer; } button.chip:hover { border-color: var(--brand);
 .op-ent { display: flex; flex-direction: column; padding: 4px 12px; border-bottom: 1px solid var(--line-2); font-size: 12px; }
 .op-ent .dt { color: var(--muted); font-size: 11px; }
 .op-ent.err .l1 { color: var(--removed); }
+
+/* ── editing values (Properties) ── */
+.ed-btn { background: #fff; border: 1px solid var(--line); border-radius: var(--radius); font-weight: 600; color: var(--text); padding: 4px 12px; font-size: 12px; }
+.ed-btn:hover:not(:disabled) { border-color: var(--sel); color: var(--sel); }
+.ed-btn:disabled { opacity: .5; cursor: not-allowed; }
+.pr .ed-btn { margin-left: 8px; padding: 1px 8px; font-size: 11px; }
+.ed-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; padding: 6px 12px 8px; }
+.ed-msg { flex: 1 1 100%; font-size: 12px; color: var(--muted); }
+.ed-msg.err { color: var(--removed); white-space: pre-wrap; overflow-wrap: anywhere; }
+.ed-note { padding: 3px 12px 6px; color: var(--muted); font-size: 12px; }
+.ed-row select { max-width: 100%; padding: 2px 4px; border: 1px solid var(--line); border-radius: var(--radius); font: inherit; background: #fff; }
+.ed-row input { width: 100%; box-sizing: border-box; padding: 3px 6px; border: 1px solid var(--line); border-radius: var(--radius); font: inherit; }
+.ed-row input.num { width: 9em; font-variant-numeric: tabular-nums; }
+.ed-row input[aria-invalid="true"] { border-color: var(--removed); background: var(--removed-bg); }
+.ed-unit { margin-left: 6px; color: var(--muted); }
+.ed-bad { color: var(--removed); font-size: 12px; margin-top: 2px; }
+.ed-tag { margin-left: 6px; padding: 0 6px; border-radius: 8px; font-size: 11px; color: var(--pending); background: var(--changed-bg); white-space: nowrap; }
 
 /* In the app (LoxAPP3.json) */
 .abadge circle { fill: #2f6fb3; stroke: #fff; stroke-width: 1.5px; vector-effect: non-scaling-stroke; }

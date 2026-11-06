@@ -9,15 +9,17 @@
 //!   (`lox config merge`), then commit and push.
 //! - **Discard**: put the module, lock and compiled config back to the last
 //!   commit.
+//! - **Edit**: write values edited in Properties into vislox's own file of
+//!   the module (`edit.rs`), then `lox logic compile`. Never deploys.
 //!
-//! What is pending comes from outside vislox: anyone (a person, or an agent
-//! working in the repository) edits the module and compiles it with
+//! What is pending comes from the module: anyone (a person, an agent working
+//! in the repository, or vislox's Edit) edits it and compiles it with
 //! `lox logic`; vislox shows the result as the pending revision.
 //!
-//! All three need the admin token (`X-Vislox-Token`). vislox itself still
+//! All four need the admin token (`X-Vislox-Token`). vislox itself still
 //! writes no config: lox and git do.
 
-use crate::restart;
+use crate::{edit, restart};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -30,6 +32,8 @@ const PUSH_TIMEOUT: Duration = Duration::from_secs(600);
 const GIT_TIMEOUT: Duration = Duration::from_secs(120);
 /// Starts an Apply message whose upload the Miniserver may not run.
 const UNVERIFIED: &str = "Not verified";
+/// `lox logic compile` reads the base and the module and writes out and the lock.
+const COMPILE_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub struct Settings {
     pub token: Option<String>,
@@ -48,6 +52,103 @@ pub struct Actions {
     /// Apply and Discard run one at a time.
     busy: tokio::sync::Mutex<()>,
     tx: broadcast::Sender<()>,
+    edit_state: Mutex<EditState>,
+    /// `GET /api/edits`, for the [`EditState::key`] it was worked out for.
+    edits_cache: Mutex<Option<(String, Value)>>,
+}
+
+/// Whether editing is on, and what `GET /api/edits` depends on: worked out
+/// on start and on file changes ([`Actions::refresh_edit`]).
+#[derive(Default, Clone, PartialEq)]
+struct EditState {
+    why: Option<String>,
+    /// vislox's file, the deployed and the pending config, by blob id.
+    key: String,
+}
+
+/// The revision the Miniserver runs, for `GET /api/edits`.
+pub struct DeployedRev {
+    /// Its commit, when it is a git revision.
+    pub commit: Option<String>,
+    pub bytes: Arc<Vec<u8>>,
+}
+
+/// Clears `running` when an edit ends, also when its request is dropped.
+struct Running<'a>(&'a Actions);
+
+impl Drop for Running<'_> {
+    fn drop(&mut self) {
+        self.0.set_running(None);
+    }
+}
+
+/// What an edit writes (vislox's file) and what the compile writes (the lock
+/// and out), as they were: put back on drop unless [`Undo::keep`] was called,
+/// so a failed or abandoned edit leaves the project as it found it.
+struct Undo {
+    file: PathBuf,
+    old: Option<String>,
+    saved: Vec<(PathBuf, Option<Vec<u8>>)>,
+    keep: bool,
+}
+
+impl Undo {
+    fn new(file: &Path, old: Option<String>, others: &[&Path]) -> Undo {
+        Undo {
+            file: file.to_path_buf(),
+            old,
+            saved: others
+                .iter()
+                .map(|p| (p.to_path_buf(), std::fs::read(p).ok()))
+                .collect(),
+            keep: false,
+        }
+    }
+
+    fn keep(&mut self) {
+        self.keep = true;
+    }
+}
+
+impl Drop for Undo {
+    fn drop(&mut self) {
+        if self.keep {
+            return;
+        }
+        match &self.old {
+            Some(t) => {
+                let _ = std::fs::write(&self.file, t);
+            }
+            None => {
+                let _ = std::fs::remove_file(&self.file);
+                // Only removed when empty.
+                let _ = self.file.parent().map(std::fs::remove_dir);
+            }
+        }
+        // Out last: it stays newer than the module, as after a compile.
+        for (path, bytes) in &self.saved {
+            let _ = match bytes {
+                Some(b) => std::fs::write(path, b),
+                None => std::fs::remove_file(path),
+            };
+        }
+    }
+}
+
+/// Removes a scratch directory when dropped.
+struct RemoveDir(PathBuf);
+
+impl Drop for RemoveDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn now_nanos() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
 }
 
 #[derive(Default)]
@@ -276,12 +377,16 @@ pub fn read_secret(path: &Path) -> anyhow::Result<String> {
 impl Actions {
     pub fn new(s: Settings) -> Actions {
         let (tx, _) = broadcast::channel(16);
-        Actions {
+        let a = Actions {
             s,
             st: Mutex::new(St::default()),
             busy: tokio::sync::Mutex::new(()),
             tx,
-        }
+            edit_state: Mutex::new(EditState::default()),
+            edits_cache: Mutex::new(None),
+        };
+        a.edit_state.lock().unwrap().why = a.why_not_edit_now();
+        a
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<()> {
@@ -308,16 +413,74 @@ impl Actions {
         }
     }
 
+    /// Why Properties cannot edit values now, if it cannot: as Apply, and the
+    /// module must be a directory, or not exist yet (the first edit creates
+    /// it): vislox writes a file of its own into it.
+    fn why_not_edit_now(&self) -> Option<String> {
+        if let Some(why) = self.why_not_apply() {
+            return Some(why.into());
+        }
+        let dir = self.s.project.as_deref()?;
+        let p = match loxone_config::Project::load(&dir.join("lox.toml")) {
+            Err(e) => return Some(format!("cannot read lox.toml: {e}")),
+            Ok(p) => p,
+        };
+        let name = p.module.file_name().unwrap_or_default().to_string_lossy();
+        if p.module.is_dir() {
+            None
+        } else if p.module.exists() {
+            Some(format!(
+                "the module ({name}) is one file; make it a directory to edit from vislox"
+            ))
+        } else if p.module.extension().is_some_and(|x| x == "loxl") {
+            Some(format!("the module ({name}) does not exist"))
+        } else {
+            None
+        }
+    }
+
+    /// Work out again whether editing is on, and the key of what
+    /// `GET /api/edits` says (vislox's file, the deployed and the pending
+    /// config): on start and on every file change, not on every event.
+    /// Tells the browsers when either changed.
+    pub fn refresh_edit(&self, deployed: Option<&str>, pending: Option<&str>) {
+        let why = self.why_not_edit_now();
+        let file = self
+            .s
+            .project
+            .as_deref()
+            .and_then(|d| loxone_config::Project::load(&d.join("lox.toml")).ok())
+            .and_then(|p| std::fs::read(p.module.join(edit::FILE)).ok())
+            .map(|b| crate::history::blob_id(&b));
+        let key = format!(
+            "{}:{}:{}",
+            file.as_deref().unwrap_or("-"),
+            deployed.unwrap_or("-"),
+            pending.unwrap_or("-")
+        );
+        let new = EditState { why, key };
+        let mut st = self.edit_state.lock().unwrap();
+        if *st != new {
+            *st = new;
+            drop(st);
+            self.changed();
+        }
+    }
+
     /// For `/api/history` and the `actions` event.
     pub fn info(&self) -> Value {
+        let edit = self.edit_state.lock().unwrap().clone();
         let st = self.st.lock().unwrap();
         let flag = |why: Option<&str>| match why {
             None => json!({ "available": true }),
             Some(r) => json!({ "available": false, "reason": r }),
         };
+        let mut e = flag(edit.why.as_deref());
+        e["key"] = json!(edit.key);
         json!({
             "shown": self.s.project.is_some(),
             "apply": flag(self.why_not_apply()),
+            "edit": e,
             "running": st.running,
             "last": st.last,
             "progress": st.progress,
@@ -699,6 +862,268 @@ impl Actions {
                 .map_err(|e| format!("lox logic compile failed:\n{}", last_lines(&e, 6)))?;
         }
         Ok(())
+    }
+
+    /// Write the edits into vislox's file of the module and compile it. The
+    /// result shows as the pending revision; nothing reaches the Miniserver.
+    /// Returns, per op, the value vislox claimed before (to undo it), and the
+    /// blob id of the new pending config.
+    ///
+    /// Safe to drop at any point (a closed tab): `running` is cleared, and a
+    /// half-done edit is put back ([`Undo`]).
+    pub async fn edit(&self, req: &edit::Request) -> Result<Value, Refusal> {
+        use axum::http::StatusCode;
+        if req.ops.is_empty() || req.ops.len() > edit::MAX_OPS {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("send 1 to {} edits", edit::MAX_OPS),
+            ));
+        }
+        let _one = self.busy.try_lock().map_err(|_| {
+            (
+                StatusCode::CONFLICT,
+                "Apply, Sync, Discard or another edit is running; edit again when it is done"
+                    .to_string(),
+            )
+        })?;
+        if let Some(why) = self.why_not_edit_now() {
+            return Err((StatusCode::CONFLICT, why));
+        }
+        self.set_running(Some("Edit"));
+        let _running = Running(self);
+        self.edit_steps(req).await
+    }
+
+    fn set_running(&self, what: Option<&'static str>) {
+        self.st.lock().unwrap().running = what;
+        self.changed();
+    }
+
+    async fn edit_steps(&self, req: &edit::Request) -> Result<Value, Refusal> {
+        use axum::http::StatusCode;
+        let bad = |e: String| (StatusCode::UNPROCESSABLE_ENTITY, e);
+        let fail = |e: String| (StatusCode::INTERNAL_SERVER_ERROR, e);
+        let dir = self.s.project.as_deref().unwrap();
+        let p = loxone_config::Project::load(&dir.join("lox.toml"))
+            .map_err(|e| fail(format!("cannot read lox.toml: {e}")))?;
+        let pending = if p.out.exists() { &p.out } else { &p.base };
+        let bytes = std::fs::read(pending)
+            .map_err(|e| fail(format!("cannot read {}: {e}", pending.display())))?;
+        if crate::history::blob_id(&bytes) != req.base {
+            return Err((
+                StatusCode::CONFLICT,
+                "The pending config changed since this page showed it (a compile, Apply or Discard). \
+                 Look at the new one, then edit again."
+                    .into(),
+            ));
+        }
+        let doc = edit::parse_doc(&bytes)
+            .map_err(|e| fail(format!("cannot read {}: {e}", pending.display())))?;
+        let file = p.module.join(edit::FILE);
+        let shown = file
+            .strip_prefix(&p.root)
+            .unwrap_or(&file)
+            .display()
+            .to_string();
+        let old = std::fs::read_to_string(&file).ok();
+        let mut claims = match &old {
+            Some(t) => edit::Claims::parse(t)
+                .map_err(|e| (StatusCode::CONFLICT, format!("{shown}: {e}")))?,
+            None => edit::Claims::default(),
+        };
+        let managed = edit::managed(&p.lock);
+        let mut previous = Vec::new();
+        for op in &req.ops {
+            previous.push(edit::apply(&mut claims, &doc, &managed, op).map_err(bad)?);
+        }
+        let text = claims.render();
+        if old.as_deref() == Some(text.as_str()) || (old.is_none() && claims.0.is_empty()) {
+            return Ok(json!({ "previous": previous, "blob": req.base, "unchanged": true }));
+        }
+        // An edit compiles the whole module: it must not take along changes
+        // someone else made to it and has not compiled.
+        self.uncompiled(&p, dir).await?;
+        let mut undo = Undo::new(&file, old, &[&p.lock, &p.out]);
+        if let Some(parent) = file.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| fail(format!("cannot create {}: {e}", parent.display())))?;
+        }
+        std::fs::write(&file, &text).map_err(|e| fail(format!("cannot write {shown}: {e}")))?;
+        edit::check_module(&p.module).map_err(bad)?;
+        run(&self.s.lox, &["logic", "compile"], dir, COMPILE_TIMEOUT)
+            .await
+            .map_err(|e| {
+                bad(format!(
+                    "lox logic compile refused the edit:\n{}",
+                    last_lines(&e, 8)
+                ))
+            })?;
+        let blob = std::fs::read(&p.out)
+            .map(|b| crate::history::blob_id(&b))
+            .map_err(|e| {
+                fail(format!(
+                    "lox logic compile wrote no {}: {e}",
+                    p.out.display()
+                ))
+            })?;
+        undo.keep();
+        Ok(json!({ "previous": previous, "blob": blob }))
+    }
+
+    /// Refuse when the module holds changes that are not compiled into the
+    /// pending config: an edit's compile would fold them in. Module files
+    /// newer than `out` make vislox compile the module as it is into a
+    /// scratch copy and compare; only a different result refuses.
+    async fn uncompiled(&self, p: &loxone_config::Project, dir: &Path) -> Result<(), Refusal> {
+        use axum::http::StatusCode;
+        let refuse = |msg: String| (StatusCode::CONFLICT, msg);
+        let out_time = std::fs::metadata(&p.out).and_then(|m| m.modified()).ok();
+        let mut newer = Vec::new();
+        edit::module_files(&p.module, &mut |f, t| {
+            if out_time.is_none_or(|o| t > o) {
+                newer.push(f.strip_prefix(&p.root).unwrap_or(f).display().to_string());
+            }
+        });
+        if newer.is_empty() {
+            return Ok(());
+        }
+        let reference = std::fs::read(&p.out)
+            .or_else(|_| std::fs::read(&p.base))
+            .map_err(|e| refuse(format!("cannot read the pending config: {e}")))?;
+        let scratch = std::env::temp_dir().join(format!(
+            "vislox-check-{}-{}",
+            std::process::id(),
+            now_nanos()
+        ));
+        std::fs::create_dir_all(&scratch)
+            .map_err(|e| refuse(format!("cannot create {}: {e}", scratch.display())))?;
+        let _gone = RemoveDir(scratch.clone());
+        let (lock, out) = (scratch.join("lock.json"), scratch.join("out.Loxone"));
+        if p.lock.exists() {
+            std::fs::copy(&p.lock, &lock)
+                .map_err(|e| refuse(format!("cannot copy the lock: {e}")))?;
+        }
+        let (lock_s, out_s) = (lock.to_string_lossy(), out.to_string_lossy());
+        let args = ["logic", "compile", "--lock", &lock_s, "--out", &out_s];
+        let files = newer.join(", ");
+        match run(&self.s.lox, &args, dir, COMPILE_TIMEOUT).await {
+            Err(e) => Err(refuse(format!(
+                "The module does not compile as it is ({files} changed since the last compile). \
+                 Fix or discard that, then edit:\n{}",
+                last_lines(&e, 6)
+            ))),
+            Ok(_) if std::fs::read(&out).ok().as_deref() == Some(reference.as_slice()) => Ok(()),
+            Ok(_) => Err(refuse(format!(
+                "The module has changes that are not compiled yet ({files}). An edit compiles the \
+                 whole module and would take them along: compile them (lox logic compile) or \
+                 discard them first."
+            ))),
+        }
+    }
+
+    /// What vislox's file claims, and which of it is not deployed: the
+    /// pending config's value differs from the deployed config's
+    /// (`GET /api/edits`). `deployed` is the revision the Miniserver runs
+    /// (its commit, if any, and its bytes); `pending` the newest compile,
+    /// `None` when nothing is pending. Cached until [`Self::refresh_edit`]
+    /// sees a change.
+    pub async fn edits(
+        &self,
+        deployed: Option<DeployedRev>,
+        pending: Option<Arc<Vec<u8>>>,
+    ) -> Value {
+        let state = self.edit_state.lock().unwrap().clone();
+        if let Some((k, v)) = &*self.edits_cache.lock().unwrap()
+            && *k == state.key
+        {
+            return v.clone();
+        }
+        let v = self.edits_now(&state, deployed, pending).await;
+        *self.edits_cache.lock().unwrap() = Some((state.key, v.clone()));
+        v
+    }
+
+    async fn edits_now(
+        &self,
+        state: &EditState,
+        deployed: Option<DeployedRev>,
+        pending: Option<Arc<Vec<u8>>>,
+    ) -> Value {
+        let off =
+            || json!({ "available": false, "reason": state.why, "claims": [], "managed": [] });
+        let Some(dir) = self.s.project.as_deref() else {
+            return off();
+        };
+        let Ok(p) = loxone_config::Project::load(&dir.join("lox.toml")) else {
+            return off();
+        };
+        let file = p.module.join(edit::FILE);
+        let rel = file
+            .strip_prefix(&p.root)
+            .unwrap_or(&file)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let mut error = None;
+        let now = match std::fs::read_to_string(&file) {
+            Ok(t) => edit::Claims::parse(&t).unwrap_or_else(|e| {
+                error = Some(format!("{rel}: {e}"));
+                edit::Claims::default()
+            }),
+            Err(_) => edit::Claims::default(),
+        };
+        // The file as the deployed revision's commit had it.
+        let mut was = edit::Claims::default();
+        if let Some(commit) = deployed.as_ref().and_then(|d| d.commit.as_deref())
+            && let Ok(t) = git(dir, &["show", &format!("{commit}:./{rel}")]).await
+        {
+            was = edit::Claims::parse(&t).unwrap_or_default();
+        }
+        let deployed_doc = deployed
+            .as_ref()
+            .and_then(|d| edit::parse_doc(&d.bytes).ok());
+        let pending_doc = pending.as_ref().and_then(|b| edit::parse_doc(b).ok());
+        // (op without its value) → (claimed now, claimed when deployed)
+        type Slot = (edit::Op, (Option<String>, Option<String>));
+        let mut slots: std::collections::BTreeMap<String, Slot> = Default::default();
+        let key = |op: &edit::Op| serde_json::to_string(op).unwrap_or_default();
+        for (ops, now_side) in [(now.ops(), true), (was.ops(), false)] {
+            for op in ops {
+                let k = op.with_value(None);
+                let slot = slots.entry(key(&k)).or_insert((k, (None, None)));
+                let v = op.value().map(String::from);
+                if now_side { slot.1.0 = v } else { slot.1.1 = v }
+            }
+        }
+        let claims: Vec<Value> = slots
+            .into_values()
+            .map(|(op, (now, was))| {
+                let value_in = |d: &Option<loxone_config::LoxoneDoc>| {
+                    d.as_ref().and_then(|d| edit::current(d, &op))
+                };
+                let deployed_value = value_in(&deployed_doc);
+                // Nothing pending: the pending config is the deployed one.
+                let pending_value = if pending.is_some() {
+                    value_in(&pending_doc)
+                } else {
+                    deployed_value.clone()
+                };
+                let mut v = serde_json::to_value(&op).unwrap_or_default();
+                v["value"] = json!(now);
+                v["deployed"] = json!(was);
+                v["pending"] = json!(pending_value != deployed_value);
+                v
+            })
+            .collect();
+        let mut managed: Vec<String> = edit::managed(&p.lock).into_iter().collect();
+        managed.sort();
+        json!({
+            "available": state.why.is_none(),
+            "reason": state.why,
+            "file": rel,
+            "error": error,
+            "claims": claims,
+            "managed": managed,
+        })
     }
 
     /// Put the module, lock and compiled config back to the last commit.
@@ -1155,6 +1580,274 @@ mod tests {
         .unwrap();
         std::fs::set_permissions(&lox, std::fs::Permissions::from_mode(0o755)).unwrap();
         (tmp, lox)
+    }
+
+    /// A lox.toml project on the test fixture with nothing pending, and a
+    /// `lox` whose `logic compile` writes the title vislox claims for the
+    /// Divide block into out (or into `--out`). It refuses a title with
+    /// "refuse" in it, writes half an out and hangs for one with "slow", and
+    /// marks out when the module has a `foo.loxl` of someone else's. It logs
+    /// its calls, and fails on any other command.
+    #[cfg(unix)]
+    fn project_for_edits() -> (tempfile::TempDir, Actions) {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("project");
+        std::fs::create_dir_all(d.join("pages")).unwrap();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/house.Loxone");
+        std::fs::copy(&fixture, d.join("base.Loxone")).unwrap();
+        std::fs::copy(&fixture, d.join("out.Loxone")).unwrap();
+        std::fs::write(
+            d.join("lox.toml"),
+            "base = \"base.Loxone\"\nmodule = \"pages\"\nout = \"out.Loxone\"\n",
+        )
+        .unwrap();
+        sh(
+            &d,
+            "git init -q && git config user.email t@t && git config user.name t \
+             && git add -A && git commit -qm init",
+        );
+        let lox = tmp.path().join("lox");
+        std::fs::write(
+            &lox,
+            r#"#!/bin/sh
+echo "$*" >> ../calls.log
+[ "$1 $2" = "logic compile" ] || { echo "unexpected: $*" >&2; exit 2; }
+out=out.Loxone; prev=
+for a in "$@"; do [ "$prev" = --out ] && out=$a; prev=$a; done
+t=$(sed -n 's/.*\.title = "\(.*\)"$/\1/p' pages/vislox/edits.loxl 2>/dev/null)
+case "$t" in
+  *refuse*) echo 'compile error: refused' >&2; exit 1 ;;
+  *slow*) echo half > "$out"; echo half > logic.lock.json; exec sleep 30 ;;
+esac
+# No claim: lox puts the original title back.
+if [ -z "$t" ]; then sed 's/Title="Teiler"/Title="O1002"/' base.Loxone > "$out"; else sed "s/Title=\"O1002\"/Title=\"$t\"/" base.Loxone > "$out"; fi
+if [ -f pages/foo.loxl ]; then echo "<!-- foo -->" >> "$out"; fi
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&lox, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let a = Actions::new(Settings {
+            token: Some("t".into()),
+            project: Some(d),
+            lox,
+            probe: None,
+            running: Arc::new(crate::running::Running::new(Err("test".into()))),
+        });
+        (tmp, a)
+    }
+
+    const DIV: &str = "10000006-0000-0060-ffff504f94000001";
+
+    fn title(base: String, v: Option<&str>) -> edit::Request {
+        edit::Request {
+            base,
+            ops: vec![edit::Op::Title {
+                uuid: DIV.into(),
+                value: v.map(Into::into),
+            }],
+        }
+    }
+
+    fn blob(d: &Path, p: &str) -> String {
+        crate::history::blob_id(&std::fs::read(d.join(p)).unwrap())
+    }
+
+    /// `GET /api/edits` as main.rs asks for it: the deployed revision is the
+    /// last commit of the base, pending is out when it differs.
+    async fn edits_of(a: &Actions, d: &Path) -> Value {
+        let commit = git(d, &["log", "-1", "--format=%H", "--", "base.Loxone"])
+            .await
+            .unwrap()
+            .trim()
+            .to_string();
+        let bytes = Arc::new(std::fs::read(d.join("base.Loxone")).unwrap());
+        let out = Arc::new(std::fs::read(d.join("out.Loxone")).unwrap());
+        let pending = (out != bytes).then_some(out);
+        let pending_blob = pending.as_ref().map(|b| crate::history::blob_id(b));
+        a.refresh_edit(Some(&blob(d, "base.Loxone")), pending_blob.as_deref());
+        let deployed = DeployedRev {
+            commit: Some(commit),
+            bytes,
+        };
+        a.edits(Some(deployed), pending).await
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_edit_is_compiled_into_the_pending_config_and_never_deployed() {
+        use axum::http::StatusCode;
+        let (tmp, a) = project_for_edits();
+        let d = tmp.path().join("project");
+        let blob = |p: &str| blob(&d, p);
+        assert_eq!(a.info()["edit"]["available"], true);
+
+        let r = a
+            .edit(&title(blob("out.Loxone"), Some("Teiler")))
+            .await
+            .unwrap();
+        assert_eq!(r["previous"], json!([null]));
+        assert_eq!(r["blob"], json!(blob("out.Loxone")));
+        assert!(
+            std::fs::read_to_string(d.join("out.Loxone"))
+                .unwrap()
+                .contains("Title=\"Teiler\"")
+        );
+        let file = std::fs::read_to_string(d.join("pages").join(edit::FILE)).unwrap();
+        assert!(file.contains(".title = \"Teiler\""), "{file}");
+        let e = edits_of(&a, &d).await;
+        assert_eq!(e["file"], "pages/vislox/edits.loxl");
+        let c = &e["claims"][0];
+        assert_eq!(
+            (&c["value"], &c["deployed"], &c["pending"]),
+            (&json!("Teiler"), &Value::Null, &json!(true))
+        );
+
+        // Made against a config that is no longer pending.
+        let (code, msg) = a
+            .edit(&title(blob("base.Loxone"), Some("X")))
+            .await
+            .unwrap_err();
+        assert_eq!(code, StatusCode::CONFLICT, "{msg}");
+        // lox refuses: the file, the lock and out are as they were.
+        let out = blob("out.Loxone");
+        let (code, msg) = a
+            .edit(&title(out.clone(), Some("refuse me")))
+            .await
+            .unwrap_err();
+        assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(msg.contains("compile error: refused"), "{msg}");
+        assert_eq!(
+            std::fs::read_to_string(d.join("pages").join(edit::FILE)).unwrap(),
+            file
+        );
+        assert_eq!(blob("out.Loxone"), out);
+        // A value vislox refuses never reaches lox.
+        let calls = || std::fs::read_to_string(tmp.path().join("calls.log")).unwrap();
+        let before = calls();
+        let op = edit::Op::Param {
+            uuid: DIV.into(),
+            port: "Input1".into(),
+            value: Some("3".into()),
+        };
+        let (code, msg) = a
+            .edit(&edit::Request {
+                base: out.clone(),
+                ops: vec![op],
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(msg.contains("wired"), "{msg}");
+        assert_eq!(calls(), before);
+
+        // A plain commit does not deploy anything: still not deployed.
+        sh(&d, "git add -A && git commit -qm 'just a commit'");
+        assert_eq!(edits_of(&a, &d).await["claims"][0]["pending"], true);
+        // Applied (the base is what was compiled, committed): deployed.
+        sh(
+            &d,
+            "cp out.Loxone base.Loxone && git add -A && git commit -qm applied",
+        );
+        let c = edits_of(&a, &d).await["claims"][0].clone();
+        assert_eq!(
+            (&c["deployed"], &c["pending"]),
+            (&json!("Teiler"), &json!(false))
+        );
+        // Dropping the claim is an edit too: back to Loxone Config's title,
+        // not deployed; Revert would claim the deployed value again.
+        let r = a.edit(&title(blob("out.Loxone"), None)).await.unwrap();
+        assert_eq!(r["previous"], json!(["Teiler"]));
+        let c = edits_of(&a, &d).await["claims"][0].clone();
+        assert_eq!(
+            (&c["value"], &c["deployed"], &c["pending"]),
+            (&Value::Null, &json!("Teiler"), &json!(true))
+        );
+        // Only `lox logic compile` ran: nothing was pushed.
+        assert!(
+            calls().lines().all(|l| l.starts_with("logic compile")),
+            "{}",
+            calls()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_dropped_edit_clears_running_and_puts_everything_back() {
+        let (tmp, a) = project_for_edits();
+        let d = tmp.path().join("project");
+        let out = std::fs::read(d.join("out.Loxone")).unwrap();
+        let req = title(blob(&d, "out.Loxone"), Some("slow"));
+        // The browser goes away while lox compiles (and has written half of out).
+        let edit = a.edit(&req);
+        let r = tokio::time::timeout(Duration::from_millis(1500), edit).await;
+        assert!(r.is_err(), "the compile should still run");
+        assert_eq!(a.info()["running"], Value::Null);
+        assert_eq!(std::fs::read(d.join("out.Loxone")).unwrap(), out);
+        assert!(!d.join("logic.lock.json").exists());
+        assert!(!d.join("pages/vislox").exists());
+        // And the next edit runs.
+        a.edit(&title(blob(&d, "out.Loxone"), Some("Teiler")))
+            .await
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_edit_does_not_take_along_module_changes_nobody_compiled() {
+        use axum::http::StatusCode;
+        let (tmp, a) = project_for_edits();
+        let d = tmp.path().join("project");
+        // A file newer than out that compiles to the same config: fine.
+        std::fs::write(d.join("pages/notes.txt"), "x").unwrap();
+        a.edit(&title(blob(&d, "out.Loxone"), Some("Teiler")))
+            .await
+            .unwrap();
+        // Someone else's change, not compiled: refused, nothing written.
+        let file = std::fs::read_to_string(d.join("pages").join(edit::FILE)).unwrap();
+        let out = blob(&d, "out.Loxone");
+        std::fs::write(d.join("pages/foo.loxl"), "# someone else's\n").unwrap();
+        let (code, msg) = a.edit(&title(out.clone(), Some("Neu"))).await.unwrap_err();
+        assert_eq!(code, StatusCode::CONFLICT);
+        assert!(
+            msg.contains("not compiled yet") && msg.contains("pages/foo.loxl"),
+            "{msg}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(d.join("pages").join(edit::FILE)).unwrap(),
+            file
+        );
+        assert_eq!(blob(&d, "out.Loxone"), out);
+    }
+
+    #[test]
+    fn editing_needs_a_module_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        let on = |module: &str| {
+            std::fs::write(
+                d.join("lox.toml"),
+                format!("base = \"b.Loxone\"\nmodule = \"{module}\"\n"),
+            )
+            .unwrap();
+            actions(Some("t"), Some(d)).info()["edit"].clone()
+        };
+        std::fs::write(d.join("m.loxl"), "").unwrap();
+        let e = on("m.loxl");
+        assert!(
+            e["reason"]
+                .as_str()
+                .unwrap()
+                .contains("make it a directory"),
+            "{e}"
+        );
+        let e = on("gone.loxl");
+        assert!(
+            e["reason"].as_str().unwrap().contains("does not exist"),
+            "{e}"
+        );
+        // A module directory not made yet: the first edit makes it.
+        assert_eq!(on("pages")["available"], true);
     }
 
     #[cfg(unix)]

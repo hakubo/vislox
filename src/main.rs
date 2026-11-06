@@ -7,6 +7,7 @@ mod backups;
 mod calendar;
 mod configdate;
 mod discover;
+mod edit;
 mod hardware;
 mod history;
 mod live;
@@ -523,6 +524,8 @@ async fn main() -> Result<()> {
         .route("/api/backups/read", axum::routing::post(api_backups_read))
         .route("/api/apply", axum::routing::post(api_apply))
         .route("/api/discard", axum::routing::post(api_discard))
+        .route("/api/edit", axum::routing::post(api_edit))
+        .route("/api/edits", get(api_edits))
         .route("/api/sync", axum::routing::post(api_sync))
         .route("/api/operate", axum::routing::post(api_operate))
         .with_state(app)
@@ -639,6 +642,7 @@ fn refresh(app: &App) {
     if let Some(v) = version {
         let _ = app.tx.send(v);
     }
+    refresh_edit(app);
 }
 
 fn spawn_watcher(app: Arc<App>) -> Result<()> {
@@ -1390,11 +1394,11 @@ async fn api_calendar(
     }
 }
 
-/// The revision the app's calendar edits are compared with: the deployed
-/// config. That is the newest commit of the watched file (the last Pull,
+/// The revision the Miniserver runs, which the app's calendar edits and
+/// vislox's edits are compared with: the deployed config. That is the newest commit of the watched file (the last Pull,
 /// Apply or Sync), not an uncommitted edit on disk, which the Miniserver
 /// does not run; without git, the file on disk. Never a pending compile.
-fn deployed_for_calendar(hist: Vec<history::Revision>) -> Option<history::Revision> {
+fn deployed_revision(hist: Vec<history::Revision>) -> Option<history::Revision> {
     let i = hist
         .iter()
         .position(|r| r.kind == "git")
@@ -1403,7 +1407,7 @@ fn deployed_for_calendar(hist: Vec<history::Revision>) -> Option<history::Revisi
 }
 
 /// The last read of the Miniserver's calendar entries against the deployed
-/// revision ([`deployed_for_calendar`]). Blocking: it may parse
+/// revision ([`deployed_revision`]). Blocking: it may parse
 /// that revision.
 fn calendar_drift(app: &App) -> Result<Arc<serde_json::Value>, String> {
     let Some(read) = app.calendar.last() else {
@@ -1424,7 +1428,7 @@ fn calendar_drift(app: &App) -> Result<Arc<serde_json::Value>, String> {
     let rev = {
         let h = app.history.lock().unwrap();
         let (_, hist) = h.list();
-        deployed_for_calendar(hist)
+        deployed_revision(hist)
     };
     let Some(rev) = rev else {
         return Ok(Arc::new(serde_json::json!({
@@ -1467,6 +1471,67 @@ async fn api_discard(State(app): State<Arc<App>>, headers: axum::http::HeaderMap
         Ok(m) => Json(serde_json::json!({ "message": m })).into_response(),
         Err(r) => refused(r),
     }
+}
+
+/// Values edited in Properties: written into the module and compiled, so
+/// they show as the pending revision. Never deploys, and never talks to the
+/// Miniserver (no preflight): only Apply does.
+async fn api_edit(
+    State(app): State<Arc<App>>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<edit::Request>,
+) -> Response {
+    if let Err(r) = app.actions.check(&headers) {
+        return refused(r);
+    }
+    let res = app.actions.edit(&req).await;
+    let a = app.clone();
+    let _ = tokio::task::spawn_blocking(move || refresh(&a)).await;
+    match res {
+        Ok(v) => Json(v).into_response(),
+        Err(r) => refused(r),
+    }
+}
+
+/// What vislox's file of the module claims, and which of it is not deployed.
+async fn api_edits(State(app): State<Arc<App>>) -> Response {
+    let a = app.clone();
+    let revs = tokio::task::spawn_blocking(move || {
+        let mut h = a.history.lock().unwrap();
+        let lists = h.lists();
+        let deployed = deployed_revision(lists.history.clone());
+        let pending = lists.pending.first().filter(|r| r.current).cloned();
+        let deployed = deployed.and_then(|r| {
+            Some(actions::DeployedRev {
+                commit: r.id.strip_prefix("git:").map(String::from),
+                bytes: h.content(&r.blob)?,
+            })
+        });
+        let pending = pending.and_then(|r| h.content(&r.blob));
+        (deployed, pending)
+    })
+    .await;
+    let (deployed, pending) = revs.unwrap_or((None, None));
+    Json(app.actions.edits(deployed, pending).await).into_response()
+}
+
+/// Tell [`actions::Actions::refresh_edit`] the deployed and the pending
+/// config. Blocking (the history lock).
+fn refresh_edit(app: &App) {
+    let (deployed, pending) = {
+        let h = app.history.lock().unwrap();
+        let lists = h.lists();
+        (
+            deployed_revision(lists.history.clone()).map(|r| r.blob),
+            lists
+                .pending
+                .first()
+                .filter(|r| r.current)
+                .map(|r| r.blob.clone()),
+        )
+    };
+    app.actions
+        .refresh_edit(deployed.as_deref(), pending.as_deref());
 }
 
 /// Make the Miniserver's running config the project's base, commit, push.
@@ -1596,7 +1661,7 @@ mod tests {
         assert_eq!(pending.len(), 1);
         assert!(hist[0].current && hist[0].kind == "live");
 
-        let rev = deployed_for_calendar(hist).unwrap();
+        let rev = deployed_revision(hist).unwrap();
         assert_eq!(rev.kind, "git");
         let bytes = h.content(&rev.blob).unwrap();
         let doc = LoxoneDoc::parse(&bytes).unwrap();
@@ -1625,7 +1690,7 @@ mod tests {
         let mut h = History::new(f, Some(o));
         h.poll_files();
         let (_, hist) = h.list();
-        let rev = deployed_for_calendar(hist).unwrap();
+        let rev = deployed_revision(hist).unwrap();
         assert!(rev.current && rev.kind == "live");
     }
 

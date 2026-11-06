@@ -161,6 +161,7 @@ async function loadHistory(fromEvent) {
   renderLiveSwitch();
   renderPull();
   renderActions();
+  editsChanged();
   renderLog();
   if (fromEvent) {
     setStatus("updated " + new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }), "live flash");
@@ -1040,6 +1041,16 @@ function calTip(cal) {
 
 const propRow = (k, v, cls, tip) => `<div class="pr ${cls || ""}"><div class="k${tip ? " hinted" : ""}"${tip ? ` title="${esc(tip)}"` : ""}>${esc(k)}</div><div class="v">${v}</div></div>`;
 function renderProps() {
+  // Live values re-render Properties often: keep the edit field being typed in.
+  const f = document.activeElement?.closest?.("#props [data-ed-field]");
+  const keep = f && { field: f.dataset.edField, a: f.selectionStart, b: f.selectionEnd };
+  renderPropsBody();
+  if (keep) {
+    const g = $("props").querySelector(`[data-ed-field="${CSS.escape(keep.field)}"]`);
+    if (g) { g.focus(); try { g.setSelectionRange(keep.a, keep.b); } catch { /* not a text field */ } }
+  }
+}
+function renderPropsBody() {
   const box = $("props");
   const o = S.sel && S.view?.objects[S.sel];
   if (!o) {
@@ -1055,6 +1066,8 @@ function renderProps() {
   const section = (name, rows, count) => { if (rows.length) sections.push({ name, rows, count }); };
   const row = propRow;
 
+  const ed = editRows(o, row);
+  if (ed) section("Edit", ed.rows, ed.count);
   const opT = opTarget(o);
   if (opT) section("Operate", [opControls(opT)]);
   if (liveHere()) {
@@ -1165,10 +1178,29 @@ function renderProps() {
     }).join("");
 }
 $("props").addEventListener("keydown", (e) => {
+  const f = e.target.closest("[data-ed-field]");
+  if (f && e.key === "Enter") { e.preventDefault(); editSave(); return; }
+  if (f && e.key === "Escape") { e.preventDefault(); e.stopPropagation(); editClose(); return; }
   const i = e.target.closest(".op input");
   if (i && e.key === "Enter") { e.preventDefault(); operate(i.dataset.opUuid, i.value); }
 });
+$("props").addEventListener("input", (e) => {
+  const f = e.target.closest("[data-ed-field]");
+  if (!f || S.edit.uuid !== S.sel) return;
+  S.edit.draft[f.dataset.edField] = f.value;
+  delete S.edit.bad[f.dataset.edField];
+});
 $("props").addEventListener("click", (e) => {
+  const eb = e.target.closest("[data-ed]");
+  if (eb) {
+    const what = eb.dataset.ed;
+    if (what === "open") editOpen(S.sel);
+    else if (what === "save") editSave();
+    else if (what === "cancel") editClose();
+    else if (what === "revert") editRevert(eb.dataset.key);
+    else if (what === "newest") editGoNewest();
+    return;
+  }
   const ob = e.target.closest("[data-op]");
   if (ob) { operate(ob.dataset.opUuid, ob.dataset.op === "set" ? ob.closest(".op").querySelector("input").value : ob.dataset.op); return; }
   const h = e.target.closest(".ps-h");
@@ -1931,9 +1963,11 @@ function renderActions() {
   const pend = pendingChange();
   $("deploy-pend").classList.toggle("idle", !pend && !a.running);
   $("deploy-pend").textContent = a.running === "Apply" ? "Deploying to the Miniserver… (download, check, upload, restart, verify)"
-    : a.running ? `${a.running}…` : pend ? `Compiled changes are pending (${fmtWhen(pend.time)}). Review them, then apply.`
+    : a.running === "Edit" ? "Compiling the edited values… (lox logic compile; nothing is deployed)"
+    : a.running ? `${a.running}…` : pend ? `Compiled changes are pending (${fmtWhen(pend.time)}), not deployed.` +
+      (editsPending().length ? ` They include ${plural(editsPending().length, "value")} edited here.` : "") + " Review them, then apply."
     : !a.apply.available ? `Apply is off: ${a.apply.reason}.`
-    : "Nothing pending. Edit the project's module and compile it (lox logic …); the result shows here for review.";
+    : `Nothing pending. ${a.edit?.available ? "Edit values in Properties, or edit" : "Edit"} the project's module and compile it (lox logic …); the result shows here for review.`;
   $("deploy-row").classList.toggle("hidden", !pend && !a.running);
   $("btn-apply").disabled = !a.apply.available || busy || !pend || applyAsking;
   const sync = $("btn-sync");
@@ -2309,10 +2343,160 @@ $("btn-sync").onclick = async () => {
   try { const j = await act("/api/sync"); deployMsg(j.message); } catch (err) { deployMsg(err.message, true); }
 };
 $("btn-discard").onclick = async () => {
-  if (!window.confirm("Discard the pending changes? The module, lock and compiled config go back to the last commit.")) return;
+  if (!window.confirm("Discard the pending changes? The module (with the values edited here), lock and compiled config go back to the last commit.")) return;
   deployMsg("");
   try { const j = await act("/api/discard"); deployMsg(j.message); } catch (err) { deployMsg(err.message, true); }
 };
+
+// ── editing values (Properties) ────────────────────────────────────────
+// A block's name, its unwired inputs' constants and the settings of a physical input or output are
+// edited here. The server writes them into vislox's own file of the project's module and runs
+// lox logic compile (docs/editing.md); the compile shows as the pending revision, so it is reviewed,
+// applied and discarded like any other. Saving never deploys: only Apply does.
+S.edits = null; // GET /api/edits: what vislox's file claims, and which of it is not deployed
+S.edit = { uuid: null, open: false, draft: {}, bad: {}, busy: false, msg: "", err: "" };
+S.editsKey = null; // the server's key of what /api/edits says (vislox's file, deployed and pending config)
+async function loadEdits() {
+  if (!S.hist?.actions?.shown) { S.edits = null; return; }
+  try { S.edits = await api("/api/edits"); } catch { S.edits = null; S.editsKey = null; }
+  renderActions();
+  if (S.sel && S.view) renderProps();
+}
+/** Fetch the edits again only when the server says they may have changed. */
+function editsChanged() {
+  const key = S.hist?.actions?.edit?.key ?? null;
+  if (key !== S.editsKey) { S.editsKey = key; loadEdits(); }
+}
+/** One claimed value, whatever the order of the list: its op, object and port or setting. */
+function editKey(c) { return [c.op, c.uuid, c.port ?? c.name ?? ""].join("|"); }
+/** The revision edits are made against: the newest compile, else the deployed config on disk. */
+function editRev() {
+  const p = S.hist?.pending?.[0];
+  if (p?.current) return p;
+  const h = S.hist?.history?.[0];
+  return h?.current ? h : null;
+}
+/** The values vislox edited and has not deployed yet, of one object or of all. */
+function editsPending(uuid) { return (S.edits?.claims || []).filter((c) => c.pending && (!uuid || c.uuid === uuid)); }
+/** Whether `o` can be edited now: `{ ok }`, or `{ why }` and maybe `{ newest }` to go to. */
+function editState(o) {
+  const a = S.hist?.actions;
+  if (!a?.shown || !o.edit) return null;
+  if (!a.edit?.available) return { why: `Editing is off: ${a.edit?.reason || "unknown"}.` };
+  if (S.edits?.managed?.includes(o.uuid)) return { why: "The project's module manages this block: change it in its .loxl file." };
+  const r = editRev();
+  if (!r) return { why: "The config on disk is not in the History yet." };
+  if (S.rev !== r.id) return { why: `Edits are made on the newest config (${r.kind === "pending" ? "Pending" : "deployed"}).`, newest: r };
+  if (a.running) return { why: `${a.running} is running.` };
+  return { ok: true, rev: r };
+}
+const EDIT_ATTR = { title: "Name", room: "Room", category: "Category" };
+function editLabel(o, c) { return EDIT_ATTR[c.op] || (c.op === "param" ? portName(o, c.port) : c.name); }
+/** The config's rooms or categories by title; a title two of them share cannot be picked (lox claims by title). */
+function editPlaces(ty) {
+  const n = new Map();
+  for (const x of Object.values(S.view?.objects || {})) if (x.ty === ty && x.status !== "removed") n.set(x.title, (n.get(x.title) || 0) + 1);
+  return [...n].sort((a, b) => a[0].localeCompare(b[0]));
+}
+/** The fields of the edit form: [field, label, value now, kind, unit]. */
+function editFields(o) {
+  const f = [];
+  if (o.edit.title) f.push(["title", "Name", o.title || "", "text"]);
+  if (o.edit.room) f.push(["room", "Room", o.room || "", "Place"]);
+  if (o.edit.category) f.push(["category", "Category", o.category || "", "Category"]);
+  for (const p of o.edit.params) f.push([`p:${p.key}`, portName(o, p.key), o.ports.find((q) => q.key === p.key)?.def ?? "0", "number", p.unit]);
+  for (const st of o.edit.settings) f.push([`s:${st.name}`, st.name, st.value ?? "", st.text ? "text" : "number"]);
+  return f;
+}
+function editRows(o, row) {
+  const st = editState(o);
+  if (!st) return null;
+  const rows = [];
+  const mine = S.edit.uuid === o.uuid ? S.edit : null;
+  // What was edited here and is not deployed yet, each with a way back.
+  for (const c of editsPending(o.uuid)) {
+    const v = c.value == null ? '<span class="none-v">back to Loxone Config\'s value</span>' : esc(c.value);
+    rows.push(row(editLabel(o, c), `<span class="ed-v">${v}</span><span class="ed-tag" title="Saved into the module and compiled, not on the Miniserver yet: Apply deploys it, Discard drops it">not deployed</span>` +
+      (st.ok ? `<button type="button" class="ed-btn small" data-ed="revert" data-key="${esc(editKey(c))}" title="${c.deployed == null ? "Hand the value back to Loxone Config" : `Back to ${esc(c.deployed)}, as deployed`}">Revert</button>` : ""), "pr-chg"));
+  }
+  if (!st.ok) {
+    rows.push(`<div class="ed-note">${esc(st.why)}${st.newest ? ' <button type="button" class="lnk" data-ed="newest">View it</button>' : ""}</div>`);
+  } else if (!mine?.open) {
+    rows.push(`<div class="ed-bar"><button type="button" class="ed-btn small" data-ed="open">Edit values</button>` +
+      (mine?.msg ? `<span class="ed-msg${mine.err ? " err" : ""}" role="status">${esc(mine.msg)}</span>` : "") + "</div>");
+  } else {
+    for (const [field, label, now, kind, unit] of editFields(o)) {
+      const v = mine.draft[field] ?? now, bad = mine.bad[field];
+      const id = `ed-${field.replace(/[^\w-]/g, "_")}`;
+      const attrs = `id="${id}" data-ed-field="${esc(field)}"${bad ? ` aria-invalid="true" aria-describedby="${id}-e"` : ""}${mine.busy ? " disabled" : ""}`;
+      const input = kind === "Place" || kind === "Category"
+        ? `<select ${attrs}>${editPlaces(kind).map(([t, n]) => `<option value="${esc(t)}"${t === v ? " selected" : ""}${n > 1 ? ' disabled title="Two of them have this title: rename one in Loxone Config to pick it"' : ""}>${esc(t)}</option>`).join("")}</select>`
+        : `<input ${attrs} value="${esc(v)}" ${kind === "number" ? 'inputmode="decimal" class="num"' : ""} autocomplete="off" spellcheck="false">`;
+      rows.push(`<div class="pr ed-row"><label class="k" for="${id}">${esc(label)}</label><div class="v">${input}` +
+        (unit ? `<span class="ed-unit">${esc(unit)}</span>` : "") + (bad ? `<div class="ed-bad" id="${id}-e">${esc(bad)}</div>` : "") + "</div></div>");
+    }
+    rows.push(`<div class="ed-bar"><button type="button" class="primary small" data-ed="save"${mine.busy ? " disabled" : ""}>${mine.busy ? "Compiling…" : "Save"}</button>` +
+      `<button type="button" class="ed-btn small" data-ed="cancel"${mine.busy ? " disabled" : ""}>Cancel</button>` +
+      `<span class="ed-msg${mine.err ? " err" : ""}" role="status" aria-live="polite">${esc(mine.err || mine.msg || "Saving compiles the module; nothing is deployed.")}</span></div>`);
+  }
+  return { rows, count: editsPending(o.uuid).length };
+}
+function editOpen(uuid) {
+  S.edit = { uuid, open: true, draft: {}, bad: {}, busy: false, msg: "", err: "" };
+  S.closed.delete("Edit");
+  renderProps();
+  $("props").querySelector("[data-ed-field]")?.focus();
+}
+function editClose() {
+  if (S.edit.busy) return;
+  S.edit = { uuid: S.edit.uuid, open: false, draft: {}, bad: {}, busy: false, msg: "", err: "" };
+  renderProps();
+  $("props").querySelector('[data-ed="open"]')?.focus();
+}
+const EDIT_NUMBER = /^-?\d+(\.\d+)?$/;
+async function editSave() {
+  const o = S.view?.objects[S.edit.uuid], st = o && editState(o);
+  if (!st?.ok || S.edit.busy || !S.edit.open) return;
+  const ops = [], bad = {};
+  for (const [field, , now, kind] of editFields(o)) {
+    const v = S.edit.draft[field];
+    if (v == null || v === now) continue;
+    const t = kind === "number" ? v.trim() : v;
+    if (kind === "number" && !EDIT_NUMBER.test(t)) { bad[field] = /,/.test(t) ? "Write a decimal point, not a comma." : "A number, like 12 or -2.5."; continue; }
+    if (field === "title" && !t.trim()) { bad[field] = "The name cannot be empty."; continue; }
+    const [k, key] = field.split(/:(.*)/s);
+    ops.push(EDIT_ATTR[field] ? { op: field, uuid: o.uuid, value: t } : k === "p" ? { op: "param", uuid: o.uuid, port: key, value: t } : { op: "setting", uuid: o.uuid, name: key, value: t });
+  }
+  S.edit.bad = bad; S.edit.err = ""; S.edit.msg = "";
+  if (Object.keys(bad).length) { S.edit.err = "Fix the marked values."; renderProps(); $("props").querySelector('[aria-invalid="true"]')?.focus(); return; }
+  if (!ops.length) { S.edit.msg = "Nothing changed."; renderProps(); return; }
+  await editSend(o.uuid, st.rev, ops);
+}
+/** Send the edits; on success show the new pending revision. */
+async function editSend(uuid, rev, ops) {
+  S.edit.busy = true; S.edit.uuid = uuid; renderProps();
+  try {
+    await act("/api/edit", { base: rev.blob, ops });
+    S.edit = { uuid, open: false, draft: {}, bad: {}, busy: false, msg: "Saved and compiled: pending, not deployed. Review it, then Apply or Discard.", err: "" };
+    await editShowNewest();
+  } catch (err) {
+    S.edit.busy = false; S.edit.err = err.message;
+    renderProps();
+  }
+}
+/** Back to the deployed value: claim what the deployed revision claimed, or nothing. */
+async function editRevert(key) {
+  const c = (S.edits?.claims || []).find((x) => editKey(x) === key && x.pending), o = c && S.view?.objects[c.uuid], st = o && editState(o);
+  if (!st?.ok) return;
+  const op = EDIT_ATTR[c.op] ? { op: c.op, uuid: c.uuid } : c.op === "param" ? { op: "param", uuid: c.uuid, port: c.port } : { op: "setting", uuid: c.uuid, name: c.name };
+  await editSend(c.uuid, st.rev, [{ ...op, value: c.deployed }]);
+}
+async function editShowNewest() {
+  await loadHistory();
+  const r = editRev();
+  if (r && S.rev !== r.id) { S.rev = r.id; S.base = r.base || null; renderHistory(); renderSelects(); await loadView(); }
+}
+function editGoNewest() { S.follow = true; $("chk-follow").checked = true; editShowNewest(); }
 
 // ── the Miniserver's log ───────────────────────────────────────────────
 // `lox log` on the server: the system log's last lines. What came after the last program change
@@ -3280,7 +3464,16 @@ function connect() {
   es.addEventListener("history", () => { loadHistory(true); loadCal(); });
   // `changed`: re-read it. `read` again unchanged: only an Apply waiting for a read cares.
   es.addEventListener("app", (e) => { if (e.data !== "read" || (S.deployed && !awaitedAppRead())) loadApp(); });
-  es.addEventListener("actions", (e) => { if (S.hist) { S.hist.actions = JSON.parse(e.data); renderActions(); } });
+  es.addEventListener("actions", (e) => {
+    if (!S.hist) return;
+    const was = S.hist.actions;
+    S.hist.actions = JSON.parse(e.data);
+    renderActions();
+    editsChanged();
+    // The Edit section shows whether editing is on and what runs.
+    const a = S.hist.actions;
+    if ((was?.running !== a.running || was?.edit?.available !== a.edit?.available || was?.edit?.reason !== a.edit?.reason) && S.sel && S.view) renderProps();
+  });
   es.addEventListener("calendar", () => loadCal());
   es.addEventListener("operate", (e) => { if (S.hist) { S.hist.operate = JSON.parse(e.data); renderHistory(); } });
   es.onerror = () => setStatus("disconnected — retrying", "error");

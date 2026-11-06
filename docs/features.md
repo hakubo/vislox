@@ -156,6 +156,13 @@ sends to the Miniserver see [miniserver.md](miniserver.md).
   it waits until nothing is pending. When merge refuses because the Miniserver holds custom changes no download
   carries, Sync makes a plain download the base instead (rules edited in the app are then not taken over).
 
+- **Edit values** (for a `lox.toml` project, with the admin token): Properties' *Edit values* changes a block's
+  name, its room and category, the constant of an unwired input (lox checks it against the documented range) and the settings of a
+  physical input or output or a device. *Save* writes them into vislox's own file of the module and runs
+  `lox logic compile`, so they show as the pending revision; nothing is deployed until Apply. Each value saved and
+  not deployed says *not deployed*, with *Revert*; Discard drops them all. Blocks the module manages are edited in
+  their own `.loxl`. How it works, and what comes next: [editing.md](editing.md).
+
 For a `lox.toml` project:
 
 ```bash
@@ -233,7 +240,8 @@ vislox ~/loxone-config/project --admin-token-file ~/.config/vislox/admin-token
   preflight checks that the Miniserver at lox's address reports the config's serial; when it reports another
   one, none, or cannot be checked, nothing is sent.
 
-vislox itself never writes to the config: lox and git do, and only on Pull, Apply and Discard. Live values only
+vislox itself never writes to the config: lox and git do, and only on Pull, Apply, Sync, Discard and when
+values are edited (then only `lox logic compile` runs, into the pending config). Live values only
 listen, apart from two read-only requests for the heating and cooling periods each time they connect, unless you
 turn on **Query blocks on this page**, which sends read-only requests. A pull reads from the
 Miniserver; only Apply writes to it, and with `--operate`, commands to virtual inputs.
