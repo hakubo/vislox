@@ -1335,10 +1335,11 @@ function renderPull() {
   const b = $("btn-pull");
   // A config repository without a usable lox setup still gets the button, disabled, to say why.
   b.classList.toggle("hidden", !info.shown);
-  b.disabled = pulling || !info.available;
+  const blk = msBlocked();
+  b.disabled = pulling || !info.available || !!blk;
   b.classList.toggle("busy", pulling);
   b.querySelector(".lbl").textContent = pulling ? "Pulling…" : "Pull from Miniserver";
-  b.title = info.available ? "Download the Miniserver's current config and commit it (lox config pull)" : `Cannot pull: ${info.reason}`;
+  b.title = !info.available ? `Cannot pull: ${info.reason}` : blk ? `Cannot pull: ${blk}` : "Download the Miniserver's current config and commit it (lox config pull)";
 }
 function pullMsg(text, cls) {
   const m = $("pull-msg");
@@ -1361,11 +1362,61 @@ async function pull() {
   } catch (e) {
     pullMsg(e.message, "error");
   } finally {
-    pulling = false; renderPull();
+    pulling = false; renderPull(); loadMs();
   }
 }
 $("btn-pull").onclick = pull;
 $("pull-msg").onclick = () => pullMsg("");
+
+// ── the Miniserver: status chip and preflight ──────────────────────────
+// The server checks the Miniserver lox talks to (its web port, FTP, the unauthenticated
+// jdev/cfg/apiKey, lox's token) and refuses Pull, Apply and Sync when they could not work.
+S.ms = null;
+function msBlocked() { return S.ms?.available ? S.ms.blocked || "" : ""; }
+async function loadMs(fresh) {
+  try { S.ms = await api("/api/miniserver" + (fresh ? "?fresh=1" : "")); } catch { return; }
+  renderMs(); renderPull(); renderActions();
+}
+function renderMs() {
+  const m = S.ms, chip = $("ms-chip");
+  chip.classList.toggle("hidden", !m?.available);
+  if (!m?.available) { closeMsPop(); return; }
+  const state = m.blocked ? "bad" : m.warnings.length ? "warn" : "ok";
+  chip.className = "ms-chip " + state;
+  $("ms-lbl").textContent = m.reachable ? [m.serial, m.firmware].filter(Boolean).join(" · ") || "Miniserver" : "Miniserver unreachable";
+  chip.title = m.blocked ? `Miniserver: ${m.blocked}`
+    : `Miniserver ${m.serial || ""} at ${m.host}` + (m.warnings.length ? `\n${m.warnings.join("\n")}` : "");
+  const tls = { on: "available", none: "none", expired: "certificate expired", unknown: "unknown" }[m.tls] || "unknown";
+  const tok = m.tokenValidUntil ? new Date(m.tokenValidUntil * 1000).toLocaleString([], { ...MONTH, year: "numeric", hour: "2-digit", minute: "2-digit" }) + (m.tokenValidUntil * 1000 < Date.now() ? " (expired)" : "") : "no token yet";
+  const row = (k, v) => v == null || v === "" ? "" : `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`;
+  $("ms-body").innerHTML = `<h3>Miniserver</h3><dl>
+      ${row("Address", m.host)}${row("Serial", m.serial)}${row("Firmware", m.firmware)}
+      ${row("Deployed config", m.config?.deployed && `Loxone Config ${m.config.deployed}`)}
+      ${row("Pending config", m.config?.pending && `Loxone Config ${m.config.pending}`)}
+      ${m.reachable ? row("Connection", m.local === false ? "remote" : m.local ? "local" : "unknown") + row("TLS", tls)
+        + row("Live-update slot", m.eventSlots == null ? "" : m.eventSlots ? "free" : "none free") : ""}
+      ${row("lox's token valid until", tok)}</dl>
+    ${m.checks.map((c) => `<div class="chk ${c.ok ? "ok" : "bad"}"><span class="dot" aria-hidden="true"></span><span><b>${esc(c.name)}</b> <span class="d">${esc(c.ok ? (c.detail === "answers" ? "answers" : "answers: " + c.detail) : c.detail)}</span></span></div>`).join("")}
+    ${m.blocked ? `<div class="blocked">Pull, Apply and Sync are off: ${esc(m.blocked)}</div>` : ""}
+    ${m.warnings.length ? `<ul class="warns">${m.warnings.map((w) => `<li>${esc(w)}</li>`).join("")}</ul>` : ""}`;
+  $("ms-when").textContent = "Checked " + new Date(m.checked * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
+function closeMsPop() { $("ms-pop").classList.add("hidden"); $("ms-chip").setAttribute("aria-expanded", "false"); }
+$("ms-chip").onclick = () => {
+  const open = $("ms-pop").classList.toggle("hidden") === false;
+  $("ms-chip").setAttribute("aria-expanded", String(open));
+  if (open) loadMs();
+};
+$("ms-recheck").onclick = async () => {
+  const b = $("ms-recheck");
+  b.disabled = true; b.textContent = "Checking…";
+  await loadMs(true);
+  b.disabled = false; b.textContent = "Check again";
+};
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && !$("ms-pop").classList.contains("hidden")) { closeMsPop(); $("ms-chip").focus(); e.stopPropagation(); }
+}, true);
+document.addEventListener("click", (e) => { if (!e.target.closest(".ms-wrap")) closeMsPop(); });
 
 // ── apply, sync, discard ───────────────────────────────────────────────
 // Whoever edits the lox.toml project's module and compiles it (a person, or an agent working in the
@@ -1390,6 +1441,7 @@ async function act(path, body) {
   });
   const j = await r.json().catch(() => ({}));
   if (r.status === 401) try { localStorage.removeItem("vislox.token"); } catch { /* private mode */ }
+  if (j.preflight || /apply|sync/.test(path)) loadMs();
   if (!r.ok) { const e = new Error(j.error || r.statusText); e.data = j; throw e; }
   return j;
 }
@@ -1410,22 +1462,25 @@ function renderActions() {
   if (!a?.shown) return;
   const busy = !!a.running;
   const pend = pendingChange();
+  const blk = msBlocked();
   $("deploy-pend").classList.toggle("idle", !pend && !a.running);
   $("deploy-pend").textContent = a.running === "Apply" ? "Deploying to the Miniserver… (download, check, upload, restart, verify)"
     : a.running ? `${a.running}…` : pend ? `Compiled changes are pending (${fmtWhen(pend.time)}). Review them, then apply.`
     : !a.apply.available ? `Apply is off: ${a.apply.reason}.`
     : "Nothing pending. Edit the project's module and compile it (lox logic …); the result shows here for review.";
   $("deploy-row").classList.toggle("hidden", !pend && !a.running);
-  $("btn-apply").disabled = !a.apply.available || busy || !pend;
+  $("btn-apply").disabled = !a.apply.available || busy || !pend || !!blk;
   const sync = $("btn-sync");
-  sync.disabled = !a.apply.available || busy || !!pend;
+  sync.disabled = !a.apply.available || busy || !!pend || !!blk;
   sync.classList.toggle("busy", a.running === "Sync");
   sync.querySelector(".lbl").textContent = a.running === "Sync" ? "Syncing…" : "Sync from Miniserver";
   sync.title = !a.apply.available ? `Cannot sync: ${a.apply.reason}`
+    : blk ? `Cannot sync: ${blk}`
     : pend ? "Apply or discard the pending changes first"
     : "Make the Miniserver's running config the project's base (lox config merge), then commit and push";
   $("btn-discard").disabled = !a.apply.available || busy || !pend;
-  $("btn-apply").title = a.apply.available ? "Deploy to the Miniserver with lox config push, then commit and push to git" : `Cannot apply: ${a.apply.reason}`;
+  $("btn-apply").title = !a.apply.available ? `Cannot apply: ${a.apply.reason}` : blk ? `Cannot apply: ${blk}`
+    : "Deploy to the Miniserver with lox config push, then commit and push to git";
   renderSteps(a);
   const last = a.last;
   if (last && last.at !== renderActions.shownAt) {
@@ -1907,3 +1962,6 @@ function connect() {
 }
 S.hash = readHash();
 loadHistory().then(connect);
+loadMs();
+// The chip stays roughly current while the page is open.
+setInterval(() => { if (!document.hidden) loadMs(); }, 5 * 60 * 1000);

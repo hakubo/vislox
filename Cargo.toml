@@ -10,6 +10,8 @@ license = "Apache-2.0"
 loxone-config = { git = "https://github.com/discostu105/lox" }
 loxone-client = { git = "https://github.com/discostu105/lox" }
 serde_yaml = "0.9"
+# The status check's unauthenticated jdev/cfg/apiKey request (loxone-client uses it too).
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 anyhow = "1"
 axum = "0.8"
 tower-http = { version = "0.6", features = ["compression-gzip"] }

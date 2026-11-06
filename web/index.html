@@ -36,6 +36,15 @@
   <label class="switch" title="Jump to each new revision as it appears">
     <input type="checkbox" id="chk-follow" checked><span class="track" aria-hidden="true"></span><span class="lbl"><span class="long">Follow latest</span><span class="short">Follow</span></span>
   </label>
+  <div class="ms-wrap">
+    <button id="ms-chip" class="ms-chip hidden" type="button" aria-haspopup="dialog" aria-expanded="false" aria-controls="ms-pop">
+      <span class="dot" aria-hidden="true"></span><span class="lbl" id="ms-lbl">Miniserver</span>
+    </button>
+    <div id="ms-pop" class="ms-pop hidden" role="dialog" aria-label="Miniserver status">
+      <div id="ms-body"></div>
+      <div class="ms-foot"><span id="ms-when"></span><button type="button" id="ms-recheck" class="pull-btn">Check again</button></div>
+    </div>
+  </div>
   <button id="btn-help" class="icon-btn" type="button" title="Keyboard shortcuts (?)" aria-label="Keyboard shortcuts">?</button>
   <div class="status" id="status" role="status" aria-live="polite"><span class="dot" aria-hidden="true"></span><span id="status-text">connecting…</span></div>
 </header>

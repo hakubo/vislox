@@ -6,6 +6,8 @@
 // CHROMIUM_PATH picks a browser other than Playwright's own.
 import { chromium } from "playwright";
 import { spawn, execFileSync } from "node:child_process";
+import { createServer } from "node:http";
+import { createServer as createTcpServer } from "node:net";
 import { mkdtempSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, appendFileSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
@@ -37,11 +39,24 @@ const liveFile = join(mkdtempSync(join(tmpdir(), "vislox-live-")), "stream.ndjso
 const liveLine = (control, state, value, uuid) => JSON.stringify({ control, state, value, uuid }) + "\n";
 writeFileSync(liveFile, liveLine("Temperatur", "value", "21.5", TEMP) + liveLine("AND", "active", "1", GATE));
 
+// A stand-in Miniserver for the status chip and the preflight: jdev/cfg/apiKey
+// over HTTP, and an FTP server that only greets (vislox reads the greeting).
+const listen = (srv) => new Promise((ok) => srv.listen(0, "127.0.0.1", () => ok(srv.address().port)));
+const msPort = await listen(createServer((req, res) => {
+  if (req.url !== "/jdev/cfg/apiKey") { res.writeHead(404); res.end(); return; }
+  res.setHeader("Content-Type", "application/json");
+  res.end(JSON.stringify({ LL: { control: "dev/cfg/apiKey", Code: "200",
+    value: "{'snr': '50:4F:94:00:00:01', 'version':'17.1.7.27', 'key':'00', 'local':true, 'httpsStatus':0}" } }));
+}));
+const ftpSockets = new Set();
+const ftp = createTcpServer((s) => { ftpSockets.add(s); s.on("close", () => ftpSockets.delete(s)); s.on("error", () => {}); s.end("220 fake FTP\r\n"); });
+const ftpPort = await listen(ftp);
+
 // "Pull from Miniserver" runs `lox config pull`. A lox configuration that pulls
 // into this repository, and a stand-in lox that commits a newer config.
 const loxDir = mkdtempSync(join(tmpdir(), "vislox-lox-"));
 const loxConfig = join(loxDir, "config.yaml");
-writeFileSync(loxConfig, `host: 127.0.0.1:9\nuser: u\npass: p\nserial: 504F94000001\nconfig_repo: ${repo}\n`);
+writeFileSync(loxConfig, `host: http://127.0.0.1:${msPort}\nuser: u\npass: p\nserial: 504F94000001\nconfig_repo: ${repo}\n`);
 const fakeLox = join(loxDir, "lox");
 writeFileSync(fakeLox, `#!/bin/sh
 [ "$*" = "config pull --quiet" ] || { echo "unexpected: $*" >&2; exit 2; }
@@ -54,7 +69,7 @@ chmodSync(fakeLox, 0o755);
 const port = 7900 + Math.floor(Math.random() * 90);
 const server = spawn(bin, [repo, "--listen", `127.0.0.1:${port}`, "--live-from", liveFile, "--lox", fakeLox], {
   stdio: ["ignore", "ignore", "pipe"],
-  env: { ...process.env, LOX_CONFIG: loxConfig },
+  env: { ...process.env, LOX_CONFIG: loxConfig, VISLOX_FTP_PORT: String(ftpPort) },
 });
 let log = "";
 server.stderr.on("data", (d) => (log += d));
@@ -131,10 +146,37 @@ try {
     edit('Title="Zähler"', 'Title="Stromzähler"');
     await page.waitForFunction((n) => document.querySelectorAll(".hrev").length > n, before, { timeout: 10000 });
   });
+  await step("the Miniserver chip shows its serial and firmware", async () => {
+    await page.waitForSelector("#ms-chip.ok");
+    assert.equal(await page.textContent("#ms-lbl"), "504F94000001 · 17.1.7.27");
+    await page.click("#ms-chip");
+    await page.waitForSelector("#ms-pop:not(.hidden)");
+    assert.match(await page.textContent("#ms-body"), /FTP \(port \d+\) answers: 220 fake FTP/);
+    await page.keyboard.press("Escape");
+    await page.waitForSelector("#ms-pop.hidden", { state: "attached" });
+  });
   await step("pull from the Miniserver commits a new backup and shows it", async () => {
     await page.click("#btn-pull");
     await page.waitForFunction(() => /^Pulled/.test(document.querySelector("#pull-msg")?.textContent || ""), null, { timeout: 15000 });
     await page.waitForFunction(() => [...document.querySelectorAll(".hrev .lbl")].some((n) => n.textContent === "Backup v2"), null, { timeout: 10000 });
+  });
+  await step("blocked FTP turns Pull off and says so", async () => {
+    await new Promise((ok) => { ftp.close(ok); for (const s of ftpSockets) s.destroy(); });
+    // "Check again" reuses a check from the last 2 s (the pull just ran one).
+    await page.waitForTimeout(2500);
+    await page.click("#ms-chip");
+    await page.click("#ms-recheck");
+    await page.waitForSelector("#ms-chip.bad");
+    assert.ok(await page.$eval("#btn-pull", (b) => b.disabled));
+    assert.match(await page.getAttribute("#btn-pull", "title"), /^Cannot pull: FTP \(port \d+\) is blocked between this host and the Miniserver/);
+    // The server refuses as well, whatever the page shows.
+    const r = await page.evaluate(() => fetch("/api/pull", { method: "POST", headers: { "X-Vislox": "pull" } }).then(async (r) => [r.status, (await r.json()).error]));
+    assert.equal(r[0], 503);
+    assert.match(r[1], /^Cannot pull: FTP/);
+    // The browser logs that refusal; it is the one expected here.
+    const i = errors.findIndex((e) => e.includes("status of 503"));
+    if (i >= 0) errors.splice(i, 1);
+    await page.keyboard.press("Escape");
   });
   await step("keyboard help opens and closes", async () => {
     await page.focus("#canvas");
