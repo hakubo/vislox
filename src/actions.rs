@@ -2,7 +2,9 @@
 //!
 //! - **Apply**: `lox config push --force` deploys what is pending (download,
 //!   drift check, upload, program restart, verify), then vislox commits the
-//!   project and pushes it to its git remote.
+//!   project and pushes it to its git remote. Each step shows as it happens
+//!   (`progress`): lox's own progress lines, and what vislox sees of the
+//!   program restart (`restart.rs`).
 //! - **Sync**: make what the Miniserver runs now the project's base
 //!   (`lox config merge`), then commit and push.
 //! - **Discard**: put the module, lock and compiled config back to the last
@@ -15,12 +17,13 @@
 //! All three need the admin token (`X-Vislox-Token`). vislox itself still
 //! writes no config: lox and git do.
 
+use crate::restart;
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 
 /// `lox config push --force` downloads twice and restarts the program.
 const PUSH_TIMEOUT: Duration = Duration::from_secs(600);
@@ -30,6 +33,9 @@ pub struct Settings {
     pub token: Option<String>,
     pub project: Option<PathBuf>,
     pub lox: PathBuf,
+    /// The Miniserver, to follow Apply's program restart. None: only lox's
+    /// own progress shows.
+    pub probe: Option<Arc<dyn restart::Probe>>,
 }
 
 pub struct Actions {
@@ -45,6 +51,184 @@ struct St {
     /// What Apply or Discard is doing now.
     running: Option<&'static str>,
     last: Option<Outcome>,
+    /// The steps of the running or last Apply.
+    progress: Option<Progress>,
+}
+
+/// An Apply, step by step.
+#[derive(Clone, Serialize)]
+struct Progress {
+    steps: Vec<Step>,
+    /// lox's last lines, for the details.
+    log: Vec<String>,
+    at: i64,
+}
+
+#[derive(Clone, Serialize)]
+struct Step {
+    id: &'static str,
+    label: &'static str,
+    /// `wait`, `run`, `ok`, `skip` or `fail`
+    state: &'static str,
+    detail: Option<String>,
+    /// When it started and ended (Unix seconds).
+    at: Option<i64>,
+    end: Option<i64>,
+}
+
+/// Apply's steps, in order.
+const APPLY_STEPS: [(&str, &str); 8] = [
+    ("check", "Download and drift check"),
+    ("upload", "Upload"),
+    ("restart", "Program restarting"),
+    ("online", "Back online"),
+    ("loaded", "New config loaded"),
+    ("verify", "Verified"),
+    ("commit", "Committed"),
+    ("push", "Pushed to git"),
+];
+const LOG_LINES: usize = 12;
+
+impl Progress {
+    fn apply() -> Progress {
+        Progress {
+            steps: APPLY_STEPS
+                .iter()
+                .map(|&(id, label)| Step {
+                    id,
+                    label,
+                    state: "wait",
+                    detail: None,
+                    at: None,
+                    end: None,
+                })
+                .collect(),
+            log: Vec::new(),
+            at: now(),
+        }
+    }
+
+    fn get(&mut self, id: &str) -> &mut Step {
+        self.steps
+            .iter_mut()
+            .find(|s| s.id == id)
+            .expect("a known step")
+    }
+
+    /// `id` starts; the steps before it that still run are done.
+    fn start(&mut self, id: &str) {
+        let t = now();
+        for s in self.steps.iter_mut().take_while(|s| s.id != id) {
+            if s.state == "run" {
+                s.state = "ok";
+                s.end = Some(t);
+            }
+        }
+        let s = self.get(id);
+        if s.state == "wait" {
+            s.state = "run";
+            s.at = Some(t);
+        }
+    }
+
+    /// `id` ends as `state` (`ok`, `skip`, `fail`), with what to say.
+    fn finish(&mut self, id: &str, state: &'static str, detail: Option<String>) {
+        let t = now();
+        let s = self.get(id);
+        s.state = state;
+        s.at.get_or_insert(t);
+        s.end = Some(t);
+        if detail.is_some() {
+            s.detail = detail;
+        }
+    }
+
+    /// End a step that is not done yet; one already done keeps its outcome.
+    fn settle(&mut self, id: &str, detail: Option<&str>) {
+        if matches!(self.get(id).state, "wait" | "run") {
+            self.finish(id, "ok", detail.map(String::from));
+        }
+    }
+
+    /// A line of lox's output.
+    fn lox_line(&mut self, line: &str) {
+        let line = line.trim_end();
+        if line.trim().is_empty() {
+            return;
+        }
+        if self.log.len() == LOG_LINES {
+            self.log.remove(0);
+        }
+        self.log.push(line.to_string());
+        match push_step(line) {
+            Some("verified") => self.finish("verify", "ok", None),
+            Some("verify") => {
+                // lox waited until the program ran the upload.
+                self.settle("restart", None);
+                self.settle("online", None);
+                self.settle("loaded", Some("lox saw the new program running"));
+                self.start("verify");
+            }
+            Some(id) => self.start(id),
+            None => {}
+        }
+    }
+
+    /// What vislox saw of the restart.
+    fn restart_event(&mut self, e: restart::Event) {
+        match e {
+            restart::Event::OutOfService(why) => {
+                self.get("restart").detail = Some(format!("out of service ({why})"));
+                self.start("online");
+            }
+            restart::Event::BackOnline(secs) => {
+                self.finish("online", "ok", Some(format!("after {secs} s")));
+            }
+            restart::Event::Loaded(secs, version) => {
+                if self.get("online").state == "wait" {
+                    self.finish("restart", "ok", Some("no outage seen".into()));
+                    self.finish("online", "ok", Some("answered throughout".into()));
+                }
+                self.finish(
+                    "loaded",
+                    "ok",
+                    Some(format!("after {secs} s · structure {version}")),
+                );
+            }
+        }
+    }
+
+    /// The running step failed (else the first one not done).
+    fn fail(&mut self, why: &str) {
+        let id = self
+            .steps
+            .iter()
+            .find(|s| s.state == "run")
+            .or_else(|| self.steps.iter().find(|s| s.state == "wait"))
+            .map(|s| s.id);
+        if let Some(id) = id {
+            self.finish(id, "fail", Some(last_lines(why, 1)));
+        }
+    }
+}
+
+/// The step a line of `lox config push` starts (its `say` lines in
+/// `config_push.rs`); `verified` ends the verify step.
+fn push_step(line: &str) -> Option<&'static str> {
+    let l = line.trim_start();
+    if l.starts_with("Downloading the live config") {
+        Some("check")
+    } else if l.starts_with("Uploading as") {
+        Some("upload")
+    } else if l.starts_with("Restarting the program") || l.starts_with("Rebooting the Miniserver") {
+        Some("restart")
+    } else if l.starts_with("Downloading the config again") {
+        Some("verify")
+    } else if l.starts_with("Pushed and verified") {
+        Some("verified")
+    } else {
+        None
+    }
 }
 
 #[derive(Clone, Serialize)]
@@ -54,6 +238,16 @@ struct Outcome {
     ok: bool,
     message: String,
     at: i64,
+    /// After an Apply: the git blob ids of the base before and after, so the
+    /// UI can show the deployed revision compared with the one it replaced.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    deployed: Option<Deployed>,
+}
+
+#[derive(Clone, Serialize)]
+struct Deployed {
+    before: Option<String>,
+    after: String,
 }
 
 /// A refused or failed action: HTTP status and message.
@@ -113,6 +307,7 @@ impl Actions {
             "apply": flag(self.why_not_apply()),
             "running": st.running,
             "last": st.last,
+            "progress": st.progress,
         })
     }
 
@@ -156,6 +351,15 @@ impl Actions {
     }
 
     fn end(&self, kind: &'static str, res: &Result<String, String>) {
+        self.end_with(kind, res, None);
+    }
+
+    fn end_with(
+        &self,
+        kind: &'static str,
+        res: &Result<String, String>,
+        deployed: Option<Deployed>,
+    ) {
         let mut st = self.st.lock().unwrap();
         st.running = None;
         st.last = Some(Outcome {
@@ -165,7 +369,21 @@ impl Actions {
                 Ok(m) | Err(m) => m.clone(),
             },
             at: now(),
+            deployed,
         });
+        if let (Err(e), Some(p)) = (res, st.progress.as_mut().filter(|_| kind == "apply")) {
+            p.fail(e);
+        }
+        drop(st);
+        self.changed();
+    }
+
+    /// Change the progress of the running Apply, and tell the browsers.
+    fn progress(&self, f: impl FnOnce(&mut Progress)) {
+        let mut st = self.st.lock().unwrap();
+        if let Some(p) = st.progress.as_mut() {
+            f(p);
+        }
         drop(st);
         self.changed();
     }
@@ -179,13 +397,18 @@ impl Actions {
             .busy
             .try_lock()
             .map_err(|_| (StatusCode::CONFLICT, "already running".to_string()))?;
+        self.st.lock().unwrap().progress = Some(Progress::apply());
         self.begin("Apply")?;
         let res = self.apply_steps(opts).await;
-        self.end("apply", &res);
+        let (res, deployed) = match res {
+            Ok((m, d)) => (Ok(m), d),
+            Err(e) => (Err(e), None),
+        };
+        self.end_with("apply", &res, deployed);
         res.map_err(|e| (StatusCode::BAD_GATEWAY, e))
     }
 
-    async fn apply_steps(&self, opts: &ApplyOpts) -> Result<String, String> {
+    async fn apply_steps(&self, opts: &ApplyOpts) -> Result<(String, Option<Deployed>), String> {
         let dir = self.s.project.as_deref().unwrap();
         let mut args = vec!["config", "push", "--force"];
         if let Some(v) = &opts.accept_version {
@@ -212,27 +435,87 @@ impl Actions {
         .ok()
         .and_then(|o| o.lines().find(|l| !l.trim().is_empty()).map(String::from))
         .unwrap_or_else(|| "Apply pending changes".into());
-        let pushed = run(lox, &args, dir, PUSH_TIMEOUT)
+        let before = std::fs::read(&p.base)
+            .ok()
+            .map(|b| crate::history::blob_id(&b));
+        let pushed = self
+            .push_followed(lox, &args, dir)
             .await
             .map_err(|e| format!("lox config push failed:\n{e}"))?;
         let mut report = vec![last_lines(&pushed, 6)];
         if let Some(m) = keep_base(dir, &p.base)? {
             report.push(m);
         }
+        let deployed = std::fs::read(&p.base).ok().map(|b| Deployed {
+            before,
+            after: crate::history::blob_id(&b),
+        });
+        self.progress(|p| p.start("commit"));
         git(dir, &["add", "-A", "."]).await?;
         let staged = git(dir, &["diff", "--cached", "--quiet"]).await.is_err();
         if staged {
             git(dir, &["commit", "-q", "-m", &subject]).await?;
             report.push(format!("Committed: {subject}"));
+            self.progress(|p| p.finish("commit", "ok", Some(subject.clone())));
+        } else {
+            self.progress(|p| p.finish("commit", "skip", Some("nothing to commit".into())));
         }
+        self.progress(|p| p.start("push"));
         match git(dir, &["push", "-q"]).await {
-            Ok(_) => report.push("Pushed to git.".into()),
-            Err(e) => report.push(format!(
-                "Deployed and committed, but git push failed: {}",
-                last_lines(&e, 3)
-            )),
+            Ok(_) => {
+                report.push("Pushed to git.".into());
+                self.progress(|p| p.finish("push", "ok", None));
+            }
+            Err(e) => {
+                report.push(format!(
+                    "Deployed and committed, but git push failed: {}",
+                    last_lines(&e, 3)
+                ));
+                self.progress(|p| p.finish("push", "fail", Some(last_lines(&e, 1))));
+            }
         }
-        Ok(report.join("\n"))
+        Ok((report.join("\n"), deployed))
+    }
+
+    /// `lox config push`, its progress lines shown as they come. From the
+    /// program restart on, vislox also watches the Miniserver itself.
+    async fn push_followed(&self, lox: &Path, args: &[&str], dir: &Path) -> Result<String, String> {
+        self.progress(|p| p.start("check"));
+        // Follow the restart only when the Miniserver answers vislox now.
+        let watch_with = match &self.s.probe {
+            Some(pr) => restart::baseline(pr).await.map(|v| (pr.clone(), v)),
+            None => None,
+        };
+        let (go_tx, go_rx) = tokio::sync::oneshot::channel::<()>();
+        let mut go_tx = Some(go_tx);
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let push = async {
+            let res = run_lines(lox, args, dir, PUSH_TIMEOUT, |line| {
+                let step = push_step(line);
+                if step == Some("restart")
+                    && let Some(tx) = go_tx.take()
+                {
+                    let _ = tx.send(());
+                }
+                if step == Some("verify") {
+                    let _ = stop_tx.send(true);
+                }
+                self.progress(|p| p.lox_line(line));
+            })
+            .await;
+            let _ = stop_tx.send(true);
+            res
+        };
+        let follow = async {
+            if let (Some((probe, before)), Ok(())) = (watch_with, go_rx.await) {
+                restart::follow(probe, before, stop_rx, |e| {
+                    self.progress(|p| p.restart_event(e))
+                })
+                .await;
+            }
+        };
+        let (res, ()) = tokio::join!(push, follow);
+        res
     }
 
     /// Make the Miniserver's running config the project's base
@@ -524,6 +807,64 @@ async fn tracked(dir: &Path, path: &str) -> bool {
         .is_ok()
 }
 
+/// [`run`], with each line of its output (standard output and error) handed
+/// to `on_line` as it comes.
+async fn run_lines(
+    cmd: &Path,
+    args: &[&str],
+    dir: &Path,
+    limit: Duration,
+    mut on_line: impl FnMut(&str),
+) -> Result<String, String> {
+    use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
+    let mut c = tokio::process::Command::new(cmd);
+    c.args(args)
+        .current_dir(dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = c
+        .spawn()
+        .map_err(|e| format!("cannot run {}: {e}", cmd.display()))?;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    fn pipe(
+        r: impl AsyncRead + Unpin + Send + 'static,
+        tx: tokio::sync::mpsc::UnboundedSender<String>,
+    ) {
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(r).lines();
+            while let Ok(Some(l)) = lines.next_line().await {
+                if tx.send(l).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    pipe(child.stdout.take().expect("piped"), tx.clone());
+    pipe(child.stderr.take().expect("piped"), tx);
+    let mut text = String::new();
+    let work = async {
+        while let Some(l) = rx.recv().await {
+            on_line(&l);
+            text.push_str(&l);
+            text.push('\n');
+        }
+        child.wait().await
+    };
+    let status = tokio::time::timeout(limit, work)
+        .await
+        .map_err(|_| format!("took longer than {} s", limit.as_secs()))?
+        .map_err(|e| format!("cannot run {}: {e}", cmd.display()))?;
+    if status.success() {
+        Ok(text)
+    } else if text.trim().is_empty() {
+        Err(format!("exit {status}"))
+    } else {
+        Err(text)
+    }
+}
+
 async fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
     run(Path::new("git"), args, dir, GIT_TIMEOUT)
         .await
@@ -568,6 +909,7 @@ mod tests {
             token: token.map(String::from),
             project: project.map(Path::to_path_buf),
             lox: PathBuf::from("lox"),
+            probe: None,
         })
     }
 
@@ -657,5 +999,195 @@ mod tests {
         );
         // Nothing to do when the base did not move.
         assert!(keep_base(d, &d.join("base.Loxone")).unwrap().is_none());
+    }
+
+    #[test]
+    fn lox_lines_move_the_steps_along() {
+        let mut p = Progress::apply();
+        let state = |p: &mut Progress, id| p.get(id).state;
+        p.lox_line("Downloading the live config...");
+        assert_eq!(state(&mut p, "check"), "run");
+        p.lox_line("Changes (live → compiled):");
+        p.lox_line("Uploading as sps_new.zip...");
+        assert_eq!(state(&mut p, "check"), "ok");
+        assert_eq!(state(&mut p, "upload"), "run");
+        p.lox_line("Restarting the program...");
+        assert_eq!(state(&mut p, "upload"), "ok");
+        assert_eq!(state(&mut p, "restart"), "run");
+        p.restart_event(restart::Event::OutOfService("503, restarting".into()));
+        assert_eq!(state(&mut p, "online"), "run");
+        p.restart_event(restart::Event::BackOnline(7));
+        assert_eq!(p.get("online").detail.as_deref(), Some("after 7 s"));
+        p.restart_event(restart::Event::Loaded(8, "2026-11-06 10:00:00".into()));
+        p.lox_line("Downloading the config again to verify...");
+        // What vislox saw stays; the restart is done.
+        assert_eq!(state(&mut p, "restart"), "ok");
+        assert_eq!(
+            p.get("restart").detail.as_deref(),
+            Some("out of service (503, restarting)")
+        );
+        assert_eq!(state(&mut p, "loaded"), "ok");
+        assert!(
+            p.get("loaded")
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains("2026-11-06")
+        );
+        assert_eq!(state(&mut p, "verify"), "run");
+        p.lox_line("Pushed and verified. lox.toml now points at backups/x.Loxone; commit …");
+        assert_eq!(state(&mut p, "verify"), "ok");
+        assert_eq!(p.log.len(), 6);
+    }
+
+    #[test]
+    fn a_restart_without_an_outage_and_a_failure() {
+        let mut p = Progress::apply();
+        p.lox_line("Restarting the program...");
+        p.restart_event(restart::Event::Loaded(2, "v2".into()));
+        assert_eq!(p.get("restart").state, "ok");
+        assert_eq!(
+            p.get("online").detail.as_deref(),
+            Some("answered throughout")
+        );
+        p.lox_line("Downloading the config again to verify...");
+        p.fail("lox config push failed:\nThe Miniserver does not run what was pushed");
+        assert_eq!(p.get("verify").state, "fail");
+        assert_eq!(
+            p.get("verify").detail.as_deref(),
+            Some("The Miniserver does not run what was pushed")
+        );
+        assert_eq!(p.get("commit").state, "wait");
+    }
+
+    fn sh(dir: &Path, cmd: &str) {
+        let ok = std::process::Command::new("sh")
+            .args(["-c", cmd])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(
+            ok.status.success(),
+            "{cmd}: {}",
+            String::from_utf8_lossy(&ok.stderr)
+        );
+    }
+
+    /// A lox.toml project in git with a remote, and a `lox` that says what
+    /// `lox config push` says and "deploys" by copying out over the base.
+    #[cfg(unix)]
+    fn project_with_fake_lox(push_ok: bool) -> (tempfile::TempDir, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("project");
+        std::fs::create_dir_all(d.join("pages")).unwrap();
+        std::fs::write(d.join("base.Loxone"), "old").unwrap();
+        std::fs::write(d.join("out.Loxone"), "new").unwrap();
+        std::fs::write(
+            d.join("lox.toml"),
+            "base = \"base.Loxone\"\nmodule = \"pages\"\nout = \"out.Loxone\"\n",
+        )
+        .unwrap();
+        sh(tmp.path(), "git init -q --bare remote.git");
+        sh(
+            &d,
+            "git init -q && git config user.email t@t && git config user.name t \
+             && git add -A && git commit -qm init && git remote add origin ../remote.git \
+             && git push -q -u origin HEAD",
+        );
+        let lox = tmp.path().join("lox");
+        let push = if push_ok {
+            "echo 'Downloading the config again to verify...' >&2\n    cp out.Loxone base.Loxone\n    echo 'Pushed and verified.' >&2"
+        } else {
+            "echo 'The Miniserver did not load the upload within a minute.' >&2\n    exit 1"
+        };
+        std::fs::write(
+            &lox,
+            format!(
+                "#!/bin/sh\ncase \"$1 $2\" in\n  'logic diff') echo 'Add a hallway light' ;;\n  'config push')\n    echo 'Downloading the live config...' >&2\n    echo 'Uploading as sps_new.zip...' >&2\n    echo 'Restarting the program...' >&2\n    sleep 2\n    {push} ;;\nesac\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&lox, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (tmp, lox)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn apply_shows_each_step_and_what_it_deployed() {
+        let (tmp, lox) = project_with_fake_lox(true);
+        let d = tmp.path().join("project");
+        let a = Actions::new(Settings {
+            token: Some("t".into()),
+            project: Some(d.clone()),
+            lox,
+            probe: Some(restart::tests::Script::probe(vec![
+                (Ok(()), Some("v1".into())),
+                (Err("503, restarting".into()), None),
+                (Ok(()), Some("v2".into())),
+            ])),
+        });
+        let msg = a.apply(&ApplyOpts::default()).await.unwrap();
+        assert!(msg.contains("Committed: Add a hallway light"), "{msg}");
+        let info = a.info();
+        let steps = info["progress"]["steps"].as_array().unwrap();
+        let st = |id: &str| {
+            let s = steps.iter().find(|s| s["id"] == id).unwrap();
+            (
+                s["state"].as_str().unwrap().to_string(),
+                s["detail"].as_str().unwrap_or("").to_string(),
+            )
+        };
+        for id in [
+            "check", "upload", "restart", "online", "loaded", "verify", "commit", "push",
+        ] {
+            assert_eq!(st(id).0, "ok", "{id}: {steps:?}");
+        }
+        assert!(st("restart").1.contains("503"), "{steps:?}");
+        assert!(st("online").1.starts_with("after "), "{steps:?}");
+        assert!(st("loaded").1.contains("v2"), "{steps:?}");
+        let dep = &info["last"]["deployed"];
+        assert_eq!(dep["before"], crate::history::blob_id(b"old"));
+        assert_eq!(dep["after"], crate::history::blob_id(b"new"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_push_marks_the_step_it_failed_in() {
+        let (tmp, lox) = project_with_fake_lox(false);
+        let a = Actions::new(Settings {
+            token: Some("t".into()),
+            project: Some(tmp.path().join("project")),
+            lox,
+            probe: None,
+        });
+        assert!(a.apply(&ApplyOpts::default()).await.is_err());
+        let info = a.info();
+        let steps = info["progress"]["steps"].as_array().unwrap();
+        let restart = steps.iter().find(|s| s["id"] == "restart").unwrap();
+        assert_eq!(restart["state"], "fail", "{steps:?}");
+        assert!(restart["detail"].as_str().unwrap().contains("did not load"));
+        assert!(info["last"].get("deployed").is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_miniserver_vislox_cannot_reach_is_not_called_out_of_service() {
+        let (tmp, lox) = project_with_fake_lox(true);
+        let a = Actions::new(Settings {
+            token: Some("t".into()),
+            project: Some(tmp.path().join("project")),
+            lox,
+            probe: Some(restart::tests::Script::probe(vec![(
+                Err("unreachable".into()),
+                None,
+            )])),
+        });
+        a.apply(&ApplyOpts::default()).await.unwrap();
+        let info = a.info();
+        let steps = info["progress"]["steps"].as_array().unwrap();
+        let restart = steps.iter().find(|s| s["id"] == "restart").unwrap();
+        assert_eq!(restart["state"], "ok");
+        assert!(restart["detail"].is_null(), "{steps:?}");
     }
 }

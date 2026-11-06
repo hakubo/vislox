@@ -54,3 +54,7 @@ jobs:
         run: node tests/ui/smoke.mjs
         env:
           VISLOX_BIN: target/release/vislox
+      - name: Apply test
+        run: node tests/ui/apply.mjs
+        env:
+          VISLOX_BIN: target/release/vislox

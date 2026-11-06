@@ -1426,6 +1426,7 @@ function renderActions() {
     : "Make the Miniserver's running config the project's base (lox config merge), then commit and push";
   $("btn-discard").disabled = !a.apply.available || busy || !pend;
   $("btn-apply").title = a.apply.available ? "Deploy to the Miniserver with lox config push, then commit and push to git" : `Cannot apply: ${a.apply.reason}`;
+  renderSteps(a);
   const last = a.last;
   if (last && last.at !== renderActions.shownAt) {
     renderActions.shownAt = last.at;
@@ -1433,16 +1434,81 @@ function renderActions() {
     deployMsg(head[last.ok ? 0 : 1] + last.message, !last.ok);
   }
 }
+/** Apply's steps as they happen: lox's progress, and what vislox sees of the program restart. */
+function renderSteps(a) {
+  const box = $("deploy-steps"), p = a.progress;
+  box.classList.toggle("hidden", !p);
+  clearTimeout(renderSteps.tick);
+  if (!p) return;
+  const icon = { wait: "·", run: "●", ok: "✓", skip: "–", fail: "✕" };
+  const nowS = Date.now() / 1000;
+  const secs = (s) => s.at == null ? "" : s.state === "run" ? `${Math.max(0, Math.round(nowS - s.at))} s` : s.end != null && s.end - s.at >= 1 ? `${s.end - s.at} s` : "";
+  box.innerHTML = p.steps.map((s) => `<li class="st-${esc(s.state)}"${s.state === "run" ? ' aria-current="step"' : ""}>` +
+    `<span class="ic" aria-label="${esc(s.state)}">${icon[s.state] || "·"}</span><span class="l">${esc(s.label)}</span><span class="t">${esc(secs(s))}</span>` +
+    (s.detail ? `<span class="d">${esc(s.detail)}</span>` : "") + "</li>").join("");
+  // The running step's clock.
+  if (a.running === "Apply") renderSteps.tick = setTimeout(() => renderSteps(S.hist?.actions || a), 1000);
+}
+/** After an Apply: view the deployed revision compared with the one it replaced, with live values,
+ *  and list what changed with each block's first value. */
+async function showDeployed() {
+  await loadHistory();
+  const d = S.hist?.actions?.last?.deployed;
+  if (!d) return;
+  const hist = S.hist.history;
+  const rev = hist.find((r) => r.blob === d.after);
+  if (!rev) return;
+  const prev = d.before && d.before !== d.after ? hist.find((r) => r.blob === d.before) : null;
+  S.rev = rev.id;
+  S.base = prev?.id || rev.base;
+  if (rev !== hist[0]) { S.follow = false; $("chk-follow").checked = false; }
+  renderHistory(); renderSelects();
+  await loadView();
+  writeHash(true);
+  if (S.hist.live?.available && !S.live.on) setLive(true);
+  renderDeployed();
+}
+/** The changed blocks of the deployed revision, each with a link and its first live value. */
+function renderDeployed() {
+  const box = $("deploy-new"), v = S.view;
+  const seen = new Set(), rows = [];
+  for (const c of v?.compared ? v.changes : []) {
+    if (!c.obj || seen.has(c.obj) || c.kind === "removed" || !v.objects[c.obj]) continue;
+    seen.add(c.obj);
+    rows.push(c);
+  }
+  box.classList.toggle("hidden", !rows.length);
+  if (!rows.length) { box.innerHTML = ""; return; }
+  const shown = rows.slice(0, 12).map((c) => {
+    const o = v.objects[c.obj];
+    const q = o.ports.find((p) => p.conns.some((x) => x.dir === "out")) || o.ports[0];
+    const name = autoTitle(o.title) ? prettyType(o.ty) : o.title;
+    return `<div class="pr"><span class="k ${esc(c.kind)}">${esc(KIND[c.kind]?.[1] || c.kind)}</span>` +
+      `<button type="button" class="go" data-go="${esc(c.obj)}" title="${esc(o.path || "")}">${esc(name)}</button>${q ? lvSpan(q.uuid) : ""}</div>`;
+  }).join("");
+  box.innerHTML = `<div class="h">Changed by this Apply<button type="button" class="x" aria-label="Close">×</button></div>${shown}` +
+    (rows.length > 12 ? `<div class="note">and ${rows.length - 12} more in Changes</div>` : "") +
+    '<div class="note">Values fill in as the Miniserver sends them; the canvas marks every change.</div>';
+}
+$("deploy-new").addEventListener("click", (e) => {
+  if (e.target.closest(".x")) { $("deploy-new").classList.add("hidden"); return; }
+  const g = e.target.closest("[data-go]");
+  if (!g) return;
+  const u = g.dataset.go, pg = S.view?.objects[u]?.page;
+  if (pg) gotoPage(pg, { focus: u });
+  select(u);
+});
 $("btn-apply").onclick = async () => {
   const pend = pendingChange();
   if (!pend) return;
   if (!window.confirm("Deploy the pending changes to the Miniserver?\n\nlox config push uploads the config and restarts the Miniserver's program (a few seconds), " +
     "checks that it runs exactly the compiled config, then vislox commits and pushes to git.")) return;
   deployMsg("");
+  $("deploy-new").classList.add("hidden");
   // lox refuses some pushes until the user allows them; ask, then retry with that allowed.
   const opts = {};
   for (let tries = 0; tries < 3; tries++) {
-    try { await act("/api/apply", opts); return; } catch (err) {
+    try { await act("/api/apply", opts); await showDeployed(); return; } catch (err) {
       const h = err.data?.hints || {};
       if (h.accept_version && !opts.accept_version && window.confirm(
         `This config was saved by a newer Loxone Config (version ${h.accept_version}) than the project last compiled with.\n\n` +
@@ -1802,7 +1868,7 @@ function liveApply(ch) {
       }
     }
   }
-  $("props").querySelectorAll("[data-lv]").forEach((n) => {
+  document.querySelectorAll("#props [data-lv], #deploy-new [data-lv]").forEach((n) => {
     const e = liveVal(n.dataset.lv);
     const txt = e ? clip(liveText(e), 40) : "no value";
     const changed = n.textContent !== txt;
