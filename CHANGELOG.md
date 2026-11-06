@@ -1,0 +1,34 @@
+# Changelog
+
+vislox follows [semantic versioning](https://semver.org). Release tags are `vX.Y.Z`; the Docker image is
+published under the same version (see [docker/README.md](docker/README.md)).
+
+## Unreleased
+
+## 0.2.0
+
+- Which config the Miniserver runs: the program file it loaded, from `def.log` and `/prog`, under the History
+  title, with warnings for an upload still waiting (`sps_new.zip`), the emergency config (`Emergency.LoxCC`),
+  and a newest file the Miniserver skipped or does not run (#28).
+- Apply verifies by load: after the program restart, `sps_new.zip` must be gone and `def.log` must show it was
+  loaded. Otherwise Apply says "Applied, but not verified" and why (#28).
+- vislox has a version: `vislox --version` and the UI show it with the commit it was built from. A release tag
+  must match `Cargo.toml`.
+- Apply follows the program restart step by step, then shows the change running (#35).
+- Miniserver status chip, and a preflight before Pull, Apply and Sync that checks the serial (#36, #37), and a
+  notice when the config changed after the base (#39).
+- Verified TLS under the CloudDNS name, and Remote Connect (#52).
+- History: the Miniserver's own backups between Pulls (#53).
+- Changes that reconfigure hardware, with the device settings explained (#54).
+- Miniserver log panel (#40) and, opt-in, its Debug-Monitor (#46).
+- Live values: opt-in queries for the blocks behind a page's wires (#45), clearer close codes and back-off (#34).
+- What the Loxone app shows (#43), calendar entries and operating modes as a year calendar (#41, #47, #48),
+  Daytimer schedules and weather (#50), heating and cooling periods (#51).
+- Operate virtual inputs from the canvas (opt-in: `--operate`) (#42).
+- Softer wires and clearer history clicks (#56); a shorter README with details in `docs/` (#57).
+- Removed: the experimental Change with AI section (#33).
+
+## 0.1.0
+
+The first version, before releases were tagged: the Loxone Config-style viewer with history, change review,
+Pull from Miniserver, live values, Change with AI, Apply, Sync and Discard, and the Docker image.

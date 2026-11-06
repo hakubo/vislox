@@ -8,10 +8,13 @@ COPY Cargo.toml Cargo.lock ./
 RUN mkdir src && echo 'fn main() {}' > src/main.rs \
     && cargo build --release --locked \
     && rm -rf src
+COPY build.rs ./
 COPY src src
 COPY web web
 COPY assets assets
-RUN touch src/main.rs && cargo build --release --locked
+# The commit, for `vislox --version` and the UI (the build has no .git).
+ARG VISLOX_COMMIT=
+RUN touch src/main.rs && VISLOX_COMMIT="$VISLOX_COMMIT" cargo build --release --locked
 
 FROM debian:bookworm-slim
 LABEL org.opencontainers.image.source="https://github.com/hakubo/vislox" \

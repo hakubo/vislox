@@ -139,6 +139,11 @@ async function loadHistory(fromEvent) {
   const prevNewest = S.hist ? (S.hist.pending[0] || S.hist.history[0])?.id : null;
   S.hist = h;
   $("doc-sub").textContent = h.label + (h.error ? " · " + h.error : "");
+  if (h.vislox) {
+    $("ver").textContent = "v" + h.vislox.version;
+    $("ver").title = `vislox ${h.vislox.version}` + (h.vislox.commit ? ` (commit ${h.vislox.commit})` : "");
+  }
+  if (h.running && !running.loaded) loadRunning(false);
   const newest = h.pending[0] || h.history[0];
   let changed = false;
   if (S.hash?.rev && revById(S.hash.rev) && !S.rev) {
@@ -1644,10 +1649,12 @@ async function pull() {
     const r = await fetch("/api/pull", { method: "POST", headers: { "X-Vislox": "pull" } });
     const j = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(j.error || r.statusText);
+    // Which file that was, and whether the Miniserver runs it, shows above (it takes a moment).
+    if (S.hist?.running) loadRunning(true);
     if (j.committed) {
       pullMsg("Pulled: the Miniserver's config is committed as a new backup.");
       await loadHistory(true);
-    } else pullMsg("Up to date: the Miniserver runs the config of the last backup.", "info");
+    } else pullMsg("Up to date: the last backup holds the Miniserver's newest config.", "info");
   } catch (e) {
     pullMsg(e.message, "error");
   } finally {
@@ -1655,6 +1662,37 @@ async function pull() {
   }
 }
 $("btn-pull").onclick = pull;
+
+// ── which config the Miniserver runs ───────────────────────────────────
+// Pull and Apply take the newest backup in /prog; the Miniserver may run another file (an upload
+// still waiting, its emergency config, a file its firmware cannot run). def.log names the one it loaded.
+const running = { loaded: false, busy: false, report: null };
+async function loadRunning(fresh) {
+  if (running.busy) return running.report;
+  running.loaded = true; running.busy = true; renderRunning();
+  try { running.report = await api("/api/running" + (fresh ? "?fresh=true" : "")); }
+  catch (e) { running.report = { error: e.message, warnings: [] }; }
+  finally { running.busy = false; renderRunning(); }
+  return running.report;
+}
+function renderRunning() {
+  const box = $("ms-run");
+  const r = running.report;
+  box.classList.toggle("hidden", !S.hist?.running || (!r && !running.busy));
+  if (!r) { box.innerHTML = running.busy ? '<div class="ms-line"><span>Asking the Miniserver which config it runs…</span></div>' : ""; return; }
+  const again = `<button type="button" class="ms-again" title="Check again" aria-label="Check again which config the Miniserver runs"${running.busy ? " disabled" : ""}>↻</button>`;
+  if (r.error) {
+    box.innerHTML = `<div class="ms-line"><span class="ms-err" title="${esc(r.error)}">Cannot tell which config the Miniserver runs: ${esc(r.error)}</span>${again}</div>`;
+    return;
+  }
+  const how = r.from === "def.log"
+    ? `def.log: loaded ${r.start?.loaded ? r.start.loaded + ", " : ""}program started ${r.start?.at || "?"}`
+    : "guessed from the files in /prog by the Miniserver's load order";
+  const tip = [how, r.firmware ? `firmware ${r.firmware}` : "", r.pull ? `Pull downloads ${r.pull}` : ""].filter(Boolean).join("\n");
+  box.innerHTML = `<div class="ms-line" title="${esc(tip)}"><span>${r.from === "def.log" ? "Runs" : "Probably runs"} <code>${esc(r.running || "?")}</code>${r.firmware ? ` · fw ${esc(r.firmware)}` : ""}</span>${again}</div>` +
+    (r.warnings || []).map((w) => `<div class="ms-warn" data-kind="${esc(w.kind)}">⚠ ${esc(w.text)}</div>`).join("");
+}
+$("ms-run").addEventListener("click", (e) => { if (e.target.closest(".ms-again")) loadRunning(true); });
 $("pull-msg").onclick = () => pullMsg("");
 
 // ── the Miniserver: status chip and preflight ──────────────────────────
@@ -1870,10 +1908,10 @@ async function act(path, body) {
   if (!r.ok) { const e = new Error(j.error || r.statusText); e.data = j; throw e; }
   return j;
 }
-function deployMsg(text, error) {
+function deployMsg(text, error, warn) {
   const m = $("deploy-msg");
   m.textContent = text || "";
-  m.className = "deploy-msg" + (error ? " error" : "") + (text ? "" : " hidden");
+  m.className = "deploy-msg" + (error ? " error" : warn ? " warn" : "") + (text ? "" : " hidden");
 }
 /** The newest compile, if it differs from what is deployed. */
 function pendingChange() {
@@ -1912,10 +1950,11 @@ function renderActions() {
   const last = a.last;
   if (last && last.at !== renderActions.shownAt) {
     renderActions.shownAt = last.at;
-    const head = { apply: ["Applied.\n", "Apply failed.\n"], sync: ["", "Sync failed.\n"], discard: ["", "Discard failed.\n"] }[last.kind] || ["", ""];
-    deployMsg(head[last.ok ? 0 : 1] + last.message, !last.ok);
+    const head = { apply: [last.warn ? "Applied, but not verified.\n" : "Applied.\n", "Apply failed.\n"], sync: ["", "Sync failed.\n"], discard: ["", "Discard failed.\n"] }[last.kind] || ["", ""];
+    deployMsg(head[last.ok ? 0 : 1] + last.message, !last.ok, last.ok && last.warn);
     // What the new program logged as it started.
     if (last.kind === "apply") logStale();
+    if (last.kind !== "discard" && S.hist?.running) loadRunning(true);
   }
 }
 /** Apply's steps as they happen: lox's progress, and what vislox sees of the program restart. */

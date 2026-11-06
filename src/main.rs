@@ -21,6 +21,7 @@ mod query;
 mod reason;
 mod restart;
 mod route;
+mod running;
 mod schedule;
 mod session;
 mod source;
@@ -51,7 +52,7 @@ use tokio_stream::wrappers::BroadcastStream;
 /// Visualize a Loxone config the way Loxone Config draws it — read-only, live
 /// reloading, with history and changes marked for review.
 #[derive(Parser, Debug)]
-#[command(version, about)]
+#[command(version = VERSION, about)]
 struct Args {
     /// A lox.toml project (or its directory), a .Loxone file, a backup .zip,
     /// or a `lox config init` repository. Default: the current directory.
@@ -123,6 +124,9 @@ struct Args {
     route: route::Mode,
 }
 
+/// `0.2.0 (1a2b3c4)`: the version, and the commit it was built from.
+const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), env!("VISLOX_COMMIT_SUFFIX"));
+
 struct App {
     label: String,
     history: Mutex<History>,
@@ -143,6 +147,8 @@ struct App {
     bus: hardware::Bus,
     monitor: Arc<monitor::Monitor>,
     ms: miniserver::Miniserver,
+    /// Which config the Miniserver runs (`/prog` and `def.log`).
+    running: Arc<running::Running>,
     actions: actions::Actions,
     operate: Arc<operate::Operate>,
 }
@@ -173,7 +179,7 @@ async fn main() -> Result<()> {
         Err(e) => return Err(e),
     };
     let history = History::new(src.current.clone(), src.proposed.clone());
-    eprintln!("vislox: watching {}", src.current.display());
+    eprintln!("vislox {VERSION}: watching {}", src.current.display());
     if let Some(p) = &src.proposed {
         eprintln!("vislox: pending changes from {}", p.display());
     }
@@ -374,6 +380,13 @@ async fn main() -> Result<()> {
         }
         Some(why) => eprintln!("vislox: no Debug-Monitor: {why}"),
     }
+    // Which config the Miniserver runs: read from /prog and def.log, the
+    // route's way, and never with --no-live.
+    let running = Arc::new(running::Running::new(if args.no_live {
+        Err("turned off (--no-live)".to_string())
+    } else {
+        own.clone()
+    }));
     let (tx, _) = broadcast::channel(16);
     let app = Arc::new(App {
         label: src.label.clone(),
@@ -390,7 +403,9 @@ async fn main() -> Result<()> {
         bus,
         monitor: monitor.clone(),
         ms,
+        running: running.clone(),
         actions: actions::Actions::new(actions::Settings {
+            running,
             token: args
                 .admin_token_file
                 .as_deref()
@@ -504,6 +519,7 @@ async fn main() -> Result<()> {
         .route("/api/monitor/start", axum::routing::post(api_monitor_start))
         .route("/api/monitor/stop", axum::routing::post(api_monitor_stop))
         .route("/api/pull", axum::routing::post(api_pull))
+        .route("/api/running", get(api_running))
         .route("/api/backups/read", axum::routing::post(api_backups_read))
         .route("/api/apply", axum::routing::post(api_apply))
         .route("/api/discard", axum::routing::post(api_discard))
@@ -670,6 +686,7 @@ async fn api_history(State(app): State<Arc<App>>) -> impl IntoResponse {
     let l = h.lists();
     Json(serde_json::json!({
         "label": app.label,
+        "vislox": { "version": env!("CARGO_PKG_VERSION"), "commit": option_env!("VISLOX_COMMIT") },
         "version": h.version,
         "pending": l.pending,
         "history": l.history,
@@ -678,6 +695,7 @@ async fn api_history(State(app): State<Arc<App>>) -> impl IntoResponse {
         "error": h.last_error,
         "live": app.live.info(),
         "pull": app.pull.info(),
+        "running": app.running.available(),
         "log": app.log.info(),
         "hardware": app.bus.info(),
         "monitor": app.monitor.info(),
@@ -1019,6 +1037,18 @@ where
         )
             .into_response(),
     }
+}
+
+#[derive(Deserialize)]
+struct RunningQuery {
+    #[serde(default)]
+    fresh: bool,
+}
+
+/// Which config the Miniserver runs (`/prog` and `def.log`), with warnings.
+/// A failed check is a 200 with `error`, so the page logs no failed request.
+async fn api_running(State(app): State<Arc<App>>, Query(q): Query<RunningQuery>) -> Response {
+    Json(app.running.get(q.fresh).await).into_response()
 }
 
 #[derive(Deserialize)]

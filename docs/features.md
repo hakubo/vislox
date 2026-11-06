@@ -55,6 +55,15 @@ sends to the Miniserver see [miniserver.md](miniserver.md).
   - *Git commits*: the file's history, e.g. from `lox config pull`.
   - **Pull from Miniserver** (in a `lox config init` repository): runs `lox config pull`, which downloads the
     Miniserver's current config and commits it when it changed. The new backup appears at once.
+  - **Which config the Miniserver runs**, under the History title: the program file it loaded (e.g.
+    `Runs sps_0274_20261106003351.zip · fw 17.2.10.21`), read from its system log (`def.log`) and the files in
+    `/prog`. `lox config pull` and lox's verify take the newest `sps_<ver>_<timestamp>.zip`, but the Miniserver
+    loads by a longer order (`Emergency.LoxCC`, `sps_new.zip`, the newest dated file its firmware can load, then
+    `sps.zip` …), so a warning shows when `sps_new.zip` is still waiting (an upload that was never loaded), when
+    it runs its emergency config (after several reboots in a row), or when the newest file was skipped because it
+    needs a newer firmware or Pull would download another file than the one it runs. Without access to `def.log`
+    (it needs an administrator) the line says *Probably runs* and follows the load order. ↻ checks again; a
+    check is kept for a minute.
   - *Miniserver backups*: the Miniserver keeps a backup of each config it loads (`/prog/sps_<ver>_<stamp>.zip`;
     one Miniserver kept its last 20). **Read** lists them and downloads each new one once (FTP, read-only). A backup with the
     bytes of the Pull next to it shows as that Pull (a *Miniserver backup* pill); the others are listed under the Pulls they
@@ -138,7 +147,9 @@ sends to the Miniserver see [miniserver.md](miniserver.md).
   upload, program restart, verify), then commits the project and pushes it to its git remote. Each step shows
   as it happens, with how long it took. vislox follows the program restart itself: the Miniserver going out of
   service, back online after N s, and the new config loaded (its structure version changed). When Apply
-  finishes, the view switches to the deployed revision, compared with the one it replaced, and turns live
+  finishes, Apply also checks **by load**: `sps_new.zip` must be gone from `/prog`, and `def.log` must show a
+  new program start that loaded it and runs the newest backup. Otherwise it reports *Applied, but not verified*
+  and why (it still commits and pushes). Then the view switches to the deployed revision, compared with the one it replaced, and turns live
   values on. **Changed by this Apply** lists the changed blocks with their first live values. **Discard** puts
   the module back to the last commit. **Sync from Miniserver** makes what the Miniserver runs now the project's
   base (`lox config merge`: changes saved from Loxone Config, rules edited in the app), then commits and pushes;

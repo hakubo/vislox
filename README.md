@@ -33,6 +33,8 @@ Then open <http://127.0.0.1:7878>. Started without a path or `--ctx` in a direct
 - Change review: added, changed, removed and moved blocks, wires and parameters, against any earlier revision.
 - History: the pending compile, snapshots taken while vislox runs, git commits, Pull from Miniserver, and the
   Miniserver's own backups of each save from Loxone Config.
+- Which config the Miniserver runs (from `def.log` and `/prog`), with a warning when an upload is still waiting,
+  it runs its emergency config, or the newest file was skipped; Apply checks that its upload loaded.
 - Live values on the wires, as in Loxone Config's Liveview, with opt-in queries for blocks the app does not see.
 - Properties for the selected block: connections, parameters, Daytimer schedules, calendar entries, what the
   Loxone app shows, and the hardware a change reconfigures.
@@ -97,7 +99,8 @@ Discard.
 
 Without any opt-in, vislox sends the Miniserver read-only requests: the live value stream, the structure file and
 its icons, the status check, the heating and cooling periods, the calendar entries, the system log (`lox log`),
-the devices on the bus (`lox extensions`), and the backup list and downloads (FTP) when you click *Read*. Pull
+the devices on the bus (`lox extensions`), which program file it runs (the `/prog` listing and `def.log`), and
+the backup list and downloads (FTP) when you click *Read*. Pull
 runs `lox config pull`, which downloads the config. When lox's address does not answer (or with
 `--route remote`), vislox asks Loxone's `connect.loxonecloud.com` for the Miniserver's Remote Connect relay. `--no-live` stops all of these except Pull.
 
@@ -138,6 +141,14 @@ VISLOX_BIN=target/release/vislox node tests/ui/apply.mjs   # Apply's steps, with
 ```
 
 CI (`.github/workflows/ci.yml`) runs all of these on every push to `main` and every pull request.
+
+## Versions
+
+The version is in `Cargo.toml`; changes are listed in [CHANGELOG.md](CHANGELOG.md). `vislox --version` and the
+UI (next to the logo) show it with the commit it was built from. To release, bump the version in
+`Cargo.toml`, move the changelog's *Unreleased* entries under it, merge, then tag the merge commit `vX.Y.Z`
+and push the tag. The Docker workflow publishes the image as `X.Y.Z`, `X.Y` and `latest`, and refuses a tag
+that does not match `Cargo.toml`.
 
 ## Licence
 

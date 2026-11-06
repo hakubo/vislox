@@ -28,6 +28,8 @@ use tokio::sync::{broadcast, watch};
 /// `lox config push --force` downloads twice and restarts the program.
 const PUSH_TIMEOUT: Duration = Duration::from_secs(600);
 const GIT_TIMEOUT: Duration = Duration::from_secs(120);
+/// Starts an Apply message whose upload the Miniserver may not run.
+const UNVERIFIED: &str = "Not verified";
 
 pub struct Settings {
     pub token: Option<String>,
@@ -36,6 +38,8 @@ pub struct Settings {
     /// The Miniserver, to follow Apply's program restart. None: only lox's
     /// own progress shows.
     pub probe: Option<Arc<dyn restart::Probe>>,
+    /// Which config the Miniserver runs, to verify an Apply by its load.
+    pub running: Arc<crate::running::Running>,
 }
 
 pub struct Actions {
@@ -236,6 +240,9 @@ struct Outcome {
     /// `apply`, `sync` or `discard`
     kind: &'static str,
     ok: bool,
+    /// Done, but not verified: the Miniserver may not run it (`message`
+    /// says why).
+    warn: bool,
     message: String,
     at: i64,
     /// After an Apply: the git blob ids of the base before and after, so the
@@ -371,6 +378,7 @@ impl Actions {
         st.last = Some(Outcome {
             kind,
             ok: res.is_ok(),
+            warn: res.as_ref().is_ok_and(|m| m.contains(UNVERIFIED)),
             message: match res {
                 Ok(m) | Err(m) => m.clone(),
             },
@@ -444,11 +452,13 @@ impl Actions {
         let before = std::fs::read(&p.base)
             .ok()
             .map(|b| crate::history::blob_id(&b));
+        let ran_before = self.s.running.get(true).await;
         let pushed = self
             .push_followed(lox, &args, dir)
             .await
             .map_err(|e| format!("lox config push failed:\n{e}"))?;
         let mut report = vec![last_lines(&pushed, 6)];
+        report.push(self.verify_load(&ran_before).await);
         if let Some(m) = keep_base(dir, &p.base)? {
             report.push(m);
         }
@@ -522,6 +532,34 @@ impl Actions {
         };
         let (res, ()) = tokio::join!(push, follow);
         res
+    }
+
+    /// lox verified the newest backup holds the upload; check that the
+    /// Miniserver loaded it too: `sps_new.zip` gone, and a program start in
+    /// def.log that loaded it and runs the newest backup. The log can lag
+    /// the restart a little, so look a few times.
+    async fn verify_load(&self, before: &crate::running::Report) -> String {
+        if !self.s.running.available() {
+            return format!(
+                "{UNVERIFIED}: no Miniserver connection to check which config it runs."
+            );
+        }
+        let mut why = Vec::new();
+        for i in 0..4 {
+            if i > 0 {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+            }
+            let after = self.s.running.get(true).await;
+            why = crate::running::verify_load(before, &after);
+            if why.is_empty() {
+                return format!(
+                    "Loaded: the Miniserver runs {} (def.log, {}).",
+                    after.running.as_deref().unwrap_or("?"),
+                    after.start.as_ref().map(|s| s.at.as_str()).unwrap_or("?")
+                );
+            }
+        }
+        format!("{UNVERIFIED} by load: {}.", why.join("; "))
     }
 
     /// Make the Miniserver's running config the project's base
@@ -916,6 +954,7 @@ mod tests {
             project: project.map(Path::to_path_buf),
             lox: PathBuf::from("lox"),
             probe: None,
+            running: Arc::new(crate::running::Running::new(Err("test".into()))),
         })
     }
 
@@ -1127,6 +1166,7 @@ mod tests {
             token: Some("t".into()),
             project: Some(d.clone()),
             lox,
+            running: Arc::new(crate::running::Running::new(Err("test".into()))),
             probe: Some(restart::tests::Script::probe(vec![
                 (Ok(()), Some("v1".into())),
                 (Err("503, restarting".into()), None),
@@ -1165,6 +1205,7 @@ mod tests {
             token: Some("t".into()),
             project: Some(tmp.path().join("project")),
             lox,
+            running: Arc::new(crate::running::Running::new(Err("test".into()))),
             probe: None,
         });
         assert!(a.apply(&ApplyOpts::default()).await.is_err());
@@ -1184,6 +1225,7 @@ mod tests {
             token: Some("t".into()),
             project: Some(tmp.path().join("project")),
             lox,
+            running: Arc::new(crate::running::Running::new(Err("test".into()))),
             probe: Some(restart::tests::Script::probe(vec![(
                 Err("unreachable".into()),
                 None,

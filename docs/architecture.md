@@ -21,6 +21,8 @@ The binary is an `axum` server with the UI embedded (plain JS and SVG, no build 
 - `src/actions.rs` runs Apply (`lox config push --force`, `git commit`, `git push`), Sync (`lox config merge`,
   `git commit`, `git push`) and Discard (`git checkout` of the module, lock and out). Apply's steps follow lox's
   progress lines as they come.
+- `src/running.rs` reads `/prog` and `def.log` for the config the Miniserver runs (`GET /api/running`), and
+  checks after an Apply that the upload loaded.
 - `src/restart.rs` follows the program restart during Apply: out of service, back online, new config loaded.
 - `src/backups.rs` lists and downloads the Miniserver's own backups for the History and caches their programs
   by blob id; `history.rs` shows each with the Pull of the same bytes, or between the Pulls around it.

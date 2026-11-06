@@ -303,6 +303,17 @@ the backup it took), else by its commit time in that zone. With no zone known, s
 without a date is placed by the backup with its bytes. `--no-live` turns reading off. vislox does not write
 backups to git: a Pull commits the newest one.
 
+## Which config the Miniserver runs
+
+`GET /api/running` (`?fresh=true` skips the cache) asks the Miniserver, over vislox's route and with its TLS
+check, for the `/prog` listing (`/dev/fslist//prog`), its system log (`/dev/fsget/log/def.log`, as `lox log`;
+it needs an administrator) and its firmware (`/dev/cfg/version`). All three only read. The answer is kept for a
+minute, one check runs at a time, and a check that takes over 30 s fails. A failed check is still a 200, with
+`error`. In the log, the last `PRG start program` says which file loaded; after `Loading sps_new.zip` the
+`Program started:` line names the program it replaced, so the `Rename program /lx/prog/<file>` line names the
+file that runs. Apply reads it once before `lox config push` and up to four times after it, 3 s apart.
+`--no-live` turns it off.
+
 ## Pull from Miniserver
 
 **Pull from Miniserver** runs `lox config pull` (the `lox` on `PATH`, or `--lox <path>`), with the same lox
