@@ -6,7 +6,9 @@ mod history;
 mod live;
 mod model;
 mod pull;
+mod reason;
 mod restart;
+mod session;
 mod source;
 
 use anyhow::{Context, Result};
@@ -451,7 +453,7 @@ async fn api_pull(State(app): State<Arc<App>>, headers: axum::http::HeaderMap) -
         }
         Err(e) => (
             StatusCode::BAD_GATEWAY,
-            Json(serde_json::json!({ "error": e })),
+            Json(serde_json::json!({ "error": reason::explain(&e) })),
         )
             .into_response(),
     }
@@ -479,7 +481,10 @@ async fn api_apply(
         // What the user could allow to retry (a newer Loxone Config, custom changes).
         Err((status, msg)) => (
             status,
-            Json(serde_json::json!({ "error": msg, "hints": actions::apply_hints(&msg) })),
+            Json(serde_json::json!({
+                "error": reason::explain(&msg),
+                "hints": actions::apply_hints(&msg),
+            })),
         )
             .into_response(),
     }
@@ -509,6 +514,6 @@ async fn api_sync(State(app): State<Arc<App>>, headers: axum::http::HeaderMap) -
     let _ = tokio::task::spawn_blocking(move || refresh(&a)).await;
     match res {
         Ok(m) => Json(serde_json::json!({ "message": m })).into_response(),
-        Err(r) => refused(r),
+        Err((status, msg)) => refused((status, reason::explain(&msg))),
     }
 }

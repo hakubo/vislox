@@ -15,8 +15,10 @@
 //! - the NDJSON output of `lox stream -o json --initial` (`--live-from`), from
 //!   a file (followed as it grows) or standard input.
 
+use crate::reason::{DEFAULT_RETRY, Reason, Retry};
+use crate::session::{self, Ended};
 use loxone_client::Connection;
-use loxone_client::stream::{self, StateEvent};
+use loxone_client::stream::StateEvent;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -29,8 +31,6 @@ use tokio::sync::{broadcast, watch};
 /// After the last browser turns live values off, the Miniserver connection
 /// stays open this long, so a reload does not reconnect.
 const LINGER: Duration = Duration::from_secs(10);
-/// Longest wait between reconnect attempts.
-const MAX_BACKOFF_SECS: u64 = 30;
 
 /// Where live values come from.
 pub enum Feed {
@@ -424,12 +424,38 @@ fn read_structure(structure: &Value) -> Structure {
 
 // ── The hub ─────────────────────────────────────────────────────────────
 
-#[derive(Clone, Serialize, PartialEq, Debug)]
+#[derive(Clone, Serialize, PartialEq, Debug, Default)]
 pub struct Status {
     /// `off` (no source), `idle` (nobody watching), `connecting`, `live`,
-    /// `offline` (retrying), `ended` (the NDJSON input ended).
+    /// `offline` (retrying), `stopped` (not retrying: see `reason`),
+    /// `ended` (the NDJSON input ended).
     pub state: &'static str,
     pub detail: Option<String>,
+    /// Why the Miniserver refused or dropped the connection, when it said.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<Reason>,
+    /// A short label for `reason`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<&'static str>,
+}
+
+impl Status {
+    fn new(state: &'static str, detail: Option<String>) -> Status {
+        Status {
+            state,
+            detail,
+            ..Status::default()
+        }
+    }
+
+    fn because(state: &'static str, reason: Option<Reason>, detail: String) -> Status {
+        Status {
+            state,
+            detail: Some(detail),
+            reason,
+            label: reason.map(Reason::label),
+        }
+    }
 }
 
 /// A stored value: the value and its text in the control's format.
@@ -471,14 +497,8 @@ pub struct Live {
 impl Live {
     pub fn new(feed: Feed, source: String) -> Arc<Live> {
         let status = match &feed {
-            Feed::Off(why) => Status {
-                state: "off",
-                detail: Some(why.clone()),
-            },
-            _ => Status {
-                state: "idle",
-                detail: None,
-            },
+            Feed::Off(why) => Status::new("off", Some(why.clone())),
+            _ => Status::new("idle", None),
         };
         let (tx, _) = broadcast::channel(256);
         let live = Arc::new(Live {
@@ -515,11 +535,14 @@ impl Live {
     }
 
     fn set_status(&self, generation: u64, state: &'static str, detail: Option<String>) {
+        self.put_status(generation, Status::new(state, detail));
+    }
+
+    fn put_status(&self, generation: u64, s: Status) {
         let mut st = self.st.lock().unwrap();
         if st.generation != generation {
             return;
         }
-        let s = Status { state, detail };
         if st.status != s {
             st.status = s;
             drop(st);
@@ -562,10 +585,7 @@ impl Live {
             let generation = st.generation;
             let (stop_tx, stop_rx) = watch::channel(false);
             st.run = Some((generation, stop_tx));
-            st.status = Status {
-                state: "connecting",
-                detail: None,
-            };
+            st.status = Status::new("connecting", None);
             tokio::spawn(
                 self.clone()
                     .run_miniserver(generation, (**conn).clone(), stop_rx),
@@ -592,10 +612,7 @@ impl Live {
             {
                 let _ = stop.send(true);
                 st.generation += 1;
-                st.status = Status {
-                    state: "idle",
-                    detail: None,
-                };
+                st.status = Status::new("idle", None);
                 st.values.clear();
                 drop(st);
                 let _ = me.tx.send(Msg::Status);
@@ -637,10 +654,10 @@ impl Live {
                 .send(Msg::Values(Arc::new(Value::Object(out).to_string())));
         }
         if gone {
-            self.set_status(
+            let r = Reason::OutOfService;
+            self.put_status(
                 generation,
-                "offline",
-                Some("the Miniserver is going offline (reboot or update)".into()),
+                Status::because("offline", Some(r), r.sentence().into()),
             );
         }
     }
@@ -665,7 +682,9 @@ impl Live {
         conn: Connection,
         mut stop: watch::Receiver<bool>,
     ) {
-        let mut wait = 1;
+        // The wait before the next attempt, and the reason it was chosen for.
+        let mut wait = 0;
+        let mut last: Option<Option<Reason>> = None;
         loop {
             if *stop.borrow() {
                 return;
@@ -679,12 +698,15 @@ impl Live {
             .await
             .map_err(|e| e.to_string())
             .and_then(|r| r);
-            let err = match structure {
-                Err(e) => format!("cannot read the structure file: {e}"),
+            let (err, reason) = match structure {
+                Err(e) => {
+                    let r = Reason::from_text(&e);
+                    (format!("cannot read the structure file: {e}"), r)
+                }
                 Ok(s) => {
                     self.load_structure(generation, &s);
                     let went_live = AtomicBool::new(false);
-                    let res = stream::stream_session(
+                    let ended = session::run(
                         &conn,
                         stop.clone(),
                         || {
@@ -701,24 +723,68 @@ impl Live {
                         return;
                     }
                     if went_live.load(Ordering::Relaxed) {
-                        wait = 1;
+                        last = None;
                     }
-                    match res {
-                        Ok(()) => "the Miniserver closed the connection".to_string(),
-                        Err(e) => e.to_string(),
+                    match ended {
+                        Ended::Stopped => return,
+                        Ended::Closed(None) => {
+                            ("the Miniserver closed the connection".into(), None)
+                        }
+                        Ended::Closed(Some(code)) => (
+                            format!("the Miniserver closed the connection (close code {code})"),
+                            Reason::from_close(code),
+                        ),
+                        Ended::Failed(e) => {
+                            let r = Reason::from_text(&e);
+                            (e, r)
+                        }
                     }
                 }
             };
-            self.set_status(
+            // The Miniserver said it is going offline, then the socket dropped.
+            let reason = reason.or_else(|| {
+                let st = self.st.lock().unwrap();
+                (st.generation == generation && st.status.reason == Some(Reason::OutOfService))
+                    .then_some(Reason::OutOfService)
+            });
+            let detail = |tail: String| match reason {
+                Some(r) => format!("{}\n({err}) · {tail}", r.sentence()),
+                None => format!("{err} · {tail}"),
+            };
+            match reason.map_or(DEFAULT_RETRY, Reason::retry) {
+                Retry::Stop => {
+                    self.put_status(
+                        generation,
+                        Status::because(
+                            "stopped",
+                            reason,
+                            detail("not retrying; turn live values off and on to try again".into()),
+                        ),
+                    );
+                    // The next browser to turn live values on starts afresh.
+                    let mut st = self.st.lock().unwrap();
+                    if st.run.as_ref().is_some_and(|(g, _)| *g == generation) {
+                        st.run = None;
+                    }
+                    return;
+                }
+                Retry::Backoff { first, max } => {
+                    wait = if last == Some(reason) {
+                        (wait * 2).clamp(first, max)
+                    } else {
+                        first
+                    };
+                    last = Some(reason);
+                }
+            }
+            self.put_status(
                 generation,
-                "offline",
-                Some(format!("{err} · retrying in {wait} s")),
+                Status::because("offline", reason, detail(format!("retrying in {wait} s"))),
             );
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_secs(wait)) => {}
                 _ = stop.changed() => return,
             }
-            wait = (wait * 2).min(MAX_BACKOFF_SECS);
         }
     }
 
@@ -779,7 +845,18 @@ impl Live {
         match v["event"].as_str() {
             Some("disconnected") => {
                 let why = v["message"].as_str().or(v["reason"].as_str());
-                self.set_status(0, "offline", why.map(String::from));
+                let reason = match v["reason"].as_str() {
+                    Some("out_of_service") => Some(Reason::OutOfService),
+                    _ => why.and_then(Reason::from_text),
+                };
+                let s = match (reason, why) {
+                    (Some(r), Some(w)) => {
+                        Status::because("offline", reason, format!("{}\n({w})", r.sentence()))
+                    }
+                    (Some(r), None) => Status::because("offline", reason, r.sentence().into()),
+                    (None, w) => Status::new("offline", w.map(String::from)),
+                };
+                self.put_status(0, s);
                 return;
             }
             Some("reconnected") => {
@@ -996,5 +1073,30 @@ mod tests {
         assert_eq!(snap["values"]["s1"], json!([22000, null, "Lux · value"]));
         assert_eq!(snap["values"]["s2"][0], "hello");
         assert_eq!(live.status().detail.as_deref(), Some("gone"));
+        assert_eq!(live.status().reason, None);
+    }
+
+    #[test]
+    fn a_known_disconnect_reason_is_explained() {
+        let live = Live::new(Feed::Off("test".into()), "test".into());
+        let mut batch = serde_json::Map::new();
+        live.ndjson_line(
+            &json!({"event": "disconnected", "reason": "out_of_service"}),
+            &mut batch,
+        );
+        assert_eq!(live.status().reason, Some(Reason::OutOfService));
+        assert_eq!(live.status().label, Some("going offline"));
+        live.ndjson_line(
+            &json!({"event": "disconnected", "reason": "error", "message": "authwithtoken failed (401)"}),
+            &mut batch,
+        );
+        let st = live.status();
+        assert_eq!(st.reason, Some(Reason::Unauthorized));
+        let d = st.detail.unwrap();
+        assert!(
+            d.starts_with("The Miniserver refused") && d.ends_with("(authwithtoken failed (401))")
+        );
+        let j: Value = serde_json::from_str(&live.status_json()).unwrap();
+        assert_eq!(j["reason"], "unauthorized");
     }
 }

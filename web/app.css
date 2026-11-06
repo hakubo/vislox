@@ -395,7 +395,7 @@ button.chip { cursor: pointer; } button.chip:hover { border-color: var(--brand);
 #sw-live.on .live-state { display: inline; }
 .live-state.st-live::before { background: var(--brand); box-shadow: 0 0 0 2px #5cb83f33; }
 .live-state.st-connecting::before { background: var(--changed-dot); }
-.live-state.st-offline::before, .live-state.st-ended::before { background: var(--removed); }
+.live-state.st-offline::before, .live-state.st-stopped::before, .live-state.st-ended::before { background: var(--removed); }
 @media (max-width: 1500px) { .live-state { max-width: 70px; } }
 .legend:not(.live) .live-only { display: none; }
 .lg.w-on::before { height: 0; border-width: 3px 0 0 0; border-radius: 0; width: 16px; vertical-align: 3px; border-color: var(--live-on); }

@@ -121,6 +121,21 @@ one turns them off. During Apply, vislox also asks the Miniserver every 0.5 s, r
 the program restart until the new config runs, and only if the Miniserver answered before the upload.
 `--no-live` turns this off as well.
 
+When the Miniserver refuses or drops the connection, the live status names the reason it gives (its close or
+response code) and says what to do. How long vislox waits before it tries again depends on the reason:
+
+| Code | Live status | vislox |
+|---|---|---|
+| 4003 | blocked after too many failed logins | stops: check the user and password (each attempt makes the block longer) |
+| 401, 403, 4006, 423 | login refused, no rights, user disabled | stops: fix the user, then turn live values off and on |
+| 4004, 4005 | a user was changed | logs in again after 1 s |
+| 4007 | firmware update | tries again after 30 s, up to every 2 min |
+| 503, out of service | restarting, going offline | tries again after 5–10 s, up to every 30–60 s |
+| 4008, 901 | no free slot (31 clients), too many connections | tries again after 1 min, up to every 5 min |
+| other | offline | tries again after 1 s, doubling up to 30 s |
+
+A Pull, Apply or Sync that fails with one of these codes shows the same explanation above lox's message.
+
 **Pull from Miniserver** runs `lox config pull` (the `lox` on `PATH`, or `--lox <path>`), with the same lox
 configuration and context as live values. It is offered only when lox would commit to the repository vislox
 shows, into the folder of the Miniserver vislox shows (`config_repo` and the serial or address in lox's
@@ -160,6 +175,9 @@ The binary is an `axum` server with the UI embedded (plain JS and SVG, no build 
 - `src/live.rs` streams the Miniserver's states with lox's `loxone-client` crate. A wire's source
   connector has the UUID of the state it carries, so the browser matches values to wires by UUID. Values
   reach the browser on `/api/live` (server-sent events).
+- `src/session.rs` is one WebSocket session (connect, log in, subscribe, stream), built from `loxone-client`'s
+  parts so that it keeps the Miniserver's close code. `src/reason.rs` turns close and response codes into a
+  reason, a plain sentence and a backoff.
 - File changes are noticed with `notify`. Git is polled every 3 s. Browsers get a server-sent event and
   reload.
 
