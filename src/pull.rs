@@ -61,6 +61,11 @@ impl Pull {
         }
     }
 
+    /// A pull is running.
+    pub fn busy(&self) -> bool {
+        self.running.try_lock().is_err()
+    }
+
     pub fn why_not(&self) -> Option<&str> {
         self.cmd.as_ref().err().map(String::as_str)
     }

@@ -2250,6 +2250,7 @@ dependencies = [
  "loxone-config",
  "notify",
  "open",
+ "reqwest",
  "serde",
  "serde_json",
  "serde_yaml",

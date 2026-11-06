@@ -285,6 +285,12 @@ impl Actions {
         let _ = self.tx.send(());
     }
 
+    /// Apply and Sync could start now (they are on, and nothing runs), so
+    /// the Miniserver is worth checking first.
+    pub fn wants_miniserver(&self) -> bool {
+        self.why_not_apply().is_none() && self.st.lock().unwrap().running.is_none()
+    }
+
     fn why_not_apply(&self) -> Option<&'static str> {
         if self.s.project.is_none() {
             Some("only for a lox.toml project")

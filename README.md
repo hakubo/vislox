@@ -67,6 +67,17 @@ marked so you can review it before you deploy.
   it waits until nothing is pending. When merge refuses because the Miniserver holds custom changes no download
   carries, Sync makes a plain download the base instead (rules edited in the app are then not taken over).
 
+- **Miniserver status and preflight**: a chip in the toolbar names the Miniserver lox talks to (serial and
+  firmware) with a green, amber or red dot. Click it for the details: address, local or remote, TLS, whether a
+  live-update slot is free, when lox's token expires, which Loxone Config version the deployed and pending
+  configs were saved with, and whether its web port and FTP (port 21) answer. Before Pull, Apply and Sync, and on
+  start, vislox checks again, and refuses what could not work, with the reason: Pull, Apply and Sync when FTP is
+  blocked (they copy the config over FTP, and live values only need the web port, so a firewall can block one and
+  not the other), Apply also when the web port does not answer (lox restarts the program over it). The buttons
+  stay on, since the cause may clear; their tooltip warns about what the last check found. A config saved with a
+  different Loxone Config version than the firmware, an expired TLS certificate or token, a remote connection,
+  no free live-update slot and a status reply that cannot be read are shown as warnings.
+
 vislox itself never writes to the config: lox and git do, and only on Pull, Apply and Discard. Live values only
 listen. A pull reads from the Miniserver; only Apply writes to it.
 
@@ -114,6 +125,21 @@ vislox ~/loxone-config/project --admin-token-file ~/.config/vislox/admin-token
   needs credentials for the project's remote. A verified push makes lox point `base` at its download in
   `backups/` (git-ignored); Apply copies that download over the project's base file and points lox.toml back at
   it, so the deployed config stays in git.
+
+### Miniserver status
+
+The status chip and the preflight only read, and never log in: a TCP connect to the web port in lox's `host`
+(443 by default) and to FTP (21), then FTP's greeting, and `jdev/cfg/apiKey`, which the Miniserver answers
+without a login, and only informs (serial, firmware, TLS, local, slots): the request follows no redirect to
+another host, as lox's own client. The token's expiry comes from lox's `token.json`. vislox uses lox's token on purpose and
+requests none of its own, so it does not show up as a client of its own in the Miniserver's token list (lox's
+is named `lox-cli`). A check is reused for up to a minute for the chip (`GET /api/miniserver`; `?fresh=1` checks again unless a
+check started in the last 2 s), and for 10 s before Pull, Apply and Sync, so that retrying an Apply does not
+check each time.
+With `--no-live` nothing is checked.
+
+Not shown yet: the token's rights (Config, FTP, program restart) and whether the password is weak. The
+Miniserver reports them only at login (`tokenRights`, `unsecurePass`), and lox does not keep them.
 
 The Miniserver connection is opened when a browser turns live values on, and closed shortly after the last
 one turns them off. During Apply, vislox also asks the Miniserver every 0.5 s, read-only, whether it answers
@@ -176,6 +202,8 @@ The binary is an `axum` server with the UI embedded (plain JS and SVG, no build 
 - `src/restart.rs` follows the program restart during Apply: out of service, back online, new config loaded.
 - `src/pull.rs` runs `lox config pull` for the Pull button (`POST /api/pull`, which needs an `X-Vislox` header so
   that no other web page can trigger it), then refreshes the history.
+- `src/miniserver.rs` checks the Miniserver for the status chip and the preflight before Pull, Apply and Sync
+  (`GET /api/miniserver`).
 - `src/live.rs` streams the Miniserver's states with lox's `loxone-client` crate. A wire's source
   connector has the UUID of the state it carries, so the browser matches values to wires by UUID. Values
   reach the browser on `/api/live` (server-sent events).

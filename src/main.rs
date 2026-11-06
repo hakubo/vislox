@@ -4,6 +4,7 @@
 mod actions;
 mod history;
 mod live;
+mod miniserver;
 mod model;
 mod pull;
 mod reason;
@@ -80,6 +81,7 @@ struct App {
     tx: broadcast::Sender<u64>,
     live: Arc<live::Live>,
     pull: pull::Pull,
+    ms: miniserver::Miniserver,
     actions: actions::Actions,
 }
 
@@ -137,6 +139,17 @@ async fn main() -> Result<()> {
             }
         }
     };
+    // The status chip and the preflight check the Miniserver lox talks to,
+    // unless vislox was told never to connect to it.
+    let ms = miniserver::Miniserver::new(
+        if args.no_live {
+            Err("turned off (--no-live)".to_string())
+        } else {
+            found.as_ref().map(|f| &f.conn).map_err(Clone::clone)
+        },
+        src.current.clone(),
+        src.proposed.clone(),
+    );
     let (tx, _) = broadcast::channel(16);
     let app = Arc::new(App {
         label: src.label.clone(),
@@ -145,6 +158,7 @@ async fn main() -> Result<()> {
         tx,
         live: live::Live::new(feed, live_source),
         pull,
+        ms,
         actions: actions::Actions::new(actions::Settings {
             token: args
                 .admin_token_file
@@ -166,6 +180,29 @@ async fn main() -> Result<()> {
             None => eprintln!("vislox: Apply, Sync and Discard on"),
             Some(why) => eprintln!("vislox: no Apply: {why}"),
         }
+    }
+
+    // Check the Miniserver once at start, and say what is wrong.
+    {
+        let app = app.clone();
+        tokio::spawn(async move {
+            let v = app.ms.chip().await;
+            if v["available"] != true {
+                return;
+            }
+            match v["blocked"].as_str() {
+                Some(why) => eprintln!("vislox: preflight: {why}"),
+                None => eprintln!(
+                    "vislox: Miniserver {} at {} runs {}",
+                    v["serial"].as_str().unwrap_or("?"),
+                    v["host"].as_str().unwrap_or("?"),
+                    v["firmware"].as_str().unwrap_or("?")
+                ),
+            }
+            for w in v["warnings"].as_array().into_iter().flatten() {
+                eprintln!("vislox: warning: {}", w.as_str().unwrap_or_default());
+            }
+        });
     }
 
     spawn_watcher(app.clone())?;
@@ -204,6 +241,7 @@ async fn main() -> Result<()> {
         .route("/api/events", get(api_events))
         .route("/api/live", get(api_live))
         .route("/api/live/retry", axum::routing::post(api_live_retry))
+        .route("/api/miniserver", get(api_miniserver))
         .route("/api/pull", axum::routing::post(api_pull))
         .route("/api/apply", axum::routing::post(api_apply))
         .route("/api/discard", axum::routing::post(api_discard))
@@ -450,6 +488,40 @@ async fn api_live(
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
+#[derive(Deserialize)]
+struct MsQuery {
+    /// Any value but `0` or `false`.
+    fresh: Option<String>,
+}
+
+/// The Miniserver's status for the toolbar chip: at most a minute old, or
+/// checked again with `?fresh=1`.
+async fn api_miniserver(State(app): State<Arc<App>>, Query(q): Query<MsQuery>) -> Response {
+    let fresh = q.fresh.is_some_and(|f| f != "0" && f != "false");
+    let v = if fresh {
+        app.ms.recheck().await
+    } else {
+        app.ms.chip().await
+    };
+    Json(v.as_ref().clone()).into_response()
+}
+
+/// Refuse Pull, Apply and Sync when the Miniserver cannot be reached the
+/// way lox needs it (FTP; for Apply also its web port), with the reason.
+async fn preflight(app: &App, what: miniserver::Action) -> Option<Response> {
+    let why = app.ms.preflight(what).await.err()?;
+    let what = format!("{what:?}").to_lowercase();
+    Some(
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(
+                serde_json::json!({ "error": format!("Cannot {what}: {why}"), "preflight": true }),
+            ),
+        )
+            .into_response(),
+    )
+}
+
 /// Fetch the Miniserver's current config with `lox config pull`, then show
 /// the new revision at once. Needs the `X-Vislox` header, which a page on
 /// another site cannot send without asking first (CORS), so no other site
@@ -461,6 +533,13 @@ async fn api_pull(State(app): State<Arc<App>>, headers: axum::http::HeaderMap) -
             Json(serde_json::json!({ "error": "missing X-Vislox header" })),
         )
             .into_response();
+    }
+    // A pull already running refuses at once, without a check.
+    if app.pull.why_not().is_none()
+        && !app.pull.busy()
+        && let Some(r) = preflight(&app, miniserver::Action::Pull).await
+    {
+        return r;
     }
     match app.pull.run().await {
         Ok(p) => {
@@ -488,6 +567,11 @@ async fn api_apply(
 ) -> Response {
     if let Err(r) = app.actions.check(&headers) {
         return refused(r);
+    }
+    if app.actions.wants_miniserver()
+        && let Some(r) = preflight(&app, miniserver::Action::Apply).await
+    {
+        return r;
     }
     let opts = body.map(|Json(o)| o).unwrap_or_default();
     let res = app.actions.apply(&opts).await;
@@ -525,6 +609,11 @@ async fn api_discard(State(app): State<Arc<App>>, headers: axum::http::HeaderMap
 async fn api_sync(State(app): State<Arc<App>>, headers: axum::http::HeaderMap) -> Response {
     if let Err(r) = app.actions.check(&headers) {
         return refused(r);
+    }
+    if app.actions.wants_miniserver()
+        && let Some(r) = preflight(&app, miniserver::Action::Sync).await
+    {
+        return r;
     }
     let res = app.actions.sync().await;
     let a = app.clone();

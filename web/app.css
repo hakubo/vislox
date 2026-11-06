@@ -471,3 +471,27 @@ button.chip { cursor: pointer; } button.chip:hover { border-color: var(--brand);
 .deploy-new .k { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; color: var(--changed); }
 .deploy-new .k.added { color: var(--added); }
 .deploy-new .note { color: var(--faint); font-size: 11px; }
+
+/* ── Miniserver status chip ────────────────────────── */
+.ms-wrap { position: relative; }
+.ms-chip { display: inline-flex; align-items: center; gap: 6px; height: 26px; padding: 0 9px; border: 1px solid var(--line); border-radius: 13px; background: #fff; font-size: 12px; white-space: nowrap; max-width: 230px; }
+.ms-chip:hover { border-color: var(--brand); }
+.ms-chip .lbl { overflow: hidden; text-overflow: ellipsis; }
+.ms-chip .dot, .ms-pop .dot { width: 8px; height: 8px; border-radius: 50%; background: #bbb; flex: none; }
+.ms-chip.ok .dot, .ms-pop .ok .dot { background: var(--brand); }
+.ms-chip.warn .dot { background: var(--changed-dot); }
+.ms-chip.bad .dot, .ms-pop .bad .dot { background: var(--removed); }
+.ms-pop { position: absolute; right: 0; top: calc(100% + 6px); z-index: 25; width: min(400px, 92vw); background: #fff; border: 1px solid var(--line); border-radius: 8px; box-shadow: 0 8px 28px #0003; padding: 12px 14px; font-size: 12px; white-space: normal; }
+.ms-pop h3 { margin: 0 0 8px; font-size: 13px; }
+.ms-pop dl { display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; margin: 0 0 8px; }
+.ms-pop dt { color: var(--muted); white-space: nowrap; }
+.ms-pop dd { margin: 0; overflow-wrap: anywhere; }
+.ms-pop .chk { display: flex; gap: 6px; align-items: baseline; margin: 3px 0; }
+.ms-pop .chk .dot { transform: translateY(-1px); }
+.ms-pop .chk .d { color: var(--muted); overflow-wrap: anywhere; }
+.ms-pop .blocked { margin: 8px 0; padding: 7px 9px; border-radius: 5px; background: var(--removed-bg); color: var(--removed); }
+.ms-pop .warns { margin: 8px 0 0; padding: 0 0 0 16px; color: var(--changed); }
+.ms-pop .warns li { margin: 2px 0; }
+.ms-foot { display: flex; align-items: center; gap: 8px; margin-top: 10px; color: var(--faint); }
+.ms-foot .pull-btn { margin-left: auto; }
+@media (max-width: 1100px) { .ms-chip .lbl { display: none; } }
