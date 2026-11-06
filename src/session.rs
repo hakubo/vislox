@@ -25,11 +25,53 @@ const DEAD_SOCKET: Duration = Duration::from_secs(90);
 /// Connecting and logging in must finish within this.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// A read-only request to send on the session's socket (`jdev/sps/io/<uuid>/all`),
-/// and where its answer goes: the `LL` object of the Miniserver's reply.
+/// A read-only request to send on the session's socket (a block query,
+/// `jdev/sps/io/<uuid>/all`, or one of [`COMMANDS`]), and where its answer
+/// goes: the `LL` object of the Miniserver's reply.
 pub struct Query {
-    pub uuid: String,
+    pub cmd: String,
+    /// What the answer's `control` contains.
+    key: String,
     pub reply: oneshot::Sender<serde_json::Value>,
+}
+
+/// The commands other than block queries that a [`Query`] may send: the
+/// heating and cooling periods.
+const COMMANDS: &[&str] = &[crate::calendar::HEAT_PERIOD, crate::calendar::COOL_PERIOD];
+
+/// What a command's answer names in its `control`: its path without the
+/// leading `j` (`dev/sps/…` for `jdev/sps/…`).
+fn control_of(cmd: &str) -> &str {
+    cmd.strip_prefix('j').unwrap_or(cmd)
+}
+
+/// Whether an answer's `control` (or a whole message) is the answer to a
+/// [`Query`], which gets it whatever its `Code`: a block query's, or one of
+/// [`COMMANDS`].
+fn is_asked(control: &str) -> bool {
+    control.contains("sps/io/") || COMMANDS.iter().any(|c| control.contains(control_of(c)))
+}
+
+impl Query {
+    /// The outputs of a block.
+    pub fn io(uuid: &str, reply: oneshot::Sender<serde_json::Value>) -> Query {
+        Query {
+            cmd: crate::query::command(uuid),
+            key: uuid.to_string(),
+            reply,
+        }
+    }
+
+    /// One of [`COMMANDS`]; panics for any other, whose answer would not
+    /// come back to it (and whose refusal would end the session).
+    pub fn command(cmd: &str, reply: oneshot::Sender<serde_json::Value>) -> Query {
+        assert!(COMMANDS.contains(&cmd), "{cmd} is not a query command");
+        Query {
+            cmd: cmd.to_string(),
+            key: control_of(cmd).to_string(),
+            reply,
+        }
+    }
 }
 
 /// How a session ended.
@@ -89,8 +131,8 @@ enum Step {
     Events(Vec<StateEvent>),
     /// A command was answered with `Code` 200: the subscription is on.
     Answered,
-    /// The answer to a block query (any `Code`: a block that cannot be
-    /// queried does not end the session): its `LL` object.
+    /// The answer to a query (any `Code`: a block that cannot be queried
+    /// does not end the session): its `LL` object.
     Reply(serde_json::Value),
     /// A command was refused: what and its `Code`.
     Refused(String),
@@ -109,7 +151,7 @@ fn step(framer: &mut Framer, msg: Message) -> Step {
         },
         Message::Text(t) => {
             framer.text();
-            if let Some(ll) = io_reply(&t) {
+            if let Some(ll) = asked_reply(&t) {
                 return Step::Reply(ll);
             }
             match ll_code(&t) {
@@ -130,14 +172,14 @@ fn step(framer: &mut Framer, msg: Message) -> Step {
     }
 }
 
-/// The `LL` object of an answer to `jdev/sps/io/…`.
-fn io_reply(t: &str) -> Option<serde_json::Value> {
-    if !t.contains("sps/io/") {
+/// The `LL` object of an answer to a query ([`is_asked`]).
+fn asked_reply(t: &str) -> Option<serde_json::Value> {
+    if !is_asked(t) {
         return None;
     }
     let mut v = serde_json::from_str::<serde_json::Value>(t).ok()?;
     let ll = v.get_mut("LL")?.take();
-    ll["control"].as_str()?.contains("sps/io/").then_some(ll)
+    is_asked(ll["control"].as_str()?).then_some(ll)
 }
 
 /// Run one session. `on_live` is called once the Miniserver has accepted
@@ -166,7 +208,7 @@ where
     keepalive.tick().await;
     let mut framer = Framer::default();
     let mut last_rx = tokio::time::Instant::now();
-    // Sent queries waiting for their answer: the block's UUID.
+    // Sent queries waiting for their answer.
     let mut asked: VecDeque<Query> = VecDeque::new();
     loop {
         let msg = tokio::select! {
@@ -177,8 +219,7 @@ where
             Some(q) = queries.recv() => {
                 // A caller that gave up waiting no longer needs its answer.
                 asked.retain(|q| !q.reply.is_closed());
-                let cmd = crate::query::command(&q.uuid);
-                if let Err(e) = ws.send(Message::Text(cmd)).await {
+                if let Err(e) = ws.send(Message::Text(q.cmd.clone())).await {
                     return Ended::Failed(chain(&e));
                 }
                 asked.push_back(q);
@@ -212,7 +253,7 @@ where
             }
             Step::Reply(ll) => {
                 let control = ll["control"].as_str().unwrap_or_default();
-                if let Some(i) = asked.iter().position(|q| control.contains(&q.uuid)) {
+                if let Some(i) = asked.iter().position(|q| control.contains(&q.key)) {
                     let q = asked.remove(i).expect("position is in range");
                     let _ = q.reply.send(ll);
                 }
@@ -248,6 +289,25 @@ mod tests {
     }
 
     #[test]
+    fn a_command_query_is_matched_by_its_control() {
+        let (reply, _) = oneshot::channel();
+        let q = Query::command(crate::calendar::COOL_PERIOD, reply);
+        assert_eq!(q.cmd, "jdev/sps/calendargetcoolperiod");
+        assert_eq!(q.key, "dev/sps/calendargetcoolperiod");
+        assert!(is_asked("dev/sps/calendargetheatperiod"));
+        assert!(is_asked("dev/sps/io/0f1e/all"));
+        assert!(!is_asked("dev/sps/enablebinstatusupdate"));
+        assert!(!is_asked("dev/sps/calendargetentries"));
+    }
+
+    #[test]
+    #[should_panic(expected = "is not a query command")]
+    fn another_command_is_refused() {
+        let (reply, _) = oneshot::channel();
+        Query::command("jdev/sps/calendargetentries", reply);
+    }
+
+    #[test]
     fn only_an_accepted_subscription_counts_as_live() {
         assert!(matches!(
             text(r#"{"LL":{"control":"dev/sps/enablebinstatusupdate","value":"","Code":"200"}}"#),
@@ -266,6 +326,11 @@ mod tests {
         assert!(matches!(
             text(r#"{"LL":{"control":"dev/sps/io/b1/all","value":"","Code":"500"}}"#),
             Step::Reply(ll) if ll["Code"] == "500"
+        ));
+        // So is the answer to the heating period's request.
+        assert!(matches!(
+            text(r#"{"LL": { "control": "dev/sps/calendargetheatperiod", "value": "10-01/04-30", "Code": "200"}}"#),
+            Step::Reply(ll) if ll["value"] == "10-01/04-30"
         ));
         // A close before any answer: the code, not "live".
         let close = Message::Close(Some(CloseFrame {

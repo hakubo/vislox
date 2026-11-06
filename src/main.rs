@@ -833,7 +833,8 @@ async fn api_live_retry(State(app): State<Arc<App>>, headers: axum::http::Header
 }
 
 /// Live values for one browser, while it keeps this stream open: `status`,
-/// then a `snapshot` of every value, then `values` as they change.
+/// then a `snapshot` of every value, then `values` as they change, and
+/// `periods` when the session has read the heating and cooling periods.
 async fn api_live(
     State(app): State<Arc<App>>,
 ) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
@@ -850,6 +851,7 @@ async fn api_live(
         match m {
             Ok(live::Msg::Status) => Event::default().event("status").data(live.status_json()),
             Ok(live::Msg::Values(v)) => Event::default().event("values").data(v.as_str()),
+            Ok(live::Msg::Periods(p)) => Event::default().event("periods").data(p.as_str()),
             // A new structure, or this browser fell behind: start over.
             Ok(live::Msg::Snapshot) | Err(_) => Event::default()
                 .event("snapshot")

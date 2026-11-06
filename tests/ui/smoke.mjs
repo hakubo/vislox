@@ -350,6 +350,71 @@ try {
     assert.match(await page.textContent(".md-chip.live"), /on now/);
     // In another year than today's, the chip still says what the calendar has today.
     assert.match(await page.getAttribute(".md-chip.live", "title"), /the calendar has it today/);
+    // The heating and cooling periods come from a Miniserver session (not --live-from): hand the
+    // page what the session sends, as a real Miniserver answered (they overlap in March and April).
+    assert.equal(await page.$$eval(".md-pchip", (n) => n.length), 0, "no periods with --live-from");
+    await page.evaluate(() => {
+      S.hist.live.periods = true;
+      S.live.periods = {
+        heat: { date: { kind: "yearly", month: 10, day: 1, month2: 4, day2: 30 }, text: "1 Oct – 30 Apr", value: "10-01/04-30" },
+        cool: { date: { kind: "yearly", month: 3, day: 1, month2: 9, day2: 7 }, text: "1 Mar – 7 Sep", value: "03-01/09-07" },
+      };
+      modesLive();
+    });
+    await page.waitForSelector(".md-pchip");
+    assert.deepEqual(await page.$$eval(".md-pchip", (n) => n.map((x) => x.textContent)), ["Heating period: 1 Oct – 30 Aprtoday", "Cooling period: 1 Mar – 7 Septoday"]);
+    assert.equal(await page.textContent(".md-ptoday"), "Today is in both the heating and the cooling period.");
+    assert.match(await cls(1, 15, 2025), /md-heat/);
+    assert.doesNotMatch(await cls(1, 15, 2025), /md-cool/);
+    assert.match(await cls(4, 1, 2025), /md-heat md-cool|md-cool md-heat/);
+    assert.match(await cls(9, 7, 2025), /md-cool/);
+    assert.doesNotMatch(await cls(9, 8, 2025), /md-cool|md-heat/);
+    await page.hover(`#md-grid [data-day="${await page.evaluate(() => mdDay(2025, 4, 1))}"]`);
+    assert.match(await page.textContent("#tooltip"), /Heating period.*Cooling period/);
+    // Its chip hides a period's days.
+    await page.click('.md-pchip[data-mode="p:heat"]');
+    assert.doesNotMatch(await cls(1, 15, 2025), /md-heat/);
+    await page.click('.md-pchip[data-mode="p:heat"]');
+    assert.match(await cls(1, 15, 2025), /md-heat/);
+    // A period the Miniserver would not give says why.
+    await page.evaluate(() => { S.live.periods = { ...S.live.periods, cool: { why: "the Miniserver refused it (Code 403)", value: "" } }; modesLive(); });
+    await page.waitForFunction(() => document.querySelector('.md-pchip[data-mode="p:cool"]')?.disabled);
+    assert.match(await page.getAttribute('.md-pchip[data-mode="p:cool"]', "title"), /cannot read: the Miniserver refused it \(Code 403\)/);
+    assert.equal(await page.textContent(".md-ptoday"), "Today is in the heating period.");
+    // A hidden period that becomes unreadable can still be shown again.
+    await page.evaluate(() => { S.live.periods = { ...S.live.periods, cool: { date: { kind: "yearly", month: 3, day: 1, month2: 9, day2: 7 }, text: "1 Mar – 7 Sep", value: "03-01/09-07" } }; modesLive(); });
+    await page.click('.md-pchip[data-mode="p:cool"]');
+    await page.evaluate(() => { S.live.periods = { ...S.live.periods, cool: { why: "the Miniserver did not answer", value: "" } }; modesLive(); });
+    await page.waitForFunction(() => document.querySelector('.md-pchip[data-mode="p:cool"]')?.title.includes("cannot read"));
+    assert.ok(!(await page.$eval('.md-pchip[data-mode="p:cool"]', (b) => b.disabled)), "a hidden chip stays clickable");
+    await page.click('.md-pchip[data-mode="p:cool"]');
+    await page.waitForFunction(() => document.querySelector('.md-pchip[data-mode="p:cool"]')?.disabled);
+    // A period read on the previous connection says so, and why this one has not read it.
+    await page.evaluate(() => { S.live.periods = { ...S.live.periods, heat: { ...S.live.periods.heat, stale: true, failed: "the Miniserver did not answer" } }; modesLive(); });
+    await page.waitForSelector('.md-pchip.stale[data-mode="p:heat"]');
+    assert.match(await page.getAttribute('.md-pchip[data-mode="p:heat"]', "title"), /previous connection; reading it again failed: the Miniserver did not answer/);
+    assert.match(await page.evaluate(() => mdPeriodRows({ ty: "HVACController" }, (k, v) => `${k}=${v}`).join("\n")), /Heating period=.*from the previous connection/);
+    // Before any read, the live state says why there are none: reading, or not connected.
+    const pending = (state, label) => page.evaluate(([state, label]) => {
+      const keep = [S.live.periods, S.live.status];
+      S.live.periods = null; S.live.status = { state, label };
+      const r = mdPeriodRows({ ty: "HeatIRoomController2" }, (k, v) => v).join("");
+      [S.live.periods, S.live.status] = keep;
+      return r;
+    }, [state, label]);
+    assert.match(await pending("live"), /Reading the heating and cooling periods/);
+    assert.match(await pending("offline"), /read when live values connect \(live values: offline\)/);
+    assert.match(await pending("stopped", "blocked"), /live values: blocked/);
+    await page.evaluate(() => { const keep = S.live.periods; S.live.periods = null; S.live.status = { state: "offline" }; modesLive(); window.__keep = keep; });
+    assert.match(await page.textContent("#md-legend"), /live values: offline/);
+    await page.evaluate(() => { S.live.periods = window.__keep; S.live.status = { state: "live" }; modesLive(); });
+    // A climate block's Properties list the periods, and link to the year.
+    const props = await page.evaluate(() => mdPeriodRows({ ty: "HeatIRoomController2" }, (k, v) => `${k}=${v}`).join("\n"));
+    assert.match(props, /Heating period=.*1 Oct – 30 Apr.*today/);
+    assert.match(props, /Cooling period=.*cannot read/);
+    assert.match(props, /Today=Today is in the heating period\./);
+    assert.match(props, /data-modes-open/);
+    assert.equal(await page.evaluate(() => mdPeriodRows({ ty: "Memory" }, (k, v) => v)), null, "only climate blocks");
     await page.click("#sw-live .track");
     await page.waitForFunction(() => !document.querySelector(".md-chip.live"));
     // No year before 2009, Loxone's day 0.

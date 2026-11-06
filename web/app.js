@@ -15,7 +15,7 @@ const S = {
   objPage: new Map(), pageOf: new Map(), loadSeq: 0, onlyChanged: false, chgIdx: -1,
   closed: new Set(["Advanced"]), dim: true, treeFocus: null, hash: null, applyingHash: false,
   app: null, appBusy: false, appErr: "", applyReads: 0, deployed: null,
-  live: { on: pref("live", false), dim: pref("liveDim", true), query: pref("liveQuery", false), qes: null, qkey: "", qstat: null, es: null, status: null, values: new Map(), controls: {}, globals: {} },
+  live: { on: pref("live", false), dim: pref("liveDim", true), query: pref("liveQuery", false), qes: null, qkey: "", qstat: null, es: null, status: null, values: new Map(), controls: {}, globals: {}, periods: null },
 };
 function pref(k, d) { try { const v = localStorage.getItem("vislox." + k); return v === null ? d : v === "1"; } catch { return d; } }
 function setPref(k, v) { try { localStorage.setItem("vislox." + k, v ? "1" : "0"); } catch { /* private mode */ } }
@@ -922,6 +922,8 @@ function renderProps() {
       })(),
     ]);
   }
+  const periods = mdPeriodRows(o, row);
+  if (periods) section("Heating and cooling", periods);
   const inApp = appRows(o, row, chg, marks);
   if (inApp) section("In the app", inApp.rows, inApp.count);
   const note = o.ty === "Text" ? o.attrs.find((a) => a.name === "Text") : null;
@@ -2749,14 +2751,26 @@ function liveStart() {
   const es = new EventSource("/api/live");
   S.live.es = es;
   S.live.status = { state: "connecting" };
-  es.addEventListener("status", (e) => { S.live.status = JSON.parse(e.data); renderLiveSwitch(); });
+  es.addEventListener("status", (e) => {
+    S.live.status = JSON.parse(e.data);
+    renderLiveSwitch();
+    // A climate block's Properties say why the periods are not there yet.
+    if (!S.live.periods && mdClimate(S.view?.objects[S.sel])) renderProps();
+  });
   es.addEventListener("snapshot", (e) => {
     const d = JSON.parse(e.data);
     S.live.values = new Map(Object.entries(d.values));
     S.live.controls = d.controls || {};
     S.live.globals = d.globals || {};
+    S.live.periods = d.periods || null;
     lvCache = new Map();
     liveQueue(null);
+  });
+  // The heating and cooling periods, as each Miniserver connection reads them (null until asked).
+  es.addEventListener("periods", (e) => {
+    S.live.periods = JSON.parse(e.data);
+    if (mdClimate(S.view?.objects[S.sel])) renderProps();
+    modesLive();
   });
   es.addEventListener("values", (e) => {
     const d = JSON.parse(e.data);
@@ -2778,6 +2792,7 @@ function liveStop() {
   S.live.values = new Map();
   S.live.controls = {};
   S.live.globals = {};
+  S.live.periods = null;
   liveQueue(null);
 }
 // Turned on by the user (the switch, L): let the server try again after it stopped (blocked,

@@ -2,8 +2,10 @@
 // vislox — Operating modes: a year calendar of when each mode is on.
 // The dates come decoded from the server (`calendar.date` of each entry, see src/calendar.rs);
 // here they are only laid out on the days of a year. Loaded after app.js, whose helpers it uses.
+// With live values on, the Miniserver's heating and cooling periods (`periods` on /api/live, see
+// src/calendar.rs `Season`) are marked on the days too, and climate blocks' Properties list them.
 
-const MD = { open: false, year: new Date().getFullYear(), hidden: new Set(), liveKey: "", cache: null };
+const MD = { open: false, year: new Date().getFullYear(), hidden: new Set(), liveKey: "", cache: null, pcache: [], plist: null };
 /** The years the view steps through: calendar periods count from 2009 (Loxone's day 0). */
 const MD_FIRST_YEAR = 2009, MD_LAST_YEAR = 9999;
 /** One colour per mode, in the order of the config's modes; white text reads on each. */
@@ -104,12 +106,80 @@ function mdLiveOn() {
   }
   return on;
 }
-function mdLiveKey(on) { return on ? [...on].sort().join(" ") : "-"; }
-/** Live values changed: repaint only when the set of modes that are on changed. */
+function mdLiveKey(on) {
+  const st = S.live.status || {};
+  return [on ? [...on].sort().join(" ") : "-", JSON.stringify(mdPeriods()), st.state, st.label].join("|");
+}
+/** Live values changed: repaint only when the set of modes that are on, the periods or the live state changed. */
 function modesLive() {
   if (MD.open && mdLiveKey(mdLiveOn()) !== MD.liveKey) renderModes();
 }
 function mdToday() { const t = new Date(); return mdDay(t.getFullYear(), t.getMonth() + 1, t.getDate()); }
+
+// ── the heating and cooling periods (live) ─────────────────────────────
+const MD_PERIODS = [{ key: "heat", title: "Heating period", word: "heating" }, { key: "cool", title: "Cooling period", word: "cooling" }];
+/** Whether this Miniserver connection reads the periods (not with --live-from). */
+function mdPeriodsAvailable() { return !!S.hist?.live?.periods; }
+/** The periods the live session read (`{heat, cool}`, each `{date?, text?, why?, value, stale?,
+ *  failed?}` or null); null without live values on this revision, or until they are asked for.
+ *  `stale`: read on an earlier connection, not again on this one (yet: `failed` says why not). */
+function mdPeriods() { return liveHere() && S.live.periods ? S.live.periods : null; }
+/** Whether a block is a climate block (Intelligent Room Controller, Climate Controller). */
+function mdClimate(o) { return /IRoomController|^HVACController$/.test(o?.ty || ""); }
+/** Each period, with whether today is in it (null: it cannot be read); the same list until the
+ *  periods or the day change. */
+function mdPeriodList() {
+  const p = mdPeriods();
+  if (!p) return null;
+  const today = mdToday();
+  if (MD.plist?.src === p && MD.plist.today === today) return MD.plist.list;
+  const ty = mdYmd(today)[0];
+  const list = MD_PERIODS.map((d) => {
+    const s = p[d.key] || { why: "not read yet", value: "" };
+    return { ...d, season: s, today: s.date ? entryDays(s.date, ty).includes(today) : null };
+  });
+  MD.plist = { src: p, today, list };
+  return list;
+}
+/** Why there are no periods yet: they are being read, or the live connection is not up. */
+function mdPeriodsPending() {
+  const st = S.live.status || { state: "connecting" };
+  if (st.state === "live") return "Reading the heating and cooling periods from the Miniserver…";
+  const now = st.label || { connecting: "connecting", idle: "connecting", offline: "offline", stopped: "stopped", ended: "the input ended", off: "off" }[st.state] || st.state;
+  return `The heating and cooling periods are read when live values connect (live values: ${now}).`;
+}
+/** A good read of an earlier connection: what to add to its text. */
+function mdPeriodStale(p) {
+  if (!p.season.date || !p.season.stale) return "";
+  return p.season.failed ? `from the previous connection; reading it again failed: ${p.season.failed}` : "from the previous connection; reading it again…";
+}
+/** Whether today is in either period, as a sentence. */
+function mdPeriodsToday(list) {
+  const known = list.filter((p) => p.today !== null), inn = known.filter((p) => p.today);
+  if (!known.length) return "";
+  if (inn.length === 2) return "Today is in both the heating and the cooling period.";
+  if (inn.length === 1) return `Today is in the ${inn[0].word} period.`;
+  return known.length === 2 ? "Today is in neither period." : `Today is not in the ${known[0].word} period.`;
+}
+/** A period as it reads: its days, or why it cannot be read. */
+function mdPeriodText(p) {
+  return p.season.text || `cannot read: ${p.season.why || "unknown"}${p.season.value ? ` (“${p.season.value}”)` : ""}`;
+}
+/** Properties of a climate block (Intelligent Room Controller, Climate Controller): the periods
+ *  it heats or cools in. `row(k, v)` makes a row; null when there is nothing to show. */
+function mdPeriodRows(o, row) {
+  if (!mdClimate(o) || !liveHere() || !mdPeriodsAvailable()) return null;
+  const list = mdPeriodList();
+  if (!list) return [`<div class="empty">${esc(mdPeriodsPending())}</div>`];
+  const rows = list.map((p) => {
+    const stale = mdPeriodStale(p);
+    return row(p.title, `<span class="md-psw ${p.key}"></span>${p.season.text ? esc(p.season.text) : `<span class="none-v">${esc(mdPeriodText(p))}</span>`}${p.today ? ' <span class="md-now">today</span>' : ""}${stale ? ` <span class="md-pstale">${esc(stale)}</span>` : ""}`);
+  });
+  const today = mdPeriodsToday(list);
+  if (today) rows.push(row("Today", esc(today)));
+  rows.push(`<div class="pr-note">Set in the app's operating-mode settings, not in the config. <button type="button" class="lnk" data-modes-open>Show on the year</button></div>`);
+  return rows;
+}
 function mdFmt(n) { const [y, m, d] = mdYmd(n); return `${d} ${MD_MONTHS[m - 1].slice(0, 3)} ${y}`; }
 
 // ── rendering ──────────────────────────────────────────────────────────
@@ -135,6 +205,10 @@ function renderModes() {
   const y = MD.year, modes = mdModes(), { days, entries } = mdYear(y), marks = mdMarks();
   MD.cache = { year: y, days, modes };
   const liveOnNow = mdLiveOn(), today = mdToday();
+  // The periods' days this year, unless their chip hides them.
+  const periods = mdPeriodList();
+  const pdays = (periods || []).filter((p) => p.season.date && !MD.hidden.has("p:" + p.key)).map((p) => ({ key: p.key, title: p.title, days: new Set(entryDays(p.season.date, y)) }));
+  MD.pcache = pdays;
   MD.liveKey = mdLiveKey(liveOnNow);
   // Today's modes come from today's year, whichever year is on screen.
   const ty = mdYmd(today)[0];
@@ -152,7 +226,8 @@ function renderModes() {
       : todayKeys.has(m.key) ? "Off now, although a calendar entry has it today." : "Off now.";
     return `<button type="button" class="md-chip${MD.hidden.has(m.key) ? " off" : ""}${live ? " live" : ""}" data-mode="${esc(m.key)}" aria-pressed="${!MD.hidden.has(m.key)}" title="${esc(`${m.title}: ${mdEntriesN(n, "calendar ")}. Click to ${MD.hidden.has(m.key) ? "show" : "hide"} its days.${why ? "\n" + why : ""}`)}">` +
       `<span class="md-sw" style="background:${m.color}"></span>${esc(m.title)}${live ? '<span class="md-now">on now</span>' : ""}</button>`;
-  }).join("") + (liveOnNow ? "" : `<span class="md-hint">${S.live.on ? "Live values show on the current, deployed revision only." : "Turn on live values to see which modes are on now."}</span>`);
+  }).join("") + (liveOnNow ? "" : `<span class="md-hint">${S.live.on ? "Live values show on the current, deployed revision only." : `Turn on live values to see which modes are on now${mdPeriodsAvailable() ? " and the heating and cooling periods" : ""}.`}</span>`)
+    + mdPeriodLegend(periods);
 
   // The year: 12 months, weeks from Monday.
   const shown = (e) => !MD.hidden.has(e.key);
@@ -169,7 +244,8 @@ function renderModes() {
       const bg = cols.length === 1 ? `background:${cols[0]}` : cols.length > 1 ? `background:linear-gradient(to bottom,${cols.map((c, j) => `${c} ${(j * 100) / cols.length}% ${((j + 1) * 100) / cols.length}%`).join(",")})` : "";
       const cls = ["md-d", cols.length ? "md-on" : "", (lead + i) % 7 >= 5 ? "md-we" : "", n === today ? "md-today" : "",
         marks && add && rem ? "md-chg" : marks && add ? "md-add" : marks && rem ? "md-rem" : "",
-        S.sel && d && [...d.on, ...d.add, ...d.rem].some((e) => e.uuid === S.sel) ? "md-hl" : ""].filter(Boolean).join(" ");
+        S.sel && d && [...d.on, ...d.add, ...d.rem].some((e) => e.uuid === S.sel) ? "md-hl" : "",
+        ...pdays.filter((p) => p.days.has(n)).map((p) => "md-" + p.key)].filter(Boolean).join(" ");
       cells += `<span class="${cls}" data-day="${n}"${bg ? ` style="${bg}"` : ""}>${i + 1}</span>`;
     }
     html += `<div class="md-month"><div class="md-mh">${MD_MONTHS[m - 1]}</div><div class="md-wk">${MD_WEEKDAYS.map((w) => `<span>${w}</span>`).join("")}</div><div class="md-days">${cells}</div></div>`;
@@ -193,6 +269,22 @@ function renderModes() {
   }).join("") : '<li class="empty">This config has no calendar entries.</li>';
 }
 
+/** The legend's periods: a chip each (hides or shows its days), and whether today is in them. */
+function mdPeriodLegend(list) {
+  if (!mdPeriodsAvailable() || !liveHere()) return "";
+  if (!list) return `<span class="md-psep"></span><span class="md-hint">${esc(mdPeriodsPending())}</span>`;
+  const chips = list.map((p) => {
+    // Hidden and unreadable are separate: a hidden chip always shows again on a click.
+    const key = "p:" + p.key, off = MD.hidden.has(key), ok = !!p.season.date, stale = mdPeriodStale(p);
+    const tip = ok ? `${p.title}: ${p.season.text} every year, from the Miniserver (set in the app's operating-mode settings).${stale ? ` Read ${stale}.` : ""}${p.today ? " Today is in it." : ""} Click to ${off ? "show" : "hide"} its days.`
+      : `${p.title}: ${mdPeriodText(p)}${off ? ". Click to show it again." : ""}`;
+    return `<button type="button" class="md-chip md-pchip${off ? " off" : ""}${ok ? "" : " none"}${stale ? " stale" : ""}" data-mode="${key}" aria-pressed="${!off}"${ok || off ? "" : " disabled"} title="${esc(tip)}">` +
+      `<span class="md-psw ${p.key}"></span>${esc(p.title)}: ${ok ? esc(p.season.text) : '<span class="none-v">cannot read</span>'}${p.today ? '<span class="md-now">today</span>' : ""}</button>`;
+  }).join("");
+  const today = mdPeriodsToday(list);
+  return `<span class="md-psep"></span>${chips}${today ? `<span class="md-ptoday">${esc(today)}</span>` : ""}`;
+}
+
 /** For a tooltip: the day, and every entry of a shown mode on it. */
 function mdDayTip(n) {
   const { modes } = MD.cache, marks = mdMarks(), shown = (e) => !MD.hidden.has(e.key);
@@ -200,6 +292,7 @@ function mdDayTip(n) {
   const d = all && { on: all.on.filter(shown), add: all.add.filter(shown), rem: all.rem.filter(shown) };
   const line = (e, tag) => `<br><span class="md-tsw" style="background:${modes.get(e.key)?.color || "#888"}"></span>${esc(e.title)} · ${esc(modes.get(e.key)?.title || e.cal.mode.title)}${tag ? ` <span class="tm">${tag}</span>` : ""}`;
   let html = `<b>${esc(mdFmt(n))}</b>${n === mdToday() ? ' <span class="tm">today</span>' : ""}`;
+  for (const p of MD.pcache || []) if (p.days.has(n)) html += `<br><span class="md-psw ${p.key}"></span>${esc(p.title)}`;
   if (!d || (!d.on.length && !d.rem.length)) return html + '<br><span class="tm">No calendar entry</span>';
   const added = new Set(marks ? d.add.map((e) => e.uuid) : []);
   for (const e of d.on) html += line(e, added.has(e.uuid) ? "added" : "");
@@ -218,6 +311,8 @@ $("md-legend").addEventListener("click", (e) => {
   MD.hidden.has(c.dataset.mode) ? MD.hidden.delete(c.dataset.mode) : MD.hidden.add(c.dataset.mode);
   renderModes();
 });
+// Properties of a climate block: "Show on the year".
+$("props").addEventListener("click", (e) => { if (e.target.closest("[data-modes-open]")) modesOpen(); });
 $("md-list").addEventListener("click", (e) => {
   const b = e.target.closest("[data-go]");
   if (b) select(b.dataset.go);
