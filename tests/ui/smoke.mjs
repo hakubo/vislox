@@ -28,10 +28,11 @@ const cfg = join(repo, "504F94000001", "config.Loxone");
 copyFileSync(fixture, cfg);
 git("add", ".");
 git("commit", "-q", "-m", "[504F94000001] Config backup 2026-11-01 10:00:00 (v1)");
-// Uncommitted edits: a rename and a parameter.
+// Uncommitted edits: a rename, a parameter and a calendar entry's date.
 const edit = (from, to) => writeFileSync(cfg, readFileSync(cfg, "utf8").replace(from, to));
 edit('Title="Licht OG"', 'Title="Licht oben"');
 edit('K="Input2" Def="1000"', 'K="Input2" Def="100"');
+edit('Month="12" Day="24"', 'Month="12" Day="26"');
 
 // Live values as `lox stream -o json --initial` writes them: the fixture's
 // temperature (an analog output) and its AND gate (a digital one).
@@ -152,6 +153,20 @@ try {
     await again.goto(link);
     await again.waitForFunction(() => document.querySelector(".ph-t")?.textContent === "Licht oben");
     await again.close();
+  });
+  await step("a calendar entry reads as a date and an operating mode", async () => {
+    const changes = await page.$$eval(".changes .chg .t", (n) => n.map((x) => x.textContent));
+    assert.ok(changes.includes("Heiligabend · when: 24 Dec → 26 Dec"), changes.join(" | "));
+    await page.click('.changes .chg:has-text("Heiligabend")');
+    await page.waitForFunction(() => document.querySelector(".ph-t")?.textContent === "Heiligabend");
+    const props = await page.textContent("#props");
+    assert.match(props, /Calendar entry/);
+    assert.match(props, /WhenEvery year on 24 DecEvery year on 26 Dec/);
+    assert.match(props, /Switches onFeiertag/);
+    assert.equal(await page.getAttribute('.tn-row[data-uuid="10000013-0000-0130-ffff504f94000001"]', "title"), "Every year on 26 Dec · switches on Feiertag");
+    // The mode is a link to the Mode object.
+    await page.click('#props .lnk:has-text("Feiertag")');
+    await page.waitForFunction(() => document.querySelector(".ph-t")?.textContent === "Feiertag");
   });
   await step("live values go on the wires and follow the stream", async () => {
     await page.click('.tab:has-text("Erdgeschoss")');

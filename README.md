@@ -20,6 +20,11 @@ marked so you can review it before you deploy.
 - **Sidebar with the block's configuration**: the periphery and page tree (filter with Ctrl+F), and the
   selected block's properties: name, type, page, room, category, connections (each one a link),
   parameters and raw attributes.
+- **Calendar entries as dates**: an operating-mode calendar entry shows *When* in words (*Every year on 24 Dec*,
+  *Easter Monday (Easter +1)*, *4 Jul 2026 – 5 Sep 2026*, *Every year 1 Oct – 30 Apr*) and the mode it *Switches
+  on*, linked to the `Mode` object. The tree's tooltip says the same, and the Changes list reads a changed entry
+  as *24 Dec → 26 Dec* and *Holiday → Party* instead of raw attributes. An entry vislox cannot decode says why;
+  its raw attributes stay under Advanced.
 - **History** (right): every revision, newest first:
   - *Pending*: the compiled `out.Loxone` of a `lox.toml` project, compared with the deployed `base`.
     This is what `lox config push` would apply.
@@ -250,6 +255,9 @@ The binary is an `axum` server with the UI embedded (plain JS and SVG, no build 
 - `src/model.rs` turns a revision, plus an optional base, into pages, objects, wires, cross-page links,
   properties and a change list. It uses `loxone_config::diff` and adds its own checks for attributes,
   positions and wires.
+- `src/calendar.rs` decodes a calendar entry's date from the `.Loxone` file's attributes (as lox's
+  `loxone-format.md` documents them: `Mode=` the kind, `From`/`To` days since 2009-01-01, `CalType=` the mode's
+  number) and words it. The view carries the decoded date by kind (`calendar.date`) for views of the year.
 - `src/actions.rs` runs Apply (`lox config push --force`, `git commit`, `git push`), Sync (`lox config merge`,
   `git commit`, `git push`) and Discard (`git checkout` of the module, lock and out). Apply's steps follow lox's
   progress lines as they come.
