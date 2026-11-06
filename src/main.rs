@@ -12,6 +12,7 @@ mod miniserver;
 mod model;
 mod operate;
 mod pull;
+mod query;
 mod reason;
 mod restart;
 mod session;
@@ -327,6 +328,10 @@ async fn main() -> Result<()> {
         .route("/api/events", get(api_events))
         .route("/api/live", get(api_live))
         .route("/api/live/retry", axum::routing::post(api_live_retry))
+        .route(
+            "/api/live/query",
+            get(api_live_query).post(api_live_query_start),
+        )
         .route("/api/miniserver", get(api_miniserver))
         .route("/api/log", get(api_log))
         .route("/api/app", get(api_app))
@@ -711,6 +716,112 @@ async fn api_live(
 }
 
 #[derive(Deserialize)]
+struct LiveQuery {
+    rev: String,
+    page: String,
+}
+
+/// Opt-in: start querying the blocks behind the wires of the page a browser
+/// shows. Only for the current, deployed revision (what the Miniserver
+/// runs), and only with the `X-Vislox` header, since it makes vislox send
+/// requests to the Miniserver: `{token, blocks}` for `GET /api/live/query`.
+async fn api_live_query_start(
+    State(app): State<Arc<App>>,
+    headers: axum::http::HeaderMap,
+    Json(q): Json<LiveQuery>,
+) -> Response {
+    let a = app.clone();
+    let plan = move || {
+        tokio::task::spawn_blocking(move || -> Result<Vec<query::Block>, String> {
+            let current = a
+                .history
+                .lock()
+                .unwrap()
+                .find(&q.rev)
+                .is_some_and(|r| r.current && r.kind != "pending");
+            if !current {
+                return Err("only the current, deployed revision is queried".into());
+            }
+            let (_, doc) = load(&a, &q.rev)?;
+            Ok(model::query_plan(&doc, &q.page))
+        })
+    };
+    live_query_start(&app.live, &headers, plan).await
+}
+
+async fn live_query_start<F>(
+    live: &live::Live,
+    headers: &axum::http::HeaderMap,
+    plan: impl FnOnce() -> F,
+) -> Response
+where
+    F: std::future::Future<
+            Output = Result<Result<Vec<query::Block>, String>, tokio::task::JoinError>,
+        >,
+{
+    if let Some(r) = not_from_vislox(headers) {
+        return r;
+    }
+    match plan().await.map_err(|e| e.to_string()).and_then(|r| r) {
+        Ok(blocks) => {
+            let n = blocks.len();
+            Json(serde_json::json!({ "token": live.offer(blocks), "blocks": n })).into_response()
+        }
+        Err(e) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({ "error": e })),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct QueryToken {
+    token: String,
+}
+
+/// The stream that holds one page's block queries (from
+/// `POST /api/live/query`): they run while it is open. It carries `query`
+/// events (`{blocks, answered, failed}`, for this page only) when they
+/// change, or `refused` for an unknown, used or expired token. The values
+/// come on `/api/live`.
+async fn api_live_query(
+    State(app): State<Arc<App>>,
+    Query(q): Query<QueryToken>,
+) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
+    let live = app.live.clone();
+    let guard = live.take(&q.token);
+    let refused = guard.is_none().then(|| {
+        Event::default()
+            .event("refused")
+            .data(r#"{"error":"the query token is unknown or used; ask again"}"#)
+    });
+    let reports = futures_util::stream::unfold(
+        (live, guard, String::new(), true),
+        |(live, guard, last, first)| async move {
+            let guard = guard?;
+            let mut last = last;
+            loop {
+                if !first || !last.is_empty() {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+                let r = live.query_report(&guard).to_string();
+                if r != last {
+                    last = r.clone();
+                    let e = Event::default().event("query").data(r);
+                    return Some((e, (live, Some(guard), last, false)));
+                }
+            }
+        },
+    );
+    let stream = tokio_stream::iter(refused)
+        .chain(reports)
+        .chain(tokio_stream::pending())
+        .map(Ok);
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+#[derive(Deserialize)]
 struct MsQuery {
     /// Any value but `0` or `false`.
     fresh: Option<String>,
@@ -946,6 +1057,29 @@ mod tests {
         std::fs::write(broken.path().join("lox.toml"), "base = [").unwrap();
         let broken = source::Source::resolve(broken.path(), None).unwrap_err();
         assert!(!offer_discovery(&broken, &args(&[])));
+    }
+
+    #[tokio::test]
+    async fn only_vislox_starts_block_queries() {
+        let live = live::Live::new(live::Feed::Off("test".into()), "test".into());
+        let planned = std::sync::atomic::AtomicBool::new(false);
+        let plan = || {
+            planned.store(true, std::sync::atomic::Ordering::Relaxed);
+            tokio::task::spawn_blocking(|| Ok(Vec::new()))
+        };
+        // Another site's request (no X-Vislox): refused, nothing planned or offered.
+        let r = live_query_start(&live, &axum::http::HeaderMap::new(), plan).await;
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
+        assert!(!planned.load(std::sync::atomic::Ordering::Relaxed));
+        let mut h = axum::http::HeaderMap::new();
+        h.insert("x-vislox", "query".parse().unwrap());
+        let r = live_query_start(&live, &h, plan).await;
+        assert_eq!(r.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(r.into_body(), 1 << 16).await.unwrap();
+        let j: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let token = j["token"].as_str().unwrap();
+        assert!(live.take(token).is_some());
+        assert!(live.take(token).is_none());
     }
 
     #[test]

@@ -54,9 +54,20 @@ marked so you can review it before you deploy.
     from their inputs, and a lighting controller's Mood output from its active mood. Computed values have a
     dashed outline and say so in the tooltip.
 
-  Blocks with timing or memory (delays, edge detection, Formula, …) and inputs the app does not show stay
-  without a value. Those wires are faded ("Dim wires without a value" in the legend turns this off). Values
-  show on the current, deployed revision only.
+  - **Query blocks on this page** (in the legend, off by default): vislox asks the Miniserver for the outputs
+    of the blocks behind the page's wires that it does not stream (`jdev/sps/io/<uuid>/all`, a read-only
+    request), every 2 s, at most 20 requests a second, on the connection live values already use. Wires that
+    pass through references are followed to the first block behind them (a memory flag or a mode answers for
+    itself). These
+    values have a dotted outline and green tint and say "queried" in the tooltip: they are up to one round
+    old (a page with more than 40 blocks takes longer than 2 s). The legend says how many of this page's blocks
+    answered and which cannot be queried (an alarm or an NFC Code Touch answers `500`; a block that does not
+    answer three times in a row is left alone for a minute). Queries stop when you leave the page, and their
+    values go with them.
+
+  Without queries, blocks with timing or memory (delays, edge detection, Formula, …) and inputs the app does
+  not show stay without a value. Those wires are faded ("Dim wires without a value" in the legend turns this
+  off). Values show on the current, deployed revision only.
 
 - **In the app**: what a block looks like in the Loxone app. Properties shows whether the config shows it in the
   app, in which room and category (changes marked old → new; showing, hiding or moving a block to another room or
@@ -126,8 +137,8 @@ marked so you can review it before you deploy.
   one, none, or cannot be checked, nothing is sent.
 
 vislox itself never writes to the config: lox and git do, and only on Pull, Apply and Discard. Live values only
-listen. A pull reads from the Miniserver; only Apply writes to it, and with `--operate`, commands to virtual
-inputs.
+listen, unless you turn on **Query blocks on this page**, which sends read-only requests. A pull reads from the
+Miniserver; only Apply writes to it, and with `--operate`, commands to virtual inputs.
 
 ## Run
 
@@ -249,7 +260,20 @@ inputs, outputs and every other block are refused. The visualization password st
 storage and is never logged. The command log is kept in memory.
 
 The Miniserver connection is opened when a browser turns live values on, and closed shortly after the last
-one turns them off. During Apply, vislox also asks the Miniserver every 0.5 s, read-only, whether it answers
+one turns them off. With **Query blocks on this page**, the browser asks for the page's queries with
+`POST /api/live/query` (`{rev, page}`, only the current, deployed revision; it needs the `X-Vislox` header, so
+that no other web page can make vislox send requests), and holds `GET /api/live/query?token=…` open with the
+one-use token it gets while it shows the page. vislox sends `jdev/sps/io/<uuid>/all` for each block the page
+needs on that same WebSocket, at most 20 a second without waiting for earlier answers, each block at most every
+2 s. Blocks whose wanted outputs the Miniserver streams are left out, and so is a block that answers with an
+error code (until the next connection) or does not answer three times in a row (for a minute). The values reach
+every browser with the others on `/api/live`; the page's own stream says how its blocks did (`query` events). How an answer maps to connectors is in `src/query.rs`:
+outputs come in config order (`nr`), under labels that are not the connector keys (`R` and `E` for a Formula's
+`AQ` and `TQ`), so they map by position when the counts match, else by a label that names the key (a meter
+leaves out its weekly totals), else by a table for the types that leave other outputs out (HVAC controller,
+presence detector, roof window, music player, …). Blocks with one value (memory flag, mode, actuator, system
+variable) give it to their first output. A lighting controller, a State block and a smoke alarm are not
+queried: their answers do not say which connector a value belongs to. During Apply, vislox also asks the Miniserver every 0.5 s, read-only, whether it answers
 (`jdev/cfg/apiKey`, no login) and which structure it runs (`jdev/sps/LoxAPPversion3`). It does this only from
 the program restart until the new config runs, and only if the Miniserver answered before the upload.
 `--no-live` turns this off as well.
@@ -333,9 +357,10 @@ The binary is an `axum` server with the UI embedded (plain JS and SVG, no build 
   token) and keeps the command log.
 - `src/live.rs` streams the Miniserver's states with lox's `loxone-client` crate. A wire's source
   connector has the UUID of the state it carries, so the browser matches values to wires by UUID. Values
-  reach the browser on `/api/live` (server-sent events).
-- `src/session.rs` is one WebSocket session (connect, log in, subscribe, stream), built from `loxone-client`'s
-  parts so that it keeps the Miniserver's close code. `src/reason.rs` turns close and response codes into a
+  reach the browser on `/api/live` (server-sent events). `src/query.rs` maps a queried block's answer to its
+  connectors, and `model::query_plan` picks the blocks a page needs.
+- `src/session.rs` is one WebSocket session (connect, log in, subscribe, stream, and the opt-in block queries),
+  built from `loxone-client`'s parts so that it keeps the Miniserver's close code. `src/reason.rs` turns close and response codes into a
   reason, a plain sentence and a backoff.
 - File changes are noticed with `notify`. Git is polled every 3 s. Browsers get a server-sent event and
   reload.
