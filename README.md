@@ -86,9 +86,11 @@ marked so you can review it before you deploy.
 
 - **The Miniserver's config changed after the base**: the chip also asks the Miniserver when its config last
   changed (`jdev/sps/LoxAPPversion3`), and compares that with the date in the download the base came from. When
-  they differ, someone saved from Loxone Config (or otherwise changed the config) after the base was taken: the
-  chip turns amber, and a notice above Deploy and History says when, with **Pull from Miniserver** or **Sync from
-  Miniserver**. Apply asks once more and warns in its confirmation. The page checks every minute while it is open.
+  the Miniserver's is later, someone saved from Loxone Config (or otherwise changed the config) after the base was
+  taken: the chip turns amber, and a notice above Deploy and History says when, with **Pull from Miniserver** or
+  **Sync from Miniserver**. Apply asks once more and warns in its confirmation. While the page is open it asks for
+  the date every minute (the rest of the check every five minutes). An earlier date (an older config restored on
+  the Miniserver) is shown in the chip's details, not as a warning.
 
 vislox itself never writes to the config: lox and git do, and only on Pull, Apply and Discard. Live values only
 listen. A pull reads from the Miniserver; only Apply writes to it.
@@ -168,10 +170,13 @@ default bridge network.
 The config date is the one request that needs lox's user and password (HTTP basic auth, as Apply's restart
 probe; no token is requested). The Miniserver sends `lastModified` of its `LoxAPP3.json`, in its local time.
 The base's own date comes from the download lox took it from: `backup.zip` next to a repository's `config.Loxone`
-(`lox config pull`), the base itself when it is a backup `.zip`, or, in a project, the zip in `backups/` beside
-the newest `.Loxone` that equals the base byte for byte (`lox config push`, `merge`, Sync). When no download
-matches (a base edited by hand), nothing is compared. The date is coarse: a push that changes only logic can leave
-it as it was, so equal dates do not prove equal configs, but different dates do mean the base is old.
+(`lox config pull`), or, in a project, the zip in `backups/` beside the newest `.Loxone` that equals the base byte
+for byte (`lox config push`, `merge`, Sync). When no download matches (a base edited by hand), nothing is
+compared, and neither is a backup `.zip` opened on its own (a look at an old config). The date is coarse: a push
+that changes only logic can leave it as it was, so equal dates do not prove equal configs, but a later date on the
+Miniserver does mean the base is old. When the Miniserver does not answer the request (no rights, wrong password,
+a timeout of 5 s), the chip's details say that it cannot tell; that is not a warning. The date is asked for apart
+from the rest of the check, so the preflight before Pull, Apply and Sync never waits for it.
 
 Not shown yet: the token's rights (Config, FTP, program restart) and whether the password is weak. The
 Miniserver reports them only at login (`tokenRights`, `unsecurePass`), and lox does not keep them.

@@ -553,14 +553,19 @@ async fn api_live(
 struct MsQuery {
     /// Any value but `0` or `false`.
     fresh: Option<String>,
+    /// The page's regular poll: any value but `0` or `false`.
+    poll: Option<String>,
 }
 
 /// The Miniserver's status for the toolbar chip: at most a minute old, or
-/// checked again with `?fresh=1`.
+/// checked again with `?fresh=1`. The page's regular poll (`?poll=1`) asks
+/// only for the config dates again, and reuses the rest for five minutes.
 async fn api_miniserver(State(app): State<Arc<App>>, Query(q): Query<MsQuery>) -> Response {
-    let fresh = q.fresh.is_some_and(|f| f != "0" && f != "false");
-    let v = if fresh {
+    let on = |v: &Option<String>| v.as_deref().is_some_and(|f| f != "0" && f != "false");
+    let v = if on(&q.fresh) {
         app.ms.recheck().await
+    } else if on(&q.poll) {
+        app.ms.poll().await
     } else {
         app.ms.chip().await
     };
