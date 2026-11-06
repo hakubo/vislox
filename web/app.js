@@ -102,7 +102,7 @@ function revInfo(r) {
 // ── URL state: #page=…&sel=…&rev=…&base=… ─────────────────────────────
 function readHash() {
   const h = new URLSearchParams(location.hash.slice(1));
-  return { page: h.get("page"), sel: h.get("sel"), rev: h.get("rev"), base: h.get("base") };
+  return { page: h.get("page"), sel: h.get("sel"), rev: h.get("rev"), base: h.get("base"), view: h.get("view") };
 }
 function writeHash(push) {
   if (S.applyingHash) return;
@@ -111,6 +111,7 @@ function writeHash(push) {
   if (S.sel) h.set("sel", S.sel);
   if (!S.follow && S.rev) h.set("rev", S.rev);
   if (!S.follow && S.base) h.set("base", S.base);
+  if (MD.open) h.set("view", "modes");
   const s = "#" + h.toString();
   if (s === location.hash) return;
   if (push) history.pushState(null, "", s); else history.replaceState(null, "", s);
@@ -125,6 +126,7 @@ window.addEventListener("popstate", async () => {
     } else {
       if (h.page && h.page !== S.page) gotoPage(h.page);
       select(h.sel || null, { noReveal: false });
+      if (h.view === "modes") modesOpen({ quiet: true }); else modesClose(true);
     }
   } finally { S.applyingHash = false; }
 });
@@ -252,6 +254,10 @@ async function loadView() {
   renderPage();
   renderProps();
   if (S.sel) applyFocus();
+  // A link or Back/Forward says whether the view is open; a reload of the revision keeps it as it is.
+  if (h?.view === "modes") modesOpen({ quiet: true });
+  else if (h) modesClose(true);
+  else renderModes();
   writeHash(false);
 }
 function renderLegend() {
@@ -301,12 +307,15 @@ $("tab-list").addEventListener("keydown", (e) => {
 });
 function gotoPage(uuid, opts) {
   if (!uuid || !S.pageOf.has(uuid)) return;
+  // Going to a page leaves the Operating modes view.
+  const left = MD.open;
+  modesClose(true);
   if (S.page !== uuid) {
     S.page = uuid;
     renderTabs(); renderPage();
     if (S.sel) applyFocus();
     writeHash(true);
-  }
+  } else if (left) writeHash(true);
   if (opts && opts.focus) focusObj(opts.focus, opts.zoom);
 }
 function stepPage(d) {
@@ -833,6 +842,7 @@ function select(uuid, opts) {
   if (uuid) vpG.querySelectorAll(`[data-uuid="${CSS.escape(uuid)}"]`).forEach((n) => n.classList.add("sel"));
   applyFocus();
   renderProps();
+  renderModes();
   if (!opts || !opts.noReveal) revealInTree(uuid);
   writeHash(false);
 }
@@ -1048,9 +1058,10 @@ function renderTree() {
     const name = autoTitle(n.title) && n.ty !== "Page" ? prettyType(n.ty) : n.title;
     const ty = extra ?? (!kids && name !== prettyType(n.ty) ? prettyType(n.ty) : "");
     const tipText = calTip(S.view.objects[n.uuid]?.calendar);
+    const year = MODES_FOLDERS.has(n.ty) ? '<button type="button" class="tn-year" data-modes tabindex="-1" title="Operating modes: a year calendar of when each mode is on">Year</button>' : "";
     const num = n.ty === "Page" || n.ty === "Refs" ? `<span class="tn-n">${n.ty === "Page" ? treeChildren(n).reduce((a, c) => a + (c.synthetic ? 0 : 1), 0) : n.children.length}</span>` : "";
     return `<div class="tn-row ${marks ? n.status : ""}${n.uuid === S.sel ? " sel" : ""}${n.uuid === S.treeFocus ? " kfocus" : ""}" role="treeitem" aria-level="${depth + 1}"${kids ? ` aria-expanded="${open}"` : ""} aria-selected="${n.uuid === S.sel}" data-uuid="${esc(n.uuid)}"${tipText ? ` title="${esc(tipText)}"` : ""} style="padding-left:${4 + depth * 14}px">` +
-      `<span class="tn-tw${open ? " open" : ""}" aria-hidden="true">${kids ? "▶" : ""}</span>${icon(n)}<span class="tn-t">${esc(name)}</span>${ty ? `<span class="tn-ty">${esc(ty)}</span>` : ""}${badge}${num}</div>`;
+      `<span class="tn-tw${open ? " open" : ""}" aria-hidden="true">${kids ? "▶" : ""}</span>${icon(n)}<span class="tn-t">${esc(name)}</span>${ty ? `<span class="tn-ty">${esc(ty)}</span>` : ""}${year}${badge}${num}</div>`;
   };
   if (q) {
     const out = [];
@@ -1097,6 +1108,8 @@ function nodeById(uuid) {
   if (S.view) treeRoots().forEach(walk);
   return found;
 }
+/** The Calendar and Operating modes folders have a button that opens the year view of the modes. */
+const MODES_FOLDERS = new Set(["CalendarCaption", "ModeCaption"]);
 function activateNode(uuid) {
   const n = nodeById(uuid);
   if (!n) return;
@@ -1116,10 +1129,12 @@ $("tree").addEventListener("click", (e) => {
   if (!row) return;
   const uuid = row.dataset.uuid;
   S.treeFocus = uuid;
+  if (e.target.closest("[data-modes]")) { modesOpen(); return; }
   if (e.target.closest(".tn-tw") && row.hasAttribute("aria-expanded")) { toggleNode(uuid); return; }
   activateNode(uuid);
 });
 $("tree").addEventListener("dblclick", (e) => {
+  if (e.target.closest("[data-modes]")) return;
   const row = e.target.closest(".tn-row");
   if (row && row.hasAttribute("aria-expanded")) toggleNode(row.dataset.uuid);
 });
@@ -1269,13 +1284,20 @@ function renderPalette() {
     if (o.moved_to || o.shape === "tag") continue;
     blocks.push({ kind: "block", title: displayTitle(o), meta: `${prettyType(o.ty)} · ${p.title}`, page: p.uuid, uuid: o.uuid });
   }
+  // Views match a whole word they start with (“mod”, “calendar”), not any subsequence, and come after
+  // pages and blocks, so that a short query still opens the best page or block.
+  const views = mdEntries().length || v.modes.length ? [{ kind: "view", title: "Operating modes", meta: "year calendar of the calendar entries", names: ["operating modes", "modes", "calendar"] }] : [];
   let items;
-  if (!q) items = [{ sec: "Pages" }, ...pages];
+  if (!q) items = [{ sec: "Pages" }, ...pages, ...(views.length ? [{ sec: "Views" }, ...views] : [])];
   else {
     const score = (it) => { const m = fuzzy(q, it.title); return m ? { ...it, score: m.score + (it.kind === "page" ? 50 : 0), hits: m.hits } : null; };
     const ps = pages.map(score).filter(Boolean).sort((a, b) => b.score - a.score).slice(0, 12);
     const bs = blocks.map(score).filter(Boolean).sort((a, b) => b.score - a.score).slice(0, 40);
-    items = [...(ps.length ? [{ sec: "Pages" }, ...ps] : []), ...(bs.length ? [{ sec: "Blocks" }, ...bs] : [])];
+    const vs = views.filter((it) => it.names.some((w) => w.startsWith(q))).map((it) => {
+      const at = it.title.toLowerCase().indexOf(q);
+      return { ...it, hits: at >= 0 ? [[at, at + q.length]] : [] };
+    });
+    items = [...(ps.length ? [{ sec: "Pages" }, ...ps] : []), ...(bs.length ? [{ sec: "Blocks" }, ...bs] : []), ...(vs.length ? [{ sec: "Views" }, ...vs] : [])];
   }
   pal.items = items;
   pal.idx = items.findIndex((x) => !x.sec);
@@ -1299,6 +1321,7 @@ function palOpen(i) {
   const it = pal.items[i];
   if (!it || it.sec) return;
   closePalette();
+  if (it.kind === "view") { modesOpen(); return; }
   if (it.kind === "page") { gotoPage(it.page); select(null, { noReveal: true }); }
   else { gotoPage(it.page, { focus: it.uuid }); select(it.uuid); }
   svg.focus({ preventScroll: true });
@@ -1332,7 +1355,7 @@ $("sel-base").onchange = (e) => { S.base = e.target.value || null; S.follow = fa
 $("chk-changes").onchange = (e) => {
   S.marks = e.target.checked;
   if (!S.view) return;
-  renderLegend(); renderTabs(); renderTree(); renderPage(); renderProps(); applyFocus();
+  renderLegend(); renderTabs(); renderTree(); renderPage(); renderProps(); applyFocus(); renderModes();
 };
 $("chk-live").onchange = (e) => setLive(e.target.checked);
 $("chk-live-dim").checked = S.live.dim;
@@ -1353,6 +1376,8 @@ window.addEventListener("keydown", (e) => {
   if (tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA") { if (e.key === "Escape") e.target.blur(); return; }
   if (e.ctrlKey || e.metaKey || e.altKey) return;
   const inTree = e.target.id === "tree", inTabs = e.target.closest?.("#tab-list");
+  // The Operating modes view takes the arrows (years) and Esc; the hidden page is not panned or zoomed.
+  if (!inTree && !inTabs && modesKey(e)) return;
   const step = e.shiftKey ? 240 : 60;
   switch (e.key) {
     case "+": case "=": zoomCenter(1.25); break;
@@ -1472,7 +1497,8 @@ function renderMs() {
         : calDrift().length ? `${calDrift().length} changed in the app` : `${S.cal.entries}, as in the deployed config`)}
       ${m.reachable ? row("Connection", m.local === false ? "remote" : m.local ? "local" : "unknown") + row("TLS", tls)
         + row("Live-update slot", m.eventSlots == null ? "" : m.eventSlots ? "free" : "none free") : ""}
-      ${row("lox's token valid until", tok)}</dl>
+      ${row("lox's token valid until", tok)}
+      ${(() => { const st = S.mon?.info?.stats; return st ? row("Load (Debug-Monitor)", `CPU ${Math.round(st.cpu)} % · heap ${st.heapKb} of ${st.maxKb} kB` + (st.linkErrors ? ` · ${st.linkErrors} Link errors` : "")) : ""; })()}</dl>
     ${m.checks.map((c) => `<div class="chk ${c.ok ? "ok" : "bad"}"><span class="dot" aria-hidden="true"></span><span><b>${esc(c.name)}</b> <span class="d">${esc(c.ok ? (c.detail === "answers" ? "answers" : "answers: " + c.detail) : c.detail)}</span></span></div>`).join("")}
     ${m.discovered?.length ? `<div class="chk"><span><b>On the local network</b> <span class="d">${m.discovered.map((d) => esc(`${d.serial} at ${d.ip} (${d.firmware})`)).join(", ")}</span></span></div>` : ""}
     ${m.discoveryNote ? `<div class="chk bad"><span class="dot" aria-hidden="true"></span><span><b>Discovery</b> <span class="d">${esc(m.discoveryNote)}</span></span></div>` : ""}
@@ -1928,7 +1954,10 @@ function logInfo() { return S.hist?.log || { available: false }; }
 /** The entries since the last program change; all of them when the lines hold none. */
 function logRecent() {
   const d = S.log.data;
-  return d?.entries ? d.entries.slice(d.since ?? 0) : [];
+  const sys = d?.entries ? d.entries.slice(d.since ?? 0) : [];
+  // Debug-Monitor lines since the last program change in the system log.
+  const after = d?.entries && d.since != null ? d.entries[d.since].at : "";
+  return [...sys, ...S.mon.lines.filter((e) => e.at >= after)];
 }
 /** UUID (a block's, or one of its ports') → the block it belongs to. */
 function logTargets() {
@@ -1947,21 +1976,23 @@ function logTargets() {
  *  deployed revision: the log is about what runs. */
 function logMarks() {
   const r = revById(S.rev);
-  if (!S.log.data || S.log.stale || !r?.current || r.kind === "pending") return new Map();
+  if ((!S.log.data && !S.mon.lines.length) || S.log.stale || !r?.current || r.kind === "pending") return new Map();
   const t = logTargets(), m = new Map();
   for (const e of logRecent()) for (const u of e.uuids || []) { const b = t.get(u); if (b) m.set(b, e); }
   return m;
 }
 function renderLog() {
-  const info = logInfo(), pane = $("log-pane");
-  pane.classList.toggle("hidden", !info.available);
-  if (!info.available) return;
+  const info = logInfo(), mon = monInfo(), pane = $("log-pane");
+  pane.classList.toggle("hidden", !info.available && !mon.available);
+  if (!info.available && !mon.available) return;
+  if (mon.available) monConnect();
+  renderMonBar();
   const open = S.log.open;
   pane.classList.toggle("open", open);
   $("log-toggle").setAttribute("aria-expanded", String(open));
   $("log-body").classList.toggle("hidden", !open);
   const b = $("btn-log");
-  b.classList.toggle("hidden", !open);
+  b.classList.toggle("hidden", !open || !info.available);
   b.disabled = S.log.loading;
   b.classList.toggle("busy", S.log.loading);
   b.querySelector(".lbl").textContent = S.log.loading ? "Reading…" : "Refresh";
@@ -1970,7 +2001,7 @@ function renderLog() {
   $("log-count").textContent = recent ? `${recent} new` : "";
   $("log-count").title = recent ? `${plural(recent, "entry")} since the last program change` : "";
   const msg = $("log-msg");
-  const text = d?.error ? `Cannot read the log: ${d.error}` : !d ? (S.log.loading ? "Reading the log (lox log)…" : "")
+  const text = !info.available ? `No system log: ${info.reason}.` : d?.error ? `Cannot read the log: ${d.error}` : !d ? (S.log.loading ? "Reading the log (lox log)…" : "")
     : S.log.stale ? (S.log.loading ? "Read before the last Apply; reading it again…" : "Read before the last Apply. Refresh to read it again.")
     : d.since == null ? `No program change in the last ${d.lines} lines.` : "";
   msg.textContent = text;
@@ -1978,20 +2009,19 @@ function renderLog() {
   $("log-only-w").classList.toggle("hidden", !d || d.since == null);
   $("chk-log-since").checked = S.log.onlySince;
   const list = $("log");
-  const entries = d?.entries || [], since = d?.since ?? null, t = logTargets();
+  const entries = d?.entries || [], since = d?.since ?? null;
   const from = S.log.onlySince && since != null ? since : 0;
   const rows = [];
+  // The Debug-Monitor's lines, live, above the system log.
+  for (let i = S.mon.lines.length - 1; i >= 0; i--) rows.push(monRow(S.mon.lines[i]));
   for (let i = entries.length - 1; i >= from; i--) {
     const e = entries[i];
-    const links = (e.uuids || []).map((u) => t.get(u)).filter((u, j, a) => u && a.indexOf(u) === j).map((u) => {
-      const o = S.view.objects[u];
-      return `<button type="button" class="go" data-go="${esc(u)}" title="${esc(o.path || "")}">${esc(autoTitle(o.title) ? prettyType(o.ty) : o.title)}</button>`;
-    }).join("");
+    const links = logLinks(e);
     rows.push(`<li class="${esc(e.kind)}${since != null && i >= since ? " since" : ""}" data-i="${i}"><span class="tm">${esc(e.at)}</span><span class="tx">${esc(e.text)}</span>${links}</li>`);
     if (i === since) rows.push(`<li class="mark">▲ The program changed here (Apply, or a save from Loxone Config)</li>`);
   }
   list.innerHTML = rows.join("") || (d && !d.error ? '<li class="tx">The log is empty.</li>' : "");
-  if (open && !d && !S.log.loading) loadLog();
+  if (open && !d && !S.log.loading && info.available) loadLog();
 }
 function marksKey(m) { return [...m].map(([u, e]) => `${u} ${e.at} ${e.text}`).join("\n"); }
 /** Redraw the page when the blocks' log marks are not what it shows. */
@@ -2004,6 +2034,18 @@ function logStale() {
   S.log.stale = true; S.log.staleSeq++;
   if (S.log.open) loadLog();
   renderLog(); redrawMarks();
+}
+/** Links to the blocks a log line names. */
+function logLinks(e) {
+  const t = logTargets();
+  return (e.uuids || []).map((u) => t.get(u)).filter((u, j, a) => u && a.indexOf(u) === j).map((u) => {
+    const o = S.view.objects[u];
+    return `<button type="button" class="go" data-go="${esc(u)}" title="${esc(o.path || "")}">${esc(autoTitle(o.title) ? prettyType(o.ty) : o.title)}</button>`;
+  }).join("");
+}
+/** A Debug-Monitor line; `_k` is its number in this browser, which stays when older lines drop off. */
+function monRow(e) {
+  return `<li class="${esc(e.kind)} monitor since" data-m="${e._k}"><span class="tm">${esc(e.at)}<span class="tag">monitor</span></span><span class="tx">${esc(e.text)}</span>${logLinks(e)}</li>`;
 }
 async function loadLog() {
   if (!logInfo().available) return;
@@ -2033,8 +2075,9 @@ function setLogOpen(open) {
 /** From a block's log mark: open the log and show that line. */
 function openLog(e) {
   if (!S.log.open) setLogOpen(true);
-  const i = S.log.data?.entries.indexOf(e);
-  const li = i >= 0 ? $("log").querySelector(`li[data-i="${i}"]`) : null;
+  // A Debug-Monitor line, or one of the system log's (whose read may have failed).
+  const i = e._k ? -1 : (S.log.data?.entries || []).indexOf(e);
+  const li = e._k ? $("log").querySelector(`li[data-m="${e._k}"]`) : i >= 0 ? $("log").querySelector(`li[data-i="${i}"]`) : null;
   if (!li) return;
   li.scrollIntoView({ block: "nearest" });
   li.classList.add("flash");
@@ -2050,6 +2093,70 @@ $("log").addEventListener("click", (e) => {
   if (pg) gotoPage(pg, { focus: u });
   select(u);
 });
+
+// ── the Debug-Monitor ──────────────────────────────────────────────────
+// With `--monitor`, vislox listens for the Miniserver's debug output (UDP). Start asks the Miniserver to
+// send it (dev/sps/log/<vislox>), Stop ends it; the lines arrive on /api/monitor.
+S.mon = { es: null, info: null, lines: [], busy: false, msg: "", fresh: true, seq: 0, marksT: null };
+function monInfo() { return S.mon.info || S.hist?.monitor || { available: false }; }
+function monConnect() {
+  if (S.mon.es) return;
+  const es = new EventSource("/api/monitor");
+  S.mon.es = es;
+  es.addEventListener("info", (e) => { S.mon.info = JSON.parse(e.data); renderMonBar(); renderMs(); });
+  const add = (list, reset) => {
+    for (const e of list) e._k = ++S.mon.seq;
+    if (reset) {
+      S.mon.lines = list;
+      if (S.log.open) renderLog();
+    } else {
+      const all = [...S.mon.lines, ...list], gone = all.slice(0, Math.max(0, all.length - 500));
+      S.mon.lines = all.slice(-500);
+      // Only the new rows, on top; lines that dropped off go. A closed panel draws all when it opens.
+      if (S.log.open) {
+        const box = $("log");
+        box.querySelector(":scope > li.tx")?.remove();
+        box.insertAdjacentHTML("afterbegin", list.slice().reverse().map(monRow).join(""));
+        for (const e of gone) box.querySelector(`li[data-m="${e._k}"]`)?.remove();
+      }
+    }
+    // The blocks' marks, at most twice a second.
+    if (!S.mon.marksT) S.mon.marksT = setTimeout(() => { S.mon.marksT = null; redrawMarks(); }, 500);
+  };
+  // Each (re)connect starts with every line kept: replace, then append.
+  es.onopen = () => { S.mon.fresh = true; };
+  es.addEventListener("lines", (e) => { add(JSON.parse(e.data), S.mon.fresh); S.mon.fresh = false; });
+  es.addEventListener("reset", (e) => add(JSON.parse(e.data), true));
+}
+function renderMonBar() {
+  const m = monInfo(), bar = $("mon-bar");
+  bar.classList.toggle("hidden", !m.available);
+  if (!m.available) return;
+  const st = $("mon-state"), b = $("btn-mon");
+  const on = !!m.until;
+  const until = on ? new Date(m.until * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "";
+  const listen = m.listening && !m.listening.ok ? m.listening.error : "";
+  st.textContent = S.mon.msg || listen || m.error || (on ? `Debug-Monitor on until ${until} · ${plural(m.packets, "packet")}`
+    : `Debug-Monitor: listening on UDP ${m.port}` + (m.packets ? ` · ${plural(m.packets, "packet")}` : "") +
+      (m.ignored ? ` · ${m.ignored} from other addresses (${m.ignoredFrom}) dropped` : ""));
+  st.className = "mon-state" + (on ? " on" : "") + (listen || m.error ? " error" : "");
+  b.disabled = S.mon.busy || !!listen;
+  b.querySelector(".lbl").textContent = S.mon.busy ? "…" : on ? "Stop" : "Start";
+  b.title = on ? "Ask the Miniserver to stop sending its debug output (dev/sps/log)"
+    : `Ask the Miniserver to send its debug output to ${m.dest || "this host"}:${m.port} for ${m.minutes} min (dev/sps/log/<address>)`;
+}
+$("btn-mon").onclick = async () => {
+  const on = !!monInfo().until;
+  if (!on && !window.confirm("Ask the Miniserver to send its debug output to vislox?\n\nThis is what Loxone Config's Debug Information does. " +
+    "Nothing in the config changes and the program does not restart. vislox stops it again with Stop, when it exits, or after the time limit.")) return;
+  S.mon.busy = true; S.mon.msg = ""; renderMonBar();
+  try {
+    const r = await fetch(on ? "/api/monitor/stop" : "/api/monitor/start", { method: "POST", headers: { "X-Vislox": "monitor" } });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) S.mon.msg = j.error || r.statusText;
+  } catch (e) { S.mon.msg = e.message; }
+  finally { S.mon.busy = false; renderMonBar(); setTimeout(() => { S.mon.msg = ""; renderMonBar(); }, 10000); }
+};
 
 // ── live values ────────────────────────────────────────────────────────
 // The Miniserver streams a value per state UUID; a wire's source connector
@@ -2372,6 +2479,7 @@ function renderLiveSwitch() {
   svg.classList.toggle("live-dim", here && S.live.dim);
   $("lg-query").classList.toggle("hidden", !info.query);
   liveQuerySync(here && info.query && S.live.query);
+  modesLive();
 }
 
 /** Opt-in block queries (`/api/live/query`): the server queries the blocks behind the wires of the
@@ -2572,6 +2680,7 @@ function liveApply(ch) {
     n.title = e?.[2] || "";
     if (ch && e && changed) flash(n);
   });
+  modesLive();
 }
 function flash(n) {
   n.classList.remove("tick");
