@@ -37,6 +37,10 @@ const SLUG_PREFIX: &str = "vx_";
 pub enum Op {
     /// The object's name (`Title=`).
     Title { uuid: String, value: Option<String> },
+    /// The room it is in (`<IoData Pr=…>`), by the room's title.
+    Room { uuid: String, value: Option<String> },
+    /// Its category (`<IoData Cr=…>`), by the category's title.
+    Category { uuid: String, value: Option<String> },
     /// The constant of an unwired input (`Def=` of connector `port`, its `K=`).
     Param {
         uuid: String,
@@ -55,7 +59,62 @@ pub enum Op {
 impl Op {
     pub fn uuid(&self) -> &str {
         match self {
-            Op::Title { uuid, .. } | Op::Param { uuid, .. } | Op::Setting { uuid, .. } => uuid,
+            Op::Title { uuid, .. }
+            | Op::Room { uuid, .. }
+            | Op::Category { uuid, .. }
+            | Op::Param { uuid, .. }
+            | Op::Setting { uuid, .. } => uuid,
+        }
+    }
+
+    /// The value it sets.
+    pub fn value(&self) -> Option<&str> {
+        match self {
+            Op::Title { value, .. }
+            | Op::Room { value, .. }
+            | Op::Category { value, .. }
+            | Op::Param { value, .. }
+            | Op::Setting { value, .. } => value.as_deref(),
+        }
+    }
+
+    /// The same op with another value.
+    pub fn with_value(&self, v: Option<String>) -> Op {
+        let mut op = self.clone();
+        match &mut op {
+            Op::Title { value, .. }
+            | Op::Room { value, .. }
+            | Op::Category { value, .. }
+            | Op::Param { value, .. }
+            | Op::Setting { value, .. } => *value = v,
+        }
+        op
+    }
+}
+
+/// An attribute of the object itself that vislox claims (`x.title`, `x.room`,
+/// `x.category`), in the order the file lists them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Which {
+    Title,
+    Room,
+    Category,
+}
+
+impl Which {
+    fn word(self) -> &'static str {
+        match self {
+            Which::Title => "title",
+            Which::Room => "room",
+            Which::Category => "category",
+        }
+    }
+
+    fn op(self, uuid: String, value: Option<String>) -> Op {
+        match self {
+            Which::Title => Op::Title { uuid, value },
+            Which::Room => Op::Room { uuid, value },
+            Which::Category => Op::Category { uuid, value },
         }
     }
 }
@@ -80,6 +139,9 @@ pub const MAX_OPS: usize = 200;
 #[derive(Serialize, Debug, Default, PartialEq)]
 pub struct Caps {
     pub title: bool,
+    /// It has a room, or a category (lox changes them, never adds them).
+    pub room: bool,
+    pub category: bool,
     pub params: Vec<ParamCap>,
     pub settings: Vec<SettingCap>,
 }
@@ -228,12 +290,21 @@ pub fn caps(el: &Element) -> Option<Caps> {
             value: el.attr_decoded(name).map(|v| v.into_owned()),
         })
         .collect();
+    let io = el.child_elements().find(|c| c.name == "IoData");
+    let bound = |a: &str| io.and_then(|io| io.attr(a)).is_some_and(|v| !v.is_empty());
     let caps = Caps {
         title: el.attr("Title").is_some(),
+        room: bound("Pr"),
+        category: bound("Cr"),
         params,
         settings,
     };
-    (caps.title || !caps.params.is_empty() || !caps.settings.is_empty()).then_some(caps)
+    (caps.title
+        || caps.room
+        || caps.category
+        || !caps.params.is_empty()
+        || !caps.settings.is_empty())
+    .then_some(caps)
 }
 
 // ── the claims file ─────────────────────────────────────────────────────
@@ -246,14 +317,15 @@ pub struct Claims(pub BTreeMap<String, Claim>);
 pub struct Claim {
     /// The object's type, as the extern declares it.
     pub ty: String,
-    pub title: Option<String>,
+    /// Its title, room and category.
+    pub attrs: BTreeMap<Which, String>,
     /// Port (by its Lox Logic name) or setting → value.
     pub sets: BTreeMap<String, Value>,
 }
 
 impl Claim {
     fn is_empty(&self) -> bool {
-        self.title.is_none() && self.sets.is_empty()
+        self.attrs.is_empty() && self.sets.is_empty()
     }
 }
 
@@ -330,14 +402,21 @@ impl Claims {
                     }
                 }
                 Item::Set(s) => set(&mut c, &by_slug, &s.target.slug, &s.target.port, s.value)?,
-                Item::Attr(a) if a.attr == Attr::Title => {
+                Item::Attr(a) => {
+                    let which = match a.attr {
+                        Attr::Title => Which::Title,
+                        Attr::Room => Which::Room,
+                        Attr::Category => Which::Category,
+                    };
                     let uuid = by_slug
                         .get(&a.slug)
-                        .ok_or_else(|| foreign(&format!("`{}.title`", a.slug)))?;
-                    c.0.get_mut(uuid).expect("declared").title = Some(plain(&a.value));
+                        .ok_or_else(|| foreign(&format!("`{a}`")))?;
+                    c.0.get_mut(uuid)
+                        .expect("declared")
+                        .attrs
+                        .insert(which, plain(&a.value));
                 }
                 Item::Gap | Item::FragmentEnd | Item::Comment(_) => {}
-                Item::Attr(a) => return Err(foreign(&format!("`{a}`"))),
                 _ => return Err(foreign("a statement")),
             }
         }
@@ -360,8 +439,8 @@ impl Claims {
                 c.ty,
                 Value::Str(uuid.clone())
             ));
-            if let Some(t) = &c.title {
-                out.push_str(&format!("{s}.title = {}\n", Value::Str(t.clone())));
+            for (w, t) in &c.attrs {
+                out.push_str(&format!("{s}.{} = {}\n", w.word(), Value::Str(t.clone())));
             }
             for (k, v) in &c.sets {
                 out.push_str(&format!("{s}.{k} = {v}\n"));
@@ -374,7 +453,9 @@ impl Claims {
     pub fn get(&self, ty: &str, op: &Op) -> Option<String> {
         let c = self.0.get(op.uuid())?;
         match op {
-            Op::Title { .. } => c.title.clone(),
+            Op::Title { .. } => c.attrs.get(&Which::Title).cloned(),
+            Op::Room { .. } => c.attrs.get(&Which::Room).cloned(),
+            Op::Category { .. } => c.attrs.get(&Which::Category).cloned(),
             Op::Param { port, .. } => c.sets.get(port_names::name_of(ty, port)).map(plain),
             Op::Setting { name, .. } => c.sets.get(name).map(plain),
         }
@@ -384,11 +465,8 @@ impl Claims {
     pub fn ops(&self) -> Vec<Op> {
         let mut v = Vec::new();
         for (uuid, c) in &self.0 {
-            if let Some(t) = &c.title {
-                v.push(Op::Title {
-                    uuid: uuid.clone(),
-                    value: Some(t.clone()),
-                });
+            for (w, t) in &c.attrs {
+                v.push(w.op(uuid.clone(), Some(t.clone())));
             }
             let settings = settings_of(&c.ty);
             for (k, val) in &c.sets {
@@ -420,6 +498,18 @@ pub fn find<'a>(el: &'a Element, uuid: &str) -> Option<&'a Element> {
         return Some(el);
     }
     el.child_elements().find_map(|c| find(c, uuid))
+}
+
+/// How many objects of type `ty` are titled `title`: a room or category is
+/// claimed by its title, which must name exactly one.
+fn titled(el: &Element, ty: &str, title: &str) -> usize {
+    let me = usize::from(
+        el.attr("Type") == Some(ty) && el.attr_decoded("Title").is_some_and(|t| t == title),
+    );
+    me + el
+        .child_elements()
+        .map(|c| titled(c, ty, title))
+        .sum::<usize>()
 }
 
 /// Whether `s` is a plain decimal number (`-2.5`), the only spelling lox
@@ -478,14 +568,41 @@ pub fn apply(
     let previous = claims.get(&ty, op);
     let caps = caps(el).unwrap_or_default();
     // `None` drops the claim, also where the value can no longer be edited.
-    let (key, value): (Option<String>, Option<Value>) = match op {
+    let (key, value): (Result<Which, String>, Option<Value>) = match op {
         Op::Title { value, .. } => {
             let v = match value {
                 Some(v) if caps.title => Some(Value::Str(text(v, "The name", false)?)),
                 Some(_) => return Err(format!("{name}: the name cannot be edited here")),
                 None => None,
             };
-            (None, v)
+            (Ok(Which::Title), v)
+        }
+        Op::Room { value, .. } | Op::Category { value, .. } => {
+            let room = matches!(op, Op::Room { .. });
+            let (what, kind, can) = if room {
+                ("room", "Place", caps.room)
+            } else {
+                ("category", "Category", caps.category)
+            };
+            let v = match value {
+                Some(v) if can => {
+                    let n = titled(&doc.xml.root, kind, v);
+                    if n != 1 {
+                        return Err(format!(
+                            "{name}: {} {what} is titled \"{v}\"; pick one of the config's {what}s",
+                            if n == 0 { "no" } else { "more than one" }
+                        ));
+                    }
+                    Some(Value::Str(v.clone()))
+                }
+                Some(_) => {
+                    return Err(format!(
+                        "{name}: it has no {what}; set one in Loxone Config first"
+                    ));
+                }
+                None => None,
+            };
+            (Ok(if room { Which::Room } else { Which::Category }), v)
         }
         Op::Param { port, value, .. } => {
             let pname = port_names::name_of(&ty, port).to_string();
@@ -500,7 +617,7 @@ pub fn apply(
                 }
                 None => None,
             };
-            (Some(pname), v)
+            (Err(pname), v)
         }
         Op::Setting {
             name: setting,
@@ -525,17 +642,22 @@ pub fn apply(
                 }
                 (None, _) => None,
             };
-            (Some(setting.clone()), v)
+            (Err(setting.clone()), v)
         }
     };
     let claim = claims.0.entry(uuid.to_string()).or_default();
     claim.ty = ty;
     match (key, value) {
-        (None, v) => claim.title = v.map(|v| plain(&v)),
-        (Some(k), Some(v)) => {
+        (Ok(w), Some(v)) => {
+            claim.attrs.insert(w, plain(&v));
+        }
+        (Ok(w), None) => {
+            claim.attrs.remove(&w);
+        }
+        (Err(k), Some(v)) => {
             claim.sets.insert(k, v);
         }
-        (Some(k), None) => {
+        (Err(k), None) => {
             claim.sets.remove(&k);
         }
     }
@@ -764,6 +886,47 @@ mod tests {
         )
         .unwrap();
         assert!(compile(&h, &c.render()).contains(r#"MinChange="0.5""#));
+    }
+
+    #[test]
+    fn room_and_category_are_claimed_by_title() {
+        let xml = std::fs::read_to_string(format!(
+            "{}/tests/fixtures/house.Loxone",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap()
+        .replace(
+            "\t\t<C Type=\"Page\" V=\"178\" U=\"10000002",
+            "\t\t<C Type=\"Place\" U=\"30000a01-0000-0000-ffff504f94000001\" Title=\"Küche\"/>\n\
+             \t\t<C Type=\"Place\" U=\"30000a02-0000-0000-ffff504f94000001\" Title=\"Bad\"/>\n\
+             \t\t<C Type=\"Place\" U=\"30000a04-0000-0000-ffff504f94000001\" Title=\"Flur\"/>\n\
+             \t\t<C Type=\"Place\" U=\"30000a05-0000-0000-ffff504f94000001\" Title=\"Flur\"/>\n\
+             \t\t<C Type=\"Category\" U=\"30000a03-0000-0000-ffff504f94000001\" Title=\"Licht\"/>\n\
+             \t\t<C Type=\"Page\" V=\"178\" U=\"10000002",
+        )
+        .replace(
+            "<Co K=\"Input1\" Nc=\"1\"",
+            "<IoData Visu=\"true\" Pr=\"30000a01-0000-0000-ffff504f94000001\" Cr=\"30000a03-0000-0000-ffff504f94000001\"/><Co K=\"Input1\" Nc=\"1\"",
+        );
+        let d = LoxoneDoc::parse(xml.as_bytes()).unwrap();
+        let div = caps(find(&d.xml.root, DIV).unwrap()).unwrap();
+        assert!(div.room && div.category);
+        assert!(!caps(find(&d.xml.root, AND).unwrap()).unwrap().room);
+        let none = HashSet::new();
+        let room = |uuid: &str, v: &str| Op::Room {
+            uuid: uuid.into(),
+            value: Some(v.into()),
+        };
+        let mut c = Claims::default();
+        let err = |c: &mut Claims, op: Op| apply(c, &d, &none, &op).unwrap_err();
+        assert!(err(&mut c, room(DIV, "Keller")).contains("no room"));
+        assert!(err(&mut c, room(DIV, "Flur")).contains("more than one"));
+        assert!(err(&mut c, room(AND, "Bad")).contains("has no room"));
+        apply(&mut c, &d, &none, &room(DIV, "Bad")).unwrap();
+        let text = c.render();
+        assert!(text.contains(".room = \"Bad\""), "{text}");
+        assert_eq!(Claims::parse(&text).unwrap(), c);
+        assert!(compile(&d, &text).contains(r#"Pr="30000a02-0000-0000-ffff504f94000001""#));
     }
 
     #[test]

@@ -2382,11 +2382,20 @@ function editState(o) {
   if (a.running) return { why: `${a.running} is running.` };
   return { ok: true, rev: r };
 }
-function editLabel(o, c) { return c.op === "title" ? "Name" : c.op === "param" ? portName(o, c.port) : c.name; }
+const EDIT_ATTR = { title: "Name", room: "Room", category: "Category" };
+function editLabel(o, c) { return EDIT_ATTR[c.op] || (c.op === "param" ? portName(o, c.port) : c.name); }
+/** The config's rooms or categories by title; a title two of them share cannot be picked (lox claims by title). */
+function editPlaces(ty) {
+  const n = new Map();
+  for (const x of Object.values(S.view?.objects || {})) if (x.ty === ty && x.status !== "removed") n.set(x.title, (n.get(x.title) || 0) + 1);
+  return [...n].sort((a, b) => a[0].localeCompare(b[0]));
+}
 /** The fields of the edit form: [field, label, value now, kind, unit]. */
 function editFields(o) {
   const f = [];
   if (o.edit.title) f.push(["title", "Name", o.title || "", "text"]);
+  if (o.edit.room) f.push(["room", "Room", o.room || "", "Place"]);
+  if (o.edit.category) f.push(["category", "Category", o.category || "", "Category"]);
   for (const p of o.edit.params) f.push([`p:${p.key}`, portName(o, p.key), o.ports.find((q) => q.key === p.key)?.def ?? "0", "number", p.unit]);
   for (const st of o.edit.settings) f.push([`s:${st.name}`, st.name, st.value ?? "", st.text ? "text" : "number"]);
   return f;
@@ -2412,9 +2421,11 @@ function editRows(o, row) {
     for (const [field, label, now, kind, unit] of editFields(o)) {
       const v = mine.draft[field] ?? now, bad = mine.bad[field];
       const id = `ed-${field.replace(/[^\w-]/g, "_")}`;
-      rows.push(`<div class="pr ed-row"><label class="k" for="${id}">${esc(label)}</label><div class="v">` +
-        `<input id="${id}" data-ed-field="${esc(field)}" value="${esc(v)}" ${kind === "number" ? 'inputmode="decimal" class="num"' : ""}` +
-        `${bad ? ` aria-invalid="true" aria-describedby="${id}-e"` : ""}${mine.busy ? " disabled" : ""} autocomplete="off" spellcheck="false">` +
+      const attrs = `id="${id}" data-ed-field="${esc(field)}"${bad ? ` aria-invalid="true" aria-describedby="${id}-e"` : ""}${mine.busy ? " disabled" : ""}`;
+      const input = kind === "Place" || kind === "Category"
+        ? `<select ${attrs}>${editPlaces(kind).map(([t, n]) => `<option value="${esc(t)}"${t === v ? " selected" : ""}${n > 1 ? ' disabled title="Two of them have this title: rename one in Loxone Config to pick it"' : ""}>${esc(t)}</option>`).join("")}</select>`
+        : `<input ${attrs} value="${esc(v)}" ${kind === "number" ? 'inputmode="decimal" class="num"' : ""} autocomplete="off" spellcheck="false">`;
+      rows.push(`<div class="pr ed-row"><label class="k" for="${id}">${esc(label)}</label><div class="v">${input}` +
         (unit ? `<span class="ed-unit">${esc(unit)}</span>` : "") + (bad ? `<div class="ed-bad" id="${id}-e">${esc(bad)}</div>` : "") + "</div></div>");
     }
     rows.push(`<div class="ed-bar"><button type="button" class="primary small" data-ed="save"${mine.busy ? " disabled" : ""}>${mine.busy ? "Compiling…" : "Save"}</button>` +
@@ -2447,7 +2458,7 @@ async function editSave() {
     if (kind === "number" && !EDIT_NUMBER.test(t)) { bad[field] = /,/.test(t) ? "Write a decimal point, not a comma." : "A number, like 12 or -2.5."; continue; }
     if (field === "title" && !t.trim()) { bad[field] = "The name cannot be empty."; continue; }
     const [k, key] = field.split(/:(.*)/s);
-    ops.push(field === "title" ? { op: "title", uuid: o.uuid, value: t } : k === "p" ? { op: "param", uuid: o.uuid, port: key, value: t } : { op: "setting", uuid: o.uuid, name: key, value: t });
+    ops.push(EDIT_ATTR[field] ? { op: field, uuid: o.uuid, value: t } : k === "p" ? { op: "param", uuid: o.uuid, port: key, value: t } : { op: "setting", uuid: o.uuid, name: key, value: t });
   }
   S.edit.bad = bad; S.edit.err = ""; S.edit.msg = "";
   if (Object.keys(bad).length) { S.edit.err = "Fix the marked values."; renderProps(); $("props").querySelector('[aria-invalid="true"]')?.focus(); return; }
@@ -2469,7 +2480,7 @@ async function editSend(uuid, rev, ops) {
 async function editRevert(i) {
   const c = S.edits?.claims?.[i], o = c && S.view?.objects[c.uuid], st = o && editState(o);
   if (!st?.ok) return;
-  const op = c.op === "title" ? { op: "title", uuid: c.uuid } : c.op === "param" ? { op: "param", uuid: c.uuid, port: c.port } : { op: "setting", uuid: c.uuid, name: c.name };
+  const op = EDIT_ATTR[c.op] ? { op: c.op, uuid: c.uuid } : c.op === "param" ? { op: "param", uuid: c.uuid, port: c.port } : { op: "setting", uuid: c.uuid, name: c.name };
   await editSend(c.uuid, st.rev, [{ ...op, value: c.committed }]);
 }
 async function editShowNewest() {

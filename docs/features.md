@@ -157,7 +157,7 @@ sends to the Miniserver see [miniserver.md](miniserver.md).
   carries, Sync makes a plain download the base instead (rules edited in the app are then not taken over).
 
 - **Edit values** (for a `lox.toml` project, with the admin token): Properties' *Edit values* changes a block's
-  name, the constant of an unwired input (lox checks it against the documented range) and the settings of a
+  name, its room and category, the constant of an unwired input (lox checks it against the documented range) and the settings of a
   physical input or output or a device. *Save* writes them into vislox's own file of the module and runs
   `lox logic compile`, so they show as the pending revision; nothing is deployed until Apply. Each value saved and
   not deployed says *not deployed*, with *Revert*; Discard drops them all. Blocks the module manages are edited in

@@ -55,31 +55,42 @@ vx_10000006_0000_0060_ffff504f94000001.In2 = 100
 lox records each original value in the lockfile and restores it when the line goes. vislox reads the file back
 with lox's parser, refuses one that holds anything it did not write, and rewrites it whole on every edit.
 
+vislox offers only what lox (v0.83.0, the version `Cargo.lock` and the Docker image pin) can express. What lox
+cannot express is left out, not worked around.
+
 | Step | Lox Logic | Notes |
 |---|---|---|
 | #58 name | `x.title = "…"` | Not on references: Loxone Config takes their title from what they mirror. |
+| #58 room, category | `x.room = "…"`, `x.category = "…"` | By title, which must name one room or category. Only on an object that has one: lox changes it, never adds it. |
 | #58 input constant | `x.Port = n` | Only an unwired input; a number. lox checks the documented range. |
 | #58 setting | `x.MinTime = n`, `x.Desc = "…"` | Physical inputs and outputs, Tree and Air devices and extensions. Most settings can only be changed, not added. |
 | #59 new block | `slug = Type("Title", Port: …)` after `page "…"` | One file per page, `<module>/vislox/<page>.loxl`; lox mints the UUIDs. |
-| #60 move | none yet | lox places the blocks it creates (`relayout`); Lox Logic has no claim for a position (see below). |
-| #61 wire | `x.Port <- y.Q` | Adds a wire. Removing a wire Loxone Config drew has no claim (see below). |
+| #60 move | none | lox places the blocks it creates; it has no claim for a position. |
+| #61 wire | `x.Port <- y.Q` | Adds a wire, and removes one vislox added. A wire Loxone Config drew cannot be removed. |
 
 Blocks the module already manages (they are in the lockfile) are refused: they are edited in their own `.loxl`.
 
-## Not settled
+## What lox cannot do, so vislox does not offer it
 
-- Once a value is claimed and applied, the module owns it: a later change in Loxone Config is overwritten on
-  the next Apply. Taking it back is deleting the line (Revert does this before Apply).
-- Moving a block (#60) and removing a wire Loxone Config drew (#61) cannot be written as Lox Logic.
-  Either lox gets claims for them, or vislox patches the compiled `out.Loxone` as a last step, which
-  `lox config push` would undo. To be decided before #60.
-- Parameters stored as block attributes (a Formula's text, a Daytimer's labels) and a virtual input's settings
-  are not offered yet.
+- Parameters stored on the block element of a block the module does not manage: a Formula's text, a Daytimer's
+  On/Off labels, a memory flag's type, a virtual input's Analog, MinVal, MaxVal and DefVal, and `Desc` on logic
+  blocks. lox takes them only in the declaration of a block it manages.
+- A room or category on an object that has none.
+- Handing a value back after Apply: deleting a claim makes lox restore the value from before the claim, which
+  undoes the applied change. So once applied, the module owns the value, and a later change in Loxone Config is
+  overwritten on the next Apply. Revert before Apply works.
+- Moving a block it does not manage, and removing a wire Loxone Config drew.
 
+## What lox can do that vislox does not offer yet
+
+Claims on objects Loxone Config owns that need an editor of their own rather than a field: a Daytimer's
+switching times (`x.schedule = …`), a lighting controller's moods (`.moods`), the members of a central block
+(`.members`), NFC Code Touch access (`.access`), notification recipients (`.recipients`) and Touch Pure Flex tiles
+(`.tiles`).
 ## The browser
 
 - Properties has an *Edit* section on the newest revision: *Edit values* opens a form for the name, the
-  unwired inputs and the settings. Numbers are checked in the browser; lox checks ranges and the rest.
+  room and category, the unwired inputs and the settings. Numbers are checked in the browser; lox checks ranges and the rest.
 - A value saved and not deployed yet (it differs from the last commit) shows *not deployed*, with *Revert*
   (back to the last commit). The Deploy pane counts them.
 - `GET /api/edits` lists what vislox's file claims now and at the last commit, and the blocks the module manages.

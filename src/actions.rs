@@ -883,20 +883,8 @@ impl Actions {
         type Slot = (Option<String>, Option<String>);
         let mut slots: std::collections::BTreeMap<String, (edit::Op, Slot)> = Default::default();
         let key = |op: &edit::Op| serde_json::to_string(op).unwrap_or_default();
-        let unset = |op: &edit::Op| {
-            let mut op = op.clone();
-            match &mut op {
-                edit::Op::Title { value, .. }
-                | edit::Op::Param { value, .. }
-                | edit::Op::Setting { value, .. } => *value = None,
-            }
-            op
-        };
-        let value = |op: &edit::Op| match op {
-            edit::Op::Title { value, .. }
-            | edit::Op::Param { value, .. }
-            | edit::Op::Setting { value, .. } => value.clone(),
-        };
+        let unset = |op: &edit::Op| op.with_value(None);
+        let value = |op: &edit::Op| op.value().map(String::from);
         for op in now.ops() {
             let k = unset(&op);
             slots.entry(key(&k)).or_insert((k, (None, None))).1.0 = value(&op);

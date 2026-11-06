@@ -20,6 +20,7 @@ const fixture = join(here, "../fixtures/house.Loxone");
 
 const DIV = "10000006-0000-0060-ffff504f94000001";
 const MONO = "1000000a-0000-00a0-ffff504f94000001";
+const KITCHEN = "30000a01-0000-0000-ffff504f94000001", BATH = "30000a02-0000-0000-ffff504f94000001";
 const root = mkdtempSync(join(tmpdir(), "vislox-edit-"));
 const dir = join(root, "project");
 mkdirSync(join(dir, "pages"), { recursive: true });
@@ -31,7 +32,12 @@ const base = readFileSync(fixture, "utf8").replace('<Co K="Q" U="10000009-0000-0
 \t\t\t\t<Co K="InputTrigger" U="1000000a-0000-00a1-00ff504f94000001"/>
 \t\t\t\t<Co K="Time" Def="2" U="1000000a-0000-00a2-01ff504f94000001"/>
 \t\t\t\t<Co K="Q" U="1000000a-0000-00a3-02ff504f94000001"/>
-\t\t\t</C>`);
+\t\t\t</C>`)
+  // Two rooms; the Divide block is shown in the app, in the kitchen.
+  .replace('\t\t<C Type="Page" V="178" U="10000002', `\t\t<C Type="Place" V="178" U="${KITCHEN}" Title="Küche"/>
+\t\t<C Type="Place" V="178" U="${BATH}" Title="Bad"/>
+\t\t<C Type="Page" V="178" U="10000002`)
+  .replace('<Co K="Input1" Nc="1" U="10000006', `<IoData Visu="true" Pr="${KITCHEN}"/>\n\t\t\t\t<Co K="Input1" Nc="1" U="10000006`);
 writeFileSync(join(dir, "base.Loxone"), base);
 writeFileSync(join(dir, "out.Loxone"), base);
 writeFileSync(join(dir, "lox.toml"), 'base = "base.Loxone"\nmodule = "pages"\nout = "out.Loxone"\n');
@@ -62,6 +68,12 @@ for (const line of src.split("\\n")) {
   if (!(m = line.match(/^(\\w+)\\.(\\w+) = (.*)$/))) continue;
   const uuid = slugs[m[1]], i = out.findIndex((l) => l.includes(\`U="\${uuid}"\`));
   if (m[2] === "title") { out[i] = out[i].replace(/Title="[^"]*"/, \`Title="\${xml(unq(m[3]))}"\`); continue; }
+  if (m[2] === "room") {
+    const place = out.find((l) => l.includes('Type="Place"') && l.includes(\`Title="\${unq(m[3])}"\`)).match(/U="([^"]+)"/)[1];
+    const j = out.findIndex((l, n) => n > i && l.includes("<IoData"));
+    out[j] = out[j].replace(/Pr="[^"]*"/, \`Pr="\${place}"\`);
+    continue;
+  }
   const key = KEYS[m[2]] || m[2];
   const j = out.findIndex((l, n) => n > i && l.includes(\`<Co K="\${key}"\`));
   out[j] = out[j].replace(/ Def="[^"]*"/, "").replace(\`<Co K="\${key}"\`, \`<Co K="\${key}" Def="\${unq(m[3])}"\`);
@@ -115,7 +127,8 @@ try {
     await pick(DIV);
     await page.click('#props [data-ed="open"]');
     // Its name and its divisor; the dividend is wired.
-    assert.deepEqual(await page.$$eval("#props [data-ed-field]", (n) => n.map((x) => x.dataset.edField)), ["title", "p:Input2"]);
+    assert.deepEqual(await page.$$eval("#props [data-ed-field]", (n) => n.map((x) => x.dataset.edField)), ["title", "room", "p:Input2"]);
+    assert.equal(await page.inputValue(field("room")), "Küche");
     assert.equal(await page.inputValue(field("p:Input2")), "1000");
   });
   await step("a value that is not a number is refused in the browser", async () => {
@@ -127,17 +140,20 @@ try {
   });
   await step("saving compiles the edit and shows it as pending, not deployed", async () => {
     await page.fill(field("title"), "Teiler");
+    await page.selectOption(field("room"), "Bad");
     await page.fill(field("p:Input2"), "100");
     await page.press(field("p:Input2"), "Enter");
     await page.waitForFunction(() => S.rev?.startsWith("pending:") && S.view?.objects["10000006-0000-0060-ffff504f94000001"]?.title === "Teiler", null, { timeout: 10000 });
     assert.equal(edits.length, 1);
     assert.deepEqual(edits[0].ops, [
       { op: "title", uuid: DIV, value: "Teiler" },
+      { op: "room", uuid: DIV, value: "Bad" },
       { op: "param", uuid: DIV, port: "Input2", value: "100" },
     ]);
-    await page.waitForFunction(() => document.querySelectorAll("#props .ed-tag").length === 2);
+    await page.waitForFunction(() => document.querySelectorAll("#props .ed-tag").length === 3);
+    assert.equal(await page.evaluate((u) => S.view.objects[u].room, DIV), "Bad");
     assert.match(await page.textContent("#props"), /Saved and compiled: pending, not deployed/);
-    assert.match(await page.textContent("#deploy-pend"), /not deployed\. They include 2 values edited here/);
+    assert.match(await page.textContent("#deploy-pend"), /not deployed\. They include 3 values edited here/);
     await page.waitForSelector("#btn-apply:not([disabled])");
     const changes = await page.$$eval(".changes .chg .t", (n) => n.map((x) => x.textContent).join(" | "));
     assert.match(changes, /Teiler/, changes);
@@ -160,7 +176,7 @@ try {
     await pick(DIV);
     const n = edits.length;
     await page.click('#props .pr:has-text("In2") [data-ed="revert"]');
-    await page.waitForFunction(() => document.querySelectorAll("#props .ed-tag").length === 1);
+    await page.waitForFunction(() => document.querySelectorAll("#props .ed-tag").length === 2);
     assert.deepEqual(edits[n].ops, [{ op: "param", uuid: DIV, port: "Input2", value: null }]);
     assert.doesNotMatch(readFileSync(join(dir, "pages/vislox/edits.loxl"), "utf8"), /In2/);
   });

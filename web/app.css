@@ -582,6 +582,7 @@ rect.ghost { fill: #1f6fd10a; stroke: var(--moved); stroke-opacity: .45; stroke-
 .ed-msg { flex: 1 1 100%; font-size: 12px; color: var(--muted); }
 .ed-msg.err { color: var(--removed); white-space: pre-wrap; overflow-wrap: anywhere; }
 .ed-note { padding: 3px 12px 6px; color: var(--muted); font-size: 12px; }
+.ed-row select { max-width: 100%; padding: 2px 4px; border: 1px solid var(--line); border-radius: var(--radius); font: inherit; background: #fff; }
 .ed-row input { width: 100%; box-sizing: border-box; padding: 3px 6px; border: 1px solid var(--line); border-radius: var(--radius); font: inherit; }
 .ed-row input.num { width: 9em; font-variant-numeric: tabular-nums; }
 .ed-row input[aria-invalid="true"] { border-color: var(--removed); background: var(--removed-bg); }
