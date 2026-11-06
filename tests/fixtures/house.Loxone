@@ -7,6 +7,27 @@
 				<Co K="Qm" U="10000001-0000-0012-01ff504f94000001"/>
 			</C>
 		</C>
+		<C Type="ModeCaption" V="178" U="10000010-0000-0100-ffff504f94000001" Title="Betriebsmodi">
+			<C Type="Mode" V="178" U="00000000-0000-0001-1500000000000000" Title="Feiertag" Nio="2" WF="16384">
+				<Co K="I" U="00000000-0000-0001-1500000000000001"/>
+				<Co K="Q" U="00000000-0000-0001-1500000000000002"/>
+			</C>
+			<C Type="Mode" V="178" U="00000000-0000-0002-1500000000000000" Title="Urlaub" Nio="2" WF="16384" Mode="1">
+				<Co K="I" U="00000000-0000-0002-1500000000000001"/>
+				<Co K="Q" U="00000000-0000-0002-1500000000000002"/>
+			</C>
+			<C Type="Mode" V="178" U="10000011-0000-0110-ffff504f94000001" Title="Party" Nio="2" WF="147456" Mode="-1">
+				<Co K="I" U="10000011-0000-0111-00ff504f94000001"/>
+				<Co K="Q" U="10000011-0000-0112-01ff504f94000001"/>
+			</C>
+		</C>
+		<C Type="CalendarCaption" V="178" U="10000012-0000-0120-ffff504f94000001" Title="Betriebszeiten">
+			<C Type="CalendarEntry" V="178" U="10000013-0000-0130-ffff504f94000001" Title="Heiligabend" Nio="2" WF="16384" Month="12" Day="24" Month2="1" Day2="1" WeekDayInMonth="1"/>
+			<C Type="CalendarEntry" V="178" U="10000014-0000-0140-ffff504f94000001" Title="Ostermontag" Nio="2" WF="16384" Mode="1" Month="1" Day="1" Month2="1" Day2="1" EasterOffset="1" WeekDayInMonth="1"/>
+			<C Type="CalendarEntry" V="178" U="10000015-0000-0150-ffff504f94000001" Title="Sommerferien" Nio="2" WF="16384" CalType="1" Mode="3" Month="1" Day="1" Month2="1" Day2="1" From="6393" To="6456" WeekDayInMonth="1"/>
+			<C Type="CalendarEntry" V="178" U="10000016-0000-0160-ffff504f94000001" Title="Heizperiode" Nio="2" WF="16384" CalType="1" Mode="4" Month="10" Day="1" Month2="4" Day2="30" WeekDayInMonth="1"/>
+			<C Type="CalendarEntry" V="178" U="10000017-0000-0170-ffff504f94000001" Title="Silvester" Nio="2" WF="16384" CalType="-1" Month="12" Day="31" Month2="1" Day2="1" WeekDayInMonth="1"/>
+		</C>
 		<C Type="Page" V="178" U="10000002-0000-0020-ffff504f94000001" Title="Erdgeschoss" WF="16384">
 			<C Type="InputRef" V="178" U="10000003-0000-0030-ffff504f94000001" Title="Temperatur" Px="960" Py="864" Px2="3072" Py2="1056" Cl="0,0,0" Nio="2" Ref="10000001-0000-0010-ffff504f94000001" Analog="true" LinkRefType="71">
 				<Co K="AI" Nc="1" U="10000003-0000-0031-00ff504f94000001">
