@@ -21,15 +21,26 @@
 //!   discovery broadcast (`discover.rs`) looks for the serial on the LAN and
 //!   names its new address.
 //!
+//! Apart from the check, and on a faster clock, the config dates: when the
+//! Miniserver's config last changed (`jdev/sps/LoxAPPversion3`, the
+//! `lastModified` of its `LoxAPP3.json`), against the same date in the
+//! download the base came from (`configdate.rs`). This one request needs
+//! lox's user and password (HTTP basic auth, as Apply's restart probe). It
+//! only informs: the preflight never waits for it, and a failure only says
+//! that it cannot tell.
+//!
 //! What the token may do (`tokenRights`) and whether the password is weak
 //! (`unsecurePass`) come only with a login, which lox does and does not keep,
 //! so they are not shown.
 
+use crate::configdate::BaseDate;
 use crate::discover;
+use crate::restart::Http;
 use loxone_client::Connection;
 use loxone_client::token::TokenStore;
 use serde_json::{Value, json};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -44,6 +55,13 @@ const MIN_AGE: Duration = Duration::from_secs(2);
 const PREFLIGHT_AGE: Duration = Duration::from_secs(10);
 /// A check this old is redone for the status chip.
 const MAX_AGE: Duration = Duration::from_secs(60);
+/// The page's regular poll (every minute) reuses a check this recent, and
+/// asks only for the config dates again.
+const POLL_AGE: Duration = Duration::from_secs(5 * 60);
+/// The config dates are asked for again when older than this.
+const DATE_AGE: Duration = Duration::from_secs(30);
+/// How long `LoxAPPversion3` may take before the chip says it cannot tell.
+const DATE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// What needs the Miniserver, and so a preflight.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -73,6 +91,22 @@ pub struct Miniserver {
     expected: Option<Expected>,
     /// The last discovery broadcast (it waits 3 s), reused for a minute.
     discovery: discover::Cache,
+    /// Bumped by [`Miniserver::forget`]: a check or a date that started
+    /// before keeps its result to itself, since what it read may be old.
+    generation: AtomicU64,
+    /// The last config dates: when they were asked for, and what came back.
+    dates: Mutex<Option<(Instant, Dates)>>,
+    dating: tokio::sync::Mutex<()>,
+}
+
+/// When the config last changed, on the Miniserver and in the base's download.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct Dates {
+    /// `LoxAPPversion3`, or why it could not be read; `None` when the
+    /// Miniserver does not answer.
+    miniserver: Option<Result<String, String>>,
+    /// The `lastModified` of the download the base came from.
+    base: Option<String>,
 }
 
 /// The serial the config belongs to, and where vislox read it.
@@ -96,6 +130,10 @@ struct Target {
     /// firmware: the deployed one, and the pending one.
     current: PathBuf,
     proposed: Option<PathBuf>,
+    /// Authenticated `jdev/…` requests (`LoxAPPversion3`).
+    http: Arc<Http>,
+    /// When the base was taken, in the Miniserver's terms.
+    base_date: Arc<BaseDate>,
 }
 
 /// What `jdev/cfg/apiKey` tells.
@@ -115,6 +153,7 @@ impl Miniserver {
         target: Result<&Connection, String>,
         current: PathBuf,
         proposed: Option<PathBuf>,
+        backups: Option<PathBuf>,
     ) -> Miniserver {
         let target = target.map(|conn| {
             let (addr, http_port) = split_host(&conn.host);
@@ -127,16 +166,25 @@ impl Miniserver {
                     .ok()
                     .and_then(|p| p.parse().ok())
                     .unwrap_or(21),
+                base_date: Arc::new(BaseDate::new(current.clone(), backups)),
+                http: Arc::new(Http::new(conn.clone())),
                 current,
                 proposed,
             }
         });
+        Miniserver::with_target(target)
+    }
+
+    fn with_target(target: Result<Target, String>) -> Miniserver {
         Miniserver {
             target,
             last: Mutex::new(None),
             probing: tokio::sync::Mutex::new(()),
             expected: None,
             discovery: discover::Cache::default(),
+            generation: AtomicU64::new(0),
+            dates: Mutex::new(None),
+            dating: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -172,19 +220,107 @@ impl Miniserver {
             return v;
         }
         let started = Instant::now();
+        let generation = self.generation.load(Ordering::SeqCst);
         let v = Arc::new(probe(t, self.expected.as_ref(), &self.discovery).await);
-        *self.last.lock().unwrap() = Some((started, v.clone()));
+        if self.generation.load(Ordering::SeqCst) == generation {
+            *self.last.lock().unwrap() = Some((started, v.clone()));
+        }
         v
+    }
+
+    /// The config dates, asked for again when older than `max_age`. Apart
+    /// from [`Miniserver::status`], so that the preflight never waits for
+    /// them.
+    async fn dates(&self, t: &Target, max_age: Duration, reachable: bool) -> Dates {
+        let asked = Instant::now();
+        let reuse = |ok: &dyn Fn(Instant) -> bool| {
+            self.dates
+                .lock()
+                .unwrap()
+                .as_ref()
+                .filter(|(started, _)| ok(*started))
+                .map(|(_, d)| d.clone())
+        };
+        if let Some(d) = reuse(&|started| started.elapsed() < max_age) {
+            return d;
+        }
+        let _one = self.dating.lock().await;
+        if let Some(d) = reuse(&|started| started >= asked) {
+            return d;
+        }
+        let started = Instant::now();
+        let generation = self.generation.load(Ordering::SeqCst);
+        let base = t.base_date.clone();
+        let base = tokio::task::spawn_blocking(move || base.get());
+        let miniserver = if reachable {
+            let http = t.http.clone();
+            let ask = tokio::task::spawn_blocking(move || http.value("jdev/sps/LoxAPPversion3"));
+            Some(match tokio::time::timeout(DATE_TIMEOUT, ask).await {
+                Ok(Ok(r)) => r,
+                Ok(Err(e)) => Err(e.to_string()),
+                Err(_) => Err("no answer".to_string()),
+            })
+        } else {
+            None
+        };
+        let d = Dates {
+            miniserver,
+            base: base.await.ok().flatten(),
+        };
+        if self.generation.load(Ordering::SeqCst) == generation {
+            *self.dates.lock().unwrap() = Some((started, d.clone()));
+        }
+        d
+    }
+
+    /// The check `v`, with the config dates (`configDate`), and a warning
+    /// when the Miniserver's config changed after the base.
+    async fn with_dates(&self, v: Arc<Value>, max_age: Duration) -> Arc<Value> {
+        let Ok(t) = &self.target else {
+            return v;
+        };
+        if v["available"] != true {
+            return v;
+        }
+        let d = self.dates(t, max_age, v["reachable"] == true).await;
+        let (date, warning) = date_report(&d, v["identity"] == "wrong");
+        let mut v = (*v).clone();
+        v["configDate"] = date;
+        if let (Some(w), Some(ws)) = (warning, v["warnings"].as_array_mut()) {
+            ws.push(w.into());
+        }
+        Arc::new(v)
     }
 
     /// For the status chip: a check at most a minute old.
     pub async fn chip(&self) -> Arc<Value> {
-        self.status(MAX_AGE).await
+        let v = self.status(MAX_AGE).await;
+        self.with_dates(v, DATE_AGE).await
+    }
+
+    /// The page's regular poll: the config dates at most half a minute old,
+    /// the rest of the check at most five minutes.
+    pub async fn poll(&self) -> Arc<Value> {
+        let v = self.status(POLL_AGE).await;
+        self.with_dates(v, DATE_AGE).await
     }
 
     /// "Check again": a new check, unless one ran just now.
     pub async fn recheck(&self) -> Arc<Value> {
-        self.status(MIN_AGE).await
+        let v = self.status(MIN_AGE).await;
+        self.with_dates(v, MIN_AGE).await
+    }
+
+    /// After Pull, Apply or Sync, which may have changed the base and the
+    /// Miniserver's config: drop what was checked, and keep a check that is
+    /// still under way from storing what it read before.
+    pub fn forget(&self) {
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        *self.last.lock().unwrap() = None;
+        *self.dates.lock().unwrap() = None;
+        if let Ok(t) = &self.target {
+            t.base_date.forget();
+        }
     }
 
     /// Before Pull, Apply and Sync: check (again, unless a check started
@@ -473,6 +609,56 @@ struct Report<'a> {
 /// The status as the UI shows it: what was checked, what blocks Pull, Apply
 /// and Sync (each only by what it needs: FTP, and for Apply the web port),
 /// and what only deserves a warning.
+/// `configDate` for the chip, and the warning when the Miniserver's config
+/// changed after the base. The dates are the Miniserver's local time
+/// (`YYYY-MM-DD HH:MM:SS`), so they compare as text. Another Miniserver's
+/// date (`wrong`) says nothing about this base, and a failed request only
+/// says that it cannot tell.
+fn date_report(d: &Dates, wrong: bool) -> (Value, Option<String>) {
+    let is_date = |s: &str| {
+        s.len() == 19
+            && s.bytes().enumerate().all(|(i, c)| match i {
+                4 | 7 => c == b'-',
+                10 => c == b' ',
+                13 | 16 => c == b':',
+                _ => c.is_ascii_digit(),
+            })
+    };
+    let (miniserver, error) = match (&d.miniserver, wrong) {
+        (_, true) | (None, _) => (None, None),
+        (Some(Ok(m)), _) => (Some(m.as_str()), None),
+        (Some(Err(e)), _) => (None, Some(e.as_str())),
+    };
+    let order = match (miniserver, d.base.as_deref()) {
+        (Some(m), Some(b)) if is_date(m) && is_date(b) => Some(match m.cmp(b) {
+            std::cmp::Ordering::Greater => "after",
+            std::cmp::Ordering::Equal => "same",
+            std::cmp::Ordering::Less => "before",
+        }),
+        _ => None,
+    };
+    let changed = order == Some("after");
+    let warning = changed.then(|| {
+        format!(
+            "The Miniserver's config changed at {}, after the base vislox shows (taken at {}). \
+             Pull or Sync from Miniserver before you change it.",
+            miniserver.unwrap_or_default(),
+            d.base.as_deref().unwrap_or_default()
+        )
+    });
+    (
+        json!({
+            "miniserver": miniserver,
+            "base": d.base,
+            // `after`, `same` or `before`: the Miniserver's against the base's.
+            "order": order,
+            "changed": changed,
+            "error": error,
+        }),
+        warning,
+    )
+}
+
 fn report(r: Report) -> Value {
     let mut warnings: Vec<String> = Vec::new();
     let scheme = if r.host.starts_with("http://") {
@@ -1076,7 +1262,7 @@ mod tests {
 
     #[tokio::test]
     async fn without_a_connection_nothing_is_checked() {
-        let ms = Miniserver::new(Err("turned off".into()), PathBuf::new(), None);
+        let ms = Miniserver::new(Err("turned off".into()), PathBuf::new(), None, None);
         assert_eq!(ms.chip().await["available"], false);
         assert!(ms.preflight(Action::Apply).await.is_ok());
     }
@@ -1107,20 +1293,17 @@ mod tests {
                 });
             }
         });
-        let ms = Miniserver {
-            target: Ok(Target {
-                conn: Connection::new(format!("http://127.0.0.1:{web_port}"), "u", "p"),
-                addr: "127.0.0.1".into(),
-                http_port: web_port,
-                ftp_port,
-                current: PathBuf::from("/nonexistent"),
-                proposed: None,
-            }),
-            last: Mutex::new(None),
-            probing: tokio::sync::Mutex::new(()),
-            expected: None,
-            discovery: discover::Cache::default(),
-        };
+        let conn = Connection::new(format!("http://127.0.0.1:{web_port}"), "u", "p");
+        let ms = Miniserver::with_target(Ok(Target {
+            http: Arc::new(Http::new(conn.clone())),
+            conn,
+            addr: "127.0.0.1".into(),
+            http_port: web_port,
+            ftp_port,
+            current: PathBuf::from("/nonexistent"),
+            proposed: None,
+            base_date: Arc::new(BaseDate::new(PathBuf::from("/nonexistent"), None)),
+        }));
         (ms, count)
     }
 
@@ -1149,5 +1332,77 @@ mod tests {
         ms.chip().await;
         assert!(ms.preflight(Action::Pull).await.is_ok());
         assert_eq!(count.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_check_that_started_before_forget_is_not_kept() {
+        use std::sync::atomic::Ordering;
+        let (ms, count) = stand_in(Duration::from_millis(300)).await;
+        let ms = Arc::new(ms);
+        let first = tokio::spawn({
+            let ms = ms.clone();
+            async move { ms.status(Duration::ZERO).await }
+        });
+        while count.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // A Pull finishes while the check is under way: what it read may be
+        // from before the Pull, so it must not be reused afterwards.
+        ms.forget();
+        first.await.unwrap();
+        assert!(ms.last.lock().unwrap().is_none());
+        // A check that starts afterwards is kept.
+        ms.status(Duration::ZERO).await;
+        assert!(ms.last.lock().unwrap().is_some());
+    }
+
+    fn dates(ms: Option<Result<&str, &str>>, base: Option<&str>) -> Dates {
+        Dates {
+            miniserver: ms.map(|r| r.map(String::from).map_err(String::from)),
+            base: base.map(String::from),
+        }
+    }
+
+    #[test]
+    fn only_a_config_changed_after_the_base_is_a_warning() {
+        let base = Some("2026-11-06 00:23:31");
+        // Same date: nothing to say.
+        let (v, w) = date_report(&dates(Some(Ok("2026-11-06 00:23:31")), base), false);
+        assert_eq!(
+            (v["order"].as_str(), v["changed"].as_bool(), w),
+            (Some("same"), Some(false), None)
+        );
+        // Saved on the Miniserver since: a warning.
+        let (v, w) = date_report(&dates(Some(Ok("2026-11-06 14:32:10")), base), false);
+        assert_eq!(
+            (v["order"].as_str(), v["changed"].as_bool()),
+            (Some("after"), Some(true))
+        );
+        let w = w.unwrap();
+        assert!(w.starts_with("The Miniserver's config changed at 2026-11-06 14:32:10, after the base vislox shows (taken at 2026-11-06 00:23:31)"), "{w}");
+        // The Miniserver runs an older config than the base (restored): not
+        // "changed after the base".
+        let (v, w) = date_report(&dates(Some(Ok("2026-10-31 20:00:00")), base), false);
+        assert_eq!(
+            (v["order"].as_str(), v["changed"].as_bool(), w),
+            (Some("before"), Some(false), None)
+        );
+        // No date for the base, or one that is not a date: nothing compared.
+        let (v, w) = date_report(&dates(Some(Ok("2026-11-06 14:32:10")), None), false);
+        assert_eq!((v["order"].clone(), w), (Value::Null, None));
+        let (v, _) = date_report(&dates(Some(Ok("soon")), base), false);
+        assert_eq!(v["order"], Value::Null);
+        // Another Miniserver's date says nothing about this base.
+        let (v, w) = date_report(&dates(Some(Ok("2026-11-06 14:32:10")), base), true);
+        assert_eq!(
+            (v["miniserver"].clone(), v["changed"].as_bool(), w),
+            (Value::Null, Some(false), None)
+        );
+        // A failed request only says that it cannot tell: no warning.
+        let (v, w) = date_report(&dates(Some(Err("HTTP 401")), base), false);
+        assert_eq!(
+            (v["error"].as_str(), v["changed"].as_bool(), w),
+            (Some("HTTP 401"), Some(false), None)
+        );
     }
 }

@@ -108,6 +108,13 @@
   </section>
 
   <aside id="right" aria-label="History and changes">
+    <div class="stale hidden" id="stale" role="status" aria-live="polite">
+      <div id="stale-text"></div>
+      <div class="stale-row" id="stale-row">
+        <button type="button" id="stale-pull" class="pull-btn hidden">Pull from Miniserver</button>
+        <button type="button" id="stale-sync" class="pull-btn hidden">Sync from Miniserver</button>
+      </div>
+    </div>
     <section class="pane hidden" id="deploy-pane" aria-labelledby="deploy-h">
       <h2 class="pane-title" id="deploy-h"><span>Deploy</span>
         <button type="button" id="btn-sync" class="pull-btn" title="Make the Miniserver's running config the project's base (lox config merge), then commit and push">

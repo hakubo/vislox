@@ -1339,6 +1339,7 @@ function renderPull() {
   b.classList.toggle("busy", pulling);
   b.querySelector(".lbl").textContent = pulling ? "Pulling…" : "Pull from Miniserver";
   b.title = !info.available ? `Cannot pull: ${info.reason}` : "Download the Miniserver's current config and commit it (lox config pull)" + msWarn("pull");
+  renderStale();
 }
 function pullMsg(text, cls) {
   const m = $("pull-msg");
@@ -1361,7 +1362,7 @@ async function pull() {
   } catch (e) {
     pullMsg(e.message, "error");
   } finally {
-    pulling = false; renderPull(); loadMs();
+    pulling = false; renderPull(); loadMs(true);
   }
 }
 $("btn-pull").onclick = pull;
@@ -1375,8 +1376,9 @@ S.ms = null;
 // button is clicked, so a cause that has cleared does not keep the button off.
 function msBlocked(what) { return S.ms?.available ? S.ms.blocked?.[what] || "" : ""; }
 function msWarn(what) { const b = msBlocked(what); return b ? `\n\n⚠ The last check found: ${b}. It is checked again when you click.` : ""; }
-async function loadMs(fresh) {
-  try { S.ms = await api("/api/miniserver" + (fresh ? "?fresh=1" : "")); } catch { return; }
+// `fresh`: check again now; `poll`: the regular poll, which asks only for the config dates again.
+async function loadMs(fresh, poll) {
+  try { S.ms = await api("/api/miniserver" + (fresh ? "?fresh=1" : poll ? "?poll=1" : "")); } catch { return; }
   renderMs(); renderPull(); renderActions();
 }
 function renderMs() {
@@ -1400,6 +1402,9 @@ function renderMs() {
       ${row("Firmware", m.firmware)}
       ${row("Deployed config", m.config?.deployed && `Loxone Config ${m.config.deployed}`)}
       ${row("Pending config", m.config?.pending && `Loxone Config ${m.config.pending}`)}
+      ${row("Config last changed", m.configDate?.error ? `can't tell (${m.configDate.error})`
+        : m.configDate?.miniserver && msDate(m.configDate.miniserver) + ({ after: " (after the base)", before: " (before the base: an older config runs)" }[m.configDate.order] || ""))}
+      ${row("Base taken at", m.configDate?.base && msDate(m.configDate.base))}
       ${m.reachable ? row("Connection", m.local === false ? "remote" : m.local ? "local" : "unknown") + row("TLS", tls)
         + row("Live-update slot", m.eventSlots == null ? "" : m.eventSlots ? "free" : "none free") : ""}
       ${row("lox's token valid until", tok)}</dl>
@@ -1408,8 +1413,39 @@ function renderMs() {
     ${m.discoveryNote ? `<div class="chk bad"><span class="dot" aria-hidden="true"></span><span><b>Discovery</b> <span class="d">${esc(m.discoveryNote)}</span></span></div>` : ""}
     ${why.map((y) => `<div class="blocked">${esc(blocked.filter((w) => m.blocked[w] === y).map((w) => w[0].toUpperCase() + w.slice(1)).join(", "))} would fail: ${esc(y)}</div>`).join("")}
     ${m.warnings.length ? `<ul class="warns">${m.warnings.map((w) => `<li>${esc(w)}</li>`).join("")}</ul>` : ""}`;
+  renderStale();
   $("ms-when").textContent = "Checked " + new Date(m.checked * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
 }
+// The Miniserver's config changed after the base (LoxAPPversion3 against the date in the
+// download the base came from): someone saved from Loxone Config, or the like.
+/** "2026-11-06 14:32:10" (the Miniserver's local time) → "14:32" today, else "2026-11-06 14:32". */
+function msDate(t) {
+  const m = /^(\d{4})-(\d\d)-(\d\d) (\d\d):(\d\d)/.exec(t || "");
+  if (!m) return t || "";
+  const d = new Date();
+  const today = +m[1] === d.getFullYear() && +m[2] === d.getMonth() + 1 && +m[3] === d.getDate();
+  return today ? `${m[4]}:${m[5]}` : `${m[1]}-${m[2]}-${m[3]} ${m[4]}:${m[5]}`;
+}
+function staleText() {
+  const c = S.ms?.available && S.ms.configDate;
+  return c?.changed ? `The Miniserver's config changed at ${msDate(c.miniserver)}, after the base vislox shows (taken at ${msDate(c.base)}).` : "";
+}
+function renderStale() {
+  const text = staleText();
+  $("stale").classList.toggle("hidden", !text);
+  if (!text) return;
+  const pullOk = !!S.hist?.pull?.available;
+  const a = S.hist?.actions;
+  const syncOk = !!a?.shown && !!a.apply?.available && !pendingChange() && !a.running;
+  $("stale-text").textContent = text + (pullOk || syncOk ? " Take it in before you change anything:" : " Changes made now start from an old base.");
+  $("stale-text").title = `Miniserver: ${S.ms.configDate.miniserver} · base: ${S.ms.configDate.base}`;
+  $("stale-pull").classList.toggle("hidden", !pullOk);
+  $("stale-pull").disabled = pulling;
+  $("stale-sync").classList.toggle("hidden", !syncOk);
+  $("stale-row").classList.toggle("hidden", !pullOk && !syncOk);
+}
+$("stale-pull").onclick = () => $("btn-pull").click();
+$("stale-sync").onclick = () => $("btn-sync").click();
 function closeMsPop() { $("ms-pop").classList.add("hidden"); $("ms-chip").setAttribute("aria-expanded", "false"); }
 $("ms-chip").onclick = () => {
   const open = $("ms-pop").classList.toggle("hidden") === false;
@@ -1450,7 +1486,7 @@ async function act(path, body) {
   });
   const j = await r.json().catch(() => ({}));
   if (r.status === 401) try { localStorage.removeItem("vislox.token"); } catch { /* private mode */ }
-  if (j.preflight || /apply|sync/.test(path)) loadMs();
+  if (j.preflight || /apply|sync/.test(path)) loadMs(true);
   if (!r.ok) { const e = new Error(j.error || r.statusText); e.data = j; throw e; }
   return j;
 }
@@ -1465,9 +1501,13 @@ function pendingChange() {
   const base = p && revById(p.base);
   return p && base && p.blob !== base.blob ? p : null;
 }
+// One Apply at a time: from the click until the confirmation is answered (and the request sent),
+// a second click does nothing.
+let applyAsking = false;
 function renderActions() {
   const a = S.hist?.actions;
   $("deploy-pane").classList.toggle("hidden", !a?.shown);
+  renderStale();
   if (!a?.shown) return;
   const busy = !!a.running;
   const pend = pendingChange();
@@ -1477,7 +1517,7 @@ function renderActions() {
     : !a.apply.available ? `Apply is off: ${a.apply.reason}.`
     : "Nothing pending. Edit the project's module and compile it (lox logic …); the result shows here for review.";
   $("deploy-row").classList.toggle("hidden", !pend && !a.running);
-  $("btn-apply").disabled = !a.apply.available || busy || !pend;
+  $("btn-apply").disabled = !a.apply.available || busy || !pend || applyAsking;
   const sync = $("btn-sync");
   sync.disabled = !a.apply.available || busy || !!pend;
   sync.classList.toggle("busy", a.running === "Sync");
@@ -1561,9 +1601,19 @@ $("deploy-new").addEventListener("click", (e) => {
   select(u);
 });
 $("btn-apply").onclick = async () => {
+  if (applyAsking) return;
+  applyAsking = true;
+  $("btn-apply").disabled = true;
+  try { await apply(); } finally { applyAsking = false; renderActions(); }
+};
+async function apply() {
   const pend = pendingChange();
   if (!pend) return;
-  if (!window.confirm("Deploy the pending changes to the Miniserver?\n\nlox config push uploads the config and restarts the Miniserver's program (a few seconds), " +
+  // Ask the Miniserver once more whether its config changed after the base.
+  await loadMs(true);
+  const stale = staleText();
+  if (!window.confirm((stale ? `⚠ ${stale} Applying overwrites what changed there since.\n\n` : "") +
+    "Deploy the pending changes to the Miniserver?\n\nlox config push uploads the config and restarts the Miniserver's program (a few seconds), " +
     "checks that it runs exactly the compiled config, then vislox commits and pushes to git.")) return;
   deployMsg("");
   $("deploy-new").classList.add("hidden");
@@ -1588,7 +1638,7 @@ $("btn-apply").onclick = async () => {
       return;
     }
   }
-};
+}
 $("btn-sync").onclick = async () => {
   deployMsg("");
   try { const j = await act("/api/sync"); deployMsg(j.message); } catch (err) { deployMsg(err.message, true); }
@@ -1971,4 +2021,7 @@ S.hash = readHash();
 loadHistory().then(connect);
 loadMs();
 // The chip stays roughly current while the page is open.
-setInterval(() => { if (!document.hidden) loadMs(); }, 5 * 60 * 1000);
+// Every minute, to notice a config saved on the Miniserver: the server asks only for its config
+// date again (reused for half a minute, so several tabs still ask once), and the full check every
+// five minutes.
+setInterval(() => { if (!document.hidden) loadMs(false, true); }, 60 * 1000);

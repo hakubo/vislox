@@ -93,7 +93,9 @@ try {
   page = await browser.newPage({ viewport: { width: 1400, height: 900 } });
   page.on("pageerror", (e) => errors.push(e.message));
   page.on("console", (m) => { if (m.type() === "error") errors.push(m.text()); });
-  page.on("dialog", (d) => d.accept());
+  let dialogs = 0, applies = 0;
+  page.on("dialog", (d) => { dialogs++; d.accept(); });
+  page.on("request", (r) => { if (r.method() === "POST" && new URL(r.url()).pathname === "/api/apply") applies++; });
   await page.addInitScript(() => localStorage.setItem("vislox.token", "secret"));
   await page.goto(`http://127.0.0.1:${port}/`);
   await page.waitForSelector(".tab");
@@ -107,7 +109,8 @@ try {
     await page.waitForSelector("#btn-apply:not([disabled])");
   });
   await step("Apply shows its steps as they happen", async () => {
-    await page.click("#btn-apply");
+    // A double click asks once, and applies once (Apply checks the Miniserver first, then asks).
+    await page.dblclick("#btn-apply");
     await page.waitForSelector("#deploy-steps:not(.hidden)");
     await page.waitForFunction(() => document.querySelector('#deploy-steps li[aria-current="step"] .l')?.textContent === "Program restarting", null, { timeout: 10000 });
     assert.equal(await state("Upload"), "ok");
@@ -116,6 +119,8 @@ try {
   });
   await step("every step ends done", async () => {
     await page.waitForFunction(() => /^Applied/.test(document.querySelector("#deploy-msg")?.textContent || ""), null, { timeout: 20000 });
+    assert.equal(dialogs, 1, "one confirmation");
+    assert.equal(applies, 1, "one /api/apply request");
     for (const l of ["Download and drift check", "Upload", "Program restarting", "Back online", "New config loaded", "Verified", "Committed", "Pushed to git"]) {
       assert.equal(await state(l), "ok", l);
     }

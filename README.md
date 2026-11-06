@@ -84,6 +84,14 @@ marked so you can review it before you deploy.
   discovery broadcast looks for the serial on the local network, and the reason names its new address and the
   `lox setup set --host …` command that points lox at it (with lox's scheme and port).
 
+- **The Miniserver's config changed after the base**: the chip also asks the Miniserver when its config last
+  changed (`jdev/sps/LoxAPPversion3`), and compares that with the date in the download the base came from. When
+  the Miniserver's is later, someone saved from Loxone Config (or otherwise changed the config) after the base was
+  taken: the chip turns amber, and a notice above Deploy and History says when, with **Pull from Miniserver** or
+  **Sync from Miniserver**. Apply asks once more and warns in its confirmation. While the page is open it asks for
+  the date every minute (the rest of the check every five minutes). An earlier date (an older config restored on
+  the Miniserver) is shown in the chip's details, not as a warning.
+
 vislox itself never writes to the config: lox and git do, and only on Pull, Apply and Discard. Live values only
 listen. A pull reads from the Miniserver; only Apply writes to it.
 
@@ -159,6 +167,17 @@ and the date of the loaded program). A search is reused for a minute. Port 7071 
 missed. Broadcasts stay in the local network: they do not cross VLANs or routers, Remote Connect, or Docker's
 default bridge network.
 
+The config date is the one request that needs lox's user and password (HTTP basic auth, as Apply's restart
+probe; no token is requested). The Miniserver sends `lastModified` of its `LoxAPP3.json`, in its local time.
+The base's own date comes from the download lox took it from: `backup.zip` next to a repository's `config.Loxone`
+(`lox config pull`), or, in a project, the zip in `backups/` beside the newest `.Loxone` that equals the base byte
+for byte (`lox config push`, `merge`, Sync). When no download matches (a base edited by hand), nothing is
+compared, and neither is a backup `.zip` opened on its own (a look at an old config). The date is coarse: a push
+that changes only logic can leave it as it was, so equal dates do not prove equal configs, but a later date on the
+Miniserver does mean the base is old. When the Miniserver does not answer the request (no rights, wrong password,
+a timeout of 5 s), the chip's details say that it cannot tell; that is not a warning. The date is asked for apart
+from the rest of the check, so the preflight before Pull, Apply and Sync never waits for it.
+
 Not shown yet: the token's rights (Config, FTP, program restart) and whether the password is weak. The
 Miniserver reports them only at login (`tokenRights`, `unsecurePass`), and lox does not keep them.
 
@@ -224,7 +243,8 @@ The binary is an `axum` server with the UI embedded (plain JS and SVG, no build 
 - `src/pull.rs` runs `lox config pull` for the Pull button (`POST /api/pull`, which needs an `X-Vislox` header so
   that no other web page can trigger it), then refreshes the history.
 - `src/miniserver.rs` checks the Miniserver for the status chip and the preflight before Pull, Apply and Sync
-  (`GET /api/miniserver`), including that the serial at the address is the config's.
+  (`GET /api/miniserver`), including that the serial at the address is the config's, and when its config last
+  changed; `src/configdate.rs` finds the same date for the base, in the download it came from.
 - `src/discover.rs` is Loxone's UDP discovery (`vislox --discover`, and finding a Miniserver whose address
   changed).
 - `src/live.rs` streams the Miniserver's states with lox's `loxone-client` crate. A wire's source

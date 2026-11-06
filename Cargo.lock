@@ -2261,6 +2261,7 @@ dependencies = [
  "tokio-stream",
  "tokio-tungstenite",
  "tower-http",
+ "zip",
 ]
 
 [[package]]
