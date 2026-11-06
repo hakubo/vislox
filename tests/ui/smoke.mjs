@@ -8,6 +8,7 @@ import { chromium } from "playwright";
 import { spawn, execFileSync } from "node:child_process";
 import { createServer } from "node:http";
 import { createServer as createTcpServer } from "node:net";
+import { createSocket } from "node:dgram";
 import { mkdtempSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, appendFileSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { crc32 } from "node:zlib";
@@ -69,6 +70,8 @@ let msConfigDate = "2026-11-01 10:00:00";
 const listen = (srv) => new Promise((ok) => srv.listen(0, "127.0.0.1", () => ok(srv.address().port)));
 // `msSerial` is what it reports; a test swaps it for another Miniserver's.
 let msSerial = "50:4F:94:00:00:01";
+// Debug-Monitor commands the stand-in Miniserver got (dev/sps/log/<ip>, dev/sps/log).
+const msMonitor = [];
 // Its structure file puts the meter in the cellar, not the kitchen the config names.
 const structure = {
   lastModified: "2026-11-01 10:00:00", msInfo: { serialNr: "504F94000001", msName: "Testhaus" },
@@ -79,6 +82,7 @@ const structure = {
 const ICON = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><rect width="16" height="16" fill="#8b6cc4"/></svg>';
 let structureReads = 0;
 const msPort = await listen(createServer((req, res) => {
+  if (req.url.startsWith("/dev/sps/log")) { msMonitor.push(req.url); res.end("ok"); return; }
   if (req.url.toLowerCase() === "/data/loxapp3.json") {
     if (!req.headers.authorization) { res.writeHead(401); res.end(); return; }
     structureReads++;
@@ -116,9 +120,24 @@ echo committed
 chmodSync(fakeLox, 0o755);
 
 const port = 7900 + Math.floor(Math.random() * 90);
+// The Debug-Monitor's UDP port: a free one.
+const monPort = await new Promise((ok) => { const u = createSocket("udp4"); u.bind(0, "127.0.0.1", () => { const p = u.address().port; u.close(() => ok(p)); }); });
+// A Debug-Monitor frame as the Miniserver sends it (src/monframe.rs): header, one string parameter.
+function monFrame(text, counter) {
+  const body = Buffer.concat([Buffer.from([1]), Buffer.from(text), Buffer.from([0])]);
+  const f = Buffer.alloc(28 + body.length);
+  f.writeUInt16LE(0xFA1F, 0); f.writeUInt16LE(f.length, 2); f[5] = 1;
+  f.writeUInt16LE(100, 6); f.writeUInt16LE(counter, 8); f.writeUInt16LE(250, 10);
+  f.writeUInt32LE(563194643, 12); f.set([127, 0, 0, 1], 16);
+  body.copy(f, 28);
+  f[4] = f.subarray(5).reduce((x, b) => x ^ b, 0);
+  return f;
+}
 const server = spawn(bin, [repo, "--listen", `127.0.0.1:${port}`, "--live-from", liveFile, "--lox", fakeLox], {
   stdio: ["ignore", "ignore", "pipe"],
-  env: { ...process.env, LOX_CONFIG: loxConfig, VISLOX_FTP_PORT: String(ftpPort), VISLOX_CACHE: mkdtempSync(join(tmpdir(), "vislox-cache-")) },
+  env: { ...process.env, LOX_CONFIG: loxConfig, VISLOX_FTP_PORT: String(ftpPort), VISLOX_CACHE: mkdtempSync(join(tmpdir(), "vislox-cache-")), VISLOX_MONITOR: "1", VISLOX_MONITOR_PORT: String(monPort),
+    // As Docker Compose passes it when unset: empty means "not set".
+    VISLOX_MONITOR_IP: "" },
 });
 let log = "";
 server.stderr.on("data", (d) => (log += d));
@@ -323,6 +342,30 @@ try {
     // The stand-in lox here only pulls, so `lox log` fails; the panel says so.
     await page.click("#log-toggle");
     await page.waitForFunction(() => /^Cannot read the log: lox log failed: unexpected: log/.test(document.querySelector("#log-msg")?.textContent || ""), null, { timeout: 15000 });
+  });
+  await step("the Debug-Monitor shows the Miniserver's frames live", async () => {
+    await page.waitForFunction((p) => document.querySelector("#mon-state")?.textContent.includes(`listening on UDP ${p}`), monPort);
+    const udp = createSocket("udp4");
+    await new Promise((ok) => udp.send(monFrame("PRG Monitor line from the house", 1), monPort, "127.0.0.1", ok));
+    udp.close();
+    await page.waitForFunction(() => [...document.querySelectorAll("#log li.monitor .tx")].some((x) => x.textContent === "PRG Monitor line from the house"));
+    assert.match(await page.textContent("#log li.monitor .tm"), /2026-11-06 10:57:23\.250\s*monitor/);
+  });
+  await step("a Monitor Server request gets the XML naming vislox", async () => {
+    const r = await fetch(`http://127.0.0.1:${port}/?504F94000001`);
+    assert.match(r.headers.get("content-type"), /xml/);
+    assert.match(await r.text(), new RegExp(`<LogDest>/dev/udp/127\\.0\\.0\\.1/${monPort}</LogDest>`));
+    // Not a serial: the page.
+    assert.match(await (await fetch(`http://127.0.0.1:${port}/?x=1`)).text(), /<html/);
+  });
+  await step("Start and Stop ask the Miniserver to send and to stop", async () => {
+    page.once("dialog", (d) => d.accept());
+    await page.click("#btn-mon");
+    await page.waitForFunction(() => /^Debug-Monitor on until/.test(document.querySelector("#mon-state")?.textContent || ""));
+    assert.deepEqual(msMonitor, ["/dev/sps/log/127.0.0.1"]);
+    await page.click("#btn-mon");
+    await page.waitForFunction(() => /^Debug-Monitor: listening/.test(document.querySelector("#mon-state")?.textContent || ""));
+    assert.deepEqual(msMonitor, ["/dev/sps/log/127.0.0.1", "/dev/sps/log"]);
     await page.click("#log-toggle");
     await page.waitForSelector("#log-body.hidden", { state: "attached" });
   });

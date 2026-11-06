@@ -42,6 +42,16 @@ With Docker Compose or a Portainer stack, use [`compose.yml`](compose.yml) and s
 | `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL` | Who commits for Apply and Sync. |
 | `VISLOX_ARGS` | More `vislox` arguments, e.g. `--no-pull` or `--serial 504F94AABBCC`. |
 | `VISLOX_PORT` | Host port (compose only, default `7878`). |
+| `VISLOX_MONITOR` | `1` turns on the Debug-Monitor (default off): vislox listens for the Miniserver's debug output on UDP, and the Log panel can start and stop it. |
+| `VISLOX_MONITOR_IP` | The Docker host's LAN address (e.g. `192.168.1.82`): where the Miniserver sends the Debug-Monitor. Needed in Docker, since vislox would otherwise name the container's own address. |
+| `VISLOX_MONITOR_PORT` | The UDP port, published by compose as `<port>/udp` (default `7777`, the Miniserver's Debug-Monitor port). |
+| `VISLOX_MONITOR_MINUTES` | How long a Start lasts before vislox stops it (default `60`). |
+
+The Debug-Monitor needs the UDP port published (compose does it: `7777:7777/udp`); Docker's default bridge network
+gets no UDP in otherwise. vislox keeps only packets from the Miniserver's address. If the Log panel says packets from
+another address (like `172.17.0.1`) were dropped, Docker rewrote the sender: run the container with
+`network_mode: host` instead. To turn the Debug-Monitor off again, click **Stop** (or let the time limit end it), then
+set `VISLOX_MONITOR` back to `0`.
 
 ## Portainer, kept up to date
 

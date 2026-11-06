@@ -558,3 +558,9 @@ button.chip { cursor: pointer; } button.chip:hover { border-color: var(--brand);
 .app-note.warn, .app-warn .k { color: #a15c00; }
 .app-warn .why { grid-column: 2; color: var(--muted); font-size: 12px; }
 .app-load { margin-left: 2px; }
+.mon-bar { flex: none; display: flex; align-items: center; gap: 6px; padding: 5px 10px; font-size: 12px; color: var(--muted); border-bottom: 1px solid var(--line-2); }
+.mon-bar .mon-state { flex: 1; min-width: 0; word-break: break-word; }
+.mon-bar .mon-state.on::before { content: "●"; color: var(--live-on); margin-right: 4px; }
+.mon-bar .mon-state.error { color: var(--removed); }
+.log li.monitor { border-left-color: var(--sel); }
+.log li .tag { display: inline-block; margin-left: 6px; padding: 0 5px; border-radius: 8px; background: var(--sel-soft); color: var(--sel); font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: .03em; }

@@ -8,6 +8,8 @@ services:
     restart: unless-stopped
     ports:
       - "${VISLOX_PORT:-7878}:7878"
+      # The Debug-Monitor (VISLOX_MONITOR=1): the Miniserver sends UDP here.
+      - "${VISLOX_MONITOR_PORT:-7777}:${VISLOX_MONITOR_PORT:-7777}/udp"
     volumes:
       - vislox-data:/data
     environment:
@@ -25,6 +27,10 @@ services:
       LOX_SERIAL: ${LOX_SERIAL:-}
       LOX_VERIFY_SSL: ${LOX_VERIFY_SSL:-}
       VISLOX_ADMIN_TOKEN: ${VISLOX_ADMIN_TOKEN:-}
+      VISLOX_MONITOR: ${VISLOX_MONITOR:-false}
+      VISLOX_MONITOR_PORT: ${VISLOX_MONITOR_PORT:-7777}
+      VISLOX_MONITOR_IP: ${VISLOX_MONITOR_IP:-}
+      VISLOX_MONITOR_MINUTES: ${VISLOX_MONITOR_MINUTES:-60}
 
 volumes:
   vislox-data:
