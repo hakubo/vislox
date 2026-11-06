@@ -203,6 +203,7 @@ async fn main() -> Result<()> {
         .route("/api/view", get(api_view))
         .route("/api/events", get(api_events))
         .route("/api/live", get(api_live))
+        .route("/api/live/retry", axum::routing::post(api_live_retry))
         .route("/api/pull", axum::routing::post(api_pull))
         .route("/api/apply", axum::routing::post(api_apply))
         .route("/api/discard", axum::routing::post(api_discard))
@@ -403,6 +404,22 @@ async fn api_events(
             .data(a.actions.info().to_string()))
     });
     Sse::new(history.merge(actions)).keep_alive(KeepAlive::default())
+}
+
+/// A user turned live values on: after a session that stopped (blocked,
+/// login refused), allow a new one. Reloads and reconnecting streams do not
+/// call this, so they never log in again on their own. Needs the `X-Vislox`
+/// header, so another site cannot make vislox log in.
+async fn api_live_retry(State(app): State<Arc<App>>, headers: axum::http::HeaderMap) -> Response {
+    if !headers.contains_key("x-vislox") {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": "missing X-Vislox header" })),
+        )
+            .into_response();
+    }
+    app.live.retry();
+    Json(serde_json::json!({ "ok": true })).into_response()
 }
 
 /// Live values for one browser, while it keeps this stream open: `status`,

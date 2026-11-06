@@ -15,7 +15,7 @@
 //! - the NDJSON output of `lox stream -o json --initial` (`--live-from`), from
 //!   a file (followed as it grows) or standard input.
 
-use crate::reason::{DEFAULT_RETRY, Reason, Retry};
+use crate::reason::{Backoff, Next, Reason};
 use crate::session::{self, Ended};
 use loxone_client::Connection;
 use loxone_client::stream::StateEvent;
@@ -424,19 +424,37 @@ fn read_structure(structure: &Value) -> Structure {
 
 // ── The hub ─────────────────────────────────────────────────────────────
 
-#[derive(Clone, Serialize, PartialEq, Debug, Default)]
+#[derive(Clone, PartialEq, Debug, Default)]
 pub struct Status {
     /// `off` (no source), `idle` (nobody watching), `connecting`, `live`,
-    /// `offline` (retrying), `stopped` (not retrying: see `reason`),
-    /// `ended` (the NDJSON input ended).
+    /// `offline` (retrying), `stopped` (not retrying until a user turns
+    /// live values off and on: see `reason`), `ended` (the NDJSON input
+    /// ended).
     pub state: &'static str,
     pub detail: Option<String>,
     /// Why the Miniserver refused or dropped the connection, when it said.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<Reason>,
-    /// A short label for `reason`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub label: Option<&'static str>,
+}
+
+/// `{state, detail, reason?, label?}`: `label` is the reason's short label.
+impl Serialize for Status {
+    fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut st = ser.serialize_struct("Status", 4)?;
+        st.serialize_field("state", self.state)?;
+        st.serialize_field("detail", &self.detail)?;
+        match self.reason {
+            Some(r) => {
+                st.serialize_field("reason", &r)?;
+                st.serialize_field("label", r.label())?;
+            }
+            None => {
+                st.skip_field("reason")?;
+                st.skip_field("label")?;
+            }
+        }
+        st.end()
+    }
 }
 
 impl Status {
@@ -453,7 +471,6 @@ impl Status {
             state,
             detail: Some(detail),
             reason,
-            label: reason.map(Reason::label),
         }
     }
 }
@@ -475,6 +492,11 @@ struct St {
     /// Bumped for each Miniserver session; an ended session's late writes
     /// carry an old one and are dropped.
     generation: u64,
+    /// The last session gave up for a reason more attempts would make worse
+    /// (blocked, login refused, user disabled). No new session starts, not
+    /// for a reload, another tab or a reconnecting stream, until a user
+    /// turns live values on again ([`Live::retry`]).
+    stopped: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -514,6 +536,7 @@ impl Live {
                 clients: 0,
                 run: None,
                 generation: 0,
+                stopped: false,
             }),
         });
         if let Feed::Ndjson(path) = &live.feed {
@@ -578,8 +601,15 @@ impl Live {
         let rx = self.tx.subscribe();
         let mut st = self.st.lock().unwrap();
         st.clients += 1;
+        self.start(&mut st);
+        (rx, Watcher(self.clone()))
+    }
+
+    /// Start a Miniserver session, unless one runs or the last one stopped.
+    fn start(self: &Arc<Self>, st: &mut St) {
         if let Feed::Miniserver(conn) = &self.feed
             && st.run.is_none()
+            && !st.stopped
         {
             st.generation += 1;
             let generation = st.generation;
@@ -591,7 +621,40 @@ impl Live {
                     .run_miniserver(generation, (**conn).clone(), stop_rx),
             );
         }
-        (rx, Watcher(self.clone()))
+    }
+
+    /// A user turned live values on: after a session that stopped (blocked,
+    /// login refused), allow one again.
+    pub fn retry(self: &Arc<Self>) {
+        let mut st = self.st.lock().unwrap();
+        if !st.stopped {
+            return;
+        }
+        st.stopped = false;
+        st.status = Status::new("idle", None);
+        if st.clients > 0 {
+            self.start(&mut st);
+        }
+        drop(st);
+        let _ = self.tx.send(Msg::Status);
+    }
+
+    /// The session `generation` gave up: show why, and start no other until
+    /// [`retry`](Live::retry).
+    fn stop_for_good(&self, generation: u64, status: Status) {
+        let mut st = self.st.lock().unwrap();
+        if st.generation != generation {
+            return;
+        }
+        st.status = status;
+        st.stopped = true;
+        if let Some((_, stop)) = st.run.take() {
+            let _ = stop.send(true);
+        }
+        // Late writes of the session are dropped.
+        st.generation += 1;
+        drop(st);
+        let _ = self.tx.send(Msg::Status);
     }
 
     fn unsubscribe(self: &Arc<Self>) {
@@ -682,9 +745,7 @@ impl Live {
         conn: Connection,
         mut stop: watch::Receiver<bool>,
     ) {
-        // The wait before the next attempt, and the reason it was chosen for.
-        let mut wait = 0;
-        let mut last: Option<Option<Reason>> = None;
+        let mut backoff = Backoff::default();
         loop {
             if *stop.borrow() {
                 return;
@@ -698,14 +759,15 @@ impl Live {
             .await
             .map_err(|e| e.to_string())
             .and_then(|r| r);
-            let (err, reason) = match structure {
+            let (err, reason, http) = match structure {
                 Err(e) => {
                     let r = Reason::from_text(&e);
-                    (format!("cannot read the structure file: {e}"), r)
+                    (format!("cannot read the structure file: {e}"), r, true)
                 }
                 Ok(s) => {
                     self.load_structure(generation, &s);
                     let went_live = AtomicBool::new(false);
+                    let going_offline = AtomicBool::new(false);
                     let ended = session::run(
                         &conn,
                         stop.clone(),
@@ -714,6 +776,9 @@ impl Live {
                             self.set_status(generation, "live", None);
                         },
                         |events| {
+                            if events.iter().any(|e| matches!(e, StateEvent::OutOfService)) {
+                                going_offline.store(true, Ordering::Relaxed);
+                            }
                             self.apply(generation, events);
                             true
                         },
@@ -723,9 +788,12 @@ impl Live {
                         return;
                     }
                     if went_live.load(Ordering::Relaxed) {
-                        last = None;
+                        backoff.reset();
                     }
-                    match ended {
+                    if going_offline.load(Ordering::Relaxed) {
+                        backoff.going_offline();
+                    }
+                    let (err, reason) = match ended {
                         Ended::Stopped => return,
                         Ended::Closed(None) => {
                             ("the Miniserver closed the connection".into(), None)
@@ -738,48 +806,29 @@ impl Live {
                             let r = Reason::from_text(&e);
                             (e, r)
                         }
-                    }
+                    };
+                    (err, reason, false)
                 }
             };
-            // The Miniserver said it is going offline, then the socket dropped.
-            let reason = reason.or_else(|| {
-                let st = self.st.lock().unwrap();
-                (st.generation == generation && st.status.reason == Some(Reason::OutOfService))
-                    .then_some(Reason::OutOfService)
-            });
-            let detail = |tail: String| match reason {
+            let (reason, next) = backoff.next(reason, http);
+            let detail = |tail: &str| match reason {
                 Some(r) => format!("{}\n({err}) · {tail}", r.sentence()),
                 None => format!("{err} · {tail}"),
             };
-            match reason.map_or(DEFAULT_RETRY, Reason::retry) {
-                Retry::Stop => {
-                    self.put_status(
+            let wait = match next {
+                Next::Stop => {
+                    let tail = "not retrying; turn live values off and on to try again";
+                    self.stop_for_good(
                         generation,
-                        Status::because(
-                            "stopped",
-                            reason,
-                            detail("not retrying; turn live values off and on to try again".into()),
-                        ),
+                        Status::because("stopped", reason, detail(tail)),
                     );
-                    // The next browser to turn live values on starts afresh.
-                    let mut st = self.st.lock().unwrap();
-                    if st.run.as_ref().is_some_and(|(g, _)| *g == generation) {
-                        st.run = None;
-                    }
                     return;
                 }
-                Retry::Backoff { first, max } => {
-                    wait = if last == Some(reason) {
-                        (wait * 2).clamp(first, max)
-                    } else {
-                        first
-                    };
-                    last = Some(reason);
-                }
-            }
+                Next::Wait(w) => w,
+            };
             self.put_status(
                 generation,
-                Status::because("offline", reason, detail(format!("retrying in {wait} s"))),
+                Status::because("offline", reason, detail(&format!("retrying in {wait} s"))),
             );
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_secs(wait)) => {}
@@ -1085,18 +1134,52 @@ mod tests {
             &mut batch,
         );
         assert_eq!(live.status().reason, Some(Reason::OutOfService));
-        assert_eq!(live.status().label, Some("going offline"));
+        let j: Value = serde_json::from_str(&live.status_json()).unwrap();
+        assert_eq!(j["label"], "going offline");
         live.ndjson_line(
-            &json!({"event": "disconnected", "reason": "error", "message": "authwithtoken failed (401)"}),
+            &json!({"event": "disconnected", "reason": "error", "message": "HTTP 401: /jdev/sps/LoxAPP3.json"}),
             &mut batch,
         );
         let st = live.status();
         assert_eq!(st.reason, Some(Reason::Unauthorized));
         let d = st.detail.unwrap();
         assert!(
-            d.starts_with("The Miniserver refused") && d.ends_with("(authwithtoken failed (401))")
+            d.starts_with("The Miniserver refused")
+                && d.ends_with("(HTTP 401: /jdev/sps/LoxAPP3.json)")
         );
         let j: Value = serde_json::from_str(&live.status_json()).unwrap();
         assert_eq!(j["reason"], "unauthorized");
+    }
+
+    fn running(live: &Live) -> bool {
+        live.st.lock().unwrap().run.is_some()
+    }
+
+    #[tokio::test]
+    async fn a_stopped_session_stays_stopped_until_a_user_turns_live_on() {
+        // Nothing listens there: attempts fail at once and are retried.
+        let conn = Connection::new("http://127.0.0.1:9", "u", "p");
+        let live = Live::new(Feed::Miniserver(Box::new(conn)), "test".into());
+        let (_rx, tab) = live.subscribe();
+        assert!(running(&live));
+        let generation = live.st.lock().unwrap().generation;
+        let r = Reason::Blocked;
+        live.stop_for_good(generation, Status::because("stopped", Some(r), "x".into()));
+        assert!(!running(&live));
+        // A reload, a second tab, a reconnecting stream: no new login.
+        drop(tab);
+        let (_rx2, _tab2) = live.subscribe();
+        let (_rx3, _tab3) = live.subscribe();
+        assert!(!running(&live));
+        let st = live.status();
+        assert_eq!((st.state, st.reason), ("stopped", Some(Reason::Blocked)));
+        let j: Value = serde_json::from_str(&live.status_json()).unwrap();
+        assert_eq!(j["label"], "blocked");
+        // The user turns live values off and on.
+        live.retry();
+        assert!(running(&live));
+        assert_eq!(live.status().state, "connecting");
+        live.retry();
+        assert!(running(&live));
     }
 }

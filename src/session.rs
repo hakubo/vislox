@@ -10,6 +10,7 @@
 use futures_util::{SinkExt, StreamExt};
 use loxone_client::Connection;
 use loxone_client::stream::{Framer, StateEvent, ws_authenticate};
+use loxone_client::system::ll_code;
 use loxone_client::token::{WsStream, token_reuse_rejected};
 use loxone_client::ws::LoxWsClient;
 use std::time::Duration;
@@ -73,28 +74,53 @@ async fn open(conn: &Connection) -> Result<WsStream, String> {
     Ok(ws)
 }
 
-/// A refused command's answer (`{"LL": {"Code": "…"}}` other than 200), as an
-/// error message.
-fn refused(text: &str) -> Option<String> {
-    let v: serde_json::Value = serde_json::from_str(text).ok()?;
-    let ll = v.get("LL")?;
-    let code = ll.get("Code").or_else(|| ll.get("code"))?;
-    let code = code
-        .as_str()
-        .map(String::from)
-        .or_else(|| code.as_i64().map(|n| n.to_string()))?;
-    if code == "200" {
-        return None;
-    }
-    let what = ll
-        .get("control")
-        .and_then(|c| c.as_str())
-        .unwrap_or("command");
-    Some(format!("{what} refused: Code {code}"))
+/// What one message from the Miniserver means for the session.
+#[derive(Debug)]
+enum Step {
+    /// State events (possibly none, for half of a header + payload pair).
+    Events(Vec<StateEvent>),
+    /// A command was answered with `Code` 200: the subscription is on.
+    Answered,
+    /// A command was refused: what and its `Code`.
+    Refused(String),
+    /// Answer a ping.
+    Pong(Vec<u8>),
+    Closed(Option<u16>),
+    Failed(String),
+    Ignore,
 }
 
-/// Run one session. `on_live` is called once subscribed; `handler` gets each
-/// batch of events and returns `false` to stop.
+fn step(framer: &mut Framer, msg: Message) -> Step {
+    match msg {
+        Message::Binary(data) => match framer.binary(&data) {
+            Ok(ev) => Step::Events(ev),
+            Err(e) => Step::Failed(chain(&e)),
+        },
+        Message::Text(t) => {
+            framer.text();
+            match ll_code(&t) {
+                None => Step::Ignore,
+                Some(200) => Step::Answered,
+                Some(code) => {
+                    let what = serde_json::from_str::<serde_json::Value>(&t)
+                        .ok()
+                        .and_then(|v| v.pointer("/LL/control")?.as_str().map(String::from))
+                        .unwrap_or_else(|| "command".into());
+                    Step::Refused(format!("{what} refused: Code {code}"))
+                }
+            }
+        }
+        Message::Ping(data) => Step::Pong(data),
+        Message::Close(frame) => Step::Closed(frame.map(|f| u16::from(f.code))),
+        _ => Step::Ignore,
+    }
+}
+
+/// Run one session. `on_live` is called once the Miniserver has accepted
+/// the subscription: when it answers it with `Code` 200 or sends the first
+/// states, not when the request is sent (a refused subscription or a 4008
+/// close never counts as live). `handler` gets each batch of events and
+/// returns `false` to stop.
 pub async fn run<F>(
     conn: &Connection,
     mut stop: watch::Receiver<bool>,
@@ -109,7 +135,7 @@ where
         Ok(Err(e)) => return Ended::Failed(e),
         Ok(Ok(ws)) => ws,
     };
-    on_live();
+    let mut on_live = Some(on_live);
     let mut keepalive = tokio::time::interval(KEEPALIVE);
     keepalive.tick().await;
     let mut framer = Framer::default();
@@ -137,28 +163,29 @@ where
             Some(Ok(m)) => m,
         };
         last_rx = tokio::time::Instant::now();
-        let events = match msg {
-            Message::Binary(data) => match framer.binary(&data) {
-                Ok(ev) => ev,
-                Err(e) => return Ended::Failed(chain(&e)),
-            },
-            Message::Text(t) => {
-                framer.text();
-                if let Some(e) = refused(&t) {
-                    return Ended::Failed(e);
+        let events = match step(&mut framer, msg) {
+            Step::Events(ev) if ev.is_empty() => continue,
+            Step::Events(ev) => ev,
+            Step::Answered => {
+                if let Some(f) = on_live.take() {
+                    f();
                 }
                 continue;
             }
-            Message::Ping(data) => {
+            Step::Refused(e) | Step::Failed(e) => return Ended::Failed(e),
+            Step::Pong(data) => {
                 if let Err(e) = ws.send(Message::Pong(data)).await {
                     return Ended::Failed(chain(&e));
                 }
                 continue;
             }
-            Message::Close(frame) => return Ended::Closed(frame.map(|f| u16::from(f.code))),
-            _ => continue,
+            Step::Closed(code) => return Ended::Closed(code),
+            Step::Ignore => continue,
         };
-        if !events.is_empty() && !handler(events) {
+        if let Some(f) = on_live.take() {
+            f();
+        }
+        if !handler(events) {
             return Ended::Stopped;
         }
     }
@@ -167,24 +194,42 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+    use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+
+    fn text(t: &str) -> Step {
+        step(&mut Framer::default(), Message::Text(t.to_string()))
+    }
 
     #[test]
-    fn a_refused_command_is_an_error() {
-        assert_eq!(
-            refused(
-                r#"{"LL":{"control":"dev/sps/enablebinstatusupdate","value":"","Code":"4008"}}"#
-            )
-            .as_deref(),
-            Some("dev/sps/enablebinstatusupdate refused: Code 4008")
-        );
-        assert_eq!(
-            refused(r#"{"LL":{"control":"keepalive","Code":"200"}}"#),
-            None
-        );
-        assert_eq!(
-            refused(r#"{"LL":{"Code":503}}"#).as_deref(),
-            Some("command refused: Code 503")
-        );
-        assert_eq!(refused("not json"), None);
+    fn only_an_accepted_subscription_counts_as_live() {
+        assert!(matches!(
+            text(r#"{"LL":{"control":"dev/sps/enablebinstatusupdate","value":"","Code":"200"}}"#),
+            Step::Answered
+        ));
+        assert!(matches!(
+            text(r#"{"LL":{"control":"dev/sps/enablebinstatusupdate","value":"","Code":"4008"}}"#),
+            Step::Refused(e) if e == "dev/sps/enablebinstatusupdate refused: Code 4008"
+        ));
+        assert!(matches!(
+            text(r#"{"LL":{"Code":503}}"#),
+            Step::Refused(e) if e == "command refused: Code 503"
+        ));
+        assert!(matches!(text("not json"), Step::Ignore));
+        // A close before any answer: the code, not "live".
+        let close = Message::Close(Some(CloseFrame {
+            code: CloseCode::from(4008),
+            reason: "".into(),
+        }));
+        assert!(matches!(
+            step(&mut Framer::default(), close),
+            Step::Closed(Some(4008))
+        ));
+        // A header whose payload has not come yet: no events, so not live.
+        let header = vec![0x03, 0x02, 0, 0, 24, 0, 0, 0];
+        assert!(matches!(
+            step(&mut Framer::default(), Message::Binary(header)),
+            Step::Events(ev) if ev.is_empty()
+        ));
     }
 }

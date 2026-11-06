@@ -1465,7 +1465,7 @@ async function showDeployed() {
   renderHistory(); renderSelects();
   await loadView();
   writeHash(true);
-  if (S.hist.live?.available && !S.live.on) setLive(true);
+  if (S.hist.live?.available && !S.live.on) setLive(true, false); // not a retry after a stop
   renderDeployed();
 }
 /** The changed blocks of the deployed revision, each with a link and its first live value. */
@@ -1775,10 +1775,17 @@ function liveStop() {
   S.live.globals = {};
   liveQueue(null);
 }
-function setLive(on) {
+// Turned on by the user (the switch, L): let the server try again after it stopped (blocked,
+// login refused). A reload or a reconnecting stream never does, so it cannot lengthen a block.
+function setLive(on, retry = true) {
   S.live.on = on;
   setPref("live", on);
-  if (on) liveStart(); else liveStop();
+  if (on && !retry) liveStart();
+  else if (on) {
+    fetch("/api/live/retry", { method: "POST", headers: { "X-Vislox": "live" } })
+      .catch(() => {})
+      .finally(() => { if (S.live.on) liveStart(); });
+  } else liveStop();
   renderLiveSwitch();
 }
 

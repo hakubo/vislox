@@ -127,14 +127,18 @@ response code) and says what to do. How long vislox waits before it tries again 
 | Code | Live status | vislox |
 |---|---|---|
 | 4003 | blocked after too many failed logins | stops: check the user and password (each attempt makes the block longer) |
-| 401, 403, 4006, 423 | login refused, no rights, user disabled | stops: fix the user, then turn live values off and on |
+| 401, 403, 4006, 423 | login refused, no rights, user disabled | stops: fix the user, then turn live values off and on (a 401 or 403 of the structure file's HTTP request is first retried twice) |
 | 4004, 4005 | a user was changed | logs in again after 1 s |
 | 4007 | firmware update | tries again after 30 s, up to every 2 min |
 | 503, out of service | restarting, going offline | tries again after 5–10 s, up to every 30–60 s |
 | 4008, 901 | no free slot (31 clients), too many connections | tries again after 1 min, up to every 5 min |
 | other | offline | tries again after 1 s, doubling up to 30 s |
 
-A Pull, Apply or Sync that fails with one of these codes shows the same explanation above lox's message.
+Once stopped, vislox does not log in again on its own: not for a reload, another tab or a reconnecting
+browser, only when a user turns live values off and on (`POST /api/live/retry`).
+
+A Pull, Apply or Sync that fails with one of these codes shows the same explanation above lox's message. Only
+the Miniserver's own wording counts (`Code 401`, `HTTP 503: /jdev/…`, `close code 4003`); git's `HTTP 403` does not.
 
 **Pull from Miniserver** runs `lox config pull` (the `lox` on `PATH`, or `--lox <path>`), with the same lox
 configuration and context as live values. It is offered only when lox would commit to the repository vislox
