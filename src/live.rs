@@ -115,6 +115,7 @@ impl LoxConf {
             ctx,
             config_repo: self.config_repo.as_ref().map(PathBuf::from),
             ms_dir: self.ms_dir(),
+            serial: Some(self.serial.trim().to_string()).filter(|s| !s.is_empty()),
         }
     }
 
@@ -148,6 +149,8 @@ pub struct Found {
     pub config_repo: Option<PathBuf>,
     /// The folder in it `lox config pull` writes to.
     pub ms_dir: String,
+    /// The serial lox's configuration names (`lox setup set --serial`).
+    pub serial: Option<String>,
 }
 
 /// The Miniserver connection lox would use, found the way lox finds it:

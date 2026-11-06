@@ -12,12 +12,20 @@
 //!   Its format is not documented in full, so it only informs: a reply that
 //!   cannot be read is a warning and never blocks anything,
 //! - when lox's token expires (its `token.json`, shared with lox on purpose:
-//!   vislox requests no token of its own).
+//!   vislox requests no token of its own),
+//! - that it is the right Miniserver: when `apiKey` reports a serial, it must
+//!   be the one the config belongs to (the repository's `<serial>` folder,
+//!   lox.toml's `serial`, or the lox context's). Another serial blocks Pull,
+//!   Apply and Sync: DHCP may have given the address to another device. When
+//!   the address does not answer or another serial answers there, a UDP
+//!   discovery broadcast (`discover.rs`) looks for the serial on the LAN and
+//!   names its new address.
 //!
 //! What the token may do (`tokenRights`) and whether the password is weak
 //! (`unsecurePass`) come only with a login, which lox does and does not keep,
 //! so they are not shown.
 
+use crate::discover;
 use loxone_client::Connection;
 use loxone_client::token::TokenStore;
 use serde_json::{Value, json};
@@ -60,6 +68,22 @@ pub struct Miniserver {
     /// The last check: when it started, and what it found.
     last: Mutex<Option<(Instant, Arc<Value>)>>,
     probing: tokio::sync::Mutex<()>,
+    /// The Miniserver the config belongs to: the one Pull, Apply and Sync
+    /// must talk to.
+    expected: Option<Expected>,
+    /// The last discovery broadcast (it waits 3 s), reused for a minute.
+    discovery: discover::Cache,
+}
+
+/// The serial the config belongs to, and where vislox read it.
+#[derive(Debug, Clone)]
+pub struct Expected {
+    /// As [`discover::norm_serial`] writes it.
+    pub serial: String,
+    /// For messages: `the repository folder`, `lox.toml`, `lox context home`.
+    pub from: String,
+    /// The lox context, for the command that fixes its address.
+    pub ctx: Option<String>,
 }
 
 struct Target {
@@ -111,7 +135,15 @@ impl Miniserver {
             target,
             last: Mutex::new(None),
             probing: tokio::sync::Mutex::new(()),
+            expected: None,
+            discovery: discover::Cache::default(),
         }
+    }
+
+    /// Check that the Miniserver at the address is the one with this serial.
+    pub fn expecting(mut self, expected: Option<Expected>) -> Miniserver {
+        self.expected = expected;
+        self
     }
 
     /// The status, checked again when the last check started more than
@@ -140,7 +172,7 @@ impl Miniserver {
             return v;
         }
         let started = Instant::now();
-        let v = Arc::new(probe(t).await);
+        let v = Arc::new(probe(t, self.expected.as_ref(), &self.discovery).await);
         *self.last.lock().unwrap() = Some((started, v.clone()));
         v
     }
@@ -220,7 +252,8 @@ fn parse_api_key(body: &str) -> Result<ApiKey, String> {
         _ => None,
     };
     Ok(ApiKey {
-        serial: k["snr"].as_str().map(|s| s.replace(':', "").to_uppercase()),
+        // Compared with the config's serial, so normalized the same way.
+        serial: k["snr"].as_str().map(discover::norm_serial),
         version: k["version"].as_str().map(String::from),
         https_status: k["httpsStatus"].as_i64(),
         local: flag("local"),
@@ -320,7 +353,7 @@ fn read_version(path: &PathBuf) -> Option<String> {
     config_version(&xml)
 }
 
-async fn probe(t: &Target) -> Value {
+async fn probe(t: &Target, expected: Option<&Expected>, discovery: &discover::Cache) -> Value {
     let (web, ftp) = tokio::join!(
         async {
             match connect(&t.addr, t.http_port).await {
@@ -341,6 +374,19 @@ async fn probe(t: &Target) -> Value {
     })
     .await
     .unwrap_or_default();
+    // When the address does not answer, or another Miniserver answers
+    // there, look on the LAN: the right one may have a new address (DHCP),
+    // and its discovery reply names it.
+    let (search, addr_ip) = if look_on_lan(expected, &web, &key) {
+        let ip = tokio::net::lookup_host((t.addr.as_str(), t.http_port))
+            .await
+            .ok()
+            .and_then(|mut a| a.find(|a| a.is_ipv4()))
+            .map(|a| a.ip().to_string());
+        (Some(discovery.get().await), ip)
+    } else {
+        (None, None)
+    };
     report(Report {
         host: &t.conn.host,
         addr: &t.addr,
@@ -353,7 +399,51 @@ async fn probe(t: &Target) -> Value {
         now: chrono::Utc::now().timestamp(),
         cfg_current,
         cfg_pending,
+        expected,
+        discovered: search.as_ref().map(|s| s.found.clone()),
+        discovery_note: search.as_ref().and_then(|s| s.note.clone()),
+        addr_ip,
     })
+}
+
+/// Whether to send the discovery broadcast: only with a serial to look for,
+/// and only when the address does not answer or another serial answers.
+/// An `apiKey` reply that cannot be read says nothing about the serial.
+fn look_on_lan(
+    expected: Option<&Expected>,
+    web: &Result<(), String>,
+    key: &Option<Result<ApiKey, String>>,
+) -> bool {
+    expected.is_some_and(|e| match (web, key) {
+        (Err(_), _) => true,
+        (Ok(()), Some(Ok(k))) => k.serial.as_ref().is_some_and(|s| *s != e.serial),
+        _ => false,
+    })
+}
+
+/// The lox command that points the context at `ip` (else at the right
+/// address), keeping the scheme and port of lox's `host` now.
+fn fix_host(e: &Expected, host: &str, ip: Option<&str>) -> String {
+    let ctx = e
+        .ctx
+        .as_deref()
+        .map(|c| format!("--ctx {c} "))
+        .unwrap_or_default();
+    let (scheme, default) = if host.starts_with("http://") {
+        ("http", 80)
+    } else {
+        ("https", 443)
+    };
+    let (_, port) = split_host(host);
+    let port = if port == default {
+        String::new()
+    } else {
+        format!(":{port}")
+    };
+    format!(
+        "`lox {ctx}setup set --host {scheme}://{}{port}`",
+        ip.unwrap_or("<address>")
+    )
 }
 
 struct Report<'a> {
@@ -371,6 +461,13 @@ struct Report<'a> {
     now: i64,
     cfg_current: Option<String>,
     cfg_pending: Option<String>,
+    expected: Option<&'a Expected>,
+    /// The LAN's discovery replies, when vislox looked.
+    discovered: Option<Vec<discover::Reply>>,
+    /// Why the discovery may have missed replies.
+    discovery_note: Option<String>,
+    /// The address as an IPv4 address, to find its discovery reply.
+    addr_ip: Option<String>,
 }
 
 /// The status as the UI shows it: what was checked, what blocks Pull, Apply
@@ -405,11 +502,6 @@ fn report(r: Report) -> Value {
             r.host
         )
     });
-    let blocked = json!({
-        "pull": no_ftp,
-        "sync": no_ftp,
-        "apply": no_web.clone().or(no_ftp.clone()),
-    });
     let key = match &r.key {
         Some(Ok(k)) => Some(k),
         Some(Err(e)) => {
@@ -420,6 +512,74 @@ fn report(r: Report) -> Value {
         }
         None => None,
     };
+    // Who answers at the address: `apiKey`, else its discovery reply.
+    let at_addr = r
+        .discovered
+        .iter()
+        .flatten()
+        .find(|d| r.addr_ip.as_deref() == Some(d.ip.as_str()) || d.ip == r.addr);
+    let serial = key
+        .and_then(|k| k.serial.clone())
+        .or_else(|| at_addr.map(|d| d.serial.clone()));
+    let firmware = key
+        .and_then(|k| k.version.clone())
+        .or_else(|| at_addr.map(|d| d.firmware.clone()));
+    // The right one elsewhere on the LAN.
+    let elsewhere = r.expected.and_then(|e| {
+        r.discovered
+            .iter()
+            .flatten()
+            .find(|d| d.serial == e.serial && at_addr.is_none_or(|a| a.ip != d.ip))
+    });
+    let (identity, wrong, moved) = match (r.expected, &serial) {
+        (None, _) => ("unchecked", None, None),
+        (Some(e), Some(s)) if *s == e.serial => ("confirmed", None, None),
+        (Some(e), Some(s)) => {
+            let fix = match elsewhere {
+                Some(d) => format!(
+                    "{} answers at {} on the local network: point lox at it with {}",
+                    e.serial,
+                    d.ip,
+                    fix_host(e, r.host, Some(&d.ip))
+                ),
+                None => format!(
+                    "Check the address in lox's configuration ({})",
+                    fix_host(e, r.host, None)
+                ),
+            };
+            let why = format!(
+                "this is not the Miniserver of this config: {} reports serial {s}, but the config \
+                 belongs to {} ({}). {fix}",
+                r.addr, e.serial, e.from
+            );
+            ("wrong", Some(why), None)
+        }
+        (Some(e), None) => {
+            let moved = elsewhere.map(|d| {
+                format!(
+                    "the Miniserver does not answer at {}, but {} answers at {} on the local \
+                     network. If its address changed, point lox at it: {}",
+                    r.host,
+                    e.serial,
+                    d.ip,
+                    fix_host(e, r.host, Some(&d.ip))
+                )
+            });
+            ("unknown", None, moved)
+        }
+    };
+    // Another Miniserver at the address blocks everything: lox would pull
+    // from it, or deploy to it. A Miniserver that moved explains what
+    // already fails.
+    let reason = |own: Option<String>| match (&wrong, own) {
+        (Some(w), _) => Some(w.clone()),
+        (None, own) => own.map(|o| moved.clone().unwrap_or(o)),
+    };
+    let blocked = json!({
+        "pull": reason(no_ftp.clone()),
+        "sync": reason(no_ftp.clone()),
+        "apply": reason(no_web.clone().or(no_ftp.clone())),
+    });
     if let Some(k) = key {
         match k.https_status {
             Some(2) => warnings.push("The Miniserver's TLS certificate has expired.".into()),
@@ -474,8 +634,15 @@ fn report(r: Report) -> Value {
         "checked": r.now,
         "host": r.host,
         "reachable": r.web.is_ok(),
-        "serial": key.and_then(|k| k.serial.clone()),
-        "firmware": key.and_then(|k| k.version.clone()),
+        "serial": serial,
+        "firmware": firmware,
+        "expected": r.expected.map(|e| json!({ "serial": e.serial, "from": e.from })),
+        // `confirmed`, `wrong`, `unknown` (no serial seen), or `unchecked`
+        // (no serial to compare with).
+        "identity": identity,
+        "movedTo": elsewhere.map(|d| d.ip.as_str()),
+        "discovered": r.discovered,
+        "discoveryNote": r.discovery_note,
         "tls": tls,
         "local": key.and_then(|k| k.local),
         "eventSlots": key.and_then(|k| k.event_slots),
@@ -533,6 +700,223 @@ mod tests {
         assert_eq!(split_host("fe80::1"), ("fe80::1".into(), 443));
     }
 
+    fn expect(serial: &str) -> Expected {
+        Expected {
+            serial: serial.into(),
+            from: "the repository folder".into(),
+            ctx: Some("home".into()),
+        }
+    }
+
+    fn reply(ip: &str, serial: &str) -> discover::Reply {
+        discover::parse_reply(&format!(
+            "LoxLIVE: Loxone Miniserver {ip}:80 {serial} 17.2.10.21 Prog:2026-11-01 10:00:00 Type:0 HwId:A0000"
+        ))
+        .unwrap()
+    }
+
+    fn blocks(v: &Value) -> Vec<String> {
+        ["pull", "apply", "sync"]
+            .iter()
+            .map(|w| v["blocked"][w].as_str().unwrap_or("-").to_string())
+            .collect()
+    }
+
+    #[test]
+    fn the_right_serial_is_confirmed() {
+        let e = expect("504F94A0E454");
+        let v = report(Report {
+            expected: Some(&e),
+            ..base()
+        });
+        assert_eq!(v["identity"], "confirmed");
+        assert_eq!(blocks(&v), ["-", "-", "-"]);
+        assert_eq!(v["expected"]["serial"], "504F94A0E454");
+        assert_eq!(report(base())["identity"], "unchecked");
+    }
+
+    #[test]
+    fn another_serial_at_the_address_blocks_every_action() {
+        let e = expect("504F94000001");
+        let v = report(Report {
+            expected: Some(&e),
+            // Even when FTP fails too: the wrong device is the reason to give.
+            ftp: Err("refused".into()),
+            ..base()
+        });
+        assert_eq!(v["identity"], "wrong");
+        for why in blocks(&v) {
+            assert!(
+                why.starts_with("this is not the Miniserver of this config: 192.168.1.120 reports serial 504F94A0E454, but the config belongs to 504F94000001 (the repository folder)"),
+                "{why}"
+            );
+            assert!(
+                why.contains("`lox --ctx home setup set --host https://<address>`"),
+                "{why}"
+            );
+        }
+    }
+
+    #[test]
+    fn when_another_miniserver_has_the_address_the_right_one_is_looked_for() {
+        // DHCP gave 192.168.1.120 to another Miniserver; ours moved to .130.
+        let e = expect("504F94000001");
+        let v = report(Report {
+            host: "https://192.168.1.120:8443",
+            expected: Some(&e),
+            discovered: Some(vec![
+                reply("192.168.1.120", "504F94A0E454"),
+                reply("192.168.1.130", "504F94000001"),
+            ]),
+            addr_ip: Some("192.168.1.120".into()),
+            ..base()
+        });
+        assert_eq!(v["identity"], "wrong");
+        assert_eq!(v["movedTo"], "192.168.1.130");
+        let why = v["blocked"]["sync"].as_str().unwrap();
+        assert!(
+            why.contains("504F94000001 answers at 192.168.1.130"),
+            "{why}"
+        );
+        // lox's scheme and port stay.
+        assert!(
+            why.contains("`lox --ctx home setup set --host https://192.168.1.130:8443`"),
+            "{why}"
+        );
+    }
+
+    #[test]
+    fn a_miniserver_with_a_new_address_is_found_on_the_lan() {
+        let e = expect("504F94A0E454");
+        let v = report(Report {
+            web: Err("no answer within 4 s".into()),
+            key: None,
+            ftp: Err("no answer within 4 s".into()),
+            expected: Some(&e),
+            discovered: Some(vec![
+                reply("192.168.1.9", "504F94111111"),
+                reply("192.168.1.130", "504F94A0E454"),
+            ]),
+            addr_ip: Some("192.168.1.120".into()),
+            ..base()
+        });
+        assert_eq!(v["identity"], "unknown");
+        assert_eq!(v["movedTo"], "192.168.1.130");
+        for why in blocks(&v) {
+            assert!(
+                why.contains("504F94A0E454 answers at 192.168.1.130"),
+                "{why}"
+            );
+            assert!(
+                why.contains("`lox --ctx home setup set --host https://192.168.1.130`"),
+                "{why}"
+            );
+        }
+        assert_eq!(v["discovered"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_moved_miniserver_explains_only_what_already_fails() {
+        // The web port is down, FTP answers: only Apply is blocked.
+        let e = expect("504F94A0E454");
+        let v = report(Report {
+            web: Err("refused".into()),
+            key: None,
+            expected: Some(&e),
+            discovered: Some(vec![reply("192.168.1.130", "504F94A0E454")]),
+            ..base()
+        });
+        let b = blocks(&v);
+        assert_eq!((b[0].as_str(), b[2].as_str()), ("-", "-"));
+        assert!(b[1].contains("answers at 192.168.1.130"), "{}", b[1]);
+    }
+
+    #[test]
+    fn the_discovery_reply_at_the_address_still_names_it() {
+        let e = expect("504F94A0E454");
+        // HTTP is blocked, but the device at the address answers discovery.
+        let v = report(Report {
+            web: Err("refused".into()),
+            key: None,
+            expected: Some(&e),
+            discovered: Some(vec![reply("192.168.1.120", "504F94111111")]),
+            addr_ip: Some("192.168.1.120".into()),
+            ..base()
+        });
+        assert_eq!(v["serial"], "504F94111111");
+        assert_eq!(v["firmware"], "17.2.10.21");
+        assert_eq!(v["identity"], "wrong");
+        assert_eq!(v["movedTo"], Value::Null);
+        // Nobody answers anywhere: unknown, and the plain reasons stay.
+        let v = report(Report {
+            web: Err("refused".into()),
+            key: None,
+            expected: Some(&e),
+            discovered: Some(vec![]),
+            ..base()
+        });
+        assert_eq!(v["identity"], "unknown");
+        assert_eq!(blocks(&v)[0], "-");
+        assert!(blocks(&v)[1].starts_with("the Miniserver does not answer"));
+    }
+
+    #[test]
+    fn an_unreadable_api_key_is_not_a_wrong_miniserver() {
+        let e = expect("504F94000001");
+        let v = report(Report {
+            key: Some(Err("cannot read the reply".into())),
+            expected: Some(&e),
+            ..base()
+        });
+        assert_eq!(v["identity"], "unknown");
+        assert_eq!(blocks(&v), ["-", "-", "-"]);
+    }
+
+    #[test]
+    fn the_fix_keeps_lox_s_scheme_and_port() {
+        let e = expect("504F94000001");
+        assert_eq!(
+            fix_host(&e, "http://10.0.0.5", Some("10.0.0.9")),
+            "`lox --ctx home setup set --host http://10.0.0.9`"
+        );
+        assert_eq!(
+            fix_host(&e, "http://10.0.0.5:8080", None),
+            "`lox --ctx home setup set --host http://<address>:8080`"
+        );
+        assert_eq!(
+            fix_host(&e, "https://10.0.0.5", Some("10.0.0.9")),
+            "`lox --ctx home setup set --host https://10.0.0.9`"
+        );
+    }
+
+    #[test]
+    fn any_serial_separator_matches() {
+        // `apiKey` and the config may write the serial differently.
+        for snr in ["50:4F:94:A0:E4:54", "50-4f-94-a0-e4-54", "504f94a0e454"] {
+            let reply = REAL.replace("50:4F:94:A0:E4:54", snr);
+            let e = expect(&discover::norm_serial("50-4F-94-A0-E4-54"));
+            let v = report(Report {
+                key: Some(parse_api_key(&reply)),
+                expected: Some(&e),
+                ..base()
+            });
+            assert_eq!(v["identity"], "confirmed", "{snr}");
+            assert_eq!(blocks(&v), ["-", "-", "-"], "{snr}");
+        }
+    }
+
+    #[test]
+    fn the_lan_is_searched_only_for_a_serial_that_is_not_at_the_address() {
+        let (right, other) = (expect("504F94A0E454"), expect("504F94000001"));
+        let down: Result<(), String> = Err("no answer".into());
+        let real = Some(parse_api_key(REAL));
+        assert!(!look_on_lan(None, &down, &None), "nothing to look for");
+        assert!(look_on_lan(Some(&right), &down, &None));
+        assert!(!look_on_lan(Some(&right), &Ok(()), &real));
+        assert!(look_on_lan(Some(&other), &Ok(()), &real));
+        assert!(!look_on_lan(Some(&other), &Ok(()), &Some(Err("x".into()))));
+    }
+
     #[tokio::test]
     async fn an_ipv6_host_can_be_connected_to() {
         // Where the machine has no IPv6 loopback, there is nothing to test.
@@ -571,6 +955,10 @@ mod tests {
             now: 1_000,
             cfg_current: Some("17.2.10.21".into()),
             cfg_pending: None,
+            expected: None,
+            discovered: None,
+            discovery_note: None,
+            addr_ip: None,
         }
     }
 
@@ -730,6 +1118,8 @@ mod tests {
             }),
             last: Mutex::new(None),
             probing: tokio::sync::Mutex::new(()),
+            expected: None,
+            discovery: discover::Cache::default(),
         };
         (ms, count)
     }

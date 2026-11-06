@@ -212,6 +212,7 @@ mod tests {
             ctx: Some("home".into()),
             config_repo: repo.map(Path::to_path_buf),
             ms_dir: ms_dir.into(),
+            serial: None,
         }
     }
 

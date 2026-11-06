@@ -23,7 +23,26 @@ pub struct Source {
     pub miniserver: Option<String>,
     /// The project's directory (the one with lox.toml), for a project.
     pub project: Option<PathBuf>,
+    /// lox.toml's `serial`: the Miniserver a project targets.
+    pub serial: Option<String>,
 }
+
+/// The directory holds no config at all: no lox.toml and no
+/// `<serial>/config.Loxone` (not: several of them, or none for `--serial`).
+#[derive(Debug)]
+pub struct NoConfig(pub PathBuf);
+
+impl std::fmt::Display for NoConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "`{}` holds no lox.toml, and no <serial>/config.Loxone",
+            self.0.display()
+        )
+    }
+}
+
+impl std::error::Error for NoConfig {}
 
 impl Source {
     pub fn resolve(path: &Path, serial: Option<&str>) -> Result<Source> {
@@ -51,6 +70,7 @@ impl Source {
                 label: format!("project {name}"),
                 miniserver: None,
                 project: Some(p.root.clone()),
+                serial: p.serial.clone().filter(|s| !s.trim().is_empty()),
             });
         }
 
@@ -64,6 +84,7 @@ impl Source {
                 proposed: None,
                 miniserver: None,
                 project: None,
+                serial: None,
             });
         }
 
@@ -82,6 +103,7 @@ impl Source {
             });
         }
         match found.len() {
+            0 if serial.is_none() => Err(NoConfig(path.clone()).into()),
             0 => bail!(
                 "`{}` holds no lox.toml, and no <serial>/config.Loxone{}",
                 path.display(),
@@ -102,6 +124,7 @@ impl Source {
                     label: format!("Miniserver {ms}"),
                     miniserver: Some(ms),
                     project: None,
+                    serial: None,
                 })
             }
             _ => bail!(
@@ -156,6 +179,7 @@ mod tests {
         assert!(s.current.ends_with("base.Loxone"));
         assert!(s.proposed.as_ref().unwrap().ends_with("out.Loxone"));
         assert!(s.label.starts_with("project "));
+        assert_eq!(s.serial, None);
         assert_eq!(
             s.project.as_deref(),
             Some(dir.canonicalize().unwrap().as_path())
@@ -179,6 +203,22 @@ mod tests {
         assert!(s.current.ends_with("504F94000002/config.Loxone"));
         assert_eq!(s.label, "Miniserver 504F94000002");
         assert!(Source::resolve(dir, Some("FFFF")).is_err());
+        // Neither is "no config here".
+        assert!(
+            Source::resolve(dir, None)
+                .unwrap_err()
+                .downcast_ref::<NoConfig>()
+                .is_none()
+        );
+        assert!(
+            Source::resolve(dir, Some("FFFF"))
+                .unwrap_err()
+                .downcast_ref::<NoConfig>()
+                .is_none()
+        );
+        let empty = tempfile::tempdir().unwrap();
+        let e = Source::resolve(empty.path(), None).unwrap_err();
+        assert!(e.downcast_ref::<NoConfig>().is_some(), "{e}");
     }
 
     #[test]

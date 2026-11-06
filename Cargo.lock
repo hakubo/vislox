@@ -2255,6 +2255,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "sha1",
+ "socket2",
  "tempfile",
  "tokio",
  "tokio-stream",
