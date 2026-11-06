@@ -194,8 +194,11 @@ pub struct CalInfo {
     pub why: Option<String>,
     /// The date by kind, for views of the year.
     pub date: Option<EntryDate>,
-    /// The date in the compared revision, when it differs.
+    /// The date in the compared revision, when both revisions' dates
+    /// decode and differ.
     pub old_when: Option<String>,
+    /// That date by kind.
+    pub old_date: Option<EntryDate>,
     /// The operating mode it switches on.
     pub mode: CalMode,
     /// The mode in the compared revision, when it is another one.
@@ -358,11 +361,16 @@ impl<'a> Ctx<'a> {
                 self.port_owner
                     .insert(p.uuid.clone(), (uuid.to_string(), p.key.clone()));
             }
-            if ty == "Mode" {
-                let n = child.attr("Mode").and_then(|v| v.trim().parse().ok());
-                self.modes
-                    .entry(n.unwrap_or(0))
-                    .or_insert_with(|| uuid.to_string());
+            // Absent is 0, the holiday mode; a number that cannot be read
+            // is no number, and must not take the holiday mode's place.
+            let number = match child.attr("Mode") {
+                None => Some(0),
+                Some(v) => v.trim().parse().ok(),
+            };
+            if ty == "Mode"
+                && let Some(n) = number
+            {
+                self.modes.entry(n).or_insert_with(|| uuid.to_string());
             }
             let is_page = ty == "Page";
             if is_page {
@@ -610,6 +618,9 @@ struct Delta {
     wires_added: HashSet<(String, String)>,
     wires_removed: HashSet<(String, String)>,
     placements: HashSet<String>,
+    /// Calendar entries whose decoded date or operating mode changed,
+    /// also when only the `Mode` object they name did.
+    calendar: HashSet<String>,
 }
 
 impl Delta {
@@ -623,6 +634,7 @@ impl Delta {
         } else if self.renamed.contains_key(uuid)
             || self.attrs.contains_key(uuid)
             || self.placements.contains(uuid)
+            || self.calendar.contains(uuid)
             || self.params.keys().any(|(o, _)| o == uuid)
         {
             CHANGED
@@ -740,10 +752,27 @@ fn k_title_changed(a: &BTreeMap<String, String>, b: &BTreeMap<String, String>) -
 pub fn build(new: &LoxoneDoc, old: Option<&LoxoneDoc>, title: &str) -> View {
     let nc = Ctx::new(new);
     let oc = old.map(Ctx::new);
-    let d = match (&oc, old) {
+    let mut d = match (&oc, old) {
         (Some(oc), Some(od)) => delta(&nc, oc, &diff::diff(od, new)),
         _ => Delta::default(),
     };
+    // Calendar entries, decoded once: their changes mark them changed.
+    let mut cals: HashMap<String, CalInfo> = HashMap::new();
+    for u in &nc.order {
+        if let Some(ci) = cal_info(&nc, oc.as_ref().filter(|_| d.on), u) {
+            if ci.old_when.is_some() || ci.old_mode.is_some() {
+                d.calendar.insert(u.clone());
+            }
+            cals.insert(u.clone(), ci);
+        }
+    }
+    if let Some(oc) = &oc {
+        for u in oc.order.iter().filter(|u| !nc.els.contains_key(*u)) {
+            if let Some(ci) = cal_info(oc, None, u) {
+                cals.insert(u.clone(), ci);
+            }
+        }
+    }
 
     let mut view = View {
         title: title.to_string(),
@@ -773,14 +802,16 @@ pub fn build(new: &LoxoneDoc, old: Option<&LoxoneDoc>, title: &str) -> View {
 
     // Properties of every object.
     for u in &nc.order {
+        let ci = cals.remove(u);
         view.objects
-            .insert(u.clone(), obj_info(&nc, oc.as_ref(), u, &d, false));
+            .insert(u.clone(), obj_info(&nc, oc.as_ref(), u, &d, false, ci));
     }
     if let Some(oc) = &oc {
         for u in &oc.order {
             if !nc.els.contains_key(u) {
+                let ci = cals.remove(u);
                 view.objects
-                    .insert(u.clone(), obj_info(oc, None, u, &d, true));
+                    .insert(u.clone(), obj_info(oc, None, u, &d, true, ci));
             }
         }
     }
@@ -1017,7 +1048,14 @@ fn page_view(c: &Ctx, old: Option<&Ctx>, uuid: &str, d: &Delta, gone: bool) -> O
     })
 }
 
-fn obj_info(c: &Ctx, old: Option<&Ctx>, uuid: &str, d: &Delta, gone: bool) -> ObjInfo {
+fn obj_info(
+    c: &Ctx,
+    old: Option<&Ctx>,
+    uuid: &str,
+    d: &Delta,
+    gone: bool,
+    calendar: Option<CalInfo>,
+) -> ObjInfo {
     let el = c.el(uuid).expect("indexed object");
     let ty = c.ty(uuid);
     let attr_changes = d.attrs.get(uuid);
@@ -1099,28 +1137,6 @@ fn obj_info(c: &Ctx, old: Option<&Ctx>, uuid: &str, d: &Delta, gone: bool) -> Ob
         });
     }
     let status = if gone { REMOVED } else { d.status(uuid) };
-    let calendar = c.entry_date(uuid).map(|date| {
-        let mode = c.entry_mode(uuid);
-        let before = old
-            .filter(|_| d.on)
-            .and_then(|o| Some((o.entry_date(uuid)?, o.entry_mode(uuid))));
-        let text = |d: &Result<EntryDate, String>| d.as_ref().ok().map(EntryDate::text);
-        let (old_when, old_mode) = match before {
-            Some((od, om)) => (
-                (od != date).then(|| text(&od).unwrap_or_else(|| "an unknown date".into())),
-                (!same_mode(&om, &mode)).then_some(om),
-            ),
-            None => (None, None),
-        };
-        CalInfo {
-            when: text(&date),
-            why: date.as_ref().err().cloned(),
-            date: date.ok(),
-            old_when,
-            mode,
-            old_mode,
-        }
-    });
     ObjInfo {
         calendar,
         uuid: uuid.to_string(),
@@ -1310,16 +1326,21 @@ fn changes(view: &mut View, nc: &Ctx, oc: &Ctx, d: &Delta) {
                 obj: Some(u.clone()),
             });
         }
+        let (lines, covered) = view
+            .objects
+            .get(&u)
+            .and_then(|o| o.calendar.as_ref())
+            .map(|ci| calendar_changes(&nc.title(&u), ci))
+            .unwrap_or_default();
+        for text in lines {
+            v.push(Change {
+                kind: "attr",
+                text,
+                page: page_for(&u),
+                obj: Some(u.clone()),
+            });
+        }
         if let Some(a) = d.attrs.get(&u) {
-            let (lines, covered) = calendar_changes(nc, oc, &u);
-            for text in lines {
-                v.push(Change {
-                    kind: "attr",
-                    text,
-                    page: page_for(&u),
-                    obj: Some(u.clone()),
-                });
-            }
             for (n, o, new) in a.iter().filter(|(n, ..)| !covered.contains(&n.as_str())) {
                 v.push(Change {
                     kind: "attr",
@@ -1409,6 +1430,38 @@ fn changes(view: &mut View, nc: &Ctx, oc: &Ctx, d: &Delta) {
     view.changes = v;
 }
 
+/// A calendar entry of `c`, decoded, compared with `old` when given;
+/// `None` when not an entry. A date counts as changed only when both
+/// revisions' dates decode: an attribute change that leaves either one
+/// undecodable stays a raw attribute change.
+fn cal_info(c: &Ctx, old: Option<&Ctx>, uuid: &str) -> Option<CalInfo> {
+    let date = c.entry_date(uuid)?;
+    let mode = c.entry_mode(uuid);
+    let (mut old_date, mut old_mode) = (None, None);
+    if let Some(o) = old
+        && let Some(od) = o.entry_date(uuid)
+    {
+        if let (Ok(a), Ok(b)) = (&od, &date)
+            && a != b
+        {
+            old_date = Some(*a);
+        }
+        let om = o.entry_mode(uuid);
+        if !same_mode(&om, &mode) {
+            old_mode = Some(om);
+        }
+    }
+    Some(CalInfo {
+        when: date.as_ref().ok().map(EntryDate::text),
+        why: date.as_ref().err().cloned(),
+        date: date.ok(),
+        old_when: old_date.map(|d| d.text()),
+        old_date,
+        mode,
+        old_mode,
+    })
+}
+
 /// Whether two revisions' modes of an entry are the same mode: the same
 /// `Mode` object, else the same number.
 fn same_mode(a: &CalMode, b: &CalMode) -> bool {
@@ -1421,27 +1474,23 @@ fn same_mode(a: &CalMode, b: &CalMode) -> bool {
 
 /// A calendar entry's changed date and mode, as the change list reads
 /// them (*Christmas · when: 24 Dec → 26 Dec*, *· switches on: Holiday →
-/// Party*), and the attributes those lines stand for. An attribute that
-/// changed without changing the decoded date or mode (one the kind does
-/// not read) is left to the raw lines.
-fn calendar_changes(nc: &Ctx, oc: &Ctx, uuid: &str) -> (Vec<String>, Vec<&'static str>) {
-    let (Some(new), Some(old)) = (nc.entry_date(uuid), oc.entry_date(uuid)) else {
-        return (Vec::new(), Vec::new());
-    };
-    let title = nc.title(uuid);
+/// Party*), and the attributes those lines stand for: those the old and
+/// the new kind of date read, and `CalType`. Any other changed attribute
+/// is left to the raw lines.
+fn calendar_changes(title: &str, ci: &CalInfo) -> (Vec<String>, Vec<&'static str>) {
     let (mut lines, mut covered) = (Vec::new(), Vec::new());
-    if new != old {
+    if let (Some(old), Some(new)) = (&ci.old_date, &ci.date) {
         lines.push(format!(
             "{title} · when: {}",
-            calendar::change_text(&old, &new)
+            calendar::change_text(old, new)
         ));
-        covered.extend_from_slice(calendar::DATE_ATTRS);
+        covered.extend_from_slice(old.attrs());
+        covered.extend_from_slice(new.attrs());
     }
-    let (nm, om) = (nc.entry_mode(uuid), oc.entry_mode(uuid));
-    if !same_mode(&nm, &om) {
+    if let Some(om) = &ci.old_mode {
         lines.push(format!(
             "{title} · switches on: {} → {}",
-            om.title, nm.title
+            om.title, ci.mode.title
         ));
         covered.push(calendar::MODE_ATTR);
     }
@@ -2088,6 +2137,104 @@ mod tests {
         );
         assert_eq!(e.mode.title, "Party");
         assert!(cal(&v, HEATING).old_when.is_none());
+    }
+
+    #[test]
+    fn an_entry_that_does_not_decode_keeps_its_raw_changes() {
+        let undecodable = |m: &str| {
+            edited(&[(
+                "CalType=\"-1\" Month=\"12\"",
+                &format!("CalType=\"-1\" Mode=\"{m}\" Month=\"12\""),
+            )])
+        };
+        let texts =
+            |v: &View| -> Vec<String> { v.changes.iter().map(|c| c.text.clone()).collect() };
+        // Err → Err with another reason: the raw Mode line, no date change.
+        let v = build(&doc(&undecodable("6")), Some(&doc(&undecodable("5"))), "");
+        assert!(
+            texts(&v).contains(&"Silvester · Mode: 5 → 6".to_string()),
+            "{:?}",
+            texts(&v)
+        );
+        assert!(
+            !texts(&v).iter().any(|t| t.contains("when:")),
+            "{:?}",
+            texts(&v)
+        );
+        assert!(cal(&v, NYE).old_when.is_none());
+        // Ok → Err: the same.
+        let v = build(&doc(&undecodable("5")), Some(&doc(HOUSE)), "");
+        assert!(
+            texts(&v).contains(&"Silvester · Mode: — → 5".to_string()),
+            "{:?}",
+            texts(&v)
+        );
+        assert!(
+            !texts(&v).iter().any(|t| t.contains("when:")),
+            "{:?}",
+            texts(&v)
+        );
+        assert!(cal(&v, NYE).old_when.is_none() && cal(&v, NYE).old_date.is_none());
+    }
+
+    #[test]
+    fn a_date_change_hides_only_the_attributes_its_kind_reads() {
+        let v = build(
+            &doc(&edited(&[(
+                "Month=\"12\" Day=\"24\" Month2=\"1\" Day2=\"1\" WeekDayInMonth=\"1\"",
+                "Month=\"12\" Day=\"26\" Month2=\"1\" Day2=\"1\" WeekDayInMonth=\"2\"",
+            )])),
+            Some(&doc(HOUSE)),
+            "",
+        );
+        let texts: Vec<&str> = v.changes.iter().map(|c| c.text.as_str()).collect();
+        assert!(
+            texts.contains(&"Heiligabend · when: 24 Dec → 26 Dec"),
+            "{texts:?}"
+        );
+        assert!(!texts.contains(&"Heiligabend · Day: 24 → 26"), "{texts:?}");
+        // A fixed date does not read WeekDayInMonth.
+        assert!(
+            texts.contains(&"Heiligabend · WeekDayInMonth: 1 → 2"),
+            "{texts:?}"
+        );
+    }
+
+    #[test]
+    fn a_renumbered_mode_shows_in_the_sidebar_and_the_change_list() {
+        // Party becomes -2; the entry's CalType -1 now names no mode.
+        let v = build(
+            &doc(&edited(&[(
+                "WF=\"147456\" Mode=\"-1\"",
+                "WF=\"147456\" Mode=\"-2\"",
+            )])),
+            Some(&doc(HOUSE)),
+            "",
+        );
+        let c = cal(&v, NYE);
+        assert_eq!(c.old_mode.as_ref().map(|m| m.title.as_str()), Some("Party"));
+        assert_eq!(c.mode.title, "Mode -1 (not in this config)");
+        assert_eq!(v.objects[NYE].status, CHANGED);
+        let texts: Vec<&str> = v.changes.iter().map(|c| c.text.as_str()).collect();
+        assert!(
+            texts.contains(&"Silvester · switches on: Party → Mode -1 (not in this config)"),
+            "{texts:?}"
+        );
+        // Entries of other modes are untouched.
+        assert!(cal(&v, XMAS).old_mode.is_none());
+        assert_eq!(v.objects[XMAS].status, "");
+    }
+
+    #[test]
+    fn a_mode_number_that_cannot_be_read_is_not_the_holiday_mode() {
+        // Listed before the holiday mode, "x" would otherwise take number 0.
+        let src = edited(&[(
+            "\t\t\t<C Type=\"Mode\" V=\"178\" U=\"00000000-0000-0001-1500000000000000\"",
+            "\t\t\t<C Type=\"Mode\" V=\"178\" U=\"10000018-0000-0180-ffff504f94000001\" Title=\"Kaputt\" Mode=\"x\"/>\n\t\t\t<C Type=\"Mode\" V=\"178\" U=\"00000000-0000-0001-1500000000000000\"",
+        )]);
+        let v = build(&doc(&src), None, "");
+        assert_eq!(cal(&v, XMAS).mode.title, "Feiertag");
+        assert_eq!(cal(&v, XMAS).mode.target.as_ref().unwrap().uuid, HOLIDAY);
     }
 
     #[test]

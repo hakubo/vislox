@@ -20,24 +20,11 @@
 //! of the year (which days a mode is on) can work from it without
 //! decoding the attributes again.
 
-use chrono::{Duration, NaiveDate};
+use chrono::{Days, NaiveDate};
 use serde::Serialize;
 
 /// The block type of a calendar entry.
 pub const ENTRY: &str = "CalendarEntry";
-
-/// The attributes that state an entry's date, in the save's order.
-pub const DATE_ATTRS: &[&str] = &[
-    "Mode",
-    "Month",
-    "Day",
-    "Month2",
-    "Day2",
-    "From",
-    "To",
-    "EasterOffset",
-    "WeekDayInMonth",
-];
 
 /// The attribute that names the operating mode by its `Mode=` number.
 pub const MODE_ATTR: &str = "CalType";
@@ -73,12 +60,7 @@ pub enum EntryDate {
     Easter { offset: i64 },
     /// One period, both days included. `to` may lie before `from`: lox's
     /// corpus has two such entries.
-    Period {
-        #[serde(serialize_with = "iso")]
-        from: NaiveDate,
-        #[serde(serialize_with = "iso")]
-        to: NaiveDate,
-    },
+    Period { from: NaiveDate, to: NaiveDate },
     /// A range every year, from `month`/`day` to `month2`/`day2`; it runs
     /// across New Year when the end comes before the start.
     Yearly {
@@ -89,24 +71,17 @@ pub enum EntryDate {
     },
 }
 
-/// `2026-07-04`, for the browser.
-fn iso<S: serde::Serializer>(d: &NaiveDate, s: S) -> Result<S::Ok, S::Error> {
-    s.serialize_str(&d.format("%Y-%m-%d").to_string())
-}
-
 /// Day 0 of a period's `From=`/`To=`.
 fn epoch() -> NaiveDate {
     NaiveDate::from_ymd_opt(2009, 1, 1).expect("valid date")
 }
 
-/// The days `month` has in some year (February 29).
-fn days_in(month: u32) -> u32 {
-    match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 => 29,
-        _ => 0,
-    }
+/// Whether `month`/`day` is a day of some year (29 Feb is).
+fn is_day_of_year(month: i64, day: i64) -> bool {
+    let (Ok(m), Ok(d)) = (u32::try_from(month), u32::try_from(day)) else {
+        return false;
+    };
+    NaiveDate::from_ymd_opt(2000, m, d).is_some()
 }
 
 fn day_month(month: u32, day: u32) -> String {
@@ -133,19 +108,18 @@ impl EntryDate {
         };
         let day_of_year = |m: &str, d: &str| -> Result<(u32, u32), String> {
             let (month, day) = (int(m, None)?, int(d, None)?);
-            let ok = (1..=12).contains(&month) && day >= 1 && day <= days_in(month as u32) as i64;
-            if ok {
+            if is_day_of_year(month, day) {
                 Ok((month as u32, day as u32))
             } else {
                 Err(format!("{m} {month} and {d} {day} are no day of the year"))
             }
         };
         let period_day = |name: &str| -> Result<NaiveDate, String> {
-            let n = int(name, Some(0))?;
-            epoch()
-                .checked_add_signed(Duration::days(n))
-                .filter(|_| n >= 0)
-                .ok_or_else(|| format!("{name} {n} is no day after 1 Jan 2009"))
+            let n = int(name, None)?;
+            u64::try_from(n)
+                .ok()
+                .and_then(|n| epoch().checked_add_days(Days::new(n)))
+                .ok_or_else(|| format!("{name} {n} is no day from 1 Jan 2009 on"))
         };
         Ok(match int("Mode", Some(0))? {
             0 => {
@@ -213,6 +187,16 @@ impl EntryDate {
         }
     }
 
+    /// The attributes this kind of date reads.
+    pub fn attrs(&self) -> &'static [&'static str] {
+        match self {
+            EntryDate::Fixed { .. } => &["Mode", "Month", "Day"],
+            EntryDate::Easter { .. } => &["Mode", "EasterOffset"],
+            EntryDate::Period { .. } => &["Mode", "From", "To"],
+            EntryDate::Yearly { .. } => &["Mode", "Month", "Day", "Month2", "Day2"],
+        }
+    }
+
     /// Whether `other` is the same kind of date.
     pub fn same_kind(&self, other: &EntryDate) -> bool {
         std::mem::discriminant(self) == std::mem::discriminant(other)
@@ -229,14 +213,12 @@ pub fn mode_number(cal_type: Option<&str>) -> Option<i64> {
 
 /// How a changed date reads: the short forms when both are of one kind
 /// (*24 Dec → 26 Dec*), else the full lines.
-pub fn change_text(old: &Result<EntryDate, String>, new: &Result<EntryDate, String>) -> String {
-    let one = |d: &Result<EntryDate, String>, short: bool| match d {
-        Ok(d) if short => d.short(),
-        Ok(d) => d.text(),
-        Err(_) => "an unknown date".to_string(),
-    };
-    let short = matches!((old, new), (Ok(a), Ok(b)) if a.same_kind(b));
-    format!("{} → {}", one(old, short), one(new, short))
+pub fn change_text(old: &EntryDate, new: &EntryDate) -> String {
+    if old.same_kind(new) {
+        format!("{} → {}", old.short(), new.short())
+    } else {
+        format!("{} → {}", old.text(), new.text())
+    }
 }
 
 #[cfg(test)]
@@ -336,22 +318,35 @@ mod tests {
             decode(&[("Mode", "3"), ("From", "x")]).unwrap_err(),
             "From is “x”, not a whole number"
         );
-        assert!(decode(&[("Mode", "3"), ("From", "-1")]).is_err());
+        assert_eq!(
+            decode(&[("Mode", "3"), ("From", "-1"), ("To", "0")]).unwrap_err(),
+            "From -1 is no day from 1 Jan 2009 on"
+        );
+        // Days far beyond any calendar are refused, not a panic.
+        for huge in ["9223372036854775807", "4000000000"] {
+            assert_eq!(
+                decode(&[("Mode", "3"), ("From", "0"), ("To", huge)]).unwrap_err(),
+                format!("To {huge} is no day from 1 Jan 2009 on")
+            );
+        }
+        // A period without both days is no period from 1 Jan 2009.
+        assert_eq!(
+            decode(&[("Mode", "3"), ("From", "6393")]).unwrap_err(),
+            "it has no To"
+        );
+        assert_eq!(decode(&[("Mode", "3")]).unwrap_err(), "it has no From");
+        assert!(decode(&[("Month", "13"), ("Day", "1")]).is_err());
         // 29 Feb is a day of some years.
         assert!(decode(&[("Month", "2"), ("Day", "29")]).is_ok());
     }
 
     #[test]
     fn a_change_reads_old_to_new() {
-        let fixed = |d| Ok(EntryDate::Fixed { month: 12, day: d });
+        let fixed = |d| EntryDate::Fixed { month: 12, day: d };
         assert_eq!(change_text(&fixed(24), &fixed(26)), "24 Dec → 26 Dec");
         assert_eq!(
-            change_text(&fixed(24), &Ok(EntryDate::Easter { offset: 1 })),
+            change_text(&fixed(24), &EntryDate::Easter { offset: 1 }),
             "Every year on 24 Dec → Easter Monday (Easter +1)"
-        );
-        assert_eq!(
-            change_text(&Err("x".into()), &fixed(24)),
-            "an unknown date → Every year on 24 Dec"
         );
     }
 
