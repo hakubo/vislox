@@ -256,14 +256,16 @@ Miniserver reports them only at login (`tokenRights`, `unsecurePass`), and lox d
 
 The Miniserver lists the calendar entries it uses with `jdev/sps/calendargetentries` (lox's user, HTTP basic
 auth; Loxone's Operating Mode Schedule datasheet, "Administrative Commands"). vislox only reads: it never sends
-`calendarcreateentry`, `calendarupdateentry` or `calendardeleteentry`. It asks when a structure file is read (each
-live session reads one, and so does *Read from the Miniserver*), at most once a minute; after Pull, Apply and
-Sync; and before Apply (`GET /api/calendar?fresh=1`, which needs an `X-Vislox` header, reuses a read from the
-last 10 s). It never asks on a timer. `GET /api/calendar` without `fresh` only reports the last read. With
+`calendarcreateentry`, `calendarupdateentry` or `calendardeleteentry`. It asks when a structure file was read
+successfully (each live session reads one, and so does *Read from the Miniserver*), at most once a minute; after Pull, Apply and
+Sync; and before Apply (`GET /api/calendar?fresh=1`, which needs an `X-Vislox` header, reuses a good read from the
+last 2 s; a failed one is never reused). One request is in flight at a time, also after vislox stopped waiting
+for it (8 s). It never asks on a timer. `GET /api/calendar` without `fresh` only reports the last read. With
 `--no-live` nothing is read.
 
 The command needs admin rights. When the Miniserver refuses (a code other than 200, HTTP 401 or 403), the chip's
-details say *can't tell* with the reason, and the notice never shows.
+details say *can't tell* with the reason, and the notice never shows. When the check before Apply fails otherwise
+(no answer, the Miniserver restarting, vislox not answering), Apply's confirmation says it could not check.
 
 The answer numbers its dates differently from the `.Loxone` file (`calMode` 0 a day every year, 1 Easter, 2 one
 date, 3 one period, 4 a range every year, 5 a weekday of the month; the file's `Mode=` is absent, 1, 3 or 4), so

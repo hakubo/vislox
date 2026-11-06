@@ -276,6 +276,11 @@ impl Structure {
         self.dir.as_ref().map(|d| d.join("LoxAPP3.json"))
     }
 
+    /// Successful reads since start; a failed load does not count.
+    pub fn reads(&self) -> u64 {
+        self.inner.lock().unwrap().reads
+    }
+
     /// Told when the structure changes, or is read again unchanged.
     pub fn subscribe(&self) -> broadcast::Receiver<Event> {
         self.tx.subscribe()

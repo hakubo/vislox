@@ -21,6 +21,7 @@
 //! decoding the attributes again.
 
 use chrono::{Days, NaiveDate};
+use loxone_config::xml::Element;
 use serde::Serialize;
 use std::collections::HashMap;
 
@@ -93,50 +94,74 @@ fn full(d: NaiveDate) -> String {
     d.format("%-d %b %Y").to_string()
 }
 
+/// Reads the whole numbers a date is stored in, by field name. The file's
+/// attributes and the API's fields share it, so that both validate alike:
+/// a difference between them would read as a change made in the app.
+struct Fields<G: Fn(&str) -> Option<String>>(G);
+
+impl<G: Fn(&str) -> Option<String>> Fields<G> {
+    /// `absent`: the value when the field is missing; `None` makes that an error.
+    fn int(&self, name: &str, absent: Option<i64>) -> Result<i64, String> {
+        match (self.0)(name) {
+            Some(v) => v
+                .trim()
+                .parse::<i64>()
+                .map_err(|_| format!("{name} is “{v}”, not a whole number")),
+            None => absent.ok_or_else(|| format!("it has no {name}")),
+        }
+    }
+
+    fn day_of_year(&self, m: &str, d: &str) -> Result<(u32, u32), String> {
+        let (month, day) = (self.int(m, None)?, self.int(d, None)?);
+        if is_day_of_year(month, day) {
+            Ok((month as u32, day as u32))
+        } else {
+            Err(format!("{m} {month} and {d} {day} are no day of the year"))
+        }
+    }
+
+    /// A day counted from 1 Jan 2009, as the file's `From`/`To`.
+    fn period_day(&self, name: &str) -> Result<NaiveDate, String> {
+        let n = self.int(name, None)?;
+        u64::try_from(n)
+            .ok()
+            .and_then(|n| epoch().checked_add_days(Days::new(n)))
+            .ok_or_else(|| format!("{name} {n} is no day from 1 Jan 2009 on"))
+    }
+
+    /// A date from its year, month and day, as the API's.
+    fn date(&self, y: &str, m: &str, d: &str) -> Result<NaiveDate, String> {
+        let (year, month, day) = (self.int(y, None)?, self.int(m, None)?, self.int(d, None)?);
+        i32::try_from(year)
+            .ok()
+            .zip(u32::try_from(month).ok())
+            .zip(u32::try_from(day).ok())
+            .and_then(|((y, m), d)| NaiveDate::from_ymd_opt(y, m, d))
+            .ok_or_else(|| format!("{year}-{month}-{day} is no date"))
+    }
+}
+
 impl EntryDate {
     /// Decode the stored attributes; `get` reads one, `None` when absent.
     /// `Err` says why there is no date: a kind the file format does not
     /// document, or a missing or impossible value.
     pub fn from_attrs<'a>(get: impl Fn(&str) -> Option<&'a str>) -> Result<EntryDate, String> {
-        let int = |name: &str, absent: Option<i64>| -> Result<i64, String> {
-            match get(name) {
-                Some(v) => v
-                    .trim()
-                    .parse::<i64>()
-                    .map_err(|_| format!("{name} is “{v}”, not a whole number")),
-                None => absent.ok_or_else(|| format!("it has no {name}")),
-            }
-        };
-        let day_of_year = |m: &str, d: &str| -> Result<(u32, u32), String> {
-            let (month, day) = (int(m, None)?, int(d, None)?);
-            if is_day_of_year(month, day) {
-                Ok((month as u32, day as u32))
-            } else {
-                Err(format!("{m} {month} and {d} {day} are no day of the year"))
-            }
-        };
-        let period_day = |name: &str| -> Result<NaiveDate, String> {
-            let n = int(name, None)?;
-            u64::try_from(n)
-                .ok()
-                .and_then(|n| epoch().checked_add_days(Days::new(n)))
-                .ok_or_else(|| format!("{name} {n} is no day from 1 Jan 2009 on"))
-        };
-        Ok(match int("Mode", Some(0))? {
+        let f = Fields(|n: &str| get(n).map(String::from));
+        Ok(match f.int("Mode", Some(0))? {
             0 => {
-                let (month, day) = day_of_year("Month", "Day")?;
+                let (month, day) = f.day_of_year("Month", "Day")?;
                 EntryDate::Fixed { month, day }
             }
             1 => EntryDate::Easter {
-                offset: int("EasterOffset", Some(0))?,
+                offset: f.int("EasterOffset", Some(0))?,
             },
             3 => EntryDate::Period {
-                from: period_day("From")?,
-                to: period_day("To")?,
+                from: f.period_day("From")?,
+                to: f.period_day("To")?,
             },
             4 => {
-                let (month, day) = day_of_year("Month", "Day")?;
-                let (month2, day2) = day_of_year("Month2", "Day2")?;
+                let (month, day) = f.day_of_year("Month", "Day")?;
+                let (month2, day2) = f.day_of_year("Month2", "Day2")?;
                 EntryDate::Yearly {
                     month,
                     day,
@@ -250,51 +275,26 @@ pub struct Entry {
 impl EntryDate {
     /// Decode an entry of `calendargetentries`. `Err` says why not.
     pub fn from_api(e: &serde_json::Value) -> Result<EntryDate, String> {
-        let int = |name: &str, absent: Option<i64>| -> Result<i64, String> {
-            match &e[name] {
-                serde_json::Value::Null => absent.ok_or_else(|| format!("it has no {name}")),
-                v => v
-                    .as_i64()
-                    .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
-                    .ok_or_else(|| format!("{name} is {v}, not a whole number")),
-            }
-        };
-        let day_of_year = |m: &str, d: &str| -> Result<(u32, u32), String> {
-            let (month, day) = (int(m, None)?, int(d, None)?);
-            if is_day_of_year(month, day) {
-                Ok((month as u32, day as u32))
-            } else {
-                Err(format!("{m} {month} and {d} {day} are no day of the year"))
-            }
-        };
-        let date = |y: &str, m: &str, d: &str| -> Result<NaiveDate, String> {
-            let (year, month, day) = (int(y, None)?, int(m, None)?, int(d, None)?);
-            i32::try_from(year)
-                .ok()
-                .zip(u32::try_from(month).ok())
-                .zip(u32::try_from(day).ok())
-                .and_then(|((y, m), d)| NaiveDate::from_ymd_opt(y, m, d))
-                .ok_or_else(|| format!("{year}-{month}-{day} is no date"))
-        };
-        Ok(match int("calMode", None)? {
+        let f = Fields(|n: &str| api_field(e, n));
+        Ok(match f.int("calMode", None)? {
             0 => {
-                let (month, day) = day_of_year("startMonth", "startDay")?;
+                let (month, day) = f.day_of_year("startMonth", "startDay")?;
                 EntryDate::Fixed { month, day }
             }
             1 => EntryDate::Easter {
-                offset: int("easterOffset", Some(0))?,
+                offset: f.int("easterOffset", Some(0))?,
             },
             2 => {
-                let d = date("startYear", "startMonth", "startDay")?;
+                let d = f.date("startYear", "startMonth", "startDay")?;
                 EntryDate::Period { from: d, to: d }
             }
             3 => EntryDate::Period {
-                from: date("startYear", "startMonth", "startDay")?,
-                to: date("endYear", "endMonth", "endDay")?,
+                from: f.date("startYear", "startMonth", "startDay")?,
+                to: f.date("endYear", "endMonth", "endDay")?,
             },
             4 => {
-                let (month, day) = day_of_year("startMonth", "startDay")?;
-                let (month2, day2) = day_of_year("endMonth", "endDay")?;
+                let (month, day) = f.day_of_year("startMonth", "startDay")?;
+                let (month2, day2) = f.day_of_year("endMonth", "endDay")?;
                 EntryDate::Yearly {
                     month,
                     day,
@@ -316,6 +316,16 @@ impl EntryDate {
     }
 }
 
+/// A field of an API entry as text, as the file's attributes are: `None`
+/// when absent (or null), a number written out.
+fn api_field(e: &serde_json::Value, name: &str) -> Option<String> {
+    match &e[name] {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(s) => Some(s.clone()),
+        v => Some(v.to_string()),
+    }
+}
+
 /// The entries of a `calendargetentries` answer (its `LL.value`).
 pub fn parse_api(value: &str) -> Result<Vec<Entry>, String> {
     let v: serde_json::Value =
@@ -327,7 +337,8 @@ pub fn parse_api(value: &str) -> Result<Vec<Entry>, String> {
             Ok(Entry {
                 uuid: uuid.to_ascii_lowercase(),
                 name: e["name"].as_str().unwrap_or_default().to_string(),
-                mode: e["operatingMode"].as_i64(),
+                // As the file's CalType: absent is 0, a numeric string a number.
+                mode: mode_number(api_field(e, "operatingMode").as_deref()),
                 date: EntryDate::from_api(e),
             })
         })
@@ -335,35 +346,38 @@ pub fn parse_api(value: &str) -> Result<Vec<Entry>, String> {
 }
 
 /// The calendar entries of a config, and its operating modes by `Mode=`
-/// number (title), for naming the mode an entry switches on.
+/// number (title), for naming the mode an entry switches on. In document
+/// order: when two `Mode` blocks share a number, the first one names it,
+/// as in the view.
 pub fn of_doc(doc: &loxone_config::doc::LoxoneDoc) -> (Vec<Entry>, HashMap<i64, String>) {
-    let idx = doc.index();
-    let (mut entries, mut modes) = (Vec::new(), HashMap::new());
-    for (uuid, path) in &idx.by_uuid {
-        let Some(el) = doc.element_at(path) else {
-            continue;
-        };
-        let title = || {
-            el.attr_decoded("Title")
-                .map(|t| t.into_owned())
-                .unwrap_or_default()
-        };
-        match el.attr("Type") {
-            Some(ENTRY) => entries.push(Entry {
-                uuid: uuid.to_ascii_lowercase(),
-                name: title(),
-                mode: mode_number(el.attr(MODE_ATTR)),
-                date: EntryDate::from_attrs(|n| el.attr(n)),
-            }),
-            // As in the view: absent is 0, an unreadable number none.
-            Some("Mode") => {
-                if let Some(n) = mode_number(el.attr("Mode")) {
-                    modes.entry(n).or_insert_with(title);
+    fn walk(el: &Element, entries: &mut Vec<Entry>, modes: &mut HashMap<i64, String>) {
+        for child in el.child_elements().filter(|e| e.name == "C") {
+            let title = || {
+                child
+                    .attr_decoded("Title")
+                    .map(|t| t.into_owned())
+                    .unwrap_or_default()
+            };
+            match (child.attr("Type"), child.attr("U")) {
+                (Some(ENTRY), Some(uuid)) => entries.push(Entry {
+                    uuid: uuid.to_ascii_lowercase(),
+                    name: title(),
+                    mode: mode_number(child.attr(MODE_ATTR)),
+                    date: EntryDate::from_attrs(|n| child.attr(n)),
+                }),
+                // As in the view: absent is 0, an unreadable number none.
+                (Some("Mode"), Some(_)) => {
+                    if let Some(n) = mode_number(child.attr("Mode")) {
+                        modes.entry(n).or_insert_with(title);
+                    }
                 }
+                _ => {}
             }
-            _ => {}
+            walk(child, entries, modes);
         }
     }
+    let (mut entries, mut modes) = (Vec::new(), HashMap::new());
+    walk(&doc.xml.root, &mut entries, &mut modes);
     entries.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.uuid.cmp(&b.uuid)));
     (entries, modes)
 }
@@ -424,9 +438,16 @@ pub fn drift(file: &[Entry], app: &[Entry], modes: &HashMap<i64, String>) -> Vec
             mode_title(modes, e.mode)
         )
     };
+    let by_uuid = |list: &'_ [Entry]| -> HashMap<String, usize> {
+        list.iter()
+            .enumerate()
+            .map(|(i, e)| (e.uuid.clone(), i))
+            .collect()
+    };
+    let (in_file, in_app) = (by_uuid(file), by_uuid(app));
     let mut out = Vec::new();
     for a in app {
-        let Some(f) = file.iter().find(|f| f.uuid == a.uuid) else {
+        let Some(f) = in_file.get(&a.uuid).map(|&i| &file[i]) else {
             out.push(Drift {
                 kind: DriftKind::Added,
                 uuid: a.uuid.clone(),
@@ -463,7 +484,7 @@ pub fn drift(file: &[Entry], app: &[Entry], modes: &HashMap<i64, String>) -> Vec
         }
     }
     for f in file {
-        if !app.iter().any(|a| a.uuid == f.uuid) {
+        if !in_app.contains_key(&f.uuid) {
             out.push(Drift {
                 kind: DriftKind::Deleted,
                 uuid: f.uuid.clone(),
@@ -797,5 +818,70 @@ mod tests {
         assert_eq!(xmas.mode, Some(0));
         assert_eq!(xmas.date, Ok(EntryDate::Fixed { month: 12, day: 24 }));
         assert!(modes.contains_key(&0));
+    }
+
+    #[test]
+    fn the_api_s_mode_reads_as_the_file_s_cal_type() {
+        // Absent is 0 (the holiday mode), as a file without CalType; a
+        // numeric string is its number.
+        let e = parse_api(
+            r#"[{"uuid":"A","calMode":0,"startMonth":1,"startDay":1},
+                {"uuid":"b","operatingMode":"0","calMode":0,"startMonth":1,"startDay":1},
+                {"uuid":"c","operatingMode":" -1","calMode":"0","startMonth":"1","startDay":1},
+                {"uuid":"d","operatingMode":"x","calMode":0,"startMonth":1,"startDay":1}]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            e.iter().map(|e| e.mode).collect::<Vec<_>>(),
+            [Some(0), Some(0), Some(-1), None]
+        );
+        assert_eq!(e[0].uuid, "a");
+        assert_eq!(e[2].date, Ok(EntryDate::Fixed { month: 1, day: 1 }));
+        // So the same entries in the file show no drift.
+        let file: Vec<Entry> = ["a", "b", "c"]
+            .iter()
+            .zip([None, Some("0"), Some("-1")])
+            .map(|(u, cal_type)| Entry {
+                uuid: u.to_string(),
+                name: String::new(),
+                mode: mode_number(cal_type),
+                date: Ok(EntryDate::Fixed { month: 1, day: 1 }),
+            })
+            .collect();
+        assert!(drift(&file, &e[..3], &HashMap::new()).is_empty());
+    }
+
+    #[test]
+    fn both_decoders_refuse_alike() {
+        let file = decode(&[("Month", "2"), ("Day", "x")]).unwrap_err();
+        let api = EntryDate::from_api(
+            &serde_json::json!({"calMode": 0, "startMonth": 2, "startDay": "x"}),
+        )
+        .unwrap_err();
+        assert_eq!(file, "Day is “x”, not a whole number");
+        assert_eq!(api, "startDay is “x”, not a whole number");
+    }
+
+    #[test]
+    fn the_first_mode_of_a_number_names_it() {
+        let src = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/house.Loxone"
+        ))
+        .unwrap();
+        // Another mode with Party's number (-1), just before it.
+        let party = r#"<C Type="Mode" V="178" U="10000011-0000-0110-ffff504f94000001""#;
+        assert!(src.contains(party));
+        let src = src.replacen(
+            party,
+            &format!(
+                r#"<C Type="Mode" V="178" U="10000099-0000-0110-ffff504f94000001" Title="Erste Party" Mode="-1"/>{party}"#
+            ),
+            1,
+        );
+        for _ in 0..8 {
+            let doc = loxone_config::doc::LoxoneDoc::parse(src.as_bytes()).unwrap();
+            assert_eq!(of_doc(&doc).1[&-1], "Erste Party");
+        }
     }
 }

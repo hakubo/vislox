@@ -99,7 +99,7 @@ struct App {
     structure: Arc<structure::Structure>,
     /// The calendar entries the Miniserver uses, edited in the app or not.
     calendar: appcalendar::AppCalendar,
-    /// Their drift from the deployed revision, for (its blob, the read's seq).
+    /// Their drift from the deployed revision (see [`CalDrift`]).
     cal_drift: Mutex<Option<CalDrift>>,
     pull: pull::Pull,
     log: log::Log,
@@ -108,7 +108,8 @@ struct App {
     operate: Arc<operate::Operate>,
 }
 
-/// A calendar drift, for (the deployed revision's blob, the read's seq).
+/// A calendar drift, for (the deployed revision's blob, the read's seq):
+/// a read with the same result reuses it, with its own `read_at`.
 type CalDrift = ((String, u64), Arc<serde_json::Value>);
 
 #[tokio::main]
@@ -309,14 +310,15 @@ async fn main() -> Result<()> {
         });
     }
 
-    // Each structure file read (a live session starting, or a user asking)
-    // also asks for the calendar entries, at most once a minute.
+    // Each successful structure file read (a live session starting, or a
+    // user asking) also asks for the calendar entries, at most once a minute.
+    // A failed load asks for nothing: the Miniserver did not answer.
     {
         let app = app.clone();
         let mut rx = app.structure.subscribe();
         tokio::spawn(async move {
             while let Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) = rx.recv().await {
-                app.calendar.read(appcalendar::ON_LIVE).await;
+                app.calendar.after_structure(app.structure.reads()).await;
             }
         });
     }
@@ -1043,6 +1045,8 @@ fn calendar_drift(app: &App) -> Result<Arc<serde_json::Value>, String> {
                 "available": true,
                 "read_at": read.at,
                 "error": why,
+                // No admin rights: skipped quietly, also before Apply.
+                "refused": appcalendar::is_refusal(why),
             })));
         }
     };
@@ -1062,7 +1066,9 @@ fn calendar_drift(app: &App) -> Result<Arc<serde_json::Value>, String> {
     if let Some((k, v)) = &*app.cal_drift.lock().unwrap()
         && *k == key
     {
-        return Ok(v.clone());
+        let mut v = (**v).clone();
+        v["read_at"] = read.at.into();
+        return Ok(Arc::new(v));
     }
     let (_, doc) = load(app, &rev.id)?;
     let (file, modes) = calendar::of_doc(&doc);

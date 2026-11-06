@@ -89,6 +89,8 @@ let msCalendar = [
   { uuid: CAL(7), name: "Silvester", operatingMode: -1, calMode: 0, startMonth: 12, startDay: 31 },
 ];
 let calendarReads = 0;
+// While set, the stand-in answers calendargetentries with this HTTP status.
+let calendarDown = 0;
 const msPort = await listen(createServer((req, res) => {
   if (req.url.toLowerCase() === "/data/loxapp3.json") {
     if (!req.headers.authorization) { res.writeHead(401); res.end(); return; }
@@ -97,6 +99,7 @@ const msPort = await listen(createServer((req, res) => {
     res.end(JSON.stringify(structure));
     return;
   }
+  if (req.url === "/jdev/sps/calendargetentries" && calendarDown) { calendarReads++; res.writeHead(calendarDown); res.end(); return; }
   if (req.url === "/IconsFilled/kitchen.svg") { res.setHeader("Content-Type", "image/svg+xml"); res.end(ICON); return; }
   const ll = {
     "/jdev/cfg/apiKey": () => ({ control: "dev/cfg/apiKey", Code: "200",
@@ -337,7 +340,47 @@ try {
     assert.match(await page.textContent("#ms-body"), /Calendar entries3 changed in the app/);
     await page.keyboard.press("Escape");
   });
+  await step("before Apply, a calendar check that failed says so, and is tried again", async () => {
+    calendarDown = 503;
+    // A good read from the last 2 s would be reused.
+    await page.waitForTimeout(2100);
+    const before = calendarReads;
+    const warn = await page.evaluate(async () => calApplyWarning(await loadCal(true)));
+    assert.equal(warn, "⚠ Couldn't check calendar entries changed in the app: 503, restarting. Applying overwrites any there are.\n\n");
+    assert.equal(calendarReads, before + 1);
+    // The failure is not reused: the next check asks again, and finds the entries.
+    calendarDown = 0;
+    const again = await page.evaluate(async () => calApplyWarning(await loadCal(true)));
+    assert.equal(calendarReads, before + 2);
+    assert.match(again, /^⚠ 3 calendar entries were changed .* Applying overwrites them:\n  Ostermontag: when: /);
+    // vislox itself not answering is a failed check too, not the last answer.
+    const failed = await page.evaluate(async () => {
+      const real = window.fetch;
+      window.fetch = async () => new Response(JSON.stringify({ error: "boom" }), { status: 500 });
+      try { return calApplyWarning(await loadCal(true)); } finally { window.fetch = real; }
+    });
+    assert.equal(failed, "⚠ Couldn't check calendar entries changed in the app: boom. Applying overwrites any there are.\n\n");
+    await page.evaluate(() => loadCal());
+  });
+  await step("an older calendar answer does not replace a newer one", async () => {
+    const kept = await page.evaluate(async () => {
+      const real = window.fetch, waiting = [];
+      window.fetch = () => new Promise((ok) => {
+        const n = waiting.length + 1;
+        waiting.push(() => ok(new Response(JSON.stringify({ available: true, read_at: n, entries: n, drift: [] }))));
+      });
+      try {
+        const first = loadCal(), second = loadCal();
+        waiting[1](); await second;
+        waiting[0](); await first;
+        return S.cal.entries;
+      } finally { window.fetch = real; await loadCal(); }
+    });
+    assert.equal(kept, 2);
+    await page.waitForSelector("#cal-drift:not(.hidden)");
+  });
   await step("pull from the Miniserver commits a new backup and shows it", async () => {
+    const readsBeforePull = calendarReads;
     // From the notice: the same as the History's Pull button.
     await page.click("#stale-pull");
     await page.waitForFunction(() => /^Pulled/.test(document.querySelector("#pull-msg")?.textContent || ""), null, { timeout: 15000 });
@@ -346,8 +389,8 @@ try {
     await page.waitForSelector("#stale.hidden", { state: "attached", timeout: 10000 });
     await page.waitForSelector("#ms-chip.ok");
     // Pull reads the calendar entries again.
-    for (let t = 0; calendarReads < 3 && t < 50; t++) await page.waitForTimeout(100);
-    assert.equal(calendarReads, 3);
+    for (let t = 0; calendarReads < readsBeforePull + 1 && t < 50; t++) await page.waitForTimeout(100);
+    assert.equal(calendarReads, readsBeforePull + 1);
   });
   await step("blocked FTP warns on Pull, and the server refuses it", async () => {
     await new Promise((ok) => { ftp.close(ok); for (const s of ftpSockets) s.destroy(); });

@@ -1468,7 +1468,7 @@ function renderMs() {
       ${row("Config last changed", m.configDate?.error ? `can't tell (${m.configDate.error})`
         : m.configDate?.miniserver && msDate(m.configDate.miniserver) + ({ after: " (after the base)", before: " (before the base: an older config runs)" }[m.configDate.order] || ""))}
       ${row("Base taken at", m.configDate?.base && msDate(m.configDate.base))}
-      ${row("Calendar entries", !S.cal?.available || !S.cal.read_at ? "" : S.cal.error ? `can't tell (${S.cal.error})`
+      ${row("Calendar entries", !S.cal?.available || (!S.cal.read_at && !S.cal.failed) ? "" : S.cal.error ? `can't tell (${S.cal.error})`
         : calDrift().length ? `${calDrift().length} changed in the app` : `${S.cal.entries}, as in the deployed config`)}
       ${m.reachable ? row("Connection", m.local === false ? "remote" : m.local ? "local" : "unknown") + row("TLS", tls)
         + row("Live-update slot", m.eventSlots == null ? "" : m.eventSlots ? "free" : "none free") : ""}
@@ -1518,27 +1518,47 @@ $("stale-sync").onclick = () => $("btn-sync").click();
 // start, after Pull, Apply and Sync, and before Apply, and compares them with the deployed
 // revision. Without admin rights nothing shows.
 S.cal = null;
+// Requests can answer out of order: only the newest one's answer is kept.
+S.calSeq = 0;
+/** Ask for the drift (`fresh`: have the server read the Miniserver again first). Returns this
+ * request's answer; a failed request is an answer too (`failed`, with `error`), never the last one. */
 async function loadCal(fresh) {
+  const seq = ++S.calSeq;
+  let c;
   try {
     const r = await fetch("/api/calendar" + (fresh ? "?fresh=1" : ""), { headers: fresh ? { "X-Vislox": "calendar" } : {} });
-    const j = await r.json();
-    if (!r.ok) return;
-    S.cal = j;
-  } catch { return; }
+    const j = await r.json().catch(() => ({}));
+    c = r.ok ? j : { available: true, failed: true, error: j.error || r.statusText || `HTTP ${r.status}` };
+  } catch (e) {
+    c = { available: true, failed: true, error: e.message || "vislox did not answer" };
+  }
+  if (seq !== S.calSeq) return c;
+  S.cal = c;
   renderCalDrift();
   if (S.ms) renderMs();
   if (S.view && S.sel && S.view.objects[S.sel]?.calendar) renderProps();
+  return c;
 }
 /** The entries the app changed, against the deployed revision. */
-function calDrift() { return S.cal?.available && Array.isArray(S.cal.drift) ? S.cal.drift : []; }
+function calDrift(c = S.cal) { return c?.available && Array.isArray(c.drift) ? c.drift : []; }
 /** How entry `uuid` was changed in the app, when it was and the deployed revision is viewed. */
 function calDriftOf(uuid) { return viewingDeployed() ? calDrift().find((d) => d.uuid === uuid) : undefined; }
-function calDriftText() {
-  const d = calDrift();
+function calDriftText(c = S.cal) {
+  const d = calDrift(c);
   if (!d.length) return "";
   const n = d.length;
   const by = ["added", "changed", "deleted"].map((k) => [k, d.filter((x) => x.kind === k).length]).filter(([, c]) => c);
   return `${n} calendar ${n === 1 ? "entry was" : "entries were"} ${by.length === 1 ? by[0][0] : `changed (${by.map(([k, c]) => `${c} ${k}`).join(", ")})`} in the Loxone app. The base vislox shows does not have ${n === 1 ? "it" : "them"}.`;
+}
+/** What Apply's confirmation says about the calendar entries, from the read just before it:
+ * the entries the app changed, or that they could not be checked. A Miniserver that refuses
+ * (no admin rights) is skipped quietly. */
+function calApplyWarning(c) {
+  if (!c?.available) return "";
+  if (c.error && !c.refused) return `⚠ Couldn't check calendar entries changed in the app: ${c.error}. Applying overwrites any there are.\n\n`;
+  const d = calDrift(c);
+  if (!d.length) return "";
+  return `⚠ ${calDriftText(c)} Applying overwrites ${d.length === 1 ? "it" : "them"}:\n${d.map((x) => `  ${x.name}: ${x.kind === "changed" ? x.changes.join("; ") : x.kind}`).join("\n")}\n\n`;
 }
 function calDriftLine(d) {
   const has = !!S.view?.objects[d.uuid];
@@ -1855,10 +1875,10 @@ async function apply() {
   if (!pend) return;
   // Ask the Miniserver once more whether its config changed after the base, and for the
   // calendar entries edited in the app.
-  await Promise.all([loadMs(true), loadCal(true)]);
-  const stale = staleText(), cal = calDriftText();
+  const [, calNow] = await Promise.all([loadMs(true), loadCal(true)]);
+  const stale = staleText();
   if (!window.confirm((stale ? `⚠ ${stale} Applying overwrites what changed there since.\n\n` : "") +
-    (cal ? `⚠ ${cal} Applying overwrites ${calDrift().length === 1 ? "it" : "them"}:\n${calDrift().map((d) => `  ${d.name}: ${d.kind === "changed" ? d.changes.join("; ") : d.kind}`).join("\n")}\n\n` : "") +
+    calApplyWarning(calNow) +
     "Deploy the pending changes to the Miniserver?\n\nlox config push uploads the config and restarts the Miniserver's program (a few seconds), " +
     "checks that it runs exactly the compiled config, then vislox commits and pushes to git.")) return;
   deployMsg("");
