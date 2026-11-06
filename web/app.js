@@ -169,13 +169,16 @@ function revButton(r, newest) {
   const info = revInfo(r);
   const b = document.createElement("button");
   b.type = "button";
-  b.className = `hrev k-${r.kind}` + (r.id === S.rev ? " sel" : "") + (r.id === S.base ? " base" : "") + (r.current ? " current" : "");
+  b.className = `hrev k-${r.kind}` + (r.id === S.rev ? " sel" : "") + (r.id === S.base ? " base" : "") + (r.current ? " current" : "") + (r.current && r.kind !== "pending" && r.kind !== "backup" ? " deployed" : "");
   b.setAttribute("aria-current", r.id === S.rev ? "true" : "false");
+  const deployed = r.current && r.kind !== "pending" && r.kind !== "backup";
   const also = r.backups?.length ? `\n\nThe Miniserver's backup${r.backups.length > 1 ? "s" : ""} ${r.backups.join(", ")} ${r.backups.length > 1 ? "hold" : "holds"} this config.` : "";
-  b.title = `${r.label}\n${r.detail}\n${new Date(r.time * 1000).toLocaleString()}${also}\n\nClick: view it, compared with the revision before\nShift+click: compare the viewed revision with this one`;
+  b.title = `${r.label}\n${r.detail}\n${new Date(r.time * 1000).toLocaleString()}${also}` +
+    (deployed ? "\n\nThis is the config on the Miniserver." : "") +
+    `\n\nClick: show it\nShift+click: compare what you see with it${r.id === S.base ? " (again: stop comparing)" : ""}`;
   const pills = [];
   if (r.kind === "pending" && r.current) pills.push('<span class="pill pend">would be deployed</span>');
-  if (r.kind !== "pending" && r.current) pills.push('<span class="pill cur">on disk</span>');
+  if (deployed) pills.push('<span class="pill cur">on Miniserver</span>');
   if (r.kind === "live") pills.push('<span class="pill new">not in git</span>');
   if (r.kind === "backup") pills.push('<span class="pill ms">not pulled</span>');
   if (r.same_as) pills.push(`<span class="pill">same as ${esc(revById(r.same_as) ? revInfo(revById(r.same_as)).title : r.same_as)}</span>`);
@@ -184,8 +187,10 @@ function revButton(r, newest) {
   b.innerHTML = `<span class="node"></span><span class="l1"><span class="lbl">${esc(info.title)}</span></span>
     <span class="dt">${esc(info.sub)}</span>${pills.length ? `<span class="tags">${pills.join("")}</span>` : ""}`;
   b.onclick = (ev) => {
-    if (ev.shiftKey) { if (r.id !== S.rev) S.base = r.id; }
-    else { S.rev = r.id; S.base = r.base; }
+    if (ev.shiftKey) {
+      if (r.id === S.rev) return;
+      S.base = r.id === S.base ? null : r.id;
+    } else { S.rev = r.id; S.base = null; }
     S.follow = !ev.shiftKey && r.id === newest ? S.follow : false;
     $("chk-follow").checked = S.follow;
     renderHistory(); renderSelects(); loadView(); writeHash(true);
@@ -524,16 +529,17 @@ function renderPage() {
   const logged = logMarks();
   S.log.drawn = marksKey(logged);
 
-  for (const w of p.wires) {
-    const pts = w.points.map((q) => q.join(",")).join(" ");
-    const line = el("polyline", { class: `wire${w.analog ? " analog" : ""}${w.status ? " d-" + w.status : ""}`, points: pts, "data-f": w.from[0], "data-t": w.to[0], "data-src": w.src }, L.wires);
-    const hit = el("polyline", { class: "wire-hit", points: pts }, L.wires);
+  const hops = wireHops(p.wires);
+  p.wires.forEach((w, wi) => {
+    const d = wirePath(hops[wi]);
+    const line = el("path", { class: `wire${w.analog ? " analog" : ""}${w.status ? " d-" + w.status : ""}`, d, "data-f": w.from[0], "data-t": w.to[0], "data-src": w.src }, L.wires);
+    const hit = el("path", { class: "wire-hit", d }, L.wires);
     const fo = objByUuid.get(w.from[0]), to = objByUuid.get(w.to[0]);
     hoverTip(hit, () => `<b>${esc(fo ? displayTitle(fo) : "")}</b>.${esc(portName(fo, w.from[1]))} → <b>${esc(to ? displayTitle(to) : "")}</b>.${esc(portName(to, w.to[1]))}<br><span class="tm">${w.analog ? "analog" : "digital"}${w.status ? " · " + w.status : ""}</span>${liveTip(w.src)}`);
     hit.addEventListener("mouseenter", () => line.classList.add("hl"));
     hit.addEventListener("mouseleave", () => line.classList.remove("hl"));
     hit.addEventListener("click", (e) => { e.stopPropagation(); if (!drag?.moved) select(w.to[0]); });
-  }
+  });
 
   const stack = new Map();
   for (const l of p.labels) {
@@ -653,6 +659,82 @@ function objTip(o) {
   if (o.ty === "Text") parts.push(esc(clip(noteText(o), 300)).replace(/\n/g, "<br>"));
   if (o.status) parts.push(`<i>${o.status}</i>`);
   return parts.join("<br>");
+}
+
+/** Wire corners are rounded with this radius (page units; a port row is 192). */
+const WIRE_R = 64;
+/** A wire hops over another wire's vertical run with a half circle of this radius. */
+const HOP_R = 36;
+
+/** Each wire's points without repeats or straight-through corners, and where its
+ *  horizontal runs cross another wire's vertical run: `{ pts, hops: Map(segment → [x…]) }`. */
+function wireHops(wires) {
+  const clean = wires.map((w) => {
+    const out = [];
+    for (const q of w.points) {
+      const a = out[out.length - 1], b = out[out.length - 2];
+      if (a && a[0] === q[0] && a[1] === q[1]) continue;
+      if (a && b && ((b[0] === a[0] && a[0] === q[0]) || (b[1] === a[1] && a[1] === q[1]))) out.pop();
+      out.push(q);
+    }
+    return out;
+  });
+  const verts = [];
+  clean.forEach((pts, wi) => {
+    for (let i = 0; i + 1 < pts.length; i++) {
+      const [a, b] = [pts[i], pts[i + 1]];
+      if (a[0] === b[0]) verts.push({ wi, x: a[0], y0: Math.min(a[1], b[1]), y1: Math.max(a[1], b[1]) });
+    }
+  });
+  return clean.map((pts, wi) => {
+    const hops = new Map();
+    for (let i = 0; i + 1 < pts.length; i++) {
+      const [a, b] = [pts[i], pts[i + 1]];
+      if (a[1] !== b[1]) continue;
+      const y = a[1], x0 = Math.min(a[0], b[0]), x1 = Math.max(a[0], b[0]);
+      // Clear of the corners, so a hop never runs into a bend.
+      const pad = WIRE_R + HOP_R;
+      const xs = [];
+      for (const v of verts) {
+        if (v.wi === wi || wires[v.wi].src === wires[wi].src) continue;
+        if (v.x > x0 + pad && v.x < x1 - pad && y > v.y0 + HOP_R && y < v.y1 - HOP_R) xs.push(v.x);
+      }
+      if (!xs.length) continue;
+      xs.sort((p, q) => (b[0] > a[0] ? p - q : q - p));
+      // Hops closer than a hop's width merge into one.
+      const merged = [];
+      for (const x of xs) if (!merged.length || Math.abs(x - merged[merged.length - 1]) >= 2 * HOP_R + 8) merged.push(x);
+      hops.set(i, merged);
+    }
+    return { pts, hops };
+  });
+}
+
+/** An SVG path for a wire: rounded corners, a half-circle hop at each crossing. */
+function wirePath({ pts, hops }) {
+  const n = pts.length;
+  const len = (i) => Math.abs(pts[i + 1][0] - pts[i][0]) + Math.abs(pts[i + 1][1] - pts[i][1]);
+  // The radius at corner i, at most half of either leg.
+  const r = (i) => (i <= 0 || i >= n - 1 ? 0 : Math.min(WIRE_R, len(i - 1) / 2, len(i) / 2));
+  const toward = (p, q, d) => {
+    const dx = Math.sign(q[0] - p[0]), dy = Math.sign(q[1] - p[1]);
+    return [p[0] + dx * d, p[1] + dy * d];
+  };
+  let d = `M${pts[0][0]},${pts[0][1]}`;
+  for (let i = 0; i + 1 < n; i++) {
+    const a = pts[i], b = pts[i + 1];
+    const dir = Math.sign(b[0] - a[0]);
+    for (const x of hops.get(i) || []) {
+      d += `L${x - dir * HOP_R},${a[1]}A${HOP_R},${HOP_R} 0 0 ${dir > 0 ? 1 : 0} ${x + dir * HOP_R},${a[1]}`;
+    }
+    const e = toward(b, a, r(i + 1));
+    d += `L${e[0]},${e[1]}`;
+    if (i + 2 < n) {
+      const s = toward(b, pts[i + 2], r(i + 1));
+      d += `Q${b[0]},${b[1]} ${s[0]},${s[1]}`;
+    }
+  }
+  return d;
 }
 
 /** Loxone Config 16 port stubs: a small grey tab on the block edge. The wire ends under it. */
@@ -814,7 +896,7 @@ function drawXref(parent, l, n) {
   L.xrefs.push({ x: bx, y, text: label, page: t.page_title || "" });
   const analog = /^A[QI]/.test(l.port) || /^A[QI]/.test(t.port || "");
   const wx = left ? bx + LABEL_W : bx;
-  el("polyline", { class: `xref-wire${analog ? " analog" : ""}${l.status ? " d-" + l.status : ""}`, "data-f": l.obj, "data-src": l.src, points: `${l.x},${l.y} ${(l.x + wx) / 2},${l.y} ${(l.x + wx) / 2},${y} ${wx},${y}` }, g);
+  el("path", { class: `xref-wire${analog ? " analog" : ""}${l.status ? " d-" + l.status : ""}`, "data-f": l.obj, "data-src": l.src, d: wirePath(wireHops([{ points: [[l.x, l.y], [(l.x + wx) / 2, l.y], [(l.x + wx) / 2, y], [wx, y]] }])[0]) }, g);
   const top = y - ROW / 2, rx = ROW / 2;
   el("rect", { class: "bar", x: bx, y: top, width: LABEL_W, height: ROW, rx, ry: rx }, g);
   // The link icon in its own pill at the wired end, like Loxone Config's connection references.
