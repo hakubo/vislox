@@ -27,12 +27,12 @@ numbers) would not change the result, so it was not attempted. An estimate from 
 
 ## What is there instead
 
-The real numbers come from the Miniserver itself and vislox already shows them:
+The real numbers come from the Miniserver itself: the Debug-Monitor's system packet carries the heap and its
+maximum, and vislox shows them in the Miniserver chip's details ("Load (Debug-Monitor)"). This needs vislox
+started with `--monitor` and a Debug-Monitor session started from the Log panel (see
+[debug-monitor.md](debug-monitor.md)); without it the chip has no memory figure.
 
-- the heap and its maximum in the Miniserver chip's details (`lox status`), and
-- the Debug-Monitor's system packet (see [debug-monitor.md](debug-monitor.md)).
-
-Both describe the program that runs now, not a pending change. A change's cost shows only after Apply.
+It describes the program that runs now, not a pending change. A change's cost shows only after Apply.
 
 ## If it comes back
 

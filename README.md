@@ -510,7 +510,7 @@ The binary is an `axum` server with the UI embedded (plain JS and SVG, no build 
   reload.
 
 `docs/program-memory.md` records why vislox does not estimate a change's program memory from `/sys/Sizes.bin`
-(on firmware 17 the file holds a constant, not sizes).
+(on the Gen 2 Miniserver checked, firmware 17.2.10.21, the file holds a constant, not sizes).
 
 `docs/reference/` holds the Loxone Config screenshots the look is based on (see `SOURCES.md`). They are
 copyright Loxone and are for internal reference only.
