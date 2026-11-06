@@ -2,6 +2,7 @@
 //! `loxone-config` manage, with live reload, history and change review.
 
 mod actions;
+mod configdate;
 mod discover;
 mod history;
 mod live;
@@ -169,6 +170,7 @@ async fn main() -> Result<()> {
         },
         src.current.clone(),
         src.proposed.clone(),
+        src.project.as_ref().map(|p| p.join("backups")),
     )
     .expecting(expected_serial(&src, found.as_ref().ok()));
     let (tx, _) = broadcast::channel(16);
@@ -604,6 +606,8 @@ async fn api_pull(State(app): State<Arc<App>>, headers: axum::http::HeaderMap) -
         Ok(p) => {
             let a = app.clone();
             let _ = tokio::task::spawn_blocking(move || refresh(&a)).await;
+            // The base may have changed: the next check reads its date again.
+            app.ms.forget();
             Json(serde_json::json!({ "committed": p.committed })).into_response()
         }
         Err(e) => (
@@ -636,6 +640,8 @@ async fn api_apply(
     let res = app.actions.apply(&opts).await;
     let a = app.clone();
     let _ = tokio::task::spawn_blocking(move || refresh(&a)).await;
+    // The base may have changed: the next check reads its date again.
+    app.ms.forget();
     match res {
         Ok(m) => Json(serde_json::json!({ "message": m })).into_response(),
         // What the user could allow to retry (a newer Loxone Config, custom changes).
@@ -677,6 +683,8 @@ async fn api_sync(State(app): State<Arc<App>>, headers: axum::http::HeaderMap) -
     let res = app.actions.sync().await;
     let a = app.clone();
     let _ = tokio::task::spawn_blocking(move || refresh(&a)).await;
+    // The base may have changed: the next check reads its date again.
+    app.ms.forget();
     match res {
         Ok(m) => Json(serde_json::json!({ "message": m })).into_response(),
         Err((status, msg)) => refused((status, reason::explain(&msg))),

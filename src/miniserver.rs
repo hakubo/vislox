@@ -19,13 +19,20 @@
 //!   Apply and Sync: DHCP may have given the address to another device. When
 //!   the address does not answer or another serial answers there, a UDP
 //!   discovery broadcast (`discover.rs`) looks for the serial on the LAN and
-//!   names its new address.
+//!   names its new address,
+//! - `jdev/sps/LoxAPPversion3`: when the Miniserver's config last changed
+//!   (`lastModified` of `LoxAPP3.json`). It needs lox's user and password
+//!   (HTTP basic auth, as for Apply's restart probe), and is compared with
+//!   the date of the download the base came from (`configdate.rs`): when
+//!   they differ, the config changed after the base was taken.
 //!
 //! What the token may do (`tokenRights`) and whether the password is weak
 //! (`unsecurePass`) come only with a login, which lox does and does not keep,
 //! so they are not shown.
 
+use crate::configdate::BaseDate;
 use crate::discover;
+use crate::restart::Http;
 use loxone_client::Connection;
 use loxone_client::token::TokenStore;
 use serde_json::{Value, json};
@@ -96,6 +103,10 @@ struct Target {
     /// firmware: the deployed one, and the pending one.
     current: PathBuf,
     proposed: Option<PathBuf>,
+    /// Authenticated `jdev/…` requests (`LoxAPPversion3`).
+    http: Arc<Http>,
+    /// When the base was taken, in the Miniserver's terms.
+    base_date: Arc<BaseDate>,
 }
 
 /// What `jdev/cfg/apiKey` tells.
@@ -115,6 +126,7 @@ impl Miniserver {
         target: Result<&Connection, String>,
         current: PathBuf,
         proposed: Option<PathBuf>,
+        backups: Option<PathBuf>,
     ) -> Miniserver {
         let target = target.map(|conn| {
             let (addr, http_port) = split_host(&conn.host);
@@ -127,8 +139,10 @@ impl Miniserver {
                     .ok()
                     .and_then(|p| p.parse().ok())
                     .unwrap_or(21),
+                base_date: Arc::new(BaseDate::new(current.clone(), backups)),
                 current,
                 proposed,
+                http: Arc::new(Http::new(conn.clone())),
             }
         });
         Miniserver {
@@ -175,6 +189,12 @@ impl Miniserver {
         let v = Arc::new(probe(t, self.expected.as_ref(), &self.discovery).await);
         *self.last.lock().unwrap() = Some((started, v.clone()));
         v
+    }
+
+    /// Drop the last check, after Pull, Apply or Sync changed what it
+    /// compared (the base, and when the Miniserver's config changed).
+    pub fn forget(&self) {
+        *self.last.lock().unwrap() = None;
     }
 
     /// For the status chip: a check at most a minute old.
@@ -365,15 +385,19 @@ async fn probe(t: &Target, expected: Option<&Expected>, discovery: &discover::Ca
     );
     let (web, key) = web;
     let (conn, current, proposed) = (t.conn.clone(), t.current.clone(), t.proposed.clone());
-    let (token, cfg_current, cfg_pending) = tokio::task::spawn_blocking(move || {
-        (
-            TokenStore::load_for(&conn).map(|ts| ts.valid_until as i64),
-            read_version(&current),
-            proposed.as_ref().and_then(read_version),
-        )
-    })
-    .await
-    .unwrap_or_default();
+    let (http, base_date, ask) = (t.http.clone(), t.base_date.clone(), web.is_ok());
+    let (token, cfg_current, cfg_pending, ms_date, base_date) =
+        tokio::task::spawn_blocking(move || {
+            (
+                TokenStore::load_for(&conn).map(|ts| ts.valid_until as i64),
+                read_version(&current),
+                proposed.as_ref().and_then(read_version),
+                ask.then(|| http.value("jdev/sps/LoxAPPversion3")),
+                base_date.get(),
+            )
+        })
+        .await
+        .unwrap_or_default();
     // When the address does not answer, or another Miniserver answers
     // there, look on the LAN: the right one may have a new address (DHCP),
     // and its discovery reply names it.
@@ -403,6 +427,8 @@ async fn probe(t: &Target, expected: Option<&Expected>, discovery: &discover::Ca
         discovered: search.as_ref().map(|s| s.found.clone()),
         discovery_note: search.as_ref().and_then(|s| s.note.clone()),
         addr_ip,
+        ms_date,
+        base_date,
     })
 }
 
@@ -468,6 +494,10 @@ struct Report<'a> {
     discovery_note: Option<String>,
     /// The address as an IPv4 address, to find its discovery reply.
     addr_ip: Option<String>,
+    /// `jdev/sps/LoxAPPversion3`, when the web port took the connection.
+    ms_date: Option<Result<String, String>>,
+    /// The `lastModified` of the download the base came from.
+    base_date: Option<String>,
 }
 
 /// The status as the UI shows it: what was checked, what blocks Pull, Apply
@@ -615,6 +645,27 @@ fn report(r: Report) -> Value {
             }
         }
     }
+    // Another Miniserver's config date says nothing about this base.
+    let ms_date = match r.ms_date.as_ref().filter(|_| wrong.is_none()) {
+        Some(Ok(d)) => Some(d.as_str()),
+        Some(Err(e)) => {
+            warnings.push(format!(
+                "When the Miniserver's config last changed (jdev/sps/LoxAPPversion3) could not be \
+                 read: {e}."
+            ));
+            None
+        }
+        None => None,
+    };
+    let changed = matches!((ms_date, &r.base_date), (Some(m), Some(b)) if m != b);
+    if changed {
+        warnings.push(format!(
+            "The Miniserver's config changed at {}, after the base vislox shows (taken at {}). \
+             Pull or Sync from Miniserver before you change it.",
+            ms_date.unwrap_or_default(),
+            r.base_date.as_deref().unwrap_or_default()
+        ));
+    }
     if let Some(until) = r.token
         && until <= r.now
     {
@@ -648,6 +699,9 @@ fn report(r: Report) -> Value {
         "eventSlots": key.and_then(|k| k.event_slots),
         "tokenValidUntil": r.token,
         "config": { "deployed": r.cfg_current, "pending": r.cfg_pending },
+        // `lastModified` (the Miniserver's local time) of its config now, and
+        // of the download the base came from.
+        "configDate": { "miniserver": ms_date, "base": r.base_date, "changed": changed },
         "checks": checks,
         "blocked": blocked,
         "warnings": warnings,
@@ -959,7 +1013,55 @@ mod tests {
             discovered: None,
             discovery_note: None,
             addr_ip: None,
+            ms_date: Some(Ok("2026-11-06 00:23:31".into())),
+            base_date: Some("2026-11-06 00:23:31".into()),
         }
+    }
+
+    #[test]
+    fn a_config_changed_after_the_base_is_a_warning() {
+        let v = report(base());
+        assert_eq!(v["configDate"]["changed"], false);
+        let v = report(Report {
+            ms_date: Some(Ok("2026-11-06 14:32:10".into())),
+            ..base()
+        });
+        assert_eq!(v["configDate"]["changed"], true);
+        assert_eq!(v["configDate"]["miniserver"], "2026-11-06 14:32:10");
+        assert_eq!(
+            v["blocked"],
+            json!({ "pull": null, "apply": null, "sync": null })
+        );
+        let w = v["warnings"][0].as_str().unwrap();
+        assert!(
+            w.starts_with("The Miniserver's config changed at 2026-11-06 14:32:10, after the base"),
+            "{w}"
+        );
+        // Without a date for the base (no download found), nothing to compare.
+        let v = report(Report {
+            ms_date: Some(Ok("2026-11-06 14:32:10".into())),
+            base_date: None,
+            ..base()
+        });
+        assert_eq!(v["configDate"]["changed"], false);
+        assert_eq!(v["warnings"], json!([]));
+        // A failed request is said, and blocks nothing.
+        let v = report(Report {
+            ms_date: Some(Err("HTTP 401".into())),
+            ..base()
+        });
+        assert!(v["warnings"][0].as_str().unwrap().contains("HTTP 401"));
+        assert_eq!(v["blocked"]["apply"], json!(null));
+        // Another Miniserver at the address: its date says nothing about the base.
+        let e = expect("504F94000001");
+        let v = report(Report {
+            expected: Some(&e),
+            ms_date: Some(Ok("2026-11-06 14:32:10".into())),
+            ..base()
+        });
+        assert_eq!(v["identity"], "wrong");
+        assert_eq!(v["configDate"]["changed"], false);
+        assert_eq!(v["configDate"]["miniserver"], json!(null));
     }
 
     #[test]
@@ -1076,7 +1178,7 @@ mod tests {
 
     #[tokio::test]
     async fn without_a_connection_nothing_is_checked() {
-        let ms = Miniserver::new(Err("turned off".into()), PathBuf::new(), None);
+        let ms = Miniserver::new(Err("turned off".into()), PathBuf::new(), None, None);
         assert_eq!(ms.chip().await["available"], false);
         assert!(ms.preflight(Action::Apply).await.is_ok());
     }
@@ -1107,14 +1209,17 @@ mod tests {
                 });
             }
         });
+        let conn = Connection::new(format!("http://127.0.0.1:{web_port}"), "u", "p");
         let ms = Miniserver {
             target: Ok(Target {
-                conn: Connection::new(format!("http://127.0.0.1:{web_port}"), "u", "p"),
+                http: Arc::new(Http::new(conn.clone())),
+                conn,
                 addr: "127.0.0.1".into(),
                 http_port: web_port,
                 ftp_port,
                 current: PathBuf::from("/nonexistent"),
                 proposed: None,
+                base_date: Arc::new(BaseDate::new(PathBuf::from("/nonexistent"), None)),
             }),
             last: Mutex::new(None),
             probing: tokio::sync::Mutex::new(()),

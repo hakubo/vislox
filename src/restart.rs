@@ -59,7 +59,7 @@ impl Http {
     }
 
     /// `LL.value` of a `jdev/…` answer that has HTTP status 200.
-    fn value(&self, path: &str) -> Result<String, String> {
+    pub fn value(&self, path: &str) -> Result<String, String> {
         // No retry: a failed request is what is being looked for.
         let (status, body) = self.client()?.get_once(path, None).map_err(|e| {
             let e = e.to_string();

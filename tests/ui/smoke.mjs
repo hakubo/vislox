@@ -10,6 +10,7 @@ import { createServer } from "node:http";
 import { createServer as createTcpServer } from "node:net";
 import { mkdtempSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, appendFileSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { crc32 } from "node:zlib";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import assert from "node:assert/strict";
@@ -39,16 +40,38 @@ const liveFile = join(mkdtempSync(join(tmpdir(), "vislox-live-")), "stream.ndjso
 const liveLine = (control, state, value, uuid) => JSON.stringify({ control, state, value, uuid }) + "\n";
 writeFileSync(liveFile, liveLine("Temperatur", "value", "21.5", TEMP) + liveLine("AND", "active", "1", GATE));
 
+// A download as lox keeps it next to config.Loxone (backup.zip): only its
+// LoxAPP3.json matters here, for when the config last changed (stored, not deflated).
+function backupZip(lastModified) {
+  const name = Buffer.from("LoxAPP3.json");
+  const data = Buffer.from(`\ufeff{"lastModified":"${lastModified}","msInfo":{}}`);
+  const u16 = (n) => { const b = Buffer.alloc(2); b.writeUInt16LE(n); return b; };
+  const u32 = (n) => { const b = Buffer.alloc(4); b.writeUInt32LE(n >>> 0); return b; };
+  const common = [u16(20), u16(0), u16(0), u16(0), u16(0), u32(crc32(data)), u32(data.length), u32(data.length), u16(name.length), u16(0)];
+  const local = Buffer.concat([u32(0x04034b50), ...common, name, data]);
+  const central = Buffer.concat([u32(0x02014b50), u16(20), ...common, u16(0), u16(0), u16(0), u32(0), u32(0), name]);
+  const end = Buffer.concat([u32(0x06054b50), u16(0), u16(0), u16(1), u16(1), u32(central.length), u32(local.length), u16(0)]);
+  return Buffer.concat([local, central, end]);
+}
+const backup = join(dirname(cfg), "backup.zip");
+writeFileSync(backup, backupZip("2026-11-01 10:00:00"));
+
 // A stand-in Miniserver for the status chip and the preflight: jdev/cfg/apiKey
-// over HTTP, and an FTP server that only greets (vislox reads the greeting).
+// and jdev/sps/LoxAPPversion3 over HTTP, and an FTP server that only greets
+// (vislox reads the greeting).
+let msConfigDate = "2026-11-01 10:00:00";
 const listen = (srv) => new Promise((ok) => srv.listen(0, "127.0.0.1", () => ok(srv.address().port)));
 // `msSerial` is what it reports; a test swaps it for another Miniserver's.
 let msSerial = "50:4F:94:00:00:01";
 const msPort = await listen(createServer((req, res) => {
-  if (req.url !== "/jdev/cfg/apiKey") { res.writeHead(404); res.end(); return; }
+  const ll = {
+    "/jdev/cfg/apiKey": () => ({ control: "dev/cfg/apiKey", Code: "200",
+      value: `{'snr': '${msSerial}', 'version':'17.1.7.27', 'key':'00', 'local':true, 'httpsStatus':0}` }),
+    "/jdev/sps/LoxAPPversion3": () => ({ control: "dev/sps/LoxAPPversion3", Code: "200", value: msConfigDate }),
+  }[req.url];
+  if (!ll) { res.writeHead(404); res.end(); return; }
   res.setHeader("Content-Type", "application/json");
-  res.end(JSON.stringify({ LL: { control: "dev/cfg/apiKey", Code: "200",
-    value: `{'snr': '${msSerial}', 'version':'17.1.7.27', 'key':'00', 'local':true, 'httpsStatus':0}` } }));
+  res.end(JSON.stringify({ LL: ll() }));
 }));
 const ftpSockets = new Set();
 const ftp = createTcpServer((s) => { ftpSockets.add(s); s.on("close", () => ftpSockets.delete(s)); s.on("error", () => {}); s.end("220 fake FTP\r\n"); });
@@ -63,6 +86,7 @@ const fakeLox = join(loxDir, "lox");
 writeFileSync(fakeLox, `#!/bin/sh
 [ "$*" = "config pull --quiet" ] || { echo "unexpected: $*" >&2; exit 2; }
 sed -i 's/Title="Temperatur"/Title="Temperatur Wohnen"/' "${cfg}"
+cp "${backup}.new" "${backup}"
 git -C "${repo}" -c user.name=lox -c user.email=lox@example.com commit -qam "[504F94000001] Config backup 2026-11-02 10:00:00 (v2)"
 echo committed
 `);
@@ -183,10 +207,32 @@ try {
     await page.waitForSelector("#ms-chip.ok");
     await page.keyboard.press("Escape");
   });
+  await step("a config saved on the Miniserver after the base is noticed", async () => {
+    assert.equal(await page.$eval("#stale", (n) => n.classList.contains("hidden")), true);
+    // Someone saves from Loxone Config: the Miniserver's config date moves on.
+    msConfigDate = "2026-11-02 09:30:00";
+    writeFileSync(backup + ".new", backupZip(msConfigDate));
+    // "Check again" reuses a check from the last 2 s.
+    await page.waitForTimeout(2500);
+    await page.click("#ms-chip");
+    await page.click("#ms-recheck");
+    await page.waitForSelector("#ms-chip.warn");
+    assert.match(await page.textContent("#ms-body"), /Config last changed2026-11-02 09:30 \(after the base\)/);
+    assert.match(await page.textContent("#ms-body"), /Base taken at2026-11-01 10:00/);
+    await page.keyboard.press("Escape");
+    await page.waitForSelector("#stale:not(.hidden)");
+    assert.match(await page.textContent("#stale-text"), /^The Miniserver's config changed at 2026-11-02 09:30, after the base vislox shows \(taken at 2026-11-01 10:00\)/);
+    assert.equal(await page.isVisible("#stale-pull"), true);
+    assert.equal(await page.isVisible("#stale-sync"), false);
+  });
   await step("pull from the Miniserver commits a new backup and shows it", async () => {
-    await page.click("#btn-pull");
+    // From the notice: the same as the History's Pull button.
+    await page.click("#stale-pull");
     await page.waitForFunction(() => /^Pulled/.test(document.querySelector("#pull-msg")?.textContent || ""), null, { timeout: 15000 });
     await page.waitForFunction(() => [...document.querySelectorAll(".hrev .lbl")].some((n) => n.textContent === "Backup v2"), null, { timeout: 10000 });
+    // The pulled download carries the Miniserver's date: the base is current again.
+    await page.waitForSelector("#stale.hidden", { state: "attached", timeout: 10000 });
+    await page.waitForSelector("#ms-chip.ok");
   });
   await step("blocked FTP warns on Pull, and the server refuses it", async () => {
     await new Promise((ok) => { ftp.close(ok); for (const s of ftpSockets) s.destroy(); });

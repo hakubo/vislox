@@ -1361,7 +1361,7 @@ async function pull() {
   } catch (e) {
     pullMsg(e.message, "error");
   } finally {
-    pulling = false; renderPull(); loadMs();
+    pulling = false; renderPull(); loadMs(true);
   }
 }
 $("btn-pull").onclick = pull;
@@ -1400,6 +1400,8 @@ function renderMs() {
       ${row("Firmware", m.firmware)}
       ${row("Deployed config", m.config?.deployed && `Loxone Config ${m.config.deployed}`)}
       ${row("Pending config", m.config?.pending && `Loxone Config ${m.config.pending}`)}
+      ${row("Config last changed", m.configDate?.miniserver && msDate(m.configDate.miniserver) + (m.configDate.changed ? " (after the base)" : ""))}
+      ${row("Base taken at", m.configDate?.base && msDate(m.configDate.base))}
       ${m.reachable ? row("Connection", m.local === false ? "remote" : m.local ? "local" : "unknown") + row("TLS", tls)
         + row("Live-update slot", m.eventSlots == null ? "" : m.eventSlots ? "free" : "none free") : ""}
       ${row("lox's token valid until", tok)}</dl>
@@ -1408,8 +1410,39 @@ function renderMs() {
     ${m.discoveryNote ? `<div class="chk bad"><span class="dot" aria-hidden="true"></span><span><b>Discovery</b> <span class="d">${esc(m.discoveryNote)}</span></span></div>` : ""}
     ${why.map((y) => `<div class="blocked">${esc(blocked.filter((w) => m.blocked[w] === y).map((w) => w[0].toUpperCase() + w.slice(1)).join(", "))} would fail: ${esc(y)}</div>`).join("")}
     ${m.warnings.length ? `<ul class="warns">${m.warnings.map((w) => `<li>${esc(w)}</li>`).join("")}</ul>` : ""}`;
+  renderStale();
   $("ms-when").textContent = "Checked " + new Date(m.checked * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
 }
+// The Miniserver's config changed after the base (LoxAPPversion3 against the date in the
+// download the base came from): someone saved from Loxone Config, or the like.
+/** "2026-11-06 14:32:10" (the Miniserver's local time) → "14:32" today, else "2026-11-06 14:32". */
+function msDate(t) {
+  const m = /^(\d{4})-(\d\d)-(\d\d) (\d\d):(\d\d)/.exec(t || "");
+  if (!m) return t || "";
+  const d = new Date();
+  const today = +m[1] === d.getFullYear() && +m[2] === d.getMonth() + 1 && +m[3] === d.getDate();
+  return today ? `${m[4]}:${m[5]}` : `${m[1]}-${m[2]}-${m[3]} ${m[4]}:${m[5]}`;
+}
+function staleText() {
+  const c = S.ms?.available && S.ms.configDate;
+  return c?.changed ? `The Miniserver's config changed at ${msDate(c.miniserver)}, after the base vislox shows (taken at ${msDate(c.base)}).` : "";
+}
+function renderStale() {
+  const text = staleText();
+  $("stale").classList.toggle("hidden", !text);
+  if (!text) return;
+  const pullOk = !!S.hist?.pull?.available;
+  const a = S.hist?.actions;
+  const syncOk = !!a?.shown && !!a.apply?.available && !pendingChange() && !a.running;
+  $("stale-text").textContent = text + (pullOk || syncOk ? " Take it in before you change anything:" : " Changes made now start from an old base.");
+  $("stale-text").title = `Miniserver: ${S.ms.configDate.miniserver} · base: ${S.ms.configDate.base}`;
+  $("stale-pull").classList.toggle("hidden", !pullOk);
+  $("stale-pull").disabled = pulling;
+  $("stale-sync").classList.toggle("hidden", !syncOk);
+  $("stale-row").classList.toggle("hidden", !pullOk && !syncOk);
+}
+$("stale-pull").onclick = () => $("btn-pull").click();
+$("stale-sync").onclick = () => $("btn-sync").click();
 function closeMsPop() { $("ms-pop").classList.add("hidden"); $("ms-chip").setAttribute("aria-expanded", "false"); }
 $("ms-chip").onclick = () => {
   const open = $("ms-pop").classList.toggle("hidden") === false;
@@ -1450,7 +1483,7 @@ async function act(path, body) {
   });
   const j = await r.json().catch(() => ({}));
   if (r.status === 401) try { localStorage.removeItem("vislox.token"); } catch { /* private mode */ }
-  if (j.preflight || /apply|sync/.test(path)) loadMs();
+  if (j.preflight || /apply|sync/.test(path)) loadMs(true);
   if (!r.ok) { const e = new Error(j.error || r.statusText); e.data = j; throw e; }
   return j;
 }
@@ -1468,6 +1501,7 @@ function pendingChange() {
 function renderActions() {
   const a = S.hist?.actions;
   $("deploy-pane").classList.toggle("hidden", !a?.shown);
+  renderStale();
   if (!a?.shown) return;
   const busy = !!a.running;
   const pend = pendingChange();
@@ -1563,7 +1597,11 @@ $("deploy-new").addEventListener("click", (e) => {
 $("btn-apply").onclick = async () => {
   const pend = pendingChange();
   if (!pend) return;
-  if (!window.confirm("Deploy the pending changes to the Miniserver?\n\nlox config push uploads the config and restarts the Miniserver's program (a few seconds), " +
+  // Ask the Miniserver once more whether its config changed after the base.
+  await loadMs(true);
+  const stale = staleText();
+  if (!window.confirm((stale ? `⚠ ${stale} Applying overwrites what changed there since.\n\n` : "") +
+    "Deploy the pending changes to the Miniserver?\n\nlox config push uploads the config and restarts the Miniserver's program (a few seconds), " +
     "checks that it runs exactly the compiled config, then vislox commits and pushes to git.")) return;
   deployMsg("");
   $("deploy-new").classList.add("hidden");
@@ -1971,4 +2009,6 @@ S.hash = readHash();
 loadHistory().then(connect);
 loadMs();
 // The chip stays roughly current while the page is open.
-setInterval(() => { if (!document.hidden) loadMs(); }, 5 * 60 * 1000);
+// Every minute, mainly to notice a config saved on the Miniserver (the server reuses a check
+// for a minute, so several tabs still check once).
+setInterval(() => { if (!document.hidden) loadMs(); }, 60 * 1000);
