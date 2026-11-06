@@ -468,7 +468,6 @@ function renderPage() {
       el("line", { class: "ghost-line ghost", x1: x + w / 2, y1: y + h / 2, x2: o.rect[0] + o.rect[2] / 2, y2: o.rect[1] + o.rect[3] / 2 }, L.ghost);
     }
   }
-  renderAiCtx();
   L.live = liveBuild(p);
   liveApply(null);
   renderMinimap();
@@ -538,12 +537,10 @@ function wrapWords(text, n, max) {
 function portName(o, key) { return o?.ports.find((q) => q.key === key)?.name || key; }
 
 function wrapObj(parent, o, cls) {
-  const g = el("g", { class: `${cls}${o.status ? " d-" + o.status : ""}${o.moved_to ? " ghosted" : ""}${o.uuid === S.sel ? " sel" : ""}${aiCtx.blocks.has(o.uuid) ? " ai-ctx" : ""}`, "data-uuid": o.moved_to ? "" : o.uuid }, parent);
+  const g = el("g", { class: `${cls}${o.status ? " d-" + o.status : ""}${o.moved_to ? " ghosted" : ""}${o.uuid === S.sel ? " sel" : ""}`, "data-uuid": o.moved_to ? "" : o.uuid }, parent);
   g.addEventListener("click", (e) => {
     e.stopPropagation();
     if (drag?.moved) return;
-    // Alt+click: add the block to (or drop it from) the AI request's context.
-    if (e.altKey && aiCtxOn() && !o.moved_to) { toggleAiCtx(o.uuid); return; }
     select(o.uuid);
   });
   g.addEventListener("dblclick", (e) => {
@@ -918,7 +915,7 @@ function renderProps() {
   if (note) S.closed.delete("Note");
   const st = marks && o.status ? ` <span class="st ${o.status}">${o.status}</span>` : "";
   const renamed = marks && o.old_title ? `<div class="ph-s"><span class="old">${esc(o.old_title)}</span>→ <span class="new">${esc(o.title)}</span></div>` : "";
-  box.innerHTML = `<div class="ph"><div class="ph-top">${color && /^\d+,\d+,\d+$/.test(color) && color !== "0,0,0" ? `<span class="swatch" style="background:rgb(${esc(color)})"></span>` : ""}<span class="ph-t">${esc(title)}</span>${st}${aiCtxOn() && o.page ? `<button type="button" class="ai-ctx-btn${aiCtx.blocks.has(o.uuid) ? " on" : ""}" data-ctx="${esc(o.uuid)}" title="Send this block with the next AI request (Alt+click on the canvas)">${aiCtx.blocks.has(o.uuid) ? "✓ In AI context" : "＋ AI context"}</button>` : ""}</div>
+  box.innerHTML = `<div class="ph"><div class="ph-top">${color && /^\d+,\d+,\d+$/.test(color) && color !== "0,0,0" ? `<span class="swatch" style="background:rgb(${esc(color)})"></span>` : ""}<span class="ph-t">${esc(title)}</span>${st}</div>
     <div class="ph-s">${esc(prettyType(o.ty))}</div>${renamed}${facts.length ? `<div class="ph-facts">${facts.join("")}</div>` : ""}</div>` +
     sections.map((s) => {
       const open = !S.closed.has(s.name) || (s.name === "Advanced" && rawChanged);
@@ -926,8 +923,6 @@ function renderProps() {
     }).join("");
 }
 $("props").addEventListener("click", (e) => {
-  const cb = e.target.closest("[data-ctx]");
-  if (cb) { toggleAiCtx(cb.dataset.ctx); return; }
   const h = e.target.closest(".ps-h");
   if (h) {
     const open = h.getAttribute("aria-expanded") !== "true";
@@ -1372,9 +1367,10 @@ async function pull() {
 $("btn-pull").onclick = pull;
 $("pull-msg").onclick = () => pullMsg("");
 
-// ── change with AI, apply, discard ─────────────────────────────────────
-// A prompt goes to an AI agent (webhook) that edits the lox.toml project's module and compiles it;
-// the compile shows as the pending revision. Apply deploys it (lox config push) and pushes to git.
+// ── apply, sync, discard ───────────────────────────────────────────────
+// Whoever edits the lox.toml project's module and compiles it (a person, or an agent working in the
+// repository), the compile shows as the pending revision. Apply deploys it (lox config push) and
+// pushes to git; Sync makes the Miniserver's running config the base; Discard drops the compile.
 function adminToken(ask) {
   let t = "";
   try { t = localStorage.getItem("vislox.token") || ""; } catch { /* private mode */ }
@@ -1397,66 +1393,10 @@ async function act(path, body) {
   if (!r.ok) { const e = new Error(j.error || r.statusText); e.data = j; throw e; }
   return j;
 }
-// What goes along with an AI request: the page on screen (unless removed) and the blocks the
-// user picked (Properties' "＋ AI context", or Alt+click on the canvas).
-const aiCtx = { blocks: new Map(), skipPage: null };
-function aiCtxOn() { return !!S.hist?.actions?.shown && !!S.hist.actions.ai.available; }
-function blockInfo(uuid) {
-  const o = S.view?.objects[uuid];
-  if (!o) return null;
-  return { uuid, title: autoTitle(o.title) ? prettyType(o.ty) : o.title, ty: o.ty, page: S.pageOf.get(o.page)?.title || "" };
-}
-function toggleAiCtx(uuid) {
-  if (aiCtx.blocks.has(uuid)) aiCtx.blocks.delete(uuid);
-  else { const b = blockInfo(uuid); if (!b) return; if (aiCtx.blocks.size >= 20) { aiMsg("At most 20 blocks go with a request.", true); return; } aiCtx.blocks.set(uuid, b); }
-  renderAiCtx(); markAiCtx(); renderProps();
-}
-function markAiCtx() {
-  vpG.querySelectorAll(".ai-ctx").forEach((n) => n.classList.remove("ai-ctx"));
-  for (const u of aiCtx.blocks.keys()) vpG.querySelectorAll(`[data-uuid="${CSS.escape(u)}"]`).forEach((n) => n.classList.add("ai-ctx"));
-}
-function aiCtxPayload() {
-  const p = curPage();
-  return {
-    page: p && aiCtx.skipPage !== p.uuid ? { uuid: p.uuid, title: p.title || "" } : null,
-    blocks: [...aiCtx.blocks.values()],
-  };
-}
-function renderAiCtx() {
-  const box = $("ai-ctx");
-  if (!box) return;
-  const p = curPage();
-  const chips = [];
-  if (p && aiCtx.skipPage !== p.uuid) chips.push(`<span class="ai-chip page" title="The page you are on goes with the request">▦ ${esc(p.title || "page")}<button type="button" data-drop-page aria-label="Don't send the page">×</button></span>`);
-  for (const b of aiCtx.blocks.values()) chips.push(`<span class="ai-chip" title="${esc(b.ty)} on ${esc(b.page)}"><button type="button" class="go" data-go-ctx="${esc(b.uuid)}">${esc(b.title)}</button><button type="button" data-drop="${esc(b.uuid)}" aria-label="Remove ${esc(b.title)}">×</button></span>`);
-  box.innerHTML = chips.join("") + `<span class="ai-ctx-hint">${aiCtx.blocks.size ? "" : "Add blocks: Alt+click on the canvas, or ＋ AI context in Properties"}</span>`;
-}
-$("ai-ctx").addEventListener("click", (e) => {
-  const d = e.target.closest("[data-drop]");
-  if (d) { toggleAiCtx(d.dataset.drop); return; }
-  if (e.target.closest("[data-drop-page]")) { aiCtx.skipPage = curPage()?.uuid || null; renderAiCtx(); return; }
-  const g = e.target.closest("[data-go-ctx]");
-  if (g) { const u = g.dataset.goCtx; const pg = S.view?.objects[u]?.page; if (pg) gotoPage(pg, { focus: u }); select(u); }
-});
-/** "page Sypialnia · 2 blocks" from the context text the agent got. */
-function ctxSummary(t) {
-  const page = /page "([^"]*)" \(uuid/.exec(t)?.[1];
-  const n = t.split("\n").filter((l) => l.startsWith("- ")).length;
-  const parts = [];
-  if (page) parts.push(`page ${page}`);
-  if (n) parts.push(`${n} block${n === 1 ? "" : "s"}`);
-  return parts.length ? "with " + parts.join(", ") : "";
-}
-/** Re-read the AI / Apply state (it changes outside revisions). */
-async function refreshActions() {
-  if (!S.hist) return;
-  try { S.hist.actions = (await api("/api/history")).actions; } catch { return; }
-  renderActions();
-}
-function aiMsg(text, error) {
-  const m = $("ai-msg");
+function deployMsg(text, error) {
+  const m = $("deploy-msg");
   m.textContent = text || "";
-  m.className = "ai-msg" + (error ? " error" : "") + (text ? "" : " hidden");
+  m.className = "deploy-msg" + (error ? " error" : "") + (text ? "" : " hidden");
 }
 /** The newest compile, if it differs from what is deployed. */
 function pendingChange() {
@@ -1466,22 +1406,16 @@ function pendingChange() {
 }
 function renderActions() {
   const a = S.hist?.actions;
-  $("ai-pane").classList.toggle("hidden", !a?.shown);
+  $("deploy-pane").classList.toggle("hidden", !a?.shown);
   if (!a?.shown) return;
-  const working = a.requests.some((r) => r.state === "sent" || r.state === "working");
-  const busy = working || !!a.running;
-  $("ai-prompt").disabled = !a.ai.available;
-  $("ai-send").disabled = !a.ai.available || busy;
-  renderAiCtx();
-  $("ai-hint").textContent = !a.ai.available ? a.ai.reason : a.running ? `${a.running} is running…` : working ? "The AI is working on it…" : "";
-  $("ai-reqs").innerHTML = a.requests.slice(0, 4).map((r) => `<div class="ai-req st-${esc(r.state.replace(/ /g, "-"))}">
-      <div class="top"><span class="st">${esc(r.state)}</span><span class="p">${esc(r.prompt)}</span><span class="t">${esc(fmtWhen(r.updated))}</span></div>
-      ${r.context ? `<div class="c" title="${esc(r.context)}">${esc(ctxSummary(r.context))}</div>` : ""}
-      ${r.summary ? `<div class="s">${esc(r.summary)}</div>` : ""}</div>`).join("");
+  const busy = !!a.running;
   const pend = pendingChange();
-  $("ai-deploy").classList.toggle("hidden", !pend && !a.running);
-  $("ai-pend").textContent = a.running === "Apply" ? "Deploying to the Miniserver… (download, check, upload, restart, verify)"
-    : a.running ? `${a.running}…` : pend ? `Compiled changes are pending (${fmtWhen(pend.time)}). Review them, then apply.` : "";
+  $("deploy-pend").classList.toggle("idle", !pend && !a.running);
+  $("deploy-pend").textContent = a.running === "Apply" ? "Deploying to the Miniserver… (download, check, upload, restart, verify)"
+    : a.running ? `${a.running}…` : pend ? `Compiled changes are pending (${fmtWhen(pend.time)}). Review them, then apply.`
+    : !a.apply.available ? `Apply is off: ${a.apply.reason}.`
+    : "Nothing pending. Edit the project's module and compile it (lox logic …); the result shows here for review.";
+  $("deploy-row").classList.toggle("hidden", !pend && !a.running);
   $("btn-apply").disabled = !a.apply.available || busy || !pend;
   const sync = $("btn-sync");
   sync.disabled = !a.apply.available || busy || !!pend;
@@ -1496,34 +1430,15 @@ function renderActions() {
   if (last && last.at !== renderActions.shownAt) {
     renderActions.shownAt = last.at;
     const head = { apply: ["Applied.\n", "Apply failed.\n"], sync: ["", "Sync failed.\n"], discard: ["", "Discard failed.\n"] }[last.kind] || ["", ""];
-    aiMsg(head[last.ok ? 0 : 1] + last.message, !last.ok);
+    deployMsg(head[last.ok ? 0 : 1] + last.message, !last.ok);
   }
 }
-$("ai-form").addEventListener("submit", async (e) => {
-  e.preventDefault();
-  const text = $("ai-prompt").value.trim();
-  if (!text) return;
-  $("ai-send").disabled = true;
-  aiMsg("");
-  try {
-    await act("/api/ai", { prompt: text, context: aiCtxPayload() });
-    aiCtx.blocks.clear();
-    renderAiCtx(); markAiCtx();
-    $("ai-prompt").value = "";
-    await refreshActions();
-  } catch (err) {
-    aiMsg(err.message, true);
-  } finally { renderActions(); }
-});
-$("ai-prompt").addEventListener("keydown", (e) => {
-  if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); $("ai-form").requestSubmit(); }
-});
 $("btn-apply").onclick = async () => {
   const pend = pendingChange();
   if (!pend) return;
   if (!window.confirm("Deploy the pending changes to the Miniserver?\n\nlox config push uploads the config and restarts the Miniserver's program (a few seconds), " +
     "checks that it runs exactly the compiled config, then vislox commits and pushes to git.")) return;
-  aiMsg("");
+  deployMsg("");
   // lox refuses some pushes until the user allows them; ask, then retry with that allowed.
   const opts = {};
   for (let tries = 0; tries < 3; tries++) {
@@ -1541,19 +1456,19 @@ $("btn-apply").onclick = async () => {
         "\n\nDelete them and apply?")) {
         opts.discard_custom_changes = true; continue;
       }
-      aiMsg(err.message, true);
+      deployMsg(err.message, true);
       return;
     }
   }
 };
 $("btn-sync").onclick = async () => {
-  aiMsg("");
-  try { const j = await act("/api/sync"); aiMsg(j.message); } catch (err) { aiMsg(err.message, true); }
+  deployMsg("");
+  try { const j = await act("/api/sync"); deployMsg(j.message); } catch (err) { deployMsg(err.message, true); }
 };
 $("btn-discard").onclick = async () => {
   if (!window.confirm("Discard the pending changes? The module, lock and compiled config go back to the last commit.")) return;
-  aiMsg("");
-  try { const j = await act("/api/discard"); aiMsg(j.message); } catch (err) { aiMsg(err.message, true); }
+  deployMsg("");
+  try { const j = await act("/api/discard"); deployMsg(j.message); } catch (err) { deployMsg(err.message, true); }
 };
 
 // ── live values ────────────────────────────────────────────────────────

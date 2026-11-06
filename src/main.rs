@@ -64,14 +64,10 @@ struct Args {
     /// The lox binary that pulls the config (`lox config pull`).
     #[arg(long, value_name = "PATH", default_value = "lox")]
     lox: PathBuf,
-    /// For a lox.toml project: a file holding the admin token that the AI
-    /// box, Apply and Discard ask for. Without it they are off.
+    /// For a lox.toml project: a file holding the admin token that Apply,
+    /// Sync and Discard ask for. Without it they are off.
     #[arg(long, value_name = "FILE")]
     admin_token_file: Option<PathBuf>,
-    /// For a lox.toml project: a file holding the webhook URL that AI
-    /// requests are sent to.
-    #[arg(long, value_name = "FILE")]
-    ai_webhook_file: Option<PathBuf>,
 }
 
 struct App {
@@ -152,30 +148,14 @@ async fn main() -> Result<()> {
                 .as_deref()
                 .map(actions::read_secret)
                 .transpose()?,
-            webhook: args
-                .ai_webhook_file
-                .as_deref()
-                .map(actions::read_secret)
-                .transpose()?,
             project: src.project.clone(),
             lox: args.lox.clone(),
-            status_url: {
-                // The agent runs on this machine.
-                let mut a = args.listen;
-                if a.ip().is_unspecified() {
-                    a.set_ip(std::net::Ipv4Addr::LOCALHOST.into());
-                }
-                format!("http://{a}/api/ai/status")
-            },
         }),
     });
     if src.project.is_some() {
-        let i = app.actions.info();
-        for (what, k) in [("AI requests", "ai"), ("Apply", "apply")] {
-            match i[k]["reason"].as_str() {
-                None => eprintln!("vislox: {what} on"),
-                Some(why) => eprintln!("vislox: no {what}: {why}"),
-            }
+        match app.actions.info()["apply"]["reason"].as_str() {
+            None => eprintln!("vislox: Apply, Sync and Discard on"),
+            Some(why) => eprintln!("vislox: no Apply: {why}"),
         }
     }
 
@@ -215,8 +195,6 @@ async fn main() -> Result<()> {
         .route("/api/events", get(api_events))
         .route("/api/live", get(api_live))
         .route("/api/pull", axum::routing::post(api_pull))
-        .route("/api/ai", axum::routing::post(api_ai))
-        .route("/api/ai/status", axum::routing::post(api_ai_status))
         .route("/api/apply", axum::routing::post(api_apply))
         .route("/api/discard", axum::routing::post(api_discard))
         .route("/api/sync", axum::routing::post(api_sync))
@@ -408,7 +386,7 @@ async fn api_events(
     let history = BroadcastStream::new(rx)
         .filter_map(|v| v.ok())
         .map(|v| Ok(Event::default().event("history").data(v.to_string())));
-    // AI requests, Apply and Discard: the whole state, on every change.
+    // Apply, Sync and Discard: the whole state, on every change.
     let a = app.clone();
     let actions = BroadcastStream::new(app.actions.subscribe()).map(move |_| {
         Ok(Event::default()
@@ -474,40 +452,6 @@ async fn api_pull(State(app): State<Arc<App>>, headers: axum::http::HeaderMap) -
 
 fn refused((status, msg): actions::Refusal) -> Response {
     (status, Json(serde_json::json!({ "error": msg }))).into_response()
-}
-
-#[derive(Deserialize)]
-struct AskBody {
-    prompt: String,
-    #[serde(default)]
-    context: actions::AskContext,
-}
-
-/// Send a change request to the AI agent's webhook.
-async fn api_ai(
-    State(app): State<Arc<App>>,
-    headers: axum::http::HeaderMap,
-    Json(b): Json<AskBody>,
-) -> Response {
-    if let Err(r) = app.actions.check(&headers) {
-        return refused(r);
-    }
-    match app.actions.ask(&b.prompt, &b.context).await {
-        Ok(v) => Json(v).into_response(),
-        Err(r) => refused(r),
-    }
-}
-
-/// The agent reports on a request; authorized by the request's own key.
-async fn api_ai_status(State(app): State<Arc<App>>, Json(v): Json<serde_json::Value>) -> Response {
-    match app.actions.report(&v) {
-        Ok(()) => {
-            let a = app.clone();
-            let _ = tokio::task::spawn_blocking(move || refresh(&a)).await;
-            Json(serde_json::json!({ "ok": true })).into_response()
-        }
-        Err(r) => refused(r),
-    }
 }
 
 /// Deploy the pending changes with `lox config push --force`, commit, push.
