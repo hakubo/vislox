@@ -55,6 +55,30 @@ pub struct Actions {
     edit_state: Mutex<EditState>,
     /// `GET /api/edits`, for the [`EditState::key`] it was worked out for.
     edits_cache: Mutex<Option<(String, Value)>>,
+    /// What vislox's last compile compiled: each module file's blob id (by
+    /// its path from the project), and the blob id of the `out` it wrote.
+    /// An edit checks the module against it by content ([`Self::uncompiled`]).
+    compiled: Mutex<Option<Compiled>>,
+}
+
+/// The module as a compile read it, and the config it wrote.
+#[derive(Clone, PartialEq)]
+struct Compiled {
+    module: std::collections::BTreeMap<String, String>,
+    out: String,
+}
+
+/// Each file of the module (as lox reads it: not hidden ones), by its path
+/// from the project, with its blob id.
+fn module_blobs(p: &loxone_config::Project) -> std::collections::BTreeMap<String, String> {
+    let mut m = std::collections::BTreeMap::new();
+    edit::module_files(&p.module, &mut |f, _| {
+        if let Ok(b) = std::fs::read(f) {
+            let rel = f.strip_prefix(&p.root).unwrap_or(f).display().to_string();
+            m.insert(rel, crate::history::blob_id(&b));
+        }
+    });
+    m
 }
 
 /// Whether editing is on, and what `GET /api/edits` depends on: worked out
@@ -570,6 +594,7 @@ impl Actions {
             tx,
             edit_state: Mutex::new(EditState::default()),
             edits_cache: Mutex::new(None),
+            compiled: Mutex::new(None),
         };
         a.edit_state.lock().unwrap().why = a.why_not_edit_now();
         a
@@ -1257,6 +1282,13 @@ impl Actions {
                     p.out.display()
                 ))
             })?;
+        // What this compile compiled, for the next edit's check. Taken
+        // before it is kept: a refused move puts the lock and out back, and
+        // then out no longer matches it.
+        let compiled = Compiled {
+            module: module_blobs(&p),
+            out: blob.clone(),
+        };
         // The UUIDs lox minted for the new blocks.
         let lock = edit::Lock::read(&p.lock);
         // A move lox did not keep is refused, not shown as done. A page laid
@@ -1278,26 +1310,60 @@ impl Actions {
             .map(|s| json!({ "slug": s, "uuid": lock.uuid_of(s) }))
             .collect();
         undo.keep();
+        *self.compiled.lock().unwrap() = Some(compiled);
         Ok(json!({ "previous": previous, "blob": blob, "added": added }))
     }
 
     /// Refuse when the module holds changes that are not compiled into the
-    /// pending config: an edit's compile would fold them in. Module files
-    /// newer than `out` make vislox compile the module as it is into a
-    /// scratch copy and compare; only a different result refuses.
+    /// pending config: an edit's compile would fold them in. By content,
+    /// never by modification times alone (two writes can share a timestamp):
+    /// a module and `out` exactly as vislox's last compile left them are
+    /// compiled; anything else is compiled as it is into a scratch copy and
+    /// compared with `out`, and only a different result refuses.
     async fn uncompiled(&self, p: &loxone_config::Project, dir: &Path) -> Result<(), Refusal> {
         use axum::http::StatusCode;
         let refuse = |msg: String| (StatusCode::CONFLICT, msg);
-        let out_time = std::fs::metadata(&p.out).and_then(|m| m.modified()).ok();
-        let mut newer = Vec::new();
-        edit::module_files(&p.module, &mut |f, t| {
-            if out_time.is_none_or(|o| t > o) {
-                newer.push(f.strip_prefix(&p.root).unwrap_or(f).display().to_string());
-            }
-        });
-        if newer.is_empty() {
+        let module = module_blobs(p);
+        let out_blob = std::fs::read(&p.out)
+            .ok()
+            .map(|b| crate::history::blob_id(&b));
+        let last = self.compiled.lock().unwrap().clone();
+        if let (Some(last), Some(o)) = (&last, &out_blob)
+            && last.module == module
+            && &last.out == o
+        {
             return Ok(());
         }
+        // The files that changed: since vislox's last compile, else those
+        // written no earlier than out (a guess, for the message only).
+        let changed: Vec<String> = match &last {
+            Some(last) => module
+                .iter()
+                .filter(|(f, b)| last.module.get(*f) != Some(*b))
+                .map(|(f, _)| f.clone())
+                .chain(
+                    last.module
+                        .keys()
+                        .filter(|f| !module.contains_key(*f))
+                        .cloned(),
+                )
+                .collect(),
+            None => {
+                let out_time = std::fs::metadata(&p.out).and_then(|m| m.modified()).ok();
+                let mut v = Vec::new();
+                edit::module_files(&p.module, &mut |f, t| {
+                    if out_time.is_none_or(|o| t >= o) {
+                        v.push(f.strip_prefix(&p.root).unwrap_or(f).display().to_string());
+                    }
+                });
+                v
+            }
+        };
+        let files = if changed.is_empty() {
+            "its files".to_string()
+        } else {
+            changed.join(", ")
+        };
         let reference = std::fs::read(&p.out)
             .or_else(|_| std::fs::read(&p.base))
             .map_err(|e| refuse(format!("cannot read the pending config: {e}")))?;
@@ -1316,14 +1382,20 @@ impl Actions {
         }
         let (lock_s, out_s) = (lock.to_string_lossy(), out.to_string_lossy());
         let args = ["logic", "compile", "--lock", &lock_s, "--out", &out_s];
-        let files = newer.join(", ");
         match run(&self.s.lox, &args, dir, COMPILE_TIMEOUT).await {
             Err(e) => Err(refuse(format!(
                 "The module does not compile as it is ({files} changed since the last compile). \
                  Fix or discard that, then edit:\n{}",
                 last_lines(&e, 6)
             ))),
-            Ok(_) if std::fs::read(&out).ok().as_deref() == Some(reference.as_slice()) => Ok(()),
+            Ok(_) if std::fs::read(&out).ok().as_deref() == Some(reference.as_slice()) => {
+                // Compiled as it is: remembered, so the next edit need not
+                // compile it again.
+                if let Some(o) = out_blob {
+                    *self.compiled.lock().unwrap() = Some(Compiled { module, out: o });
+                }
+                Ok(())
+            }
             Ok(_) => Err(refuse(format!(
                 "The module has changes that are not compiled yet ({files}). An edit compiles the \
                  whole module and would take them along: compile them (lox logic compile) or \
@@ -2254,7 +2326,7 @@ if [ -f pages/foo.loxl ]; then echo "<!-- foo -->" >> "$out"; fi
         // The browser goes away while lox compiles (and has written half of out).
         let edit = a.edit(&req, None);
         let r = tokio::time::timeout(Duration::from_millis(1500), edit).await;
-        assert!(r.is_err(), "the compile should still run");
+        assert!(r.is_err(), "the compile should still run: {r:?}");
         assert_eq!(a.info()["running"], Value::Null);
         assert_eq!(std::fs::read(d.join("out.Loxone")).unwrap(), out);
         assert!(!d.join("logic.lock.json").exists());
@@ -2276,23 +2348,80 @@ if [ -f pages/foo.loxl ]; then echo "<!-- foo -->" >> "$out"; fi
         a.edit(&title(blob(&d, "out.Loxone"), Some("Teiler")), None)
             .await
             .unwrap();
-        // Someone else's change, not compiled: refused, nothing written.
+        // As the last edit left it: no scratch compile needed.
+        let compiles = || {
+            std::fs::read_to_string(tmp.path().join("calls.log"))
+                .unwrap()
+                .lines()
+                .count()
+        };
+        let n = compiles();
+        a.edit(&title(blob(&d, "out.Loxone"), Some("Teiler2")), None)
+            .await
+            .unwrap();
+        assert_eq!(compiles(), n + 1);
+        // Someone else's change, not compiled: refused, nothing written. By
+        // content, whatever the file's time: here older than out (copied
+        // in with its time kept), or written in the same clock tick.
         let file = std::fs::read_to_string(d.join("pages").join(edit::FILE)).unwrap();
         let out = blob(&d, "out.Loxone");
+        let out_time = std::fs::metadata(d.join("out.Loxone"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        for when in [out_time - std::time::Duration::from_secs(3600), out_time] {
+            std::fs::write(d.join("pages/foo.loxl"), "# someone else's\n").unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(d.join("pages/foo.loxl"))
+                .unwrap()
+                .set_modified(when)
+                .unwrap();
+            let (code, msg) = a
+                .edit(&title(out.clone(), Some("Neu")), None)
+                .await
+                .unwrap_err();
+            assert_eq!(code, StatusCode::CONFLICT);
+            assert!(
+                msg.contains("not compiled yet") && msg.contains("pages/foo.loxl"),
+                "{msg}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(d.join("pages").join(edit::FILE)).unwrap(),
+                file
+            );
+            assert_eq!(blob(&d, "out.Loxone"), out);
+        }
+    }
+
+    /// Without a compile of vislox's to go by (after a restart), the module
+    /// is compiled as it is and compared, whatever the files' times.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_uncompiled_change_is_found_without_a_previous_edit() {
+        use axum::http::StatusCode;
+        let (tmp, a) = project_for_edits();
+        let d = tmp.path().join("project");
+        let old = std::fs::metadata(d.join("out.Loxone"))
+            .unwrap()
+            .modified()
+            .unwrap()
+            - std::time::Duration::from_secs(3600);
         std::fs::write(d.join("pages/foo.loxl"), "# someone else's\n").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(d.join("pages/foo.loxl"))
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        let out = blob(&d, "out.Loxone");
         let (code, msg) = a
             .edit(&title(out.clone(), Some("Neu")), None)
             .await
             .unwrap_err();
         assert_eq!(code, StatusCode::CONFLICT);
-        assert!(
-            msg.contains("not compiled yet") && msg.contains("pages/foo.loxl"),
-            "{msg}"
-        );
-        assert_eq!(
-            std::fs::read_to_string(d.join("pages").join(edit::FILE)).unwrap(),
-            file
-        );
+        assert!(msg.contains("not compiled yet"), "{msg}");
+        assert!(!d.join("pages").join(edit::FILE).exists());
         assert_eq!(blob(&d, "out.Loxone"), out);
     }
 
@@ -2306,6 +2435,8 @@ if [ -f pages/foo.loxl ]; then echo "<!-- foo -->" >> "$out"; fi
             r#"#!/bin/sh
 echo "$*" >> ../calls.log
 [ "$1 $2" = "logic compile" ] || { echo "unexpected: $*" >&2; exit 2; }
+out=out.Loxone; lock=logic.lock.json; prev=
+for a in "$@"; do [ "$prev" = --out ] && out=$a; [ "$prev" = --lock ] && lock=$a; prev=$a; done
 n=0; objs=""; els=""
 for s in $(cat pages/vislox/*.loxl 2>/dev/null | sed -n 's/^\(vx_[a-z0-9_]*\) = .*/\1/p'); do
   n=$((n+1)); u="aaaaaaa$n-0000-0000-ffff504f94000001"
@@ -2313,8 +2444,8 @@ for s in $(cat pages/vislox/*.loxl 2>/dev/null | sed -n 's/^\(vx_[a-z0-9_]*\) = 
   els="$els<C Type=\"And\" U=\"$u\" Title=\"$s\"><Co K=\"I1\"/></C>
 "
 done
-echo "{\"objects\":{$objs}}" > logic.lock.json
-{ sed '$d' base.Loxone | sed '$d'; printf '%s' "$els"; printf '\t</C>\n</ControlList>\n'; } > out.Loxone
+echo "{\"objects\":{$objs}}" > "$lock"
+{ sed '$d' base.Loxone | sed '$d'; printf '%s' "$els"; printf '\t</C>\n</ControlList>\n'; } > "$out"
 "#,
         )
         .unwrap();
@@ -2445,12 +2576,14 @@ echo "{\"objects\":{$objs}}" > logic.lock.json
             r#"#!/bin/sh
 echo "$*" >> ../calls.log
 [ "$1 $2" = "logic compile" ] || { echo "unexpected: $*" >&2; exit 2; }
-cp logic.lock.json ../lock-seen.json
-px=$(sed -n '/"layout"/,/}/s/.*"px": \(-\{0,1\}[0-9]*\).*/\1/p' logic.lock.json | head -1)
-py=$(sed -n '/"layout"/,/}/s/.*"py": \(-\{0,1\}[0-9]*\).*/\1/p' logic.lock.json | head -1)
+out=out.Loxone; lock=logic.lock.json; prev=
+for a in "$@"; do [ "$prev" = --out ] && out=$a; [ "$prev" = --lock ] && lock=$a; prev=$a; done
+cp "$lock" ../lock-seen.json
+px=$(sed -n '/"layout"/,/}/s/.*"px": *\(-\{0,1\}[0-9]*\).*/\1/p' "$lock" | head -1)
+py=$(sed -n '/"layout"/,/}/s/.*"py": *\(-\{0,1\}[0-9]*\).*/\1/p' "$lock" | head -1)
 case "$*" in *--relayout*) px=96; py=96 ;; esac
 [ "$px" = 9600 ] && px=4032
-sed '/U="10000006-0000-0060-ffff504f94000001"/s/Px="[0-9-]*" Py="[0-9-]*"/Px="'"$px"'" Py="'"$py"'"/' base.Loxone > out.Loxone
+sed '/U="10000006-0000-0060-ffff504f94000001"/s/Px="[0-9-]*" Py="[0-9-]*"/Px="'"$px"'" Py="'"$py"'"/' base.Loxone > "$out"
 "#,
         )
         .unwrap();

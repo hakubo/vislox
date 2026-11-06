@@ -53,9 +53,11 @@ POST /api/edit
 - All ops of one request are checked first, then written and compiled once. If anything fails, or the request
   goes away mid-compile (a closed tab), the file, the lock and `out.Loxone` are put back as they were.
 - **An edit never takes along someone else's uncompiled changes.** The compile covers the whole module, so
-  before it, vislox checks that the module is what `out.Loxone` was compiled from. When a module file is newer
-  than `out`, it compiles the module as it is into a scratch copy (copied lock, `--out` elsewhere) and compares;
-  a different result refuses the edit with 409, naming the files: compile or discard them first.
+  before it, vislox checks that the module is what `out.Loxone` was compiled from, by content, not by file times
+  (two writes can share one). A module and `out` exactly as vislox's last compile left them (each file's blob id,
+  and out's) pass; otherwise vislox compiles the module as it is into a scratch copy (copied lock, `--out`
+  elsewhere) and compares. A different result refuses the edit with 409, naming the files that changed: compile
+  or discard them first.
 
 Later steps add operations to the same list: `wire` and `unwire` (#61).
 

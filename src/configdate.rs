@@ -22,11 +22,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::SystemTime;
 
-/// What the date found depends on: the base file, and the downloads it is
-/// looked for in (a file added to `backups/` changes the directory's time).
+/// What the date found depends on: the base file (by content: a rewrite of
+/// the same size can keep its time), and the downloads it is looked for in
+/// (a file added to `backups/` changes the directory's time).
 #[derive(Clone, PartialEq, Debug)]
 struct Stamp {
-    base: (u64, Option<SystemTime>),
+    base: String,
     backup_zip: Option<SystemTime>,
     backups: Option<SystemTime>,
 }
@@ -54,13 +55,13 @@ impl BaseDate {
     /// is found. Blocking (reads files, when the base or the downloads
     /// changed since the last time; a date not found is remembered too).
     pub fn get(&self) -> Option<String> {
-        let stamp = self.stamp()?;
+        let bytes = std::fs::read(&self.file).ok()?;
+        let stamp = self.stamp(&bytes);
         if let Some((s, v)) = self.cache.lock().unwrap().as_ref()
             && *s == stamp
         {
             return v.clone();
         }
-        let bytes = std::fs::read(&self.file).ok()?;
         let v = find(&self.file, self.backups.as_deref(), &bytes);
         *self.cache.lock().unwrap() = Some((stamp, v.clone()));
         v
@@ -71,17 +72,16 @@ impl BaseDate {
         *self.cache.lock().unwrap() = None;
     }
 
-    fn stamp(&self) -> Option<Stamp> {
+    fn stamp(&self, bytes: &[u8]) -> Stamp {
         let modified = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
-        let m = std::fs::metadata(&self.file).ok()?;
-        Some(Stamp {
-            base: (m.len(), m.modified().ok()),
+        Stamp {
+            base: crate::history::blob_id(bytes),
             backup_zip: self
                 .file
                 .parent()
                 .and_then(|d| modified(&d.join("backup.zip"))),
             backups: self.backups.as_deref().and_then(modified),
-        })
+        }
     }
 }
 
