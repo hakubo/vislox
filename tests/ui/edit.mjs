@@ -78,7 +78,8 @@ for (const line of src.split("\\n")) {
   const j = out.findIndex((l, n) => n > i && l.includes(\`<Co K="\${key}"\`));
   out[j] = out[j].replace(/ Def="[^"]*"/, "").replace(\`<Co K="\${key}"\`, \`<Co K="\${key}" Def="\${unq(m[3])}"\`);
 }
-fs.writeFileSync("out.Loxone", out.join("\\n"));
+const to = process.argv.indexOf("--out");
+fs.writeFileSync(to > 0 ? process.argv[to + 1] : "out.Loxone", out.join("\\n"));
 `);
 chmodSync(fakeLox, 0o755);
 const token = join(loxDir, "token");
@@ -175,6 +176,8 @@ try {
   await step("Revert hands one value back", async () => {
     await pick(DIV);
     const n = edits.length;
+    // The list is replaced while the page shows it: Revert still reverts its own value.
+    await page.evaluate(() => S.edits.claims.reverse());
     await page.click('#props .pr:has-text("In2") [data-ed="revert"]');
     await page.waitForFunction(() => document.querySelectorAll("#props .ed-tag").length === 2);
     assert.deepEqual(edits[n].ops, [{ op: "param", uuid: DIV, port: "Input2", value: null }]);
@@ -189,7 +192,7 @@ try {
   await step("nothing was deployed: lox only compiled", async () => {
     const ran = readFileSync(calls, "utf8").trim().split("\n");
     assert.ok(ran.length >= 2, ran.join(" | "));
-    assert.ok(ran.every((l) => l === "logic compile"), ran.join(" | "));
+    assert.ok(ran.every((l) => l.startsWith("logic compile")), ran.join(" | "));
   });
   await step("no errors in the browser", async () => {
     assert.deepEqual(errors, []);

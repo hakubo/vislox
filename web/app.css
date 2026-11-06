@@ -294,7 +294,7 @@ button.chip { cursor: pointer; } button.chip:hover { border-color: var(--brand);
 .marks-on .ghosted .body, .marks-on .ghosted .bar { stroke-dasharray: 6 4; }
 .marks-off .halo, .marks-off .ghost, .marks-off .dbadge, .marks-off .pin-chg, .marks-off .ghost-note { display: none; }
 .marks-off .d-removed, .marks-off .wire.d-removed, .marks-off .xref.d-removed, .marks-off .ghosted { display: none; }
-rect.ghost { fill: #1f6fd10a; stroke: var(--moved); stroke-opacity: .45; stroke-width: 1.2px; stroke-dasharray: 4 5; vector-effect: non-scaling-stroke; pointer-events: none; }
+rect.ghost, line.ghost { fill: #1f6fd10a; stroke: var(--moved); stroke-opacity: .45; stroke-width: 1.2px; stroke-dasharray: 4 5; vector-effect: non-scaling-stroke; pointer-events: none; }
 .ghost-line { stroke: var(--moved); stroke-opacity: .4; stroke-width: 1px; stroke-dasharray: 2 4; vector-effect: non-scaling-stroke; }
 .dbadge circle { stroke: #fff; stroke-width: 1.5px; vector-effect: non-scaling-stroke; }
 .dbadge text { fill: #fff; font-weight: 700; font-size: 150px; }

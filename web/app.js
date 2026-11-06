@@ -161,7 +161,7 @@ async function loadHistory(fromEvent) {
   renderLiveSwitch();
   renderPull();
   renderActions();
-  loadEdits();
+  editsChanged();
   renderLog();
   if (fromEvent) {
     setStatus("updated " + new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }), "live flash");
@@ -1197,7 +1197,7 @@ $("props").addEventListener("click", (e) => {
     if (what === "open") editOpen(S.sel);
     else if (what === "save") editSave();
     else if (what === "cancel") editClose();
-    else if (what === "revert") editRevert(Number(eb.dataset.i));
+    else if (what === "revert") editRevert(eb.dataset.key);
     else if (what === "newest") editGoNewest();
     return;
   }
@@ -2355,12 +2355,20 @@ $("btn-discard").onclick = async () => {
 // applied and discarded like any other. Saving never deploys: only Apply does.
 S.edits = null; // GET /api/edits: what vislox's file claims, and which of it is not deployed
 S.edit = { uuid: null, open: false, draft: {}, bad: {}, busy: false, msg: "", err: "" };
+S.editsKey = null; // the server's key of what /api/edits says (vislox's file, deployed and pending config)
 async function loadEdits() {
   if (!S.hist?.actions?.shown) { S.edits = null; return; }
-  try { S.edits = await api("/api/edits"); } catch { S.edits = null; }
+  try { S.edits = await api("/api/edits"); } catch { S.edits = null; S.editsKey = null; }
   renderActions();
   if (S.sel && S.view) renderProps();
 }
+/** Fetch the edits again only when the server says they may have changed. */
+function editsChanged() {
+  const key = S.hist?.actions?.edit?.key ?? null;
+  if (key !== S.editsKey) { S.editsKey = key; loadEdits(); }
+}
+/** One claimed value, whatever the order of the list: its op, object and port or setting. */
+function editKey(c) { return [c.op, c.uuid, c.port ?? c.name ?? ""].join("|"); }
 /** The revision edits are made against: the newest compile, else the deployed config on disk. */
 function editRev() {
   const p = S.hist?.pending?.[0];
@@ -2407,10 +2415,9 @@ function editRows(o, row) {
   const mine = S.edit.uuid === o.uuid ? S.edit : null;
   // What was edited here and is not deployed yet, each with a way back.
   for (const c of editsPending(o.uuid)) {
-    const i = S.edits.claims.indexOf(c);
     const v = c.value == null ? '<span class="none-v">back to Loxone Config\'s value</span>' : esc(c.value);
     rows.push(row(editLabel(o, c), `<span class="ed-v">${v}</span><span class="ed-tag" title="Saved into the module and compiled, not on the Miniserver yet: Apply deploys it, Discard drops it">not deployed</span>` +
-      (st.ok ? `<button type="button" class="ed-btn small" data-ed="revert" data-i="${i}" title="${c.committed == null ? "Hand the value back to Loxone Config" : `Back to ${esc(c.committed)}, as last committed`}">Revert</button>` : ""), "pr-chg"));
+      (st.ok ? `<button type="button" class="ed-btn small" data-ed="revert" data-key="${esc(editKey(c))}" title="${c.deployed == null ? "Hand the value back to Loxone Config" : `Back to ${esc(c.deployed)}, as deployed`}">Revert</button>` : ""), "pr-chg"));
   }
   if (!st.ok) {
     rows.push(`<div class="ed-note">${esc(st.why)}${st.newest ? ' <button type="button" class="lnk" data-ed="newest">View it</button>' : ""}</div>`);
@@ -2477,11 +2484,12 @@ async function editSend(uuid, rev, ops) {
     renderProps();
   }
 }
-async function editRevert(i) {
-  const c = S.edits?.claims?.[i], o = c && S.view?.objects[c.uuid], st = o && editState(o);
+/** Back to the deployed value: claim what the deployed revision claimed, or nothing. */
+async function editRevert(key) {
+  const c = (S.edits?.claims || []).find((x) => editKey(x) === key && x.pending), o = c && S.view?.objects[c.uuid], st = o && editState(o);
   if (!st?.ok) return;
   const op = EDIT_ATTR[c.op] ? { op: c.op, uuid: c.uuid } : c.op === "param" ? { op: "param", uuid: c.uuid, port: c.port } : { op: "setting", uuid: c.uuid, name: c.name };
-  await editSend(c.uuid, st.rev, [{ ...op, value: c.committed }]);
+  await editSend(c.uuid, st.rev, [{ ...op, value: c.deployed }]);
 }
 async function editShowNewest() {
   await loadHistory();
@@ -3456,7 +3464,16 @@ function connect() {
   es.addEventListener("history", () => { loadHistory(true); loadCal(); });
   // `changed`: re-read it. `read` again unchanged: only an Apply waiting for a read cares.
   es.addEventListener("app", (e) => { if (e.data !== "read" || (S.deployed && !awaitedAppRead())) loadApp(); });
-  es.addEventListener("actions", (e) => { if (S.hist) { S.hist.actions = JSON.parse(e.data); renderActions(); } });
+  es.addEventListener("actions", (e) => {
+    if (!S.hist) return;
+    const was = S.hist.actions;
+    S.hist.actions = JSON.parse(e.data);
+    renderActions();
+    editsChanged();
+    // The Edit section shows whether editing is on and what runs.
+    const a = S.hist.actions;
+    if ((was?.running !== a.running || was?.edit?.available !== a.edit?.available || was?.edit?.reason !== a.edit?.reason) && S.sel && S.view) renderProps();
+  });
   es.addEventListener("calendar", () => loadCal());
   es.addEventListener("operate", (e) => { if (S.hist) { S.hist.operate = JSON.parse(e.data); renderHistory(); } });
   es.onerror = () => setStatus("disconnected — retrying", "error");

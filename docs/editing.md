@@ -37,8 +37,12 @@ POST /api/edit
 - `value: null` drops vislox's claim: lox puts back the value Loxone Config had before.
 - The reply has, per op, the value vislox claimed before (`previous`), and the new pending blob id. An op with its
   `previous` value undoes it: that is all #62 needs from the server. The history itself can live in the browser.
-- All ops of one request are checked first, then written and compiled once. If anything fails, the file, the
-  lock and `out.Loxone` are put back as they were.
+- All ops of one request are checked first, then written and compiled once. If anything fails, or the request
+  goes away mid-compile (a closed tab), the file, the lock and `out.Loxone` are put back as they were.
+- **An edit never takes along someone else's uncompiled changes.** The compile covers the whole module, so
+  before it, vislox checks that the module is what `out.Loxone` was compiled from. When a module file is newer
+  than `out`, it compiles the module as it is into a scratch copy (copied lock, `--out` elsewhere) and compares;
+  a different result refuses the edit with 409, naming the files: compile or discard them first.
 
 Later steps add operations to the same list: `add_block` (#59), `move` (#60), `wire` and `unwire` (#61).
 
@@ -116,6 +120,11 @@ Around the module: #64 (mark managed blocks), #65 (`lox logic check` errors), #6
 
 - Properties has an *Edit* section on the newest revision: *Edit values* opens a form for the name, the
   room and category, the unwired inputs and the settings. Numbers are checked in the browser; lox checks ranges and the rest.
-- A value saved and not deployed yet (it differs from the last commit) shows *not deployed*, with *Revert*
-  (back to the last commit). The Deploy pane counts them.
-- `GET /api/edits` lists what vislox's file claims now and at the last commit, and the blocks the module manages.
+- **Not deployed** means the pending config's value differs from the deployed config's, for a value vislox
+  claims now or claimed in the deployed revision. The deployed revision is the newest git commit of the base
+  (the last Apply, Pull or Sync), as for the app's calendar entries, so a plain `git commit` deploys nothing.
+  Such a value shows *not deployed*, with *Revert*: back to what the deployed revision claimed (or no claim).
+  The Deploy pane counts them.
+- `GET /api/edits` lists what vislox's file claims now and in the deployed revision, which of it is not
+  deployed, and the blocks the module manages. It is worked out again only when vislox's file, the deployed or
+  the pending config changes (`actions.edit.key`); the browser fetches it only then.

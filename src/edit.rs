@@ -625,11 +625,8 @@ pub fn apply(
             ..
         } => {
             let v = match (value, caps.settings.iter().find(|s| &s.name == setting)) {
-                (Some(v), Some(cap)) if cap.text => Some(Value::Str(text(
-                    v,
-                    setting,
-                    setting == "Installation" || setting.starts_with("SwitchBoard"),
-                )?)),
+                // Settings are optional text: empty clears them (`Desc=""`).
+                (Some(v), Some(cap)) if cap.text => Some(Value::Str(text(v, setting, true)?)),
                 (Some(v), Some(_)) => {
                     let n = number(v).map_err(|e| format!("{setting}: {e}"))?;
                     if NON_NEGATIVE.contains(&setting.as_str()) && n.starts_with('-') {
@@ -686,6 +683,60 @@ pub fn check_module(module: &Path) -> Result<(), String> {
         Ok(())
     } else {
         Err(out_of_range.join("\n"))
+    }
+}
+
+/// A `.Loxone` file's (or backup's) program, parsed.
+pub fn parse_doc(bytes: &[u8]) -> Result<LoxoneDoc, String> {
+    let xml = crate::source::program_xml(bytes).map_err(|e| e.to_string())?;
+    LoxoneDoc::parse(&xml).map_err(|e| e.to_string())
+}
+
+/// The value `op` changes, as `doc` has it (`None`: no such object, or the
+/// value is not set). An input without `Def=` holds 0.
+pub fn current(doc: &LoxoneDoc, op: &Op) -> Option<String> {
+    let el = find(&doc.xml.root, op.uuid())?;
+    let ty = el.attr("Type").unwrap_or_default();
+    let decoded = |e: &Element, a: &str| e.attr_decoded(a).map(|v| v.into_owned());
+    let place = |a: &str| {
+        let io = el.child_elements().find(|c| c.name == "IoData")?;
+        let id = io.attr(a).filter(|v| !v.is_empty())?;
+        decoded(find(&doc.xml.root, id)?, "Title")
+    };
+    match op {
+        Op::Title { .. } => decoded(el, "Title"),
+        Op::Room { .. } => place("Pr"),
+        Op::Category { .. } => place("Cr"),
+        Op::Param { port, .. } => {
+            let key = port_names::key_or_raw(ty, port);
+            let co = el
+                .child_elements()
+                .find(|c| c.name == "Co" && c.attr("K") == Some(key))?;
+            Some(co.attr("Def").unwrap_or("0").to_string())
+        }
+        Op::Setting { name, .. } => decoded(el, name),
+    }
+}
+
+/// Every file of the module directory (not hidden ones, as lox skips them),
+/// with its modification time.
+pub fn module_files(dir: &Path, found: &mut dyn FnMut(&Path, std::time::SystemTime)) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let path = e.path();
+        if path
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().starts_with('.'))
+        {
+            continue;
+        }
+        if path.is_dir() {
+            module_files(&path, found);
+        } else if let Ok(t) = e.metadata().and_then(|m| m.modified()) {
+            found(&path, t);
+        }
     }
 }
 
@@ -842,6 +893,19 @@ mod tests {
         apply(&mut c, &h, &none, &set("MinChange", "0.5")).unwrap();
         apply(&mut c, &h, &none, &set("Desc", "Pegel")).unwrap();
         assert_eq!(c.ops().len(), 2);
+        // An optional text clears to empty (lox writes `Desc=""`); a name cannot.
+        apply(&mut c, &h, &none, &set("Desc", "")).unwrap();
+        assert!(c.render().contains(".Desc = \"\""), "{}", c.render());
+        assert!(compile(&h, &c.render()).contains(r#"Desc="""#));
+        let no_name = Op::Title {
+            uuid: AI_IN.into(),
+            value: Some(String::new()),
+        };
+        assert!(
+            apply(&mut c, &h, &none, &no_name)
+                .unwrap_err()
+                .contains("cannot be empty")
+        );
     }
 
     #[test]
@@ -927,6 +991,26 @@ mod tests {
         assert!(text.contains(".room = \"Bad\""), "{text}");
         assert_eq!(Claims::parse(&text).unwrap(), c);
         assert!(compile(&d, &text).contains(r#"Pr="30000a02-0000-0000-ffff504f94000001""#));
+    }
+
+    #[test]
+    fn current_values_are_read_as_a_config_has_them() {
+        let d = doc("house.Loxone");
+        let get = |op: Op| current(&d, &op);
+        assert_eq!(get(param(DIV, "Input2", None)).as_deref(), Some("1000"));
+        // No `Def=`: 0.
+        assert_eq!(get(param(AND, "I2", None)).as_deref(), Some("0"));
+        let t = Op::Title {
+            uuid: DIV.into(),
+            value: None,
+        };
+        assert_eq!(get(t).as_deref(), Some("O1002"));
+        let room = Op::Room {
+            uuid: DIV.into(),
+            value: None,
+        };
+        assert_eq!(get(room), None);
+        assert_eq!(get(param("nope", "I1", None)), None);
     }
 
     #[test]
