@@ -66,6 +66,9 @@ pub struct Structure {
     loading: tokio::sync::Mutex<()>,
     /// The Miniserver serves few requests at once.
     icon_gate: Semaphore,
+    /// Icons the live text states named (Status blocks), which the
+    /// structure file does not list.
+    state_icons: Mutex<HashSet<String>>,
     /// One download per icon name at a time.
     icon_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
@@ -200,6 +203,18 @@ fn summarize(raw: &Value) -> (Map<String, Value>, HashSet<String>) {
     (out, icons)
 }
 
+/// Whether a name from a live text state may be fetched as an icon: no
+/// `..`, no leading `/`, no query, at most 128 plain characters.
+fn icon_name_ok(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && !name.starts_with('/')
+        && !name.contains("..")
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'))
+}
+
 /// The type of an icon the Miniserver sent: SVG comes as text (and is
 /// often gzipped), PNG as binary.
 pub fn icon_type(bytes: &[u8]) -> (&'static str, Option<&'static str>) {
@@ -218,19 +233,32 @@ pub fn icon_whole(bytes: &[u8]) -> bool {
     if bytes.starts_with(b"\x89PNG") {
         return bytes.ends_with(b"IEND\xaeB`\x82");
     }
-    let mut text = Vec::new();
-    let svg: &[u8] = if bytes.starts_with(&[0x1f, 0x8b]) {
-        // Bounded: an icon is small.
-        let mut d = flate2::read::GzDecoder::new(bytes).take(4 << 20);
-        if d.read_to_end(&mut text).is_err() {
-            return false;
+    let text;
+    let svg: &[u8] = match gunzip(bytes) {
+        Some(t) => {
+            text = t;
+            &text
         }
-        &text
-    } else {
-        bytes
+        None => bytes,
     };
     let s = String::from_utf8_lossy(svg);
     s.contains("<svg") && s.trim_end().ends_with("</svg>")
+}
+
+/// A gzipped icon, unpacked; `None` when not gzipped. The Miniserver may
+/// leave out the gzip trailer (its checksum and length) after a whole SVG,
+/// so what was unpacked counts even when the stream ends early; whether
+/// the SVG is whole is checked on the text.
+fn gunzip(bytes: &[u8]) -> Option<Vec<u8>> {
+    if !bytes.starts_with(&[0x1f, 0x8b]) {
+        return None;
+    }
+    let mut text = Vec::new();
+    // Bounded: an icon is small. On an error, `text` keeps what was read.
+    let _ = flate2::read::GzDecoder::new(bytes)
+        .take(4 << 20)
+        .read_to_end(&mut text);
+    Some(text)
 }
 
 impl Structure {
@@ -251,6 +279,7 @@ impl Structure {
             tx,
             loading: tokio::sync::Mutex::new(()),
             icon_gate: Semaphore::new(4),
+            state_icons: Mutex::new(HashSet::new()),
             icon_locks: Mutex::new(HashMap::new()),
         });
         // The last one read, from an earlier run.
@@ -393,11 +422,23 @@ impl Structure {
         self.summary().0
     }
 
+    /// Serve the icons live text states named (a Status block's), too.
+    /// Only plain icon names are taken: a path of letters, digits, `-`,
+    /// `_` and `.` such as `IconsFilled/battery-full.svg`.
+    pub fn allow_icons(&self, names: Vec<String>) {
+        let mut set = self.state_icons.lock().unwrap();
+        for n in names {
+            if icon_name_ok(&n) {
+                set.insert(n);
+            }
+        }
+    }
+
     /// An icon the structure file names: from the cache, else from the
     /// Miniserver (then cached, if it arrived whole). `Err(None)`: not a
     /// name it lists.
     pub async fn icon(&self, name: &str) -> Result<Vec<u8>, Option<String>> {
-        if !self.summary().1.contains(name) {
+        if !self.summary().1.contains(name) && !self.state_icons.lock().unwrap().contains(name) {
             return Err(None);
         }
         // Names that differ only in characters `file_name` replaces get
@@ -448,6 +489,8 @@ impl Structure {
                 bytes.len()
             )));
         }
+        // Kept and served unpacked: a browser refuses gzip without its trailer.
+        let bytes = gunzip(&bytes).unwrap_or(bytes);
         if let Some(p) = &path {
             let _ = write_file(p, &bytes);
         }
@@ -499,6 +542,38 @@ mod tests {
         assert_eq!(icon_type(&[0x1f, 0x8b, 8]), ("image/svg+xml", Some("gzip")));
         assert_eq!(icon_type(b"\x89PNG\r\n"), ("image/png", None));
         assert_eq!(icon_type(b"<svg/>"), ("image/svg+xml", None));
+    }
+
+    #[test]
+    fn a_gzipped_icon_without_its_trailer_is_whole_when_its_svg_is() {
+        use std::io::Write;
+        let svg = b"<svg xmlns=\"http://www.w3.org/2000/svg\"><rect/></svg>\n";
+        let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        e.write_all(svg).unwrap();
+        let gz = e.finish().unwrap();
+        assert!(icon_whole(&gz));
+        // The Miniserver's way: the 8-byte trailer left out.
+        let cut = &gz[..gz.len() - 8];
+        assert!(icon_whole(cut));
+        assert_eq!(gunzip(cut).unwrap(), svg);
+        // Cut inside the SVG: not whole.
+        assert!(!icon_whole(&gz[..gz.len() / 2]));
+    }
+
+    #[test]
+    fn only_plain_icon_names_from_text_states_are_served() {
+        let s = Structure::with_dir(Err("no Miniserver".into()), None);
+        s.allow_icons(vec![
+            "IconsFilled/battery-full.svg".into(),
+            "1d4cc1e7-0000-0000-0000000000000000".into(),
+            "../etc/passwd".into(),
+            "/jdev/sps/io/x/on".into(),
+            "a?b".into(),
+        ]);
+        let set = s.state_icons.lock().unwrap();
+        assert!(set.contains("IconsFilled/battery-full.svg"));
+        assert!(set.contains("1d4cc1e7-0000-0000-0000000000000000"));
+        assert_eq!(set.len(), 2);
     }
 
     #[test]
@@ -708,7 +783,8 @@ mod tests {
         gz.write_all(svg).unwrap();
         let gz = gz.finish().unwrap();
         assert!(icon_whole(&gz));
-        assert!(!icon_whole(&gz[..gz.len() - 6]));
+        // Cut inside the compressed SVG (a missing trailer alone is fine: see below).
+        assert!(!icon_whole(&gz[..gz.len() - 20]));
         assert!(icon_whole(b"\x89PNG\r\n\x1a\n....IEND\xaeB`\x82"));
         assert!(!icon_whole(b"\x89PNG\r\n\x1a\n...."));
     }

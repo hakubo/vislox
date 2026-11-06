@@ -905,6 +905,10 @@ function renderProps() {
     }
     section("Live values", rows.length ? rows : [`<div class="empty">The Miniserver sends no values for this block.</div>`], rows.length);
   }
+  const stat = statusRows(o, row);
+  if (stat) section("Status", stat);
+  if (o.schedule) section("Schedule", scheduleRows(o, row, marks), o.schedule.modes.length);
+  if (o.ty === "WeatherServer") { const w = weatherRows(row); if (w) section("Weather", w.rows, w.count); }
   const cal = o.calendar;
   if (cal) {
     const modeV = (m) => (m.target ? linkTarget(m.target) : `<span class="none-v">${esc(m.title)}</span>`);
@@ -1808,13 +1812,24 @@ $("btn-apply").onclick = async () => {
   $("btn-apply").disabled = true;
   try { await apply(); } finally { applyAsking = false; renderActions(); }
 };
+/** For Apply's confirmation: the schedules on the Miniserver the pending config would change. */
+async function pendingScheduleText(pend) {
+  let v = S.rev === pend.id ? S.view : null;
+  try { v ||= await api(`/api/view?rev=${encodeURIComponent(pend.id)}&base=`); } catch { return ""; }
+  const any = Object.values(v.objects).some((o) => o.schedule && o.status !== "removed");
+  if (!any) return "";
+  if (!liveStreaming()) return "Live values are off, so the switching times were not compared with the Miniserver's (edits in the app).\n\n";
+  const c = scheduleConflicts(v);
+  return c.length ? `⚠ The Miniserver runs other switching times than this config for:\n  ${c.join("\n  ")}\nApplying replaces them with the config's (an edit in the app among them).\n\n` : "";
+}
 async function apply() {
   const pend = pendingChange();
   if (!pend) return;
   // Ask the Miniserver once more whether its config changed after the base.
   await loadMs(true);
   const stale = staleText();
-  if (!window.confirm((stale ? `⚠ ${stale} Applying overwrites what changed there since.\n\n` : "") +
+  const sched = await pendingScheduleText(pend);
+  if (!window.confirm((stale ? `⚠ ${stale} Applying overwrites what changed there since.\n\n` : "") + sched +
     "Deploy the pending changes to the Miniserver?\n\nlox config push uploads the config and restarts the Miniserver's program (a few seconds), " +
     "checks that it runs exactly the compiled config, then vislox commits and pushes to git.")) return;
   deployMsg("");
@@ -2233,6 +2248,11 @@ function lvFind(u, depth) {
     try { ids = JSON.parse(S.live.values.get(su)?.[0]); } catch { ids = null; }
     if (Array.isArray(ids) && ids.length === 1) return [ids[0], null, "the lighting controller's active mood", "computed"];
   }
+  if (g.weather && u in g.weather) {
+    const w = weatherNow();
+    const f = WEATHER_FIELDS[g.weather[u]];
+    if (w && f && w.entry[f[0]] !== undefined) return [w.entry[f[0]], null, `the weather server's ${w.what} (${f[1]})`, "computed"];
+  }
   if (g.consts && u in g.consts) return [g.consts[u], null, "constant in the config", "const"];
   const gate = g.gates?.[u];
   if (gate) {
@@ -2351,6 +2371,8 @@ function gateEval(g, depth) {
 function liveText(e) {
   const [v, t] = e;
   if (t) return t;
+  // A Daytimer's or the weather server's event table: shown in its own section.
+  if (v && typeof v === "object") return v.schedule ? `schedule (${v.entries.length} ${v.entries.length === 1 ? "entry" : "entries"})` : v.weather ? "weather (see Weather)" : JSON.stringify(v);
   if (typeof v === "number") return String(Number.isInteger(v) ? v : +v.toFixed(2));
   return String(v ?? "");
 }
@@ -2362,7 +2384,143 @@ function liveTip(src) {
 }
 function lvSpan(u) {
   const e = liveVal(u);
-  return `<span class="lv${e ? "" : " none"}${e?.[3] ? " " + e[3] : ""}" data-lv="${esc(u)}"${e?.[2] ? ` title="${esc(e[2])}"` : ""}>${e ? esc(clip(liveText(e), 40)) : "no value"}</span>`;
+  return (e?.[4] ? appIcon(e[4]) : "") + `<span class="lv${e ? "" : " none"}${e?.[3] ? " " + e[3] : ""}" data-lv="${esc(u)}"${e?.[2] ? ` title="${esc(e[2])}"` : ""}>${e ? esc(clip(liveText(e), 40)) : "no value"}</span>`;
+}
+
+// ── schedules, weather and Status blocks ─────────────────────────────────
+// A Daytimer's switching times (and an Intelligent Room Controller's) as the config stores them, next to
+// the event table the Miniserver streams for it: what runs now, edits made in the app included.
+
+/** Live values come in from the Miniserver (on any revision: a schedule is compared with each). */
+function liveStreaming() { return S.live.on && !!S.live.es; }
+/** The Miniserver's schedule for `si` (`{default, entries}`), when it streams one. */
+function liveSchedule(si) {
+  const v = S.live.values.get(si.state)?.[0];
+  return v && typeof v === "object" && v.schedule ? v : undefined;
+}
+function hhmm(m) { return `${String(Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`; }
+/** An entry for comparing. A digital timer's value does not count: the Miniserver sends 0 where the file has 1. */
+const schedKey = (e, analog) => `${e.from}-${e.to}-${analog ? +e.value : ""}-${!!e.activate}`;
+const schedOf = (es, mode) => es.filter((e) => e.mode === mode).sort((a, b) => a.from - b.from || a.to - b.to);
+/** The modes whose entries differ between `a` and `b`. */
+function schedDiff(a, b, analog) {
+  const modes = [...new Set([...a, ...b].map((e) => e.mode))];
+  const key = (es, m) => schedOf(es, m).map((e) => schedKey(e, analog)).join("|");
+  return modes.filter((m) => key(a, m) !== key(b, m));
+}
+function schedVal(v) { return String(Number.isInteger(+v) ? +v : +(+v).toFixed(2)); }
+function schedLine(es, analog) {
+  return es.length ? es.map((e) => `${hhmm(e.from)}–${hhmm(e.to)}${analog ? " " + schedVal(e.value) : ""}${e.activate ? " (activate)" : ""}`).join(", ") : "no entries";
+}
+/** How the config's schedule and the Miniserver's differ: the modes, and the default value. */
+function schedCompare(si, live) {
+  const modes = schedDiff(si.entries, live.entries, si.analog);
+  const defDiff = si.analog && si.default != null && live.default != null && +si.default !== +live.default;
+  return { modes, defDiff, same: !modes.length && !defDiff };
+}
+function schedModeTitle(si, n) {
+  const m = si.modes.find((m) => m.number === n) || si.old_modes?.find((m) => m.number === n);
+  return m ? m.title : n == null ? "a column with no operating mode" : `Mode ${n}`;
+}
+/** One day as a bar: each entry a segment over the hours, its value in the tooltip. */
+function schedBar(es, si, cls) {
+  const segs = es.map((e) => {
+    const l = (e.from / 1440) * 100, w = Math.max(((e.to - e.from) / 1440) * 100, 0.4);
+    const tip = `${hhmm(e.from)}–${hhmm(e.to)}${si.analog ? " · " + schedVal(e.value) : ""}${e.activate ? " · needs activation" : ""}`;
+    return `<span class="sch-seg${e.activate ? " act" : ""}" style="left:${l.toFixed(2)}%;width:${w.toFixed(2)}%" title="${esc(tip)}">${si.analog && w > 9 ? esc(schedVal(e.value)) : ""}</span>`;
+  }).join("");
+  return `<div class="sch-bar ${cls}" title="${esc(schedLine(es, si.analog))}">${segs}</div>`;
+}
+function scheduleRows(o, row, marks) {
+  const si = o.schedule;
+  const live = liveStreaming() ? liveSchedule(si) : undefined;
+  const cmp = live && schedCompare(si, live);
+  const changedHere = new Set(marks && si.old_entries ? schedDiff(si.old_entries, si.entries, true) : []);
+  const r = revById(S.rev);
+  const rows = [];
+  // What the comparison means on this revision.
+  let note;
+  if (!S.live.on) note = `<div class="sch-note">Turn on live values to compare with the switching times the Miniserver runs.</div>`;
+  else if (!live) note = `<div class="sch-note">The Miniserver sends no schedule for this block${liveStreaming() ? " (only blocks shown in the app have one)" : ""}.</div>`;
+  else if (cmp.same) note = `<div class="sch-note ok">The Miniserver runs the same switching times.</div>`;
+  else if (r?.kind === "pending") note = `<div class="sch-note warn">⚠ The Miniserver runs other switching times (${esc(schedWhat(si, cmp))}). Apply would replace them with this config's.</div>`;
+  else if (r?.current) note = `<div class="sch-note warn">⚠ Changed in the app since this config (${esc(schedWhat(si, cmp))}). An edit in the app is a custom change until Loxone Config saves the program: Apply refuses while one is pending, and replaces it with the config's switching times when you allow that.</div>`;
+  else note = `<div class="sch-note warn">The Miniserver runs other switching times than this revision (${esc(schedWhat(si, cmp))}).</div>`;
+  rows.push(note);
+  if (si.analog && (si.default != null || live)) {
+    const differs = cmp?.defDiff;
+    rows.push(row("Default value", `${si.default != null ? esc(schedVal(si.default)) : '<span class="none-v">—</span>'}${live ? ` <span class="sch-live${differs ? " diff" : ""}" title="The Miniserver's">${esc(schedVal(live.default))}</span>` : ""}`, differs ? "pr-chg" : ""));
+  }
+  const modes = si.modes.map((m) => m.number);
+  for (const e of [...(live?.entries || []), ...si.entries]) if (!modes.includes(e.mode)) modes.push(e.mode);
+  rows.push(`<div class="sch-grid"><div class="sch-axis"><span></span><span class="sch-hours"><i>0</i><i>6</i><i>12</i><i>18</i><i>24 h</i></span></div>` + modes.map((n) => {
+    const mine = schedOf(si.entries, n), theirs = live ? schedOf(live.entries, n) : null;
+    const differs = cmp?.modes.includes(n);
+    const m = si.modes.find((x) => x.number === n);
+    const name = m?.target ? `<button type="button" class="lnk" data-go="${esc(m.target.uuid)}" data-page="${esc(m.target.page || "")}" title="${esc(m.title)}">${esc(m.title)}</button>` : `<span title="${esc(schedModeTitle(si, n))}">${esc(schedModeTitle(si, n))}</span>`;
+    const was = changedHere.has(n) ? `<div class="sch-was">was ${esc(schedLine(schedOf(si.old_entries, n), si.analog))}</div>` : "";
+    return `<div class="sch-row${differs ? " diff" : ""}${changedHere.has(n) ? " chg" : ""}"><div class="sch-mode">${name}</div><div class="sch-bars">${schedBar(mine, si, "cfg")}${theirs ? schedBar(theirs, si, "live") : ""}</div>${was}${differs ? `<div class="sch-was">Miniserver: ${esc(schedLine(theirs, si.analog))}</div>` : ""}</div>`;
+  }).join("") + `</div>`);
+  if (live) rows.push(`<div class="sch-legend"><span class="sch-key cfg"></span>this config <span class="sch-key live"></span>the Miniserver</div>`);
+  return rows;
+}
+function schedWhat(si, cmp) {
+  const parts = cmp.modes.map((n) => schedModeTitle(si, n));
+  if (cmp.defDiff) parts.push("default value");
+  return parts.join(", ");
+}
+/** The schedules a pending config would change on the Miniserver: those whose live entries differ. */
+function scheduleConflicts(view) {
+  const out = [];
+  for (const o of Object.values(view?.objects || {})) {
+    const si = o.schedule;
+    const live = si && o.status !== "removed" && liveSchedule(si);
+    if (!live) continue;
+    const cmp = schedCompare(si, live);
+    if (!cmp.same) out.push(`${autoTitle(o.title) ? prettyType(o.ty) : o.title}: ${schedWhat(si, cmp)}`);
+  }
+  return out;
+}
+
+/** The weather server's current weather: its `actual` state, else the forecast's hour that has begun. */
+function weatherNow() {
+  const gl = S.live.globals || {};
+  const tab = (k) => { const v = S.live.values.get(gl[k])?.[0]; return v && v.weather && v.entries?.length ? v : null; };
+  const a = tab("weather.actual");
+  if (a) return { entry: a.entries[0], what: "current weather", table: a };
+  const f = tab("weather.forecast");
+  if (!f) return null;
+  // Loxone time: seconds since 2009-01-01, the Miniserver's local time.
+  const now = (Date.now() - Date.UTC(2009, 0, 1)) / 1000 - new Date().getTimezoneOffset() * 60;
+  const past = f.entries.filter((e) => e.time <= now);
+  return { entry: past.length ? past[past.length - 1] : f.entries[0], what: "forecast for this hour", table: f };
+}
+/** A weather data block's `WType=` → the field of a weather entry, and what it is. */
+const WEATHER_FIELDS = {
+  1: ["temperature", "temperature"], 2: ["dewPoint", "dew point"], 3: ["humidity", "relative humidity"],
+  4: ["windSpeed", "wind speed"], 5: ["windDirection", "wind direction"], 7: ["solarRadiation", "solar radiation"],
+  9: ["precipitation", "precipitation"], 10: ["type", "weather type"], 11: ["pressure", "air pressure"],
+  26: ["perceived", "perceived temperature"],
+};
+function weatherRows(row) {
+  if (!liveHere()) return null;
+  const w = weatherNow();
+  if (!w) return { rows: [`<div class="empty">The Miniserver sends no weather (it needs a weather subscription).</div>`], count: 0 };
+  const rows = [row("From", esc(w.what))];
+  for (const [k, label] of Object.values(WEATHER_FIELDS)) if (w.entry[k] !== undefined) rows.push(row(label, `<span class="lv computed">${esc(schedVal(w.entry[k]))}</span>`));
+  return { rows, count: rows.length - 1 };
+}
+
+/** A Status block (the app's TextState): its live text with the icon and colour the Miniserver gives. */
+function statusRows(o, row) {
+  if (!liveHere()) return null;
+  const st = S.live.controls[o.uuid]?.states || {};
+  if (!st.textAndIcon) return null;
+  const text = S.live.values.get(st.textAndIcon);
+  let ic = text?.[4] || null, color = null;
+  try { const j = JSON.parse(S.live.values.get(st.iconAndColor)?.[0] || "null"); ic = j?.icon || ic; color = j?.color || null; } catch { /* not JSON */ }
+  const sw = color && /^#[0-9a-f]{3,8}$/i.test(color) ? `<span class="swatch" style="background:${color}" title="${esc(color)}"></span>` : "";
+  return [`<div class="status-live">${ic ? appIcon(ic) : ""}${sw}<span>${text ? esc(liveText(text)) : '<span class="none-v">no value</span>'}</span></div>`];
 }
 
 function renderLiveSwitch() {

@@ -3,6 +3,7 @@
 //! tree, and — when a base revision is given — what changed against it.
 
 use crate::calendar::{self, EntryDate};
+use crate::schedule;
 use loxone_config::diff::{self, DocDiff};
 use loxone_config::doc::{LoxoneDoc, PortView, WireView, ports};
 use loxone_config::layout::{GeoObject, Layout, PageGeometry, ROW, Shape, Side};
@@ -63,6 +64,9 @@ pub struct LiveGraph {
     /// A lighting controller's Mood output → the controller, whose app
     /// control streams its active moods.
     pub moods: BTreeMap<String, String>,
+    /// A weather data block's output → the weather field it gives (its
+    /// `WType=`), read from the Miniserver's weather states.
+    pub weather: BTreeMap<String, i64>,
 }
 
 #[derive(Serialize)]
@@ -200,6 +204,24 @@ pub struct ObjInfo {
     pub target: Option<Target>,
     /// A calendar entry's date and operating mode, decoded.
     pub calendar: Option<CalInfo>,
+    /// The switching times of a Daytimer, or of a block that holds one.
+    pub schedule: Option<SchedInfo>,
+}
+
+/// A schedule, as the viewed config stores it (see `schedule.rs`).
+#[derive(Serialize)]
+pub struct SchedInfo {
+    /// The UUID the Miniserver streams the live schedule under.
+    pub state: String,
+    pub analog: bool,
+    pub default: Option<f64>,
+    /// The columns, one per operating mode.
+    pub modes: Vec<CalMode>,
+    pub entries: Vec<schedule::Entry>,
+    /// The compared revision's entries, when they differ.
+    pub old_entries: Option<Vec<schedule::Entry>>,
+    /// Those of the compared revision's columns that this one lacks.
+    pub old_modes: Vec<CalMode>,
 }
 
 /// A calendar entry, decoded (see `calendar.rs`).
@@ -517,6 +539,37 @@ impl<'a> Ctx<'a> {
         }
     }
 
+    /// A mode by its `Mode=` number, as a calendar entry names it.
+    fn mode_by_number(&self, number: Option<i64>) -> CalMode {
+        let target = number
+            .and_then(|n| self.modes.get(&n))
+            .map(|m| self.target(m, None));
+        let title = match (&target, number) {
+            (Some(t), _) => t.title.clone(),
+            (None, Some(n)) => format!("Mode {n} (not in this config)"),
+            (None, None) => "a column with no operating mode".into(),
+        };
+        CalMode {
+            number,
+            title,
+            target,
+        }
+    }
+
+    /// The `Mode=` number of the `Mode` object `uuid` (absent: 0).
+    fn mode_number(&self, uuid: &str) -> Option<i64> {
+        let el = self.el(uuid).filter(|e| e.attr("Type") == Some("Mode"))?;
+        match el.attr("Mode") {
+            None => Some(0),
+            Some(v) => v.trim().parse().ok(),
+        }
+    }
+
+    /// The switching times of block `uuid`, when it has them.
+    fn timer(&self, uuid: &str) -> Option<schedule::Timer> {
+        schedule::read(self.el(uuid)?, uuid, |m| self.mode_number(m))
+    }
+
     /// The block's visualization settings, from its `<IoData>` child.
     fn in_app(&self, el: &Element) -> Option<InApp> {
         let k = io_key(el)?;
@@ -678,6 +731,8 @@ struct Delta {
     /// Calendar entries whose decoded date or operating mode changed,
     /// also when only the `Mode` object they name did.
     calendar: HashSet<String>,
+    /// Blocks whose switching times changed.
+    schedule: HashSet<String>,
     /// Objects whose app settings changed: shown or not, room, category.
     in_app: HashSet<String>,
 }
@@ -694,6 +749,7 @@ impl Delta {
             || self.attrs.contains_key(uuid)
             || self.placements.contains(uuid)
             || self.calendar.contains(uuid)
+            || self.schedule.contains(uuid)
             || self.in_app.contains(uuid)
             || self.params.keys().any(|(o, _)| o == uuid)
         {
@@ -845,6 +901,24 @@ pub fn build(new: &LoxoneDoc, old: Option<&LoxoneDoc>, title: &str) -> View {
         }
     }
 
+    // Switching times, decoded once: a changed one marks its block changed.
+    let mut scheds: HashMap<String, SchedInfo> = HashMap::new();
+    for u in &nc.order {
+        if let Some(si) = sched_info(&nc, oc.as_ref().filter(|_| d.on), u) {
+            if si.old_entries.is_some() {
+                d.schedule.insert(u.clone());
+            }
+            scheds.insert(u.clone(), si);
+        }
+    }
+    if let Some(oc) = &oc {
+        for u in oc.order.iter().filter(|u| !nc.els.contains_key(*u)) {
+            if let Some(si) = sched_info(oc, None, u) {
+                scheds.insert(u.clone(), si);
+            }
+        }
+    }
+
     let mut view = View {
         title: title.to_string(),
         compared: d.on,
@@ -874,15 +948,17 @@ pub fn build(new: &LoxoneDoc, old: Option<&LoxoneDoc>, title: &str) -> View {
     // Properties of every object.
     for u in &nc.order {
         let ci = cals.remove(u);
-        view.objects
-            .insert(u.clone(), obj_info(&nc, oc.as_ref(), u, &d, false, ci));
+        let mut o = obj_info(&nc, oc.as_ref(), u, &d, false, ci);
+        o.schedule = scheds.remove(u);
+        view.objects.insert(u.clone(), o);
     }
     if let Some(oc) = &oc {
         for u in &oc.order {
             if !nc.els.contains_key(u) {
                 let ci = cals.remove(u);
-                view.objects
-                    .insert(u.clone(), obj_info(oc, None, u, &d, true, ci));
+                let mut o = obj_info(oc, None, u, &d, true, ci);
+                o.schedule = scheds.remove(u);
+                view.objects.insert(u.clone(), o);
             }
         }
     }
@@ -1217,6 +1293,7 @@ fn obj_info(
     let app_old = app_old.flatten();
     ObjInfo {
         calendar,
+        schedule: None,
         uuid: uuid.to_string(),
         title: c.title(uuid),
         old_title: d.renamed.get(uuid).cloned().flatten(),
@@ -1421,6 +1498,16 @@ fn changes(view: &mut View, nc: &Ctx, oc: &Ctx, d: &Delta) {
                 obj: Some(u.clone()),
             });
         }
+        if let Some(si) = view.objects.get(&u).and_then(|o| o.schedule.as_ref()) {
+            for text in schedule_changes(&nc.title(&u), si, nc) {
+                v.push(Change {
+                    kind: "attr",
+                    text,
+                    page: page_for(&u),
+                    obj: Some(u.clone()),
+                });
+            }
+        }
         if let Some(a) = d.attrs.get(&u) {
             for (n, o, new) in a.iter().filter(|(n, ..)| !covered.contains(&n.as_str())) {
                 v.push(Change {
@@ -1611,6 +1698,65 @@ fn same_mode(a: &CalMode, b: &CalMode) -> bool {
     }
 }
 
+/// The switching times of block `uuid` in `c`, compared with `old` when
+/// given; `None` when it has none.
+fn sched_info(c: &Ctx, old: Option<&Ctx>, uuid: &str) -> Option<SchedInfo> {
+    let t = c.timer(uuid)?;
+    let entries: Vec<schedule::Entry> = t.entries.iter().map(|(_, e)| *e).collect();
+    let column = |ctx: &Ctx, m: &str| match ctx.mode_number(m) {
+        Some(n) => ctx.mode_by_number(Some(n)),
+        None => CalMode {
+            number: None,
+            title: format!("{m} (no operating mode in this config)"),
+            target: None,
+        },
+    };
+    let modes: Vec<CalMode> = t.modes.iter().map(|m| column(c, m)).collect();
+    let (mut old_entries, mut old_modes) = (None, Vec::new());
+    if let Some(ot) = old.and_then(|o| o.timer(uuid)) {
+        let oe: Vec<schedule::Entry> = ot.entries.iter().map(|(_, e)| *e).collect();
+        if !schedule::changed_modes(&oe, &entries).is_empty() {
+            old_entries = Some(oe);
+        }
+        let o = old.expect("old");
+        old_modes = ot
+            .modes
+            .iter()
+            .filter(|m| !t.modes.contains(m))
+            .map(|m| column(o, m))
+            .collect();
+    }
+    Some(SchedInfo {
+        state: t.state,
+        analog: t.analog,
+        default: t.default,
+        modes,
+        entries,
+        old_entries,
+        old_modes,
+    })
+}
+
+/// A schedule's changed switching times, per operating mode, as the
+/// change list reads them: *Uhr · schedule, Monday: 06:30–08:00 →
+/// 06:00–08:00*.
+fn schedule_changes(title: &str, si: &SchedInfo, c: &Ctx) -> Vec<String> {
+    let Some(old) = &si.old_entries else {
+        return Vec::new();
+    };
+    schedule::changed_modes(old, &si.entries)
+        .into_iter()
+        .map(|m| {
+            format!(
+                "{title} · schedule, {}: {} → {}",
+                c.mode_by_number(m).title,
+                schedule::line(&schedule::of_mode(old, m), si.analog),
+                schedule::line(&schedule::of_mode(&si.entries, m), si.analog)
+            )
+        })
+        .collect()
+}
+
 /// A calendar entry's changed date and mode, as the change list reads
 /// them (*Christmas · when: 24 Dec → 26 Dec*, *· switches on: Holiday →
 /// Party*), and the attributes those lines stand for: those the old and
@@ -1763,6 +1909,15 @@ fn live_graph(c: &Ctx) -> LiveGraph {
                     for o in outs(&["AQ", "Q"]) {
                         g.pass.insert(o, f.clone());
                     }
+                }
+            }
+            // A weather data block gives one field of the weather server's
+            // current weather.
+            "WeatherData" => {
+                if let (Some(p), Some(Ok(w))) =
+                    (by("AQ"), el.attr("WType").map(|w| w.trim().parse()))
+                {
+                    g.weather.insert(p.uuid.clone(), w);
                 }
             }
             "LightController2" => {
@@ -2449,6 +2604,72 @@ mod tests {
                 .attrs
                 .iter()
                 .any(|a| a.name == "Mode" && a.value.as_deref() == Some("5"))
+        );
+    }
+
+    /// The fixture with a Daytimer on the upper floor, columns Feiertag
+    /// (0) and Party (-1), and `entries` as its `<Entry>` rows.
+    fn with_timer(entries: &str) -> String {
+        let timer = format!(
+            "<C Type=\"DayTimer\" V=\"178\" U=\"10000020-0000-0200-ffff504f94000001\" Title=\"Uhr\" \
+             Px=\"960\" Py=\"2880\" Px2=\"3648\" Py2=\"3768\" Nio=\"2\" WF=\"16384\" Analog=\"true\" \
+             DefValue=\"18\" Modes=\"{HOLIDAY},{PARTY}\">\
+             <Co K=\"Mode\" U=\"10000020-0000-0201-00ff504f94000001\"/>\
+             <Co K=\"AQ\" U=\"10000020-0000-0202-01ff504f94000001\"/>{entries}</C>\n\t\t</C>\n\t</C>\n</ControlList>"
+        );
+        let mut s = HOUSE.to_string();
+        let end = "\n\t\t</C>\n\t</C>\n</ControlList>";
+        assert!(s.trim_end().ends_with(end.trim_start_matches('\n')));
+        let at = s.rfind(end).expect("end of the upper floor");
+        s.replace_range(at.., &timer);
+        s
+    }
+    const TIMER: &str = "10000020-0000-0200-ffff504f94000001";
+
+    #[test]
+    fn a_daytimer_shows_its_schedule_and_its_changes_per_mode() {
+        let base = doc(&with_timer(
+            "<Entry From=\"390\" To=\"480\" V=\"21\"/><Entry From=\"1080\" To=\"1380\" Ix=\"1\" V=\"22.5\"/>",
+        ));
+        let v = build(&base, None, "");
+        let si = v.objects[TIMER].schedule.as_ref().expect("a schedule");
+        assert_eq!(si.state, TIMER);
+        assert_eq!(si.default, Some(18.0));
+        let titles: Vec<&str> = si.modes.iter().map(|m| m.title.as_str()).collect();
+        assert_eq!(titles, ["Feiertag", "Party"]);
+        assert_eq!(si.entries[1].mode, Some(-1));
+        assert!(si.old_entries.is_none());
+        // Other blocks have none.
+        assert!(v.objects[AND].schedule.is_none());
+
+        // Party's evening moves; Feiertag stays.
+        let new = doc(&with_timer(
+            "<Entry From=\"390\" To=\"480\" V=\"21\"/><Entry From=\"1020\" To=\"1380\" Ix=\"1\" V=\"22.5\"/>",
+        ));
+        let v = build(&new, Some(&base), "");
+        let o = &v.objects[TIMER];
+        assert_eq!(o.status, "changed");
+        assert!(o.schedule.as_ref().unwrap().old_entries.is_some());
+        let texts: Vec<&str> = v.changes.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            ["Uhr · schedule, Party: 18:00–23:00 22.5 → 17:00–23:00 22.5"],
+            "{texts:?}"
+        );
+    }
+
+    #[test]
+    fn weather_data_blocks_give_their_field_of_the_weather() {
+        let src = edited(&[(
+            "\t\t<C Type=\"ModeCaption\"",
+            "\t\t<C Type=\"WeatherServer\" V=\"178\" U=\"10000021-0000-0210-ffff504f94000001\" Title=\"Wetter\">\
+             <C Type=\"WeatherData\" V=\"178\" U=\"10000021-0000-0211-ffff504f94000001\" Title=\"Temperatur\" Nio=\"1\" WType=\"1\">\
+             <Co K=\"AQ\" U=\"10000021-0000-0212-00ff504f94000001\"/></C></C>\n\t\t<C Type=\"ModeCaption\"",
+        )]);
+        let v = build(&doc(&src), None, "");
+        assert_eq!(
+            v.live.weather.get("10000021-0000-0212-00ff504f94000001"),
+            Some(&1)
         );
     }
 

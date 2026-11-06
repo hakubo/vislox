@@ -28,10 +28,17 @@ mkdirSync(join(repo, "504F94000001"));
 const cfg = join(repo, "504F94000001", "config.Loxone");
 copyFileSync(fixture, cfg);
 // The meter is shown in the app, in the kitchen (a room of its own config).
+const TIMER = "10000030-0000-0300-ffff504f94000001";
 const METER = "10000005-0000-0050-ffff504f94000001", ROOM = "10000020-0000-00a1-ffff504f94000001", CELLAR = "10000021-0000-00a1-ffff504f94000001";
 writeFileSync(cfg, readFileSync(cfg, "utf8")
   .replace('<C Type="Page" V="178" U="10000002', `<C Type="Place" V="178" U="${ROOM}" Title="Küche"/>\n\t\t<C Type="Page" V="178" U="10000002`)
-  .replace('<Co K="Pf" Nc="1"', `<IoData Visu="true" Pr="${ROOM}"/><Co K="Pf" Nc="1"`));
+  .replace('<Co K="Pf" Nc="1"', `<IoData Visu="true" Pr="${ROOM}"/><Co K="Pf" Nc="1"`)
+  // A Daytimer on the upper floor, with columns Feiertag (0) and Party (-1).
+  .replace('<Co K="Q" U="10000009-0000-0093-02ff504f94000001"/>\n\t\t\t</C>', `<Co K="Q" U="10000009-0000-0093-02ff504f94000001"/>\n\t\t\t</C>
+\t\t\t<C Type="DayTimer" V="178" U="${TIMER}" Title="Uhr" Px="960" Py="2880" Px2="3648" Py2="3768" Nio="2" WF="16384" Analog="true" DefValue="18" Modes="00000000-0000-0001-1500000000000000,10000011-0000-0110-ffff504f94000001">
+\t\t\t\t<Co K="Mode" U="10000030-0000-0301-00ff504f94000001"/><Co K="AQ" U="10000030-0000-0302-01ff504f94000001"/>
+\t\t\t\t<Entry From="390" To="480" V="21"/><Entry From="1080" To="1380" Ix="1" V="22.5"/>
+\t\t\t</C>`));
 git("add", ".");
 git("commit", "-q", "-m", "[504F94000001] Config backup 2026-11-01 10:00:00 (v1)");
 // Uncommitted edits: a rename, a parameter and a calendar entry's date.
@@ -41,6 +48,7 @@ edit('K="Input2" Def="1000"', 'K="Input2" Def="100"');
 edit('Month="12" Day="24"', 'Month="12" Day="26"');
 // … and one whose date no longer decodes (a kind of date vislox does not know).
 edit('CalType="-1" Month="12" Day="31"', 'CalType="-1" Mode="5" Month="12" Day="31"');
+edit('<Entry From="1080" To="1380" Ix="1"', '<Entry From="1020" To="1380" Ix="1"');
 
 // Live values as `lox stream -o json --initial` writes them: the fixture's
 // temperature (an analog output) and its AND gate (a digital one).
@@ -49,7 +57,11 @@ const liveFile = join(mkdtempSync(join(tmpdir(), "vislox-live-")), "stream.ndjso
 const liveLine = (control, state, value, uuid) => JSON.stringify({ control, state, value, uuid }) + "\n";
 // The holiday mode (Feiertag) is on: its Q.
 const HOLIDAY_Q = "00000000-0000-0001-1500000000000002";
-writeFileSync(liveFile, liveLine("Temperatur", "value", "21.5", TEMP) + liveLine("AND", "active", "1", GATE) + liveLine("Feiertag", "active", "1", HOLIDAY_Q));
+// The Daytimer's event table: Feiertag starts at 07:00 on the Miniserver (edited in the app).
+const schedule = { schedule: true, default: 18, entries: [
+  { mode: 0, from: 420, to: 480, activate: false, value: 21 }, { mode: -1, from: 1020, to: 1380, activate: false, value: 22.5 }] };
+writeFileSync(liveFile, liveLine("Temperatur", "value", "21.5", TEMP) + liveLine("AND", "active", "1", GATE)
+  + liveLine("Feiertag", "active", "1", HOLIDAY_Q) + liveLine("Uhr", "entriesAndDefaultValue", schedule, TIMER));
 
 // A download as lox keeps it next to config.Loxone (backup.zip): only its
 // LoxAPP3.json matters here, for when the config last changed (stored, not deflated).
@@ -353,6 +365,24 @@ try {
     await pill("22.25");
     // Block queries need a Miniserver connection: a recording offers none.
     assert.ok(await page.$eval("#lg-query", (n) => n.classList.contains("hidden")), "no block queries from a recording");
+    await page.click("#sw-live .track");
+    await page.waitForFunction(() => !document.querySelector("#canvas").classList.contains("live"));
+  });
+  await step("a Daytimer's switching times: changes per mode, and the Miniserver's next to the config's", async () => {
+    const changes = await page.$$eval(".changes .chg .t", (n) => n.map((x) => x.textContent));
+    assert.ok(changes.includes("Uhr · schedule, Party: 18:00–23:00 22.5 → 17:00–23:00 22.5"), changes.join(" | "));
+    await page.click('.changes .chg:has-text("Uhr · schedule")');
+    await page.waitForFunction(() => document.querySelector(".ph-t")?.textContent === "Uhr");
+    const sec = () => page.$$eval("#props section", (s) => s.find((x) => x.querySelector(".ps-h")?.dataset.sec === "Schedule")?.textContent || "");
+    assert.match(await sec(), /Turn on live values to compare/);
+    assert.match(await sec(), /was 18:00–23:00 22\.5/);
+    await page.click("#sw-live .track");
+    await page.waitForFunction(() => document.querySelector("#props .sch-row.diff"));
+    // Party is the same on both sides; Feiertag was changed in the app.
+    assert.match(await sec(), /Changed in the app since this config \(Feiertag\)/);
+    assert.match(await sec(), /Miniserver: 07:00–08:00 21/);
+    assert.equal(await page.$$eval("#props .sch-row.diff", (r) => r.length), 1);
+    assert.equal(await page.$$eval("#props .sch-bar.live", (r) => r.length), 2);
     await page.click("#sw-live .track");
     await page.waitForFunction(() => !document.querySelector("#canvas").classList.contains("live"));
   });
