@@ -38,6 +38,8 @@ const edit = (from, to) => writeFileSync(cfg, readFileSync(cfg, "utf8").replace(
 edit('Title="Licht OG"', 'Title="Licht oben"');
 edit('K="Input2" Def="1000"', 'K="Input2" Def="100"');
 edit('Month="12" Day="24"', 'Month="12" Day="26"');
+// … and one whose date no longer decodes (a kind of date vislox does not know).
+edit('CalType="-1" Month="12" Day="31"', 'CalType="-1" Mode="5" Month="12" Day="31"');
 
 // Live values as `lox stream -o json --initial` writes them: the fixture's
 // temperature (an analog output) and its AND gate (a digital one).
@@ -220,15 +222,23 @@ try {
     if (i >= 0) errors.splice(i, 1);
   });
   await step("Operating modes: a year calendar of the calendar entries", async () => {
-    // From Ctrl+K.
+    // Ctrl+K lists the view after pages and blocks, and only for a word it starts with.
     await page.keyboard.press("Control+k");
+    await page.keyboard.type("o");
+    assert.notEqual(await page.textContent('#pal-list [aria-selected="true"] .pk'), "view");
+    await page.keyboard.type("bergeschoss");
+    assert.ok(!(await page.textContent("#pal-list")).includes("Operating modes"));
+    await page.fill("#pal-input", "");
     await page.keyboard.type("operating");
     await page.keyboard.press("Enter");
     await page.waitForSelector("#modes:not(.hidden)");
     assert.match(page.url(), /view=modes/);
     // Easter Sunday, Gregorian computus.
     assert.deepEqual(await page.evaluate(() => [2024, 2025, 2026, 2038, 2285].map(easterSunday)), [[3, 31], [4, 20], [4, 5], [4, 25], [3, 22]]);
-    await page.evaluate(() => { MD.year = 2026; renderModes(); });
+    // Dates are whole days, also in years before 100 (Date.UTC would make 50 into 1950).
+    assert.deepEqual(await page.evaluate(() => mdYmd(mdDay(50, 3, 1))), [50, 3, 1]);
+    // Today is fixed for the test: Easter Monday 2026, a Feiertag.
+    await page.evaluate(() => { window.mdToday = () => mdDay(2026, 4, 6); MD.year = 2026; renderModes(); });
     const cls = (m, d, y = 2026) => page.evaluate(([y, m, d]) => document.querySelector(`#md-grid [data-day="${mdDay(y, m, d)}"]`)?.className ?? "", [y, m, d]);
     const bg = (m, d) => page.evaluate(([m, d]) => document.querySelector(`#md-grid [data-day="${mdDay(2026, m, d)}"]`)?.getAttribute("style") ?? "", [m, d]);
     assert.match(await cls(4, 6), /md-on/, "Easter Monday 2026 is 6 Apr");
@@ -244,7 +254,8 @@ try {
     assert.match(await cls(7, 4), /md-on/);
     assert.match(await cls(9, 5), /md-on/);
     assert.doesNotMatch(await cls(9, 6), /md-on/);
-    assert.notEqual(await bg(12, 31), await bg(7, 4), "Party and Urlaub have their own colours");
+    const sw = (t) => page.$eval(`.md-chip[title^="${t}:"] .md-sw`, (n) => n.style.background);
+    assert.notEqual(await sw("Party"), await sw("Urlaub"), "each mode has its own colour");
     assert.equal(await bg(1, 15), await bg(7, 4));
     // The uncommitted edit moved Heiligabend from 24 to 26 Dec.
     assert.match(await cls(12, 26), /md-add/);
@@ -252,6 +263,16 @@ try {
     // Hovering a day lists its entries.
     await page.hover(`#md-grid [data-day="${await page.evaluate(() => mdDay(2026, 12, 24))}"]`);
     assert.match(await page.textContent("#tooltip"), /24 Dec 2026.*Heiligabend · Feiertag removed/);
+    // Silvester no longer decodes: its old day (31 Dec, Party) shows as removed.
+    assert.match(await cls(12, 31), /md-rem/);
+    await page.hover(`#md-grid [data-day="${await page.evaluate(() => mdDay(2026, 12, 31))}"]`);
+    assert.match(await page.textContent("#tooltip"), /Silvester · Party removed/);
+    // A hidden mode is left out of the day's tooltip too.
+    await page.click('.md-chip[title^="Party:"]');
+    await page.hover(`#md-grid [data-day="${await page.evaluate(() => mdDay(2026, 12, 31))}"]`);
+    assert.doesNotMatch(await page.textContent("#tooltip"), /Silvester/);
+    assert.doesNotMatch(await cls(12, 31), /md-rem/);
+    await page.click('.md-chip[title^="Party:"]');
     // The list has every entry with its date and mode; clicking one selects it.
     const list = await page.$$eval("#md-list .md-e", (n) => n.map((x) => x.textContent));
     assert.equal(list.length, 5, list.join(" | "));
@@ -260,8 +281,10 @@ try {
     await page.waitForFunction(() => document.querySelector(".ph-t")?.textContent === "Ostermontag");
     assert.match(await cls(4, 6), /md-hl/);
     assert.ok(await page.isVisible("#modes"), "the view stays open");
-    // Another year: the summer holidays of 2026 are not in 2025.
-    await page.click("#md-prev");
+    // Another year: the summer holidays of 2026 are not in 2025. The arrows step the year even
+    // when focus left the view (a click on a day re-renders it).
+    await page.click(`#md-grid [data-day="${await page.evaluate(() => mdDay(2026, 4, 6))}"]`);
+    await page.keyboard.press("ArrowLeft");
     assert.equal(await page.textContent("#md-year"), "2025");
     assert.doesNotMatch(await cls(7, 4, 2025), /md-on/);
     assert.ok((await page.textContent("#md-list")).includes("Feiertag · 21 Apr 2025"), "Easter Monday 2025 is 21 Apr");
@@ -270,14 +293,30 @@ try {
     await page.click("#sw-live .track");
     await page.waitForSelector('.md-chip.live:has-text("Feiertag")');
     assert.match(await page.textContent(".md-chip.live"), /on now/);
+    // In another year than today's, the chip still says what the calendar has today.
+    assert.match(await page.getAttribute(".md-chip.live", "title"), /the calendar has it today/);
     await page.click("#sw-live .track");
     await page.waitForFunction(() => !document.querySelector(".md-chip.live"));
-    // Esc goes back to the page; the Calendar folder in the tree opens the view again.
+    // No year before 2009, Loxone's day 0.
+    await page.evaluate(() => { MD.year = 2010; renderModes(); });
+    await page.click("#md-prev");
+    assert.equal(await page.textContent("#md-year"), "2009");
+    assert.ok(await page.$eval("#md-prev", (b) => b.disabled));
+    await page.keyboard.press("ArrowLeft");
+    assert.equal(await page.textContent("#md-year"), "2009");
+    // Esc goes back to the page; the Calendar folder's Year button opens the view again, and the
+    // folder row itself still folds.
     await page.focus("#md-title");
     await page.keyboard.press("Escape");
     await page.waitForSelector("#modes.hidden", { state: "attached" });
     assert.doesNotMatch(page.url(), /view=modes/);
-    await page.click('.tn-row:has-text("Betriebszeiten")');
+    const folder = '.tn-row:has-text("Betriebszeiten")';
+    const expanded = () => page.getAttribute(folder, "aria-expanded");
+    const was = await expanded();
+    await page.click(`${folder} .tn-tw`);
+    assert.notEqual(await expanded(), was);
+    assert.ok(await page.isHidden("#modes"));
+    await page.click(`${folder} [data-modes]`);
     await page.waitForSelector("#modes:not(.hidden)");
     await page.click("#md-close");
     await page.waitForSelector("#modes.hidden", { state: "attached" });

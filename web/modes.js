@@ -3,14 +3,17 @@
 // The dates come decoded from the server (`calendar.date` of each entry, see src/calendar.rs);
 // here they are only laid out on the days of a year. Loaded after app.js, whose helpers it uses.
 
-const MD = { open: false, year: new Date().getFullYear(), hidden: new Set(), liveKey: "" };
+const MD = { open: false, year: new Date().getFullYear(), hidden: new Set(), liveKey: "", cache: null };
+/** The years the view steps through: calendar periods count from 2009 (Loxone's day 0). */
+const MD_FIRST_YEAR = 2009, MD_LAST_YEAR = 9999;
 /** One colour per mode, in the order of the config's modes; white text reads on each. */
 const MD_COLORS = ["#c8691c", "#2f6fb8", "#8a4fc0", "#1f8a5c", "#c23a5a", "#8c6d12", "#0d7f9c", "#5d655d", "#b0428f", "#4d6b1f"];
 const MD_MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
 const MD_WEEKDAYS = ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"];
 
 // ── dates: whole days since 1970-01-01 (UTC, so no daylight-saving shifts) ──
-function mdDay(y, m, d) { return Math.floor(Date.UTC(y, m - 1, d) / 864e5); }
+// setUTCFullYear, not Date.UTC, which would read years 0–99 as 1900–1999.
+function mdDay(y, m, d) { const t = new Date(0); t.setUTCFullYear(y, m - 1, d); return Math.floor(t.getTime() / 864e5); }
 function mdYmd(n) { const t = new Date(n * 864e5); return [t.getUTCFullYear(), t.getUTCMonth() + 1, t.getUTCDate()]; }
 /** `month`/`day` in year `y`, or null when the year has no such day (29 Feb). */
 function mdDate(y, m, d) { const n = mdDay(y, m, d); return mdYmd(n)[1] === m ? n : null; }
@@ -101,11 +104,10 @@ function mdLiveOn() {
   }
   return on;
 }
+function mdLiveKey(on) { return on ? [...on].sort().join(" ") : "-"; }
 /** Live values changed: repaint only when the set of modes that are on changed. */
 function modesLive() {
-  if (!MD.open) return;
-  const on = mdLiveOn(), key = on ? [...on].sort().join(" ") : "-";
-  if (key !== MD.liveKey) renderModes();
+  if (MD.open && mdLiveKey(mdLiveOn()) !== MD.liveKey) renderModes();
 }
 function mdToday() { const t = new Date(); return mdDay(t.getFullYear(), t.getMonth() + 1, t.getDate()); }
 function mdFmt(n) { const [y, m, d] = mdYmd(n); return `${d} ${MD_MONTHS[m - 1].slice(0, 3)} ${y}`; }
@@ -114,7 +116,6 @@ function mdFmt(n) { const [y, m, d] = mdYmd(n); return `${d} ${MD_MONTHS[m - 1].
 function modesOpen(opts) {
   if (!S.view) return;
   MD.open = true;
-  if (opts?.year) MD.year = opts.year;
   $("modes").classList.remove("hidden");
   renderModes();
   if (!opts?.quiet) { writeHash(true); $("md-title").focus({ preventScroll: true }); }
@@ -126,16 +127,22 @@ function modesClose(quiet) {
   hideTip();
   if (!quiet) writeHash(true);
 }
-function modesStep(d) { MD.year += d; renderModes(); }
+function modesStep(d) { MD.year = Math.max(MD_FIRST_YEAR, Math.min(MD_LAST_YEAR, MD.year + d)); renderModes(); }
 
 function renderModes() {
   if (!MD.open || !S.view) return;
+  MD.year = Math.max(MD_FIRST_YEAR, Math.min(MD_LAST_YEAR, MD.year));
   const y = MD.year, modes = mdModes(), { days, entries } = mdYear(y), marks = mdMarks();
+  MD.cache = { year: y, days, modes };
   const liveOnNow = mdLiveOn(), today = mdToday();
-  MD.liveKey = liveOnNow ? [...liveOnNow].sort().join(" ") : "-";
-  const todayKeys = new Set((days.get(today)?.on || []).map((e) => e.key));
+  MD.liveKey = mdLiveKey(liveOnNow);
+  // Today's modes come from today's year, whichever year is on screen.
+  const ty = mdYmd(today)[0];
+  const todayKeys = new Set(((ty === y ? days : mdYear(ty).days).get(today)?.on || []).map((e) => e.key));
   $("md-year").textContent = y;
-  $("md-today").disabled = y === new Date().getFullYear();
+  $("md-today").disabled = y === ty;
+  $("md-prev").disabled = y <= MD_FIRST_YEAR;
+  $("md-next").disabled = y >= MD_LAST_YEAR;
 
   // Legend: one chip per mode; click hides or shows its days.
   $("md-legend").innerHTML = [...modes.values()].map((m) => {
@@ -186,9 +193,11 @@ function renderModes() {
   }).join("") : '<li class="empty">This config has no calendar entries.</li>';
 }
 
-/** For a tooltip: the day, and every entry on it. */
+/** For a tooltip: the day, and every entry of a shown mode on it. */
 function mdDayTip(n) {
-  const d = mdYear(MD.year).days.get(n), modes = mdModes(), marks = mdMarks();
+  const { modes } = MD.cache, marks = mdMarks(), shown = (e) => !MD.hidden.has(e.key);
+  const all = MD.cache.days.get(n);
+  const d = all && { on: all.on.filter(shown), add: all.add.filter(shown), rem: all.rem.filter(shown) };
   const line = (e, tag) => `<br><span class="md-tsw" style="background:${modes.get(e.key)?.color || "#888"}"></span>${esc(e.title)} · ${esc(modes.get(e.key)?.title || e.cal.mode.title)}${tag ? ` <span class="tm">${tag}</span>` : ""}`;
   let html = `<b>${esc(mdFmt(n))}</b>${n === mdToday() ? ' <span class="tm">today</span>' : ""}`;
   if (!d || (!d.on.length && !d.rem.length)) return html + '<br><span class="tm">No calendar entry</span>';
@@ -201,7 +210,7 @@ function mdDayTip(n) {
 // ── events ─────────────────────────────────────────────────────────────
 $("md-prev").onclick = () => modesStep(-1);
 $("md-next").onclick = () => modesStep(1);
-$("md-today").onclick = () => { MD.year = new Date().getFullYear(); renderModes(); };
+$("md-today").onclick = () => { MD.year = mdYmd(mdToday())[0]; renderModes(); };
 $("md-close").onclick = () => { modesClose(); svg.focus({ preventScroll: true }); };
 $("md-legend").addEventListener("click", (e) => {
   const c = e.target.closest("[data-mode]");
@@ -215,22 +224,27 @@ $("md-list").addEventListener("click", (e) => {
 });
 $("md-grid").addEventListener("mousemove", (e) => {
   const c = e.target.closest("[data-day]");
-  if (c) showTip(e, mdDayTip(+c.dataset.day)); else hideTip();
+  if (c && MD.cache) showTip(e, mdDayTip(+c.dataset.day)); else hideTip();
 });
 $("md-grid").addEventListener("mouseleave", hideTip);
 $("md-grid").addEventListener("click", (e) => {
   // A day selects its first entry (one it switches on, else one removed from it).
   const c = e.target.closest("[data-day]");
-  const d = c && mdYear(MD.year).days.get(+c.dataset.day);
+  const d = c && MD.cache?.days.get(+c.dataset.day);
   const first = d && [...d.on, ...d.rem].find((x) => !MD.hidden.has(x.key));
   if (first) select(first.uuid);
 });
-$("modes").addEventListener("keydown", (e) => {
-  if (e.target.closest("input, select, textarea")) return;
-  if (e.key === "Escape") { modesClose(); svg.focus({ preventScroll: true }); }
-  else if (e.key === "ArrowLeft" && !e.target.closest(".md-list")) modesStep(-1);
-  else if (e.key === "ArrowRight" && !e.target.closest(".md-list")) modesStep(1);
-  else return;
+/** The window's keys while the view is open (app.js asks first): ← / → step the year, Esc
+ *  closes, and the keys that pan or zoom the hidden page do nothing. True when handled. */
+function modesKey(e) {
+  if (!MD.open) return false;
+  switch (e.key) {
+    case "ArrowLeft": modesStep(-1); break;
+    case "ArrowRight": modesStep(1); break;
+    case "Escape": modesClose(); svg.focus({ preventScroll: true }); break;
+    case "ArrowUp": case "ArrowDown": case "+": case "=": case "-": case "_": case "0": case "1": break;
+    default: return false;
+  }
   e.preventDefault();
-  e.stopPropagation();
-});
+  return true;
+}

@@ -608,3 +608,7 @@ button.chip { cursor: pointer; } button.chip:hover { border-color: var(--brand);
 .md-ew, .md-em { font-size: 12px; color: var(--muted); grid-column: 2; }
 .md-ey { color: var(--faint); }
 @media (max-width: 900px) { .md-body { flex-direction: column; } .md-side { width: auto; max-height: 40%; border-left: 0; border-top: 1px solid var(--line); } }
+.tn-year { margin-left: auto; padding: 0 7px; height: 18px; border: 1px solid var(--line); border-radius: 9px; background: #fff; color: var(--muted); font-size: 11px; font-weight: 600; }
+.tn-year:hover { border-color: var(--brand); color: var(--text); }
+.tn-year + .badge, .tn-year + .tn-n { margin-left: 6px; }
+.md-years button:disabled { opacity: .4; cursor: default; }

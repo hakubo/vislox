@@ -25,13 +25,13 @@ marked so you can review it before you deploy.
   on*, linked to the `Mode` object. The tree's tooltip says the same, and the Changes list reads a changed entry
   as *24 Dec → 26 Dec* and *Holiday → Party* instead of raw attributes. An entry vislox cannot decode says why;
   its raw attributes stay under Advanced.
-- **Operating modes** (Ctrl+K *Operating modes*, or the tree's Calendar or Operating modes folder): a year
-  calendar of when each mode is on. Each day carries the colour of every mode its entries switch on; ← / →
-  go to other years, and a mode's chip hides or shows its days. Hovering a day lists its entries, and clicking
+- **Operating modes** (Ctrl+K *Operating modes*, or **Year** on the tree's Calendar or Operating modes folder): a
+  year calendar of when each mode is on. Each day carries the colour of every mode its entries switch on; ← / →
+  go to other years (from 2009, Loxone's day 0), and a mode's chip hides or shows its days. Hovering a day lists its entries, and clicking
   a day or an entry in the list beside the year selects the entry (Properties). Today is outlined. With live
   values on, the modes that are on now (their `Q`) are marked *on now*, and the chip's tooltip says whether the
   calendar has that mode today or logic switched it on. In change review, days the viewed revision adds are
-  outlined green and days it removes red (amber for both), so a timespan in the wrong year stands out. Easter
+  outlined green and days it removes red (amber for both), so a timespan in the wrong year stands out. An entry whose date no longer decodes shows its old days as removed. Easter
   comes from the Gregorian computus; a yearly range that ends before it starts runs across New Year. Weekday
   entries (*the last Monday of May*) are not decoded yet, so they are not on the calendar.
 - **History** (right): every revision, newest first:

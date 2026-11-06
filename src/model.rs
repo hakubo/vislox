@@ -214,7 +214,9 @@ pub struct CalInfo {
     /// The date in the compared revision, when both revisions' dates
     /// decode and differ.
     pub old_when: Option<String>,
-    /// That date by kind.
+    /// That date by kind; also when only the compared revision's date
+    /// decodes (then without `old_when`), so that views of the year can
+    /// show the days the entry no longer has.
     pub old_date: Option<EntryDate>,
     /// The operating mode it switches on.
     pub mode: CalMode,
@@ -1555,14 +1557,17 @@ fn changes(view: &mut View, nc: &Ctx, oc: &Ctx, d: &Delta) {
 fn cal_info(c: &Ctx, old: Option<&Ctx>, uuid: &str) -> Option<CalInfo> {
     let date = c.entry_date(uuid)?;
     let mode = c.entry_mode(uuid);
-    let (mut old_date, mut old_mode) = (None, None);
+    let (mut old_date, mut old_mode, mut old_when) = (None, None, None);
     if let Some(o) = old
         && let Some(od) = o.entry_date(uuid)
     {
-        if let (Ok(a), Ok(b)) = (&od, &date)
-            && a != b
-        {
-            old_date = Some(*a);
+        match (&od, &date) {
+            (Ok(a), Ok(b)) if a != b => {
+                old_date = Some(*a);
+                old_when = Some(a.text());
+            }
+            (Ok(a), Err(_)) => old_date = Some(*a),
+            _ => {}
         }
         let om = o.entry_mode(uuid);
         if !same_mode(&om, &mode) {
@@ -1573,7 +1578,7 @@ fn cal_info(c: &Ctx, old: Option<&Ctx>, uuid: &str) -> Option<CalInfo> {
         when: date.as_ref().ok().map(EntryDate::text),
         why: date.as_ref().err().cloned(),
         date: date.ok(),
-        old_when: old_date.map(|d| d.text()),
+        old_when,
         old_date,
         mode,
         old_mode,
@@ -2541,7 +2546,13 @@ mod tests {
             "{:?}",
             texts(&v)
         );
-        assert!(cal(&v, NYE).old_when.is_none() && cal(&v, NYE).old_date.is_none());
+        // The year view still gets the old date, to show the days it no
+        // longer has; the change list and Properties do not.
+        assert!(cal(&v, NYE).old_when.is_none());
+        assert_eq!(
+            cal(&v, NYE).old_date,
+            Some(EntryDate::Fixed { month: 12, day: 31 })
+        );
     }
 
     #[test]
