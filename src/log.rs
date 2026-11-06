@@ -136,7 +136,7 @@ impl LoxRead {
         &self,
         args: &[&str],
         what: &str,
-        ok: impl FnOnce(&str, i64) -> Result<Value, String>,
+        ok: impl FnOnce(&str) -> Result<Value, String>,
         empty: Value,
     ) -> Value {
         let cmd = match &self.cmd {
@@ -152,7 +152,7 @@ impl LoxRead {
         }
         let started = Instant::now();
         let now = chrono::Utc::now().timestamp();
-        let v = match cmd.run(args, what).await.and_then(|t| ok(&t, now)) {
+        let v = match cmd.run(args, what).await.and_then(|t| ok(&t)) {
             Ok(mut v) => {
                 v["available"] = json!(true);
                 v["host"] = json!(self.host);
@@ -201,7 +201,7 @@ impl Log {
             .fetch(
                 &["log", "-n", &lines, "--no-color", "--no-header"],
                 "lox log",
-                |text, _| {
+                |text| {
                     let entries = parse(text);
                     let since = last_program_change(&entries);
                     Ok(json!({ "lines": LINES, "since": since, "entries": entries }))

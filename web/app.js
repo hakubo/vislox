@@ -1108,6 +1108,8 @@ const HW_HOW = {
   added: "Added: the Miniserver configures this device once it finds it on the bus",
   removed: "Removed: the Miniserver no longer configures this device",
   replaced: "Device replaced: another serial is another physical device",
+  paired: "Paired: the config now names this device's serial, so the Miniserver configures the device with it",
+  unpaired: "Unpaired: the config no longer names a serial, so no physical device gets this configuration",
   changed: "Reconfigures the device: the Miniserver sends it a new configuration, which the device stores",
 };
 const HW_LABEL = { AC: "Audible acknowledgement", SSC: "Send interval", MinChange: "Threshold", MinTime: "Minimal time between sends", AverageTime: "Mean value time", TreeType: "Device type", SubType: "Device subtype", HwVersion: "Hardware version" };
@@ -1879,35 +1881,55 @@ async function showDeployed() {
 // come from `lox extensions` (GET /api/hardware, read-only): before Apply, a new serial that is not on the
 // bus is a warning; after Apply, the reconfigured devices show whether they are online.
 function hwInfo() { return S.hist?.hardware || { available: false }; }
-async function loadBus() {
-  const r = await fetch("/api/hardware", { headers: { "X-Vislox": "hardware" } });
+/** The devices on the bus; with `ms`, gives up after that long (a hung lox must not block Apply's dialog). */
+async function loadBus(ms) {
+  const ctl = new AbortController(), t = ms && setTimeout(() => ctl.abort(), ms);
+  let r;
+  try { r = await fetch("/api/hardware", { headers: { "X-Vislox": "hardware" }, signal: ctl.signal }); } catch (e) {
+    throw new Error(e.name === "AbortError" ? `no answer within ${ms / 1000} s` : e.message);
+  } finally { clearTimeout(t); }
   const j = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(j.error || r.statusText);
   if (j.available === false) throw new Error(j.reason || "the bus cannot be read");
   if (j.error) throw new Error(j.error);
   return j.devices || [];
 }
-function hwSerial(s) { return String(s || "").replace(/[^0-9a-f]/gi, "").toUpperCase(); }
-/** A device of `view.hardware` on the bus: by serial, else (not paired yet) by name. */
+/** A device of `view.hardware` on the bus. The server writes serials as the bus list does; a device
+ *  whose serial cannot be looked for (`check` false: not paired yet, or an Air device, whose `IP=` is no
+ *  bus serial) is matched by name, and only to show its state, never to warn that it is missing. */
 function onBus(d, bus) {
-  const s = hwSerial(d.serial);
-  return /^0*$/.test(s) ? bus.find((b) => b.name === d.title) : bus.find((b) => b.serial === s);
+  return d.check ? bus.find((b) => b.serial === d.serial) : bus.find((b) => b.name === d.title);
 }
+/** What is on the Miniserver now: the newest revision that is not a compile. Both Apply's confirmation and
+ *  the after-Apply list compare with it, so they count the same devices. */
+function deployedRev() { return S.hist?.history.find((r) => r.current) || null; }
+/** How long Apply's confirmation waits for the device list and the bus, together, before it asks anyway
+ *  (and says the bus check did not finish). */
+const HW_WAIT = 6000;
 /** The devices the pending change reconfigures, and, for new serials, whether they are on the bus. */
 async function pendingHardware(pend) {
+  const base = deployedRev()?.id || pend.base || "";
+  const until = Date.now() + HW_WAIT;
   let devs;
   try {
-    devs = (await api(`/api/view?rev=${encodeURIComponent(pend.id)}&base=${encodeURIComponent(pend.base || "")}`)).hardware || [];
-  } catch (e) { return { error: e.message, devs: [] }; }
-  const fresh = devs.filter((d) => (d.how === "added" || d.how === "replaced") && !/^0*$/.test(hwSerial(d.serial)));
+    const ctl = new AbortController(), t = setTimeout(() => ctl.abort(), HW_WAIT);
+    try {
+      const r = await fetch(`/api/hardware/changes?rev=${encodeURIComponent(pend.id)}&base=${encodeURIComponent(base)}`, { signal: ctl.signal });
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.error || r.statusText);
+      devs = j.devices || [];
+    } finally { clearTimeout(t); }
+  } catch (e) { return { error: e.name === "AbortError" ? `no answer within ${HW_WAIT / 1000} s` : e.message, devs: [] }; }
+  const fresh = devs.filter((d) => (d.how === "added" || d.how === "replaced" || d.how === "paired") && d.check);
   if (!fresh.length || !hwInfo().available) return { devs, fresh: [] };
   try {
-    const bus = await loadBus();
+    const bus = await loadBus(Math.max(1000, until - Date.now()));
     return { devs, fresh, missing: fresh.filter((d) => !onBus(d, bus)) };
   } catch (e) { return { devs, fresh, busError: e.message }; }
 }
 function hwLine(d) {
-  const what = d.how === "replaced" ? `replaced, serial ${d.old_serial || "—"} → ${d.serial || "—"}` : d.how === "changed" ? "settings" : d.how;
+  const what = d.how === "replaced" || d.how === "unpaired" ? `${d.how}, serial ${d.old_serial || "—"} → ${d.serial || "—"}`
+    : d.how === "paired" ? `paired, serial ${d.serial || "—"}` : d.how === "changed" ? "settings" : d.how;
   return `  ${d.title} (${d.kind}): ${what}`;
 }
 /** Apply's confirmation: "This reconfigures 3 devices", and new serials that are not on the bus. */
@@ -1923,7 +1945,7 @@ function hwApplyText(hw) {
       hw.missing.map((d) => `${d.title} (${d.kind}), serial ${d.serial}`).join("; ") +
       `. Until that device is connected, its inputs and outputs do not work.\n\n` + t;
   } else if (hw.busError) {
-    t = `Could not check the new serials against the bus: ${hw.busError}\n\n` + t;
+    t = `The new serials were not checked against the bus (lox extensions: ${hw.busError}).\n\n` + t;
   }
   return t;
 }
@@ -1950,8 +1972,8 @@ function deployedHardware(d) {
   const rows = d.hw.slice(0, 12).map((x) => {
     const on = b?.devices ? onBus(x, b.devices) : null;
     const was = b?.offline.get(x.uuid);
-    const state = !b ? "" : !b.devices ? (b.error ? "" : "checking…") : !on ? "not on the bus" : on.online ? (was ? `online (was offline at ${new Date(was).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })})` : "online") : "offline";
-    const bad = b?.devices && (!on || !on.online || was);
+    const state = !b ? "" : !b.devices ? (b.error ? "" : "checking…") : !on ? (x.check ? "not on the bus" : "—") : on.online ? (was ? `online (was offline at ${new Date(was).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })})` : "online") : "offline";
+    const bad = b?.devices && ((!on && x.check) || (on && !on.online) || was);
     return `<div class="pr hw-dev${bad ? " off" : ""}"><span class="k">${esc(x.how === "changed" ? "settings" : x.how)}</span>` +
       `<button type="button" class="go" data-go="${esc(x.uuid)}" title="${esc(x.kind)}">${esc(x.title)}</button><span class="why">${esc(state)}</span></div>`;
   }).join("");

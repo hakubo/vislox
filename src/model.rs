@@ -3,8 +3,8 @@
 //! tree, and — when a base revision is given — what changed against it.
 
 use crate::calendar::{self, EntryDate};
-use crate::schedule;
 use crate::hardware;
+use crate::schedule;
 use loxone_config::diff::{self, DocDiff};
 use loxone_config::doc::{LoxoneDoc, PortView, WireView, ports};
 use loxone_config::layout::{GeoObject, Layout, PageGeometry, ROW, Shape, Side};
@@ -49,12 +49,17 @@ pub struct HwDevice {
     pub kind: String,
     /// The device type on the bus (`0x8003`), when known.
     pub code: Option<String>,
-    /// `added`, `removed`, `replaced` (its serial changed) or `changed`.
+    /// `added`, `removed`, `replaced` (another serial), `paired` (a serial
+    /// where there was none), `unpaired` (its serial cleared) or `changed`.
     pub how: &'static str,
-    /// Its serial (an Air device's `IP=`) in the compared revision; for a
-    /// removed device, the one it had.
+    /// Its serial (an Air device's `IP=`) in the compared revision, as
+    /// [`crate::discover::norm_serial`] writes it; for a removed device, the
+    /// one it had.
     pub serial: Option<String>,
     pub old_serial: Option<String>,
+    /// Whether `serial` can be looked for on the bus (`lox extensions`): a
+    /// real serial, not an Air device's MAC-derived address.
+    pub check: bool,
 }
 
 /// An operating mode (`Mode`), by the number calendar entries name it with.
@@ -657,7 +662,7 @@ impl<'a> Ctx<'a> {
         loop {
             let el = self.el(cur)?;
             let ty = el.attr("Type").unwrap_or("");
-            if hardware::is_device(ty, el.attr("Serial").is_some()) {
+            if hardware::is_device(ty) {
                 return Some(cur.to_string());
             }
             if matches!(ty, "LoxLIVE" | "Page" | "Document") {
@@ -1075,6 +1080,15 @@ pub fn build(new: &LoxoneDoc, old: Option<&LoxoneDoc>, title: &str) -> View {
     view
 }
 
+/// The devices `new` reconfigures compared with `old` (`view.hardware`),
+/// without building the rest of the view: for Apply's confirmation.
+pub fn hardware(new: &LoxoneDoc, old: &LoxoneDoc) -> Vec<HwDevice> {
+    let (nc, oc) = (Ctx::new(new), Ctx::new(old));
+    let mut d = delta(&nc, &oc, &diff::diff(old, new));
+    hw_delta(&nc, &oc, &mut d);
+    hw_devices(&nc, &oc, &d)
+}
+
 /// Which devices the change reconfigures, and with which attributes.
 fn hw_delta(nc: &Ctx, oc: &Ctx, d: &mut Delta) {
     let is_dev = |c: &Ctx, u: &str| c.device_of(u).as_deref() == Some(u);
@@ -1098,12 +1112,13 @@ fn hw_delta(nc: &Ctx, oc: &Ctx, d: &mut Delta) {
             }
             d.hw_attrs.insert((u.clone(), n.clone()));
             let how = if own && n == hardware::identity(&dty) {
-                "replaced"
+                hardware::identity_change(oc.serial(u).as_deref(), nc.serial(u).as_deref())
             } else {
                 CHANGED
             };
+            // The identity's change says more than a setting's.
             let e = d.hw.entry(dev.clone()).or_insert(how);
-            if how == "replaced" {
+            if how != CHANGED {
                 *e = how;
             }
         }
@@ -1122,14 +1137,19 @@ fn hw_devices(nc: &Ctx, oc: &Ctx, d: &Delta) -> Vec<HwDevice> {
                 } else {
                     c.order.iter().position(|o| o == u).unwrap_or(0)
                 };
+                let norm = |s: Option<String>| s.map(|s| crate::discover::norm_serial(&s));
+                let serial = norm(c.serial(u));
                 let dev = HwDevice {
+                    check: c.ty(u) != hardware::AIR && !hardware::unpaired(serial.as_deref()),
                     uuid: u.clone(),
                     title: c.title(u),
                     kind,
                     code,
                     how,
-                    serial: c.serial(u),
-                    old_serial: (*how == "replaced").then(|| oc.serial(u)).flatten(),
+                    serial,
+                    old_serial: matches!(*how, "replaced" | "unpaired")
+                        .then(|| norm(oc.serial(u)))
+                        .flatten(),
                 };
                 (pos, dev)
             })
@@ -1700,6 +1720,7 @@ fn changes(view: &mut View, nc: &Ctx, oc: &Ctx, d: &Delta) {
                     text,
                     page: page_for(&u),
                     obj: Some(u.clone()),
+                    hw: None,
                 });
             }
         }
@@ -1710,14 +1731,14 @@ fn changes(view: &mut View, nc: &Ctx, oc: &Ctx, d: &Delta) {
                     .contains(&(u.clone(), n.clone()))
                     .then(|| nc.device_of(&u))
                     .flatten();
-                let replaced = hw.as_deref() == Some(u.as_str())
-                    && d.hw.get(&u) == Some(&"replaced")
-                    && *n == hardware::identity(&nc.ty(&u));
-                let text = if replaced {
+                let identity =
+                    hw.as_deref() == Some(u.as_str()) && *n == hardware::identity(&nc.ty(&u));
+                let text = if identity {
                     let (kind, code) = nc.dev_kind(&u);
                     format!(
-                        "{} · device replaced: {}{}, {} {} → {}",
+                        "{} · device {}: {}{}, {} {} → {}",
                         nc.title(&u),
+                        hardware::identity_change(o.as_deref(), new.as_deref()),
                         code.map(|c| format!("{c} ")).unwrap_or_default(),
                         kind,
                         if n == "IP" { "address" } else { "serial" },
@@ -3218,6 +3239,72 @@ mod tests {
         assert_eq!(
             c.text,
             "Touch Küche · device replaced: 0x8003 Touch Tree, serial B03B368A → B03B9999"
+        );
+    }
+
+    #[test]
+    fn a_newer_loxone_config_save_reconfigures_no_device() {
+        // Every object's `V=` bumped, and attributes not matched to a device's block changed.
+        let new = HW
+            .replace("V=\"178\"", "V=\"179\"")
+            .replace("PG=\"\" AC=", "PG=\"7\" AC=");
+        let v = build(&doc(&new), Some(&doc(HW)), "t");
+        assert!(v.changes.iter().any(|c| c.text.contains("V: 178 → 179")));
+        assert!(v.hardware.is_empty(), "{:?}", v.hardware);
+        assert!(v.changes.iter().all(|c| c.hw.is_none()));
+    }
+
+    #[test]
+    fn a_cleared_serial_unpairs_the_device_and_a_first_one_pairs_it() {
+        // The Touch's serial removed: still a device, now unpaired.
+        let cleared = hw_edited(&[(" Serial=\"B03B368A\"", "")]);
+        let v = build(&doc(&cleared), Some(&doc(HW)), "t");
+        let d = &v.hardware[0];
+        assert_eq!((d.uuid.as_str(), d.how), (TOUCH, "unpaired"));
+        assert_eq!(
+            (d.serial.as_deref(), d.old_serial.as_deref()),
+            (None, Some("B03B368A"))
+        );
+        assert!(!d.check);
+        assert!(
+            v.changes
+                .iter()
+                .any(|c| c.hw.is_some() && c.text.contains("device unpaired"))
+        );
+        assert!(v.objects[TOUCH].device.is_some());
+        // Added offline (00000000), then found: paired, not replaced.
+        let offline = hw_edited(&[("Serial=\"B03B368A\"", "Serial=\"00000000\"")]);
+        let v = build(&doc(HW), Some(&doc(&offline)), "t");
+        let d = &v.hardware[0];
+        assert_eq!((d.how, d.serial.as_deref()), ("paired", Some("B03B368A")));
+        assert!(d.check && d.old_serial.is_none());
+        let c = v.changes.iter().find(|c| c.hw.is_some()).unwrap();
+        assert_eq!(
+            c.text,
+            "Touch Küche · device paired: 0x8003 Touch Tree, serial 00000000 → B03B368A"
+        );
+    }
+
+    #[test]
+    fn a_serial_outside_the_buses_is_no_device() {
+        // An Intercom (its Serial= is a MAC) added under the Miniserver.
+        let intercom = "20000008-0000-0080-ffff504f94000002";
+        let new = hw_edited(&[(
+            "\t\t\t<C Type=\"LoxTree\"",
+            &format!(
+                "\t\t\t<C Type=\"IntercomDevice\" V=\"178\" U=\"{intercom}\" Title=\"Haustür\" Serial=\"504F94D00001\"/>\n\t\t\t<C Type=\"LoxTree\""
+            ),
+        )]);
+        let v = build(&doc(&new), Some(&doc(HW)), "t");
+        assert!(v.objects[intercom].device.is_none());
+        assert!(v.hardware.is_empty(), "{:?}", v.hardware);
+        assert!(
+            v.changes
+                .iter()
+                .find(|c| c.kind == "added")
+                .unwrap()
+                .hw
+                .is_none()
         );
     }
 

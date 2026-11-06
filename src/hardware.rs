@@ -21,30 +21,58 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use std::path::Path;
 
-/// The Miniserver itself: its settings are not a device's configuration.
-const MINISERVER: &str = "LoxLIVE";
+/// Extensions and bus interfaces: their type, the name, and the device type
+/// code on the bus (`NAT/LoxoneLinkNATProtocol.md`, "Device Type").
+const EXTENSIONS: &[(&str, &str, Option<u32>)] = &[
+    ("LoxAin", "AI Extension", Some(0x19)),
+    ("LoxAout", "AO Extension", Some(0x17)),
+    ("LoxDigin", "DI Extension", Some(0x14)),
+    ("LoxREL", "Relay Extension", Some(0x0B)),
+    ("LoxDIMM", "Dimmer Extension", Some(0x02)),
+    ("LoxOCEAN", "EnOcean Extension", Some(0x03)),
+    ("LoxMORE", "Extension", Some(0x01)),
+    ("LoxTree", "Tree Extension", Some(0x13)),
+    ("LoxAIR", "Air Base Extension", Some(0x0C)),
+    ("Comm485", "RS485 Extension", Some(0x07)),
+    ("Comm232", "RS232 Extension", Some(0x06)),
+    ("CommDMX", "DMX Extension", Some(0x04)),
+    ("CommIR", "IR Extension", Some(0x08)),
+    ("EIBline", "KNX Extension", Some(0x15)),
+    ("Comm1wire", "1-Wire Extension", None),
+];
 
-/// Whether an object of type `ty` is a device of its own: an extension, a
-/// bus interface, a Tree or Air device. Hardware carries its serial in
-/// `Serial=` (an Air device its MAC in `IP=`, lox's `loxone-format.md`,
-/// "Hardware identity").
-pub fn is_device(ty: &str, has_serial: bool) -> bool {
-    ty != MINISERVER && (has_serial || ty == "LoxAIRDevice")
+/// An Air device: its identity is a MAC-derived `IP=`, not a bus serial.
+pub const AIR: &str = "LoxAIRDevice";
+
+/// Whether an object of type `ty` is a device on the Miniserver's buses: an
+/// extension, a bus interface, a Tree or Air device. Decided by type, so a
+/// device whose serial is cleared is still one, and an Intercom, a client
+/// Miniserver or a network device (their `Serial=` is a MAC) is not.
+pub fn is_device(ty: &str) -> bool {
+    ty == "TreeDevice" || ty == AIR || EXTENSIONS.iter().any(|(t, ..)| *t == ty)
 }
 
 /// The attribute that identifies a device of type `ty`: another value is
 /// another physical device.
 pub fn identity(ty: &str) -> &'static str {
-    if ty == "LoxAIRDevice" { "IP" } else { "Serial" }
+    if ty == AIR { "IP" } else { "Serial" }
 }
 
-/// A serial as hex digits only, upper case, so `b03b368a` and
-/// `50:4F:94:…` compare with what the config writes.
-pub fn norm_serial(s: &str) -> String {
-    s.chars()
-        .filter(char::is_ascii_hexdigit)
-        .map(|c| c.to_ascii_uppercase())
-        .collect()
+/// A serial that names no device: a Tree device added offline in Loxone
+/// Config has `00000000`, a device without one no `Serial=` or an empty one.
+pub fn unpaired(serial: Option<&str>) -> bool {
+    serial.is_none_or(|s| s.trim().chars().all(|c| c == '0'))
+}
+
+/// How a change of a device's identity (`Serial=`, an Air device's `IP=`)
+/// reads: `paired` from none to one, `unpaired` from one to none, else
+/// `replaced` (another physical device).
+pub fn identity_change(old: Option<&str>, new: Option<&str>) -> &'static str {
+    match (unpaired(old), unpaired(new)) {
+        (true, false) => "paired",
+        (false, true) => "unpaired",
+        _ => "replaced",
+    }
 }
 
 /// What kind of device an object of type `ty` is (with the `TreeType=` of
@@ -62,26 +90,13 @@ pub fn kind(ty: &str, tree_type: Option<&str>) -> (String, Option<String>) {
             });
         return (name, code);
     }
-    let (name, code): (&str, Option<u32>) = match ty {
-        "LoxAin" => ("AI Extension", Some(0x19)),
-        "LoxAout" => ("AO Extension", Some(0x17)),
-        "LoxDigin" => ("DI Extension", Some(0x14)),
-        "LoxREL" => ("Relay Extension", Some(0x0B)),
-        "LoxDIMM" => ("Dimmer Extension", Some(0x02)),
-        "LoxOCEAN" => ("EnOcean Extension", Some(0x03)),
-        "LoxMORE" => ("Extension", Some(0x01)),
-        "LoxTree" => ("Tree Extension", Some(0x13)),
-        "LoxAIR" => ("Air Base Extension", Some(0x0C)),
-        "Comm485" => ("RS485 Extension", Some(0x07)),
-        "Comm232" => ("RS232 Extension", Some(0x06)),
-        "CommDMX" => ("DMX Extension", Some(0x04)),
-        "CommIR" => ("IR Extension", Some(0x08)),
-        "EIBline" => ("KNX Extension", Some(0x15)),
-        "Comm1wire" => ("1-Wire Extension", None),
-        "LoxAIRDevice" => ("Air device", None),
-        _ => return (ty.to_string(), None),
-    };
-    (name.to_string(), code.map(|c| format!("0x{c:02X}")))
+    if ty == AIR {
+        return ("Air device".to_string(), None);
+    }
+    match EXTENSIONS.iter().find(|(t, ..)| *t == ty) {
+        Some((_, name, code)) => (name.to_string(), code.map(|c| format!("0x{c:02X}"))),
+        None => (ty.to_string(), None),
+    }
 }
 
 /// Tree device types (`NAT/LoxoneLinkNATProtocol.md`, "Device Type"), with
@@ -147,30 +162,13 @@ pub fn note(ty: &str, tree: Option<&str>) -> Option<&'static str> {
     None
 }
 
-/// Attributes of a device object that stay in the Miniserver: names,
-/// where it is mounted, how Loxone Config draws it. Everything else on a
-/// device object counts as its configuration.
-const NOT_ON_DEVICE: &[&str] = &[
-    "Title",
-    "Desc",
-    "Installation",
-    "SwitchBoard",
-    "SwitchBoardRow",
-    "SwitchBoardPos",
-    "Cl",
-    "WF",
-    "TId",
-];
-
-/// Whether a change of `attr` reconfigures the device: on the device object
-/// (`own`) every attribute but those that stay in the Miniserver; on one of
-/// its inputs or outputs only those matched to its configuration ([`hint`]).
+/// Whether a change of `attr` reconfigures the device: only attributes
+/// matched to its configuration block (those with a [`hint`]), on the device
+/// object (`own`) or one of its inputs and outputs. Anything else (names,
+/// mounting, the `V=` a newer Loxone Config writes, attributes not matched
+/// yet) does not count.
 pub fn reconfigures(dev_ty: &str, tree: Option<&str>, obj_ty: &str, own: bool, attr: &str) -> bool {
-    if own {
-        !NOT_ON_DEVICE.contains(&attr)
-    } else {
-        hint(dev_ty, tree, obj_ty, own, attr).is_some()
-    }
+    hint(dev_ty, tree, obj_ty, own, attr).is_some()
 }
 
 /// What `attr` does on the device, for its tooltip in Properties: on the
@@ -190,7 +188,7 @@ pub fn hint(
                  another physical device (a replacement); until one with this serial answers, the \
                  device's inputs and outputs do not work.",
             ),
-            "IP" if dev_ty == "LoxAIRDevice" => Some(
+            "IP" if dev_ty == AIR => Some(
                 "The Air device's address, formed from its MAC (its serial): another value is \
                  another physical device.",
             ),
@@ -235,7 +233,7 @@ pub fn hint(
 #[derive(Serialize, Debug, PartialEq)]
 pub struct OnBus {
     pub name: String,
-    /// Hex digits only, upper case ([`norm_serial`]); empty when none.
+    /// Upper case, without separators ([`crate::discover::norm_serial`]); empty when none.
     pub serial: String,
     pub online: bool,
     #[serde(rename = "type")]
@@ -256,7 +254,7 @@ pub fn parse(text: &str) -> Result<Vec<OnBus>, String> {
         .iter()
         .map(|d| OnBus {
             name: s(d, "name").unwrap_or_default(),
-            serial: norm_serial(&s(d, "serial").unwrap_or_default()),
+            serial: crate::discover::norm_serial(&s(d, "serial").unwrap_or_default()),
             online: d.get("online").and_then(Value::as_bool).unwrap_or(false),
             ty: s(d, "type").unwrap_or_default(),
             parent: s(d, "parent"),
@@ -289,7 +287,7 @@ impl Bus {
             .fetch(
                 &["extensions", "-o", "json", "--no-color"],
                 "lox extensions",
-                |text, _| Ok(json!({ "devices": parse(text)? })),
+                |text| Ok(json!({ "devices": parse(text)? })),
                 json!({ "devices": [] }),
             )
             .await
@@ -301,15 +299,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn devices_are_the_objects_with_a_serial_but_the_miniserver() {
-        assert!(is_device("TreeDevice", true));
-        assert!(is_device("LoxDigin", true));
-        assert!(is_device("LoxAIRDevice", false));
-        assert!(!is_device("LoxLIVE", true));
-        assert!(!is_device("VoltageIn", false));
+    fn devices_are_the_bus_types() {
+        assert!(is_device("TreeDevice"));
+        assert!(is_device("LoxDigin"));
+        assert!(is_device("LoxAIRDevice"));
+        // A Serial= alone does not make a bus device: the Miniserver, a client
+        // Miniserver, an Intercom, a network device (their serial is a MAC).
+        for ty in ["LoxLIVE", "IntercomDevice", "NetworkDevice", "VoltageIn"] {
+            assert!(!is_device(ty), "{ty}");
+        }
         assert_eq!(identity("LoxAIRDevice"), "IP");
         assert_eq!(identity("TreeDevice"), "Serial");
-        assert_eq!(norm_serial("50:4f:94:a0"), "504F94A0");
+    }
+
+    #[test]
+    fn a_serial_from_none_is_a_pairing_not_a_replacement() {
+        assert_eq!(
+            identity_change(Some("00000000"), Some("B03B368A")),
+            "paired"
+        );
+        assert_eq!(identity_change(None, Some("B03B368A")), "paired");
+        assert_eq!(identity_change(Some("B03B368A"), None), "unpaired");
+        assert_eq!(
+            identity_change(Some("B03B368A"), Some("00000000")),
+            "unpaired"
+        );
+        assert_eq!(
+            identity_change(Some("B03B368A"), Some("B03B9999")),
+            "replaced"
+        );
+        assert!(unpaired(Some("")) && !unpaired(Some("B03B368A")));
     }
 
     #[test]
@@ -340,8 +359,15 @@ mod tests {
     #[test]
     fn only_settings_that_reach_the_device_reconfigure_it() {
         let touch = Some("32771");
-        // On the device: everything but names, mounting and drawing.
+        // On the device: only what its configuration block has; not the
+        // Loxone Config version a save writes, nor attributes not matched yet.
         assert!(reconfigures("TreeDevice", touch, "TreeDevice", true, "AC"));
+        for a in ["V", "PG", "BlinkPos"] {
+            assert!(
+                !reconfigures("TreeDevice", touch, "TreeDevice", true, a),
+                "{a}"
+            );
+        }
         assert!(reconfigures(
             "TreeDevice",
             touch,

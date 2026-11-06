@@ -461,6 +461,7 @@ async fn main() -> Result<()> {
         .route("/api/miniserver", get(api_miniserver))
         .route("/api/log", get(api_log))
         .route("/api/hardware", get(api_hardware))
+        .route("/api/hardware/changes", get(api_hardware_changes))
         .route("/api/app", get(api_app))
         .route("/api/app/load", axum::routing::post(api_app_load))
         .route("/api/app/icon", get(api_app_icon))
@@ -694,6 +695,30 @@ async fn api_schedules(State(app): State<Arc<App>>, Query(q): Query<RevQuery>) -
     .and_then(|r| r);
     match res {
         Ok(list) => Json(list).into_response(),
+        Err(e) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({ "error": e })),
+        )
+            .into_response(),
+    }
+}
+
+/// The devices `rev` reconfigures compared with `base` (`view.hardware`),
+/// without the rest of the view: what Apply's confirmation lists.
+async fn api_hardware_changes(State(app): State<Arc<App>>, Query(q): Query<ViewQuery>) -> Response {
+    let res = tokio::task::spawn_blocking(move || {
+        let base = q.base.as_deref().filter(|b| !b.is_empty());
+        let (_, new) = load(&app, &q.rev)?;
+        match base {
+            Some(b) => Ok(model::hardware(&new, &load(&app, b)?.1)),
+            None => Ok(Vec::new()),
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())
+    .and_then(|r: Result<_, String>| r);
+    match res {
+        Ok(devices) => Json(serde_json::json!({ "devices": devices })).into_response(),
         Err(e) => (
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(serde_json::json!({ "error": e })),

@@ -357,15 +357,18 @@ both Pull and Sync, as the config-date notice does.
 
 ### Hardware changes
 
-An object is a device when it carries a serial (`Serial=`; an Air device its `IP=`), except the Miniserver
-itself (`LoxLIVE`): the extensions (`LoxAin`, `LoxDigin`, `LoxREL`, `LoxTree`, `LoxAIR`, …), the bus interfaces
-(`Comm485`, …), Tree devices (`TreeDevice`, the kind from `TreeType=`) and Air devices (`LoxAIRDevice`). Its
-inputs and outputs belong to it. What counts as reconfiguring it (`src/hardware.rs`):
+An object is a device by its type: the extensions (`LoxAin`, `LoxDigin`, `LoxREL`, `LoxTree`, `LoxAIR`, …), the
+bus interfaces (`Comm485`, …), Tree devices (`TreeDevice`, the kind from `TreeType=`) and Air devices
+(`LoxAIRDevice`). A `Serial=` alone does not make one: the Miniserver, client Miniservers, Intercoms and network
+devices carry a MAC there. Its inputs and outputs belong to it. What counts as reconfiguring it
+(`src/hardware.rs`):
 
-- adding or removing the device, and a new serial (*replaced*);
-- any attribute of the device object, except those that stay in the Miniserver: `Title`, `Desc`, `Installation`,
-  `SwitchBoard`, `SwitchBoardRow`, `SwitchBoardPos`, `Cl`, `WF` and `TId`;
-- on an input or output, only the attributes matched to the device's configuration block.
+- adding or removing the device;
+- its identity (`Serial=`, an Air device's `IP=`): *replaced* from one real serial to another, *paired* from none
+  (or `00000000`, a device added offline) to one, *unpaired* the other way;
+- on the device or its inputs and outputs, only the attributes matched to its configuration block (the table
+  below). Anything else does not count: names, mounting, the `V=` a newer Loxone Config writes on every object,
+  and attributes not matched yet.
 
 The device types and the configuration blocks come from
 [Inside-The-Loxone-Miniserver](https://github.com/sarnau/Inside-The-Loxone-Miniserver) (`NAT/`), bus captures
@@ -387,9 +390,12 @@ Weather Station, Motion Sensor). The NAT table's `0x801A` is named *Presence Sen
 
 The devices on the bus come from `lox extensions -o json` (name, serial, online), run like `lox log` with
 lox's configuration and context (`GET /api/hardware`, which needs an `X-Vislox` header since lox logs in; one read
-at a time). It only reads. vislox asks before Apply, only when the pending change adds a device or gives one a
-new serial (`00000000`, a device not paired yet, is not checked), and after Apply, every 15 s for 3 minutes,
-only when the Apply reconfigured a device. Devices match by serial, a device not paired yet by name. lox 0.14
+at a time). It only reads. Apply's confirmation lists the devices from `GET /api/hardware/changes?rev=&base=`
+(the pending compile compared with what is deployed, as the list after Apply is), and reads the bus only when
+the change adds, pairs or replaces a device. It waits at most 6 s for both, then asks anyway and says the bus
+was not checked. After Apply, the bus is read every 15 s for 3 minutes, only when the Apply reconfigured a
+device. Devices match by serial. An Air device (its `IP=` is not the serial the bus lists) and a device not
+paired yet match by name, only to show their state: they are never reported missing. lox 0.14
 has no `lox hw status`; when it does, it compares the config's serials with the Miniserver's `/data/status`
 itself. Not shown yet: the reset reason a device reports when it starts (power-on, watchdog, …), which would
 say why one went offline around an Apply; lox does not expose it. `--no-live` turns the bus reads off.

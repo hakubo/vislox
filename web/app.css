@@ -689,3 +689,5 @@ button.chip { cursor: pointer; } button.chip:hover { border-color: var(--brand);
 #props .hw-note { color: var(--muted); font-size: 12px; }
 .deploy-new .hw-dev .why { flex: none; color: var(--muted); font-size: 11px; }
 .deploy-new .hw-dev.off .why { color: var(--removed); font-weight: 600; }
+#props .pr.pr-hw { box-shadow: inset 3px 0 0 var(--changed-dot); }
+#props .pr.pr-hw .k::after { content: " ⚙"; color: var(--changed); }
