@@ -74,19 +74,44 @@ Blocks the module already manages (they are in the lockfile) are refused: they a
 
 - Parameters stored on the block element of a block the module does not manage: a Formula's text, a Daytimer's
   On/Off labels, a memory flag's type, a virtual input's Analog, MinVal, MaxVal and DefVal, and `Desc` on logic
-  blocks. lox takes them only in the declaration of a block it manages.
+  blocks. lox takes them only in the declaration of a block it manages: adopt the block first (#72), then edit
+  it as a managed block (#79).
 - A room or category on an object that has none.
 - Handing a value back after Apply: deleting a claim makes lox restore the value from before the claim, which
   undoes the applied change. So once applied, the module owns the value, and a later change in Loxone Config is
   overwritten on the next Apply. Revert before Apply works.
 - Moving a block it does not manage, and removing a wire Loxone Config drew.
 
-## What lox can do that vislox does not offer yet
+## The rest of the language
 
-Claims on objects Loxone Config owns that need an editor of their own rather than a field: a Daytimer's
-switching times (`x.schedule = …`), a lighting controller's moods (`.moods`), the members of a central block
-(`.members`), NFC Code Touch access (`.access`), notification recipients (`.recipients`) and Touch Pure Flex tiles
-(`.tiles`).
+Each of these plugs in as new op kinds on `POST /api/edit`, written into `<module>/vislox/`:
+
+| Issue | Lox Logic |
+|---|---|
+| #59 | new blocks (`slug = Type(…)`, `page`) |
+| #60, #61 | move; wires (`<-`) |
+| #62 | undo and redo |
+| #72 | adopt a block into the module |
+| #73 | Daytimer switching times (`schedule`, `.schedule`) |
+| #74 | lighting moods and circuits (`moods`, `.moods`) |
+| #75 | members of a central block (`.members`) |
+| #76 | NFC Code Touch access (`access`, `.access`) |
+| #77 | notification recipients and messages (`recipients`, `OutputRefLM`) |
+| #78 | Touch Pure Flex tiles (`tiles`, `.tiles`) |
+| #79 | a managed block's label and settings (`Desc:`, `Type:`, `Formula:`, `Code: file(…)`, …) |
+| #80 | delete and rename managed blocks (`removed`, `moved`) |
+| #81 | `let` and `defaults` |
+| #82 | expressions and named signals |
+| #83 | `template` instances |
+| #84 | virtual inputs, virtual and Modbus devices |
+| #85 | Tree and Air hardware (`Statistics:`, new Tree devices) |
+| #86 | operating modes and calendar entries |
+| #87 | Automatic Designer rules (`rule`) |
+| #88 | new pages (`page "…" (room: …)`) |
+
+Around the module: #64 (mark managed blocks), #65 (`lox logic check` errors), #66 (lint), #67 (`lox logic test`),
+#68 (review claimed access, recipients and schedules), #70 (removals on Apply).
+
 ## The browser
 
 - Properties has an *Edit* section on the newest revision: *Edit values* opens a form for the name, the
