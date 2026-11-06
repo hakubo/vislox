@@ -67,7 +67,7 @@ The binary is an `axum` server with the UI embedded (plain JS and SVG, no build 
 
 - [program-memory.md](program-memory.md) records why vislox does not estimate a change's program memory from
   `/sys/Sizes.bin` (on the Gen 2 Miniserver checked, firmware 17.2.10.21, the file holds a constant, not sizes).
-- [reference/SOURCES.md](reference/SOURCES.md) lists the Loxone Config screenshots the look is based on. The
-  images are copyright Loxone and are not in the repository (`.gitignore` keeps them local).
+- The look is based on Loxone Config screenshots, which are copyright Loxone and are not part of the repository.
+  `.gitignore` excludes `docs/reference/`, so a local copy for comparison is never committed.
 - `VISLOX_FTP_PORT` overrides the FTP port the status check connects to (default 21). It exists for tests;
   lox always uses 21.

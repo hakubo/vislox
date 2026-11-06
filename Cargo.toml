@@ -6,7 +6,7 @@ rust-version = "1.91"
 description = "Loxone Config-style viewer and change review for Miniserver configs managed by lox, with live values and history"
 repository = "https://github.com/hakubo/vislox"
 readme = "README.md"
-license = "Apache-2.0"
+license = "MIT"
 
 [dependencies]
 loxone-config = { git = "https://github.com/discostu105/lox" }

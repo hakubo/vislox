@@ -141,5 +141,4 @@ CI (`.github/workflows/ci.yml`) runs all of these on every push to `main` and ev
 
 ## Licence
 
-Not decided yet. `Cargo.toml` says `Apache-2.0`, but there is no `LICENSE` file, so treat the licence as open
-until one is added.
+[MIT](LICENSE)
