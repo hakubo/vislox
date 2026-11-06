@@ -1894,21 +1894,14 @@ function renderLog() {
   $("log-only-w").classList.toggle("hidden", !d || d.since == null);
   $("chk-log-since").checked = S.log.onlySince;
   const list = $("log");
-  const entries = d?.entries || [], since = d?.since ?? null, t = logTargets();
+  const entries = d?.entries || [], since = d?.since ?? null;
   const from = S.log.onlySince && since != null ? since : 0;
   const rows = [];
-  const linksOf = (e) => (e.uuids || []).map((u) => t.get(u)).filter((u, j, a) => u && a.indexOf(u) === j).map((u) => {
-    const o = S.view.objects[u];
-    return `<button type="button" class="go" data-go="${esc(u)}" title="${esc(o.path || "")}">${esc(autoTitle(o.title) ? prettyType(o.ty) : o.title)}</button>`;
-  }).join("");
   // The Debug-Monitor's lines, live, above the system log.
-  for (let i = S.mon.lines.length - 1; i >= 0; i--) {
-    const e = S.mon.lines[i];
-    rows.push(`<li class="${esc(e.kind)} monitor since" data-m="${i}"><span class="tm">${esc(e.at)}<span class="tag">monitor</span></span><span class="tx">${esc(e.text)}</span>${linksOf(e)}</li>`);
-  }
+  for (let i = S.mon.lines.length - 1; i >= 0; i--) rows.push(monRow(S.mon.lines[i]));
   for (let i = entries.length - 1; i >= from; i--) {
     const e = entries[i];
-    const links = linksOf(e);
+    const links = logLinks(e);
     rows.push(`<li class="${esc(e.kind)}${since != null && i >= since ? " since" : ""}" data-i="${i}"><span class="tm">${esc(e.at)}</span><span class="tx">${esc(e.text)}</span>${links}</li>`);
     if (i === since) rows.push(`<li class="mark">▲ The program changed here (Apply, or a save from Loxone Config)</li>`);
   }
@@ -1926,6 +1919,18 @@ function logStale() {
   S.log.stale = true; S.log.staleSeq++;
   if (S.log.open) loadLog();
   renderLog(); redrawMarks();
+}
+/** Links to the blocks a log line names. */
+function logLinks(e) {
+  const t = logTargets();
+  return (e.uuids || []).map((u) => t.get(u)).filter((u, j, a) => u && a.indexOf(u) === j).map((u) => {
+    const o = S.view.objects[u];
+    return `<button type="button" class="go" data-go="${esc(u)}" title="${esc(o.path || "")}">${esc(autoTitle(o.title) ? prettyType(o.ty) : o.title)}</button>`;
+  }).join("");
+}
+/** A Debug-Monitor line; `_k` is its number in this browser, which stays when older lines drop off. */
+function monRow(e) {
+  return `<li class="${esc(e.kind)} monitor since" data-m="${e._k}"><span class="tm">${esc(e.at)}<span class="tag">monitor</span></span><span class="tx">${esc(e.text)}</span>${logLinks(e)}</li>`;
 }
 async function loadLog() {
   if (!logInfo().available) return;
@@ -1955,8 +1960,9 @@ function setLogOpen(open) {
 /** From a block's log mark: open the log and show that line. */
 function openLog(e) {
   if (!S.log.open) setLogOpen(true);
-  const i = S.log.data?.entries.indexOf(e);
-  const li = i >= 0 ? $("log").querySelector(`li[data-i="${i}"]`) : null;
+  // A Debug-Monitor line, or one of the system log's (whose read may have failed).
+  const i = e._k ? -1 : (S.log.data?.entries || []).indexOf(e);
+  const li = e._k ? $("log").querySelector(`li[data-m="${e._k}"]`) : i >= 0 ? $("log").querySelector(`li[data-i="${i}"]`) : null;
   if (!li) return;
   li.scrollIntoView({ block: "nearest" });
   li.classList.add("flash");
@@ -1976,7 +1982,7 @@ $("log").addEventListener("click", (e) => {
 // ── the Debug-Monitor ──────────────────────────────────────────────────
 // With `--monitor`, vislox listens for the Miniserver's debug output (UDP). Start asks the Miniserver to
 // send it (dev/sps/log/<vislox>), Stop ends it; the lines arrive on /api/monitor.
-S.mon = { es: null, info: null, lines: [], busy: false, msg: "", fresh: true };
+S.mon = { es: null, info: null, lines: [], busy: false, msg: "", fresh: true, seq: 0, marksT: null };
 function monInfo() { return S.mon.info || S.hist?.monitor || { available: false }; }
 function monConnect() {
   if (S.mon.es) return;
@@ -1984,8 +1990,23 @@ function monConnect() {
   S.mon.es = es;
   es.addEventListener("info", (e) => { S.mon.info = JSON.parse(e.data); renderMonBar(); renderMs(); });
   const add = (list, reset) => {
-    S.mon.lines = reset ? list : [...S.mon.lines, ...list].slice(-500);
-    renderLog(); redrawMarks();
+    for (const e of list) e._k = ++S.mon.seq;
+    if (reset) {
+      S.mon.lines = list;
+      if (S.log.open) renderLog();
+    } else {
+      const all = [...S.mon.lines, ...list], gone = all.slice(0, Math.max(0, all.length - 500));
+      S.mon.lines = all.slice(-500);
+      // Only the new rows, on top; lines that dropped off go. A closed panel draws all when it opens.
+      if (S.log.open) {
+        const box = $("log");
+        box.querySelector(":scope > li.tx")?.remove();
+        box.insertAdjacentHTML("afterbegin", list.slice().reverse().map(monRow).join(""));
+        for (const e of gone) box.querySelector(`li[data-m="${e._k}"]`)?.remove();
+      }
+    }
+    // The blocks' marks, at most twice a second.
+    if (!S.mon.marksT) S.mon.marksT = setTimeout(() => { S.mon.marksT = null; redrawMarks(); }, 500);
   };
   // Each (re)connect starts with every line kept: replace, then append.
   es.onopen = () => { S.mon.fresh = true; };

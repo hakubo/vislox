@@ -10,9 +10,9 @@ mod live;
 mod log;
 mod miniserver;
 mod model;
-mod operate;
 mod monframe;
 mod monitor;
+mod operate;
 mod pull;
 mod query;
 mod reason;
@@ -100,7 +100,7 @@ struct Args {
     /// the Miniserver reaches it (needed in Docker). Default: this host's
     /// address on the route to the Miniserver.
     #[arg(long, env = "VISLOX_MONITOR_IP", value_name = "IPV4")]
-    monitor_ip: Option<std::net::Ipv4Addr>,
+    monitor_ip: Option<String>,
     /// How long a Debug-Monitor started from the Log panel runs.
     #[arg(long, env = "VISLOX_MONITOR_MINUTES", default_value_t = 60)]
     monitor_minutes: u32,
@@ -260,11 +260,17 @@ async fn main() -> Result<()> {
     // The Debug-Monitor, when asked for; --no-live means vislox never talks
     // to the Miniserver.
     let monitor = Arc::new(monitor::Monitor::new(
-        (args.monitor && !args.no_live).then_some(monitor::Settings {
-            port: args.monitor_port,
-            advertise: args.monitor_ip,
-            minutes: args.monitor_minutes,
-        }),
+        if !args.monitor {
+            Err("off (start vislox with --monitor)".to_string())
+        } else if args.no_live {
+            Err("turned off (--no-live)".to_string())
+        } else {
+            Ok(monitor::Settings {
+                port: args.monitor_port,
+                advertise: monitor_ip(args.monitor_ip.as_deref())?,
+                minutes: args.monitor_minutes,
+            })
+        },
         found.as_ref(),
         expected_serial(&src, found.as_ref().ok()).map(|e| e.serial),
     ));
@@ -418,6 +424,18 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// `--monitor-ip`: an IPv4 address, or nothing. Empty counts as nothing, so
+/// that an empty `VISLOX_MONITOR_IP` (as Docker Compose passes an unset
+/// one) leaves the default.
+fn monitor_ip(v: Option<&str>) -> Result<Option<std::net::Ipv4Addr>> {
+    match v.map(str::trim).filter(|v| !v.is_empty()) {
+        None => Ok(None),
+        Some(v) => v.parse().map(Some).with_context(|| {
+            format!("--monitor-ip / VISLOX_MONITOR_IP: `{v}` is not an IPv4 address")
+        }),
+    }
 }
 
 /// Whether a failed start lists the Miniservers on the LAN: only when
@@ -925,16 +943,19 @@ async fn api_monitor(
     State(app): State<Arc<App>>,
 ) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
     let m = app.monitor.clone();
-    let rx = m.subscribe();
+    // The lines kept and what comes after them, without a line twice.
+    let (rx, lines) = m.subscribe();
     let first = [
         Event::default().event("info").data(m.info().to_string()),
-        Event::default().event("lines").data(m.lines().to_string()),
+        Event::default().event("lines").data(lines.to_string()),
     ];
     let rest = BroadcastStream::new(rx).map(move |msg| match msg {
         Ok(monitor::Msg::Lines(l)) => Event::default().event("lines").data(l.as_str()),
         Ok(monitor::Msg::Info) => Event::default().event("info").data(m.info().to_string()),
         // Fell behind: everything again.
-        Err(_) => Event::default().event("reset").data(m.lines().to_string()),
+        Err(_) => Event::default()
+            .event("reset")
+            .data(m.subscribe().1.to_string()),
     });
     Sse::new(tokio_stream::iter(first).chain(rest).map(Ok)).keep_alive(KeepAlive::default())
 }
@@ -1208,6 +1229,19 @@ mod tests {
         let token = j["token"].as_str().unwrap();
         assert!(live.take(token).is_some());
         assert!(live.take(token).is_none());
+    }
+
+    #[test]
+    fn an_empty_monitor_ip_is_no_monitor_ip() {
+        // As Docker Compose passes VISLOX_MONITOR_IP when it is not set.
+        let a = args(&["--monitor", "--monitor-ip", ""]);
+        assert_eq!(monitor_ip(a.monitor_ip.as_deref()).unwrap(), None);
+        assert_eq!(monitor_ip(Some("  ")).unwrap(), None);
+        assert_eq!(
+            monitor_ip(Some("192.168.1.82")).unwrap(),
+            Some(std::net::Ipv4Addr::new(192, 168, 1, 82))
+        );
+        assert!(monitor_ip(Some("vislox.local")).is_err());
     }
 
     #[test]

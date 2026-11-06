@@ -24,11 +24,19 @@ use serde_json::{Value, json};
 use std::collections::VecDeque;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
-use tokio::sync::broadcast;
+use std::time::{Duration, Instant};
+use tokio::sync::{Notify, broadcast};
 
 /// How many lines vislox keeps for a browser that opens the panel later.
 const KEEP: usize = 500;
+/// How often the Miniserver's address is looked up again; a packet from an
+/// unknown address asks for it sooner, at most this often.
+const RESOLVE_EVERY: Duration = Duration::from_secs(300);
+const RESOLVE_SOONEST: Duration = Duration::from_secs(30);
+/// Counters reach the browsers at most this often.
+const INFO_EVERY: Duration = Duration::from_secs(1);
+/// After this many receive errors in a row, the listener gives up.
+const RECV_ERRORS: u32 = 50;
 
 pub struct Settings {
     pub port: u16,
@@ -46,9 +54,22 @@ pub enum Msg {
     Info,
 }
 
+/// Sends a `dev/…` command to the Miniserver (lox's connection).
+pub trait Cmd: Send + Sync {
+    fn call(&self, path: &str) -> Result<(), String>;
+}
+
+impl Cmd for Http {
+    fn call(&self, path: &str) -> Result<(), String> {
+        Http::call(self, path)
+    }
+}
+
 pub struct Monitor {
     on: Result<On, String>,
     tx: broadcast::Sender<Msg>,
+    /// Look the Miniserver's address up again.
+    resolve: Notify,
 }
 
 struct On {
@@ -59,7 +80,11 @@ struct On {
     host: String,
     serial: Option<String>,
     minutes: u32,
-    http: Option<Arc<Http>>,
+    /// How long a Start lasts, and the first wait before a failed Stop is
+    /// tried again (doubling, up to 5 min).
+    limit: Duration,
+    retry: Duration,
+    cmd: Arc<dyn Cmd>,
     state: Mutex<State>,
 }
 
@@ -67,15 +92,18 @@ struct On {
 struct State {
     entries: VecDeque<Line>,
     stats: Option<(i64, Stats)>,
-    /// The Miniserver's addresses (resolved from its host).
+    /// The Miniserver's addresses (resolved from its host), and when.
     from: Vec<IpAddr>,
+    resolved: Option<Instant>,
     /// Bound, or why not.
     listening: Option<Result<String, String>>,
     packets: u64,
     ignored: u64,
     ignored_from: Option<IpAddr>,
+    /// Counters changed since the browsers last heard.
+    dirty: bool,
     /// Started from vislox (`dev/sps/log/<ip>`): until when (Unix time),
-    /// and a number that changes with each start, for the timer.
+    /// and a number that changes with each start and stop that worked.
     until: Option<i64>,
     generation: u64,
     last_error: Option<String>,
@@ -99,30 +127,44 @@ pub struct Line {
 }
 
 impl Monitor {
+    /// `settings`: on, or why it is off.
     pub fn new(
-        settings: Option<Settings>,
+        settings: Result<Settings, String>,
         found: Result<&crate::live::Found, &String>,
         serial: Option<String>,
     ) -> Monitor {
-        let (tx, _) = broadcast::channel(256);
         let on = match (settings, found) {
-            (None, _) => Err("off (start vislox with --monitor)".to_string()),
-            (Some(_), Err(e)) => Err(format!("no lox configuration: {e}")),
-            (Some(s), Ok(f)) => Ok(On {
-                port: s.port,
-                advertise: s.advertise,
-                host: host_of(&f.conn.host),
+            (Err(why), _) => Err(why),
+            (Ok(_), Err(e)) => Err(format!("no lox configuration: {e}")),
+            (Ok(s), Ok(f)) => Ok(On::new(
+                s,
+                &f.conn.host,
                 serial,
-                minutes: s.minutes.max(1),
-                http: Some(Arc::new(Http::new(f.conn.clone()))),
-                state: Mutex::new(State::default()),
-            }),
+                Arc::new(Http::new(f.conn.clone())),
+            )),
         };
-        Monitor { on, tx }
+        Monitor::with(on)
     }
 
-    pub fn subscribe(&self) -> broadcast::Receiver<Msg> {
-        self.tx.subscribe()
+    fn with(on: Result<On, String>) -> Monitor {
+        let (tx, _) = broadcast::channel(256);
+        Monitor {
+            on,
+            tx,
+            resolve: Notify::new(),
+        }
+    }
+
+    /// The lines kept (oldest first) and a receiver for what comes after
+    /// them: taken under one lock, so no line is in both.
+    pub fn subscribe(&self) -> (broadcast::Receiver<Msg>, Value) {
+        match &self.on {
+            Ok(on) => {
+                let st = on.state.lock().unwrap();
+                (self.tx.subscribe(), json!(st.entries))
+            }
+            Err(_) => (self.tx.subscribe(), json!([])),
+        }
     }
 
     /// For `/api/history` and the panel: on or off, what it does, and stats.
@@ -153,101 +195,147 @@ impl Monitor {
         })
     }
 
-    /// The lines kept, oldest first.
-    pub fn lines(&self) -> Value {
-        match &self.on {
-            Ok(on) => json!(on.state.lock().unwrap().entries),
-            Err(_) => json!([]),
-        }
-    }
-
-    /// Bind the UDP port and keep what the Miniserver sends. Returns at once.
+    /// Bind the UDP port and keep what the Miniserver sends; look its address
+    /// up now and then; tell the browsers about new counts once a second.
+    /// Returns at once.
     pub fn spawn(self: &Arc<Self>) {
         let Ok(on) = &self.on else { return };
-        let me = self.clone();
         let port = on.port;
+        // The Miniserver's address: now, every 5 min, and when asked.
+        let me = self.clone();
         tokio::spawn(async move {
-            let from = resolve(&me.on.as_ref().unwrap().host).await;
-            let sock = tokio::net::UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], port))).await;
-            {
-                let on = me.on.as_ref().unwrap();
-                let mut st = on.state.lock().unwrap();
-                st.from = from.clone();
-                st.listening = Some(match &sock {
-                    Ok(s) => Ok(s.local_addr().map(|a| a.to_string()).unwrap_or_default()),
-                    Err(e) => Err(format!("cannot listen on UDP port {port}: {e}")),
-                });
-            }
-            let _ = me.tx.send(Msg::Info);
-            let Ok(sock) = sock else { return };
-            if from.is_empty() {
-                eprintln!(
-                    "vislox: Debug-Monitor: cannot resolve the Miniserver's address; every packet is dropped"
-                );
-            }
-            let mut buf = vec![0u8; 65536];
             loop {
-                let Ok((n, peer)) = sock.recv_from(&mut buf).await else {
-                    continue;
-                };
-                me.receive(peer.ip(), &buf[..n]);
+                me.refresh_from().await;
+                tokio::select! {
+                    _ = tokio::time::sleep(RESOLVE_EVERY) => {}
+                    _ = me.resolve.notified() => {}
+                }
             }
         });
+        // Counters, throttled.
+        let me = self.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(INFO_EVERY);
+            loop {
+                tick.tick().await;
+                let dirty = me
+                    .on
+                    .as_ref()
+                    .is_ok_and(|on| std::mem::take(&mut on.state.lock().unwrap().dirty));
+                if dirty {
+                    let _ = me.tx.send(Msg::Info);
+                }
+            }
+        });
+        let me = self.clone();
+        tokio::spawn(async move {
+            let sock = tokio::net::UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], port))).await;
+            me.set_listening(match &sock {
+                Ok(s) => Ok(s.local_addr().map(|a| a.to_string()).unwrap_or_default()),
+                Err(e) => Err(format!("cannot listen on UDP port {port}: {e}")),
+            });
+            let Ok(sock) = sock else { return };
+            let mut buf = vec![0u8; 65536];
+            let mut errors = 0u32;
+            loop {
+                match sock.recv_from(&mut buf).await {
+                    Ok((n, peer)) => {
+                        errors = 0;
+                        me.receive(peer.ip(), &buf[..n]);
+                    }
+                    Err(e) => {
+                        errors += 1;
+                        if errors >= RECV_ERRORS {
+                            me.set_listening(Err(format!(
+                                "stopped listening after {errors} receive errors: {e}"
+                            )));
+                            return;
+                        }
+                        // 100 ms, doubling, at most 5 s.
+                        let wait = 100u64 << errors.min(6);
+                        tokio::time::sleep(Duration::from_millis(wait.min(5000))).await;
+                    }
+                }
+            }
+        });
+    }
+
+    fn set_listening(&self, l: Result<String, String>) {
+        if let Ok(on) = &self.on {
+            on.state.lock().unwrap().listening = Some(l);
+        }
+        let _ = self.tx.send(Msg::Info);
+    }
+
+    /// Look the Miniserver's address up again.
+    async fn refresh_from(&self) {
+        let Ok(on) = &self.on else { return };
+        let from = resolve(&on.host).await;
+        let mut st = on.state.lock().unwrap();
+        if from.is_empty() {
+            st.last_error = Some(format!(
+                "cannot resolve {}; every packet is dropped",
+                on.host
+            ));
+        } else if st
+            .last_error
+            .as_deref()
+            .is_some_and(|e| e.starts_with("cannot resolve"))
+        {
+            st.last_error = None;
+        }
+        if !from.is_empty() || st.from.is_empty() {
+            st.from = from;
+        }
+        st.resolved = Some(Instant::now());
+        st.dirty = true;
     }
 
     /// One datagram from `peer`.
     pub fn receive(&self, peer: IpAddr, data: &[u8]) {
         let Ok(on) = &self.on else { return };
-        let mut new = Vec::new();
-        let mut info = false;
-        {
-            let mut st = on.state.lock().unwrap();
-            if !st.from.iter().any(|a| same_ip(*a, peer)) {
-                st.ignored += 1;
-                if st.ignored_from.is_none() {
-                    info = true;
-                }
-                st.ignored_from = Some(peer);
-                drop(st);
-                if info {
-                    let _ = self.tx.send(Msg::Info);
-                }
-                return;
+        let mut st = on.state.lock().unwrap();
+        st.dirty = true;
+        if !st.from.iter().any(|a| same_ip(*a, peer)) {
+            st.ignored += 1;
+            st.ignored_from = Some(peer);
+            // The Miniserver's address may have changed: look it up again,
+            // at most every 30 s.
+            if st.resolved.is_none_or(|t| t.elapsed() >= RESOLVE_SOONEST) {
+                st.resolved = Some(Instant::now());
+                self.resolve.notify_one();
             }
-            st.packets += 1;
-            for f in monframe::frames(data) {
-                let Some(h) = Header::parse(f) else { continue };
-                if h.string_id == monframe::STATS {
-                    if let Some(s) = Stats::parse(f) {
-                        st.stats = Some((chrono::Utc::now().timestamp(), s));
-                        info = true;
-                    }
-                    continue;
-                }
-                if h.string_id >= monframe::TASKS {
-                    continue;
-                }
-                // The same line again (sent twice): once is enough.
-                if st.counter == Some(h.counter) {
-                    continue;
-                }
-                st.counter = Some(h.counter);
-                let line = line(&h, f, st.strings.as_deref());
-                st.entries.push_back(line.clone());
-                while st.entries.len() > KEEP {
-                    st.entries.pop_front();
-                }
-                new.push(line);
-            }
-            if st.packets == 1 {
-                info = true;
-            }
+            return;
         }
+        st.packets += 1;
+        let mut new = Vec::new();
+        for f in monframe::frames(data) {
+            let Some(h) = Header::parse(f) else { continue };
+            if h.string_id == monframe::STATS {
+                if let Some(s) = Stats::parse(f) {
+                    st.stats = Some((chrono::Utc::now().timestamp(), s));
+                }
+                continue;
+            }
+            if h.string_id >= monframe::TASKS {
+                continue;
+            }
+            // The same line again (sent twice): once is enough.
+            if st.counter == Some(h.counter) {
+                continue;
+            }
+            st.counter = Some(h.counter);
+            let line = line(&h, f, st.strings.as_deref());
+            st.entries.push_back(line.clone());
+            while st.entries.len() > KEEP {
+                st.entries.pop_front();
+            }
+            new.push(line);
+        }
+        // Sent under the lock, so `subscribe` sees each line either in its
+        // snapshot or on its receiver, never both.
         if !new.is_empty() {
             let _ = self.tx.send(Msg::Lines(Arc::new(json!(new).to_string())));
-        }
-        if info {
-            let _ = self.tx.send(Msg::Info);
         }
     }
 
@@ -268,17 +356,25 @@ impl Monitor {
     }
 
     /// The address the Miniserver sends to: `--monitor-ip`, else this host's
-    /// address on the route to the Miniserver.
+    /// IPv4 address on the route to the Miniserver (`LogDest` and
+    /// `dev/sps/log/<ip>` take IPv4).
     fn dest(&self) -> Option<Ipv4Addr> {
         let on = self.on.as_ref().ok()?;
         if let Some(d) = on.advertise {
             on.state.lock().unwrap().dest = Some(d);
             return Some(d);
         }
-        let to = on.state.lock().unwrap().from.first().copied()?;
+        let to = {
+            let st = on.state.lock().unwrap();
+            let v4 = |a: &IpAddr| match a {
+                IpAddr::V4(v) => Some(*v),
+                IpAddr::V6(v) => v.to_ipv4_mapped(),
+            };
+            st.from.iter().find_map(v4)?
+        };
         let s = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
         // Connecting a UDP socket sends nothing; it picks the route.
-        s.connect(SocketAddr::new(to, 7777)).ok()?;
+        s.connect(SocketAddr::new(IpAddr::V4(to), 7777)).ok()?;
         let d = match s.local_addr().ok()?.ip() {
             IpAddr::V4(a) if !a.is_unspecified() => a,
             _ => return None,
@@ -290,16 +386,20 @@ impl Monitor {
     /// Start: `dev/sps/log/<this host>`, until Stop or the time limit.
     pub async fn start(self: &Arc<Self>) -> Result<String, String> {
         let on = self.on.as_ref().map_err(Clone::clone)?;
+        // The Miniserver's address may have changed since the last lookup.
+        if on.advertise.is_none() {
+            self.refresh_from().await;
+        }
         let dest = self
             .dest()
-            .ok_or("cannot tell this host's address for the Miniserver (pass --monitor-ip)")?;
-        let http = on.http.clone().ok_or("no connection")?;
+            .ok_or("cannot tell this host's IPv4 address for the Miniserver (pass --monitor-ip)")?;
+        let cmd = on.cmd.clone();
         let path = format!("dev/sps/log/{dest}");
-        tokio::task::spawn_blocking(move || http.call(&path))
+        tokio::task::spawn_blocking(move || cmd.call(&path))
             .await
             .map_err(|e| e.to_string())?
             .inspect_err(|e| self.note_error(e))?;
-        let until = chrono::Utc::now().timestamp() + on.minutes as i64 * 60;
+        let until = chrono::Utc::now().timestamp() + on.limit.as_secs() as i64;
         let generation = {
             let mut st = on.state.lock().unwrap();
             st.until = Some(until);
@@ -309,38 +409,53 @@ impl Monitor {
         };
         let _ = self.tx.send(Msg::Info);
         let me = self.clone();
-        let minutes = on.minutes;
+        let limit = on.limit;
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(minutes as u64 * 60)).await;
-            let current = me
-                .on
-                .as_ref()
-                .is_ok_and(|on| on.state.lock().unwrap().generation == generation);
-            if current {
-                let _ = me.stop().await;
-            }
+            tokio::time::sleep(limit).await;
+            me.stop_after_limit(generation).await;
         });
         Ok(format!(
-            "The Miniserver sends its debug output to {dest} for {minutes} min."
+            "The Miniserver sends its debug output to {dest} for {} min.",
+            on.minutes
         ))
     }
 
-    /// Stop: `dev/sps/log`.
+    /// The time limit of the Start `generation` ran out: stop, and try again
+    /// (30 s, doubling, up to 5 min) until it works, or until another Start
+    /// or Stop takes over.
+    async fn stop_after_limit(&self, generation: u64) {
+        let Ok(on) = &self.on else { return };
+        let mut wait = on.retry;
+        loop {
+            let current = {
+                let st = on.state.lock().unwrap();
+                st.generation == generation && st.until.is_some()
+            };
+            if !current || self.stop().await.is_ok() {
+                return;
+            }
+            tokio::time::sleep(wait).await;
+            wait = (wait * 2).min(Duration::from_secs(300));
+        }
+    }
+
+    /// Stop: `dev/sps/log`. A failed Stop leaves the Start in place (and its
+    /// time limit tries again).
     pub async fn stop(&self) -> Result<String, String> {
         let on = self.on.as_ref().map_err(Clone::clone)?;
-        let http = on.http.clone().ok_or("no connection")?;
-        let res = tokio::task::spawn_blocking(move || http.call("dev/sps/log"))
+        let cmd = on.cmd.clone();
+        let res = tokio::task::spawn_blocking(move || cmd.call("dev/sps/log"))
             .await
             .map_err(|e| e.to_string())?;
         {
             let mut st = on.state.lock().unwrap();
-            st.generation += 1;
             match &res {
                 Ok(()) => {
+                    st.generation += 1;
                     st.until = None;
                     st.last_error = None;
                 }
-                Err(e) => st.last_error = Some(e.clone()),
+                Err(e) => st.last_error = Some(format!("Stop failed: {e}")),
             }
         }
         let _ = self.tx.send(Msg::Info);
@@ -368,11 +483,21 @@ impl Monitor {
         }
         let _ = self.tx.send(Msg::Info);
     }
+}
 
-    #[cfg(test)]
-    fn accept_from(&self, a: IpAddr) {
-        if let Ok(on) = &self.on {
-            on.state.lock().unwrap().from = vec![a];
+impl On {
+    fn new(s: Settings, host: &str, serial: Option<String>, cmd: Arc<dyn Cmd>) -> On {
+        let minutes = s.minutes.max(1);
+        On {
+            port: s.port,
+            advertise: s.advertise,
+            host: crate::miniserver::split_host(host).0,
+            serial,
+            minutes,
+            limit: Duration::from_secs(minutes as u64 * 60),
+            retry: Duration::from_secs(30),
+            cmd,
+            state: Mutex::new(State::default()),
         }
     }
 }
@@ -416,21 +541,6 @@ pub fn log_xml(dest: Ipv4Addr, port: u16) -> String {
     )
 }
 
-/// `https://192.168.1.120:443/x` → `192.168.1.120`; `[fe80::1]:80` → `fe80::1`.
-fn host_of(url: &str) -> String {
-    let rest = url.split_once("://").map_or(url, |(_, r)| r);
-    let hostport = rest.split('/').next().unwrap_or(rest);
-    let hostport = hostport.rsplit_once('@').map_or(hostport, |(_, h)| h);
-    if let Some(v6) = hostport.strip_prefix('[') {
-        return v6.split(']').next().unwrap_or(v6).to_string();
-    }
-    hostport
-        .rsplit_once(':')
-        .filter(|(_, p)| p.chars().all(|c| c.is_ascii_digit()))
-        .map_or(hostport, |(h, _)| h)
-        .to_string()
-}
-
 async fn resolve(host: &str) -> Vec<IpAddr> {
     if let Ok(ip) = host.parse::<IpAddr>() {
         return vec![ip];
@@ -467,65 +577,105 @@ mod tests {
         }
     }
 
-    fn monitor(serial: Option<&str>) -> Arc<Monitor> {
-        let f = found("http://127.0.0.1:1");
-        Arc::new(Monitor::new(
-            Some(Settings {
+    /// A stand-in for the Miniserver's `dev/…` commands: records them, and
+    /// fails the first `fail` ones.
+    #[derive(Default)]
+    struct Fake {
+        calls: Mutex<Vec<String>>,
+        fail: Mutex<u32>,
+    }
+
+    impl Cmd for Fake {
+        fn call(&self, path: &str) -> Result<(), String> {
+            self.calls.lock().unwrap().push(path.to_string());
+            let mut f = self.fail.lock().unwrap();
+            if *f > 0 {
+                *f -= 1;
+                return Err("no answer".into());
+            }
+            Ok(())
+        }
+    }
+
+    fn with_fake(fake: Arc<Fake>, limit: Duration) -> Arc<Monitor> {
+        let mut on = On::new(
+            Settings {
                 port: 0,
                 advertise: Some(Ipv4Addr::new(192, 168, 1, 82)),
                 minutes: 60,
-            }),
-            Ok(&f),
-            serial.map(String::from),
-        ))
+            },
+            "https://192.168.1.120",
+            None,
+            fake,
+        );
+        on.limit = limit;
+        on.retry = Duration::from_millis(20);
+        Arc::new(Monitor::with(Ok(on)))
     }
+
+    fn monitor(serial: Option<&str>) -> Arc<Monitor> {
+        Arc::new(Monitor::with(Ok(On::new(
+            Settings {
+                port: 0,
+                advertise: Some(Ipv4Addr::new(192, 168, 1, 82)),
+                minutes: 60,
+            },
+            "http://127.0.0.1:1",
+            serial.map(String::from),
+            Arc::new(Fake::default()),
+        ))))
+    }
+
+    impl Monitor {
+        fn accept_from(&self, a: &[&str]) {
+            if let Ok(on) = &self.on {
+                on.state.lock().unwrap().from = a.iter().map(|x| x.parse().unwrap()).collect();
+            }
+        }
+    }
+
+    const MS: &str = "192.168.1.120";
 
     #[test]
     fn off_unless_asked_for() {
         let f = found("http://127.0.0.1");
-        let m = Monitor::new(None, Ok(&f), None);
+        let m = Monitor::new(Err("turned off (--no-live)".into()), Ok(&f), None);
         assert_eq!(m.info()["available"], false);
+        assert_eq!(m.info()["reason"], "turned off (--no-live)");
         assert!(m.server_xml("504F94A0E454").is_none());
         let e = "no config".to_string();
-        let m = Monitor::new(
-            Some(Settings {
-                port: 7777,
-                advertise: None,
-                minutes: 60,
-            }),
-            Err(&e),
-            None,
-        );
+        let s = Settings {
+            port: 7777,
+            advertise: None,
+            minutes: 60,
+        };
+        let m = Monitor::new(Ok(s), Err(&e), None);
         assert!(m.info()["reason"].as_str().unwrap().contains("no config"));
     }
 
     #[test]
     fn only_the_miniserver_s_packets_count() {
         let m = monitor(None);
-        m.accept_from("192.168.1.120".parse().unwrap());
-        let mut rx = m.subscribe();
+        m.accept_from(&[MS]);
+        let (mut rx, _) = m.subscribe();
         let f = frame(1, 1, 0, 0, &string("PRG start program"), 1);
         m.receive("192.168.1.99".parse().unwrap(), &f);
-        assert_eq!(m.lines(), json!([]));
+        assert_eq!(m.subscribe().1, json!([]));
         assert_eq!(m.info()["ignored"], 1);
         assert_eq!(m.info()["ignoredFrom"], "192.168.1.99");
         // The Miniserver, also as an IPv4-mapped IPv6 address.
         m.receive("::ffff:192.168.1.120".parse().unwrap(), &f);
-        let lines = m.lines();
+        let lines = m.subscribe().1;
         assert_eq!(lines[0]["text"], "PRG start program");
         assert_eq!(lines[0]["kind"], "program");
         assert_eq!(m.info()["packets"], 1);
-        let mut got_lines = false;
-        while let Ok(msg) = rx.try_recv() {
-            got_lines |= matches!(msg, Msg::Lines(_));
-        }
-        assert!(got_lines);
+        assert!(matches!(rx.try_recv(), Ok(Msg::Lines(_))));
     }
 
     #[test]
     fn repeats_are_dropped_and_stats_kept() {
         let m = monitor(None);
-        m.accept_from("192.168.1.120".parse().unwrap());
+        m.accept_from(&[MS]);
         let warn = frame(
             2,
             9,
@@ -544,8 +694,8 @@ mod tests {
             &stats(900, 1000, 4096, 8192),
             0,
         ));
-        m.receive("192.168.1.120".parse().unwrap(), &data);
-        let lines = m.lines();
+        m.receive(MS.parse().unwrap(), &data);
+        let lines = m.subscribe().1;
         assert_eq!(lines.as_array().unwrap().len(), 1);
         assert_eq!(lines[0]["kind"], "warning");
         assert_eq!(lines[0]["uuids"][0], "1d525782-02d4-82be-ffff60c50ef75c80");
@@ -557,23 +707,17 @@ mod tests {
     #[test]
     fn format_strings_come_from_the_string_table() {
         let m = monitor(None);
-        m.accept_from("192.168.1.120".parse().unwrap());
+        m.accept_from(&[MS]);
         m.set_strings(Strings::parse(
             r#"<String IDV="300" Text="Link %s: %d errors"/>"#,
         ));
         let mut body = string("Tree 1");
         body.push(0x03);
         body.extend(4u32.to_le_bytes());
-        m.receive(
-            "192.168.1.120".parse().unwrap(),
-            &frame(300, 1, 0, 0, &body, 2),
-        );
+        m.receive(MS.parse().unwrap(), &frame(300, 1, 0, 0, &body, 2));
         // Unknown ID without parameters: say which message it was.
-        m.receive(
-            "192.168.1.120".parse().unwrap(),
-            &frame(301, 2, 0, 0, &[], 0),
-        );
-        let l = m.lines();
+        m.receive(MS.parse().unwrap(), &frame(301, 2, 0, 0, &[], 0));
+        let l = m.subscribe().1;
         assert_eq!(l[0]["text"], "Link Tree 1: 4 errors");
         assert_eq!(l[1]["text"], "(message 301)");
     }
@@ -599,46 +743,169 @@ mod tests {
     }
 
     #[test]
-    fn the_host_comes_from_lox_s_address() {
-        assert_eq!(host_of("https://192.168.1.120"), "192.168.1.120");
-        assert_eq!(host_of("http://ms.local:8080/x"), "ms.local");
-        assert_eq!(host_of("192.168.1.120:443"), "192.168.1.120");
-        assert_eq!(host_of("https://[fe80::1]:443"), "fe80::1");
-        assert_eq!(host_of("ms"), "ms");
+    fn the_host_comes_from_lox_s_address_also_bare_ipv6() {
+        let host = |h: &str| {
+            let f = found(h);
+            let s = Settings {
+                port: 0,
+                advertise: None,
+                minutes: 1,
+            };
+            Monitor::new(Ok(s), Ok(&f), None).info()["host"].clone()
+        };
+        assert_eq!(host("https://192.168.1.120"), "192.168.1.120");
+        assert_eq!(host("http://ms.local:8080/x"), "ms.local");
+        assert_eq!(host("https://[fe80::1]:443"), "fe80::1");
+        assert_eq!(host("fe80::1"), "fe80::1");
+        assert_eq!(host("https://fe80::1"), "fe80::1");
+    }
+
+    #[test]
+    fn the_destination_is_ipv4() {
+        let m = Arc::new(Monitor::with(Ok(On::new(
+            Settings {
+                port: 7777,
+                advertise: None,
+                minutes: 1,
+            },
+            "ms.local",
+            None,
+            Arc::new(Fake::default()),
+        ))));
+        // Not looked up yet, or IPv6 only: no address to send to.
+        assert!(m.server_xml("504F94A0E454").is_none());
+        m.accept_from(&["fe80::1"]);
+        assert!(m.server_xml("504F94A0E454").is_none());
+        // IPv4 too: that one, whatever the order.
+        m.accept_from(&["::1", "127.0.0.1"]);
+        assert!(
+            m.server_xml("504F94A0E454")
+                .unwrap()
+                .contains("<LogDest>/dev/udp/127.0.0.1/7777</LogDest>")
+        );
     }
 
     #[tokio::test]
-    async fn the_listener_takes_frames_from_the_miniserver_only() {
+    async fn a_failed_stop_keeps_the_start_and_the_time_limit_tries_again() {
+        let fake = Arc::new(Fake::default());
+        let m = with_fake(fake.clone(), Duration::from_millis(50));
+        m.start().await.unwrap();
+        assert!(m.started());
+        // Stop by hand fails: still started, with the reason.
+        *fake.fail.lock().unwrap() = 1;
+        assert!(m.stop().await.is_err());
+        assert!(m.started());
+        assert!(
+            m.info()["error"]
+                .as_str()
+                .unwrap()
+                .starts_with("Stop failed")
+        );
+        // The time limit stops it; its first two tries fail, the third works.
+        *fake.fail.lock().unwrap() = 2;
+        for _ in 0..200 {
+            if !m.started() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!m.started(), "{}", m.info());
+        assert_eq!(
+            *fake.calls.lock().unwrap(),
+            [
+                "dev/sps/log/192.168.1.82",
+                "dev/sps/log",
+                "dev/sps/log",
+                "dev/sps/log",
+                "dev/sps/log"
+            ]
+        );
+        assert!(m.info()["error"].is_null());
+    }
+
+    #[tokio::test]
+    async fn a_stop_or_new_start_cancels_the_old_time_limit() {
+        let fake = Arc::new(Fake::default());
+        let m = with_fake(fake.clone(), Duration::from_millis(40));
+        m.start().await.unwrap();
+        m.stop().await.unwrap();
+        m.start().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        // The first Start's limit has run out, the second's not yet.
+        assert!(m.started());
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(!m.started());
+        assert_eq!(fake.calls.lock().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn a_line_is_in_the_snapshot_or_on_the_receiver_never_both() {
+        let m = monitor(None);
+        m.accept_from(&[MS]);
+        let sender = {
+            let m = m.clone();
+            std::thread::spawn(move || {
+                for i in 0..600u16 {
+                    let f = frame(1, i, 0, 0, &string(&format!("line {i}")), 1);
+                    m.receive(MS.parse().unwrap(), &f);
+                }
+            })
+        };
+        let mut taken = Vec::new();
+        while !sender.is_finished() {
+            taken.push(m.subscribe());
+        }
+        sender.join().unwrap();
+        for (mut rx, snap) in taken {
+            let mut seen: std::collections::HashSet<String> = snap
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|l| l["text"].as_str().unwrap().to_string())
+                .collect();
+            while let Ok(msg) = rx.try_recv() {
+                if let Msg::Lines(l) = msg {
+                    for l in serde_json::from_str::<Vec<Value>>(&l).unwrap() {
+                        let t = l["text"].as_str().unwrap().to_string();
+                        assert!(seen.insert(t.clone()), "{t} twice");
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_listener_takes_frames_and_reports_counts() {
         // Bind on a free port; the Miniserver is 127.0.0.1.
         let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let port = probe.local_addr().unwrap().port();
         drop(probe);
         let f = found("http://127.0.0.1:1");
-        let m = Arc::new(Monitor::new(
-            Some(Settings {
-                port,
-                advertise: None,
-                minutes: 60,
-            }),
-            Ok(&f),
-            None,
-        ));
-        let mut rx = m.subscribe();
+        let s = Settings {
+            port,
+            advertise: None,
+            minutes: 60,
+        };
+        let m = Arc::new(Monitor::new(Ok(s), Ok(&f), None));
+        let (mut rx, _) = m.subscribe();
         m.spawn();
-        // Wait until it listens.
-        while !matches!(rx.recv().await, Ok(Msg::Info)) {}
-        assert_eq!(m.info()["listening"]["ok"], true, "{}", m.info());
+        // Listening, and the Miniserver's address looked up.
+        while m.info()["listening"]["ok"] != true || m.server_xml("504F94A0E454").is_none() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         let s = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         s.send_to(&frame(5, 1, 0, 0, &string("hello"), 1), ("127.0.0.1", port))
             .await
             .unwrap();
+        // The line at once, then the new count within a second.
+        let mut line = false;
         loop {
-            if let Ok(Msg::Lines(l)) = rx.recv().await {
-                assert!(l.contains("hello"));
-                break;
+            match rx.recv().await {
+                Ok(Msg::Lines(l)) => line = l.contains("hello"),
+                Ok(Msg::Info) if line && m.info()["packets"] == 1 => break,
+                _ => {}
             }
         }
-        // The address the Miniserver would send to: this host's, on its route.
         assert!(
             m.server_xml("504F94A0E454")
                 .unwrap()

@@ -135,7 +135,9 @@ function monFrame(text, counter) {
 }
 const server = spawn(bin, [repo, "--listen", `127.0.0.1:${port}`, "--live-from", liveFile, "--lox", fakeLox], {
   stdio: ["ignore", "ignore", "pipe"],
-  env: { ...process.env, LOX_CONFIG: loxConfig, VISLOX_FTP_PORT: String(ftpPort), VISLOX_CACHE: mkdtempSync(join(tmpdir(), "vislox-cache-")), VISLOX_MONITOR: "1", VISLOX_MONITOR_PORT: String(monPort) },
+  env: { ...process.env, LOX_CONFIG: loxConfig, VISLOX_FTP_PORT: String(ftpPort), VISLOX_CACHE: mkdtempSync(join(tmpdir(), "vislox-cache-")), VISLOX_MONITOR: "1", VISLOX_MONITOR_PORT: String(monPort),
+    // As Docker Compose passes it when unset: empty means "not set".
+    VISLOX_MONITOR_IP: "" },
 });
 let log = "";
 server.stderr.on("data", (d) => (log += d));
