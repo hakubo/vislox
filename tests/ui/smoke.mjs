@@ -260,6 +260,25 @@ try {
     await page.click("#log-toggle");
     await page.waitForSelector("#log-body.hidden", { state: "attached" });
   });
+  await step("operating two inputs: each waits for its own state update", async () => {
+    // Operating is off here (--live-from): drive the page's waiting directly, with fake value
+    // events. Nothing is sent anywhere.
+    const res = await page.evaluate(async () => {
+      opExpect("in-a", "Code 200 (ok)", new Set(["a-q"]), 400);
+      opExpect("in-b", "Code 200 (ok)", new Set(["b-q"]), 400);
+      opSeen({ "b-q": [1, null, ""] });
+      const afterB = { a: opRes.get("in-a").cls, b: opRes.get("in-b").cls, waiting: opWait.size };
+      opSeen({ "a-q": [21.5, null, ""] });
+      const afterA = { a: opRes.get("in-a").text, waiting: opWait.size };
+      opExpect("in-c", "Code 200 (ok)", new Set(["c-q"]), 50);
+      await new Promise((r) => setTimeout(r, 150));
+      const c = opRes.get("in-c");
+      return { afterB, afterA, c };
+    });
+    if (res.afterB.b !== "ok" || res.afterB.a !== "busy" || res.afterB.waiting !== 1) throw new Error(JSON.stringify(res));
+    if (!/state update: 21.5$/.test(res.afterA.a) || res.afterA.waiting !== 0) throw new Error(JSON.stringify(res));
+    if (res.c.cls !== "warn" || !/no state update came back/.test(res.c.text)) throw new Error(JSON.stringify(res));
+  });
   await step("keyboard help opens and closes", async () => {
     await page.focus("#canvas");
     await page.keyboard.press("?");

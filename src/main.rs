@@ -215,14 +215,7 @@ async fn main() -> Result<()> {
             Some(why) if args.operate => eprintln!("vislox: no operating inputs: {why}"),
             Some(_) => {}
         }
-        Arc::new(operate::Operate::new(
-            operate::Settings {
-                off,
-                current: src.current.clone(),
-                user,
-            },
-            port,
-        ))
+        Arc::new(operate::Operate::new(operate::Settings { off, user }, port))
     };
     let (tx, _) = broadcast::channel(16);
     let app = Arc::new(App {
@@ -338,10 +331,7 @@ async fn main() -> Result<()> {
     // Browsers keep the live-update stream open for good, so waiting for
     // connections to close would never end: stop at once instead.
     tokio::select! {
-        res = axum::serve(
-            listener,
-            router.into_make_service_with_connect_info::<SocketAddr>(),
-        ) => res?,
+        res = axum::serve(listener, router) => res?,
         _ = shutdown_signal() => {
             eprintln!("vislox: stopped");
             std::process::exit(0);
@@ -779,26 +769,54 @@ async fn api_sync(State(app): State<Arc<App>>, headers: axum::http::HeaderMap) -
     }
 }
 
+/// The virtual inputs of the deployed revision (the current one that is not
+/// pending), parsed once per revision. Blocking.
+fn deployed_inputs(app: &App) -> Result<Arc<operate::Inputs>, String> {
+    let rev = {
+        let h = app.history.lock().unwrap();
+        let (_, hist) = h.list();
+        hist.into_iter()
+            .find(|r| r.current)
+            .ok_or("no deployed revision to look the input up in")?
+    };
+    app.operate
+        .inputs_of(&rev.blob, || load(app, &rev.id).map(|(_, d)| d))
+}
+
 /// Send one command to a virtual input (opt-in: `--operate`). Needs the
-/// admin token; the browser has asked the user to confirm it.
+/// `X-Vislox` header and the admin token; the browser has asked the user to
+/// confirm it. The request is checked first (400), then the preflight makes
+/// sure the Miniserver at the address is the config's.
 async fn api_operate(
     State(app): State<Arc<App>>,
-    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<SocketAddr>,
     headers: axum::http::HeaderMap,
     Json(req): Json<operate::Req>,
 ) -> Response {
+    if let Some(r) = not_from_vislox(&headers) {
+        return r;
+    }
     if let Err(r) = app.actions.check(&headers) {
         return refused(r);
     }
-    // Never to a device that is not the config's Miniserver.
-    if app.operate.why_not().is_none()
-        && let Some(r) = preflight(&app, miniserver::Action::Operate).await
-    {
-        return r;
-    }
-    match app.operate.send(req, addr.ip().to_string()).await {
+    let a = app.clone();
+    let inputs = match tokio::task::spawn_blocking(move || deployed_inputs(&a)).await {
+        Ok(Ok(i)) => i,
+        Ok(Err(e)) => return refused((StatusCode::INTERNAL_SERVER_ERROR, e)),
+        Err(e) => return refused((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+    };
+    let res = app
+        .operate
+        .run(req, &inputs, || {
+            app.ms.preflight(miniserver::Action::Operate)
+        })
+        .await;
+    match res {
         Ok(e) => Json(e).into_response(),
-        Err(r) => refused(r),
+        Err(f) => (
+            f.status,
+            Json(serde_json::json!({ "error": f.error, "badPassword": f.bad_password })),
+        )
+            .into_response(),
     }
 }
 

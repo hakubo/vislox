@@ -345,10 +345,15 @@ impl Miniserver {
 /// Why a command to an input must not be sent, from a check: unless the
 /// Miniserver at the address is confirmed to have the config's serial. A
 /// command to another device that DHCP gave the address to, or to the wrong
-/// context, would switch something in the wrong house.
+/// context, would switch something in the wrong house. Fails closed:
+/// without a check that confirmed the serial, nothing is sent.
 fn operate_why(v: &Value) -> Option<String> {
-    if v["available"] == false {
-        return None;
+    if v["available"] != true {
+        return Some(format!(
+            "vislox cannot check the Miniserver ({}), so it cannot confirm that it is the \
+             config's",
+            v["reason"].as_str().unwrap_or("no status")
+        ));
     }
     match v["identity"].as_str() {
         Some("confirmed") => None,
@@ -1315,8 +1320,23 @@ mod tests {
         }
         let moved = json!({ "available": true, "identity": "unknown", "movedTo": "10.0.0.9" });
         assert!(operate_why(&moved).unwrap().contains("10.0.0.9"));
-        // Without a connection there is nothing to operate (Operate is off).
-        assert_eq!(operate_why(&json!({ "available": false })), None);
+        // Fails closed: no check, no confirmed serial, no command.
+        let why = operate_why(&json!({ "available": false, "reason": "turned off" })).unwrap();
+        assert!(
+            why.contains("turned off") && why.contains("confirm"),
+            "{why}"
+        );
+        assert!(operate_why(&json!({})).is_some());
+        assert!(
+            operate_why(&json!({ "available": true })).is_some(),
+            "no identity"
+        );
+    }
+
+    #[tokio::test]
+    async fn without_a_connection_no_input_is_operated() {
+        let ms = Miniserver::new(Err("turned off".into()), PathBuf::new(), None, None);
+        assert!(ms.preflight(Action::Operate).await.is_err());
     }
 
     #[tokio::test]

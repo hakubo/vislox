@@ -1504,7 +1504,7 @@ async function act(path, body) {
   if (!t) throw new Error("Changes need the admin token.");
   const r = await fetch(path, {
     method: "POST",
-    headers: { "Content-Type": "application/json", "X-Vislox-Token": t },
+    headers: { "Content-Type": "application/json", "X-Vislox-Token": t, "X-Vislox": "act" },
     body: JSON.stringify(body || {}),
   });
   const j = await r.json().catch(() => ({}));
@@ -1817,7 +1817,7 @@ $("log").addEventListener("click", (e) => {
 // to test a change the way Loxone Config's Liveview does. Only virtual inputs of the deployed
 // config, only with live values on, and every command is confirmed first.
 const opRes = new Map(); // input uuid → { text, cls }
-let opWait = null;       // { uuid, states: Set, timer }
+const opWait = new Map(); // input uuid → { head, states: Set, timer }: one per input waiting for its update
 function opOn() { return !!S.hist?.operate?.available && liveHere(); }
 /** The virtual input a block operates: itself, or the one an input reference mirrors. */
 function opTarget(o) {
@@ -1878,45 +1878,56 @@ async function operate(uuid, cmd) {
   let r;
   try { r = await act("/api/operate", body); }
   catch (e) {
-    if (secured && /visualization password/.test(e.message)) try { sessionStorage.removeItem("vislox.visu"); } catch { /* private mode */ }
-    opShow(uuid, "Not sent: " + e.message, "err");
+    // Only a password the Miniserver refused is forgotten; a key that expired, a block that refused
+    // the command or a network error leave it.
+    if (e.data?.badPassword) try { sessionStorage.removeItem("vislox.visu"); } catch { /* private mode */ }
+    opShow(uuid, e.message.startsWith("not sent") ? e.message[0].toUpperCase() + e.message.slice(1) : "Not sent: " + e.message, "err");
     return;
   }
-  const head = r.code == null ? `Failed: ${r.note}` : `Code ${r.code} (${r.note})`;
+  const head = r.code == null ? `Sent, ${r.note}` : `Code ${r.code} (${r.note})`;
   if (r.code !== 200) { opShow(uuid, head, "err"); return; }
   // The answer's value is not reliable; the state update that follows is (Communicating with the Miniserver, p. 14).
   const states = new Set(Object.values(S.live.controls[uuid]?.states || {}).filter((x) => typeof x === "string"));
   for (const q of t.ports) states.add(q.uuid);
-  clearTimeout(opWait?.timer);
-  opWait = { uuid, head, states, timer: setTimeout(() => {
-    if (opWait?.uuid !== uuid) return;
-    opWait = null;
+  opExpect(uuid, head, states);
+}
+/** Wait for `uuid`'s state update (any of `states`); each input waits on its own. */
+function opExpect(uuid, head, states, ms = 3000) {
+  clearTimeout(opWait.get(uuid)?.timer);
+  const timer = setTimeout(() => {
+    if (opWait.get(uuid)?.timer !== timer) return;
+    opWait.delete(uuid);
     opShow(uuid, `${head} · no state update came back (the input is not streamed to the app, or its value did not change)`, "warn");
-  }, 3000) };
+  }, ms);
+  opWait.set(uuid, { head, states, timer });
   opShow(uuid, `${head} · waiting for the state update…`, "busy");
 }
-/** A `values` event: did the input we just operated report back? */
+/** A `values` event: did an input we just operated report back? */
 function opSeen(d) {
-  if (!opWait) return;
-  const k = Object.keys(d).find((k) => opWait.states.has(k));
-  if (!k) return;
-  const { uuid, head, timer } = opWait;
-  clearTimeout(timer);
-  opWait = null;
-  opShow(uuid, `${head} · state update: ${liveText(d[k])}`, "ok");
+  for (const [uuid, w] of [...opWait]) {
+    const k = Object.keys(d).find((k) => w.states.has(k));
+    if (!k) continue;
+    clearTimeout(w.timer);
+    opWait.delete(uuid);
+    opShow(uuid, `${w.head} · state update: ${liveText(d[k])}`, "ok");
+  }
 }
 function renderOpLog(box) {
-  const log = S.hist?.operate?.log || [];
-  if (!log.length) return;
-  const d = document.createElement("details");
-  d.className = "op-log";
-  d.open = !!S.opLogOpen;
-  d.ontoggle = () => (S.opLogOpen = d.open);
-  d.innerHTML = `<summary class="hist-sec">Commands sent to inputs <span class="count">${log.length}</span></summary>` +
-    log.map((e) => `<div class="op-ent${e.code === 200 ? "" : " err"}" title="${esc(`${new Date(e.time * 1000).toLocaleString()}\n${e.who}\n${e.uuid}`)}">
+  const all = S.hist?.operate?.log || [];
+  const ent = (e) => `<div class="op-ent${e.sent && e.code === 200 ? "" : " err"}" title="${esc(`${new Date(e.time * 1000).toLocaleString()}\n${e.uuid}`)}">
       <span class="l1"><b>${esc(e.cmd)}</b> → ${esc(e.title)}${e.secured ? " 🔒" : ""}</span>
-      <span class="dt">${esc(fmtWhen(e.time))} · ${esc(e.who)} · ${e.code == null ? esc(e.note) : `code ${e.code} ${esc(e.note)}`}</span></div>`).join("");
-  box.appendChild(d);
+      <span class="dt">${esc(fmtWhen(e.time))} · ${e.sent ? (e.code == null ? esc(e.note) : `code ${e.code} ${esc(e.note)}`) : `not sent: ${esc(e.note)}`}</span></div>`;
+  // Commands that went out, and, apart, requests that failed before theirs could.
+  for (const [sent, title, key] of [[true, "Commands sent to inputs", "opLogOpen"], [false, "Not sent", "opNotOpen"]]) {
+    const log = all.filter((e) => !!e.sent === sent);
+    if (!log.length) continue;
+    const d = document.createElement("details");
+    d.className = "op-log";
+    d.open = !!S[key];
+    d.ontoggle = () => (S[key] = d.open);
+    d.innerHTML = `<summary class="hist-sec">${title} <span class="count">${log.length}</span></summary>` + log.map(ent).join("");
+    box.appendChild(d);
+  }
 }
 
 /** Live values belong to what runs on the Miniserver: the current, deployed revision. */

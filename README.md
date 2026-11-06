@@ -103,10 +103,12 @@ marked so you can review it before you deploy.
   Each command needs a confirmation. The Miniserver's code shows next to the control, then vislox waits for the
   state update: the wire turns green or shows the new value, or the control says that no update came back.
   A block with a visualization password shows a lock. vislox asks for the password once per browser session and
-  checks it (`checkuservisupwd`) before it sends the command. Every command sent (who, what, when, code) is
-  listed under *Commands sent to inputs* in the History pane until vislox stops. Before each command the preflight
-  checks that the Miniserver at lox's address reports the config's serial; when it reports another one, or none,
-  nothing is sent.
+  checks it (`checkuservisupwd`) before it sends the command; secured commands go one at a time, since each
+  key is single-use. Every command sent (what, when, code) is listed under *Commands sent to inputs* in the History
+  pane until vislox stops, and a request that failed before its command went out under *Not sent*, with the
+  reason. vislox has one shared token and no user accounts, so the log names no one. Before each command the
+  preflight checks that the Miniserver at lox's address reports the config's serial; when it reports another
+  one, none, or cannot be checked, nothing is sent.
 
 vislox itself never writes to the config: lox and git do, and only on Pull, Apply and Discard. Live values only
 listen. A pull reads from the Miniserver; only Apply writes to it, and with `--operate`, commands to virtual
