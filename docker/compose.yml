@@ -25,7 +25,6 @@ services:
       LOX_SERIAL: ${LOX_SERIAL:-}
       LOX_VERIFY_SSL: ${LOX_VERIFY_SSL:-}
       VISLOX_ADMIN_TOKEN: ${VISLOX_ADMIN_TOKEN:-}
-      VISLOX_AI_WEBHOOK: ${VISLOX_AI_WEBHOOK:-}
 
 volumes:
   vislox-data:

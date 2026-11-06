@@ -38,8 +38,7 @@ With Docker Compose or a Portainer stack, use [`compose.yml`](compose.yml) and s
 | `VISLOX_GIT_PULL_SECONDS` | Fast-forward `/data/repo` from its remote this often, so commits pushed elsewhere show up in History. Skipped while there are uncommitted changes. `0` turns it off. Compose default: `60`. |
 | `VISLOX_PATH` | What to view: a `lox.toml` project, a `lox config init` repository, a `.Loxone` file or a backup `.zip`. Default: `/data/repo` if it exists, else `/data`. |
 | `LOX_HOST`, `LOX_USER`, `LOX_PASS`, `LOX_SERIAL`, `LOX_VERIFY_SSL` | The Miniserver, written to lox's `~/.lox/config.yaml`. Needed for live values, Pull, Sync and Apply. |
-| `VISLOX_ADMIN_TOKEN` | Turns on Apply, Discard, Sync and the AI box, which ask for this token. |
-| `VISLOX_AI_WEBHOOK` | URL that AI requests are posted to. |
+| `VISLOX_ADMIN_TOKEN` | Turns on Apply, Discard and Sync, which ask for this token. |
 | `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL` | Who commits for Apply and Sync. |
 | `VISLOX_ARGS` | More `vislox` arguments, e.g. `--no-pull` or `--serial 504F94AABBCC`. |
 | `VISLOX_PORT` | Host port (compose only, default `7878`). |
