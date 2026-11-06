@@ -1,0 +1,30 @@
+# vislox as a Docker Compose / Portainer stack. Every setting comes from the
+# environment (a .env file, or the stack's environment variables in Portainer);
+# docker/README.md explains them. The `deploy` branch carries this file with
+# the image pinned to the latest build of main, for Portainer's Git updates.
+services:
+  vislox:
+    image: ghcr.io/hakubo/vislox:main
+    restart: unless-stopped
+    ports:
+      - "${VISLOX_PORT:-7878}:7878"
+    volumes:
+      - vislox-data:/data
+    environment:
+      VISLOX_GIT_URL: ${VISLOX_GIT_URL:-}
+      VISLOX_GIT_BRANCH: ${VISLOX_GIT_BRANCH:-}
+      VISLOX_GIT_PULL_SECONDS: ${VISLOX_GIT_PULL_SECONDS:-60}
+      VISLOX_PATH: ${VISLOX_PATH:-}
+      VISLOX_ARGS: ${VISLOX_ARGS:-}
+      GIT_AUTHOR_NAME: ${GIT_AUTHOR_NAME:-vislox}
+      GIT_AUTHOR_EMAIL: ${GIT_AUTHOR_EMAIL:-vislox@localhost}
+      LOX_HOST: ${LOX_HOST:-}
+      LOX_USER: ${LOX_USER:-}
+      LOX_PASS: ${LOX_PASS:-}
+      LOX_SERIAL: ${LOX_SERIAL:-}
+      LOX_VERIFY_SSL: ${LOX_VERIFY_SSL:-}
+      VISLOX_ADMIN_TOKEN: ${VISLOX_ADMIN_TOKEN:-}
+      VISLOX_AI_WEBHOOK: ${VISLOX_AI_WEBHOOK:-}
+
+volumes:
+  vislox-data:

@@ -1,0 +1,5 @@
+target
+.git
+tests
+docs
+node_modules

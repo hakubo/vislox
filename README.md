@@ -78,6 +78,12 @@ vislox config.Loxone            # one .Loxone file, or a backup .zip
 vislox ~/loxone-config --serial 504F94AABBCC   # several Miniservers in one repository
 ```
 
+Or with Docker, which bundles git and lox (see [docker/README.md](docker/README.md)):
+
+```bash
+docker run -d -p 7878:7878 -v ~/loxone-config:/data/repo ghcr.io/hakubo/vislox:main
+```
+
 Then open <http://127.0.0.1:7878> (`--listen` changes the address, and `--open` launches the browser).
 
 Live values use the Miniserver connection of `lox` (`lox setup set …`), found the way lox finds it:
