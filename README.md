@@ -43,7 +43,7 @@ marked so you can review it before you deploy.
     Miniserver's current config and commits it when it changed. The new backup appears at once.
   - *Miniserver backups*: the Miniserver keeps a backup of each config it loads (`/prog/sps_<ver>_<stamp>.zip`;
     one Miniserver kept its last 20). **Read** lists them and downloads each new one once (FTP, read-only). A backup with the
-    bytes of a Pull shows as that Pull (a *Miniserver backup* pill); the others are listed under the Pulls they
+    bytes of the Pull next to it shows as that Pull (a *Miniserver backup* pill); the others are listed under the Pulls they
     were saved between (*Between Backup v273 and Backup v274*, *Since the last Pull*), each compared with the
     save before it. So every save from Loxone Config can be reviewed on its own, even when nobody pulled in
     between, and shift-click compares any two.
@@ -406,9 +406,20 @@ the LoxCC size and CRC-32). Its program is the same bytes `lox config pull` comm
 the Pull that took it. The program is cached by that blob id in `VISLOX_CACHE` (as the structure file), under
 `<serial or address>/backups/`, with `index.json` (file name to blob id) and the last listing (`list.json`). A
 backup is never downloaded twice, and one the Miniserver has deleted stays in the History (*no longer on the
-Miniserver*). The time in the file name is the Miniserver's local time; a Pull is placed by the date in its
-subject (`Config backup 2026-11-05 23:55:04`, the backup it took), else by the backup with its bytes, else by its
-commit time. `--no-live` turns this off. vislox does not write backups to git: a Pull commits the newest one.
+Miniserver*). The cache shows with `--no-live` too, and links to a backup keep working; reading needs a cache
+directory, and is refused without one. A backup that cannot be downloaded or read (one still being written) is
+listed under *Could not be read* with the reason, and tried again on the next Read; the others are read anyway.
+One FTP session at a time: a listing (30 s) or download (120 s) that takes too long stops the read, and the next
+one waits until that session has ended.
+
+Saves in a row with the same program are one. A backup shows as a Pull only when it is next to it in time (the
+Pull took it, or nothing changed in between); a save that goes back to an older program shows in its gap, *same
+as* that revision. The time in a file name is the Miniserver's local time, in the zone its config names
+(`Timezone="Europe/Warsaw"` in the `Document`, from the newest backup), never in the zone of the computer vislox
+runs on (in Docker that is UTC). A Pull is placed by the date in its subject (`Config backup 2026-11-05 23:55:04`,
+the backup it took), else by its commit time in that zone. With no zone known, stamps count as UTC, and a Pull
+without a date is placed by the backup with its bytes. `--no-live` turns reading off. vislox does not write
+backups to git: a Pull commits the newest one.
 
 **Pull from Miniserver** runs `lox config pull` (the `lox` on `PATH`, or `--lox <path>`), with the same lox
 configuration and context as live values. It is offered only when lox would commit to the repository vislox

@@ -53,7 +53,7 @@ const cacheDir = mkdtempSync(join(tmpdir(), "vislox-cache-"));
   const index = {}, files = [];
   for (const [file, bytes] of [["sps_1_20261101100000.zip", pulled], ["sps_15_20261101120000.zip", saved]]) {
     writeFileSync(join(dir, blob(bytes) + ".Loxone"), bytes);
-    index[file] = blob(bytes);
+    index[file] = { blob: blob(bytes) };
     files.push({ file, version: Number(file.split("_")[1]), stamp: file.split("_")[2].slice(0, 14), size: 1 });
   }
   writeFileSync(join(dir, "index.json"), JSON.stringify(index));

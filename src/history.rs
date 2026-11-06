@@ -4,15 +4,17 @@
 //! the commit holding the same bytes are recognisably the same.
 //!
 //! The Miniserver's own backups (`/prog/sps_<ver>_<stamp>.zip`, see
-//! `backups.rs`) join by the same key: one with the bytes of a commit shows
-//! as that commit, the others as the saves between two Pulls.
+//! `backups.rs`) join by the same key: one with the bytes of the Pull that
+//! took it shows as that Pull, the others as the saves between two Pulls.
 
+use chrono::TimeZone;
+use chrono_tz::Tz;
 use serde::Serialize;
 use sha1::{Digest, Sha1};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Revision {
@@ -39,6 +41,22 @@ pub struct Revision {
     pub after: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub before: Option<String>,
+    /// A backup whose program another revision has too (not the Pulls
+    /// around it: a save that undid changes): that revision.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub same_as: Option<String>,
+}
+
+/// What the History shows, see [`History::lists`].
+#[derive(Debug, Default)]
+pub struct Lists {
+    /// Newest first.
+    pub pending: Vec<Revision>,
+    /// Newest first.
+    pub history: Vec<Revision>,
+    /// The Miniserver backups that show on their own, newest first.
+    pub backups: Vec<Revision>,
+    by_id: HashMap<String, Revision>,
 }
 
 /// A Miniserver backup that vislox downloaded, cached as its program
@@ -82,6 +100,10 @@ pub struct History {
     contents: HashMap<String, Arc<Vec<u8>>>,
     /// The Miniserver's backups that were downloaded, any order.
     backups: Vec<Backup>,
+    /// The Miniserver's time zone, which backup stamps are in.
+    zone: Option<Tz>,
+    /// [`History::lists`] for a version.
+    lists: Mutex<Option<(u64, Arc<Lists>)>>,
     /// Bumped on every change, for the UI's event stream.
     pub version: u64,
     pub last_error: Option<String>,
@@ -252,9 +274,26 @@ impl History {
 
     /// (pending, history), newest first, each with its comparison base.
     pub fn list(&self) -> (Vec<Revision>, Vec<Revision>) {
+        let l = self.lists();
+        (l.pending.clone(), l.history.clone())
+    }
+
+    /// Everything the History shows, worked out once per version.
+    pub fn lists(&self) -> Arc<Lists> {
+        let mut cache = self.lists.lock().unwrap();
+        if let Some((v, l)) = cache.as_ref()
+            && *v == self.version
+        {
+            return l.clone();
+        }
+        let l = Arc::new(self.compute());
+        *cache = Some((self.version, l.clone()));
+        l
+    }
+
+    fn compute(&self) -> Lists {
         let mut hist: Vec<Revision> = Vec::new();
-        let commit_blobs: std::collections::HashSet<&str> =
-            self.commits.iter().map(|c| c.blob.as_str()).collect();
+        let commit_blobs: HashSet<&str> = self.commits.iter().map(|c| c.blob.as_str()).collect();
         // Live snapshots, newest first; one that a commit records is shown
         // as that commit.
         let disk_blob = self.live.last().map(|r| r.blob.clone());
@@ -293,14 +332,7 @@ impl History {
         for i in 0..hist.len() {
             hist[i].base = hist.get(i + 1).map(|r| r.id.clone());
         }
-        // A backup with the bytes of a revision shows as that revision.
-        let mut backups: Vec<&Backup> = self.backups.iter().collect();
-        backups.sort_by(|a, b| a.stamp.cmp(&b.stamp));
-        for b in backups {
-            if let Some(r) = hist.iter_mut().find(|r| r.blob == b.blob) {
-                r.backups.push(b.file.clone());
-            }
-        }
+        let backups = place_backups(&mut hist, &self.backups, self.zone);
         if let Some(first) = hist.first_mut() {
             first.current = Some(&first.blob) == disk_blob.as_ref();
         }
@@ -308,47 +340,51 @@ impl History {
         // A compile that is the deployed config would deploy nothing; when
         // the newest one is, nothing is pending at all.
         let head_blob = hist.first().map(|r| r.blob.clone());
-        if self.pending.last().map(|r| &r.blob) == head_blob.as_ref() {
-            return (Vec::new(), hist);
-        }
-        let pending: Vec<Revision> = self
-            .pending
+        let pending: Vec<Revision> = if self.pending.last().map(|r| &r.blob) == head_blob.as_ref() {
+            Vec::new()
+        } else {
+            self.pending
+                .iter()
+                .rev()
+                .filter(|r| Some(&r.blob) != head_blob.as_ref())
+                .enumerate()
+                .map(|(i, r)| {
+                    let mut r = r.clone();
+                    r.base = head_id.clone();
+                    r.current = i == 0;
+                    if i > 0 {
+                        r.label = "Earlier compile".into();
+                    }
+                    r
+                })
+                .collect()
+        };
+        let by_id = pending
             .iter()
-            .rev()
-            .filter(|r| Some(&r.blob) != head_blob.as_ref())
-            .enumerate()
-            .map(|(i, r)| {
-                let mut r = r.clone();
-                r.base = head_id.clone();
-                r.current = i == 0;
-                if i > 0 {
-                    r.label = "Earlier compile".into();
-                }
-                r
-            })
+            .chain(&hist)
+            .chain(&backups)
+            .map(|r| (r.id.clone(), r.clone()))
             .collect();
-        (pending, hist)
-    }
-
-    /// The Miniserver backups that show on their own (no revision has
-    /// their bytes), newest first. Each is compared with the save before it:
-    /// the backup or Pull saved last before it.
-    pub fn backup_list(&self) -> Vec<Revision> {
-        backup_revisions(&self.list().1, &self.backups)
+        Lists {
+            pending,
+            history: hist,
+            backups,
+            by_id,
+        }
     }
 
     pub fn find(&self, id: &str) -> Option<Revision> {
-        let (p, h) = self.list();
-        let b = backup_revisions(&h, &self.backups);
-        p.into_iter().chain(h).chain(b).find(|r| r.id == id)
+        self.lists().by_id.get(id).cloned()
     }
 
-    /// Show these backups (see `backups.rs`). Returns whether they changed.
-    pub fn set_backups(&mut self, backups: Vec<Backup>) -> bool {
-        if backups == self.backups {
+    /// Show these backups (see `backups.rs`), whose stamps are in `zone`,
+    /// the Miniserver's time zone. Returns whether anything changed.
+    pub fn set_backups(&mut self, backups: Vec<Backup>, zone: Option<Tz>) -> bool {
+        if backups == self.backups && zone == self.zone {
             return false;
         }
         self.backups = backups;
+        self.zone = zone;
         self.version += 1;
         true
     }
@@ -380,32 +416,34 @@ impl History {
     }
 }
 
-/// `YYYYMMDDHHMMSS` as a time in this computer's time zone (the
-/// Miniserver's local time, which is normally the same).
-fn local_unix(stamp: &str) -> Option<i64> {
-    use chrono::TimeZone;
+/// `YYYYMMDDHHMMSS` in the Miniserver's time zone as Unix seconds. Without
+/// a zone (no backup said which), as UTC: never this computer's zone, which
+/// in a container is UTC anyway and elsewhere need not be the Miniserver's.
+pub fn stamp_unix(stamp: &str, zone: Option<Tz>) -> Option<i64> {
     let t = chrono::NaiveDateTime::parse_from_str(stamp.get(..14)?, "%Y%m%d%H%M%S").ok()?;
-    chrono::Local
-        .from_local_datetime(&t)
-        .earliest()
-        .map(|t| t.timestamp())
+    match zone {
+        Some(z) => z.from_local_datetime(&t).earliest().map(|t| t.timestamp()),
+        None => Some(t.and_utc().timestamp()),
+    }
 }
 
-fn local_stamp(unix: i64) -> String {
-    chrono::DateTime::from_timestamp(unix, 0)
-        .map(|t| {
-            t.with_timezone(&chrono::Local)
-                .format("%Y%m%d%H%M%S")
-                .to_string()
-        })
-        .unwrap_or_default()
+/// Unix seconds as a stamp in the Miniserver's time zone (UTC without one).
+fn unix_stamp(unix: i64, zone: Option<Tz>) -> String {
+    let Some(t) = chrono::DateTime::from_timestamp(unix, 0) else {
+        return String::new();
+    };
+    match zone {
+        Some(z) => t.with_timezone(&z).format("%Y%m%d%H%M%S").to_string(),
+        None => t.format("%Y%m%d%H%M%S").to_string(),
+    }
 }
 
 /// When the config a Pull committed was saved, as a backup's stamp: the date
 /// `lox config pull` writes into its subject (`Config backup 2026-11-05
-/// 23:55:01 (v274)`, the stamp of the backup it downloaded), else the first
-/// backup with its bytes, else when it was committed.
-fn pull_stamp(r: &Revision, backups: &[Backup]) -> String {
+/// 23:55:01 (v274)`, the stamp of the backup it downloaded, in the
+/// Miniserver's time). Else its commit time in the Miniserver's zone; with no
+/// zone known, the first backup with its bytes, else the commit time in UTC.
+fn pull_stamp(r: &Revision, zone: Option<Tz>, first_with: &HashMap<&str, &str>) -> String {
     if let Some(rest) = r.label.split("Config backup ").nth(1)
         && let Some(date) = rest.get(..19)
     {
@@ -414,50 +452,81 @@ fn pull_stamp(r: &Revision, backups: &[Backup]) -> String {
             return digits;
         }
     }
-    r.backups
-        .first()
-        .and_then(|f| backups.iter().find(|b| &b.file == f))
-        .map(|b| b.stamp.clone())
-        .unwrap_or_else(|| local_stamp(r.time))
+    match (zone, first_with.get(r.blob.as_str())) {
+        (None, Some(stamp)) => stamp.to_string(),
+        _ => unix_stamp(r.time, zone),
+    }
 }
 
-/// The backups that show on their own, newest first (see
-/// [`History::backup_list`]). `hist` is the History, newest first, with each
-/// revision's `backups` filled in.
-fn backup_revisions(hist: &[Revision], backups: &[Backup]) -> Vec<Revision> {
-    // Every save in time order: (stamp, order at the same stamp: a backup is
-    // saved before a Pull takes it, id it shows as, blob, is a Pull).
-    let mut saves: Vec<(String, u8, String, &str, bool)> = Vec::new();
-    for r in hist.iter().filter(|r| r.kind == "git") {
-        saves.push((pull_stamp(r, backups), 1, r.id.clone(), &r.blob, true));
-    }
+/// Place the backups among the Pulls (the git revisions of `hist`, newest
+/// first), and return the ones that show on their own, newest first.
+///
+/// In time order, saves with the same program in a row are one: when a Pull
+/// is among them, its backups show as that Pull (`backups`); otherwise the
+/// oldest shows, compared with the save before it. A program that comes back
+/// later (a save that undoes changes) shows on its own, `same_as` the
+/// revision it equals.
+fn place_backups(hist: &mut [Revision], backups: &[Backup], zone: Option<Tz>) -> Vec<Revision> {
+    // The first backup with each program, for a Pull without a date.
+    let mut first_with: HashMap<&str, &str> = HashMap::new();
     for b in backups {
-        // One with the bytes of a revision shows as that revision.
-        let id = hist
-            .iter()
-            .find(|r| r.blob == b.blob)
-            .map(|r| r.id.clone())
-            .unwrap_or_else(|| format!("backup:{}", b.file));
-        saves.push((b.stamp.clone(), 0, id, &b.blob, false));
+        let e = first_with.entry(&b.blob).or_insert(&b.stamp);
+        if b.stamp.as_str() < *e {
+            *e = &b.stamp;
+        }
+    }
+    // (stamp, at the same stamp a backup comes first: it is saved before a
+    // Pull takes it, blob, Pull index in hist, backup index)
+    type Save<'a> = (String, u8, &'a str, Option<usize>, Option<usize>);
+    let mut saves: Vec<Save> = Vec::new();
+    for (i, r) in hist.iter().enumerate().filter(|(_, r)| r.kind == "git") {
+        saves.push((pull_stamp(r, zone, &first_with), 1, &r.blob, Some(i), None));
+    }
+    for (i, b) in backups.iter().enumerate() {
+        saves.push((b.stamp.clone(), 0, &b.blob, None, Some(i)));
     }
     saves.sort_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
-    let mut out = Vec::new();
-    let mut prev: Option<(&str, &str)> = None; // id, blob
-    let mut after: Option<&str> = None;
-    for (i, (_, _, id, blob, pull)) in saves.iter().enumerate() {
-        if *pull {
-            prev = Some((id, blob));
-            after = Some(id);
-            continue;
+    let n = saves.len();
+    // The first Pull after each save.
+    let mut next_pull: Vec<Option<usize>> = vec![None; n];
+    let mut np = None;
+    for k in (0..n).rev() {
+        next_pull[k] = np;
+        if saves[k].3.is_some() {
+            np = saves[k].3;
         }
-        let shown_alone = id.starts_with("backup:");
-        // The same program saved again adds nothing to compare.
-        if shown_alone && prev.map(|p| p.1) != Some(*blob) {
-            let b = backups
+    }
+    let mut shown: HashMap<String, String> = HashMap::new(); // blob -> id
+    let mut out = Vec::new();
+    let mut prev: Option<String> = None;
+    let mut last_pull: Option<usize> = None;
+    let mut collapsed: Vec<(usize, String)> = Vec::new();
+    let mut k = 0;
+    while k < n {
+        let blob = saves[k].2;
+        let mut e = k;
+        while e < n && saves[e].2 == blob {
+            e += 1;
+        }
+        let run = &saves[k..e];
+        if let Some(p) = run.iter().filter_map(|s| s.3).next_back() {
+            for s in run {
+                if let Some(b) = s.4 {
+                    collapsed.push((p, backups[b].file.clone()));
+                }
+                if let Some(pp) = s.3 {
+                    last_pull = Some(pp);
+                }
+            }
+            prev = Some(hist[p].id.clone());
+        } else {
+            let b = &backups[run[0].4.expect("a save without a Pull is a backup")];
+            let id = format!("backup:{}", b.file);
+            let same_as = hist
                 .iter()
-                .find(|b| format!("backup:{}", b.file) == *id)
-                .expect("a backup's own id");
-            let before = saves[i + 1..].iter().find(|s| s.4).map(|s| s.2.clone());
+                .find(|r| r.blob == b.blob)
+                .map(|r| r.id.clone())
+                .or_else(|| shown.get(&b.blob).cloned());
             out.push(Revision {
                 id: id.clone(),
                 kind: "backup",
@@ -467,17 +536,21 @@ fn backup_revisions(hist: &[Revision], backups: &[Backup]) -> Vec<Revision> {
                 } else {
                     format!("{} · no longer on the Miniserver", b.file)
                 },
-                time: local_unix(&b.stamp).unwrap_or_default(),
+                time: stamp_unix(&b.stamp, zone).unwrap_or_default(),
                 blob: b.blob.clone(),
-                base: prev.map(|p| p.0.to_string()),
-                after: after.map(str::to_string),
-                before,
+                base: prev.clone(),
+                after: last_pull.map(|p| hist[p].id.clone()),
+                before: next_pull[e - 1].map(|p| hist[p].id.clone()),
+                same_as,
                 ..Revision::default()
             });
-        } else if shown_alone {
-            continue;
+            shown.entry(b.blob.clone()).or_insert_with(|| id.clone());
+            prev = Some(id);
         }
-        prev = Some((id, blob));
+        k = e;
+    }
+    for (p, file) in collapsed {
+        hist[p].backups.push(file);
     }
     out.reverse();
     out
@@ -680,8 +753,11 @@ mod tests {
             backup(cache.path(), "sps_4_20261104100000.zip", b"v4"),
             backup(cache.path(), "sps_5_20261105100000.zip", b"v5"),
         ];
-        assert!(h.set_backups(backups.clone()));
-        assert!(!h.set_backups(backups), "the same backups change nothing");
+        assert!(h.set_backups(backups.clone(), None));
+        assert!(
+            !h.set_backups(backups, None),
+            "the same backups change nothing"
+        );
 
         let (_, hist) = h.list();
         // The backups with a commit's bytes show as that commit.
@@ -690,7 +766,7 @@ mod tests {
         // A Pull is still compared with the Pull before it.
         assert_eq!(hist[0].base.as_deref(), Some(hist[1].id.as_str()));
 
-        let b = h.backup_list();
+        let b = h.lists().backups.clone();
         let ids: Vec<&str> = b.iter().map(|r| r.id.as_str()).collect();
         assert_eq!(
             ids,
@@ -727,17 +803,131 @@ mod tests {
         git(&repo, &["add", "."]);
         git(&repo, &["commit", "-q", "-m", "Apply: 2 blocks changed"]);
         let mut h = History::new(file, None);
-        h.set_backups(vec![
-            backup(cache.path(), "sps_1_20000101000000.zip", b"before"),
-            backup(cache.path(), "sps_2_20000102000000.zip", b"a"),
-            backup(cache.path(), "sps_3_20000103000000.zip", b"after"),
-        ]);
+        h.set_backups(
+            vec![
+                backup(cache.path(), "sps_1_20000101000000.zip", b"before"),
+                backup(cache.path(), "sps_2_20000102000000.zip", b"a"),
+                backup(cache.path(), "sps_3_20000103000000.zip", b"after"),
+            ],
+            None,
+        );
         let (_, hist) = h.list();
-        let b = h.backup_list();
+        let b = h.lists().backups.clone();
         assert_eq!(b.len(), 2);
         assert_eq!(b[0].base.as_deref(), Some(hist[0].id.as_str()));
         assert_eq!(b[0].after.as_deref(), Some(hist[0].id.as_str()));
         assert_eq!(b[1].before.as_deref(), Some(hist[0].id.as_str()));
         assert_eq!(b[1].base, None);
+    }
+
+    #[test]
+    fn a_save_that_goes_back_to_an_older_pull_stays_in_its_gap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().canonicalize().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        git(&repo, &["init", "-q"]);
+        let file = repo.join("config.Loxone");
+        fs::write(&file, "v1").unwrap();
+        git(&repo, &["add", "."]);
+        git(
+            &repo,
+            &[
+                "commit",
+                "-q",
+                "-m",
+                "[x] Config backup 2026-11-01 10:00:00 (v1)",
+            ],
+        );
+        fs::write(&file, "v4").unwrap();
+        git(
+            &repo,
+            &[
+                "commit",
+                "-q",
+                "-am",
+                "[x] Config backup 2026-11-04 10:00:00 (v4)",
+            ],
+        );
+        let mut h = History::new(file, None);
+        h.set_backups(
+            vec![
+                backup(cache.path(), "sps_1_20261101100000.zip", b"v1"),
+                backup(cache.path(), "sps_2_20261102100000.zip", b"v2"),
+                // Undoes the change of v2: the program of the first Pull again.
+                backup(cache.path(), "sps_3_20261103100000.zip", b"v1"),
+                backup(cache.path(), "sps_4_20261104100000.zip", b"v4"),
+            ],
+            None,
+        );
+        let l = h.lists();
+        let (hist, b) = (&l.history, &l.backups);
+        // Only the backup the first Pull took shows as it.
+        assert_eq!(hist[1].backups, ["sps_1_20261101100000.zip"]);
+        let ids: Vec<&str> = b.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "backup:sps_3_20261103100000.zip",
+                "backup:sps_2_20261102100000.zip"
+            ]
+        );
+        assert_eq!(b[0].same_as.as_deref(), Some(hist[1].id.as_str()));
+        assert_eq!(b[0].base.as_deref(), Some(b[1].id.as_str()));
+        assert_eq!(b[0].before.as_deref(), Some(hist[0].id.as_str()));
+        assert_eq!(b[1].same_as, None);
+        // The Pull after it is compared with the Pull before (as always), and
+        // the revert is found by its id.
+        assert_eq!(h.find(&b[0].id).unwrap().blob, hist[1].blob);
+    }
+
+    #[test]
+    fn backup_times_are_in_the_miniserver_s_zone_not_this_computer_s() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().canonicalize().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        git(&repo, &["init", "-q"]);
+        let file = repo.join("base.Loxone");
+        fs::write(&file, "applied").unwrap();
+        git(&repo, &["add", "."]);
+        // An Apply (no date in its subject) at 10:30 UTC, 11:30 in Warsaw.
+        let ok = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+            .args(["-c", "commit.gpgsign=false", "commit", "-q", "-m", "Apply"])
+            .env("GIT_COMMITTER_DATE", "2026-11-05T10:30:00Z")
+            .env("GIT_AUTHOR_DATE", "2026-11-05T10:30:00Z")
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok);
+        let mut h = History::new(file, None);
+        let backups = vec![
+            // Saved at 11:00 and 12:00 Warsaw time: before and after the Apply.
+            backup(cache.path(), "sps_1_20261105110000.zip", b"before"),
+            backup(cache.path(), "sps_2_20261105120000.zip", b"after"),
+        ];
+        let warsaw: Tz = "Europe/Warsaw".parse().unwrap();
+        h.set_backups(backups.clone(), Some(warsaw));
+        let l = h.lists();
+        let apply = l.history[0].id.clone();
+        let b = &l.backups;
+        assert_eq!(b.len(), 2);
+        assert_eq!(b[0].after.as_deref(), Some(apply.as_str()));
+        assert_eq!(b[0].before, None);
+        assert_eq!(b[1].before.as_deref(), Some(apply.as_str()));
+        assert_eq!(b[1].after, None);
+        // 11:00 in Warsaw (CET) is 10:00 UTC.
+        assert_eq!(b[1].time, 1_793_872_800);
+        // Without a zone, the stamps count as UTC (never the host's zone):
+        // the Apply at 10:30 now seems to come before both.
+        h.set_backups(backups, None);
+        let l = h.lists();
+        assert!(
+            l.backups
+                .iter()
+                .all(|r| r.after.as_deref() == Some(apply.as_str()))
+        );
+        assert_eq!(l.backups[1].time, 1_793_872_800 + 3600);
     }
 }

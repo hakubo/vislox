@@ -288,10 +288,15 @@ async fn main() -> Result<()> {
                 .map(|f| Arc::new(backups::Ftp(f.conn.clone())) as Arc<dyn backups::Port>)
                 .map_err(Clone::clone)
         },
-        found.as_ref().ok().map(|f| f.ms_dir.as_str()),
+        found
+            .as_ref()
+            .ok()
+            .map(|f| f.ms_dir.as_str())
+            .or(src.miniserver.as_deref()),
     ));
     let mut history = history;
-    history.set_backups(backups.entries());
+    let (list, zone) = backups.entries();
+    history.set_backups(list, zone);
     // The Debug-Monitor, when asked for; --no-live means vislox never talks
     // to the Miniserver.
     let monitor = Arc::new(monitor::Monitor::new(
@@ -615,13 +620,13 @@ fn spawn_watcher(app: Arc<App>) -> Result<()> {
 
 async fn api_history(State(app): State<Arc<App>>) -> impl IntoResponse {
     let h = app.history.lock().unwrap();
-    let (pending, hist) = h.list();
+    let l = h.lists();
     Json(serde_json::json!({
         "label": app.label,
         "version": h.version,
-        "pending": pending,
-        "history": hist,
-        "backups": h.backup_list(),
+        "pending": l.pending,
+        "history": l.history,
+        "backups": l.backups,
         "ms_backups": app.backups.info(),
         "error": h.last_error,
         "live": app.live.info(),
@@ -1175,7 +1180,8 @@ fn read_backups(app: &Arc<App>) -> Result<(), String> {
     app.backups.start(Arc::new(move || {
         let v = {
             let mut h = a.history.lock().unwrap();
-            h.set_backups(a.backups.entries());
+            let (list, zone) = a.backups.entries();
+            h.set_backups(list, zone);
             h.touch()
         };
         let _ = a.tx.send(v);

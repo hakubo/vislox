@@ -178,6 +178,7 @@ function revButton(r, newest) {
   if (r.kind !== "pending" && r.current) pills.push('<span class="pill cur">on disk</span>');
   if (r.kind === "live") pills.push('<span class="pill new">not in git</span>');
   if (r.kind === "backup") pills.push('<span class="pill ms">not pulled</span>');
+  if (r.same_as) pills.push(`<span class="pill">same as ${esc(revById(r.same_as) ? revInfo(revById(r.same_as)).title : r.same_as)}</span>`);
   if (r.backups?.length) pills.push(`<span class="pill ms">Miniserver backup${r.backups.length > 1 ? ` ×${r.backups.length}` : ""}</span>`);
   if (r.id === S.base) pills.push('<span class="pill">compared with</span>');
   b.innerHTML = `<span class="node"></span><span class="l1"><span class="lbl">${esc(info.title)}</span></span>
@@ -215,25 +216,34 @@ function renderHistory() {
 // Every config the Miniserver loads leaves /prog/sps_<ver>_<stamp>.zip behind. vislox lists and
 // downloads them (FTP, read-only) only when asked, once each; one with the bytes of a Pull shows
 // as that Pull (its "Miniserver backup" pill), the others here, grouped by the Pulls around them.
-let backupsBusy = false, backupsErr = "";
+let backupsBusy = false;
+// A Read the server refused, with the state it refused in: once that state moves on (a read ran,
+// from here or after a Pull), the newer state counts.
+let backupsErr = null;
+function backupsState(info) { return `${info?.listed}|${info?.busy}|${info?.error}`; }
 function renderBackups(box) {
   const info = S.hist.ms_backups;
-  if (!info?.available) return;
   const list = S.hist.backups || [];
+  const broken = info?.broken || [];
+  if (!info || (!info.available && !list.length && !broken.length)) return;
+  if (backupsErr && backupsErr.state !== backupsState(info)) backupsErr = null;
   const busy = backupsBusy || info.busy;
   const h = document.createElement("div");
   h.className = "hist-sec bk-sec";
-  h.innerHTML = `<span>Miniserver backups</span><button type="button" class="bk-read"${busy ? " disabled" : ""}
-    title="List the backups on the Miniserver (/prog, FTP, read-only) and download the new ones${esc(msWarn("pull"))}">${busy ? "Reading…" : "Read"}</button>`;
+  const tip = info.available ? `List the backups on the Miniserver (/prog, FTP, read-only) and download the new ones${msWarn("pull")}` : `Cannot read the backups: ${info.reason}`;
+  h.innerHTML = `<span>Miniserver backups</span><button type="button" class="bk-read"${busy || !info.available ? " disabled" : ""}
+    title="${esc(tip)}">${busy ? "Reading…" : "Read"}</button>`;
   h.querySelector("button").onclick = readBackups;
   box.appendChild(h);
   const p = info.progress;
-  const err = backupsErr || info.error;
-  const note = busy ? (p?.[1] ? `Downloading ${Math.min(p[0] + 1, p[1])} of ${p[1]}…` : "Listing the backups on the Miniserver…")
+  const err = backupsErr?.text || info.error;
+  const note = info.stuck ? `${info.error || "An FTP call took too long"}. Waiting for its FTP session to end before the next read.`
+    : busy ? (p?.[1] ? `Downloading ${Math.min(p[0] + 1, p[1])} of ${p[1]}…` : "Listing the backups on the Miniserver…")
     : err ? `Cannot read the backups: ${err}`
+    : !info.available ? `Downloaded before. Not read now: ${info.reason}.`
     : info.listed == null ? "The Miniserver keeps a backup of each config it loads. Read lists them and downloads each one once."
     : `${info.on_miniserver} on the Miniserver, read ${fmtWhen(info.listed, true)}.` + (list.length ? "" : " Each one is a Pull above, or the same as the save before it.");
-  box.insertAdjacentHTML("beforeend", `<div class="bk-note${err && !busy ? " error" : ""}" role="status">${esc(note)}</div>`);
+  box.insertAdjacentHTML("beforeend", `<div class="bk-note${(err && !busy) || info.stuck ? " error" : ""}" role="status">${esc(note)}</div>`);
   const pulls = S.hist.history.some((r) => r.kind === "git");
   const short = (id) => { const r = revById(id); return r ? revInfo(r).short : id; };
   let group;
@@ -249,16 +259,25 @@ function renderBackups(box) {
     }
     box.appendChild(revButton(r, null));
   }
+  if (broken.length) {
+    box.insertAdjacentHTML("beforeend", `<div class="bk-gap">Could not be read (tried again on the next Read)</div>` +
+      broken.map((b) => `<div class="bk-broken" title="${esc(b.file)}"><span class="l1">Miniserver backup v${esc(String(b.version))} · ${esc(fmtStamp(b.stamp))}</span>
+        <span class="dt">${esc(b.error)}</span></div>`).join(""));
+  }
 }
+/** `YYYYMMDDHHMMSS` (the Miniserver's local time) as `2026-11-05 23:55`. */
+function fmtStamp(s) { return s.length >= 12 ? `${s.slice(0, 4)}-${s.slice(4, 6)}-${s.slice(6, 8)} ${s.slice(8, 10)}:${s.slice(10, 12)}` : s; }
 async function readBackups() {
   if (backupsBusy) return;
-  backupsBusy = true; backupsErr = ""; renderHistory();
+  backupsBusy = true; backupsErr = null; renderHistory();
+  let text = "";
   try {
     const r = await fetch("/api/backups/read", { method: "POST", headers: { "X-Vislox": "backups" } });
     const j = await r.json().catch(() => ({}));
-    if (!r.ok) backupsErr = j.error || r.statusText;
-  } catch (e) { backupsErr = e.message; }
+    if (!r.ok) text = j.error || r.statusText;
+  } catch (e) { text = e.message; }
   backupsBusy = false;
+  if (text) backupsErr = { text, state: backupsState(S.hist?.ms_backups) };
   await loadHistory();
 }
 
