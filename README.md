@@ -11,16 +11,18 @@ marked so you can review it before you deploy.
   many changes it holds.
 - **Blocks, refs and wires** in the Loxone Config 16 look: rounded blocks with a coloured header, grey port
   stubs, constants beside unwired inputs, and pill-shaped references with their address and an analog (`#`) or
-  digital (◉) mark. Block footprints, port rows and wire routing come from
-  `loxone_config::layout`, the same geometry `lox` uses to place blocks. Input and output refs show as
-  reference bars with their short address (`VI1`, `AQ1`, …).
+  digital (◉) mark. Block footprints and port rows come from `loxone_config::layout`, the same geometry
+  `lox` uses to place blocks. Input and output refs show as reference bars with their short address
+  (`VI1`, `AQ1`, …). Wires have rounded corners and hop over the wires they cross. Each wire's vertical
+  run takes its own lane, clear of blocks and other wires; wires from one output share theirs and branch.
 - **Links between pages**: when a wire's far end is on another page, the port gets a reference bar with
   the far block, its port and its page. Click it to go to that page. Double-click a ref tag to go to the
   block it mirrors.
 - **Sidebar with the block's configuration**: the periphery and page tree (filter with Ctrl+F), and the
   selected block's properties: name, type, page, room, category, connections (each one a link),
   parameters and raw attributes.
-- **History** (right): every revision, newest first:
+- **History** (right): every revision, newest first. The config on the Miniserver is marked *on Miniserver*.
+  Click an entry to show it; Shift+click another to compare with it:
   - *Pending*: the compiled `out.Loxone` of a `lox.toml` project, compared with the deployed `base`.
     This is what `lox config push` would apply.
   - *Changed on disk*: snapshots taken while vislox runs, whenever the file changes.
@@ -129,7 +131,7 @@ configuration). Otherwise the button is greyed out and its tooltip says why. `--
 
 | Input | Click | Shift+click |
 |---|---|---|
-| History entry | view it, compared with the entry before it | compare the viewed revision with this one |
+| History entry | show it | compare the viewed revision with this one (again: stop comparing) |
 
 The *Viewing* and *compared with* menus in the toolbar pick any pair of revisions. Pick *nothing* to see
 a revision without change marks. *Follow latest* jumps to each new revision as it appears.

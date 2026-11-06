@@ -4,7 +4,7 @@
 
 use loxone_config::diff::{self, DocDiff};
 use loxone_config::doc::{LoxoneDoc, PortView, WireView, ports};
-use loxone_config::layout::{GeoObject, Layout, PageGeometry, ROW, Shape, Side};
+use loxone_config::layout::{GRID, GeoObject, Layout, PageGeometry, ROW, Shape, Side};
 use loxone_config::port_names;
 use loxone_config::xml::Element;
 use serde::Serialize;
@@ -525,6 +525,125 @@ fn route(
     ]
 }
 
+/// Wires that share a vertical run cannot be told apart, and a run through a
+/// block hides behind it. Move the vertical run of each plain route (out,
+/// across, in) to a free lane between its ends: clear of blocks and of other
+/// wires' runs, as near the middle as it can. Wires from one source share
+/// their run, so they branch like a tree.
+fn untangle(wires: &mut [PWire], blocks: &[[i64; 4]]) {
+    const LANE: i64 = GRID / 2;
+    const REACH: i64 = 24;
+    struct Run {
+        wires: Vec<usize>,
+        lo: i64,
+        hi: i64,
+        y0: i64,
+        y1: i64,
+        x1: i64,
+        ya: i64,
+    }
+    // Vertical runs already placed: (x, y0, y1).
+    let mut taken: Vec<(i64, i64, i64)> = Vec::new();
+    let mut runs: Vec<Run> = Vec::new();
+    let mut by_src: HashMap<(String, i64, i64), usize> = HashMap::new();
+    for (i, w) in wires.iter().enumerate() {
+        let p = &w.points;
+        if p.len() != 4 {
+            // Loop routes keep their runs; others steer clear of them.
+            for s in p.windows(2).filter(|s| s[0][0] == s[1][0]) {
+                taken.push((s[0][0], s[0][1].min(s[1][1]), s[0][1].max(s[1][1])));
+            }
+            continue;
+        }
+        let ([x1, ya], [x2, yb]) = (p[0], p[3]);
+        let k = (w.src.clone(), x1, ya);
+        let r = *by_src.entry(k).or_insert_with(|| {
+            runs.push(Run {
+                wires: Vec::new(),
+                lo: x1 + 2 * LANE,
+                hi: i64::MAX,
+                y0: ya,
+                y1: ya,
+                x1,
+                ya,
+            });
+            runs.len() - 1
+        });
+        let r = &mut runs[r];
+        r.wires.push(i);
+        r.hi = r.hi.min(x2 - 2 * LANE);
+        r.y0 = r.y0.min(yb);
+        r.y1 = r.y1.max(yb);
+    }
+    // A segment's cost: the blocks it runs through.
+    let through = |x0: i64, y0: i64, x1: i64, y1: i64| -> i64 {
+        let (x0, x1) = (x0.min(x1), x0.max(x1));
+        let (y0, y1) = (y0.min(y1), y0.max(y1));
+        blocks
+            .iter()
+            .filter(|b| {
+                x0 < b[0] + b[2] && b[0] < x1 && y0 < b[1] + b[3] && b[1] < y1 || {
+                    // A line on the block's edge counts as through it.
+                    (x0 == x1 && b[0] <= x0 && x0 <= b[0] + b[2] && y0 < b[1] + b[3] && b[1] < y1)
+                        || (y0 == y1
+                            && b[1] <= y0
+                            && y0 <= b[1] + b[3]
+                            && x0 < b[0] + b[2]
+                            && b[0] < x1)
+                }
+            })
+            .count() as i64
+    };
+    // Tightest first: they have the fewest lanes to choose from.
+    let mut order: Vec<usize> = (0..runs.len()).collect();
+    order.sort_by_key(|&r| (runs[r].hi - runs[r].lo, runs[r].x1, runs[r].ya));
+    for r in order {
+        let run = &runs[r];
+        if run.hi < run.lo {
+            continue;
+        }
+        let mid = (run.lo + run.hi) / 2;
+        let mut best = (i64::MAX, mid);
+        for k in 0..=2 * REACH {
+            // 0, +1, −1, +2, −2, …: nearest the middle first.
+            let off = if k % 2 == 1 { (k + 1) / 2 } else { -(k / 2) };
+            let x = mid + off * LANE;
+            if x < run.lo || x > run.hi {
+                continue;
+            }
+            let mut cost = off.abs();
+            cost += 1000 * through(x, run.y0, x, run.y1);
+            for &i in &run.wires {
+                let [_, yb] = wires[i].points[3];
+                let x2 = wires[i].points[3][0];
+                // The horizontal legs, inset so the blocks at either end do not count.
+                cost +=
+                    1000 * (through(run.x1 + 1, run.ya, x, run.ya) + through(x, yb, x2 - 1, yb));
+            }
+            cost += 200
+                * taken
+                    .iter()
+                    .filter(|&&(tx, t0, t1)| (tx - x).abs() < LANE && t0 <= run.y1 && run.y0 <= t1)
+                    .count() as i64;
+            if cost < best.0 {
+                best = (cost, x);
+            }
+            if cost == 0 {
+                break;
+            }
+        }
+        let x = best.1;
+        for &i in &run.wires {
+            let p = &mut wires[i].points;
+            p[1][0] = x;
+            p[2][0] = x;
+        }
+        if run.y0 != run.y1 {
+            taken.push((x, run.y0, run.y1));
+        }
+    }
+}
+
 /// One changed attribute: (name, old value, new value).
 type AttrDelta = (String, Option<String>, Option<String>);
 
@@ -916,6 +1035,12 @@ fn page_view(c: &Ctx, old: Option<&Ctx>, uuid: &str, d: &Delta, gone: bool) -> O
         }
     }
     let _ = geo.labels; // recomputed above with their targets
+    let blocks: Vec<[i64; 4]> = objects
+        .iter()
+        .filter(|o| o.status != REMOVED && o.moved_to.is_none())
+        .map(|o| o.rect)
+        .collect();
+    untangle(&mut wires, &blocks);
 
     let old_title = old
         .filter(|_| d.renamed.contains_key(uuid))
@@ -1483,6 +1608,51 @@ fn live_graph(c: &Ctx) -> LiveGraph {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn z_wire(src: &str, a: (i64, i64), b: (i64, i64)) -> PWire {
+        let xm = (a.0 + b.0) / 2;
+        PWire {
+            from: [src.into(), "Q".into()],
+            to: ["sink".into(), "I1".into()],
+            points: vec![[a.0, a.1], [xm, a.1], [xm, b.1], [b.0, b.1]],
+            analog: false,
+            status: "",
+            src: src.into(),
+        }
+    }
+
+    #[test]
+    fn wires_from_different_sources_take_separate_lanes() {
+        let mut w = vec![
+            z_wire("a", (0, 0), (2000, 1000)),
+            z_wire("b", (0, 500), (2000, 1500)),
+        ];
+        untangle(&mut w, &[]);
+        let (xa, xb) = (w[0].points[1][0], w[1].points[1][0]);
+        assert!((xa - xb).abs() >= GRID / 2, "{xa} vs {xb}");
+        for w in &w {
+            assert_eq!(w.points[1][0], w.points[2][0]);
+        }
+    }
+
+    #[test]
+    fn wires_from_one_source_share_their_lane() {
+        let mut w = vec![
+            z_wire("a", (0, 0), (2000, 1000)),
+            z_wire("a", (0, 0), (3000, 1500)),
+        ];
+        untangle(&mut w, &[]);
+        assert_eq!(w[0].points[1][0], w[1].points[1][0]);
+    }
+
+    #[test]
+    fn a_lane_avoids_blocks() {
+        let mut w = vec![z_wire("a", (0, 0), (2000, 1000))];
+        // A block across the middle of the gap.
+        untangle(&mut w, &[[800, -200, 400, 1400]]);
+        let x = w[0].points[1][0];
+        assert!(!(800..=1200).contains(&x), "{x}");
+    }
 
     const HOUSE: &str = include_str!("../tests/fixtures/house.Loxone");
     const AND: &str = "10000004-0000-0040-ffff504f94000001";
