@@ -79,6 +79,21 @@ impl Http {
     }
 }
 
+impl Http {
+    /// A request that only needs HTTP 200 (a `dev/…` command, not `jdev`).
+    pub fn call(&self, path: &str) -> Result<(), String> {
+        let (status, _) = self
+            .client()?
+            .get_once(path, None)
+            .map_err(|e| format!("no answer: {e}"))?;
+        match status {
+            200 => Ok(()),
+            401 | 403 => Err(format!("HTTP {status}: lox's user may not do this")),
+            s => Err(format!("HTTP {s}")),
+        }
+    }
+}
+
 impl Drop for Http {
     fn drop(&mut self) {
         if let Some(Some(c)) = self.client.take() {

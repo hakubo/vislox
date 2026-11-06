@@ -217,7 +217,7 @@ fn is_time(s: &str) -> bool {
         && (b.len() == 19 || (b[19] == b'.' && b[20..].iter().all(u8::is_ascii_digit)))
 }
 
-fn kind(text: &str) -> &'static str {
+pub(crate) fn kind(text: &str) -> &'static str {
     if is_program_change(text)
         || is_restart_command(text)
         || text.starts_with("PRG Start ")
@@ -318,6 +318,13 @@ pub fn uuids(text: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A test that hangs fails instead.
+    async fn within<F: std::future::Future>(f: F) -> F::Output {
+        tokio::time::timeout(std::time::Duration::from_secs(30), f)
+            .await
+            .expect("the test took longer than 30 s")
+    }
 
     // From a real Miniserver (17.2), shortened.
     const SAMPLE: &str = "\
@@ -431,51 +438,54 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn the_log_comes_from_lox_with_vislox_s_context() {
-        use loxone_client::Connection;
-        use std::os::unix::fs::PermissionsExt;
-        let tmp = tempfile::tempdir().unwrap();
-        let lox = tmp.path().join("lox");
-        let f = Found {
-            conn: Connection::new("https://192.168.1.120", "u", "p"),
-            from: "test".into(),
-            ctx: Some("home".into()),
-            config_repo: None,
-            ms_dir: "192_168_1_120".into(),
-            serial: None,
-        };
-        let script = |body: &str| {
-            std::fs::write(&lox, format!("#!/bin/sh\n{body}\n")).unwrap();
-            std::fs::set_permissions(&lox, std::fs::Permissions::from_mode(0o755)).unwrap();
-            Log::new(&lox, None, Ok(&f), tmp.path())
-        };
-        let l = script(&format!(
-            r#"[ "$*" = "--ctx home log -n {LINES} --no-color --no-header" ] || {{ echo "unexpected: $*" >&2; exit 2; }}
-printf '%s' "{SAMPLE}""#
-        ));
-        assert_eq!(l.info()["available"], true);
-        let v = l.fetch().await;
-        assert_eq!(v["entries"].as_array().unwrap().len(), 8, "{v}");
-        assert_eq!(v["since"], 2);
-        assert!(v.get("error").is_none());
+        within(async {
+            use loxone_client::Connection;
+            use std::os::unix::fs::PermissionsExt;
+            let tmp = tempfile::tempdir().unwrap();
+            let lox = tmp.path().join("lox");
+            let f = Found {
+                conn: Connection::new("https://192.168.1.120", "u", "p"),
+                from: "test".into(),
+                ctx: Some("home".into()),
+                config_repo: None,
+                ms_dir: "192_168_1_120".into(),
+                serial: None,
+            };
+            let script = |body: &str| {
+                std::fs::write(&lox, format!("#!/bin/sh\n{body}\n")).unwrap();
+                std::fs::set_permissions(&lox, std::fs::Permissions::from_mode(0o755)).unwrap();
+                Log::new(&lox, None, Ok(&f), tmp.path())
+            };
+            let l = script(&format!(
+                r#"[ "$*" = "--ctx home log -n {LINES} --no-color --no-header" ] || {{ echo "unexpected: $*" >&2; exit 2; }}
+    printf '%s' "{SAMPLE}""#
+            ));
+            assert_eq!(l.info()["available"], true);
+            let v = l.fetch().await;
+            assert_eq!(v["entries"].as_array().unwrap().len(), 8, "{v}");
+            assert_eq!(v["since"], 2);
+            assert!(v.get("error").is_none());
 
-        // A failure keeps nothing it did not have, and says why.
-        let l = script("echo 'login refused: Code 4003' >&2; exit 1");
-        let v = l.fetch().await;
-        assert!(v["error"].as_str().unwrap().contains("Code 4003"), "{v}");
-        assert_eq!(v["entries"].as_array().unwrap().len(), 0);
+            // A failure keeps nothing it did not have, and says why.
+            let l = script("echo 'login refused: Code 4003' >&2; exit 1");
+            let v = l.fetch().await;
+            assert!(v["error"].as_str().unwrap().contains("Code 4003"), "{v}");
+            assert_eq!(v["entries"].as_array().unwrap().len(), 0);
 
-        // Off, or no lox configuration: not available, and why.
-        let off = Log::new(&lox, Some("turned off (--no-live)"), Ok(&f), tmp.path());
-        assert_eq!(off.info()["available"], false);
-        assert_eq!(off.fetch().await["reason"], "turned off (--no-live)");
-        let err = "no config".to_string();
-        let none = Log::new(&lox, None, Err(&err), tmp.path());
-        assert!(
-            none.info()["reason"]
-                .as_str()
-                .unwrap()
-                .contains("no config")
-        );
+            // Off, or no lox configuration: not available, and why.
+            let off = Log::new(&lox, Some("turned off (--no-live)"), Ok(&f), tmp.path());
+            assert_eq!(off.info()["available"], false);
+            assert_eq!(off.fetch().await["reason"], "turned off (--no-live)");
+            let err = "no config".to_string();
+            let none = Log::new(&lox, None, Err(&err), tmp.path());
+            assert!(
+                none.info()["reason"]
+                    .as_str()
+                    .unwrap()
+                    .contains("no config")
+            );
+        })
+        .await;
     }
 
     /// A stand-in lox that counts its runs, takes 300 ms, and then prints
@@ -521,37 +531,43 @@ printf '%s' "{SAMPLE}""#
     #[cfg(unix)]
     #[tokio::test]
     async fn a_request_never_gets_a_log_read_before_it_asked() {
-        let tmp = tempfile::tempdir().unwrap();
-        let l = counting(tmp.path(), false);
-        let later = || async {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            l.fetch().await
-        };
-        // Two requests while the first read runs: they share the next one.
-        let (a, b, c) = tokio::join!(l.fetch(), later(), later());
-        let text = |v: &Value| v["entries"][0]["text"].as_str().unwrap().to_string();
-        assert_eq!(text(&a), "run 1");
-        assert_eq!(text(&b), "run 2");
-        assert_eq!(text(&c), "run 2");
-        assert_eq!(runs(tmp.path()), "2");
-        // A request after that reads again.
-        assert_eq!(text(&l.fetch().await), "run 3");
+        within(async {
+            let tmp = tempfile::tempdir().unwrap();
+            let l = counting(tmp.path(), false);
+            let later = || async {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                l.fetch().await
+            };
+            // Two requests while the first read runs: they share the next one.
+            let (a, b, c) = tokio::join!(l.fetch(), later(), later());
+            let text = |v: &Value| v["entries"][0]["text"].as_str().unwrap().to_string();
+            assert_eq!(text(&a), "run 1");
+            assert_eq!(text(&b), "run 2");
+            assert_eq!(text(&c), "run 2");
+            assert_eq!(runs(tmp.path()), "2");
+            // A request after that reads again.
+            assert_eq!(text(&l.fetch().await), "run 3");
+        })
+        .await;
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn requests_waiting_on_a_failing_read_share_its_failure() {
-        let tmp = tempfile::tempdir().unwrap();
-        let l = counting(tmp.path(), true);
-        let later = || async {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            l.fetch().await
-        };
-        let (a, b, c) = tokio::join!(l.fetch(), later(), later());
-        assert!(a["error"].as_str().unwrap().contains("down 1"), "{a}");
-        assert!(b["error"].as_str().unwrap().contains("down 2"), "{b}");
-        assert_eq!(b, c);
-        // Two runs, not one for each request.
-        assert_eq!(runs(tmp.path()), "2");
+        within(async {
+            let tmp = tempfile::tempdir().unwrap();
+            let l = counting(tmp.path(), true);
+            let later = || async {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                l.fetch().await
+            };
+            let (a, b, c) = tokio::join!(l.fetch(), later(), later());
+            assert!(a["error"].as_str().unwrap().contains("down 1"), "{a}");
+            assert!(b["error"].as_str().unwrap().contains("down 2"), "{b}");
+            assert_eq!(b, c);
+            // Two runs, not one for each request.
+            assert_eq!(runs(tmp.path()), "2");
+        })
+        .await;
     }
 }

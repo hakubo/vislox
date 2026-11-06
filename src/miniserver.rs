@@ -384,7 +384,7 @@ fn operate_why(v: &Value) -> Option<String> {
 /// `https://host:port/` → (address, port); the port defaults by scheme, and
 /// an IPv6 address loses its brackets (`[::1]` → `::1`) so it can be
 /// connected to.
-fn split_host(host: &str) -> (String, u16) {
+pub(crate) fn split_host(host: &str) -> (String, u16) {
     let (rest, default) = if let Some(r) = host.strip_prefix("http://") {
         (r, 80)
     } else {

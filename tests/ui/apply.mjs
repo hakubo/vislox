@@ -14,6 +14,7 @@ import { chromium } from "playwright";
 import { spawn, execFileSync } from "node:child_process";
 import { createServer as createHttpServer } from "node:http";
 import { createServer as createTcpServer } from "node:net";
+import { createSocket } from "node:dgram";
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
@@ -94,12 +95,24 @@ const TEMP = "10000003-0000-0032-01ff504f94000001";
 const liveFile = join(loxDir, "stream.ndjson");
 writeFileSync(liveFile, JSON.stringify({ control: "Temperatur", state: "value", value: "21.5", uuid: TEMP }) + "\n");
 
+// The Debug-Monitor's UDP port: a free one; and a frame as the Miniserver sends it (src/monframe.rs).
+const monPort = await new Promise((ok) => { const u = createSocket("udp4"); u.bind(0, "127.0.0.1", () => { const p = u.address().port; u.close(() => ok(p)); }); });
+function monFrame(text, counter) {
+  const body = Buffer.concat([Buffer.from([1]), Buffer.from(text), Buffer.from([0])]);
+  const f = Buffer.alloc(28 + body.length);
+  f.writeUInt16LE(0xFA1F, 0); f.writeUInt16LE(f.length, 2); f[5] = 1;
+  f.writeUInt16LE(100, 6); f.writeUInt16LE(counter, 8);
+  f.writeUInt32LE(563194643, 12); f.set([127, 0, 0, 1], 16);
+  body.copy(f, 28);
+  f[4] = f.subarray(5).reduce((x, b) => x ^ b, 0);
+  return f;
+}
 const port = 7990 + Math.floor(Math.random() * 9);
 const server = spawn(bin, [dir, "--listen", `127.0.0.1:${port}`, "--lox", fakeLox, "--admin-token-file", token, "--live-from", liveFile], {
   stdio: ["ignore", "ignore", "pipe"],
   // Apply commits: a runner without a git identity needs one.
   env: {
-    ...process.env, LOX_CONFIG: loxConfig, VISLOX_FTP_PORT: String(ftpPort), VISLOX_CACHE: join(root, "cache"),
+    ...process.env, LOX_CONFIG: loxConfig, VISLOX_FTP_PORT: String(ftpPort), VISLOX_MONITOR: "1", VISLOX_MONITOR_PORT: String(monPort), VISLOX_CACHE: join(root, "cache"),
     GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@example.com", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@example.com",
   },
 });
@@ -205,6 +218,21 @@ try {
     // The block carries a mark on the canvas, for the new warning.
     await page.waitForSelector('#viewport .lbadge.warning');
     assert.deepEqual(await page.evaluate(() => [...logMarks().values()].map((e) => e.text.slice(0, 12))), ["Warning 1167"]);
+  });
+  await step("a Debug-Monitor line marks its block, and the mark opens that line", async () => {
+    const udp = createSocket("udp4");
+    await new Promise((ok) => udp.send(monFrame("Warning 1, all, MeterAbsUni (Zähler,10000005-0000-0050-ffff504f94000001)", 1), monPort, "127.0.0.1", ok));
+    udp.close();
+    await page.waitForFunction(() => S.mon.lines.length === 1);
+    // As after a read of the system log that failed in the browser: no entries at all.
+    await page.evaluate(() => { S.log.data = { error: "offline" }; });
+    // The marks are redrawn at most twice a second: wait until the block's mark is the monitor line's.
+    await page.waitForFunction(() => S.log.drawn.includes("Warning 1, all"));
+    await page.waitForSelector("#viewport .lbadge.warning");
+    await page.click("#log-toggle");
+    await page.waitForSelector("#log-body.hidden", { state: "attached" });
+    await page.click("#viewport .lbadge.warning", { force: true });
+    await page.waitForSelector("#log li.monitor.flash");
   });
   await step("a changed block opens from the list", async () => {
     await page.click('#deploy-new .go:has-text("Licht oben")');

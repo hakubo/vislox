@@ -188,6 +188,10 @@
         </button>
       </h2>
       <div class="log-body hidden" id="log-body">
+        <div class="mon-bar hidden" id="mon-bar">
+          <span class="mon-state" id="mon-state" role="status" aria-live="polite"></span>
+          <button type="button" id="btn-mon" class="pull-btn" title="Ask the Miniserver to send its debug output to vislox (dev/sps/log)"><span class="lbl">Start</span></button>
+        </div>
         <div class="log-msg hidden" id="log-msg" role="status" aria-live="polite"></div>
         <label class="log-only" id="log-only-w" title="Hide what the Miniserver logged before the last program change (an Apply, or a save from Loxone Config)"><input type="checkbox" id="chk-log-since"> Only since the last program change</label>
         <ol class="log" id="log" aria-label="Log entries, newest first"></ol>

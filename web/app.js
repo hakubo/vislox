@@ -1489,7 +1489,8 @@ function renderMs() {
       ${row("Base taken at", m.configDate?.base && msDate(m.configDate.base))}
       ${m.reachable ? row("Connection", m.local === false ? "remote" : m.local ? "local" : "unknown") + row("TLS", tls)
         + row("Live-update slot", m.eventSlots == null ? "" : m.eventSlots ? "free" : "none free") : ""}
-      ${row("lox's token valid until", tok)}</dl>
+      ${row("lox's token valid until", tok)}
+      ${(() => { const st = S.mon?.info?.stats; return st ? row("Load (Debug-Monitor)", `CPU ${Math.round(st.cpu)} % · heap ${st.heapKb} of ${st.maxKb} kB` + (st.linkErrors ? ` · ${st.linkErrors} Link errors` : "")) : ""; })()}</dl>
     ${m.checks.map((c) => `<div class="chk ${c.ok ? "ok" : "bad"}"><span class="dot" aria-hidden="true"></span><span><b>${esc(c.name)}</b> <span class="d">${esc(c.ok ? (c.detail === "answers" ? "answers" : "answers: " + c.detail) : c.detail)}</span></span></div>`).join("")}
     ${m.discovered?.length ? `<div class="chk"><span><b>On the local network</b> <span class="d">${m.discovered.map((d) => esc(`${d.serial} at ${d.ip} (${d.firmware})`)).join(", ")}</span></span></div>` : ""}
     ${m.discoveryNote ? `<div class="chk bad"><span class="dot" aria-hidden="true"></span><span><b>Discovery</b> <span class="d">${esc(m.discoveryNote)}</span></span></div>` : ""}
@@ -1863,7 +1864,10 @@ function logInfo() { return S.hist?.log || { available: false }; }
 /** The entries since the last program change; all of them when the lines hold none. */
 function logRecent() {
   const d = S.log.data;
-  return d?.entries ? d.entries.slice(d.since ?? 0) : [];
+  const sys = d?.entries ? d.entries.slice(d.since ?? 0) : [];
+  // Debug-Monitor lines since the last program change in the system log.
+  const after = d?.entries && d.since != null ? d.entries[d.since].at : "";
+  return [...sys, ...S.mon.lines.filter((e) => e.at >= after)];
 }
 /** UUID (a block's, or one of its ports') → the block it belongs to. */
 function logTargets() {
@@ -1882,21 +1886,23 @@ function logTargets() {
  *  deployed revision: the log is about what runs. */
 function logMarks() {
   const r = revById(S.rev);
-  if (!S.log.data || S.log.stale || !r?.current || r.kind === "pending") return new Map();
+  if ((!S.log.data && !S.mon.lines.length) || S.log.stale || !r?.current || r.kind === "pending") return new Map();
   const t = logTargets(), m = new Map();
   for (const e of logRecent()) for (const u of e.uuids || []) { const b = t.get(u); if (b) m.set(b, e); }
   return m;
 }
 function renderLog() {
-  const info = logInfo(), pane = $("log-pane");
-  pane.classList.toggle("hidden", !info.available);
-  if (!info.available) return;
+  const info = logInfo(), mon = monInfo(), pane = $("log-pane");
+  pane.classList.toggle("hidden", !info.available && !mon.available);
+  if (!info.available && !mon.available) return;
+  if (mon.available) monConnect();
+  renderMonBar();
   const open = S.log.open;
   pane.classList.toggle("open", open);
   $("log-toggle").setAttribute("aria-expanded", String(open));
   $("log-body").classList.toggle("hidden", !open);
   const b = $("btn-log");
-  b.classList.toggle("hidden", !open);
+  b.classList.toggle("hidden", !open || !info.available);
   b.disabled = S.log.loading;
   b.classList.toggle("busy", S.log.loading);
   b.querySelector(".lbl").textContent = S.log.loading ? "Reading…" : "Refresh";
@@ -1905,7 +1911,7 @@ function renderLog() {
   $("log-count").textContent = recent ? `${recent} new` : "";
   $("log-count").title = recent ? `${plural(recent, "entry")} since the last program change` : "";
   const msg = $("log-msg");
-  const text = d?.error ? `Cannot read the log: ${d.error}` : !d ? (S.log.loading ? "Reading the log (lox log)…" : "")
+  const text = !info.available ? `No system log: ${info.reason}.` : d?.error ? `Cannot read the log: ${d.error}` : !d ? (S.log.loading ? "Reading the log (lox log)…" : "")
     : S.log.stale ? (S.log.loading ? "Read before the last Apply; reading it again…" : "Read before the last Apply. Refresh to read it again.")
     : d.since == null ? `No program change in the last ${d.lines} lines.` : "";
   msg.textContent = text;
@@ -1913,20 +1919,19 @@ function renderLog() {
   $("log-only-w").classList.toggle("hidden", !d || d.since == null);
   $("chk-log-since").checked = S.log.onlySince;
   const list = $("log");
-  const entries = d?.entries || [], since = d?.since ?? null, t = logTargets();
+  const entries = d?.entries || [], since = d?.since ?? null;
   const from = S.log.onlySince && since != null ? since : 0;
   const rows = [];
+  // The Debug-Monitor's lines, live, above the system log.
+  for (let i = S.mon.lines.length - 1; i >= 0; i--) rows.push(monRow(S.mon.lines[i]));
   for (let i = entries.length - 1; i >= from; i--) {
     const e = entries[i];
-    const links = (e.uuids || []).map((u) => t.get(u)).filter((u, j, a) => u && a.indexOf(u) === j).map((u) => {
-      const o = S.view.objects[u];
-      return `<button type="button" class="go" data-go="${esc(u)}" title="${esc(o.path || "")}">${esc(autoTitle(o.title) ? prettyType(o.ty) : o.title)}</button>`;
-    }).join("");
+    const links = logLinks(e);
     rows.push(`<li class="${esc(e.kind)}${since != null && i >= since ? " since" : ""}" data-i="${i}"><span class="tm">${esc(e.at)}</span><span class="tx">${esc(e.text)}</span>${links}</li>`);
     if (i === since) rows.push(`<li class="mark">▲ The program changed here (Apply, or a save from Loxone Config)</li>`);
   }
   list.innerHTML = rows.join("") || (d && !d.error ? '<li class="tx">The log is empty.</li>' : "");
-  if (open && !d && !S.log.loading) loadLog();
+  if (open && !d && !S.log.loading && info.available) loadLog();
 }
 function marksKey(m) { return [...m].map(([u, e]) => `${u} ${e.at} ${e.text}`).join("\n"); }
 /** Redraw the page when the blocks' log marks are not what it shows. */
@@ -1939,6 +1944,18 @@ function logStale() {
   S.log.stale = true; S.log.staleSeq++;
   if (S.log.open) loadLog();
   renderLog(); redrawMarks();
+}
+/** Links to the blocks a log line names. */
+function logLinks(e) {
+  const t = logTargets();
+  return (e.uuids || []).map((u) => t.get(u)).filter((u, j, a) => u && a.indexOf(u) === j).map((u) => {
+    const o = S.view.objects[u];
+    return `<button type="button" class="go" data-go="${esc(u)}" title="${esc(o.path || "")}">${esc(autoTitle(o.title) ? prettyType(o.ty) : o.title)}</button>`;
+  }).join("");
+}
+/** A Debug-Monitor line; `_k` is its number in this browser, which stays when older lines drop off. */
+function monRow(e) {
+  return `<li class="${esc(e.kind)} monitor since" data-m="${e._k}"><span class="tm">${esc(e.at)}<span class="tag">monitor</span></span><span class="tx">${esc(e.text)}</span>${logLinks(e)}</li>`;
 }
 async function loadLog() {
   if (!logInfo().available) return;
@@ -1968,8 +1985,9 @@ function setLogOpen(open) {
 /** From a block's log mark: open the log and show that line. */
 function openLog(e) {
   if (!S.log.open) setLogOpen(true);
-  const i = S.log.data?.entries.indexOf(e);
-  const li = i >= 0 ? $("log").querySelector(`li[data-i="${i}"]`) : null;
+  // A Debug-Monitor line, or one of the system log's (whose read may have failed).
+  const i = e._k ? -1 : (S.log.data?.entries || []).indexOf(e);
+  const li = e._k ? $("log").querySelector(`li[data-m="${e._k}"]`) : i >= 0 ? $("log").querySelector(`li[data-i="${i}"]`) : null;
   if (!li) return;
   li.scrollIntoView({ block: "nearest" });
   li.classList.add("flash");
@@ -1985,6 +2003,70 @@ $("log").addEventListener("click", (e) => {
   if (pg) gotoPage(pg, { focus: u });
   select(u);
 });
+
+// ── the Debug-Monitor ──────────────────────────────────────────────────
+// With `--monitor`, vislox listens for the Miniserver's debug output (UDP). Start asks the Miniserver to
+// send it (dev/sps/log/<vislox>), Stop ends it; the lines arrive on /api/monitor.
+S.mon = { es: null, info: null, lines: [], busy: false, msg: "", fresh: true, seq: 0, marksT: null };
+function monInfo() { return S.mon.info || S.hist?.monitor || { available: false }; }
+function monConnect() {
+  if (S.mon.es) return;
+  const es = new EventSource("/api/monitor");
+  S.mon.es = es;
+  es.addEventListener("info", (e) => { S.mon.info = JSON.parse(e.data); renderMonBar(); renderMs(); });
+  const add = (list, reset) => {
+    for (const e of list) e._k = ++S.mon.seq;
+    if (reset) {
+      S.mon.lines = list;
+      if (S.log.open) renderLog();
+    } else {
+      const all = [...S.mon.lines, ...list], gone = all.slice(0, Math.max(0, all.length - 500));
+      S.mon.lines = all.slice(-500);
+      // Only the new rows, on top; lines that dropped off go. A closed panel draws all when it opens.
+      if (S.log.open) {
+        const box = $("log");
+        box.querySelector(":scope > li.tx")?.remove();
+        box.insertAdjacentHTML("afterbegin", list.slice().reverse().map(monRow).join(""));
+        for (const e of gone) box.querySelector(`li[data-m="${e._k}"]`)?.remove();
+      }
+    }
+    // The blocks' marks, at most twice a second.
+    if (!S.mon.marksT) S.mon.marksT = setTimeout(() => { S.mon.marksT = null; redrawMarks(); }, 500);
+  };
+  // Each (re)connect starts with every line kept: replace, then append.
+  es.onopen = () => { S.mon.fresh = true; };
+  es.addEventListener("lines", (e) => { add(JSON.parse(e.data), S.mon.fresh); S.mon.fresh = false; });
+  es.addEventListener("reset", (e) => add(JSON.parse(e.data), true));
+}
+function renderMonBar() {
+  const m = monInfo(), bar = $("mon-bar");
+  bar.classList.toggle("hidden", !m.available);
+  if (!m.available) return;
+  const st = $("mon-state"), b = $("btn-mon");
+  const on = !!m.until;
+  const until = on ? new Date(m.until * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "";
+  const listen = m.listening && !m.listening.ok ? m.listening.error : "";
+  st.textContent = S.mon.msg || listen || m.error || (on ? `Debug-Monitor on until ${until} · ${plural(m.packets, "packet")}`
+    : `Debug-Monitor: listening on UDP ${m.port}` + (m.packets ? ` · ${plural(m.packets, "packet")}` : "") +
+      (m.ignored ? ` · ${m.ignored} from other addresses (${m.ignoredFrom}) dropped` : ""));
+  st.className = "mon-state" + (on ? " on" : "") + (listen || m.error ? " error" : "");
+  b.disabled = S.mon.busy || !!listen;
+  b.querySelector(".lbl").textContent = S.mon.busy ? "…" : on ? "Stop" : "Start";
+  b.title = on ? "Ask the Miniserver to stop sending its debug output (dev/sps/log)"
+    : `Ask the Miniserver to send its debug output to ${m.dest || "this host"}:${m.port} for ${m.minutes} min (dev/sps/log/<address>)`;
+}
+$("btn-mon").onclick = async () => {
+  const on = !!monInfo().until;
+  if (!on && !window.confirm("Ask the Miniserver to send its debug output to vislox?\n\nThis is what Loxone Config's Debug Information does. " +
+    "Nothing in the config changes and the program does not restart. vislox stops it again with Stop, when it exits, or after the time limit.")) return;
+  S.mon.busy = true; S.mon.msg = ""; renderMonBar();
+  try {
+    const r = await fetch(on ? "/api/monitor/stop" : "/api/monitor/start", { method: "POST", headers: { "X-Vislox": "monitor" } });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) S.mon.msg = j.error || r.statusText;
+  } catch (e) { S.mon.msg = e.message; }
+  finally { S.mon.busy = false; renderMonBar(); setTimeout(() => { S.mon.msg = ""; renderMonBar(); }, 10000); }
+};
 
 // ── live values ────────────────────────────────────────────────────────
 // The Miniserver streams a value per state UUID; a wire's source connector

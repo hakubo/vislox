@@ -130,8 +130,12 @@ marked so you can review it before you deploy.
   when you open the panel, on Refresh, and after an Apply. The entries since the last program change (an Apply, or
   a save from Loxone Config) are marked, so you see what the new program logged as it started. A line that names a
   block (warnings carry the UUID of the block that raised them) gets a link that selects that block, and on the
-  deployed revision that block gets a small `!` mark on the canvas. The live Debug-Monitor stream (UDP 7777) is
-  not shown yet: see [docs/debug-monitor.md](docs/debug-monitor.md).
+  deployed revision that block gets a small `!` mark on the canvas.
+- **Debug-Monitor** (`--monitor`, off by default): the Miniserver's live debug output (UDP 7777) in the same panel,
+  marked *monitor*. **Start** asks the Miniserver to send it to vislox (`dev/sps/log/<address>`, as Loxone Config's
+  Debug Information does; nothing in the config changes and the program does not restart), **Stop** ends it, and so
+  do vislox exiting and a time limit (60 min). Only packets from the Miniserver's address count. Its CPU load and
+  heap show in the Miniserver chip's details. See [docs/debug-monitor.md](docs/debug-monitor.md).
 - **Operate virtual inputs** (opt-in: `--operate` with `--admin-token-file`): with live values on, a virtual
   input, or an input reference to one, gets controls in Properties: **Pulse**, **On** and **Off** for a digital
   input, a number field for an analog one. That lets you test a change the way Loxone Config's Liveview does.
@@ -314,6 +318,11 @@ before it asked. When lox fails, the panel says why and keeps the entries it had
 program restart is not one. After an Apply, the log read before it marks no blocks until it is read again.
 `--no-live` turns it off.
 
+The **Debug-Monitor** listens on UDP (`--monitor`, `--monitor-port 7777`, `--monitor-ip <this host>`, or the
+`VISLOX_MONITOR*` environment variables) and streams to the browser on `GET /api/monitor`. Start and Stop are
+`POST /api/monitor/start` and `/stop` (with the `X-Vislox` header). `GET /?<serial>` answers a Monitor Server request
+with the XML that points the Miniserver at vislox. To turn it off: Stop, then start vislox without `--monitor`.
+
 **Pull from Miniserver** runs `lox config pull` (the `lox` on `PATH`, or `--lox <path>`), with the same lox
 configuration and context as live values. It is offered only when lox would commit to the repository vislox
 shows, into the folder of the Miniserver vislox shows (`config_repo` and the serial or address in lox's
@@ -354,6 +363,8 @@ The binary is an `axum` server with the UI embedded (plain JS and SVG, no build 
 - `src/restart.rs` follows the program restart during Apply: out of service, back online, new config loaded.
 - `src/pull.rs` runs `lox config pull` for the Pull button (`POST /api/pull`, which needs an `X-Vislox` header so
   that no other web page can trigger it), then refreshes the history.
+- `src/monitor.rs` is the Debug-Monitor: the UDP listener, the address filter, Start/Stop and the Monitor Server
+  answer. `src/monframe.rs` parses its frames (checksum, header, parameters, format strings, system stats).
 - `src/log.rs` runs `lox log` for the Log panel (`GET /api/log`), splits it into entries, marks the last program
   change and picks out the UUIDs a line names.
 - `src/miniserver.rs` checks the Miniserver for the status chip and the preflight before Pull, Apply and Sync
