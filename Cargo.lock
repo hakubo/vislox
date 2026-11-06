@@ -2257,6 +2257,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-stream",
+ "tokio-tungstenite",
  "tower-http",
 ]
 

@@ -1465,7 +1465,7 @@ async function showDeployed() {
   renderHistory(); renderSelects();
   await loadView();
   writeHash(true);
-  if (S.hist.live?.available && !S.live.on) setLive(true);
+  if (S.hist.live?.available && !S.live.on) setLive(true, false); // not a retry after a stop
   renderDeployed();
 }
 /** The changed blocks of the deployed revision, each with a link and its first live value. */
@@ -1728,11 +1728,14 @@ function renderLiveSwitch() {
   const here = liveHere();
   const st = S.live.status || { state: "connecting" };
   const ls = $("live-state");
-  ls.textContent = !here ? "other revision" : { live: "", connecting: "connecting…", idle: "connecting…", offline: "offline", ended: "input ended", off: "off" }[st.state] ?? st.state;
+  // A known reason (close or response code) names itself: "blocked", "firmware update", …
+  ls.textContent = !here ? "other revision" : st.label || ({ live: "", connecting: "connecting…", idle: "connecting…", offline: "offline", stopped: "stopped", ended: "input ended", off: "off" }[st.state] ?? st.state);
   ls.className = "live-state st-" + (here ? st.state : "elsewhere");
   ls.title = [st.detail, info.source && `from ${info.source}`].filter(Boolean).join("\n");
   $("legend").classList.toggle("live", on);
-  $("live-note").textContent = on && !here ? "Live values show on the current, deployed revision only" : "";
+  // With a known reason, its plain sentence (the detail's first line) says what to do.
+  $("live-note").textContent = on && !here ? "Live values show on the current, deployed revision only"
+    : on && st.reason && st.state !== "live" ? (st.detail || "").split("\n")[0] : "";
   svg.classList.toggle("live", here);
   svg.classList.toggle("live-dim", here && S.live.dim);
 }
@@ -1772,10 +1775,17 @@ function liveStop() {
   S.live.globals = {};
   liveQueue(null);
 }
-function setLive(on) {
+// Turned on by the user (the switch, L): let the server try again after it stopped (blocked,
+// login refused). A reload or a reconnecting stream never does, so it cannot lengthen a block.
+function setLive(on, retry = true) {
   S.live.on = on;
   setPref("live", on);
-  if (on) liveStart(); else liveStop();
+  if (on && !retry) liveStart();
+  else if (on) {
+    fetch("/api/live/retry", { method: "POST", headers: { "X-Vislox": "live" } })
+      .catch(() => {})
+      .finally(() => { if (S.live.on) liveStart(); });
+  } else liveStop();
   renderLiveSwitch();
 }
 

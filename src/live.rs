@@ -15,8 +15,10 @@
 //! - the NDJSON output of `lox stream -o json --initial` (`--live-from`), from
 //!   a file (followed as it grows) or standard input.
 
+use crate::reason::{Backoff, Next, Reason};
+use crate::session::{self, Ended};
 use loxone_client::Connection;
-use loxone_client::stream::{self, StateEvent};
+use loxone_client::stream::StateEvent;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -29,8 +31,6 @@ use tokio::sync::{broadcast, watch};
 /// After the last browser turns live values off, the Miniserver connection
 /// stays open this long, so a reload does not reconnect.
 const LINGER: Duration = Duration::from_secs(10);
-/// Longest wait between reconnect attempts.
-const MAX_BACKOFF_SECS: u64 = 30;
 
 /// Where live values come from.
 pub enum Feed {
@@ -424,12 +424,55 @@ fn read_structure(structure: &Value) -> Structure {
 
 // ── The hub ─────────────────────────────────────────────────────────────
 
-#[derive(Clone, Serialize, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug, Default)]
 pub struct Status {
     /// `off` (no source), `idle` (nobody watching), `connecting`, `live`,
-    /// `offline` (retrying), `ended` (the NDJSON input ended).
+    /// `offline` (retrying), `stopped` (not retrying until a user turns
+    /// live values off and on: see `reason`), `ended` (the NDJSON input
+    /// ended).
     pub state: &'static str,
     pub detail: Option<String>,
+    /// Why the Miniserver refused or dropped the connection, when it said.
+    pub reason: Option<Reason>,
+}
+
+/// `{state, detail, reason?, label?}`: `label` is the reason's short label.
+impl Serialize for Status {
+    fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut st = ser.serialize_struct("Status", 4)?;
+        st.serialize_field("state", self.state)?;
+        st.serialize_field("detail", &self.detail)?;
+        match self.reason {
+            Some(r) => {
+                st.serialize_field("reason", &r)?;
+                st.serialize_field("label", r.label())?;
+            }
+            None => {
+                st.skip_field("reason")?;
+                st.skip_field("label")?;
+            }
+        }
+        st.end()
+    }
+}
+
+impl Status {
+    fn new(state: &'static str, detail: Option<String>) -> Status {
+        Status {
+            state,
+            detail,
+            ..Status::default()
+        }
+    }
+
+    fn because(state: &'static str, reason: Option<Reason>, detail: String) -> Status {
+        Status {
+            state,
+            detail: Some(detail),
+            reason,
+        }
+    }
 }
 
 /// A stored value: the value and its text in the control's format.
@@ -449,6 +492,11 @@ struct St {
     /// Bumped for each Miniserver session; an ended session's late writes
     /// carry an old one and are dropped.
     generation: u64,
+    /// The last session gave up for a reason more attempts would make worse
+    /// (blocked, login refused, user disabled). No new session starts, not
+    /// for a reload, another tab or a reconnecting stream, until a user
+    /// turns live values on again ([`Live::retry`]).
+    stopped: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -471,14 +519,8 @@ pub struct Live {
 impl Live {
     pub fn new(feed: Feed, source: String) -> Arc<Live> {
         let status = match &feed {
-            Feed::Off(why) => Status {
-                state: "off",
-                detail: Some(why.clone()),
-            },
-            _ => Status {
-                state: "idle",
-                detail: None,
-            },
+            Feed::Off(why) => Status::new("off", Some(why.clone())),
+            _ => Status::new("idle", None),
         };
         let (tx, _) = broadcast::channel(256);
         let live = Arc::new(Live {
@@ -494,6 +536,7 @@ impl Live {
                 clients: 0,
                 run: None,
                 generation: 0,
+                stopped: false,
             }),
         });
         if let Feed::Ndjson(path) = &live.feed {
@@ -515,11 +558,14 @@ impl Live {
     }
 
     fn set_status(&self, generation: u64, state: &'static str, detail: Option<String>) {
+        self.put_status(generation, Status::new(state, detail));
+    }
+
+    fn put_status(&self, generation: u64, s: Status) {
         let mut st = self.st.lock().unwrap();
         if st.generation != generation {
             return;
         }
-        let s = Status { state, detail };
         if st.status != s {
             st.status = s;
             drop(st);
@@ -555,23 +601,60 @@ impl Live {
         let rx = self.tx.subscribe();
         let mut st = self.st.lock().unwrap();
         st.clients += 1;
+        self.start(&mut st);
+        (rx, Watcher(self.clone()))
+    }
+
+    /// Start a Miniserver session, unless one runs or the last one stopped.
+    fn start(self: &Arc<Self>, st: &mut St) {
         if let Feed::Miniserver(conn) = &self.feed
             && st.run.is_none()
+            && !st.stopped
         {
             st.generation += 1;
             let generation = st.generation;
             let (stop_tx, stop_rx) = watch::channel(false);
             st.run = Some((generation, stop_tx));
-            st.status = Status {
-                state: "connecting",
-                detail: None,
-            };
+            st.status = Status::new("connecting", None);
             tokio::spawn(
                 self.clone()
                     .run_miniserver(generation, (**conn).clone(), stop_rx),
             );
         }
-        (rx, Watcher(self.clone()))
+    }
+
+    /// A user turned live values on: after a session that stopped (blocked,
+    /// login refused), allow one again.
+    pub fn retry(self: &Arc<Self>) {
+        let mut st = self.st.lock().unwrap();
+        if !st.stopped {
+            return;
+        }
+        st.stopped = false;
+        st.status = Status::new("idle", None);
+        if st.clients > 0 {
+            self.start(&mut st);
+        }
+        drop(st);
+        let _ = self.tx.send(Msg::Status);
+    }
+
+    /// The session `generation` gave up: show why, and start no other until
+    /// [`retry`](Live::retry).
+    fn stop_for_good(&self, generation: u64, status: Status) {
+        let mut st = self.st.lock().unwrap();
+        if st.generation != generation {
+            return;
+        }
+        st.status = status;
+        st.stopped = true;
+        if let Some((_, stop)) = st.run.take() {
+            let _ = stop.send(true);
+        }
+        // Late writes of the session are dropped.
+        st.generation += 1;
+        drop(st);
+        let _ = self.tx.send(Msg::Status);
     }
 
     fn unsubscribe(self: &Arc<Self>) {
@@ -592,10 +675,7 @@ impl Live {
             {
                 let _ = stop.send(true);
                 st.generation += 1;
-                st.status = Status {
-                    state: "idle",
-                    detail: None,
-                };
+                st.status = Status::new("idle", None);
                 st.values.clear();
                 drop(st);
                 let _ = me.tx.send(Msg::Status);
@@ -637,10 +717,10 @@ impl Live {
                 .send(Msg::Values(Arc::new(Value::Object(out).to_string())));
         }
         if gone {
-            self.set_status(
+            let r = Reason::OutOfService;
+            self.put_status(
                 generation,
-                "offline",
-                Some("the Miniserver is going offline (reboot or update)".into()),
+                Status::because("offline", Some(r), r.sentence().into()),
             );
         }
     }
@@ -665,7 +745,7 @@ impl Live {
         conn: Connection,
         mut stop: watch::Receiver<bool>,
     ) {
-        let mut wait = 1;
+        let mut backoff = Backoff::default();
         loop {
             if *stop.borrow() {
                 return;
@@ -679,12 +759,16 @@ impl Live {
             .await
             .map_err(|e| e.to_string())
             .and_then(|r| r);
-            let err = match structure {
-                Err(e) => format!("cannot read the structure file: {e}"),
+            let (err, reason, http) = match structure {
+                Err(e) => {
+                    let r = Reason::from_text(&e);
+                    (format!("cannot read the structure file: {e}"), r, true)
+                }
                 Ok(s) => {
                     self.load_structure(generation, &s);
                     let went_live = AtomicBool::new(false);
-                    let res = stream::stream_session(
+                    let going_offline = AtomicBool::new(false);
+                    let ended = session::run(
                         &conn,
                         stop.clone(),
                         || {
@@ -692,6 +776,9 @@ impl Live {
                             self.set_status(generation, "live", None);
                         },
                         |events| {
+                            if events.iter().any(|e| matches!(e, StateEvent::OutOfService)) {
+                                going_offline.store(true, Ordering::Relaxed);
+                            }
                             self.apply(generation, events);
                             true
                         },
@@ -701,24 +788,52 @@ impl Live {
                         return;
                     }
                     if went_live.load(Ordering::Relaxed) {
-                        wait = 1;
+                        backoff.reset();
                     }
-                    match res {
-                        Ok(()) => "the Miniserver closed the connection".to_string(),
-                        Err(e) => e.to_string(),
+                    if going_offline.load(Ordering::Relaxed) {
+                        backoff.going_offline();
                     }
+                    let (err, reason) = match ended {
+                        Ended::Stopped => return,
+                        Ended::Closed(None) => {
+                            ("the Miniserver closed the connection".into(), None)
+                        }
+                        Ended::Closed(Some(code)) => (
+                            format!("the Miniserver closed the connection (close code {code})"),
+                            Reason::from_close(code),
+                        ),
+                        Ended::Failed(e) => {
+                            let r = Reason::from_text(&e);
+                            (e, r)
+                        }
+                    };
+                    (err, reason, false)
                 }
             };
-            self.set_status(
+            let (reason, next) = backoff.next(reason, http);
+            let detail = |tail: &str| match reason {
+                Some(r) => format!("{}\n({err}) · {tail}", r.sentence()),
+                None => format!("{err} · {tail}"),
+            };
+            let wait = match next {
+                Next::Stop => {
+                    let tail = "not retrying; turn live values off and on to try again";
+                    self.stop_for_good(
+                        generation,
+                        Status::because("stopped", reason, detail(tail)),
+                    );
+                    return;
+                }
+                Next::Wait(w) => w,
+            };
+            self.put_status(
                 generation,
-                "offline",
-                Some(format!("{err} · retrying in {wait} s")),
+                Status::because("offline", reason, detail(&format!("retrying in {wait} s"))),
             );
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_secs(wait)) => {}
                 _ = stop.changed() => return,
             }
-            wait = (wait * 2).min(MAX_BACKOFF_SECS);
         }
     }
 
@@ -779,7 +894,18 @@ impl Live {
         match v["event"].as_str() {
             Some("disconnected") => {
                 let why = v["message"].as_str().or(v["reason"].as_str());
-                self.set_status(0, "offline", why.map(String::from));
+                let reason = match v["reason"].as_str() {
+                    Some("out_of_service") => Some(Reason::OutOfService),
+                    _ => why.and_then(Reason::from_text),
+                };
+                let s = match (reason, why) {
+                    (Some(r), Some(w)) => {
+                        Status::because("offline", reason, format!("{}\n({w})", r.sentence()))
+                    }
+                    (Some(r), None) => Status::because("offline", reason, r.sentence().into()),
+                    (None, w) => Status::new("offline", w.map(String::from)),
+                };
+                self.put_status(0, s);
                 return;
             }
             Some("reconnected") => {
@@ -996,5 +1122,64 @@ mod tests {
         assert_eq!(snap["values"]["s1"], json!([22000, null, "Lux · value"]));
         assert_eq!(snap["values"]["s2"][0], "hello");
         assert_eq!(live.status().detail.as_deref(), Some("gone"));
+        assert_eq!(live.status().reason, None);
+    }
+
+    #[test]
+    fn a_known_disconnect_reason_is_explained() {
+        let live = Live::new(Feed::Off("test".into()), "test".into());
+        let mut batch = serde_json::Map::new();
+        live.ndjson_line(
+            &json!({"event": "disconnected", "reason": "out_of_service"}),
+            &mut batch,
+        );
+        assert_eq!(live.status().reason, Some(Reason::OutOfService));
+        let j: Value = serde_json::from_str(&live.status_json()).unwrap();
+        assert_eq!(j["label"], "going offline");
+        live.ndjson_line(
+            &json!({"event": "disconnected", "reason": "error", "message": "HTTP 401: /jdev/sps/LoxAPP3.json"}),
+            &mut batch,
+        );
+        let st = live.status();
+        assert_eq!(st.reason, Some(Reason::Unauthorized));
+        let d = st.detail.unwrap();
+        assert!(
+            d.starts_with("The Miniserver refused")
+                && d.ends_with("(HTTP 401: /jdev/sps/LoxAPP3.json)")
+        );
+        let j: Value = serde_json::from_str(&live.status_json()).unwrap();
+        assert_eq!(j["reason"], "unauthorized");
+    }
+
+    fn running(live: &Live) -> bool {
+        live.st.lock().unwrap().run.is_some()
+    }
+
+    #[tokio::test]
+    async fn a_stopped_session_stays_stopped_until_a_user_turns_live_on() {
+        // Nothing listens there: attempts fail at once and are retried.
+        let conn = Connection::new("http://127.0.0.1:9", "u", "p");
+        let live = Live::new(Feed::Miniserver(Box::new(conn)), "test".into());
+        let (_rx, tab) = live.subscribe();
+        assert!(running(&live));
+        let generation = live.st.lock().unwrap().generation;
+        let r = Reason::Blocked;
+        live.stop_for_good(generation, Status::because("stopped", Some(r), "x".into()));
+        assert!(!running(&live));
+        // A reload, a second tab, a reconnecting stream: no new login.
+        drop(tab);
+        let (_rx2, _tab2) = live.subscribe();
+        let (_rx3, _tab3) = live.subscribe();
+        assert!(!running(&live));
+        let st = live.status();
+        assert_eq!((st.state, st.reason), ("stopped", Some(Reason::Blocked)));
+        let j: Value = serde_json::from_str(&live.status_json()).unwrap();
+        assert_eq!(j["label"], "blocked");
+        // The user turns live values off and on.
+        live.retry();
+        assert!(running(&live));
+        assert_eq!(live.status().state, "connecting");
+        live.retry();
+        assert!(running(&live));
     }
 }

@@ -6,7 +6,9 @@ mod history;
 mod live;
 mod model;
 mod pull;
+mod reason;
 mod restart;
+mod session;
 mod source;
 
 use anyhow::{Context, Result};
@@ -201,6 +203,7 @@ async fn main() -> Result<()> {
         .route("/api/view", get(api_view))
         .route("/api/events", get(api_events))
         .route("/api/live", get(api_live))
+        .route("/api/live/retry", axum::routing::post(api_live_retry))
         .route("/api/pull", axum::routing::post(api_pull))
         .route("/api/apply", axum::routing::post(api_apply))
         .route("/api/discard", axum::routing::post(api_discard))
@@ -403,6 +406,22 @@ async fn api_events(
     Sse::new(history.merge(actions)).keep_alive(KeepAlive::default())
 }
 
+/// A user turned live values on: after a session that stopped (blocked,
+/// login refused), allow a new one. Reloads and reconnecting streams do not
+/// call this, so they never log in again on their own. Needs the `X-Vislox`
+/// header, so another site cannot make vislox log in.
+async fn api_live_retry(State(app): State<Arc<App>>, headers: axum::http::HeaderMap) -> Response {
+    if !headers.contains_key("x-vislox") {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": "missing X-Vislox header" })),
+        )
+            .into_response();
+    }
+    app.live.retry();
+    Json(serde_json::json!({ "ok": true })).into_response()
+}
+
 /// Live values for one browser, while it keeps this stream open: `status`,
 /// then a `snapshot` of every value, then `values` as they change.
 async fn api_live(
@@ -451,7 +470,7 @@ async fn api_pull(State(app): State<Arc<App>>, headers: axum::http::HeaderMap) -
         }
         Err(e) => (
             StatusCode::BAD_GATEWAY,
-            Json(serde_json::json!({ "error": e })),
+            Json(serde_json::json!({ "error": reason::explain(&e) })),
         )
             .into_response(),
     }
@@ -479,7 +498,10 @@ async fn api_apply(
         // What the user could allow to retry (a newer Loxone Config, custom changes).
         Err((status, msg)) => (
             status,
-            Json(serde_json::json!({ "error": msg, "hints": actions::apply_hints(&msg) })),
+            Json(serde_json::json!({
+                "error": reason::explain(&msg),
+                "hints": actions::apply_hints(&msg),
+            })),
         )
             .into_response(),
     }
@@ -509,6 +531,6 @@ async fn api_sync(State(app): State<Arc<App>>, headers: axum::http::HeaderMap) -
     let _ = tokio::task::spawn_blocking(move || refresh(&a)).await;
     match res {
         Ok(m) => Json(serde_json::json!({ "message": m })).into_response(),
-        Err(r) => refused(r),
+        Err((status, msg)) => refused((status, reason::explain(&msg))),
     }
 }
