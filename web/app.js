@@ -1597,14 +1597,20 @@ function renderMs() {
   const state = blocked.length ? "bad" : m.warnings.length ? "warn" : "ok";
   chip.className = "ms-chip " + state;
   $("ms-lbl").textContent = m.identity === "wrong" ? `Wrong Miniserver (${m.serial})`
-    : m.reachable ? [m.serial, m.firmware].filter(Boolean).join(" · ") || "Miniserver" : "Miniserver unreachable";
+    : (m.reachable ? [m.serial, m.firmware].filter(Boolean).join(" · ") || "Miniserver" : "Miniserver unreachable")
+      + (m.route?.kind === "remote" ? " · Remote Connect" : "");
   chip.title = why.length ? `Miniserver: ${why.join("\n")}`
     : `Miniserver ${m.serial || ""} at ${m.host}` + (m.warnings.length ? `\n${m.warnings.join("\n")}` : "");
   const tls = { on: "available", none: "none", expired: "certificate expired", unknown: "unknown" }[m.tls] || "unknown";
   const tok = m.tokenValidUntil ? new Date(m.tokenValidUntil * 1000).toLocaleString([], { ...MONTH, year: "numeric", hour: "2-digit", minute: "2-digit" }) + (m.tokenValidUntil * 1000 < Date.now() ? " (expired)" : "") : "no token yet";
   const row = (k, v) => v == null || v === "" ? "" : `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`;
+  // How vislox reaches it (route.rs): its CloudDNS name, Remote Connect, or lox's host as it is.
+  const r = m.route;
+  const route = r && ({ clouddns: "local, under its CloudDNS name", remote: "Remote Connect", local: "lox's host" }[r.kind]
+    + (r.url.startsWith("https://") ? (r.verified ? " · certificate checked" : " · certificate not checked") : " · no TLS"));
   $("ms-body").innerHTML = `<h3>Miniserver</h3><dl>
-      ${row("Address", m.host)}${row("Serial", m.serial)}
+      ${row("Address", m.host)}${row("Route", route)}${r && r.url !== r.loxHost ? row("lox's host (Pull, Apply, Sync)", r.loxHost || "none (a serial only)") : ""}
+      ${r?.note && r.verified ? row("Why", r.note) : ""}${row("Serial", m.serial)}
       ${m.expected ? row("Config belongs to", `${m.expected.serial} (${m.expected.from})` + ({ confirmed: " ✓", wrong: " ✗ not this one" }[m.identity] || "")) : ""}
       ${row("Firmware", m.firmware)}
       ${row("Deployed config", m.config?.deployed && `Loxone Config ${m.config.deployed}`)}

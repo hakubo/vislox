@@ -196,6 +196,14 @@ pub struct Cache {
 }
 
 impl Cache {
+    /// A cache that already holds `s` (tests: no broadcast).
+    #[cfg(test)]
+    pub fn primed(s: Search) -> Cache {
+        Cache {
+            last: Mutex::new(Some((Instant::now(), Arc::new(s)))),
+        }
+    }
+
     pub async fn get(&self) -> Arc<Search> {
         if let Some((at, s)) = self.last.lock().unwrap().as_ref()
             && at.elapsed() < CACHE_FOR
