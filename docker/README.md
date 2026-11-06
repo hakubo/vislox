@@ -33,6 +33,7 @@ With Docker Compose or a Portainer stack, use [`compose.yml`](compose.yml) and s
 | Variable | |
 |---|---|
 | `VISLOX_GIT_URL` | Config repository to clone into `/data/repo` on first start. Put credentials in the URL if Apply and Sync should push. |
+| `VISLOX_GIT_SSH_KEY` | Private SSH key for the repository (e.g. a Gitea/GitHub deploy key with write access), as is or base64-encoded. Hosts are trusted on first use. |
 | `VISLOX_GIT_BRANCH` | Branch to clone (default: the remote's default). |
 | `VISLOX_GIT_PULL_SECONDS` | Fast-forward `/data/repo` from its remote this often, so commits pushed elsewhere show up in History. Skipped while there are uncommitted changes. `0` turns it off. Compose default: `60`. |
 | `VISLOX_PATH` | What to view: a `lox.toml` project, a `lox config init` repository, a `.Loxone` file or a backup `.zip`. Default: `/data/repo` if it exists, else `/data`. |

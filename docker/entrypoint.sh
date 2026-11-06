@@ -10,6 +10,19 @@ yq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/''/g")"; }
 git config --global user.name "${GIT_AUTHOR_NAME:-vislox}"
 git config --global user.email "${GIT_AUTHOR_EMAIL:-vislox@localhost}"
 git config --global --add safe.directory '*'
+# An SSH key for the repository: the key itself or base64 of it (stack
+# environment variables are one line). Hosts are trusted on first use.
+if [ -n "${VISLOX_GIT_SSH_KEY:-}" ]; then
+    mkdir -p "$HOME/.ssh"
+    key="$HOME/.ssh/vislox_git"
+    case "$VISLOX_GIT_SSH_KEY" in
+        *"PRIVATE KEY"*) printf '%s\n' "$VISLOX_GIT_SSH_KEY" > "$key" ;;
+        *) printf '%s' "$VISLOX_GIT_SSH_KEY" | base64 -d > "$key" ;;
+    esac
+    chmod 600 "$key"
+    export GIT_SSH_COMMAND="ssh -i $key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/data/.ssh_known_hosts"
+    unset VISLOX_GIT_SSH_KEY
+fi
 repo=/data/repo
 if [ -n "${VISLOX_GIT_URL:-}" ] && [ ! -d "$repo/.git" ]; then
     echo "vislox: cloning the config repository into $repo"
