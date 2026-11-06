@@ -14,23 +14,35 @@
 //!   no commands.
 //! - the NDJSON output of `lox stream -o json --initial` (`--live-from`), from
 //!   a file (followed as it grows) or standard input.
+//!
+//! Opt-in, a browser can also have the blocks behind the wires of the page it
+//! shows queried (`jdev/sps/io/<uuid>/all`, read-only, on the same socket):
+//! see `query.rs`. Those values are marked as queried: they are up to one
+//! round old.
 
+use crate::query;
 use crate::reason::{Backoff, Next, Reason};
 use crate::session::{self, Ended};
 use loxone_client::Connection;
 use loxone_client::stream::StateEvent;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::{broadcast, watch};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 /// After the last browser turns live values off, the Miniserver connection
 /// stays open this long, so a reload does not reconnect.
 const LINGER: Duration = Duration::from_secs(10);
+
+/// Block queries: at most 20 a second, all of a page's blocks every 2 s at
+/// most (a page with more than 40 takes longer), and an answer within 3 s.
+const QUERY_GAP: Duration = Duration::from_millis(50);
+const QUERY_ROUND: Duration = Duration::from_secs(2);
+const QUERY_WAIT: Duration = Duration::from_secs(3);
 
 /// Where live values come from.
 pub enum Feed {
@@ -322,6 +334,8 @@ struct Owner {
     format: Option<String>,
     /// Names for the values (the operating modes, for `operatingMode`).
     names: Option<Arc<HashMap<String, String>>>,
+    /// The value was queried, not streamed (`query.rs`).
+    queried: bool,
 }
 
 impl Owner {
@@ -374,6 +388,7 @@ fn read_structure(structure: &Value) -> Structure {
                         state: state.clone(),
                         format: format.clone(),
                         names: None,
+                        queried: false,
                     },
                 );
                 states.insert(state.clone(), Value::from(su));
@@ -415,6 +430,7 @@ fn read_structure(structure: &Value) -> Structure {
             state: name.clone(),
             format: None,
             names: (name == "operatingMode" && !modes.is_empty()).then(|| modes.clone()),
+            queried: false,
         });
         controls.entry(su.to_string()).or_insert_with(|| {
             json!({ "name": format!("Miniserver · {name}"), "type": "GlobalState", "states": { "value": su } })
@@ -502,6 +518,11 @@ struct St {
     /// for a reload, another tab or a reconnecting stream, until a user
     /// turns live values on again ([`Live::retry`]).
     stopped: bool,
+    /// The blocks each browser that asked for it has queried (`query.rs`).
+    queries: HashMap<u64, Arc<Vec<query::Block>>>,
+    next_query: u64,
+    /// Connectors with a queried value → their block.
+    queried: HashMap<String, String>,
 }
 
 #[derive(Clone, Debug)]
@@ -509,8 +530,11 @@ pub enum Msg {
     Status,
     /// Everything changed (a new structure): clients re-read the snapshot.
     Snapshot,
-    /// Changed values: `{uuid: [value, text, label]}`.
+    /// Changed values: `{uuid: [value, text, label, kind?] | null}` (null:
+    /// the value is gone).
     Values(Arc<String>),
+    /// How block queries went: `{blocks, answered, failed: [[title, why]], ms}`.
+    Query(Arc<String>),
 }
 
 pub struct Live {
@@ -544,6 +568,9 @@ impl Live {
                 run: None,
                 generation: 0,
                 stopped: false,
+                queries: HashMap::new(),
+                next_query: 0,
+                queried: HashMap::new(),
             }),
             structure: Mutex::new(None),
         });
@@ -562,7 +589,10 @@ impl Live {
     pub fn info(&self) -> Value {
         match &self.feed {
             Feed::Off(why) => json!({ "available": false, "reason": why }),
-            _ => json!({ "available": true, "source": self.source }),
+            Feed::Miniserver(_) => {
+                json!({ "available": true, "source": self.source, "query": true })
+            }
+            Feed::Ndjson(_) => json!({ "available": true, "source": self.source }),
         }
     }
 
@@ -690,6 +720,8 @@ impl Live {
                 st.generation += 1;
                 st.status = Status::new("idle", None);
                 st.values.clear();
+                st.owners.retain(|_, o| !o.queried);
+                st.queried.clear();
                 drop(st);
                 let _ = me.tx.send(Msg::Status);
             }
@@ -755,6 +787,7 @@ impl Live {
         st.controls = Arc::new(s.controls.to_string());
         st.globals = Arc::new(s.globals.to_string());
         st.values.clear();
+        st.queried.clear();
         drop(st);
         let _ = self.tx.send(Msg::Snapshot);
     }
@@ -788,22 +821,27 @@ impl Live {
                     self.load_structure(generation, &s);
                     let went_live = AtomicBool::new(false);
                     let going_offline = AtomicBool::new(false);
-                    let ended = session::run(
-                        &conn,
-                        stop.clone(),
-                        || {
-                            went_live.store(true, Ordering::Relaxed);
-                            self.set_status(generation, "live", None);
-                        },
-                        |events| {
-                            if events.iter().any(|e| matches!(e, StateEvent::OutOfService)) {
-                                going_offline.store(true, Ordering::Relaxed);
-                            }
-                            self.apply(generation, events);
-                            true
-                        },
-                    )
-                    .await;
+                    let (queries, asked) = mpsc::channel(1);
+                    let ended = tokio::select! {
+                        ended = session::run(
+                            &conn,
+                            stop.clone(),
+                            || {
+                                went_live.store(true, Ordering::Relaxed);
+                                self.set_status(generation, "live", None);
+                            },
+                            |events| {
+                                if events.iter().any(|e| matches!(e, StateEvent::OutOfService)) {
+                                    going_offline.store(true, Ordering::Relaxed);
+                                }
+                                self.apply(generation, events);
+                                true
+                            },
+                            asked,
+                        ) => ended,
+                        // Never ends: it stops with the session.
+                        () = self.query_blocks(generation, &went_live, queries) => Ended::Stopped,
+                    };
                     if *stop.borrow() {
                         return;
                     }
@@ -854,6 +892,190 @@ impl Live {
                 _ = tokio::time::sleep(Duration::from_secs(wait)) => {}
                 _ = stop.changed() => return,
             }
+        }
+    }
+
+    /// A browser shows a page with block queries on: query `blocks` while
+    /// the returned guard lives.
+    pub fn query(self: &Arc<Self>, blocks: Vec<query::Block>) -> Querying {
+        let mut st = self.st.lock().unwrap();
+        st.next_query += 1;
+        let id = st.next_query;
+        st.queries.insert(id, Arc::new(blocks));
+        Querying(self.clone(), id)
+    }
+
+    /// A browser left its page: drop the values only it had queried.
+    fn unquery(&self, id: u64) {
+        let mut st = self.st.lock().unwrap();
+        st.queries.remove(&id);
+        let blocks: HashSet<String> = st
+            .queries
+            .values()
+            .flat_map(|q| q.iter().map(|b| b.uuid.clone()))
+            .collect();
+        let gone: Vec<String> = st
+            .queried
+            .iter()
+            .filter(|(_, b)| !blocks.contains(*b))
+            .map(|(u, _)| u.clone())
+            .collect();
+        let mut out = serde_json::Map::new();
+        for u in gone {
+            st.queried.remove(&u);
+            st.owners.remove(&u);
+            if st.values.remove(&u).is_some() {
+                out.insert(u, Value::Null);
+            }
+        }
+        drop(st);
+        if !out.is_empty() {
+            let _ = self
+                .tx
+                .send(Msg::Values(Arc::new(Value::Object(out).to_string())));
+        }
+    }
+
+    /// The blocks to query now: every browser's, once, except those whose
+    /// wanted outputs the Miniserver streams, and those that cannot be.
+    fn to_query(&self, failed: &HashMap<String, String>) -> Vec<query::Block> {
+        let st = self.st.lock().unwrap();
+        let mut out: Vec<query::Block> = Vec::new();
+        for q in st.queries.values() {
+            for b in q.iter() {
+                if failed.contains_key(&b.uuid) || query::unmapped(&b.ty) {
+                    continue;
+                }
+                let streamed = |u: &String| st.owners.get(u).is_some_and(|o| !o.queried);
+                if b.want.iter().all(streamed) {
+                    continue;
+                }
+                match out.iter_mut().find(|o| o.uuid == b.uuid) {
+                    Some(o) => o.want.extend(b.want.iter().cloned()),
+                    None => out.push(b.clone()),
+                }
+            }
+        }
+        out
+    }
+
+    fn still_queried(&self, block: &str) -> bool {
+        let st = self.st.lock().unwrap();
+        st.queries
+            .values()
+            .any(|q| q.iter().any(|b| b.uuid == block))
+    }
+
+    /// Store a block's queried outputs; a streamed value always wins.
+    fn put_queried(&self, generation: u64, b: &query::Block, ll: &Value) {
+        let mapped = query::map(b, ll);
+        let mut out = serde_json::Map::new();
+        {
+            let mut st = self.st.lock().unwrap();
+            if st.generation != generation {
+                return;
+            }
+            for (uuid, value, key, name) in mapped {
+                if st.owners.get(&uuid).is_some_and(|o| !o.queried) {
+                    continue;
+                }
+                let owner = Owner {
+                    label: format!("{} · {name}, queried", b.title),
+                    state: key,
+                    format: None,
+                    names: None,
+                    queried: true,
+                };
+                let val: Val = (value, None);
+                if st.values.get(&uuid) != Some(&val) {
+                    out.insert(uuid.clone(), entry(&val, Some(&owner)));
+                    st.values.insert(uuid.clone(), val);
+                }
+                st.owners.insert(uuid.clone(), owner);
+                st.queried.insert(uuid, b.uuid.clone());
+            }
+        }
+        if !out.is_empty() {
+            let _ = self
+                .tx
+                .send(Msg::Values(Arc::new(Value::Object(out).to_string())));
+        }
+    }
+
+    /// Query the blocks browsers asked for, in rounds, on the session's
+    /// socket, once the session is live. Runs until the session ends.
+    async fn query_blocks(
+        &self,
+        generation: u64,
+        live: &AtomicBool,
+        asked: mpsc::Sender<session::Query>,
+    ) {
+        // Blocks that cannot be queried (Code 404, 500): not again this session.
+        let mut failed: HashMap<String, String> = HashMap::new();
+        let mut gap = tokio::time::interval(QUERY_GAP);
+        gap.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut last_idle = true;
+        loop {
+            let start = tokio::time::Instant::now();
+            let blocks = if live.load(Ordering::Relaxed) {
+                self.to_query(&failed)
+            } else {
+                Vec::new()
+            };
+            let (mut sent, mut answered) = (0, 0);
+            for b in &blocks {
+                if !self.still_queried(&b.uuid) {
+                    continue;
+                }
+                gap.tick().await;
+                sent += 1;
+                let (reply, answer) = oneshot::channel();
+                let q = session::Query {
+                    uuid: b.uuid.clone(),
+                    reply,
+                };
+                if asked.send(q).await.is_err() {
+                    return std::future::pending().await;
+                }
+                // No answer in time: asked again next round.
+                if let Ok(Ok(ll)) = tokio::time::timeout(QUERY_WAIT, answer).await {
+                    match query::failure(&ll) {
+                        Some(why) => {
+                            failed.insert(b.uuid.clone(), format!("{} ({}): {why}", b.title, b.ty));
+                        }
+                        None => {
+                            answered += 1;
+                            self.put_queried(generation, b, &ll);
+                        }
+                    }
+                }
+            }
+            let mut fails: Vec<&String> = failed
+                .iter()
+                .filter(|(u, _)| self.still_queried(u))
+                .map(|(_, why)| why)
+                .collect();
+            fails.sort();
+            let report = json!({
+                "blocks": sent,
+                "answered": answered,
+                "failed": fails,
+                "ms": start.elapsed().as_millis() as u64,
+            })
+            .to_string();
+            // Every round while there is something to query (a browser that
+            // just connected learns it within a round), else once.
+            let idle = blocks.is_empty() && fails.is_empty();
+            if !idle || !last_idle {
+                let _ = self.tx.send(Msg::Query(Arc::new(report)));
+            }
+            last_idle = idle;
+            let wait = if blocks.is_empty() {
+                Duration::from_millis(500)
+            } else {
+                QUERY_ROUND
+            };
+            tokio::time::sleep_until(start + wait).await;
         }
     }
 
@@ -954,6 +1176,7 @@ impl Live {
             state: v["state"].as_str().unwrap_or_default().to_string(),
             format: None,
             names: None,
+            queried: false,
         };
         let val: Val = (value, None);
         let mut st = self.st.lock().unwrap();
@@ -975,7 +1198,19 @@ impl Live {
 }
 
 fn entry(v: &Val, owner: Option<&Owner>) -> Value {
-    json!([v.0, v.1, owner.map(|o| o.label.as_str())])
+    match owner {
+        Some(o) if o.queried => json!([v.0, v.1, o.label, "queried"]),
+        _ => json!([v.0, v.1, owner.map(|o| o.label.as_str())]),
+    }
+}
+
+/// One browser's page with block queries on; dropping it ends them.
+pub struct Querying(Arc<Live>, u64);
+
+impl Drop for Querying {
+    fn drop(&mut self) {
+        self.0.unquery(self.1);
+    }
 }
 
 /// One browser with live values on; dropping it turns them off.
@@ -1170,6 +1405,92 @@ mod tests {
         );
         let j: Value = serde_json::from_str(&live.status_json()).unwrap();
         assert_eq!(j["reason"], "unauthorized");
+    }
+
+    fn block(uuid: &str, ty: &str, ports: &[(&str, &str)], want: &[&str]) -> query::Block {
+        query::Block {
+            uuid: uuid.into(),
+            ty: ty.into(),
+            title: format!("{ty} 1"),
+            ports: ports
+                .iter()
+                .map(|(k, u)| (k.to_string(), u.to_string(), k.to_string()))
+                .collect(),
+            want: want.iter().map(|w| w.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn queried_values_are_marked_and_go_when_no_page_needs_them() {
+        let live = Live::new(Feed::Off("test".into()), "test".into());
+        let mut rx = live.tx.subscribe();
+        // `s1` is streamed: the query neither asks for it nor overwrites it.
+        live.load_structure(
+            0,
+            &json!({ "controls": { "c": { "name": "Lux", "type": "InfoOnlyAnalog", "states": { "value": "s1" } } } }),
+        );
+        live.apply(
+            0,
+            vec![StateEvent::ValueState {
+                uuid: "s1".into(),
+                value: 5.0,
+            }],
+        );
+        let f = block(
+            "f",
+            "Formula",
+            &[("Input1", "f-i"), ("AQ", "f-aq"), ("TQ", "f-tq")],
+            &["f-aq"],
+        );
+        let streamed = block("v", "VirtualIn", &[("Q", "s1")], &["s1"]);
+        let tab1 = live.query(vec![f.clone(), streamed.clone()]);
+        let tab2 = live.query(vec![f.clone()]);
+        let failed = HashMap::new();
+        let todo: Vec<String> = live.to_query(&failed).into_iter().map(|b| b.uuid).collect();
+        assert_eq!(todo, ["f"]);
+        let mut gone = HashMap::new();
+        gone.insert("f".to_string(), "Code 500".to_string());
+        assert!(live.to_query(&gone).is_empty());
+
+        let ll = json!({"Code": "200", "output0": {"name": "R", "nr": 1, "value": 21.5},
+                        "output1": {"name": "E", "nr": 2, "value": "ok"}});
+        live.put_queried(0, &f, &ll);
+        let snap: Value = serde_json::from_str(&live.snapshot_json()).unwrap();
+        assert_eq!(
+            snap["values"]["f-aq"],
+            json!([21.5, null, "Formula 1 · AQ, queried", "queried"])
+        );
+        assert_eq!(snap["values"]["f-tq"][0], "ok");
+        assert_eq!(snap["values"]["s1"], json!([5, null, "Lux · value"]));
+        // A block that answers for a streamed connector does not overwrite it.
+        live.put_queried(0, &streamed, &json!({"Code": "200", "value": "7"}));
+        let snap: Value = serde_json::from_str(&live.snapshot_json()).unwrap();
+        assert_eq!(snap["values"]["s1"][0], 5);
+        // A session that ended writes nothing.
+        live.put_queried(
+            3,
+            &f,
+            &json!({"Code": "200", "output0": {"name": "R", "nr": 1, "value": 1}}),
+        );
+        assert_eq!(live.st.lock().unwrap().values["f-aq"].0, json!(21.5));
+
+        // One tab leaves: the other still shows the block.
+        drop(tab1);
+        assert!(live.st.lock().unwrap().values.contains_key("f-aq"));
+        while rx.try_recv().is_ok() {}
+        drop(tab2);
+        let st = live.st.lock().unwrap();
+        assert!(!st.values.contains_key("f-aq") && !st.owners.contains_key("f-aq"));
+        assert!(st.values.contains_key("s1"));
+        drop(st);
+        match rx.try_recv() {
+            Ok(Msg::Values(v)) => {
+                let v: Value = serde_json::from_str(&v).unwrap();
+                assert_eq!(v["f-aq"], Value::Null);
+                assert_eq!(v["f-tq"], Value::Null);
+            }
+            _ => panic!("the browsers learn that the values are gone"),
+        }
     }
 
     fn running(live: &Live) -> bool {

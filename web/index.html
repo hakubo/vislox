@@ -87,8 +87,9 @@
         <span class="lg-sep diff-only"></span>
         <span class="lg added diff-only">added</span><span class="lg changed diff-only">changed</span><span class="lg removed diff-only">removed</span><span class="lg moved diff-only">moved</span>
         <span class="lg-sep live-only"></span>
-        <span class="lg w-on live-only">on</span><span class="lg-pill live-only">21.5°</span><span class="lg-pill computed live-only" title="Computed by vislox from the block's inputs; the Miniserver does not send it">computed</span><span class="lg-note live-only" id="live-note"></span>
+        <span class="lg w-on live-only">on</span><span class="lg-pill live-only">21.5°</span><span class="lg-pill computed live-only" title="Computed by vislox from the block's inputs; the Miniserver does not send it">computed</span><span class="lg-pill queried live-only" title="Queried from the block: up to one round (2 s or more) old">queried</span><span class="lg-note live-only" id="live-note"></span>
         <label class="lg-dim live-only" title="Fade wires the Miniserver sends no value for"><input type="checkbox" id="chk-live-dim" checked> Dim wires without a value</label>
+        <label class="lg-dim live-only" id="lg-query" title="Ask the Miniserver every 2 s for the outputs of the blocks behind this page's wires that it does not stream (read-only requests, at most 20 a second)"><input type="checkbox" id="chk-live-query"> Query blocks on this page</label><span class="lg-note lg-qnote live-only" id="query-note"></span>
       </div>
       <div id="minimap" class="hud minimap" aria-hidden="true"><svg id="mm"><g id="mm-objs"></g><rect id="mm-view"/></svg></div>
     </div>

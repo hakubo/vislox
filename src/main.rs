@@ -12,6 +12,7 @@ mod miniserver;
 mod model;
 mod operate;
 mod pull;
+mod query;
 mod reason;
 mod restart;
 mod session;
@@ -327,6 +328,7 @@ async fn main() -> Result<()> {
         .route("/api/events", get(api_events))
         .route("/api/live", get(api_live))
         .route("/api/live/retry", axum::routing::post(api_live_retry))
+        .route("/api/live/query", get(api_live_query))
         .route("/api/miniserver", get(api_miniserver))
         .route("/api/log", get(api_log))
         .route("/api/app", get(api_app))
@@ -700,6 +702,7 @@ async fn api_live(
         match m {
             Ok(live::Msg::Status) => Event::default().event("status").data(live.status_json()),
             Ok(live::Msg::Values(v)) => Event::default().event("values").data(v.as_str()),
+            Ok(live::Msg::Query(q)) => Event::default().event("query").data(q.as_str()),
             // A new structure, or this browser fell behind: start over.
             Ok(live::Msg::Snapshot) | Err(_) => Event::default()
                 .event("snapshot")
@@ -707,6 +710,63 @@ async fn api_live(
         }
     });
     let stream = tokio_stream::iter(first).chain(rest).map(Ok);
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+#[derive(Deserialize)]
+struct LiveQuery {
+    rev: String,
+    page: String,
+}
+
+/// Opt-in: query the blocks behind the wires of the page a browser shows,
+/// for as long as it keeps this stream open (the values come on
+/// `/api/live`). Only for the current, deployed revision: what the
+/// Miniserver runs. The stream itself carries only `ok` (`{blocks}`) or `refused` (`{error}`).
+async fn api_live_query(
+    State(app): State<Arc<App>>,
+    Query(q): Query<LiveQuery>,
+) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
+    let a = app.clone();
+    let plan = tokio::task::spawn_blocking(move || -> Result<Vec<query::Block>, String> {
+        let current = a
+            .history
+            .lock()
+            .unwrap()
+            .find(&q.rev)
+            .is_some_and(|r| r.current && r.kind != "pending");
+        if !current {
+            return Err("only the current, deployed revision is queried".into());
+        }
+        let (_, doc) = load(&a, &q.rev)?;
+        Ok(model::query_plan(&doc, &q.page))
+    })
+    .await
+    .map_err(|e| e.to_string())
+    .and_then(|r| r);
+    let (first, guard) = match plan {
+        Ok(blocks) => {
+            let n = blocks.len();
+            (
+                Event::default()
+                    .event("ok")
+                    .data(serde_json::json!({ "blocks": n }).to_string()),
+                Some(app.live.query(blocks)),
+            )
+        }
+        Err(e) => (
+            Event::default()
+                .event("refused")
+                .data(serde_json::json!({ "error": e }).to_string()),
+            None,
+        ),
+    };
+    let stream = tokio_stream::iter([first])
+        .chain(tokio_stream::pending())
+        .map(move |e| {
+            let _on = &guard;
+            Ok(e)
+        });
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 

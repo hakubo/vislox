@@ -228,6 +228,8 @@ try {
     await page.waitForFunction(() => [...document.querySelectorAll("#props .lv.computed")].some((n) => /^0\.2\d$/.test(n.textContent)));
     appendFileSync(liveFile, liveLine("Temperatur", "value", "22.25", TEMP));
     await pill("22.25");
+    // Block queries need a Miniserver connection: a recording offers none.
+    assert.ok(await page.$eval("#lg-query", (n) => n.classList.contains("hidden")), "no block queries from a recording");
     await page.click("#sw-live .track");
     await page.waitForFunction(() => !document.querySelector("#canvas").classList.contains("live"));
   });

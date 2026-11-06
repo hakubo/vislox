@@ -15,7 +15,7 @@ const S = {
   objPage: new Map(), pageOf: new Map(), loadSeq: 0, onlyChanged: false, chgIdx: -1,
   closed: new Set(["Advanced"]), dim: true, treeFocus: null, hash: null, applyingHash: false,
   app: null, appBusy: false, appErr: "", applyReads: 0, deployed: null,
-  live: { on: pref("live", false), dim: pref("liveDim", true), es: null, status: null, values: new Map(), controls: {}, globals: {} },
+  live: { on: pref("live", false), dim: pref("liveDim", true), query: pref("liveQuery", false), qes: null, qkey: "", qstat: null, es: null, status: null, values: new Map(), controls: {}, globals: {} },
 };
 function pref(k, d) { try { const v = localStorage.getItem("vislox." + k); return v === null ? d : v === "1"; } catch { return d; } }
 function setPref(k, v) { try { localStorage.setItem("vislox." + k, v ? "1" : "0"); } catch { /* private mode */ } }
@@ -1331,6 +1331,8 @@ $("chk-changes").onchange = (e) => {
 $("chk-live").onchange = (e) => setLive(e.target.checked);
 $("chk-live-dim").checked = S.live.dim;
 $("chk-live-dim").onchange = (e) => { S.live.dim = e.target.checked; setPref("liveDim", S.live.dim); renderLiveSwitch(); };
+$("chk-live-query").checked = S.live.query;
+$("chk-live-query").onchange = (e) => { S.live.query = e.target.checked; setPref("liveQuery", S.live.query); renderLiveSwitch(); };
 $("chk-dim").onchange = (e) => { S.dim = e.target.checked; renderPage(); applyFocus(); };
 $("chk-follow").onchange = (e) => { S.follow = e.target.checked; if (S.follow) { S.rev = null; loadHistory(); } writeHash(false); };
 
@@ -2090,7 +2092,7 @@ function liveHere() {
 /** A connector's value: streamed by the Miniserver, passed on by a reference or a memory flag,
  *  a constant in the config, or computed from a simple gate's inputs (`view.live`).
  *  Entries are `[value, text, label, kind]`; kind is "const" or "computed" for values the
- *  Miniserver did not send. Cached until the next change. */
+ *  Miniserver did not send, and "queried" for values vislox asked a block for (opt-in). Cached until the next change. */
 let lvCache = new Map();
 function liveVal(uuid) { return liveHere() ? lvResolve(uuid, 0) : undefined; }
 function lvResolve(u, depth) {
@@ -2278,6 +2280,36 @@ function renderLiveSwitch() {
     : on && st.reason && st.state !== "live" ? (st.detail || "").split("\n")[0] : "";
   svg.classList.toggle("live", here);
   svg.classList.toggle("live-dim", here && S.live.dim);
+  $("lg-query").classList.toggle("hidden", !info.query);
+  liveQuerySync(here && info.query && S.live.query);
+}
+
+/** Opt-in block queries (`/api/live/query`): the server queries the blocks behind the wires of the
+ *  page on screen while this stream is open; their values come on `/api/live`, marked "queried". */
+function liveQuerySync(want) {
+  const key = want && S.page ? `${S.rev}|${S.page}` : "";
+  if (key === S.live.qkey) { renderQueryNote(); return; }
+  S.live.qes?.close();
+  S.live.qes = null;
+  S.live.qkey = key;
+  S.live.qstat = null;
+  if (key) {
+    const es = new EventSource(`/api/live/query?rev=${encodeURIComponent(S.rev)}&page=${encodeURIComponent(S.page)}`);
+    S.live.qes = es;
+    es.addEventListener("ok", (e) => { S.live.qstat = { ...JSON.parse(e.data), planned: true }; renderQueryNote(); });
+    es.addEventListener("refused", (e) => { S.live.qstat = { error: JSON.parse(e.data).error }; es.close(); renderQueryNote(); });
+  }
+  renderQueryNote();
+}
+function renderQueryNote() {
+  const n = $("query-note"), q = S.live.qstat;
+  const failed = q?.failed || [];
+  n.textContent = !S.live.qkey || !q ? ""
+    : q.error ? `not queried: ${q.error}`
+    : q.planned ? (q.blocks ? `querying ${q.blocks} block${q.blocks === 1 ? "" : "s"}…` : "no blocks to query here")
+    : (q.blocks ? `${q.answered} of ${q.blocks} queried in ${(q.ms / 1000).toFixed(1)} s` : "nothing left to query: the Miniserver streams the rest")
+      + (failed.length ? ` · ${failed.length} cannot be` : "");
+  n.title = failed.join("\n");
 }
 
 function liveStart() {
@@ -2286,6 +2318,8 @@ function liveStart() {
   S.live.es = es;
   S.live.status = { state: "connecting" };
   es.addEventListener("status", (e) => { S.live.status = JSON.parse(e.data); renderLiveSwitch(); });
+  // How the block queries went (every round while there is something to query).
+  es.addEventListener("query", (e) => { if (S.live.qkey) { S.live.qstat = JSON.parse(e.data); renderQueryNote(); } });
   es.addEventListener("snapshot", (e) => {
     const d = JSON.parse(e.data);
     S.live.values = new Map(Object.entries(d.values));
@@ -2296,8 +2330,8 @@ function liveStart() {
   });
   es.addEventListener("values", (e) => {
     const d = JSON.parse(e.data);
-    for (const k in d) S.live.values.set(k, d[k]);
-    opSeen(d);
+    for (const k in d) if (d[k] === null) S.live.values.delete(k); else S.live.values.set(k, d[k]);
+    opSeen(Object.fromEntries(Object.entries(d).filter(([, v]) => v !== null)));
     lvCache = new Map();
     liveQueue(Object.keys(d));
   });
@@ -2408,6 +2442,7 @@ function liveApply(ch) {
     for (const pl of it.pills) {
       pl.g.style.display = show ? "" : "none";
       pl.g.classList.toggle("computed", e?.[3] === "computed");
+      pl.g.classList.toggle("queried", e?.[3] === "queried");
       if (!show) continue;
       if (pl.t.textContent !== txt) {
         const was = pl.t.textContent;

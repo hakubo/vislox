@@ -1770,6 +1770,70 @@ fn live_graph(c: &Ctx) -> LiveGraph {
     g
 }
 
+/// Reference-like types: they pass on another connector's value, so the
+/// block behind them is queried instead (`live_graph`'s `pass`). Constants
+/// are in the config.
+const PASS_THROUGH: &[&str] = &["InputRef", "OutputRef", "OutputRefLM", "Constant"];
+
+/// The blocks to query for live values on a page (opt-in): the sources of
+/// the wires that start or end on it, followed through references, memory
+/// flags and modes to the block that produces the value. Each block once,
+/// in the order its first wire comes up.
+pub fn query_plan(doc: &LoxoneDoc, page: &str) -> Vec<crate::query::Block> {
+    let c = Ctx::new(doc);
+    let pass = live_graph(&c).pass;
+    let on_page = |port: &str| {
+        c.port_owner
+            .get(port)
+            .is_some_and(|(o, _)| c.page_of.get(o).map(String::as_str) == Some(page))
+    };
+    let mut order: Vec<String> = Vec::new();
+    let mut want: HashMap<String, Vec<String>> = HashMap::new();
+    for w in &c.wires {
+        if !on_page(&w.from_port) && !on_page(&w.to_port) {
+            continue;
+        }
+        let mut s = Some(w.from_port.clone());
+        for _ in 0..60 {
+            let Some(port) = s.take() else {
+                break;
+            };
+            if let Some((owner, _)) = c.port_owner.get(&port)
+                && !PASS_THROUGH.contains(&c.ty(owner).as_str())
+            {
+                let ws = want.entry(owner.clone()).or_insert_with(|| {
+                    order.push(owner.clone());
+                    Vec::new()
+                });
+                if !ws.contains(&port) {
+                    ws.push(port.clone());
+                }
+            }
+            s = pass.get(&port).cloned();
+        }
+    }
+    order
+        .into_iter()
+        .filter_map(|u| {
+            let el = c.el(&u)?;
+            let ty = c.ty(&u);
+            Some(crate::query::Block {
+                ports: ports(el)
+                    .into_iter()
+                    .map(|p| {
+                        let name = port_names::name_of(&ty, &p.key).to_string();
+                        (p.key, p.uuid, name)
+                    })
+                    .collect(),
+                want: want.remove(&u).unwrap_or_default(),
+                title: c.title(&u),
+                uuid: u,
+                ty,
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1844,6 +1908,39 @@ mod tests {
         let div = &g.gates["10000006-0000-0063-02ff504f94000001"];
         assert_eq!(div.op, "div");
         assert_eq!(div.ins[1].def, Some(1000.0));
+    }
+
+    #[test]
+    fn query_plan_takes_the_blocks_behind_a_pages_wires() {
+        let d = doc(HOUSE);
+        let plan = query_plan(&d, PAGE_EG);
+        let blocks: Vec<(&str, &str)> = plan
+            .iter()
+            .map(|b| (b.ty.as_str(), b.uuid.as_str()))
+            .collect();
+        // The reference is followed to the virtual input it shows; the And
+        // feeds the meter and a block on the other page.
+        assert_eq!(
+            blocks,
+            [
+                ("VirtualIn", "10000001-0000-0010-ffff504f94000001"),
+                ("And", AND),
+            ]
+        );
+        assert_eq!(plan[0].want, ["10000001-0000-0011-00ff504f94000001"]);
+        let and = &plan[1];
+        assert_eq!(and.want, ["10000004-0000-0043-02ff504f94000001"]);
+        assert_eq!(
+            and.ports.iter().map(|p| p.0.as_str()).collect::<Vec<_>>(),
+            ["I1", "I2", "Q"]
+        );
+        // The other page's wire comes from the And on the first.
+        let og: Vec<String> = query_plan(&d, PAGE_OG)
+            .into_iter()
+            .map(|b| b.uuid)
+            .collect();
+        assert_eq!(og, [AND]);
+        assert!(query_plan(&d, "no-such-page").is_empty());
     }
 
     #[test]

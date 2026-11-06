@@ -27,6 +27,7 @@
   --live-pill-line: #c9b25a;
   --live-tick: #ffe27a;      /* a value that just changed */
   --live-computed: #f1f5fb;  /* a value vislox computed, not the Miniserver's */
+  --live-queried: #eef8f1;   /* a value vislox queried from the block, up to a round old */
   --radius: 6px;
   --shadow: 0 1px 2px #0000000f, 0 2px 8px #0000000f;
   font-family: "Segoe UI", system-ui, -apple-system, "Noto Sans", "DejaVu Sans", Arial, sans-serif;
@@ -192,7 +193,7 @@ button.chip { cursor: pointer; } button.chip:hover { border-color: var(--brand);
 .hud-zoom button:last-child { border-right: none; font-size: 13px; padding: 0 10px; }
 .hud-zoom button.pct { font-size: 12px; min-width: 52px; color: var(--muted); font-variant-numeric: tabular-nums; }
 .hud-zoom button:hover { background: var(--brand-soft); }
-.legend { white-space: nowrap; flex-wrap: nowrap; left: 50%; transform: translateX(-50%); bottom: 10px; padding: 5px 10px; display: flex; gap: 12px; align-items: center; font-size: 12px; color: var(--muted); }
+.legend { white-space: nowrap; flex-wrap: wrap; justify-content: center; max-width: calc(100% - 420px); width: max-content; left: 50%; transform: translateX(-50%); bottom: 10px; padding: 5px 10px; display: flex; gap: 4px 12px; align-items: center; font-size: 12px; color: var(--muted); }
 .legend:not(.diff) .diff-only { display: none; }
 .lg-sep { width: 1px; height: 14px; background: var(--line); }
 .lg { display: inline-flex; align-items: center; }
@@ -435,6 +436,9 @@ button.chip { cursor: pointer; } button.chip:hover { border-color: var(--brand);
 .pull-msg.info { background: var(--panel-2); color: var(--muted); }
 .live-pill.computed rect { stroke-dasharray: 4 3; fill: var(--live-computed); }
 .pr .lv.computed, .lg-pill.computed { border-style: dashed; background: var(--live-computed); }
+.live-pill.queried rect { stroke-dasharray: 1 2; fill: var(--live-queried); }
+.pr .lv.queried, .lg-pill.queried { border-style: dotted; background: var(--live-queried); }
+.lg-qnote { color: var(--muted); }
 .pr .lv.const { background: var(--panel-2); border-color: var(--line); }
 
 /* ── apply, sync, discard ─────────────────────────── */

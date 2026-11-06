@@ -13,8 +13,9 @@ use loxone_client::stream::{Framer, StateEvent, ws_authenticate};
 use loxone_client::system::ll_code;
 use loxone_client::token::{WsStream, token_reuse_rejected};
 use loxone_client::ws::LoxWsClient;
+use std::collections::VecDeque;
 use std::time::Duration;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio_tungstenite::tungstenite::Message;
 
 /// Keepalive interval: the Miniserver drops sockets that send nothing for ~5 min.
@@ -23,6 +24,13 @@ const KEEPALIVE: Duration = Duration::from_secs(30);
 const DEAD_SOCKET: Duration = Duration::from_secs(90);
 /// Connecting and logging in must finish within this.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// A read-only request to send on the session's socket (`jdev/sps/io/<uuid>/all`),
+/// and where its answer goes: the `LL` object of the Miniserver's reply.
+pub struct Query {
+    pub uuid: String,
+    pub reply: oneshot::Sender<serde_json::Value>,
+}
 
 /// How a session ended.
 #[derive(Debug, PartialEq)]
@@ -81,6 +89,9 @@ enum Step {
     Events(Vec<StateEvent>),
     /// A command was answered with `Code` 200: the subscription is on.
     Answered,
+    /// The answer to a block query (any `Code`: a block that cannot be
+    /// queried does not end the session): its `LL` object.
+    Reply(serde_json::Value),
     /// A command was refused: what and its `Code`.
     Refused(String),
     /// Answer a ping.
@@ -98,6 +109,9 @@ fn step(framer: &mut Framer, msg: Message) -> Step {
         },
         Message::Text(t) => {
             framer.text();
+            if let Some(ll) = io_reply(&t) {
+                return Step::Reply(ll);
+            }
             match ll_code(&t) {
                 None => Step::Ignore,
                 Some(200) => Step::Answered,
@@ -116,16 +130,28 @@ fn step(framer: &mut Framer, msg: Message) -> Step {
     }
 }
 
+/// The `LL` object of an answer to `jdev/sps/io/…`.
+fn io_reply(t: &str) -> Option<serde_json::Value> {
+    if !t.contains("sps/io/") {
+        return None;
+    }
+    let mut v = serde_json::from_str::<serde_json::Value>(t).ok()?;
+    let ll = v.get_mut("LL")?.take();
+    ll["control"].as_str()?.contains("sps/io/").then_some(ll)
+}
+
 /// Run one session. `on_live` is called once the Miniserver has accepted
 /// the subscription: when it answers it with `Code` 200 or sends the first
 /// states, not when the request is sent (a refused subscription or a 4008
 /// close never counts as live). `handler` gets each batch of events and
-/// returns `false` to stop.
+/// returns `false` to stop. `queries` are sent on the same socket once
+/// the session is open, and answered in turn.
 pub async fn run<F>(
     conn: &Connection,
     mut stop: watch::Receiver<bool>,
     on_live: impl FnOnce(),
     mut handler: F,
+    mut queries: mpsc::Receiver<Query>,
 ) -> Ended
 where
     F: FnMut(Vec<StateEvent>) -> bool,
@@ -140,11 +166,23 @@ where
     keepalive.tick().await;
     let mut framer = Framer::default();
     let mut last_rx = tokio::time::Instant::now();
+    // Sent queries waiting for their answer: the block's UUID.
+    let mut asked: VecDeque<Query> = VecDeque::new();
     loop {
         let msg = tokio::select! {
             _ = stop.changed() => {
                 let _ = ws.close(None).await;
                 return Ended::Stopped;
+            }
+            Some(q) = queries.recv() => {
+                // A caller that gave up waiting no longer needs its answer.
+                asked.retain(|q| !q.reply.is_closed());
+                let cmd = crate::query::command(&q.uuid);
+                if let Err(e) = ws.send(Message::Text(cmd)).await {
+                    return Ended::Failed(chain(&e));
+                }
+                asked.push_back(q);
+                continue;
             }
             _ = keepalive.tick() => {
                 if last_rx.elapsed() > DEAD_SOCKET {
@@ -169,6 +207,14 @@ where
             Step::Answered => {
                 if let Some(f) = on_live.take() {
                     f();
+                }
+                continue;
+            }
+            Step::Reply(ll) => {
+                let control = ll["control"].as_str().unwrap_or_default();
+                if let Some(i) = asked.iter().position(|q| control.contains(&q.uuid)) {
+                    let q = asked.remove(i).expect("position is in range");
+                    let _ = q.reply.send(ll);
                 }
                 continue;
             }
@@ -216,6 +262,11 @@ mod tests {
             Step::Refused(e) if e == "command refused: Code 503"
         ));
         assert!(matches!(text("not json"), Step::Ignore));
+        // A block query's answer, even a refusal, is the querier's.
+        assert!(matches!(
+            text(r#"{"LL":{"control":"dev/sps/io/b1/all","value":"","Code":"500"}}"#),
+            Step::Reply(ll) if ll["Code"] == "500"
+        ));
         // A close before any answer: the code, not "live".
         let close = Message::Close(Some(CloseFrame {
             code: CloseCode::from(4008),
