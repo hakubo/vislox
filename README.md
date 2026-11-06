@@ -213,9 +213,12 @@ A Pull, Apply or Sync that fails with one of these codes shows the same explanat
 the Miniserver's own wording counts (`Code 401`, `HTTP 503: /jdev/…`, `close code 4003`); git's `HTTP 403` does not.
 
 The **Miniserver log** runs `lox log -n 300` with the same lox configuration and context as live values
-(`GET /api/log`, which needs an `X-Vislox` header, since lox logs in for it). It only reads. Requests within 2 s
-of each other share one run. When lox fails, the panel says why and keeps the entries it had. `--no-live` turns
-it off.
+(`GET /api/log`, which needs an `X-Vislox` header, since lox logs in for it). It only reads. One `lox log` runs
+at a time, and requests that come in while it runs share the next one (its failure too), so none gets a log read
+before it asked. When lox fails, the panel says why and keeps the entries it had. A program change is a
+`Program changed by user` line, with the `PRG got restart command` logged up to 2 s before it; a reboot or a plain
+program restart is not one. After an Apply, the log read before it marks no blocks until it is read again.
+`--no-live` turns it off.
 
 **Pull from Miniserver** runs `lox config pull` (the `lox` on `PATH`, or `--lox <path>`), with the same lox
 configuration and context as live values. It is offered only when lox would commit to the repository vislox

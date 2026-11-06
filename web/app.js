@@ -433,6 +433,8 @@ function renderPage() {
   }
   for (const l of p.labels) wire(l.obj, l.port);
   const objByUuid = new Map(p.objects.map((o) => [o.uuid, o]));
+  const logged = logMarks();
+  S.log.drawn = marksKey(logged);
 
   for (const w of p.wires) {
     const pts = w.points.map((q) => q.join(",")).join(" ");
@@ -457,8 +459,7 @@ function renderPage() {
     if (o.shape === "tag") drawTag(L.objs, o, p);
     else drawBlock(L.objs, o);
     if (o.status && S.view.compared) drawBadge(L.badges, o);
-    const logged = logMarks().get(o.uuid);
-    if (logged) drawLogBadge(L.badges, o, logged);
+    if (logged.has(o.uuid)) drawLogBadge(L.badges, o, logged.get(o.uuid));
     if (o.moved_to) {
       const g = el("g", { class: "xref ghost-note" }, L.badges);
       const t = el("text", { class: "pg", x: o.rect[0], y: o.rect[1] + o.rect[3] + 160 }, g, `→ moved to page “${o.moved_to.page_title}”`);
@@ -747,7 +748,7 @@ function drawLogBadge(parent, o, e) {
   el("circle", { cx, cy, r: 100 }, g);
   el("text", { x: cx, y: cy + 46, "text-anchor": "middle" }, g, "!");
   hoverTip(g, () => `<b>Miniserver log</b> ${esc(e.at)}<br>${esc(e.text)}`);
-  g.addEventListener("click", (ev) => { ev.stopPropagation(); openLog(e); });
+  g.addEventListener("click", (ev) => { ev.stopPropagation(); if (!drag?.moved) openLog(e); });
 }
 
 function followTarget(t) {
@@ -1548,7 +1549,7 @@ function renderActions() {
     const head = { apply: ["Applied.\n", "Apply failed.\n"], sync: ["", "Sync failed.\n"], discard: ["", "Discard failed.\n"] }[last.kind] || ["", ""];
     deployMsg(head[last.ok ? 0 : 1] + last.message, !last.ok);
     // What the new program logged as it started.
-    if (last.kind === "apply" && S.log.open) loadLog();
+    if (last.kind === "apply") logStale();
   }
 }
 /** Apply's steps as they happen: lox's progress, and what vislox sees of the program restart. */
@@ -1667,7 +1668,9 @@ $("btn-discard").onclick = async () => {
 // ── the Miniserver's log ───────────────────────────────────────────────
 // `lox log` on the server: the system log's last lines. What came after the last program change
 // (an Apply, or a save from Loxone Config) is marked; lines that name a block's UUID link to it.
-S.log = { open: pref("logOpen", false), data: null, loading: false, onlySince: pref("logSince", false) };
+// `stale`: an Apply ran since the log was read, so it describes the program before. `staleSeq` counts
+// Applies, so that only a read that started after the last one clears it.
+S.log = { open: pref("logOpen", false), data: null, loading: false, again: false, stale: false, staleSeq: 0, drawn: "", onlySince: pref("logSince", false) };
 function logInfo() { return S.hist?.log || { available: false }; }
 /** The entries since the last program change; all of them when the lines hold none. */
 function logRecent() {
@@ -1691,7 +1694,7 @@ function logTargets() {
  *  deployed revision: the log is about what runs. */
 function logMarks() {
   const r = revById(S.rev);
-  if (!S.log.data || !r?.current || r.kind === "pending") return new Map();
+  if (!S.log.data || S.log.stale || !r?.current || r.kind === "pending") return new Map();
   const t = logTargets(), m = new Map();
   for (const e of logRecent()) for (const u of e.uuids || []) { const b = t.get(u); if (b) m.set(b, e); }
   return m;
@@ -1710,11 +1713,12 @@ function renderLog() {
   b.classList.toggle("busy", S.log.loading);
   b.querySelector(".lbl").textContent = S.log.loading ? "Reading…" : "Refresh";
   const d = S.log.data;
-  const recent = d?.entries && d.since != null ? d.entries.length - d.since : null;
+  const recent = d?.entries && d.since != null && !S.log.stale ? d.entries.length - d.since : null;
   $("log-count").textContent = recent ? `${recent} new` : "";
   $("log-count").title = recent ? `${plural(recent, "entry")} since the last program change` : "";
   const msg = $("log-msg");
   const text = d?.error ? `Cannot read the log: ${d.error}` : !d ? (S.log.loading ? "Reading the log (lox log)…" : "")
+    : S.log.stale ? (S.log.loading ? "Read before the last Apply; reading it again…" : "Read before the last Apply. Refresh to read it again.")
     : d.since == null ? `No program change in the last ${d.lines} lines.` : "";
   msg.textContent = text;
   msg.className = "log-msg" + (d?.error ? " error" : "") + (text ? "" : " hidden");
@@ -1736,25 +1740,42 @@ function renderLog() {
   list.innerHTML = rows.join("") || (d && !d.error ? '<li class="tx">The log is empty.</li>' : "");
   if (open && !d && !S.log.loading) loadLog();
 }
+function marksKey(m) { return [...m].map(([u, e]) => `${u} ${e.at} ${e.text}`).join("\n"); }
+/** Redraw the page when the blocks' log marks are not what it shows. */
+function redrawMarks() {
+  if (S.view && marksKey(logMarks()) !== S.log.drawn) { renderPage(); applyFocus(); }
+}
+/** After an Apply: the log read before is about the old program. Hide its marks; read it again now if
+ *  the panel is open, else when it opens. */
+function logStale() {
+  S.log.stale = true; S.log.staleSeq++;
+  if (S.log.open) loadLog();
+  renderLog(); redrawMarks();
+}
 async function loadLog() {
-  if (S.log.loading || !logInfo().available) return;
+  if (!logInfo().available) return;
+  // One read at a time; a request during one (an Apply that finished) runs after it.
+  if (S.log.loading) { S.log.again = true; return; }
+  const seq = S.log.staleSeq;
   S.log.loading = true; renderLog();
   try {
     const r = await fetch("/api/log", { headers: { "X-Vislox": "log" } });
     const j = await r.json().catch(() => ({}));
     S.log.data = r.ok ? j : { ...(S.log.data || {}), error: j.error || r.statusText };
+    if (!S.log.data.error && seq === S.log.staleSeq) S.log.stale = false;
   } catch (e) {
     S.log.data = { ...(S.log.data || {}), error: e.message };
   } finally {
     S.log.loading = false;
     renderLog();
-    // The blocks' log marks.
-    if (S.view) { renderPage(); applyFocus(); }
+    redrawMarks();
+    if (S.log.again) { S.log.again = false; loadLog(); }
   }
 }
 function setLogOpen(open) {
   S.log.open = open; setPref("logOpen", open);
   renderLog();
+  if (open && S.log.stale) loadLog();
 }
 /** From a block's log mark: open the log and show that line. */
 function openLog(e) {

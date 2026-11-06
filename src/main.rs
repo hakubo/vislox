@@ -518,17 +518,27 @@ async fn api_events(
     Sse::new(history.merge(actions)).keep_alive(KeepAlive::default())
 }
 
+/// Requests that make vislox talk to the Miniserver carry an `X-Vislox`
+/// header. A page on another site cannot send it without asking first
+/// (CORS), so it cannot make vislox log in, pull or read the log.
+/// The refusal, when the header is missing.
+fn not_from_vislox(headers: &axum::http::HeaderMap) -> Option<Response> {
+    (!headers.contains_key("x-vislox")).then(|| {
+        (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": "missing X-Vislox header" })),
+        )
+            .into_response()
+    })
+}
+
 /// A user turned live values on: after a session that stopped (blocked,
 /// login refused), allow a new one. Reloads and reconnecting streams do not
 /// call this, so they never log in again on their own. Needs the `X-Vislox`
 /// header, so another site cannot make vislox log in.
 async fn api_live_retry(State(app): State<Arc<App>>, headers: axum::http::HeaderMap) -> Response {
-    if !headers.contains_key("x-vislox") {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({ "error": "missing X-Vislox header" })),
-        )
-            .into_response();
+    if let Some(r) = not_from_vislox(&headers) {
+        return r;
     }
     app.live.retry();
     Json(serde_json::json!({ "ok": true })).into_response()
@@ -589,12 +599,8 @@ async fn api_miniserver(State(app): State<Arc<App>>, Query(q): Query<MsQuery>) -
 /// `X-Vislox` header: lox logs in to the Miniserver for it, and another site
 /// must not be able to make it do that.
 async fn api_log(State(app): State<Arc<App>>, headers: axum::http::HeaderMap) -> Response {
-    if !headers.contains_key("x-vislox") {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({ "error": "missing X-Vislox header" })),
-        )
-            .into_response();
+    if let Some(r) = not_from_vislox(&headers) {
+        return r;
     }
     Json(app.log.fetch().await).into_response()
 }
@@ -620,12 +626,8 @@ async fn preflight(app: &App, what: miniserver::Action) -> Option<Response> {
 /// another site cannot send without asking first (CORS), so no other site
 /// can start a pull in this browser.
 async fn api_pull(State(app): State<Arc<App>>, headers: axum::http::HeaderMap) -> Response {
-    if !headers.contains_key("x-vislox") {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({ "error": "missing X-Vislox header" })),
-        )
-            .into_response();
+    if let Some(r) = not_from_vislox(&headers) {
+        return r;
     }
     // A pull already running refuses at once, without a check.
     if app.pull.why_not().is_none()

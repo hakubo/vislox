@@ -19,13 +19,14 @@ use std::time::{Duration, Instant};
 const TIMEOUT: Duration = Duration::from_secs(30);
 /// How many lines to ask for.
 pub const LINES: usize = 300;
-/// A request within this long of the last fetch gets the same result: a
-/// browser that reloads, or two open tabs, do not ask the Miniserver twice.
-const REUSE: Duration = Duration::from_secs(2);
+/// "Program changed by user" and "PRG got restart command" lines this close
+/// together belong to one program change.
+const PAIR: chrono::TimeDelta = chrono::TimeDelta::seconds(2);
 
 pub struct Log {
     cmd: Result<Cmd, String>,
     host: String,
+    /// The last answer (a failure too), and when its `lox log` started.
     last: Mutex<Option<(Instant, Value)>>,
     running: tokio::sync::Mutex<()>,
 }
@@ -73,20 +74,25 @@ impl Log {
         }
     }
 
-    /// The log, fetched now (or within the last 2 s). A failure is part of
-    /// the answer (`error`), with the entries of the last fetch that worked.
+    /// The log, read after this request came in. A failure is part of the
+    /// answer (`error`), with the entries of the last read that worked.
+    /// One `lox log` at a time: requests that come in while one runs share
+    /// the next, so two tabs, or a refresh during an Apply, do not each ask
+    /// the Miniserver (or each wait out its timeout when it is down), and
+    /// none gets a log that was read before it asked.
     pub async fn fetch(&self) -> Value {
         let cmd = match &self.cmd {
             Ok(c) => c,
             Err(why) => return json!({ "available": false, "reason": why }),
         };
-        // One fetch at a time; a request that waited gets its result.
+        let asked = Instant::now();
         let _one = self.running.lock().await;
-        if let Some((at, v)) = self.last.lock().unwrap().as_ref()
-            && at.elapsed() < REUSE
+        if let Some((started, v)) = self.last.lock().unwrap().as_ref()
+            && *started >= asked
         {
             return v.clone();
         }
+        let started = Instant::now();
         let now = chrono::Utc::now().timestamp();
         let v = match run(cmd).await {
             Ok(text) => {
@@ -113,10 +119,10 @@ impl Log {
                     );
                 v["error"] = json!(crate::reason::explain(&e));
                 v["failed"] = json!(now);
-                return v;
+                v
             }
         };
-        *self.last.lock().unwrap() = Some((Instant::now(), v.clone()));
+        *self.last.lock().unwrap() = Some((started, v.clone()));
         v
     }
 }
@@ -213,6 +219,7 @@ fn is_time(s: &str) -> bool {
 
 fn kind(text: &str) -> &'static str {
     if is_program_change(text)
+        || is_restart_command(text)
         || text.starts_with("PRG Start ")
         || text.starts_with("PRG start program")
         || text.starts_with("Program started")
@@ -230,21 +237,38 @@ fn kind(text: &str) -> &'static str {
     }
 }
 
-/// What a deployed config leaves in the log: `lox config push` (Apply) and
-/// a save from Loxone Config both write these when the new program loads.
+/// What a new program leaves in the log: `lox config push` (Apply) and a save
+/// from Loxone Config both write it when the Miniserver takes the new program.
+/// A reboot or a plain program restart does not.
 fn is_program_change(text: &str) -> bool {
-    text.starts_with("Program changed by user") || text.starts_with("PRG got restart command")
+    text.starts_with("Program changed by user")
+}
+
+/// Written with a program change, but also by a plain program restart.
+fn is_restart_command(text: &str) -> bool {
+    text.starts_with("PRG got restart command")
+}
+
+fn time(at: &str) -> Option<chrono::NaiveDateTime> {
+    chrono::NaiveDateTime::parse_from_str(at, "%Y-%m-%d %H:%M:%S%.f").ok()
 }
 
 /// The index of the first entry of the last program change: what came after
-/// it is what the deployed config did. `None` when the lines hold none.
+/// it is what the new program did. `None` when the lines hold none.
 pub fn last_program_change(entries: &[Entry]) -> Option<usize> {
     let last = entries.iter().rposition(|e| is_program_change(&e.text))?;
-    // "Program changed by user" and "PRG got restart command" come together:
-    // start at the first of the pair.
+    // The restart command that comes with it may be logged first, a moment
+    // earlier: start the change there.
     let mut i = last;
-    while i > 0 && is_program_change(&entries[i - 1].text) && entries[i - 1].at == entries[last].at
-    {
+    while i > 0 {
+        let prev = &entries[i - 1];
+        let close = match (time(&prev.at), time(&entries[i].at)) {
+            (Some(a), Some(b)) => b - a <= PAIR && b >= a,
+            _ => false,
+        };
+        if !close || !(is_program_change(&prev.text) || is_restart_command(&prev.text)) {
+            break;
+        }
         i -= 1;
     }
     Some(i)
@@ -356,10 +380,40 @@ mod tests {
         let e = parse(SAMPLE);
         assert_eq!(last_program_change(&e), Some(2));
         assert_eq!(last_program_change(&e[..2]), None);
-        // A restart without a new program is not a program change.
-        let r = parse("2026-11-06 10:57:06.255;PRG Start 17.2.10.21\n");
+        // A reboot, or a program restart without a new program, is not a
+        // program change.
+        let r = parse(
+            "2026-11-06 00:33:33.801;Restart SPS by user 'Jakub'\n\
+             2026-11-06 00:33:40.000;PRG got restart command; user: Jakub(192.168.1.123)\n\
+             2026-11-06 10:57:06.255;PRG Start 17.2.10.21\n",
+        );
         assert_eq!(last_program_change(&r), None);
-        assert_eq!(r[0].kind, "program");
+        assert!(r.iter().all(|e| e.kind == "program"));
+        // A restart after the last program change does not move it.
+        let mut e = parse(SAMPLE);
+        e.extend(r);
+        assert_eq!(last_program_change(&e), Some(2));
+    }
+
+    #[test]
+    fn a_program_change_logged_a_moment_apart_stays_one() {
+        let at = |a: &str, b: &str| {
+            parse(&format!(
+                "2026-11-06 00:20:00.000;PRG got restart command; user: Jakub\n\
+                 {a};PRG got restart command; user: Jakub\n\
+                 {b};Program changed by user 'Jakub'\n\
+                 2026-11-06 00:23:34.971;PRG start program\n"
+            ))
+        };
+        // The restart command a millisecond before: one change, from there.
+        let e = at("2026-11-06 00:23:32.566", "2026-11-06 00:23:32.567");
+        assert_eq!(last_program_change(&e), Some(1));
+        // Within 2 s still; an older restart command is not part of it.
+        let e = at("2026-11-06 00:23:30.900", "2026-11-06 00:23:32.567");
+        assert_eq!(last_program_change(&e), Some(1));
+        // Further apart: the change starts at its own line.
+        let e = at("2026-11-06 00:23:29.000", "2026-11-06 00:23:32.567");
+        assert_eq!(last_program_change(&e), Some(2));
     }
 
     #[test]
@@ -422,5 +476,82 @@ printf '%s' "{SAMPLE}""#
                 .unwrap()
                 .contains("no config")
         );
+    }
+
+    /// A stand-in lox that counts its runs, takes 300 ms, and then prints
+    /// its run number (or fails with it).
+    #[cfg(unix)]
+    fn counting(tmp: &Path, fail: bool) -> Log {
+        use std::os::unix::fs::PermissionsExt;
+        let lox = tmp.join("lox");
+        let count = tmp.join("count");
+        let end = if fail {
+            "echo \"down $n\" >&2; exit 1"
+        } else {
+            "echo \"2026-11-06 10:00:00.000;run $n\""
+        };
+        std::fs::write(
+            &lox,
+            format!(
+                "#!/bin/sh\nn=$(cat '{c}' 2>/dev/null || echo 0); n=$((n+1)); echo $n > '{c}'\nsleep 0.3\n{end}\n",
+                c = count.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&lox, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let f = Found {
+            conn: loxone_client::Connection::new("https://192.168.1.120", "u", "p"),
+            from: "test".into(),
+            ctx: None,
+            config_repo: None,
+            ms_dir: "192_168_1_120".into(),
+            serial: None,
+        };
+        Log::new(&lox, None, Ok(&f), tmp)
+    }
+
+    #[cfg(unix)]
+    fn runs(tmp: &Path) -> String {
+        std::fs::read_to_string(tmp.join("count"))
+            .unwrap()
+            .trim()
+            .to_string()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_request_never_gets_a_log_read_before_it_asked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let l = counting(tmp.path(), false);
+        let later = || async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            l.fetch().await
+        };
+        // Two requests while the first read runs: they share the next one.
+        let (a, b, c) = tokio::join!(l.fetch(), later(), later());
+        let text = |v: &Value| v["entries"][0]["text"].as_str().unwrap().to_string();
+        assert_eq!(text(&a), "run 1");
+        assert_eq!(text(&b), "run 2");
+        assert_eq!(text(&c), "run 2");
+        assert_eq!(runs(tmp.path()), "2");
+        // A request after that reads again.
+        assert_eq!(text(&l.fetch().await), "run 3");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn requests_waiting_on_a_failing_read_share_its_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let l = counting(tmp.path(), true);
+        let later = || async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            l.fetch().await
+        };
+        let (a, b, c) = tokio::join!(l.fetch(), later(), later());
+        assert!(a["error"].as_str().unwrap().contains("down 1"), "{a}");
+        assert!(b["error"].as_str().unwrap().contains("down 2"), "{b}");
+        assert_eq!(b, c);
+        // Two runs, not one for each request.
+        assert_eq!(runs(tmp.path()), "2");
     }
 }
