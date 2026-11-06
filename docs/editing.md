@@ -52,7 +52,9 @@ POST /api/edit
   `add_block` it is null, and `remove_block` with the new UUID undoes it. For `move` it is the `move` back to
   where the block was; for `relayout`, the list of `move`s that put each block back. For `wire` it is the
   `unwire` of the same ends, and for `unwire` the `wire`. A reconnected wire is one request, `unwire` then `wire`:
-  undone, the reverse list. That is all #62 needs from the server. The history itself can live in the browser.
+  undone, the reverse list. The ops of one request see each other: `unwire` then `wire` of the same wire is
+  accepted (and changes nothing). `remove_block`'s `add_block` carries the wires the removal took out
+  (`wires`, an empty UUID for the block itself), since lox mints new UUIDs when it is added again. That is all #62 needs from the server. The history itself can live in the browser.
 - All ops of one request are checked first, then written and compiled once. If anything fails, or the request
   goes away mid-compile (a closed tab), the file, the lock and `out.Loxone` are put back as they were.
 - **An edit never takes along someone else's uncompiled changes.** The compile covers the whole module, so
@@ -172,10 +174,20 @@ vx_and_1.In1 <- vx_10000006_0000_0060_ffff504f94000001.AQ
   to Loxone Config); and an input with a constant edited here is cleared first (lox refuses a constant and a wire
   on one port of a declaration). Both ends must be in the base lox compiles against.
 - Types: Loxone Config wires digital and analog connectors to each other (a value other than 0 is on), but text
-  only to text. vislox tells them by the connector key (`TQ…`, `Txt`, `Text` are text; `AQ`, `AI`, … analog), by a
-  reference's `Text="true"` or `Analog="true"`, and a virtual text input is text. The page sends each port's kind
-  (`kind` on a port) so the browser marks the targets while dragging; the server checks again.
-- Taking out a block added here takes its wires with it.
+  only to text, and lox does not check it on an extern. vislox takes what a connector carries from what is known:
+  a reference's `Text="true"` or `Analog="true"`; the value of the objects lox mints references for (virtual
+  inputs, sensors and actuators, a memory flag by its `Tp=`); the text connectors of lox's port table (`TQ…`,
+  `OutText`, `Text`, `inText`, `TTS`, `TM`, `TI`); and any other connector of lox's port table as analog by its key
+  (`AQ`, `AI`, …) or digital. A connector none of these knows is *unknown*, and a wire to it is refused rather than
+  guessed. The page sends each port's kind (`kind` on a port) so the browser marks the targets while dragging; the
+  server checks again.
+- Who draws a wire vislox's file does not: the rest of the module, for a wire lox tracks onto an extern
+  (`extern_wires`) or one into a block the module declares, else Loxone Config. `unwire` refuses by this rule, and
+  `GET /api/edits` sends the module's wires (`module_wires`) and both reasons (`wire_why`) so the card says the
+  same.
+- Taking out a block added here takes its wires with it; its undo (`previous`) draws them again.
+- A wire in the file whose end is neither an extern of `edits.loxl` nor a block vislox added (its line deleted by
+  hand) is refused when the files are read, naming the wire: it would break every compile.
 - In the pending revision the Changes list and the canvas show a wire added (green) or removed (red, dashed), as
   for any compile. Discard drops them with the rest; Apply deploys them (`lox config push` compiles the module).
 
@@ -282,7 +294,8 @@ Around the module: #64 (mark managed blocks), #65 (`lox logic check` errors), #6
   and the drop is compiled. Properties shows *moved, not deployed* with *Revert* (back to the deployed position),
   and the Deploy pane counts the blocks moved. Dragging any other block pans the page, as before.
 - A wire is drawn by dragging from a port to a port on another block, an output to an input either way round
-  (the newest revision, with editing on). While dragging, the ports it may end at are blue and those it may not
+  (the newest revision, with editing on). A port's target is the size of its stub; a click on it without a drag
+  selects its block. While dragging, the ports it may end at are blue and those it may not
   red, with the reason on hover; dropping on one of those says why and sends nothing. The drop is compiled.
 - Clicking a wire opens its card: its ends and kind, and *Delete* (also the Delete key) and the ends to drag
   elsewhere for a wire vislox drew, *Revert* for one drawn or taken out here and not deployed, or why it cannot be
@@ -296,6 +309,8 @@ Around the module: #64 (mark managed blocks), #65 (`lox logic check` errors), #6
   it), the other blocks the module manages, the blocks lox can move (`movable`: managed and drawn on a page) and
   those the pending config draws elsewhere than the deployed one (`moves`: UUID, position, deployed position),
   for each page with such a block whether *Arrange* can lay it out (`arrange`: page UUID → null, or why not), and
-  the wires vislox's files draw now or drew in the deployed revision (`wires`: `from`, `to`, `now`, `deployed`). It
+  the wires vislox's files draw now or drew in the deployed revision (`wires`: `from`, `to`, `now`, `deployed`), the
+  wires the rest of the module draws (`module_wires`), and why vislox leaves those and Loxone Config's alone
+  (`wire_why`). It
   is worked out again only when vislox's files, the lockfile, the deployed or
   the pending config changes (`actions.edit.key`); the browser fetches it only then.

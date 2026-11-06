@@ -2748,20 +2748,34 @@ function moveRows(o, row) {
 // to an input, either way round), reconnected by dragging an end of a wire vislox drew, and taken out
 // with Delete. The server writes it as `to <- from` into vislox's file of the module (docs/editing.md)
 // and compiles: it shows as the pending revision, like any edit. lox removes only the wires its source
-// draws, so a wire Loxone Config drew says so instead of offering Delete.
-let WR = null; // the wire being drawn or reconnected: { fixed: { o, q }, old, moving, hot, … }
+// draws, so a wire Loxone Config or the rest of the module drew says so instead of offering Delete.
+let WR = null; // the wire being drawn or reconnected: { fixed: { o, q }, re, moved, hot, path }
+let WI = null; // the page shown, indexed for wiring: { objs: uuid → object, wired: "from>to" keys }
 S.wrBusy = false;
-S.wsel = null; // the wire whose card is open: { from, to }, and where the card is
-/** Whether wires can be drawn now: the add state (newest revision, editing on), else null. */
-function wireState() {
+S.wsel = null; // the wire whose card is open: { from, to, at }
+S.wmsg = null; // a message in the card: { at }
+/** Why wires cannot be drawn now, or null. */
+function wireWhy() {
   const st = addState();
-  return st?.ok && !S.mvBusy && !S.wrBusy ? st : null;
+  if (!st) return "Editing is off.";
+  if (!st.ok) return st.why;
+  if (S.mvBusy || S.wrBusy) return "Another edit is compiling; wire again when it is done.";
+  return null;
 }
+/** Whether wires can be drawn now: the add state (newest revision, editing on), else null. */
+function wireState() { return wireWhy() ? null : addState(); }
 const sameEnd = (a, b) => a[0] === b[0] && a[1] === b[1];
+const wireKey = (f, t) => `${f[0]}|${f[1]}>${t[0]}|${t[1]}`;
 /** What /api/edits says of the wire `w`: drawn by vislox's file now and/or when deployed; null: neither. */
 function editsWire(w) { return (S.edits?.wires || []).find((x) => sameEnd(x.from, w.from) && sameEnd(x.to, w.to)) || null; }
 /** The wires vislox drew or took out and has not deployed yet. */
 function editsWires() { return (S.edits?.wires || []).filter((w) => w.now !== w.deployed); }
+/** Who draws the wire `w`, by the server's rule (the one `unwire` refuses by): `vislox`, `module` or
+ *  `loxone_config`. */
+function wireOwner(w) {
+  if (editsWire(w)?.now) return "vislox";
+  return (S.edits?.module_wires || []).some((x) => sameEnd(x.from, w.from) && sameEnd(x.to, w.to)) ? "module" : "loxone_config";
+}
 /** The ports of `o` a wire can start or end at, as the page draws them. */
 function wrPorts(o) {
   if (o.moved_to || o.ty === "Text") return [];
@@ -2780,8 +2794,9 @@ function wrWhy(a, b) {
   if (a.q.side !== "R" || b.q.side !== "L") return "A wire goes from an output (on a block's right side) to an input (on its left side).";
   for (const e of [a, b]) if (S.edits?.managed?.includes(e.o.uuid)) return `The project's module manages ${displayTitle(e.o)}: wire it in its .loxl file.`;
   if (b.q.inv) return `${lbl(b)} is inverted in Loxone Config, which owns that input; lox does not wire it.`;
-  if ((a.q.kind === "text") !== (b.q.kind === "text")) return `${lbl(a)} is a ${a.q.kind || "digital"} output and ${lbl(b)} a ${b.q.kind || "digital"} input: Loxone Config wires text only to text.`;
-  if (curPage()?.wires.some((w) => sameEnd(w.from, [a.o.uuid, a.q.key]) && sameEnd(w.to, [b.o.uuid, b.q.key]) && w.status !== "removed")) return `${lbl(a)} is already wired to ${lbl(b)}.`;
+  for (const e of [a, b]) if (e.q.kind === "unknown") return `vislox cannot tell whether ${lbl(e)} carries text, a number or on/off (lox's port table does not list it); wire it in Loxone Config.`;
+  if ((a.q.kind === "text") !== (b.q.kind === "text")) return `${lbl(a)} is a ${a.q.kind} output and ${lbl(b)} a ${b.q.kind} input: Loxone Config wires text only to text.`;
+  if (WI?.wired.has(wireKey([a.o.uuid, a.q.key], [b.o.uuid, b.q.key]))) return `${lbl(a)} is already wired to ${lbl(b)}.`;
   return null;
 }
 /** Page coordinates of a mouse event. */
@@ -2789,34 +2804,42 @@ function pagePt(e) {
   const r = svg.getBoundingClientRect(), v = S.vp[S.page];
   return [(e.clientX - r.left - v.x) / v.k, (e.clientY - r.top - v.y) / v.k];
 }
-/** Draw the port targets (and the open card's end handles) over the page. */
+/** Draw the port targets (and the open card's end handles) over the page. Each is the size of its port's
+ *  stub, so clicks beside it reach the block or wire below; a click on one selects its block. */
 function wrDraw(p) {
   L.ports = el("g", { class: "wr-layer" }, vpG);
+  WI = { objs: new Map(p.objects.filter((o) => !o.moved_to).map((o) => [o.uuid, o])), wired: new Set(p.wires.filter((w) => w.status !== "removed").map((w) => wireKey(w.from, w.to))) };
   // A card of a wire this page does not draw (another page, a new revision) closes.
   if (S.wsel && !p.wires.some((x) => sameEnd(x.from, S.wsel.from) && sameEnd(x.to, S.wsel.to))) { S.wsel = null; wcard.classList.add("hidden"); }
-  if (!wireState()) { wcardPlace(); return; }
-  for (const o of p.objects) {
-    for (const q of wrPorts(o)) {
-      const [cx, cy] = stubAt(q);
-      const c = el("circle", { class: "port-hit", cx, cy, r: 90, "data-port": `${o.uuid}|${q.key}`, "data-side": q.side }, L.ports);
-      c.addEventListener("mousedown", (e) => wrStart(e, { o, q }, null));
-      hoverTip(c, () => `<b>${esc(displayTitle(o))}</b>.${esc(q.name)} <span class="tm">${q.side === "L" ? "input" : "output"} · ${q.kind || "digital"}</span><br>Drag to ${q.side === "L" ? "an output" : "an input"} to wire it.`);
+  if (wireState()) {
+    for (const o of p.objects) {
+      for (const q of wrPorts(o)) {
+        const [cx, cy] = stubAt(q);
+        const c = el("circle", { class: "port-hit", cx, cy, r: 50, "data-port": `${o.uuid}|${q.key}`, "data-side": q.side }, L.ports);
+        c.addEventListener("mousedown", (e) => wrStart(e, { o, q }, null));
+        hoverTip(c, () => `<b>${esc(displayTitle(o))}</b>.${esc(q.name)} <span class="tm">${q.side === "L" ? "input" : "output"} · ${q.kind}</span><br>Drag to ${q.side === "L" ? "an output" : "an input"} to wire it.`);
+      }
     }
   }
-  // The open card's wire, if vislox drew it: its ends can be dragged elsewhere.
-  const w = S.wsel && p.wires.find((x) => sameEnd(x.from, S.wsel.from) && sameEnd(x.to, S.wsel.to) && x.status !== "removed");
-  if (w && editsWire(w)?.now) {
-    const objs = new Map(p.objects.map((o) => [o.uuid, o]));
-    for (const [end, pt] of [["from", w.points[0]], ["to", w.points[w.points.length - 1]]]) {
-      const other = end === "from" ? w.to : w.from, o = objs.get(other[0]), q = o?.ports.find((x) => x.key === other[1]);
-      if (!q) continue;
-      const h = el("circle", { class: "wire-end", cx: pt[0], cy: pt[1], r: 80, "data-end": end }, L.ports);
-      h.addEventListener("mousedown", (e) => wrStart(e, { o, q }, { w, moving: end }));
-      hoverTip(h, "Drag this end to another port to reconnect the wire.");
-    }
-  }
+  wrHandles();
   if (WR) wrMark();
   wcardPlace();
+}
+/** The open card's wire, if vislox drew it: its ends can be dragged elsewhere. Only these are redrawn
+ *  when the card opens or closes. */
+function wrHandles() {
+  if (!L.ports) return;
+  L.ports.querySelectorAll(".wire-end").forEach((n) => n.remove());
+  const p = curPage();
+  const w = S.wsel && wireState() && p?.wires.find((x) => sameEnd(x.from, S.wsel.from) && sameEnd(x.to, S.wsel.to) && x.status !== "removed");
+  if (!w || wireOwner(w) !== "vislox") return;
+  for (const [end, pt] of [["from", w.points[0]], ["to", w.points[w.points.length - 1]]]) {
+    const other = end === "from" ? w.to : w.from, o = WI.objs.get(other[0]), q = o?.ports.find((x) => x.key === other[1]);
+    if (!q) continue;
+    const h = el("circle", { class: "wire-end", cx: pt[0], cy: pt[1], r: 60, "data-end": end }, L.ports);
+    h.addEventListener("mousedown", (e) => wrStart(e, { o, q }, { w, moving: end }));
+    hoverTip(h, "Drag this end to another port to reconnect the wire.");
+  }
 }
 /** Begin drawing a wire from `fixed`; `re`: reconnecting the wire `re.w`, whose `re.moving` end follows. */
 function wrStart(e, fixed, re) {
@@ -2836,8 +2859,7 @@ function wrMark() {
   WR.path = el("path", { class: "wire-draft" }, L.ports);
   WR.hot = null;
   const want = WR.fixed.q.side === "L" ? "R" : "L";
-  for (const c of L.ports.querySelectorAll(".port-hit")) {
-    if (c.dataset.side !== want) continue;
+  for (const c of L.ports.querySelectorAll(`.port-hit[data-side="${want}"]`)) {
     const t = wrTarget(c);
     c.classList.add(t && !wrCheck(t) ? "cand" : "bad");
   }
@@ -2845,10 +2867,10 @@ function wrMark() {
 /** The page object and port a target circle stands for. */
 function wrTarget(c) {
   const [uuid, key] = c.dataset.port.split("|");
-  const o = curPage()?.objects.find((x) => x.uuid === uuid && !x.moved_to), q = o?.ports.find((x) => x.key === key);
+  const o = WI?.objs.get(uuid), q = o?.ports.find((x) => x.key === key);
   return q ? { o, q } : null;
 }
-/** Why the drag may not end at `t`, or null: as an output → input wire, either way round. */
+/** Why the drag `d` may not end at `t`, or null: as an output → input wire, either way round. */
 function wrCheck(t, d = WR) {
   const f = d.fixed;
   const [a, b] = f.q.side === "R" ? [f, t] : [t, f];
@@ -2880,10 +2902,13 @@ window.addEventListener("mouseup", (e) => {
   WR = null;
   svg.classList.remove("wiring");
   hideTip();
+  // A press on a port without a drag is a click on its block.
+  if (!w.moved) { w.path?.remove(); if (!w.re) select(w.fixed.o.uuid); return; }
   // A drag is not a click on the page; a stale one would pan it on the next move.
-  if (w.moved) { const d = (drag = { moved: true, x: e.clientX, y: e.clientY }); setTimeout(() => { if (drag === d) drag = null; }, 0); }
-  const t = w.moved && w.hot && wrTarget(w.hot);
-  const why = t && wrCheck(t, w);
+  const d = (drag = { moved: true, x: e.clientX, y: e.clientY });
+  setTimeout(() => { if (drag === d) drag = null; }, 0);
+  const t = w.hot && wrTarget(w.hot);
+  const why = t ? wrCheck(t, w) : null;
   if (!t || why) {
     renderPage();
     if (why) wcardMsg(e, why, true);
@@ -2894,14 +2919,15 @@ window.addEventListener("mouseup", (e) => {
   const ops = [];
   if (w.re) ops.push({ op: "unwire", from: w.re.w.from, to: w.re.w.to });
   ops.push({ op: "wire", from: [a.o.uuid, a.q.key], to: [b.o.uuid, b.q.key] });
-  // Drawn at once, routed again by the compile.
-  wcardMsg(e, w.re ? "Reconnecting: compiling…" : "Wiring: compiling…");
-  wrSend(ops, w.re ? "Reconnected" : "Wired", e);
+  wrSend(ops, w.re ? "Reconnected" : "Wired", e, w.re ? "Reconnecting: compiling…" : "Wiring: compiling…");
 });
-/** Send wire ops; the reply's pending revision is shown, a refusal in the card. */
-async function wrSend(ops, done, at) {
-  const st = wireState();
-  if (!st) return;
+/** Send wire ops; the reply's pending revision is shown, a refusal (or why nothing can be sent now) in
+ *  the card at the mouse (`at`). `busy`: the card's text while it compiles. */
+async function wrSend(ops, done, at, busy) {
+  const why = wireWhy();
+  if (why) { renderPage(); wcardMsg(at, why, true); return; }
+  const st = addState();
+  wcardMsg(at, busy || "Compiling…");
   S.wrBusy = true; renderAddHud();
   try {
     const res = await act("/api/edit", { base: st.rev.blob, ops });
@@ -2926,10 +2952,10 @@ wcard.className = "wcard hidden";
 wcard.setAttribute("role", "dialog");
 wcard.setAttribute("aria-label", "Wire");
 $("canvas-wrap").appendChild(wcard);
-/** Where the card sits, relative to the canvas, from a mouse event. */
+/** Where the card sits, relative to the canvas: at a mouse event, else where it was. */
 function wcardAt(e) {
   const r = $("canvas-wrap").getBoundingClientRect();
-  return e ? [e.clientX - r.left, e.clientY - r.top] : S.wsel?.at || [16, 16];
+  return e?.clientX != null ? [e.clientX - r.left, e.clientY - r.top] : (S.wsel || S.wmsg)?.at || [16, 16];
 }
 function wcardPlace() {
   const at = (S.wsel || S.wmsg)?.at;
@@ -2940,21 +2966,22 @@ function wcardPlace() {
 }
 /** A message in the card at the mouse (`e`), or none. */
 function wcardMsg(e, text, error) {
+  const at = wcardAt(e);
   S.wsel = null;
-  if (!text) { S.wmsg = null; wcard.classList.add("hidden"); return; }
-  S.wmsg = { at: wcardAt(e) };
+  if (!text) { S.wmsg = null; wcard.classList.add("hidden"); wrHandles(); return; }
+  S.wmsg = { at };
   wcard.innerHTML = `<div class="wc-msg${error ? " err" : ""}" role="status">${esc(text)}</div>` + (error ? '<div class="wc-bar"><button type="button" class="ed-btn small" data-wc="close">Close</button></div>' : "");
   wcard.classList.remove("hidden");
+  wrHandles();
   wcardPlace();
 }
 /** Open the card of the wire `w` (as the page draws it), clicked at `e`. */
 function wcardOpen(e, w) {
   S.wmsg = null;
   S.wsel = { from: w.from, to: w.to, at: wcardAt(e) };
-  const p = curPage(), objs = new Map(p.objects.map((o) => [o.uuid, o]));
-  const fo = objs.get(w.from[0]), to = objs.get(w.to[0]);
+  const fo = WI?.objs.get(w.from[0]), to = WI?.objs.get(w.to[0]);
   const q = fo?.ports.find((x) => x.key === w.from[1]);
-  const x = editsWire(w), st = wireState();
+  const x = editsWire(w), st = wireState(), who = wireOwner(w);
   const removed = w.status === "removed";
   let what, btn = "";
   if (x?.now && !x.deployed) {
@@ -2968,26 +2995,25 @@ function wcardOpen(e, w) {
     btn = '<button type="button" class="ed-btn small" data-wc="rewire" title="Draw the wire again, as deployed">Revert</button>';
   } else if (removed) {
     what = '<span class="tm">Not in this revision.</span>';
-  } else if ([fo, to].some((o) => o && S.edits?.managed?.includes(o.uuid))) {
-    what = "<span class=\"tm\">The project's module draws this wire: change it in its .loxl file.</span>";
   } else {
-    what = '<span class="tm">Drawn in Loxone Config. lox removes only the wires its source draws: remove it in Loxone Config.</span>';
+    what = `<span class="tm">${esc(S.edits?.wire_why?.[who] || "")}</span>`;
   }
-  const why = !st && S.hist?.actions?.shown ? addState()?.why : "";
+  const why = S.hist?.actions?.shown ? wireWhy() : "";
   wcard.innerHTML = `<div class="wc-head"><b>${esc(fo ? displayTitle(fo) : "")}</b>.${esc(portName(fo, w.from[1]))} → <b>${esc(to ? displayTitle(to) : "")}</b>.${esc(portName(to, w.to[1]))}</div>` +
     `<div class="wc-sub tm">${esc(q?.kind || (w.analog ? "analog" : "digital"))}${w.status ? " · " + esc(w.status) : ""}</div>` +
     `<div class="wc-what">${what}</div>` +
-    (x?.now && !removed && st ? '<div class="wc-note tm">Drag an end of the wire to another port to reconnect it.</div>' : "") +
-    (why ? `<div class="wc-note tm">${esc(why)}</div>` : "") +
+    (who === "vislox" && !removed && st ? '<div class="wc-note tm">Drag an end of the wire to another port to reconnect it.</div>' : "") +
+    (why && btn ? `<div class="wc-note tm">${esc(why)}</div>` : "") +
     `<div class="wc-bar">${st ? btn : ""}<button type="button" class="ed-btn small" data-wc="close">Close</button></div>`;
   wcard.classList.remove("hidden");
-  renderPage();
+  wrHandles();
+  wcardPlace();
 }
 function wcardClose() {
   S.wsel = null; S.wmsg = null;
   if (wcard.classList.contains("hidden")) return false;
   wcard.classList.add("hidden");
-  renderPage();
+  wrHandles();
   return true;
 }
 /** Delete (or Revert) the wire whose card is open. */

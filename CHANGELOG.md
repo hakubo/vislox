@@ -23,7 +23,7 @@ published under the same version (see [docker/README.md](docker/README.md)).
   here to reconnect it, and click a wire for its card with Delete. vislox writes each wire as `to <- from` into
   `<module>/vislox/edits.loxl` and runs `lox logic compile`; it shows in the pending revision and the Changes list
   as added or removed, with Revert. A link Loxone Config would not have (an input to an input, text into a number,
-  an inverted input, a pair already wired) is refused with the reason. A wire Loxone Config drew cannot be taken
+  an inverted input, a pair already wired, a connector vislox cannot tell the kind of) is refused with the reason. A wire Loxone Config drew cannot be taken
   out: lox removes only the wires its source draws. Never deploys (#61).
 - Fixed: Discard failed when the last commit had no lockfile (the first compile writes one), or one was staged
   but not committed. Discard now reads the last commit, never deletes a lock vislox did not write (one not in git

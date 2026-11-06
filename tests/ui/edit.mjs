@@ -475,6 +475,32 @@ try {
     await page.keyboard.press("Escape");
     await page.waitForSelector("#wcard.hidden", { state: "attached" });
   });
+  await step("a click on a port, without a drag, selects its block", async () => {
+    const n = edits.length;
+    await page.evaluate(() => select(null));
+    const [x, y] = await portBox(METER, "Pf");
+    await page.mouse.click(x, y);
+    await page.waitForFunction((u) => S.sel === u, METER);
+    assert.equal(edits.length, n);
+    assert.equal(await page.locator("#canvas .wire-draft").count(), 0);
+  });
+  await step("a drop while another edit compiles says so, and the card does not hang", async () => {
+    const n = edits.length;
+    const [x0, y0] = await portBox(AND, "Q"), [x1, y1] = await portBox(DIV, "Input2");
+    await page.mouse.move(x0, y0);
+    await page.mouse.down();
+    await page.mouse.move((x0 + x1) / 2, (y0 + y1) / 2, { steps: 6 });
+    await page.mouse.move(x1, y1, { steps: 6 });
+    // A move starts compiling before the mouse is let go.
+    await page.evaluate(() => { S.mvBusy = true; });
+    await page.mouse.up();
+    await waitText("#wcard .wc-msg.err", /Another edit is compiling/);
+    assert.equal(edits.length, n);
+    assert.equal(await page.locator("#canvas .wire-draft").count(), 0);
+    await page.evaluate(() => { S.mvBusy = false; renderPage(); });
+    await page.click('#wcard [data-wc="close"]');
+    await page.waitForSelector("#wcard.hidden", { state: "attached" });
+  });
   await step("a wire Loxone Config drew says so, and offers no Delete", async () => {
     await clickWire([AND, "Q"], [METER, "Pf"]);
     await waitText("#wcard", /Drawn in Loxone Config/);

@@ -167,7 +167,7 @@ pub struct PPort {
     pub inv: bool,
     pub status: &'static str,
     /// What it carries (#61): a wire joins text only to text.
-    pub kind: Option<crate::edit::Signal>,
+    pub kind: crate::edit::Signal,
 }
 
 #[derive(Serialize)]
@@ -1308,7 +1308,7 @@ fn page_view(c: &Ctx, old: Option<&Ctx>, uuid: &str, d: &Delta, gone: bool) -> O
                 y,
                 def: pv.and_then(|v| v.def.clone()),
                 inv: pv.is_some_and(|v| v.inv),
-                kind: el.map(|e| crate::edit::signal(e, &p.key)),
+                kind: crate::edit::signal(&g.block_type, el, &p.key),
                 status: if d.on && d.params.contains_key(&(g.uuid.clone(), p.key.clone())) {
                     CHANGED
                 } else {

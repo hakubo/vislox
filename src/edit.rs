@@ -77,6 +77,10 @@ pub enum Op {
         /// Setting (`Formula`, `Type`, `At`, …) → value.
         #[serde(default)]
         settings: BTreeMap<String, String>,
+        /// Wires (#61) to draw with it; an empty UUID is this block. The
+        /// `previous` of a `remove_block` carries the wires it took out.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        wires: Vec<Ends>,
     },
     /// Take out a block added here that is not deployed yet. Its `previous`
     /// is the `add_block` that adds it again.
@@ -947,6 +951,20 @@ impl Files {
                 );
             }
         }
+        // Every end of a wire is an extern of the claims file or a block
+        // vislox added; anything else would break every compile.
+        for w in &f.claims.1 {
+            for (s, _) in [&w.from, &w.to] {
+                let ext = f.claims.0.keys().any(|u| slug(u) == *s);
+                if !ext && f.block(s).is_none() {
+                    return Err(format!(
+                        "{CLAIMS}: the wire `{}` names `{s}`, which is neither an extern of this \
+                         file nor a block vislox added; put its line back or delete the wire",
+                        w.render()
+                    ));
+                }
+            }
+        }
         Ok(f)
     }
 
@@ -1130,6 +1148,10 @@ pub struct Ctx<'a> {
     pub deployed: Option<&'a LoxoneDoc>,
     /// The names the module's other files declare.
     pub names: &'a BTreeSet<String>,
+    /// The wires vislox's file drew when the request began: one the
+    /// pending config has and an earlier op of the request took out is not
+    /// wired any more (#61).
+    pub drawn: &'a BTreeSet<Wire>,
 }
 
 /// What [`apply_op`] did: the value or op that undoes it (`previous`),
@@ -1224,6 +1246,7 @@ fn add_block(files: &mut Files, ctx: &Ctx, op: &Op) -> Result<Applied, String> {
         title,
         params,
         settings,
+        wires,
     } = op
     else {
         unreachable!()
@@ -1296,12 +1319,26 @@ fn add_block(files: &mut Files, ctx: &Ctx, op: &Op) -> Result<Applied, String> {
         ..PageFile::new(&page_title)
     });
     f.page = page_title;
-    f.blocks.push(NewBlock {
+    let b = NewBlock {
         slug: slug.clone(),
         ty: ty.clone(),
         title,
         args,
-    });
+    };
+    f.blocks.push(b.clone());
+    // Its wires (an undone removal's): an empty UUID is this block.
+    let mut geo = Geo::new();
+    for w in wires {
+        let mut at = |e: &[String; 2]| {
+            if e[0].is_empty() {
+                new_end(&b, &e[1])
+            } else {
+                end(files, ctx, e, &mut geo)
+            }
+        };
+        let (src, dst) = (at(&w.from)?, at(&w.to)?);
+        connect(files, ctx, &src, &dst)?;
+    }
     Ok(Applied {
         previous: serde_json::Value::Null,
         added: Some(slug),
@@ -1344,12 +1381,36 @@ fn remove_block(files: &mut Files, ctx: &Ctx, uuid: &str) -> Result<Applied, Str
         }
     };
     let (params, settings) = split_args(&b);
+    // Its wires, which go with it: drawn again when it is added again.
+    let here = |e: &(String, String)| -> Option<[String; 2]> {
+        if e.0 == slug {
+            Some([
+                String::new(),
+                port_names::key_or_raw(&b.ty, &e.1).to_string(),
+            ])
+        } else {
+            wire_end_at(files, ctx.lock, e)
+        }
+    };
+    let wires = files
+        .claims
+        .1
+        .iter()
+        .filter(|w| w.touches(&slug))
+        .filter_map(|w| {
+            Some(Ends {
+                from: here(&w.from)?,
+                to: here(&w.to)?,
+            })
+        })
+        .collect();
     let again = Op::AddBlock {
         page,
         ty: b.ty.clone(),
         title: b.title.clone(),
         params,
         settings,
+        wires,
     };
     let p = files.pages.get_mut(&file).expect("found");
     p.blocks.retain(|x| x.slug != slug);
@@ -1616,13 +1677,16 @@ pub fn moves_missed(
 // ── wires (#61) ─────────────────────────────────────────────────────────
 
 /// What a connector carries. Loxone Config wires a digital output to an
-/// analog input and back (a value other than 0 is on), but text only to text.
+/// analog input and back (a value other than 0 is on), but text only to
+/// text. `Unknown`: vislox cannot tell, so it does not wire it (lox does not
+/// check what an extern's connector carries).
 #[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Signal {
     Digital,
     Analog,
     Text,
+    Unknown,
 }
 
 impl Signal {
@@ -1631,6 +1695,7 @@ impl Signal {
             Signal::Digital => "digital",
             Signal::Analog => "analog",
             Signal::Text => "text",
+            Signal::Unknown => "unknown",
         }
     }
 }
@@ -1643,43 +1708,149 @@ pub fn analog_key(key: &str) -> bool {
         || matches!(key, "Txt" | "TQ" | "V" | "Pos" | "Value" | "Temp")
 }
 
-/// Text connectors by key: the text outputs (`TQ`, `TQ1`, `OutText`, …)
-/// and text inputs of lox's port table (`Text`, `inText`, `Txt`).
+/// The text connectors of lox's port table: text outputs (`TQ`, `TQ1`,
+/// `TQU`, `OutText`), text inputs (`Text`, `inText`, `TTS`) and message
+/// texts (`TM`, `TI`), and `Txt`.
 fn text_key(key: &str) -> bool {
-    key.starts_with("TQ") || matches!(key, "Txt" | "Text" | "inText" | "OutText")
+    key.starts_with("TQ")
+        || matches!(
+            key,
+            "Txt" | "Text" | "inText" | "OutText" | "TM" | "TI" | "TTS"
+        )
 }
 
-/// What the connector `key` of `el` carries. A reference says it of the
-/// object it mirrors (`Text="true"`, `Analog="true"`); a virtual text
-/// input carries text; otherwise the key tells.
-pub fn signal(el: &Element, key: &str) -> Signal {
-    let ty = el.attr("Type").unwrap_or_default();
-    if text_key(key) || el.attr("Text") == Some("true") || ty == "VirtualTextIn" {
-        Signal::Text
-    } else if analog_key(key) || el.attr("Analog") == Some("true") {
-        Signal::Analog
-    } else {
-        Signal::Digital
+/// What the connector `key` of an object of type `ty` (its element `el`,
+/// if the config has it) carries:
+/// - text: a text connector of lox's port table, or a reference to text
+///   (`Text="true"`);
+/// - an object whose value lox knows (a virtual input, a sensor, a memory
+///   flag: the table lox mints references from): that value, and the
+///   object's `Analog="true"` or a memory flag's `Tp=`;
+/// - a reference: `Analog="true"` or an analog key;
+/// - a connector of lox's port table: analog by its key, else digital;
+/// - anything else: unknown.
+pub fn signal(ty: &str, el: Option<&Element>, key: &str) -> Signal {
+    let attr = |a: &str| el.and_then(|e| e.attr(a));
+    if attr("Text") == Some("true") || text_key(key) {
+        return Signal::Text;
     }
+    if let Some((_, v)) = connectors::ref_link_type(ty) {
+        return match (v, attr("Tp")) {
+            (connectors::RefValue::Text, _) | (_, Some("2")) => Signal::Text,
+            (connectors::RefValue::Analog, _) | (_, Some("1")) => Signal::Analog,
+            _ if attr("Analog") == Some("true") => Signal::Analog,
+            _ => Signal::Digital,
+        };
+    }
+    let is_ref = matches!(ty, "InputRef" | "OutputRef" | "OutputRefLM");
+    let known = connectors::builtin(ty).is_some_and(|s| s.iter().any(|s| s.key == key));
+    if is_ref || known {
+        if analog_key(key) || attr("Analog") == Some("true") {
+            Signal::Analog
+        } else {
+            Signal::Digital
+        }
+    } else {
+        Signal::Unknown
+    }
+}
+
+/// Who draws a wire vislox's file does not, and so who can take it out.
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Owner {
+    /// The rest of the module: a wire lox tracks onto an extern
+    /// (`extern_wires`), or one into a block the module declares.
+    Module,
+    /// Loxone Config.
+    LoxoneConfig,
+}
+
+impl Owner {
+    /// Why a wire it draws is not changed in vislox.
+    pub fn why(self) -> &'static str {
+        match self {
+            Owner::Module => "The project's module draws this wire: change it in its .loxl file.",
+            Owner::LoxoneConfig => {
+                "Drawn in Loxone Config. lox removes only the wires its source draws: remove it in \
+                 Loxone Config."
+            }
+        }
+    }
+}
+
+/// Who draws the wire from the connector `from` into `to` (connector UUIDs),
+/// into the object `sink`, that vislox's file does not draw. One rule for
+/// `unwire` and the page (`module_wires` in `GET /api/edits`).
+fn owner(lock: &Lock, files: &Files, from: &str, to: &str, sink: &str) -> Owner {
+    let module_block = lock.slug_of(sink).is_some_and(|s| files.block(s).is_none());
+    if module_block || lock.wires.contains(&(from.to_string(), to.to_string())) {
+        Owner::Module
+    } else {
+        Owner::LoxoneConfig
+    }
+}
+
+/// The wires of `doc` the rest of the module draws, by their ends as the
+/// page names them.
+pub fn module_wires(
+    doc: &LoxoneDoc,
+    lock: &Lock,
+    files: &Files,
+) -> Vec<([String; 2], [String; 2])> {
+    fn walk<'a>(el: &'a Element, out: &mut HashMap<&'a str, (&'a str, &'a str)>) {
+        if let Some(u) = el.attr("U") {
+            for co in el.child_elements().filter(|c| c.name == "Co") {
+                if let (Some(cu), Some(k)) = (co.attr("U"), co.attr("K")) {
+                    out.insert(cu, (u, k));
+                }
+            }
+        }
+        for c in el.child_elements() {
+            walk(c, out);
+        }
+    }
+    let mut at = HashMap::new();
+    walk(&doc.xml.root, &mut at);
+    let end = |p: &str| at.get(p).map(|(u, k)| [u.to_string(), k.to_string()]);
+    doc.wires()
+        .iter()
+        .filter_map(|w| {
+            let (f, t) = (end(&w.from_port)?, end(&w.to_port)?);
+            (owner(lock, files, &w.from_port, &w.to_port, &t[0]) == Owner::Module).then_some((f, t))
+        })
+        .collect()
+}
+
+/// Two ends of a wire as the page names them: `[object UUID, connector key]`.
+/// In an `add_block`'s `wires`, an empty UUID is the block it adds.
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq)]
+pub struct Ends {
+    pub from: [String; 2],
+    pub to: [String; 2],
 }
 
 /// One end of a wire: the object, its connector, and the name lox knows
 /// them by.
 struct End<'a> {
-    uuid: &'a str,
-    el: &'a Element,
+    /// Empty for the block the same `add_block` adds.
+    uuid: String,
+    /// The connector (`<Co>`); none on a block not compiled yet.
+    co: Option<&'a Element>,
     /// The object's name, for messages.
     name: String,
-    /// The connector (`<Co>`).
-    co: &'a Element,
+    ty: String,
     /// The slug the wire names it by: an extern of [`FILE`], or a block
     /// vislox added. `None` for a block the rest of the module manages.
     slug: Option<String>,
+    /// A block vislox added: declared in its files, not an extern.
+    added: bool,
     /// The port's Lox Logic name (`In1` for `I1`).
     port: String,
     /// Whether the end is an input (a sink), by lox's port table, else by
     /// the side of the block Loxone Config draws it on. `None`: neither.
     input: Option<bool>,
+    signal: Signal,
 }
 
 impl End<'_> {
@@ -1688,11 +1859,20 @@ impl End<'_> {
     }
 }
 
-/// Whether the connector `key` of the object `uuid` is an input: by lox's
-/// port table, else by the side of the block its page draws it on (inputs
-/// on the left), else by whether it holds a constant or a wire.
-fn port_input(doc: &LoxoneDoc, el: &Element, uuid: &str, key: &str) -> Option<bool> {
-    let ty = el.attr("Type").unwrap_or_default();
+/// The page geometries an op looked at, by page UUID: built once per page.
+type Geo = HashMap<String, Option<loxone_config::layout::PageGeometry>>;
+
+/// Whether the connector `key` (`co`) of the object `uuid` is an input: by
+/// lox's port table, else by the side of the block its page draws it on
+/// (inputs on the left), else by whether it holds a constant or a wire.
+fn port_input(
+    doc: &LoxoneDoc,
+    ty: &str,
+    uuid: &str,
+    key: &str,
+    co: Option<&Element>,
+    geo: &mut Geo,
+) -> Option<bool> {
     if let Some(spec) = connectors::builtin(ty).and_then(|s| s.iter().find(|s| s.key == key)) {
         return match spec.dir {
             PortDir::Input | PortDir::Param => Some(true),
@@ -1700,53 +1880,85 @@ fn port_input(doc: &LoxoneDoc, el: &Element, uuid: &str, key: &str) -> Option<bo
             PortDir::Api => None,
         };
     }
-    let side = drawn_at(doc, uuid)
-        .and_then(|(page, _)| loxone_config::layout::PageGeometry::of(doc, &page))
-        .and_then(|g| {
-            let o = g.objects.into_iter().find(|o| o.uuid == uuid)?;
-            o.ports.into_iter().find(|p| p.key == key).map(|p| p.side)
-        });
+    let co = co?;
+    let side = drawn_at(doc, uuid).and_then(|(page, _)| {
+        let g = geo
+            .entry(page.clone())
+            .or_insert_with(|| loxone_config::layout::PageGeometry::of(doc, &page))
+            .as_ref()?;
+        let o = g.objects.iter().find(|o| o.uuid == uuid)?;
+        o.ports.iter().find(|p| p.key == key).map(|p| p.side)
+    });
     match side {
         Some(loxone_config::layout::Side::Left) => Some(true),
         Some(loxone_config::layout::Side::Right) => Some(false),
-        None => {
-            let co = el
-                .child_elements()
-                .find(|c| c.name == "Co" && c.attr("K") == Some(key))?;
-            (co.attr("Def").is_some() || co.child_elements().any(|c| c.name == "In"))
-                .then_some(true)
-        }
+        None => (co.attr("Def").is_some() || co.child_elements().any(|c| c.name == "In"))
+            .then_some(true),
     }
 }
 
 /// The end `[uuid, key]` of a wire in the pending config.
-fn end<'a>(files: &Files, ctx: &'a Ctx, at: &'a [String; 2]) -> Result<End<'a>, String> {
+fn end<'a>(
+    files: &Files,
+    ctx: &'a Ctx,
+    at: &[String; 2],
+    geo: &mut Geo,
+) -> Result<End<'a>, String> {
     let [uuid, key] = at;
     let el = find(&ctx.doc.xml.root, uuid)
         .ok_or_else(|| format!("no object {uuid} in the pending config"))?;
-    let ty = el.attr("Type").unwrap_or_default();
+    let ty = el.attr("Type").unwrap_or_default().to_string();
     let name = el
         .attr_decoded("Title")
         .filter(|t| !t.trim().is_empty())
         .map(|t| t.into_owned())
-        .unwrap_or_else(|| ty.to_string());
+        .unwrap_or_else(|| ty.clone());
     let co = el
         .child_elements()
         .find(|c| c.name == "Co" && c.attr("K") == Some(key.as_str()))
         .ok_or_else(|| format!("{name} has no connector {key}"))?;
-    let slug = match ctx.lock.slug_of(uuid) {
-        Some(s) if files.block(s).is_some() => Some(s.to_string()),
-        Some(_) => None,
-        None => Some(slug(uuid)),
+    let (slug, added) = match ctx.lock.slug_of(uuid) {
+        Some(s) if files.block(s).is_some() => (Some(s.to_string()), true),
+        Some(_) => (None, false),
+        None => (Some(slug(uuid)), false),
     };
     Ok(End {
-        uuid,
-        el,
+        input: port_input(ctx.doc, &ty, uuid, key, Some(co), geo),
+        signal: signal(&ty, Some(el), key),
+        port: port_names::name_of(&ty, key).to_string(),
+        uuid: uuid.clone(),
+        co: Some(co),
         name,
-        co,
+        ty,
         slug,
-        port: port_names::name_of(ty, key).to_string(),
-        input: port_input(ctx.doc, el, uuid, key),
+        added,
+    })
+}
+
+/// The end `key` of the block `b` an `add_block` adds now: not in the
+/// pending config yet, so known by lox's port table alone.
+fn new_end<'a>(b: &NewBlock, key: &str) -> Result<End<'a>, String> {
+    let name = b.title.clone().unwrap_or_else(|| b.slug.clone());
+    if !connectors::builtin(&b.ty).is_some_and(|s| s.iter().any(|s| s.key == key)) {
+        return Err(format!("{name} has no connector {key}"));
+    }
+    let input = connectors::builtin(&b.ty)
+        .and_then(|s| s.iter().find(|s| s.key == key))
+        .and_then(|s| match s.dir {
+            PortDir::Input | PortDir::Param => Some(true),
+            PortDir::Output => Some(false),
+            PortDir::Api => None,
+        });
+    Ok(End {
+        uuid: String::new(),
+        co: None,
+        signal: signal(&b.ty, None, key),
+        port: port_names::name_of(&b.ty, key).to_string(),
+        name,
+        ty: b.ty.clone(),
+        slug: Some(b.slug.clone()),
+        added: true,
+        input,
     })
 }
 
@@ -1760,12 +1972,18 @@ fn wire_of(from: &End, to: &End) -> Option<Wire> {
 
 /// Whether the pending config wires `from` into `to`.
 fn wired(from: &End, to: &End) -> bool {
-    let Some(src) = from.co.attr("U") else {
+    let (Some(src), Some(co)) = (from.co.and_then(|c| c.attr("U")), to.co) else {
         return false;
     };
-    to.co
-        .child_elements()
+    co.child_elements()
         .any(|c| c.name == "In" && c.attr("Input") == Some(src))
+}
+
+/// Whether `w` is wired now, as the ops of this request so far leave it:
+/// in vislox's file, or in the pending config and not one of vislox's
+/// wires this request took out.
+fn wired_now(files: &Files, ctx: &Ctx, w: &Wire, src: &End, dst: &End) -> bool {
+    files.claims.1.contains(w) || (wired(src, dst) && !ctx.drawn.contains(w))
 }
 
 /// Draw a wire from an output to an input. Each end is an object Loxone
@@ -1777,8 +1995,25 @@ fn wire(
     from: &[String; 2],
     to: &[String; 2],
 ) -> Result<Applied, String> {
-    let (src, dst) = (end(files, ctx, from)?, end(files, ctx, to)?);
-    if src.uuid == dst.uuid {
+    let mut geo = Geo::new();
+    let (src, dst) = (
+        end(files, ctx, from, &mut geo)?,
+        end(files, ctx, to, &mut geo)?,
+    );
+    connect(files, ctx, &src, &dst)?;
+    Ok(Applied {
+        previous: serde_json::to_value(Op::Unwire {
+            from: from.clone(),
+            to: to.clone(),
+        })
+        .unwrap_or_default(),
+        added: None,
+    })
+}
+
+/// Check the wire `src` → `dst` and write it into vislox's file.
+fn connect(files: &mut Files, ctx: &Ctx, src: &End, dst: &End) -> Result<(), String> {
+    if src.slug.is_some() && src.slug == dst.slug {
         return Err(format!(
             "{}: a wire goes from one block's output to another block's input",
             src.name
@@ -1804,7 +2039,7 @@ fn wire(
         }
         None => return Err(format!("{} cannot be wired", dst.label())),
     }
-    for e in [&src, &dst] {
+    for e in [src, dst] {
         if e.slug.is_none() {
             return Err(format!(
                 "{}: the module manages this block; wire it in its .loxl file",
@@ -1812,34 +2047,42 @@ fn wire(
             ));
         }
         // lox matches an extern in the base it compiles against.
-        if ctx.lock.slug_of(e.uuid).is_none() && find(&ctx.base.xml.root, e.uuid).is_none() {
+        if !e.added && find(&ctx.base.xml.root, &e.uuid).is_none() {
             return Err(format!("{} is not in the project's base config", e.name));
         }
     }
-    if dst.co.attr("Inv").is_some() {
+    if dst.co.is_some_and(|c| c.attr("Inv").is_some()) {
         return Err(format!(
             "{} is inverted in Loxone Config, which owns that input; lox does not wire it",
             dst.label()
         ));
     }
-    let (a, b) = (signal(src.el, &from[1]), signal(dst.el, &to[1]));
-    if (a == Signal::Text) != (b == Signal::Text) {
+    for e in [src, dst] {
+        if e.signal == Signal::Unknown {
+            return Err(format!(
+                "vislox cannot tell whether {} carries text, a number or on/off (lox's port table \
+                 does not list it); wire it in Loxone Config",
+                e.label()
+            ));
+        }
+    }
+    if (src.signal == Signal::Text) != (dst.signal == Signal::Text) {
         return Err(format!(
             "{} is a {} output and {} a {} input: Loxone Config wires text only to text",
             src.label(),
-            a.word(),
+            src.signal.word(),
             dst.label(),
-            b.word()
+            dst.signal.word()
         ));
     }
-    if wired(&src, &dst) {
+    let w = wire_of(src, dst).expect("both have a slug");
+    if wired_now(files, ctx, &w, src, dst) {
         return Err(format!(
             "{} is already wired to {}",
             src.label(),
             dst.label()
         ));
     }
-    let w = wire_of(&src, &dst).expect("both have a slug");
     // An input takes a wire or a constant, not both (lox refuses both in
     // one declaration; on an extern the constant would be hidden).
     let constant = match files.block(&w.to.0) {
@@ -1847,7 +2090,7 @@ fn wire(
         None => files
             .claims
             .0
-            .get(dst.uuid)
+            .get(&dst.uuid)
             .is_some_and(|c| c.sets.contains_key(&w.to.1)),
     };
     if constant {
@@ -1856,21 +2099,13 @@ fn wire(
             dst.label()
         ));
     }
-    for e in [&src, &dst] {
-        if files.block(e.slug.as_deref().unwrap_or_default()).is_none() {
-            let claim = files.claims.0.entry(e.uuid.to_string()).or_default();
-            claim.ty = e.el.attr("Type").unwrap_or_default().to_string();
+    for e in [src, dst] {
+        if !e.added {
+            files.claims.0.entry(e.uuid.clone()).or_default().ty = e.ty.clone();
         }
     }
     files.claims.1.insert(w);
-    Ok(Applied {
-        previous: serde_json::to_value(Op::Unwire {
-            from: from.clone(),
-            to: to.clone(),
-        })
-        .unwrap_or_default(),
-        added: None,
-    })
+    Ok(())
 }
 
 /// Take out a wire vislox's file draws. lox removes only the wires its
@@ -1881,29 +2116,25 @@ fn unwire(
     from: &[String; 2],
     to: &[String; 2],
 ) -> Result<Applied, String> {
-    let (src, dst) = (end(files, ctx, from)?, end(files, ctx, to)?);
-    let mine = wire_of(&src, &dst).filter(|w| files.claims.1.contains(w));
-    let Some(w) = mine else {
-        if !wired(&src, &dst) {
+    let mut geo = Geo::new();
+    let (src, dst) = (
+        end(files, ctx, from, &mut geo)?,
+        end(files, ctx, to, &mut geo)?,
+    );
+    let w = wire_of(&src, &dst);
+    let mine = w.as_ref().filter(|w| files.claims.1.contains(w));
+    let Some(w) = mine.cloned() else {
+        let taken = w.as_ref().is_some_and(|w| ctx.drawn.contains(w));
+        if taken || !wired(&src, &dst) {
             return Err(format!("{} is not wired to {}", src.label(), dst.label()));
         }
-        let ports = (
-            src.co.attr("U").unwrap_or_default().to_string(),
-            dst.co.attr("U").unwrap_or_default().to_string(),
-        );
-        if ctx.lock.wires.contains(&ports) || ctx.lock.slug_of(dst.uuid).is_some() {
-            return Err(format!(
-                "{} → {}: the module draws this wire; change it in its .loxl file",
-                src.label(),
-                dst.label()
-            ));
-        }
-        return Err(format!(
-            "{} → {} was drawn in Loxone Config, and lox removes only the wires its source \
-             draws; remove it in Loxone Config",
-            src.label(),
-            dst.label()
-        ));
+        let port = |e: &End| {
+            e.co.and_then(|c| c.attr("U"))
+                .unwrap_or_default()
+                .to_string()
+        };
+        let who = owner(ctx.lock, files, &port(&src), &port(&dst), &dst.uuid);
+        return Err(format!("{} → {}: {}", src.label(), dst.label(), who.why()));
     };
     files.claims.1.remove(&w);
     files.claims.prune();
@@ -1917,25 +2148,34 @@ fn unwire(
     })
 }
 
+/// The end `(slug, port name)` of a wire of vislox's files as the page
+/// names it, `[object UUID, connector key]`; `None` when the lock does not
+/// know the block (yet).
+fn wire_end_at(files: &Files, lock: &Lock, (s, port): &(String, String)) -> Option<[String; 2]> {
+    let (uuid, ty) = match files.block(s) {
+        Some((_, b)) => (lock.uuid_of(s)?.to_string(), b.ty.clone()),
+        None => {
+            let (u, c) = files.claims.0.iter().find(|(u, _)| slug(u) == *s)?;
+            (u.clone(), c.ty.clone())
+        }
+    };
+    Some([uuid, port_names::key_or_raw(&ty, port).to_string()])
+}
+
 /// The wires of vislox's files, by their ends as the page names them
 /// (`[object UUID, connector key]`): from, to. An end the lock no longer
 /// knows is left out.
 pub fn wire_ends(files: &Files, lock: &Lock) -> Vec<([String; 2], [String; 2])> {
-    let at = |(s, port): &(String, String)| -> Option<[String; 2]> {
-        let (uuid, ty) = match files.block(s) {
-            Some((_, b)) => (lock.uuid_of(s)?.to_string(), b.ty.clone()),
-            None => {
-                let (u, c) = files.claims.0.iter().find(|(u, _)| slug(u) == *s)?;
-                (u.clone(), c.ty.clone())
-            }
-        };
-        Some([uuid, port_names::key_or_raw(&ty, port).to_string()])
-    };
     files
         .claims
         .1
         .iter()
-        .filter_map(|w| Some((at(&w.from)?, at(&w.to)?)))
+        .filter_map(|w| {
+            Some((
+                wire_end_at(files, lock, &w.from)?,
+                wire_end_at(files, lock, &w.to)?,
+            ))
+        })
         .collect()
 }
 
@@ -2473,6 +2713,7 @@ mod tests {
             title: title.map(Into::into),
             params: m(params),
             settings: m(settings),
+            wires: vec![],
         }
     }
 
@@ -2509,6 +2750,7 @@ mod tests {
                 base: &d,
                 deployed: None,
                 names: &names,
+                drawn: &Default::default(),
             };
             apply_op(&mut files, &ctx, &add(EG, t, None, &[], &[])).unwrap();
             let mut l = Lockfile::default();
@@ -2538,6 +2780,7 @@ mod tests {
             base: &d,
             deployed: None,
             names: &names,
+            drawn: &Default::default(),
         };
         let a = apply_op(
             &mut files,
@@ -2603,6 +2846,7 @@ mod tests {
             base: &d,
             deployed: Some(&d),
             names: &names,
+            drawn: &Default::default(),
         };
         let title = Op::Title {
             uuid: mono.clone(),
@@ -2662,6 +2906,7 @@ mod tests {
             base: &d,
             deployed: Some(&d),
             names: &names,
+            drawn: &Default::default(),
         };
         let r = apply_op(&mut files, &ctx, &Op::RemoveBlock { uuid: mono.clone() }).unwrap();
         assert_eq!(
@@ -2683,6 +2928,7 @@ mod tests {
             base: &d,
             deployed: Some(&out),
             names: &names,
+            drawn: &Default::default(),
         };
         let e = apply_op(&mut files, &ctx, &Op::RemoveBlock { uuid: pulse }).unwrap_err();
         assert!(e.contains("is deployed"), "{e}");
@@ -2703,6 +2949,7 @@ mod tests {
             lock: &lock,
             deployed: None,
             names: &names,
+            drawn: &Default::default(),
         };
         apply_op(&mut files, &ctx, &add(OG, "And", Some("Licht"), &[], &[])).unwrap();
         let text = files.render()["obergeschoss.loxl"].clone();
@@ -2731,6 +2978,7 @@ mod tests {
             lock: &lock,
             deployed: None,
             names: &names,
+            drawn: &Default::default(),
         };
         apply_op(&mut files, &ctx, &add(OG, "Or", None, &[], &[])).unwrap();
         let r = files.render();
@@ -2761,6 +3009,7 @@ mod tests {
             lock: &lock,
             deployed: Some(&renamed),
             names: &names,
+            drawn: &Default::default(),
         };
         for s in ["vx_and_1", "vx_or_1"] {
             let uuid = l.objects[s].uuid.clone();
@@ -2783,6 +3032,7 @@ mod tests {
             base: &d,
             deployed: None,
             names: &names,
+            drawn: &Default::default(),
         };
         let mut files = Files::default();
         let err = |op: Op| apply_op(&mut files.clone(), &ctx, &op).unwrap_err();
@@ -2814,6 +3064,7 @@ mod tests {
             base: &d,
             deployed: None,
             names: &names,
+            drawn: &Default::default(),
         };
         let e = apply_op(&mut Files::default(), &ctx, &add(OG, "And", None, &[], &[])).unwrap_err();
         assert!(e.contains("2 pages are titled"), "{e}");
@@ -2860,6 +3111,7 @@ mod tests {
             base: &d,
             deployed: None,
             names: &names,
+            drawn: &Default::default(),
         };
         apply_op(&mut files, &ctx, &add(OG, "And", Some("Licht"), &[], &[])).unwrap();
         // Deployed: the base draws it where lox placed it.
@@ -2874,6 +3126,7 @@ mod tests {
             base: &base,
             deployed: Some(&base),
             names: &names,
+            drawn: &Default::default(),
         };
         // Snapped to the grid, the size kept; `previous` moves it back.
         let mut files = Files::from_texts(&files.render()).unwrap();
@@ -2953,6 +3206,7 @@ mod tests {
             base: &d,
             deployed: None,
             names: &names,
+            drawn: &Default::default(),
         };
         apply_op(&mut files, &ctx, &add(OG, "And", None, &[], &[])).unwrap();
         apply_op(&mut files, &ctx, &add(OG, "Or", None, &[], &[])).unwrap();
@@ -2964,6 +3218,7 @@ mod tests {
             base: &d,
             deployed: None,
             names: &names,
+            drawn: &Default::default(),
         };
         let err = |op: Op| apply_op(&mut files.clone(), &ctx, &op).unwrap_err();
         // Drawn in Loxone Config: lox does not move it.
@@ -3049,6 +3304,7 @@ mod tests {
             base: &d,
             deployed: None,
             names: &names,
+            drawn: &Default::default(),
         };
         apply_op(&mut files, &ctx, &add(OG, "And", None, &[], &[])).unwrap();
         let out = compile_files(&d, &files, &mut l).unwrap();
@@ -3070,6 +3326,7 @@ mod tests {
                 base: &base,
                 deployed: Some(&base),
                 names: &names,
+                drawn: &Default::default(),
             };
             files.layout = Placement::default();
             apply_op(
@@ -3137,6 +3394,7 @@ mod tests {
             base: &d,
             deployed: None,
             names: &names,
+            drawn: &Default::default(),
         };
         apply_op(&mut files, &ctx, &add(OG, "And", None, &[], &[])).unwrap();
         apply_op(&mut files, &ctx, &add(EG, "Or", None, &[], &[])).unwrap();
@@ -3187,6 +3445,7 @@ mod tests {
             base: &d,
             deployed: None,
             names: &names,
+            drawn: &Default::default(),
         };
         apply_op(&mut files, &ctx, &add(OG, "And", None, &[], &[])).unwrap();
         let out = compile_files(&d, &files, &mut l).unwrap();
@@ -3272,6 +3531,7 @@ mod tests {
             base: &d,
             deployed: None,
             names: &names,
+            drawn: &Default::default(),
         };
         // The Divide block's output onto the upper floor's OR: another page.
         let w = wire_op((DIV, "AQ"), (OR, "I2"));
@@ -3307,14 +3567,26 @@ mod tests {
 
         // Taken out again: the statement and the externs go, and lox takes the wire out.
         let lock = lock_of(&l);
+        let drawn = files.claims.1.clone();
         let ctx = Ctx {
             doc: &out,
             lock: &lock,
             base: &d,
             deployed: None,
             names: &names,
+            drawn: &drawn,
         };
+        // One request may take a wire out and draw it again (an undo and a
+        // redo, a reconnect to the same port): the ops see each other.
         let u = unwire_op((DIV, "AQ"), (OR, "I2"));
+        let mut again = files.clone();
+        apply_op(&mut again, &ctx, &u).unwrap();
+        let e = apply_op(&mut again.clone(), &ctx, &u).unwrap_err();
+        assert!(e.contains("is not wired"), "{e}");
+        apply_op(&mut again, &ctx, &w).unwrap();
+        assert_eq!(again, files);
+        let e = apply_op(&mut again, &ctx, &w).unwrap_err();
+        assert!(e.contains("already wired"), "{e}");
         assert_eq!(
             apply_op(&mut files, &ctx, &u).unwrap().previous,
             serde_json::to_value(&w).unwrap()
@@ -3337,6 +3609,7 @@ mod tests {
             base: &d,
             deployed: None,
             names: &names,
+            drawn: &Default::default(),
         };
         let err = |op: Op| apply_op(&mut Files::default(), &ctx, &op).unwrap_err();
         assert!(err(wire_op((DIV, "Input2"), (OR, "I2"))).contains("is an input"));
@@ -3347,7 +3620,7 @@ mod tests {
         assert!(err(wire_op(AND_Q, (OR, "I1"))).contains("already wired"));
         // ...and only Loxone Config can take it out.
         let e = err(unwire_op(AND_Q, (OR, "I1")));
-        assert!(e.contains("drawn in Loxone Config"), "{e}");
+        assert!(e.contains("Drawn in Loxone Config"), "{e}");
         assert!(err(unwire_op((DIV, "AQ"), (OR, "I2"))).contains("not wired"));
 
         // A text output goes only into a text input.
@@ -3362,21 +3635,27 @@ mod tests {
         );
         let t = LoxoneDoc::parse(xml.as_bytes()).unwrap();
         let ref_el = find(&t.xml.root, REF).unwrap();
-        assert_eq!(signal(ref_el, "AQ"), Signal::Text);
-        assert_eq!(
-            signal(find(&d.xml.root, REF).unwrap(), "AQ"),
-            Signal::Analog
-        );
-        assert_eq!(
-            signal(find(&d.xml.root, AND).unwrap(), "Q"),
-            Signal::Digital
-        );
+        assert_eq!(signal("InputRef", Some(ref_el), "AQ"), Signal::Text);
+        let el = |u: &str| find(&d.xml.root, u);
+        assert_eq!(signal("InputRef", el(REF), "AQ"), Signal::Analog);
+        assert_eq!(signal("And", el(AND), "Q"), Signal::Digital);
+        // From lox's tables: a virtual input's value, a text output, a
+        // memory flag's type; a connector lox does not list is unknown.
+        assert_eq!(signal("VirtualIn", el(VI), "Q"), Signal::Digital);
+        assert_eq!(signal("VirtualTextIn", None, "Q"), Signal::Text);
+        assert_eq!(signal("Status", None, "TQ"), Signal::Text);
+        let mem =
+            loxone_config::xml::XmlDocument::parse(br#"<C Type="Memory" Tp="2" U="x"/>"#).unwrap();
+        assert_eq!(signal("Memory", Some(&mem.root), "Q"), Signal::Text);
+        assert_eq!(signal("Banana", None, "Q"), Signal::Unknown);
+        assert_eq!(signal("And", None, "Nope"), Signal::Unknown);
         let tctx = Ctx {
             doc: &t,
             lock: &lock,
             base: &t,
             deployed: None,
             names: &names,
+            drawn: &Default::default(),
         };
         let e = apply_op(
             &mut Files::default(),
@@ -3409,6 +3688,7 @@ mod tests {
             base: &d,
             deployed: None,
             names: &names,
+            drawn: &Default::default(),
         };
         let e = apply_op(
             &mut Files::default(),
@@ -3423,7 +3703,7 @@ mod tests {
             &unwire_op((REF, "AQ"), (DIV, "Input1")),
         )
         .unwrap_err();
-        assert!(e.contains("the module draws this wire"), "{e}");
+        assert!(e.contains("module draws this wire"), "{e}");
         // An input with a constant edited here is cleared first.
         let mut files = Files::default();
         apply_op(&mut files, &ctx, &param(OR, "I2", Some("1"))).unwrap();
@@ -3444,6 +3724,7 @@ mod tests {
             base: &d,
             deployed: None,
             names: &names,
+            drawn: &Default::default(),
         };
         apply_op(&mut files, &ctx, &add(OG, "And", None, &[("I2", "1")], &[])).unwrap();
         let out = compile_files(&d, &files, &mut l).unwrap();
@@ -3455,6 +3736,7 @@ mod tests {
             base: &d,
             deployed: None,
             names: &names,
+            drawn: &Default::default(),
         };
         // Its input with a constant takes no wire; the other does.
         let e = apply_op(&mut files, &ctx, &wire_op((DIV, "AQ"), (&new, "I2"))).unwrap_err();
@@ -3487,8 +3769,11 @@ mod tests {
             base: &d,
             deployed: None,
             names: &names,
+            drawn: &Default::default(),
         };
-        apply_op(&mut files, &ctx, &Op::RemoveBlock { uuid: new.clone() }).unwrap();
+        let undo = apply_op(&mut files, &ctx, &Op::RemoveBlock { uuid: new.clone() })
+            .unwrap()
+            .previous;
         assert!(
             files.claims.1.is_empty() && files.claims.0.is_empty(),
             "{:?}",
@@ -3497,6 +3782,64 @@ mod tests {
         let out = compile_files(&d, &files, &mut l).unwrap();
         assert!(find(&out.xml.root, &new).is_none());
         assert!(!has_wire(&out, (DIV, "AQ"), (OR, "I2")));
+
+        // Its `previous` adds it again with its wires: a complete undo. lox
+        // mints new UUIDs, so the block names itself by an empty UUID.
+        let undo: Op = serde_json::from_value(undo).unwrap();
+        let Op::AddBlock { wires, .. } = &undo else {
+            panic!("{undo:?}")
+        };
+        let mut got: Vec<_> = wires
+            .iter()
+            .map(|w| (w.from.clone(), w.to.clone()))
+            .collect();
+        got.sort();
+        let mut want = vec![ends((DIV, "AQ"), ("", "I1")), ends(("", "Q"), (OR, "I2"))];
+        want.sort();
+        assert_eq!(got, want);
+        let lock = lock_of(&l);
+        let ctx = Ctx {
+            doc: &out,
+            lock: &lock,
+            base: &d,
+            deployed: None,
+            names: &names,
+            drawn: &Default::default(),
+        };
+        let a = apply_op(&mut files, &ctx, &undo).unwrap();
+        let slug2 = a.added.unwrap();
+        let out = compile_files(&d, &files, &mut l).unwrap();
+        let back = l.objects[&slug2].uuid.clone();
+        assert_ne!(back, new);
+        assert!(has_wire(&out, (DIV, "AQ"), (&back, "I1")));
+        assert!(has_wire(&out, (&back, "Q"), (OR, "I2")));
+        assert_eq!(
+            find(&out.xml.root, &back).unwrap().attr("Type"),
+            Some("And")
+        );
+    }
+
+    #[test]
+    fn a_wire_whose_end_the_files_do_not_declare_is_refused() {
+        let s = slug(DIV);
+        let page = "# page uuid: 10000008-0000-0080-ffff504f94000001\npage \"Obergeschoss\"\n\nvx_and_1 = And()\n";
+        let files = |claims: String| {
+            BTreeMap::from([
+                ("edits.loxl".to_string(), claims),
+                ("obergeschoss.loxl".to_string(), page.to_string()),
+            ])
+        };
+        let ok = format!("extern {s} = Div(uuid: \"{DIV}\")\nvx_and_1.In1 <- {s}.AQ\n");
+        assert_eq!(Files::from_texts(&files(ok)).unwrap().claims.1.len(), 1);
+        // Its extern deleted by hand: refused, not written back to break the compile.
+        let e = Files::from_texts(&files(format!("vx_and_1.In1 <- {s}.AQ\n"))).unwrap_err();
+        assert!(e.contains(&format!("names `{s}`")), "{e}");
+        // A block no file of vislox's declares.
+        let e = Files::from_texts(&files(format!(
+            "extern {s} = Div(uuid: \"{DIV}\")\nvx_or_9.In1 <- {s}.AQ\n"
+        )))
+        .unwrap_err();
+        assert!(e.contains("names `vx_or_9`"), "{e}");
     }
 
     #[test]
