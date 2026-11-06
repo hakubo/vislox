@@ -447,3 +447,27 @@ button.chip { cursor: pointer; } button.chip:hover { border-color: var(--brand);
 .deploy-msg { margin: 8px 10px 0; padding: 6px 8px; border-radius: 4px; font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; background: var(--brand-soft); color: var(--brand-strong); max-height: 12em; overflow: auto; }
 .deploy-msg.error { background: var(--removed-bg); color: var(--removed); }
 #deploy-pane > :last-child { margin-bottom: 10px; }
+/* Apply, step by step */
+.deploy-steps { list-style: none; margin: 8px 10px 0; padding: 0; display: flex; flex-direction: column; gap: 2px; font-size: 12px; }
+.deploy-steps li { display: grid; grid-template-columns: 16px 1fr auto; gap: 0 6px; align-items: baseline; color: var(--muted); }
+.deploy-steps .ic { text-align: center; font-weight: 700; }
+.deploy-steps .d { grid-column: 2 / 4; color: var(--faint); font-size: 11px; overflow-wrap: anywhere; }
+.deploy-steps .t { color: var(--faint); font-size: 11px; font-variant-numeric: tabular-nums; }
+.deploy-steps .st-wait { color: var(--faint); }
+.deploy-steps .st-run { color: var(--text); font-weight: 600; }
+.deploy-steps .st-run .ic { color: var(--changed); animation: dep-pulse 1s ease-in-out infinite alternate; }
+.deploy-steps .st-ok .ic { color: var(--added); }
+.deploy-steps .st-skip .ic { color: var(--faint); }
+.deploy-steps .st-fail { color: var(--removed); }
+@keyframes dep-pulse { from { opacity: .35; } to { opacity: 1; } }
+@media (prefers-reduced-motion: reduce) { .deploy-steps .st-run .ic { animation: none; } }
+/* What the last Apply changed, with its first live values */
+.deploy-new { margin: 8px 10px 0; padding: 6px 8px; border: 1px solid var(--line-2); border-radius: 4px; background: var(--panel-2); font-size: 12px; }
+.deploy-new .h { display: flex; align-items: center; gap: 6px; font-weight: 600; margin-bottom: 4px; }
+.deploy-new .h .x { margin-left: auto; border: none; background: none; color: var(--muted); font-size: 14px; line-height: 1; padding: 0 2px; }
+.deploy-new .pr { display: flex; align-items: baseline; gap: 6px; padding: 1px 0; }
+.deploy-new .go { flex: 1; min-width: 0; text-align: left; border: none; background: none; padding: 0; color: var(--sel); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.deploy-new .go:hover { text-decoration: underline; }
+.deploy-new .k { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; color: var(--changed); }
+.deploy-new .k.added { color: var(--added); }
+.deploy-new .note { color: var(--faint); font-size: 11px; }

@@ -57,7 +57,11 @@ marked so you can review it before you deploy.
   Logic module and compile it with `lox logic`, by hand or with an agent of your own working in the repository
   (see [docs/agent-workflow.md](docs/agent-workflow.md)). The compile shows as the pending revision, so you
   review it like any other change. **Apply** deploys it with `lox config push --force` (download, drift check,
-  upload, program restart, verify), then commits the project and pushes it to its git remote. **Discard** puts
+  upload, program restart, verify), then commits the project and pushes it to its git remote. Each step shows
+  as it happens, with how long it took. vislox follows the program restart itself: the Miniserver going out of
+  service, back online after N s, and the new config loaded (its structure version changed). When Apply
+  finishes, the view switches to the deployed revision, compared with the one it replaced, and turns live
+  values on. **Changed by this Apply** lists the changed blocks with their first live values. **Discard** puts
   the module back to the last commit. **Sync from Miniserver** makes what the Miniserver runs now the project's
   base (`lox config merge`: changes saved from Loxone Config, rules edited in the app), then commits and pushes;
   it waits until nothing is pending. When merge refuses because the Miniserver holds custom changes no download
@@ -112,7 +116,10 @@ vislox ~/loxone-config/project --admin-token-file ~/.config/vislox/admin-token
   it, so the deployed config stays in git.
 
 The Miniserver connection is opened when a browser turns live values on, and closed shortly after the last
-one turns them off.
+one turns them off. During Apply, vislox also asks the Miniserver every 0.5 s, read-only, whether it answers
+(`jdev/cfg/apiKey`, no login) and which structure it runs (`jdev/sps/LoxAPPversion3`). It does this only from
+the program restart until the new config runs, and only if the Miniserver answered before the upload.
+`--no-live` turns this off as well.
 
 **Pull from Miniserver** runs `lox config pull` (the `lox` on `PATH`, or `--lox <path>`), with the same lox
 configuration and context as live values. It is offered only when lox would commit to the repository vislox
@@ -145,7 +152,9 @@ The binary is an `axum` server with the UI embedded (plain JS and SVG, no build 
   properties and a change list. It uses `loxone_config::diff` and adds its own checks for attributes,
   positions and wires.
 - `src/actions.rs` runs Apply (`lox config push --force`, `git commit`, `git push`), Sync (`lox config merge`,
-  `git commit`, `git push`) and Discard (`git checkout` of the module, lock and out).
+  `git commit`, `git push`) and Discard (`git checkout` of the module, lock and out). Apply's steps follow lox's
+  progress lines as they come.
+- `src/restart.rs` follows the program restart during Apply: out of service, back online, new config loaded.
 - `src/pull.rs` runs `lox config pull` for the Pull button (`POST /api/pull`, which needs an `X-Vislox` header so
   that no other web page can trigger it), then refreshes the history.
 - `src/live.rs` streams the Miniserver's states with lox's `loxone-client` crate. A wire's source
@@ -165,6 +174,7 @@ cargo test                                   # model, history, source; fixture: 
 cargo build --release
 cd tests/ui && npm ci && npx playwright install chromium && cd ../..
 VISLOX_BIN=target/release/vislox node tests/ui/smoke.mjs   # drives the UI in headless Chromium
+VISLOX_BIN=target/release/vislox node tests/ui/apply.mjs   # Apply's steps, with a stand-in lox
 ```
 
 CI (`.github/workflows/ci.yml`) runs all of these on every push to `main` and on every pull request.

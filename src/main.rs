@@ -6,6 +6,7 @@ mod history;
 mod live;
 mod model;
 mod pull;
+mod restart;
 mod source;
 
 use anyhow::{Context, Result};
@@ -150,6 +151,13 @@ async fn main() -> Result<()> {
                 .transpose()?,
             project: src.project.clone(),
             lox: args.lox.clone(),
+            // Follows Apply's program restart (read-only); --no-live means
+            // vislox never talks to the Miniserver.
+            probe: match (&found, &src.project, args.no_live) {
+                (Ok(f), Some(_), false) => restart::Http::new(f.conn.clone())
+                    .map(|h| Arc::new(h) as Arc<dyn restart::Probe>),
+                _ => None,
+            },
         }),
     });
     if src.project.is_some() {
