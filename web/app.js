@@ -195,6 +195,7 @@ function renderHistory() {
       box.appendChild(b);
     }
   };
+  renderOpLog(box);
   if (S.hist.pending.length) { sec("Pending deployment", S.hist.pending); sec("Deployed history", S.hist.history); }
   else sec(null, S.hist.history);
   if (!S.hist.history.length) box.insertAdjacentHTML("beforeend", '<div class="empty">No revisions yet.</div>');
@@ -869,6 +870,8 @@ function renderProps() {
   const section = (name, rows, count) => { if (rows.length) sections.push({ name, rows, count }); };
   const row = (k, v, cls) => `<div class="pr ${cls || ""}"><div class="k">${esc(k)}</div><div class="v">${v}</div></div>`;
 
+  const opT = opTarget(o);
+  if (opT) section("Operate", [opControls(opT)]);
   if (liveHere()) {
     const rows = [];
     const ctl = S.live.controls[o.uuid];
@@ -951,7 +954,13 @@ function renderProps() {
       return `<section><button type="button" class="ps-h" aria-expanded="${open}" data-sec="${esc(s.name)}">${esc(s.name)}${s.count ? `<span class="count">${s.count}</span>` : ""}</button><div class="ps-b"${open ? "" : " hidden"}>${s.rows.join("")}</div></section>`;
     }).join("");
 }
+$("props").addEventListener("keydown", (e) => {
+  const i = e.target.closest(".op input");
+  if (i && e.key === "Enter") { e.preventDefault(); operate(i.dataset.opUuid, i.value); }
+});
 $("props").addEventListener("click", (e) => {
+  const ob = e.target.closest("[data-op]");
+  if (ob) { operate(ob.dataset.opUuid, ob.dataset.op === "set" ? ob.closest(".op").querySelector("input").value : ob.dataset.op); return; }
   const h = e.target.closest(".ps-h");
   if (h) {
     const open = h.getAttribute("aria-expanded") !== "true";
@@ -1511,7 +1520,7 @@ async function act(path, body) {
   if (!t) throw new Error("Changes need the admin token.");
   const r = await fetch(path, {
     method: "POST",
-    headers: { "Content-Type": "application/json", "X-Vislox-Token": t },
+    headers: { "Content-Type": "application/json", "X-Vislox-Token": t, "X-Vislox": "act" },
     body: JSON.stringify(body || {}),
   });
   const j = await r.json().catch(() => ({}));
@@ -1819,6 +1828,124 @@ $("log").addEventListener("click", (e) => {
 // has the UUID of the state it carries. Logic blocks the app does not see
 // stream nothing, so their wires have no value.
 
+// ── operate inputs ─────────────────────────────────────────────────────
+// Opt-in (vislox --operate, with the admin token): Pulse, On/Off or a value for a virtual input,
+// to test a change the way Loxone Config's Liveview does. Only virtual inputs of the deployed
+// config, only with live values on, and every command is confirmed first.
+const opRes = new Map(); // input uuid → { text, cls }
+const opWait = new Map(); // input uuid → { head, states: Set, timer }: one per input waiting for its update
+function opOn() { return !!S.hist?.operate?.available && liveHere(); }
+/** The virtual input a block operates: itself, or the one an input reference mirrors. */
+function opTarget(o) {
+  if (!opOn()) return null;
+  const t = o.ty === "VirtualIn" ? o : o.ty === "InputRef" && o.target?.ty === "VirtualIn" ? S.view.objects[o.target.uuid] : null;
+  return t && t.status !== "removed" ? t : null;
+}
+function opAttr(t, k) { return t.attrs.find((a) => a.name === k)?.value; }
+function opControls(t) {
+  const analog = opAttr(t, "Analog") === "true";
+  const secured = !!S.live.controls[t.uuid]?.secured;
+  const u = esc(t.uuid);
+  const b = (cmd, label, tip) => `<button type="button" class="ghost small" data-op="${cmd}" data-op-uuid="${u}" title="${esc(tip)}">${label}</button>`;
+  let ctl;
+  if (analog) {
+    const checks = opAttr(t, "EnVal") === "true";
+    const min = checks ? opAttr(t, "MinVal") : null, max = checks ? opAttr(t, "MaxVal") : null;
+    ctl = `<input type="number" step="any" data-op-uuid="${u}" aria-label="Value for ${esc(t.title)}"${min != null ? ` min="${esc(min)}"` : ""}${max != null ? ` max="${esc(max)}"` : ""}>` +
+      b("set", "Set", "Send this value to the virtual input");
+  } else {
+    ctl = b("pulse", "Pulse", "On for a moment, then off") + b("on", "On", "Switch the virtual input on") + b("off", "Off", "Switch the virtual input off");
+  }
+  const r = opRes.get(t.uuid);
+  return `<div class="op">${secured ? '<span class="op-lock" title="This block has a visualization password: vislox asks for it once per session">🔒</span>' : ""}` +
+    `<span class="op-what">${esc(t.title)} <span class="tm">${analog ? "analog" : "digital"} virtual input${t.uuid !== S.sel ? " (mirrored)" : ""}</span></span>` +
+    `<div class="op-ctl">${ctl}</div>` +
+    `<div class="op-res${r ? " " + r.cls : ""}" role="status" aria-live="polite">${r ? esc(r.text) : "Sends a command to the Miniserver."}</div></div>`;
+}
+function opShow(uuid, text, cls) {
+  opRes.set(uuid, { text, cls });
+  $("props").querySelectorAll(".op-res").forEach((n) => {
+    if (n.closest(".op")?.querySelector(`[data-op-uuid="${CSS.escape(uuid)}"]`)) { n.textContent = text; n.className = "op-res " + cls; }
+  });
+}
+function visuPassword(ask) {
+  let p = "";
+  try { p = sessionStorage.getItem("vislox.visu") || ""; } catch { /* private mode */ }
+  if (!p && ask) {
+    p = window.prompt("This block has a visualization password. Enter it (kept for this browser session only):") || "";
+    if (p) try { sessionStorage.setItem("vislox.visu", p); } catch { /* private mode */ }
+  }
+  return p;
+}
+async function operate(uuid, cmd) {
+  const t = S.view?.objects[uuid];
+  if (!t || !opOn()) return;
+  cmd = String(cmd ?? "").trim();
+  if (!cmd) { opShow(uuid, "Enter a value first.", "err"); return; }
+  const what = { pulse: "Pulse", on: "On", off: "Off" }[cmd] || `the value ${cmd}`;
+  if (!window.confirm(`Send "${what}" to the virtual input "${t.title}" on the Miniserver?\n\nThis runs on the real installation: the logic it feeds reacts.`)) return;
+  const secured = !!S.live.controls[uuid]?.secured;
+  const body = { uuid, cmd };
+  if (secured) {
+    body.visu_password = visuPassword(true);
+    if (!body.visu_password) { opShow(uuid, "Not sent: the block needs its visualization password.", "err"); return; }
+  }
+  opShow(uuid, "Sending…", "busy");
+  let r;
+  try { r = await act("/api/operate", body); }
+  catch (e) {
+    // Only a password the Miniserver refused is forgotten; a key that expired, a block that refused
+    // the command or a network error leave it.
+    if (e.data?.badPassword) try { sessionStorage.removeItem("vislox.visu"); } catch { /* private mode */ }
+    opShow(uuid, e.message.startsWith("not sent") ? e.message[0].toUpperCase() + e.message.slice(1) : "Not sent: " + e.message, "err");
+    return;
+  }
+  const head = r.code == null ? `Sent, ${r.note}` : `Code ${r.code} (${r.note})`;
+  if (r.code !== 200) { opShow(uuid, head, "err"); return; }
+  // The answer's value is not reliable; the state update that follows is (Communicating with the Miniserver, p. 14).
+  const states = new Set(Object.values(S.live.controls[uuid]?.states || {}).filter((x) => typeof x === "string"));
+  for (const q of t.ports) states.add(q.uuid);
+  opExpect(uuid, head, states);
+}
+/** Wait for `uuid`'s state update (any of `states`); each input waits on its own. */
+function opExpect(uuid, head, states, ms = 3000) {
+  clearTimeout(opWait.get(uuid)?.timer);
+  const timer = setTimeout(() => {
+    if (opWait.get(uuid)?.timer !== timer) return;
+    opWait.delete(uuid);
+    opShow(uuid, `${head} · no state update came back (the input is not streamed to the app, or its value did not change)`, "warn");
+  }, ms);
+  opWait.set(uuid, { head, states, timer });
+  opShow(uuid, `${head} · waiting for the state update…`, "busy");
+}
+/** A `values` event: did an input we just operated report back? */
+function opSeen(d) {
+  for (const [uuid, w] of [...opWait]) {
+    const k = Object.keys(d).find((k) => w.states.has(k));
+    if (!k) continue;
+    clearTimeout(w.timer);
+    opWait.delete(uuid);
+    opShow(uuid, `${w.head} · state update: ${liveText(d[k])}`, "ok");
+  }
+}
+function renderOpLog(box) {
+  const all = S.hist?.operate?.log || [];
+  const ent = (e) => `<div class="op-ent${e.sent && e.code === 200 ? "" : " err"}" title="${esc(`${new Date(e.time * 1000).toLocaleString()}\n${e.uuid}`)}">
+      <span class="l1"><b>${esc(e.cmd)}</b> → ${esc(e.title)}${e.secured ? " 🔒" : ""}</span>
+      <span class="dt">${esc(fmtWhen(e.time))} · ${e.sent ? (e.code == null ? esc(e.note) : `code ${e.code} ${esc(e.note)}`) : `not sent: ${esc(e.note)}`}</span></div>`;
+  // Commands that went out, and, apart, requests that failed before theirs could.
+  for (const [sent, title, key] of [[true, "Commands sent to inputs", "opLogOpen"], [false, "Not sent", "opNotOpen"]]) {
+    const log = all.filter((e) => !!e.sent === sent);
+    if (!log.length) continue;
+    const d = document.createElement("details");
+    d.className = "op-log";
+    d.open = !!S[key];
+    d.ontoggle = () => (S[key] = d.open);
+    d.innerHTML = `<summary class="hist-sec">${title} <span class="count">${log.length}</span></summary>` + log.map(ent).join("");
+    box.appendChild(d);
+  }
+}
+
 /** Live values belong to what runs on the Miniserver: the current, deployed revision. */
 function liveHere() {
   const r = revById(S.rev);
@@ -2034,6 +2161,7 @@ function liveStart() {
   es.addEventListener("values", (e) => {
     const d = JSON.parse(e.data);
     for (const k in d) S.live.values.set(k, d[k]);
+    opSeen(d);
     lvCache = new Map();
     liveQueue(Object.keys(d));
   });
@@ -2180,6 +2308,7 @@ function connect() {
   es.onopen = () => { setStatus("live", "live"); if (S.hist) loadHistory(); };
   es.addEventListener("history", () => loadHistory(true));
   es.addEventListener("actions", (e) => { if (S.hist) { S.hist.actions = JSON.parse(e.data); renderActions(); } });
+  es.addEventListener("operate", (e) => { if (S.hist) { S.hist.operate = JSON.parse(e.data); renderHistory(); } });
   es.onerror = () => setStatus("disconnected — retrying", "error");
 }
 S.hash = readHash();

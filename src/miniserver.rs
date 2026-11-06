@@ -69,6 +69,8 @@ pub enum Action {
     Pull,
     Apply,
     Sync,
+    /// A command to a virtual input (`--operate`).
+    Operate,
 }
 
 impl Action {
@@ -77,6 +79,7 @@ impl Action {
             Action::Pull => "pull",
             Action::Apply => "apply",
             Action::Sync => "sync",
+            Action::Operate => "operate",
         }
     }
 }
@@ -329,10 +332,52 @@ impl Miniserver {
     /// check (`--no-live`, no lox configuration), lox finds out.
     pub async fn preflight(&self, what: Action) -> Result<(), String> {
         let v = self.status(PREFLIGHT_AGE).await;
+        if what == Action::Operate {
+            return operate_why(&v).map_or(Ok(()), Err);
+        }
         match v["blocked"][what.key()].as_str() {
             Some(why) => Err(why.to_string()),
             None => Ok(()),
         }
+    }
+}
+
+/// Why a command to an input must not be sent, from a check: unless the
+/// Miniserver at the address is confirmed to have the config's serial. A
+/// command to another device that DHCP gave the address to, or to the wrong
+/// context, would switch something in the wrong house. Fails closed:
+/// without a check that confirmed the serial, nothing is sent.
+fn operate_why(v: &Value) -> Option<String> {
+    if v["available"] != true {
+        return Some(format!(
+            "vislox cannot check the Miniserver ({}), so it cannot confirm that it is the \
+             config's",
+            v["reason"].as_str().unwrap_or("no status")
+        ));
+    }
+    match v["identity"].as_str() {
+        Some("confirmed") => None,
+        // The reason that names both serials, as Pull, Apply and Sync give it.
+        Some("wrong") => Some(
+            v["blocked"]["apply"]
+                .as_str()
+                .unwrap_or("this is not the Miniserver of this config")
+                .to_string(),
+        ),
+        Some("unchecked") => Some(
+            "vislox does not know the serial this config belongs to, so it cannot confirm that \
+             the Miniserver at lox's address is the right one"
+                .into(),
+        ),
+        _ => Some(match v["movedTo"].as_str() {
+            Some(ip) => format!(
+                "the Miniserver at lox's address did not report its serial, and the config's \
+                 Miniserver answers at {ip}"
+            ),
+            None => "the Miniserver at lox's address did not report its serial, so vislox \
+                     cannot confirm that it is the config's"
+                .into(),
+        }),
     }
 }
 
@@ -1258,6 +1303,40 @@ mod tests {
                 .any(|w| w.starts_with("The pending config was saved with Loxone Config 17.1.7.27"))
         );
         assert!(!w.iter().any(|w| w.starts_with("The deployed config")));
+    }
+
+    #[test]
+    fn inputs_are_operated_only_on_the_confirmed_miniserver() {
+        assert_eq!(
+            operate_why(&json!({ "available": true, "identity": "confirmed" })),
+            None
+        );
+        let wrong = json!({ "available": true, "identity": "wrong",
+            "blocked": { "apply": "this is not the Miniserver of this config: 1.2.3.4 reports serial B" } });
+        assert!(operate_why(&wrong).unwrap().contains("reports serial B"));
+        for id in ["unknown", "unchecked"] {
+            let why = operate_why(&json!({ "available": true, "identity": id })).unwrap();
+            assert!(why.contains("confirm"), "{why}");
+        }
+        let moved = json!({ "available": true, "identity": "unknown", "movedTo": "10.0.0.9" });
+        assert!(operate_why(&moved).unwrap().contains("10.0.0.9"));
+        // Fails closed: no check, no confirmed serial, no command.
+        let why = operate_why(&json!({ "available": false, "reason": "turned off" })).unwrap();
+        assert!(
+            why.contains("turned off") && why.contains("confirm"),
+            "{why}"
+        );
+        assert!(operate_why(&json!({})).is_some());
+        assert!(
+            operate_why(&json!({ "available": true })).is_some(),
+            "no identity"
+        );
+    }
+
+    #[tokio::test]
+    async fn without_a_connection_no_input_is_operated() {
+        let ms = Miniserver::new(Err("turned off".into()), PathBuf::new(), None, None);
+        assert!(ms.preflight(Action::Operate).await.is_err());
     }
 
     #[tokio::test]

@@ -381,7 +381,9 @@ fn read_structure(structure: &Value) -> Structure {
         }
         controls.insert(
             uuid.to_string(),
-            json!({ "name": name, "type": ctrl["type"], "states": states }),
+            json!({ "name": name, "type": ctrl["type"], "states": states,
+                    // A visualization password guards its commands.
+                    "secured": ctrl["isSecured"].as_bool().unwrap_or(false) }),
         );
         for (su, sub) in ctrl["subControls"].as_object().into_iter().flatten() {
             add(owners, controls, su, sub, Some(own));
@@ -1006,6 +1008,7 @@ mod tests {
         assert_eq!(owners["s4"].label, "Licht / Spots · active");
         assert_eq!(controls["c3"]["states"]["active"], "s4");
         assert_eq!(controls["c1"]["type"], "InfoOnlyAnalog");
+        assert_eq!(controls["c1"]["secured"], false);
     }
 
     #[test]

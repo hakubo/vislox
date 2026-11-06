@@ -526,3 +526,19 @@ button.chip { cursor: pointer; } button.chip:hover { border-color: var(--brand);
 .lbadge circle { fill: #fff; stroke: var(--changed-dot); stroke-width: 2px; vector-effect: non-scaling-stroke; }
 .lbadge.error circle { stroke: var(--removed); }
 .lbadge text { fill: var(--text); font-weight: 700; font-size: 130px; }
+
+/* ── operate inputs (opt-in: --operate) ── */
+.op { padding: 6px 12px 8px; display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; }
+.op-what { flex: 1 1 100%; }
+.op-lock { font-size: 13px; }
+.op-ctl { display: flex; gap: 6px; align-items: center; }
+.op-ctl input { width: 96px; padding: 3px 6px; border: 1px solid var(--line); border-radius: var(--radius); font: inherit; }
+.op-res { flex: 1 1 100%; font-size: 12px; color: var(--muted); }
+.op-res.ok { color: var(--added); }
+.op-res.warn { color: var(--changed); }
+.op-res.err { color: var(--removed); }
+.op-log summary { cursor: pointer; list-style: none; }
+.op-log summary::-webkit-details-marker { display: none; }
+.op-ent { display: flex; flex-direction: column; padding: 4px 12px; border-bottom: 1px solid var(--line-2); font-size: 12px; }
+.op-ent .dt { color: var(--muted); font-size: 11px; }
+.op-ent.err .l1 { color: var(--removed); }

@@ -10,6 +10,7 @@ mod live;
 mod log;
 mod miniserver;
 mod model;
+mod operate;
 mod pull;
 mod reason;
 mod restart;
@@ -78,6 +79,11 @@ struct Args {
     /// Sync and Discard ask for. Without it they are off.
     #[arg(long, value_name = "FILE")]
     admin_token_file: Option<PathBuf>,
+    /// Let the browser operate virtual inputs on the Miniserver (Pulse,
+    /// On/Off, a value) to test a change. Needs --admin-token-file and live
+    /// values from the Miniserver. Off by default: vislox only listens.
+    #[arg(long)]
+    operate: bool,
 }
 
 struct App {
@@ -90,6 +96,7 @@ struct App {
     log: log::Log,
     ms: miniserver::Miniserver,
     actions: actions::Actions,
+    operate: Arc<operate::Operate>,
 }
 
 #[tokio::main]
@@ -184,6 +191,33 @@ async fn main() -> Result<()> {
         src.project.as_ref().map(|p| p.join("backups")),
     )
     .expecting(expected_serial(&src, found.as_ref().ok()));
+    let operate = {
+        let conn = match (&found, args.no_live || args.live_from.is_some()) {
+            (Ok(f), false) => Some(f.conn.clone()),
+            _ => None,
+        };
+        let off = if !args.operate {
+            Some("start vislox with --operate".to_string())
+        } else if args.admin_token_file.is_none() {
+            Some("start vislox with --admin-token-file".to_string())
+        } else if conn.is_none() {
+            Some("needs live values from the Miniserver (not --no-live or --live-from)".to_string())
+        } else {
+            None
+        };
+        let user = conn.as_ref().map(|c| c.user.clone()).unwrap_or_default();
+        let port = conn
+            .filter(|_| off.is_none())
+            .map(|c| Arc::new(operate::Http(c)) as Arc<dyn operate::Port>);
+        match &off {
+            None => eprintln!(
+                "vislox: operating virtual inputs is ON (--operate): commands go to the Miniserver"
+            ),
+            Some(why) if args.operate => eprintln!("vislox: no operating inputs: {why}"),
+            Some(_) => {}
+        }
+        Arc::new(operate::Operate::new(operate::Settings { off, user }, port))
+    };
     let (tx, _) = broadcast::channel(16);
     let app = Arc::new(App {
         label: src.label.clone(),
@@ -209,6 +243,7 @@ async fn main() -> Result<()> {
                 _ => None,
             },
         }),
+        operate,
     });
     if src.project.is_some() {
         match app.actions.info()["apply"]["reason"].as_str() {
@@ -282,6 +317,7 @@ async fn main() -> Result<()> {
         .route("/api/apply", axum::routing::post(api_apply))
         .route("/api/discard", axum::routing::post(api_discard))
         .route("/api/sync", axum::routing::post(api_sync))
+        .route("/api/operate", axum::routing::post(api_operate))
         .with_state(app)
         .layer(tower_http::compression::CompressionLayer::new());
 
@@ -435,6 +471,7 @@ async fn api_history(State(app): State<Arc<App>>) -> impl IntoResponse {
         "pull": app.pull.info(),
         "log": app.log.info(),
         "actions": app.actions.info(),
+        "operate": app.operate.info(),
     }))
 }
 
@@ -516,7 +553,14 @@ async fn api_events(
             .event("actions")
             .data(a.actions.info().to_string()))
     });
-    Sse::new(history.merge(actions)).keep_alive(KeepAlive::default())
+    // Commands sent to inputs: the whole log, on every command.
+    let o = app.clone();
+    let operate = BroadcastStream::new(app.operate.subscribe()).map(move |_| {
+        Ok(Event::default()
+            .event("operate")
+            .data(o.operate.info().to_string()))
+    });
+    Sse::new(history.merge(actions).merge(operate)).keep_alive(KeepAlive::default())
 }
 
 /// Requests that make vislox talk to the Miniserver carry an `X-Vislox`
@@ -723,6 +767,57 @@ async fn api_sync(State(app): State<Arc<App>>, headers: axum::http::HeaderMap) -
     match res {
         Ok(m) => Json(serde_json::json!({ "message": m })).into_response(),
         Err((status, msg)) => refused((status, reason::explain(&msg))),
+    }
+}
+
+/// The virtual inputs of the deployed revision (the current one that is not
+/// pending), parsed once per revision. Blocking.
+fn deployed_inputs(app: &App) -> Result<Arc<operate::Inputs>, String> {
+    let rev = {
+        let h = app.history.lock().unwrap();
+        let (_, hist) = h.list();
+        hist.into_iter()
+            .find(|r| r.current)
+            .ok_or("no deployed revision to look the input up in")?
+    };
+    app.operate
+        .inputs_of(&rev.blob, || load(app, &rev.id).map(|(_, d)| d))
+}
+
+/// Send one command to a virtual input (opt-in: `--operate`). Needs the
+/// `X-Vislox` header and the admin token; the browser has asked the user to
+/// confirm it. The request is checked first (400), then the preflight makes
+/// sure the Miniserver at the address is the config's.
+async fn api_operate(
+    State(app): State<Arc<App>>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<operate::Req>,
+) -> Response {
+    if let Some(r) = not_from_vislox(&headers) {
+        return r;
+    }
+    if let Err(r) = app.actions.check(&headers) {
+        return refused(r);
+    }
+    let a = app.clone();
+    let inputs = match tokio::task::spawn_blocking(move || deployed_inputs(&a)).await {
+        Ok(Ok(i)) => i,
+        Ok(Err(e)) => return refused((StatusCode::INTERNAL_SERVER_ERROR, e)),
+        Err(e) => return refused((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+    };
+    let res = app
+        .operate
+        .run(req, &inputs, || {
+            app.ms.preflight(miniserver::Action::Operate)
+        })
+        .await;
+    match res {
+        Ok(e) => Json(e).into_response(),
+        Err(f) => (
+            f.status,
+            Json(serde_json::json!({ "error": f.error, "badPassword": f.bad_password })),
+        )
+            .into_response(),
     }
 }
 
