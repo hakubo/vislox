@@ -120,12 +120,14 @@ The blocks vislox added are the exception: their `.loxl` is vislox's.
   undoes the applied change. So once applied, the module owns the value, and a later change in Loxone Config is
   overwritten on the next Apply. Revert before Apply works.
 - Moving a block it does not manage, and removing a wire Loxone Config drew.
-- New blocks of some types. vislox offers the page blocks of lox's verified builtin table (`loxl types`), which
-  lox creates; a test compiles each one with lox. Not offered:
+- New blocks of some types. vislox offers the page blocks of lox's verified builtin table (`loxl types`) that
+  lox creates and that work as placed; a test compiles each one with lox. Not offered:
   - virtual inputs, virtual HTTP, UDP and text inputs, virtual outputs and their commands, Modbus servers,
     devices and their I/O, and operating modes: objects of the object tree, not of a page (#84);
   - the NFC Code Touch, Intercom and Touch Pure Flex controller blocks, which exist because Loxone Config paired
     the device (lox adopts them, never creates them);
+  - blocks lox creates but that do nothing until they are set up in Loxone Config: the burglar and smoke alarms,
+    the room controller, the irrigation, and the central light and shade blocks (their members are #75);
   - every type outside lox's table (lox refuses it: "Refuse, never guess"), and templates (#83).
 - On a new block: a program's text (`Code:` takes only `file(…)`), a wire or an expression on an input (#61, #82),
   its position (#60), and a room or category (lox has no claim for them on a managed block). Its settings

@@ -29,14 +29,27 @@ pub const SLUG_PREFIX: &str = "vx_";
 /// Whether vislox offers `ty` as a new block on a page: a type of lox's
 /// verified builtin table that is drawn on a page and that lox creates.
 /// Not offered: objects of the object tree (virtual inputs, virtual and
-/// Modbus devices, operating modes: #84), and blocks a device carries,
-/// which exist because Loxone Config paired the device.
+/// Modbus devices, operating modes: #84), blocks a device carries,
+/// which exist because Loxone Config paired the device, and [`NEEDS_SETUP`].
 pub fn offered(ty: &str) -> bool {
     connectors::BUILTIN_TYPES.contains(&ty)
         && !connectors::object_tree(ty)
         && !connectors::adopt_only(ty)
         && ty != "Mode"
+        && !NEEDS_SETUP.contains(&ty)
 }
+
+/// Types lox creates that do nothing until they are set up in Loxone
+/// Config: an alarm's sensors and its zones, a room controller's and an
+/// irrigation's settings, a central block's members (#75). Not offered.
+pub const NEEDS_SETUP: &[&str] = &[
+    "Alarm",
+    "SmokeAlarm",
+    "HeatIRoomController2",
+    "Irrigation",
+    "CentralLight",
+    "CentralShade",
+];
 
 /// How a setting of a new block (an attribute parameter, `Formula:`,
 /// `Type:`, `At:`, …) is written.
@@ -426,6 +439,8 @@ mod tests {
         // The object tree, and blocks a device carries.
         assert!(!offered("VirtualIn") && !offered("ModbusDev") && !offered("Mode"));
         assert!(!offered("NfcCodeTouch") && !offered("TpfController"));
+        // Set up in Loxone Config before they do anything.
+        assert!(!offered("Alarm") && !offered("Irrigation") && !offered("CentralLight"));
         assert!(!offered("Banana"));
         let p = palette();
         let types = p["types"].as_array().unwrap();
