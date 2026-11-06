@@ -97,9 +97,20 @@ marked so you can review it before you deploy.
   block (warnings carry the UUID of the block that raised them) gets a link that selects that block, and on the
   deployed revision that block gets a small `!` mark on the canvas. The live Debug-Monitor stream (UDP 7777) is
   not shown yet: see [docs/debug-monitor.md](docs/debug-monitor.md).
+- **Operate virtual inputs** (opt-in: `--operate` with `--admin-token-file`): with live values on, a virtual
+  input, or an input reference to one, gets controls in Properties: **Pulse**, **On** and **Off** for a digital
+  input, a number field for an analog one. That lets you test a change the way Loxone Config's Liveview does.
+  Each command needs a confirmation. The Miniserver's code shows next to the control, then vislox waits for the
+  state update: the wire turns green or shows the new value, or the control says that no update came back.
+  A block with a visualization password shows a lock. vislox asks for the password once per browser session and
+  checks it (`checkuservisupwd`) before it sends the command. Every command sent (who, what, when, code) is
+  listed under *Commands sent to inputs* in the History pane until vislox stops. Before each command the preflight
+  checks that the Miniserver at lox's address reports the config's serial; when it reports another one, or none,
+  nothing is sent.
 
 vislox itself never writes to the config: lox and git do, and only on Pull, Apply and Discard. Live values only
-listen. A pull reads from the Miniserver; only Apply writes to it.
+listen. A pull reads from the Miniserver; only Apply writes to it, and with `--operate`, commands to virtual
+inputs.
 
 ## Run
 
@@ -187,6 +198,20 @@ from the rest of the check, so the preflight before Pull, Apply and Sync never w
 Not shown yet: the token's rights (Config, FTP, program restart) and whether the password is weak. The
 Miniserver reports them only at login (`tokenRights`, `unsecurePass`), and lox does not keep them.
 
+### Operate virtual inputs
+
+```bash
+vislox ~/loxone-config --admin-token-file ~/.config/vislox/admin-token --operate
+```
+
+This is the only part of vislox that sends commands to the Miniserver, so it needs both flags, and live values
+from the Miniserver itself (not `--no-live` or `--live-from`). Commands go over HTTP as the lox user
+(`jdev/sps/io/{uuid}/{cmd}`, or `jdev/sps/ios/{hash}/{uuid}/{cmd}` for a block with a visualization password).
+vislox takes commands only for `VirtualIn` objects of the deployed config. A digital input takes `pulse`, `on`
+or `off`. An analog input takes a number, within its `MinVal`/`MaxVal` when it checks values. Physical
+inputs, outputs and every other block are refused. The visualization password stays in the browser's session
+storage and is never logged. The command log is kept in memory.
+
 The Miniserver connection is opened when a browser turns live values on, and closed shortly after the last
 one turns them off. During Apply, vislox also asks the Miniserver every 0.5 s, read-only, whether it answers
 (`jdev/cfg/apiKey`, no login) and which structure it runs (`jdev/sps/LoxAPPversion3`). It does this only from
@@ -263,6 +288,8 @@ The binary is an `axum` server with the UI embedded (plain JS and SVG, no build 
   changed; `src/configdate.rs` finds the same date for the base, in the download it came from.
 - `src/discover.rs` is Loxone's UDP discovery (`vislox --discover`, and finding a Miniserver whose address
   changed).
+- `src/operate.rs` sends the commands of `--operate` to virtual inputs (`POST /api/operate`, with the admin
+  token) and keeps the command log.
 - `src/live.rs` streams the Miniserver's states with lox's `loxone-client` crate. A wire's source
   connector has the UUID of the state it carries, so the browser matches values to wires by UUID. Values
   reach the browser on `/api/live` (server-sent events).
