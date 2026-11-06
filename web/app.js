@@ -152,6 +152,7 @@ async function loadHistory(fromEvent) {
   renderLiveSwitch();
   renderPull();
   renderActions();
+  renderLog();
   if (fromEvent) {
     setStatus("updated " + new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }), "live flash");
     setTimeout(() => setStatus("live", "live"), 2500);
@@ -456,6 +457,8 @@ function renderPage() {
     if (o.shape === "tag") drawTag(L.objs, o, p);
     else drawBlock(L.objs, o);
     if (o.status && S.view.compared) drawBadge(L.badges, o);
+    const logged = logMarks().get(o.uuid);
+    if (logged) drawLogBadge(L.badges, o, logged);
     if (o.moved_to) {
       const g = el("g", { class: "xref ghost-note" }, L.badges);
       const t = el("text", { class: "pg", x: o.rect[0], y: o.rect[1] + o.rect[3] + 160 }, g, `→ moved to page “${o.moved_to.page_title}”`);
@@ -735,6 +738,16 @@ function drawBadge(parent, o) {
   const cx = o.rect[0] + o.rect[2], cy = o.rect[1];
   el("circle", { cx, cy, r: 110, fill: col }, g);
   el("text", { x: cx, y: cy + 52, "text-anchor": "middle" }, g, sym);
+}
+
+/** A block the Miniserver's log named since the last program change: a small mark on its top-left corner. */
+function drawLogBadge(parent, o, e) {
+  const g = el("g", { class: "lbadge " + e.kind }, parent);
+  const cx = o.rect[0], cy = o.rect[1];
+  el("circle", { cx, cy, r: 100 }, g);
+  el("text", { x: cx, y: cy + 46, "text-anchor": "middle" }, g, "!");
+  hoverTip(g, () => `<b>Miniserver log</b> ${esc(e.at)}<br>${esc(e.text)}`);
+  g.addEventListener("click", (ev) => { ev.stopPropagation(); openLog(e); });
 }
 
 function followTarget(t) {
@@ -1534,6 +1547,8 @@ function renderActions() {
     renderActions.shownAt = last.at;
     const head = { apply: ["Applied.\n", "Apply failed.\n"], sync: ["", "Sync failed.\n"], discard: ["", "Discard failed.\n"] }[last.kind] || ["", ""];
     deployMsg(head[last.ok ? 0 : 1] + last.message, !last.ok);
+    // What the new program logged as it started.
+    if (last.kind === "apply" && S.log.open) loadLog();
   }
 }
 /** Apply's steps as they happen: lox's progress, and what vislox sees of the program restart. */
@@ -1648,6 +1663,119 @@ $("btn-discard").onclick = async () => {
   deployMsg("");
   try { const j = await act("/api/discard"); deployMsg(j.message); } catch (err) { deployMsg(err.message, true); }
 };
+
+// ── the Miniserver's log ───────────────────────────────────────────────
+// `lox log` on the server: the system log's last lines. What came after the last program change
+// (an Apply, or a save from Loxone Config) is marked; lines that name a block's UUID link to it.
+S.log = { open: pref("logOpen", false), data: null, loading: false, onlySince: pref("logSince", false) };
+function logInfo() { return S.hist?.log || { available: false }; }
+/** The entries since the last program change; all of them when the lines hold none. */
+function logRecent() {
+  const d = S.log.data;
+  return d?.entries ? d.entries.slice(d.since ?? 0) : [];
+}
+/** UUID (a block's, or one of its ports') → the block it belongs to. */
+function logTargets() {
+  const v = S.view;
+  if (!v) return new Map();
+  if (logTargets.view === v) return logTargets.map;
+  const m = new Map();
+  for (const [u, o] of Object.entries(v.objects)) {
+    m.set(u.toLowerCase(), u);
+    for (const q of o.ports || []) if (q.uuid) m.set(String(q.uuid).toLowerCase(), u);
+  }
+  logTargets.view = v; logTargets.map = m;
+  return m;
+}
+/** Blocks named in the log since the last program change, with the newest line about each. Only on the
+ *  deployed revision: the log is about what runs. */
+function logMarks() {
+  const r = revById(S.rev);
+  if (!S.log.data || !r?.current || r.kind === "pending") return new Map();
+  const t = logTargets(), m = new Map();
+  for (const e of logRecent()) for (const u of e.uuids || []) { const b = t.get(u); if (b) m.set(b, e); }
+  return m;
+}
+function renderLog() {
+  const info = logInfo(), pane = $("log-pane");
+  pane.classList.toggle("hidden", !info.available);
+  if (!info.available) return;
+  const open = S.log.open;
+  pane.classList.toggle("open", open);
+  $("log-toggle").setAttribute("aria-expanded", String(open));
+  $("log-body").classList.toggle("hidden", !open);
+  const b = $("btn-log");
+  b.classList.toggle("hidden", !open);
+  b.disabled = S.log.loading;
+  b.classList.toggle("busy", S.log.loading);
+  b.querySelector(".lbl").textContent = S.log.loading ? "Reading…" : "Refresh";
+  const d = S.log.data;
+  const recent = d?.entries && d.since != null ? d.entries.length - d.since : null;
+  $("log-count").textContent = recent ? `${recent} new` : "";
+  $("log-count").title = recent ? `${plural(recent, "entry")} since the last program change` : "";
+  const msg = $("log-msg");
+  const text = d?.error ? `Cannot read the log: ${d.error}` : !d ? (S.log.loading ? "Reading the log (lox log)…" : "")
+    : d.since == null ? `No program change in the last ${d.lines} lines.` : "";
+  msg.textContent = text;
+  msg.className = "log-msg" + (d?.error ? " error" : "") + (text ? "" : " hidden");
+  $("log-only-w").classList.toggle("hidden", !d || d.since == null);
+  $("chk-log-since").checked = S.log.onlySince;
+  const list = $("log");
+  const entries = d?.entries || [], since = d?.since ?? null, t = logTargets();
+  const from = S.log.onlySince && since != null ? since : 0;
+  const rows = [];
+  for (let i = entries.length - 1; i >= from; i--) {
+    const e = entries[i];
+    const links = (e.uuids || []).map((u) => t.get(u)).filter((u, j, a) => u && a.indexOf(u) === j).map((u) => {
+      const o = S.view.objects[u];
+      return `<button type="button" class="go" data-go="${esc(u)}" title="${esc(o.path || "")}">${esc(autoTitle(o.title) ? prettyType(o.ty) : o.title)}</button>`;
+    }).join("");
+    rows.push(`<li class="${esc(e.kind)}${since != null && i >= since ? " since" : ""}" data-i="${i}"><span class="tm">${esc(e.at)}</span><span class="tx">${esc(e.text)}</span>${links}</li>`);
+    if (i === since) rows.push(`<li class="mark">▲ The program changed here (Apply, or a save from Loxone Config)</li>`);
+  }
+  list.innerHTML = rows.join("") || (d && !d.error ? '<li class="tx">The log is empty.</li>' : "");
+  if (open && !d && !S.log.loading) loadLog();
+}
+async function loadLog() {
+  if (S.log.loading || !logInfo().available) return;
+  S.log.loading = true; renderLog();
+  try {
+    const r = await fetch("/api/log", { headers: { "X-Vislox": "log" } });
+    const j = await r.json().catch(() => ({}));
+    S.log.data = r.ok ? j : { ...(S.log.data || {}), error: j.error || r.statusText };
+  } catch (e) {
+    S.log.data = { ...(S.log.data || {}), error: e.message };
+  } finally {
+    S.log.loading = false;
+    renderLog();
+    // The blocks' log marks.
+    if (S.view) { renderPage(); applyFocus(); }
+  }
+}
+function setLogOpen(open) {
+  S.log.open = open; setPref("logOpen", open);
+  renderLog();
+}
+/** From a block's log mark: open the log and show that line. */
+function openLog(e) {
+  if (!S.log.open) setLogOpen(true);
+  const i = S.log.data?.entries.indexOf(e);
+  const li = i >= 0 ? $("log").querySelector(`li[data-i="${i}"]`) : null;
+  if (!li) return;
+  li.scrollIntoView({ block: "nearest" });
+  li.classList.add("flash");
+  setTimeout(() => li.classList.remove("flash"), 2000);
+}
+$("log-toggle").onclick = () => setLogOpen(!S.log.open);
+$("btn-log").onclick = () => loadLog();
+$("chk-log-since").onchange = (e) => { S.log.onlySince = e.target.checked; setPref("logSince", S.log.onlySince); renderLog(); };
+$("log").addEventListener("click", (e) => {
+  const g = e.target.closest("[data-go]");
+  if (!g) return;
+  const u = g.dataset.go, pg = S.view?.objects[u]?.page;
+  if (pg) gotoPage(pg, { focus: u });
+  select(u);
+});
 
 // ── live values ────────────────────────────────────────────────────────
 // The Miniserver streams a value per state UUID; a wire's source connector

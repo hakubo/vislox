@@ -156,6 +156,21 @@
       <div class="chg-filter" id="chg-filter" role="group" aria-label="Filter changes"></div>
       <div class="changes" id="changes" role="list"></div>
     </section>
+    <section class="pane hidden" id="log-pane" aria-labelledby="log-h">
+      <h2 class="pane-title" id="log-h">
+        <button type="button" id="log-toggle" class="log-toggle" aria-expanded="false" aria-controls="log-body" title="The Miniserver's system log (lox log)"><span class="tw" aria-hidden="true">▸</span>Miniserver log</button>
+        <span class="count" id="log-count"></span>
+        <button type="button" id="btn-log" class="pull-btn hidden" title="Read the Miniserver's system log again (lox log)">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M13 8a5 5 0 1 1-1.5-3.6M13 2.5V5h-2.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          <span class="lbl">Refresh</span>
+        </button>
+      </h2>
+      <div class="log-body hidden" id="log-body">
+        <div class="log-msg hidden" id="log-msg" role="status" aria-live="polite"></div>
+        <label class="log-only" id="log-only-w" title="Hide what the Miniserver logged before the last program change (an Apply, or a save from Loxone Config)"><input type="checkbox" id="chk-log-since"> Only since the last program change</label>
+        <ol class="log" id="log" aria-label="Log entries, newest first"></ol>
+      </div>
+    </section>
   </aside>
 </main>
 

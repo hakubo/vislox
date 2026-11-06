@@ -165,7 +165,9 @@ fn check(
 /// Linux, a file just written can still be held open for writing by a child
 /// another thread forked at that moment, and executing it fails until that
 /// child execs.
-async fn output_retrying(c: &mut tokio::process::Command) -> std::io::Result<std::process::Output> {
+pub(crate) async fn output_retrying(
+    c: &mut tokio::process::Command,
+) -> std::io::Result<std::process::Output> {
     let mut tries = 0;
     loop {
         match c.output().await {
@@ -179,7 +181,7 @@ async fn output_retrying(c: &mut tokio::process::Command) -> std::io::Result<std
 }
 
 /// `name` as a path, or looked up on `PATH`.
-fn which(name: &Path) -> Option<PathBuf> {
+pub(crate) fn which(name: &Path) -> Option<PathBuf> {
     if name.components().count() > 1 {
         return name.is_file().then(|| name.to_path_buf());
     }

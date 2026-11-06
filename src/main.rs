@@ -6,6 +6,7 @@ mod configdate;
 mod discover;
 mod history;
 mod live;
+mod log;
 mod miniserver;
 mod model;
 mod pull;
@@ -85,6 +86,7 @@ struct App {
     tx: broadcast::Sender<u64>,
     live: Arc<live::Live>,
     pull: pull::Pull,
+    log: log::Log,
     ms: miniserver::Miniserver,
     actions: actions::Actions,
 }
@@ -135,6 +137,14 @@ async fn main() -> Result<()> {
         Some(why) if src.miniserver.is_some() => eprintln!("vislox: no pull: {why}"),
         Some(_) => {}
     }
+    // The Log panel reads `lox log`; --no-live means vislox never talks to
+    // the Miniserver.
+    let log = log::Log::new(
+        &args.lox,
+        args.no_live.then_some("turned off (--no-live)"),
+        found.as_ref(),
+        &start,
+    );
     let (feed, live_source) = if args.no_live {
         (
             live::Feed::Off("turned off (--no-live)".into()),
@@ -181,6 +191,7 @@ async fn main() -> Result<()> {
         tx,
         live: live::Live::new(feed, live_source),
         pull,
+        log,
         ms,
         actions: actions::Actions::new(actions::Settings {
             token: args
@@ -265,6 +276,7 @@ async fn main() -> Result<()> {
         .route("/api/live", get(api_live))
         .route("/api/live/retry", axum::routing::post(api_live_retry))
         .route("/api/miniserver", get(api_miniserver))
+        .route("/api/log", get(api_log))
         .route("/api/pull", axum::routing::post(api_pull))
         .route("/api/apply", axum::routing::post(api_apply))
         .route("/api/discard", axum::routing::post(api_discard))
@@ -420,6 +432,7 @@ async fn api_history(State(app): State<Arc<App>>) -> impl IntoResponse {
         "error": h.last_error,
         "live": app.live.info(),
         "pull": app.pull.info(),
+        "log": app.log.info(),
         "actions": app.actions.info(),
     }))
 }
@@ -570,6 +583,20 @@ async fn api_miniserver(State(app): State<Arc<App>>, Query(q): Query<MsQuery>) -
         app.ms.chip().await
     };
     Json(v.as_ref().clone()).into_response()
+}
+
+/// The Miniserver's system log (`lox log`), fetched now. Needs the
+/// `X-Vislox` header: lox logs in to the Miniserver for it, and another site
+/// must not be able to make it do that.
+async fn api_log(State(app): State<Arc<App>>, headers: axum::http::HeaderMap) -> Response {
+    if !headers.contains_key("x-vislox") {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": "missing X-Vislox header" })),
+        )
+            .into_response();
+    }
+    Json(app.log.fetch().await).into_response()
 }
 
 /// Refuse Pull, Apply and Sync when the Miniserver cannot be reached the
