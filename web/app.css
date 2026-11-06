@@ -190,6 +190,10 @@ button.chip { cursor: pointer; } button.chip:hover { border-color: var(--brand);
 .canvas-msg span { background: #fffffff0; padding: 10px 16px; border-radius: var(--radius); box-shadow: var(--shadow); max-width: 70%; text-align: center; }
 .hud { position: absolute; background: #fffffff2; border: 1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow); }
 .hud-zoom { left: 10px; bottom: 10px; display: flex; overflow: hidden; }
+.hud-add { left: 10px; top: 10px; overflow: hidden; }
+.hud-add button { height: 30px; border: none; background: transparent; font-weight: 600; padding: 0 12px; }
+.hud-add button:hover:not(:disabled) { background: var(--brand-soft); }
+.hud-add button:disabled { opacity: .55; cursor: not-allowed; }
 .hud-zoom button { min-width: 32px; height: 30px; border: none; border-right: 1px solid var(--line-2); background: transparent; font-size: 15px; }
 .hud-zoom button:last-child { border-right: none; font-size: 13px; padding: 0 10px; }
 .hud-zoom button.pct { font-size: 12px; min-width: 52px; color: var(--muted); font-variant-numeric: tabular-nums; }
@@ -381,14 +385,30 @@ rect.ghost, line.ghost { fill: #1f6fd10a; stroke: var(--moved); stroke-opacity: 
 .overlay { position: fixed; inset: 0; z-index: 20; background: #1d211d55; display: flex; align-items: flex-start; justify-content: center; padding-top: 12vh; }
 .pal-box, .help-box { width: min(620px, 92vw); background: #fff; border-radius: 10px; box-shadow: 0 10px 40px #0004; overflow: hidden; }
 #pal-input { width: 100%; border: none; border-bottom: 1px solid var(--line); padding: 14px 16px; font-size: 16px; outline: none; }
-#pal-list { list-style: none; margin: 0; padding: 4px 0; max-height: 52vh; overflow: auto; }
-#pal-list li { display: flex; align-items: center; gap: 10px; padding: 7px 16px; cursor: pointer; }
-#pal-list li[aria-selected="true"] { background: var(--sel-soft); box-shadow: inset 3px 0 0 var(--sel); }
+#pal-list, #ab-list { list-style: none; margin: 0; padding: 4px 0; max-height: 52vh; overflow: auto; }
+#pal-list li, #ab-list li { display: flex; align-items: center; gap: 10px; padding: 7px 16px; cursor: pointer; }
+#pal-list li[aria-selected="true"], #ab-list li[aria-selected="true"] { background: var(--sel-soft); box-shadow: inset 3px 0 0 var(--sel); }
 #pal-list .pk { flex: none; width: 52px; font-size: 11px; font-weight: 700; color: var(--faint); text-transform: uppercase; letter-spacing: .04em; }
 #pal-list .pt { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 #pal-list .pt mark { background: #fff1a8; color: inherit; border-radius: 2px; }
 #pal-list .pm { color: var(--muted); font-size: 12px; white-space: nowrap; }
 #pal-list .sec { padding: 6px 16px 2px; font-size: 11px; font-weight: 700; color: var(--faint); text-transform: uppercase; letter-spacing: .05em; cursor: default; }
+.ab-head { display: flex; align-items: baseline; gap: 10px; padding: 12px 16px 8px; border-bottom: 1px solid var(--line-2); }
+.ab-head h2 { margin: 0; font-size: 16px; }
+.ab-page { color: var(--muted); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#ab-q { width: 100%; border: none; border-bottom: 1px solid var(--line); padding: 12px 16px; font-size: 15px; outline: none; }
+#ab-list li { align-items: baseline; }
+#ab-list .at { flex: none; font-weight: 600; }
+#ab-list .at mark { background: #fff1a8; color: inherit; border-radius: 2px; }
+#ab-list .ac { flex: none; color: var(--faint); font-size: 12px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+#ab-list .as { flex: 1; min-width: 0; color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ab-form { max-height: 60vh; overflow: auto; padding: 6px 0; }
+.ab-sum { padding: 4px 16px 8px; color: var(--muted); font-size: 13px; }
+.ab-sum a { margin-left: 6px; }
+.ab-form .pr { padding-left: 16px; padding-right: 16px; }
+.ab-form h3 { margin: 8px 16px 2px; font-size: 11px; font-weight: 700; color: var(--faint); text-transform: uppercase; letter-spacing: .05em; }
+.ab-form details summary { margin: 8px 16px 2px; font-size: 12px; color: var(--muted); cursor: pointer; }
+.ab-form .ed-bar { padding: 10px 16px 12px; border-top: 1px solid var(--line-2); margin-top: 6px; }
 .pal-foot { padding: 7px 16px; border-top: 1px solid var(--line-2); color: var(--muted); font-size: 12px; background: #fafbfa; }
 .help-box { padding: 18px 22px; }
 .help-box h2 { margin: 0 0 12px; font-size: 17px; }

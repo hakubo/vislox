@@ -1,0 +1,560 @@
+//! Adding blocks (#59): the block types vislox offers, and the files that
+//! declare the blocks it adds. The design is in `docs/editing.md`.
+//!
+//! A block added in vislox is a managed block of the Lox Logic module: a
+//! declaration `vx_and_1 = And("Licht", In2: 1)` in a file of vislox's own,
+//! one per page, headed by the page's `page "…"` line
+//! (`<module>/vislox/<page>.loxl`). `lox logic compile` mints its UUIDs (in
+//! the lockfile) and places it on the page. vislox picks the slug, never
+//! derived from the name, so that a rename never changes the block's
+//! identity.
+//!
+//! A block added here and not deployed yet can be taken out again: its
+//! declaration goes, and a `removed <slug>` line tells lox that is meant
+//! (without it lox refuses a lockfile entry the source lost). The line is
+//! dropped once the lockfile no longer has the block.
+
+use loxone_config::connectors::{self, PortDir};
+use loxone_config::logic::{ArgItem, Binding, BindingKind, Item, Module, PageDecl, Value};
+use loxone_config::port_names;
+use serde::Serialize;
+use serde_json::{Value as Json, json};
+use std::collections::{BTreeMap, BTreeSet};
+
+/// The slugs vislox picks start with this; nothing else in a module should.
+pub const SLUG_PREFIX: &str = "vx_";
+
+// ── the palette ─────────────────────────────────────────────────────────
+
+/// Whether vislox offers `ty` as a new block on a page: a type of lox's
+/// verified builtin table that is drawn on a page and that lox creates.
+/// Not offered: objects of the object tree (virtual inputs, virtual and
+/// Modbus devices, operating modes: #84), blocks a device carries,
+/// which exist because Loxone Config paired the device, and [`NEEDS_SETUP`].
+pub fn offered(ty: &str) -> bool {
+    connectors::BUILTIN_TYPES.contains(&ty)
+        && !connectors::object_tree(ty)
+        && !connectors::adopt_only(ty)
+        && ty != "Mode"
+        && !NEEDS_SETUP.contains(&ty)
+}
+
+/// Types lox creates that do nothing until they are set up in Loxone
+/// Config: an alarm's sensors and its zones, a room controller's and an
+/// irrigation's settings, a central block's members (#75). Not offered.
+pub const NEEDS_SETUP: &[&str] = &[
+    "Alarm",
+    "SmokeAlarm",
+    "HeatIRoomController2",
+    "Irrigation",
+    "CentralLight",
+    "CentralShade",
+];
+
+/// How a setting of a new block (an attribute parameter, `Formula:`,
+/// `Type:`, `At:`, …) is written.
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Kind {
+    /// One line of text; `empty` says whether it may be empty.
+    Text,
+    /// One of a few words.
+    Choice,
+    /// `on` or `off`.
+    OnOff,
+    /// A time of day, `HH:MM` or `HH:MM:SS`.
+    Time,
+    /// A number.
+    Number,
+}
+
+/// How `param`, a setting of `ty`, is written; `None` for one vislox does
+/// not offer: a program's text, which lox takes only as `file(…)`.
+pub fn setting_kind(ty: &str, param: &str) -> Option<Kind> {
+    if connectors::file_params(ty).contains(&param) {
+        None
+    } else if connectors::clock_params(ty).contains(&param) {
+        Some(Kind::Time)
+    } else if connectors::choice_values(ty, param).is_some() {
+        Some(Kind::Choice)
+    } else if connectors::bool_params(ty).contains(&param) {
+        Some(Kind::OnOff)
+    } else if connectors::text_params(ty).contains(&param) || (ty, param) == ("Formula", "Formula")
+    {
+        Some(Kind::Text)
+    } else {
+        Some(Kind::Number)
+    }
+}
+
+/// The settings vislox offers on a new block of `ty`, in lox's order.
+pub fn settings(ty: &str) -> Vec<(&'static str, Kind)> {
+    connectors::attr_params(ty)
+        .into_iter()
+        .filter_map(|p| Some((p, setting_kind(ty, p)?)))
+        .collect()
+}
+
+/// The ports of `ty` a new block may give a constant: its parameters, and
+/// its inputs (a constant until something is wired to them).
+pub fn valued_ports(ty: &str) -> impl Iterator<Item = &'static connectors::PortSpec> {
+    connectors::builtin(ty)
+        .unwrap_or_default()
+        .iter()
+        .filter(|s| matches!(s.dir, PortDir::Input | PortDir::Param))
+}
+
+/// What lox's hover says about a type: its purpose, the link to Loxone's
+/// documentation, and the label Loxone Config draws on each port. lox
+/// keeps these tables to itself; its language server shows them, so they
+/// are read from there. `None` where it says nothing.
+struct TypeDoc {
+    summary: Option<String>,
+    docs: Option<String>,
+    labels: BTreeMap<String, String>,
+}
+
+fn type_doc(ty: &str) -> TypeDoc {
+    use loxone_config::lsp::analysis::Workspace;
+    let path = std::path::PathBuf::from("/vislox-palette/types.loxl");
+    let mut ws = Workspace::default();
+    ws.open(path.clone(), format!("{ty}\n"));
+    let md = ws.hover(&path, 0, 0).map(|(m, _)| m).unwrap_or_default();
+    let mut doc = TypeDoc {
+        summary: None,
+        docs: None,
+        labels: BTreeMap::new(),
+    };
+    for line in md.lines().skip(1) {
+        let line = line.trim();
+        if let Some(url) = line
+            .strip_prefix("[Loxone documentation](")
+            .and_then(|r| r.strip_suffix(')'))
+        {
+            doc.docs = Some(url.to_string());
+        } else if let Some(rest) = line.strip_prefix("- `") {
+            // - `Name` input (Label)
+            if let Some((name, rest)) = rest.split_once('`')
+                && let Some(label) = rest
+                    .rfind(" (")
+                    .map(|i| &rest[i + 2..])
+                    .and_then(|l| l.strip_suffix(')'))
+            {
+                doc.labels.insert(name.to_string(), label.to_string());
+            }
+        } else if !line.is_empty() && doc.summary.is_none() && !line.starts_with("**") {
+            doc.summary = Some(line.to_string());
+        }
+    }
+    doc
+}
+
+/// `GET /api/block-types`: the types vislox offers on a page, each with
+/// what lox knows of it: its purpose, its ports (the source name, the key
+/// the config stores, the direction, the unit, the label Loxone Config
+/// draws, the value a new block gets) and its settings.
+pub fn palette() -> Json {
+    let types: Vec<Json> = connectors::BUILTIN_TYPES
+        .iter()
+        .filter(|t| offered(t))
+        .map(|&ty| {
+            let doc = type_doc(ty);
+            let ports: Vec<Json> = connectors::builtin(ty)
+                .unwrap_or_default()
+                .iter()
+                .map(|s| {
+                    json!({
+                        "key": s.key,
+                        "name": s.name,
+                        "dir": match s.dir {
+                            PortDir::Input => "input",
+                            PortDir::Output => "output",
+                            PortDir::Param => "param",
+                            PortDir::Api => "api",
+                        },
+                        "unit": connectors::port_unit(ty, s.key).map(crate::edit::unit_suffix),
+                        "label": doc.labels.get(s.name),
+                        "default": loxone_config::gui_defaults::gui_default(ty, s.key).unwrap_or("0"),
+                    })
+                })
+                .collect();
+            let settings: Vec<Json> = settings(ty)
+                .into_iter()
+                .map(|(name, kind)| {
+                    json!({
+                        "name": name,
+                        "kind": kind,
+                        "choices": connectors::choice_values(ty, name)
+                            .map(|c| c.iter().map(|(w, _)| *w).collect::<Vec<_>>()),
+                        "empty": connectors::empty_ok(ty, name),
+                    })
+                })
+                .collect();
+            json!({
+                "type": ty,
+                "summary": doc.summary,
+                "docs": doc.docs,
+                "ports": ports,
+                "settings": settings,
+            })
+        })
+        .collect();
+    json!({ "types": types })
+}
+
+// ── the files ───────────────────────────────────────────────────────────
+
+/// One block vislox added: `slug = Type("Title", Port: value, …)`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NewBlock {
+    pub slug: String,
+    pub ty: String,
+    /// The label; `None` shows the slug.
+    pub title: Option<String>,
+    /// Port (by its source name) or setting → value, in the order written.
+    pub args: Vec<(String, Value)>,
+}
+
+impl NewBlock {
+    pub fn get(&self, name: &str) -> Option<&Value> {
+        self.args.iter().find(|(k, _)| k == name).map(|(_, v)| v)
+    }
+
+    /// Set `name`, or drop it with `None`.
+    pub fn set(&mut self, name: &str, v: Option<Value>) {
+        match (self.args.iter_mut().find(|(k, _)| k == name), v) {
+            (Some(slot), Some(v)) => slot.1 = v,
+            (None, Some(v)) => self.args.push((name.to_string(), v)),
+            (_, None) => self.args.retain(|(k, _)| k != name),
+        }
+    }
+
+    fn render(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(t) = &self.title {
+            parts.push(Value::Str(t.clone()).to_string());
+        }
+        for (k, v) in &self.args {
+            parts.push(format!("{k}: {v}"));
+        }
+        format!("{} = {}({})", self.slug, self.ty, parts.join(", "))
+    }
+}
+
+/// One file of blocks vislox added: the page they are on, the blocks, and
+/// the removals of blocks added here that lox has not forgotten yet.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PageFile {
+    /// The page's UUID, from a `# page uuid: …` line: the file follows its
+    /// page when Loxone Config renames it (`page "…"` names it by title).
+    pub uuid: Option<String>,
+    pub page: String,
+    /// `page "…" (room: …, category: …)`: kept as written (#88 writes them).
+    pub room: Option<String>,
+    pub category: Option<String>,
+    pub blocks: Vec<NewBlock>,
+    pub removed: BTreeSet<String>,
+}
+
+/// The comment that ties a file to its page: `# page uuid: …`.
+const UUID_LINE: &str = "page uuid:";
+
+fn foreign(what: &str) -> String {
+    format!("it holds {what}, which vislox did not write; move it to another file of the module")
+}
+
+impl PageFile {
+    pub fn new(page: &str) -> PageFile {
+        PageFile {
+            uuid: None,
+            page: page.to_string(),
+            room: None,
+            category: None,
+            blocks: Vec::new(),
+            removed: BTreeSet::new(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.blocks.is_empty() && self.removed.is_empty()
+    }
+
+    /// Read a file vislox wrote. Only what vislox writes is accepted, so
+    /// that a rewrite never drops a statement someone added by hand.
+    pub fn parse(text: &str) -> Result<PageFile, String> {
+        let m = Module::parse(text).map_err(|e| e.to_string())?;
+        let mut file: Option<PageFile> = None;
+        let mut uuid = None;
+        for item in m.items {
+            match item {
+                Item::Comment(c) if file.is_none() && c.trim().starts_with(UUID_LINE) => {
+                    uuid = Some(c.trim()[UUID_LINE.len()..].trim().to_string());
+                }
+                Item::Page(p) if file.is_none() => {
+                    file = Some(PageFile {
+                        uuid: uuid.take(),
+                        room: p.room,
+                        category: p.category,
+                        ..PageFile::new(&p.title)
+                    })
+                }
+                Item::Block(b) => {
+                    let f = file
+                        .as_mut()
+                        .ok_or_else(|| foreign(&format!("`{}` before its page line", b.slug)))?;
+                    if !b.slug.starts_with(SLUG_PREFIX) {
+                        return Err(foreign(&format!("`{}`", b.slug)));
+                    }
+                    let mut args = Vec::new();
+                    for a in &b.args {
+                        match a {
+                            ArgItem::Binding(Binding {
+                                port,
+                                kind: BindingKind::Param(v),
+                                ..
+                            }) => args.push((port.clone(), v.clone())),
+                            ArgItem::Binding(_) => {
+                                return Err(foreign(&format!("a wire onto `{}`", b.slug)));
+                            }
+                            ArgItem::Comment(_) => {}
+                        }
+                    }
+                    f.blocks.push(NewBlock {
+                        slug: b.slug,
+                        ty: b.block_type,
+                        title: b.title,
+                        args,
+                    });
+                }
+                Item::Removed(r) if r.slug.starts_with(SLUG_PREFIX) => {
+                    file.as_mut()
+                        .ok_or_else(|| foreign("`removed` before the page line"))?
+                        .removed
+                        .insert(r.slug);
+                }
+                Item::Gap | Item::FragmentEnd | Item::Comment(_) => {}
+                _ => return Err(foreign("a statement")),
+            }
+        }
+        file.ok_or_else(|| "it has no page line".to_string())
+    }
+
+    pub fn render(&self) -> String {
+        let page = PageDecl {
+            title: self.page.clone(),
+            room: self.room.clone(),
+            category: self.category.clone(),
+            comment: None,
+        };
+        let mut out = String::from(
+            "# Blocks added in vislox on this page. vislox rewrites this file on every edit;\n\
+             # see docs/editing.md in vislox.\n",
+        );
+        if let Some(u) = &self.uuid {
+            out.push_str(&format!("# {UUID_LINE} {u}\n"));
+        }
+        out.push_str(&render_page(&page));
+        out.push('\n');
+        if !self.blocks.is_empty() {
+            out.push('\n');
+        }
+        for b in &self.blocks {
+            out.push_str(&b.render());
+            out.push('\n');
+        }
+        if !self.removed.is_empty() {
+            out.push_str("\n# Added here and taken out again before Apply.\n");
+        }
+        for s in &self.removed {
+            out.push_str(&format!("removed {s}\n"));
+        }
+        out
+    }
+}
+
+fn render_page(p: &PageDecl) -> String {
+    let mut args = Vec::new();
+    if let Some(r) = &p.room {
+        args.push(format!("room: {}", Value::Str(r.clone())));
+    }
+    if let Some(c) = &p.category {
+        args.push(format!("category: {}", Value::Str(c.clone())));
+    }
+    let t = Value::Str(p.title.clone());
+    if args.is_empty() {
+        format!("page {t}")
+    } else {
+        format!("page {t} ({})", args.join(", "))
+    }
+}
+
+/// The file name for the blocks of page `title`: its title in plain
+/// letters, digits and dashes (`Küche Licht` → `kueche-licht.loxl`), unless
+/// another page's file has that name already.
+pub fn file_name(title: &str, taken: &dyn Fn(&str) -> bool) -> String {
+    let mut s = String::new();
+    for c in title.chars().flat_map(char::to_lowercase) {
+        match c {
+            'ä' => s.push_str("ae"),
+            'ö' => s.push_str("oe"),
+            'ü' => s.push_str("ue"),
+            'ß' => s.push_str("ss"),
+            c if c.is_ascii_alphanumeric() => s.push(c),
+            _ if !s.ends_with('-') => s.push('-'),
+            _ => {}
+        }
+    }
+    let mut stem: String = s.trim_matches('-').chars().take(40).collect();
+    stem = stem.trim_end_matches('-').to_string();
+    // `edits.loxl` is the file of #58's claims.
+    if stem.is_empty() || stem == "edits" {
+        stem = format!("page-{stem}").trim_end_matches('-').to_string();
+    }
+    let mut name = format!("{stem}.loxl");
+    let mut n = 2;
+    while taken(&name) {
+        name = format!("{stem}-{n}.loxl");
+        n += 1;
+    }
+    name
+}
+
+/// A new slug for a block of `ty`: `vx_<type>_<n>`, the lowest `n` no name
+/// of the module, the lockfile (its tombstones included) or vislox's files
+/// has.
+pub fn new_slug(ty: &str, taken: &dyn Fn(&str) -> bool) -> String {
+    let stem: String = ty
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .flat_map(|c| c.to_lowercase())
+        .collect();
+    (1..)
+        .map(|n| format!("{SLUG_PREFIX}{stem}_{n}"))
+        .find(|s| !taken(s))
+        .expect("an unused slug")
+}
+
+/// The source name of port `key` of `ty`, if a new block may give it a
+/// constant.
+pub fn port_name(ty: &str, key: &str) -> Option<&'static str> {
+    valued_ports(ty).find(|s| s.key == key).map(|s| s.name)
+}
+
+/// The key of the port `name` (a source name) of `ty`.
+pub fn port_key<'a>(ty: &str, name: &'a str) -> &'a str {
+    port_names::key_or_raw(ty, name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_palette_offers_page_blocks_lox_creates() {
+        assert!(offered("And") && offered("Formula") && offered("PulseAt"));
+        // The object tree, and blocks a device carries.
+        assert!(!offered("VirtualIn") && !offered("ModbusDev") && !offered("Mode"));
+        assert!(!offered("NfcCodeTouch") && !offered("TpfController"));
+        // Set up in Loxone Config before they do anything.
+        assert!(!offered("Alarm") && !offered("Irrigation") && !offered("CentralLight"));
+        assert!(!offered("Banana"));
+        let p = palette();
+        let types = p["types"].as_array().unwrap();
+        let and = types.iter().find(|t| t["type"] == "And").unwrap();
+        assert!(
+            and["summary"].as_str().unwrap().contains("AND"),
+            "lox's hover changed: {and}"
+        );
+        let names: Vec<_> = and["ports"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["In1", "In2", "Q"]);
+        let mono = types.iter().find(|t| t["type"] == "Monoflop").unwrap();
+        let time = mono["ports"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["key"] == "Time")
+            .unwrap();
+        assert_eq!(time["unit"], "s");
+        let pulse = types.iter().find(|t| t["type"] == "PulseAt").unwrap();
+        let kinds: Vec<_> = pulse["settings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| (s["name"].as_str().unwrap(), s["kind"].as_str().unwrap()))
+            .collect();
+        assert!(kinds.contains(&("At", "time")), "{kinds:?}");
+        assert!(kinds.contains(&("Pulse", "choice")), "{kinds:?}");
+        // A program's text is only taken from a file.
+        let code = types.iter().find(|t| t["type"] == "Code16").unwrap();
+        assert!(
+            !code["settings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|s| s["name"] == "Code")
+        );
+        assert_eq!(setting_kind("Formula", "Formula"), Some(Kind::Text));
+    }
+
+    #[test]
+    fn a_page_file_round_trips() {
+        let mut f = PageFile::new("Küche \"Licht\"");
+        f.uuid = Some("10000008-0000-0080-ffff504f94000001".into());
+        f.blocks.push(NewBlock {
+            slug: "vx_and_1".into(),
+            ty: "And".into(),
+            title: Some("Licht an".into()),
+            args: vec![("In2".into(), Value::Number("1".into()))],
+        });
+        f.blocks.push(NewBlock {
+            slug: "vx_or_1".into(),
+            ty: "Or".into(),
+            title: None,
+            args: vec![],
+        });
+        f.removed.insert("vx_not_1".into());
+        let text = f.render();
+        assert!(text.contains("page \"Küche \\\"Licht\\\"\"\n"), "{text}");
+        assert!(
+            text.contains("# page uuid: 10000008-0000-0080-ffff504f94000001\npage "),
+            "{text}"
+        );
+        assert!(
+            text.contains("vx_and_1 = And(\"Licht an\", In2: 1)\n"),
+            "{text}"
+        );
+        assert!(text.contains("vx_or_1 = Or()\n"), "{text}");
+        assert!(text.contains("removed vx_not_1\n"), "{text}");
+        assert_eq!(PageFile::parse(&text).unwrap(), f);
+    }
+
+    #[test]
+    fn statements_vislox_did_not_write_are_refused() {
+        let bad = |t: &str| PageFile::parse(t).unwrap_err();
+        assert!(bad("page \"A\"\nlicht = And()\n").contains("did not write"));
+        assert!(
+            bad("page \"A\"\nvx_and_1 = And(In1: x.Q)\nextern x = And(uuid: \"u\")\n")
+                .contains("did not write")
+        );
+        assert!(bad("vx_and_1 = And()\n").contains("page line"));
+        assert!(bad("# nothing\n").contains("no page line"));
+    }
+
+    #[test]
+    fn names_are_plain_and_unique() {
+        let none = |_: &str| false;
+        assert_eq!(file_name("Küche Licht", &none), "kueche-licht.loxl");
+        assert_eq!(file_name("  ", &none), "page.loxl");
+        assert_eq!(file_name("Edits", &none), "page-edits.loxl");
+        let taken = |n: &str| n == "bad.loxl" || n == "bad-2.loxl";
+        assert_eq!(file_name("Bad", &taken), "bad-3.loxl");
+        let used = |s: &str| s == "vx_greaterequal_1";
+        assert_eq!(new_slug("GreaterEqual", &used), "vx_greaterequal_2");
+        assert_eq!(new_slug("And", &none), "vx_and_1");
+    }
+}

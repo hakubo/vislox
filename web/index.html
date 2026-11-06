@@ -76,6 +76,9 @@
         <g id="viewport"></g>
       </svg>
       <div id="canvas-msg" class="canvas-msg" role="status"></div>
+      <div class="hud hud-add hidden" id="hud-add">
+        <button id="btn-add-block" type="button" aria-haspopup="dialog"><span aria-hidden="true">+</span> Add block</button>
+      </div>
       <div class="hud hud-zoom" role="group" aria-label="Zoom">
         <button id="btn-zoom-out" type="button" title="Zoom out (−)" aria-label="Zoom out">−</button>
         <button id="btn-zoom-pct" type="button" title="Zoom to 100%" class="pct">100%</button>
@@ -218,6 +221,12 @@
   </div>
 </div>
 
+<div id="addblk" class="overlay hidden" role="dialog" aria-modal="true" aria-labelledby="ab-h">
+  <div class="pal-box ab-box">
+    <div class="ab-head"><h2 id="ab-h">Add a block</h2><span class="ab-page" id="ab-page"></span></div>
+    <div id="ab-body"></div>
+  </div>
+</div>
 <div id="help" class="overlay hidden" role="dialog" aria-modal="true" aria-labelledby="help-h">
   <div class="help-box">
     <h2 id="help-h">Keyboard shortcuts</h2>

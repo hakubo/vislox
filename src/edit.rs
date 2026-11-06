@@ -14,21 +14,26 @@
 //! the lockfile and restores it when the statement leaves the module, so
 //! dropping a claim hands the value back to Loxone Config.
 
+use crate::blocks::{self, NewBlock, PageFile};
 use loxone_config::connectors::{self, PortDir, PortUnit};
 use loxone_config::logic::{ArgItem, Attr, BindingKind, Item, MatchSpec, Module, Value};
 use loxone_config::port_names;
 use loxone_config::xml::Element;
 use loxone_config::{LoxoneDoc, logic};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
 
-/// vislox's own file in the module directory. The rest of the module is
-/// never touched. Later edits (new blocks, #59) get their own files next to it.
+/// vislox's own file in the module directory, for the values it claims.
+/// The rest of the module is never touched. The blocks vislox adds (#59)
+/// are in files of their own next to it, one per page ([`crate::blocks`]).
 pub const FILE: &str = "vislox/edits.loxl";
 
-/// The slugs of [`FILE`] start with this; nothing else in a module should.
-const SLUG_PREFIX: &str = "vx_";
+/// vislox's directory in the module: [`FILE`] and the files of new blocks.
+pub const DIR: &str = "vislox";
+
+/// The slugs of vislox's files start with this; nothing else in a module should.
+const SLUG_PREFIX: &str = crate::blocks::SLUG_PREFIX;
 
 /// One edit. `value: None` drops vislox's claim on the value: lox puts
 /// back what Loxone Config had before the claim (see the module comment).
@@ -54,20 +59,43 @@ pub enum Op {
         name: String,
         value: Option<String>,
     },
+    /// A new block of `type` on the page with UUID `page` (#59). lox mints
+    /// its UUIDs and places it; the reply names it (`added`).
+    AddBlock {
+        page: String,
+        #[serde(rename = "type")]
+        ty: String,
+        /// Its name; none shows the slug vislox picks.
+        #[serde(default)]
+        title: Option<String>,
+        /// Port key → the constant of an input or parameter. A port left
+        /// out gets the value Loxone Config places the block with.
+        #[serde(default)]
+        params: BTreeMap<String, String>,
+        /// Setting (`Formula`, `Type`, `At`, …) → value.
+        #[serde(default)]
+        settings: BTreeMap<String, String>,
+    },
+    /// Take out a block added here that is not deployed yet. Its `previous`
+    /// is the `add_block` that adds it again.
+    RemoveBlock { uuid: String },
 }
 
 impl Op {
-    pub fn uuid(&self) -> &str {
+    /// The object it changes; `None` for a new block.
+    pub fn uuid(&self) -> Option<&str> {
         match self {
             Op::Title { uuid, .. }
             | Op::Room { uuid, .. }
             | Op::Category { uuid, .. }
             | Op::Param { uuid, .. }
-            | Op::Setting { uuid, .. } => uuid,
+            | Op::Setting { uuid, .. }
+            | Op::RemoveBlock { uuid } => Some(uuid),
+            Op::AddBlock { .. } => None,
         }
     }
 
-    /// The value it sets.
+    /// The value it sets (`None` also for a block op).
     pub fn value(&self) -> Option<&str> {
         match self {
             Op::Title { value, .. }
@@ -75,10 +103,11 @@ impl Op {
             | Op::Category { value, .. }
             | Op::Param { value, .. }
             | Op::Setting { value, .. } => value.as_deref(),
+            Op::AddBlock { .. } | Op::RemoveBlock { .. } => None,
         }
     }
 
-    /// The same op with another value.
+    /// The same op with another value (a block op stays as it is).
     pub fn with_value(&self, v: Option<String>) -> Op {
         let mut op = self.clone();
         match &mut op {
@@ -87,6 +116,7 @@ impl Op {
             | Op::Category { value, .. }
             | Op::Param { value, .. }
             | Op::Setting { value, .. } => *value = v,
+            Op::AddBlock { .. } | Op::RemoveBlock { .. } => {}
         }
         op
     }
@@ -237,7 +267,7 @@ fn not_editable(ty: &str) -> bool {
     ) || ty.ends_with("Caption")
 }
 
-fn unit_suffix(u: PortUnit) -> String {
+pub fn unit_suffix(u: PortUnit) -> String {
     match u {
         PortUnit::Milliseconds => "ms".into(),
         PortUnit::Seconds => "s".into(),
@@ -451,13 +481,14 @@ impl Claims {
 
     /// The value claimed for what `op` changes.
     pub fn get(&self, ty: &str, op: &Op) -> Option<String> {
-        let c = self.0.get(op.uuid())?;
+        let c = self.0.get(op.uuid()?)?;
         match op {
             Op::Title { .. } => c.attrs.get(&Which::Title).cloned(),
             Op::Room { .. } => c.attrs.get(&Which::Room).cloned(),
             Op::Category { .. } => c.attrs.get(&Which::Category).cloned(),
             Op::Param { port, .. } => c.sets.get(port_names::name_of(ty, port)).map(plain),
             Op::Setting { name, .. } => c.sets.get(name).map(plain),
+            Op::AddBlock { .. } | Op::RemoveBlock { .. } => None,
         }
     }
 
@@ -555,7 +586,10 @@ pub fn apply(
     managed: &HashSet<String>,
     op: &Op,
 ) -> Result<Option<String>, String> {
-    let uuid = op.uuid();
+    let uuid = op
+        .uuid()
+        .filter(|_| !matches!(op, Op::RemoveBlock { .. }))
+        .ok_or_else(|| "not a value".to_string())?;
     let el = find(&doc.xml.root, uuid)
         .ok_or_else(|| format!("no object {uuid} in the pending config"))?;
     let ty = el.attr("Type").unwrap_or_default().to_string();
@@ -641,6 +675,7 @@ pub fn apply(
             };
             (Err(setting.clone()), v)
         }
+        Op::AddBlock { .. } | Op::RemoveBlock { .. } => unreachable!("not a value"),
     };
     let claim = claims.0.entry(uuid.to_string()).or_default();
     claim.ty = ty;
@@ -664,7 +699,585 @@ pub fn apply(
     Ok(previous)
 }
 
-/// Check the whole module, with [`FILE`] as written, the way `lox logic
+// ── vislox's files, and the blocks it adds ──────────────────────────────
+
+/// What the lockfile says about managed blocks: slug → UUID, and the slugs
+/// of its removal tombstones (not to be picked again).
+#[derive(Default, Clone, Debug)]
+pub struct Lock {
+    pub slugs: BTreeMap<String, String>,
+    pub tombstones: BTreeSet<String>,
+}
+
+impl Lock {
+    pub fn read(path: &Path) -> Lock {
+        let Ok(bytes) = std::fs::read(path) else {
+            return Lock::default();
+        };
+        let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            return Lock::default();
+        };
+        let slugs = v
+            .get("objects")
+            .and_then(|o| o.as_object())
+            .map(|o| {
+                o.iter()
+                    .filter_map(|(s, x)| Some((s.clone(), x.get("uuid")?.as_str()?.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let tombstones = v
+            .get("removed")
+            .and_then(|o| o.as_object())
+            .map(|o| {
+                o.values()
+                    .filter_map(|x| Some(x.get("slug")?.as_str()?.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Lock { slugs, tombstones }
+    }
+
+    pub fn slug_of(&self, uuid: &str) -> Option<&str> {
+        self.slugs
+            .iter()
+            .find(|(_, u)| u.as_str() == uuid)
+            .map(|(s, _)| s.as_str())
+    }
+
+    pub fn uuid_of(&self, slug: &str) -> Option<&str> {
+        self.slugs.get(slug).map(String::as_str)
+    }
+}
+
+/// vislox's files in the module ([`DIR`]): the values it claims ([`FILE`])
+/// and the blocks it added, by file name.
+#[derive(Default, Clone, Debug, PartialEq)]
+pub struct Files {
+    pub claims: Claims,
+    pub pages: BTreeMap<String, PageFile>,
+    /// The files there were. [`FILE`] stays once there, empty or not; a
+    /// page file goes with its last block.
+    pub present: BTreeSet<String>,
+}
+
+/// The name of [`FILE`] in [`DIR`].
+const CLAIMS: &str = "edits.loxl";
+
+impl Files {
+    /// The files from their texts, by name ([`Files::texts`]). A file
+    /// vislox did not write is an error that names it.
+    pub fn from_texts(texts: &BTreeMap<String, String>) -> Result<Files, String> {
+        let mut f = Files {
+            present: texts.keys().cloned().collect(),
+            ..Files::default()
+        };
+        for (name, text) in texts {
+            if name == CLAIMS {
+                f.claims = Claims::parse(text).map_err(|e| format!("{name}: {e}"))?;
+            } else {
+                f.pages.insert(
+                    name.clone(),
+                    PageFile::parse(text).map_err(|e| format!("{name}: {e}"))?,
+                );
+            }
+        }
+        Ok(f)
+    }
+
+    /// The `.loxl` files of `dir`, by name.
+    pub fn texts(dir: &Path) -> BTreeMap<String, String> {
+        let mut out = BTreeMap::new();
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return out;
+        };
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') || !name.ends_with(".loxl") || !e.path().is_file() {
+                continue;
+            }
+            if let Ok(t) = std::fs::read_to_string(e.path()) {
+                out.insert(name, t);
+            }
+        }
+        out
+    }
+
+    /// Each file's text, by name. A page file with no block and no
+    /// `removed` line is left out (deleted); [`FILE`] only while it was never
+    /// written and claims nothing.
+    pub fn render(&self) -> BTreeMap<String, String> {
+        let mut out = BTreeMap::new();
+        if !self.claims.0.values().all(Claim::is_empty) || self.present.contains(CLAIMS) {
+            out.insert(CLAIMS.to_string(), self.claims.render());
+        }
+        for (name, p) in &self.pages {
+            if !p.is_empty() {
+                out.insert(name.clone(), p.render());
+            }
+        }
+        out
+    }
+
+    /// The text of [`FILE`] with nothing claimed: what keeps a module
+    /// directory from having no `.loxl` file at all, which lox refuses.
+    pub fn placeholder() -> (String, String) {
+        (CLAIMS.to_string(), Claims::default().render())
+    }
+
+    /// Tie each page file to its page in `base` by UUID, and follow a page
+    /// Loxone Config renamed: `page "…"` names the page by its title. A file
+    /// written before it had a UUID takes the first page with its title.
+    pub fn follow_pages(&mut self, base: &LoxoneDoc) {
+        for p in self.pages.values_mut() {
+            match &p.uuid {
+                Some(u) => {
+                    if let Some(t) = find(&base.xml.root, u)
+                        .filter(|e| e.attr("Type") == Some("Page"))
+                        .and_then(|e| e.attr_decoded("Title"))
+                        .filter(|t| !t.trim().is_empty())
+                    {
+                        p.page = t.into_owned();
+                    }
+                }
+                None => {
+                    let mut same = Vec::new();
+                    pages_titled(&base.xml.root, &p.page, &mut same);
+                    p.uuid = same.first().and_then(|e| e.attr("U")).map(String::from);
+                }
+            }
+        }
+    }
+
+    /// The block vislox added as `slug`: its file and declaration.
+    pub fn block(&self, slug: &str) -> Option<(&str, &NewBlock)> {
+        self.pages.iter().find_map(|(n, p)| {
+            p.blocks
+                .iter()
+                .find(|b| b.slug == slug)
+                .map(|b| (n.as_str(), b))
+        })
+    }
+
+    fn block_mut(&mut self, slug: &str) -> Option<&mut NewBlock> {
+        self.pages
+            .values_mut()
+            .find_map(|p| p.blocks.iter_mut().find(|b| b.slug == slug))
+    }
+
+    /// Whether a block or removal of vislox's files is named `slug`.
+    fn names(&self, slug: &str) -> bool {
+        self.pages
+            .values()
+            .any(|p| p.removed.contains(slug) || p.blocks.iter().any(|b| b.slug == slug))
+    }
+
+    /// Drop the `removed` lines lox needs no more: the lockfile has
+    /// forgotten the block (or never knew it, when it was added and taken
+    /// out before a compile).
+    pub fn tidy(&mut self, lock: &Lock) {
+        for p in self.pages.values_mut() {
+            p.removed.retain(|s| lock.slugs.contains_key(s));
+        }
+    }
+
+    /// Every value vislox claims or wrote into a block it added (by the
+    /// block's UUID in `lock`), as the ops that set it.
+    pub fn ops(&self, lock: &Lock) -> Vec<Op> {
+        let mut v = self.claims.ops();
+        for p in self.pages.values() {
+            for b in &p.blocks {
+                let Some(uuid) = lock.uuid_of(&b.slug) else {
+                    continue;
+                };
+                if let Some(t) = &b.title {
+                    v.push(Op::Title {
+                        uuid: uuid.into(),
+                        value: Some(t.clone()),
+                    });
+                }
+                let (params, settings) = split_args(b);
+                for (port, value) in params {
+                    v.push(Op::Param {
+                        uuid: uuid.into(),
+                        port,
+                        value: Some(value),
+                    });
+                }
+                for (name, value) in settings {
+                    v.push(Op::Setting {
+                        uuid: uuid.into(),
+                        name,
+                        value: Some(value),
+                    });
+                }
+            }
+        }
+        v
+    }
+}
+
+/// A new block's arguments as the ops name them: port key → constant, and
+/// setting → value, each as Properties shows it.
+pub fn split_args(b: &NewBlock) -> (BTreeMap<String, String>, BTreeMap<String, String>) {
+    let (mut params, mut settings) = (BTreeMap::new(), BTreeMap::new());
+    for (k, v) in &b.args {
+        let key = blocks::port_key(&b.ty, k);
+        if blocks::port_name(&b.ty, key).is_some() {
+            params.insert(key.to_string(), plain(v));
+        } else {
+            settings.insert(k.clone(), plain(v));
+        }
+    }
+    (params, settings)
+}
+
+/// The settings Properties edits on a block added here (#59): each with how
+/// it is written and the value the declaration gives it.
+pub fn new_block_settings(b: &NewBlock) -> serde_json::Value {
+    blocks::settings(&b.ty)
+        .into_iter()
+        .map(|(name, kind)| {
+            serde_json::json!({
+                "name": name,
+                "kind": kind,
+                "choices": connectors::choice_values(&b.ty, name)
+                    .map(|c| c.iter().map(|(w, _)| *w).collect::<Vec<_>>()),
+                "value": b.get(name).map(plain),
+            })
+        })
+        .collect()
+}
+
+/// What an op is checked against.
+pub struct Ctx<'a> {
+    /// The pending config, which the browser showed.
+    pub doc: &'a LoxoneDoc,
+    /// The project's base: lox compiles the module against it, so a
+    /// `page "…"` title must name one of its pages.
+    pub base: &'a LoxoneDoc,
+    pub lock: &'a Lock,
+    /// The deployed revision (the History's: the newest commit of the
+    /// base), to tell whether a block added here is deployed. `None`: none.
+    pub deployed: Option<&'a LoxoneDoc>,
+    /// The names the module's other files declare.
+    pub names: &'a BTreeSet<String>,
+}
+
+/// What [`apply_op`] did: the value or op that undoes it (`previous`),
+/// and the slug of a block it added.
+#[derive(Debug, PartialEq)]
+pub struct Applied {
+    pub previous: serde_json::Value,
+    pub added: Option<String>,
+}
+
+/// Apply `op` to vislox's files, checked against `ctx`.
+pub fn apply_op(files: &mut Files, ctx: &Ctx, op: &Op) -> Result<Applied, String> {
+    let done = |p: Option<String>| Applied {
+        previous: serde_json::json!(p),
+        added: None,
+    };
+    match op {
+        Op::AddBlock { .. } => add_block(files, ctx, op),
+        Op::RemoveBlock { uuid } => remove_block(files, ctx, uuid),
+        _ => {
+            let uuid = op.uuid().unwrap_or_default();
+            match ctx.lock.slug_of(uuid) {
+                Some(slug) if files.block(slug).is_some() => {
+                    let slug = slug.to_string();
+                    edit_new_block(files, ctx, &slug, op).map(done)
+                }
+                _ => {
+                    let managed: HashSet<String> = ctx.lock.slugs.values().cloned().collect();
+                    apply(&mut files.claims, ctx.doc, &managed, op).map(done)
+                }
+            }
+        }
+    }
+}
+
+/// The pages titled `title`, in document order.
+fn pages_titled<'a>(el: &'a Element, title: &str, out: &mut Vec<&'a Element>) {
+    if el.attr("Type") == Some("Page") && el.attr_decoded("Title").is_some_and(|t| t == title) {
+        out.push(el);
+    }
+    for c in el.child_elements() {
+        pages_titled(c, title, out);
+    }
+}
+
+/// A name for a new block: one line, and as a Loxone Config save keeps it.
+fn block_title(ty: &str, t: &str) -> Result<String, String> {
+    let t = text(t, "The name", false)?;
+    if let Some(w) = connectors::title_save_rewrite(ty, &t) {
+        return Err(format!(
+            "The name: a Loxone Config save would write it as \"{w}\" (it drops {{ }}, and \
+             turns % < | and spaces at either end into _); write that instead"
+        ));
+    }
+    Ok(t)
+}
+
+/// A setting's value as lox takes it.
+fn setting_value(ty: &str, name: &str, kind: blocks::Kind, v: &str) -> Result<Value, String> {
+    use blocks::Kind;
+    Ok(match kind {
+        Kind::Text => Value::Str(text(v, name, connectors::empty_ok(ty, name))?),
+        Kind::Choice => {
+            let c = connectors::choice_values(ty, name).unwrap_or_default();
+            if !c.iter().any(|(w, _)| *w == v) {
+                return Err(format!("{name}: one of {}", connectors::choice_list(c)));
+            }
+            Value::Str(v.to_string())
+        }
+        Kind::OnOff => match v {
+            "on" => Value::Bool(true),
+            "off" => Value::Bool(false),
+            _ => return Err(format!("{name}: on or off")),
+        },
+        Kind::Time => Value::Clock(
+            logic::clock_seconds(v.trim())
+                .and_then(logic::clock_text)
+                .ok_or_else(|| format!("{name}: a time of day, like 19:00 or 06:30:15"))?,
+        ),
+        Kind::Number => Value::Number(number(v).map_err(|e| format!("{name}: {e}"))?),
+    })
+}
+
+fn add_block(files: &mut Files, ctx: &Ctx, op: &Op) -> Result<Applied, String> {
+    let Op::AddBlock {
+        page,
+        ty,
+        title,
+        params,
+        settings,
+    } = op
+    else {
+        unreachable!()
+    };
+    let pg = find(&ctx.base.xml.root, page)
+        .filter(|e| e.attr("Type") == Some("Page"))
+        .ok_or_else(|| format!("no page {page} in the project's base config"))?;
+    let page_title = pg.attr_decoded("Title").unwrap_or_default().into_owned();
+    if page_title.trim().is_empty() {
+        return Err("the page has no title; name it in Loxone Config first".into());
+    }
+    // `page "…"` names a page by its title, and lox builds on the first.
+    let mut same = Vec::new();
+    pages_titled(&ctx.base.xml.root, &page_title, &mut same);
+    if same.first().and_then(|e| e.attr("U")) != Some(page.as_str()) {
+        return Err(format!(
+            "{} pages are titled \"{page_title}\", and lox puts new blocks on the first; \
+             rename one in Loxone Config to add blocks here",
+            same.len()
+        ));
+    }
+    if !blocks::offered(ty) {
+        return Err(format!("vislox does not add blocks of type {ty}"));
+    }
+    let title = title.as_deref().map(|t| block_title(ty, t)).transpose()?;
+    if let Some(key) = params.keys().find(|k| blocks::port_name(ty, k).is_none()) {
+        return Err(format!("{ty} has no input {key}"));
+    }
+    let offered = blocks::settings(ty);
+    if let Some(name) = settings
+        .keys()
+        .find(|n| !offered.iter().any(|(o, _)| o == n))
+    {
+        return Err(format!("{ty}: {name} cannot be set here"));
+    }
+    // In the order lox lists them: the ports, then the settings.
+    let mut args = Vec::new();
+    for spec in blocks::valued_ports(ty) {
+        if let Some(v) = params.get(spec.key) {
+            let n = spec.name;
+            args.push((
+                n.to_string(),
+                Value::Number(number(v).map_err(|e| format!("{n}: {e}"))?),
+            ));
+        }
+    }
+    for (name, kind) in offered {
+        if let Some(v) = settings.get(name) {
+            args.push((name.to_string(), setting_value(ty, name, kind, v)?));
+        }
+    }
+    let taken = |s: &str| {
+        ctx.names.contains(s)
+            || ctx.lock.slugs.contains_key(s)
+            || ctx.lock.tombstones.contains(s)
+            || files.names(s)
+    };
+    let slug = blocks::new_slug(ty, &taken);
+    // The page's file: by its UUID (it may have been renamed), else a new one.
+    let file = match files
+        .pages
+        .iter()
+        .find(|(_, p)| p.uuid.as_deref() == Some(page.as_str()))
+    {
+        Some((n, _)) => n.clone(),
+        None => blocks::file_name(&page_title, &|n| n == CLAIMS || files.pages.contains_key(n)),
+    };
+    let f = files.pages.entry(file).or_insert_with(|| PageFile {
+        uuid: Some(page.clone()),
+        ..PageFile::new(&page_title)
+    });
+    f.page = page_title;
+    f.blocks.push(NewBlock {
+        slug: slug.clone(),
+        ty: ty.clone(),
+        title,
+        args,
+    });
+    Ok(Applied {
+        previous: serde_json::Value::Null,
+        added: Some(slug),
+    })
+}
+
+fn remove_block(files: &mut Files, ctx: &Ctx, uuid: &str) -> Result<Applied, String> {
+    let el = find(&ctx.doc.xml.root, uuid)
+        .ok_or_else(|| format!("no object {uuid} in the pending config"))?;
+    let name = el.attr_decoded("Title").unwrap_or_default().into_owned();
+    let slug = match ctx.lock.slug_of(uuid) {
+        Some(s) if files.block(s).is_some() => s.to_string(),
+        Some(_) => {
+            return Err(format!(
+                "{name}: the module manages this block; delete it in its .loxl file"
+            ));
+        }
+        None => return Err(format!("{name}: only a block added here can be taken out")),
+    };
+    if ctx
+        .deployed
+        .is_some_and(|d| find(&d.xml.root, uuid).is_some())
+    {
+        return Err(format!(
+            "{name} is deployed: vislox takes out only a block added here and not applied yet"
+        ));
+    }
+    let (file, b) = files.block(&slug).expect("checked");
+    let (file, b) = (file.to_string(), b.clone());
+    let pf = &files.pages[&file];
+    let page = match &pf.uuid {
+        Some(u) => u.clone(),
+        None => {
+            let mut same = Vec::new();
+            pages_titled(&ctx.base.xml.root, &pf.page, &mut same);
+            same.first()
+                .and_then(|e| e.attr("U"))
+                .unwrap_or_default()
+                .to_string()
+        }
+    };
+    let (params, settings) = split_args(&b);
+    let again = Op::AddBlock {
+        page,
+        ty: b.ty.clone(),
+        title: b.title.clone(),
+        params,
+        settings,
+    };
+    let p = files.pages.get_mut(&file).expect("found");
+    p.blocks.retain(|x| x.slug != slug);
+    p.removed.insert(slug);
+    Ok(Applied {
+        previous: serde_json::to_value(&again).unwrap_or_default(),
+        added: None,
+    })
+}
+
+/// A value of a block vislox added: its name, an unwired input's constant,
+/// or a setting lox takes in the declaration (`Formula:`, `Type:`, `At:`, …).
+/// lox has no room or category for a managed block.
+fn edit_new_block(
+    files: &mut Files,
+    ctx: &Ctx,
+    slug: &str,
+    op: &Op,
+) -> Result<Option<String>, String> {
+    let uuid = op.uuid().unwrap_or_default();
+    let el = find(&ctx.doc.xml.root, uuid)
+        .ok_or_else(|| format!("no object {uuid} in the pending config"))?;
+    let name = el.attr_decoded("Title").unwrap_or_default().into_owned();
+    let caps = caps(el).unwrap_or_default();
+    let b = files.block_mut(slug).expect("checked");
+    match op {
+        Op::Title { value, .. } => {
+            let previous = b.title.clone();
+            b.title = value
+                .as_deref()
+                .map(|t| block_title(&b.ty, t))
+                .transpose()?;
+            Ok(previous)
+        }
+        Op::Param { port, value, .. } => {
+            let pname = blocks::port_name(&b.ty, port)
+                .ok_or_else(|| format!("{name}: {port} cannot be edited here"))?;
+            let previous = b.get(pname).map(plain);
+            let v = match value {
+                Some(v) if caps.params.iter().any(|p| &p.key == port) => Some(Value::Number(
+                    number(v).map_err(|e| format!("{pname}: {e}"))?,
+                )),
+                Some(_) => {
+                    return Err(format!(
+                        "{name}: {pname} cannot be edited here (it is wired, or not an input)"
+                    ));
+                }
+                None => None,
+            };
+            b.set(pname, v);
+            Ok(previous)
+        }
+        Op::Setting {
+            name: setting,
+            value,
+            ..
+        } => {
+            let kind = blocks::settings(&b.ty)
+                .into_iter()
+                .find(|(n, _)| n == setting)
+                .map(|(_, k)| k)
+                .ok_or_else(|| format!("{name}: {setting} cannot be edited here"))?;
+            let previous = b.get(setting).map(plain);
+            let v = value
+                .as_deref()
+                .map(|v| setting_value(&b.ty, setting, kind, v))
+                .transpose()?;
+            b.set(setting, v);
+            Ok(previous)
+        }
+        _ => Err(format!(
+            "{name}: a block added here has no room or category lox can set; \
+             only its name, its inputs' constants and its settings are edited"
+        )),
+    }
+}
+
+/// The names the module declares (blocks, externs, signals, instances,
+/// constants), so that a new slug is none of them. Empty when the module
+/// does not read; then the check after writing says why.
+pub fn module_names(module: &Path) -> BTreeSet<String> {
+    let Some(m) = module
+        .to_str()
+        .and_then(|p| loxone_config::cli::read_module(p).ok())
+    else {
+        return BTreeSet::new();
+    };
+    m.items
+        .iter()
+        .filter_map(|i| match i {
+            Item::Block(b) | Item::Instance(b) => Some(b.slug.clone()),
+            Item::Extern(e) => Some(e.slug.clone()),
+            Item::Signal(s) => Some(s.slug.clone()),
+            Item::Let(l) => Some(l.name.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Check the whole module, with vislox's files as written, the way `lox logic
 /// check` and `lint` would: syntax, ports, and the documented range of each
 /// value vislox claims. Faster than a compile, and its messages name the value.
 pub fn check_module(module: &Path) -> Result<(), String> {
@@ -695,7 +1308,7 @@ pub fn parse_doc(bytes: &[u8]) -> Result<LoxoneDoc, String> {
 /// The value `op` changes, as `doc` has it (`None`: no such object, or the
 /// value is not set). An input without `Def=` holds 0.
 pub fn current(doc: &LoxoneDoc, op: &Op) -> Option<String> {
-    let el = find(&doc.xml.root, op.uuid())?;
+    let el = find(&doc.xml.root, op.uuid()?)?;
     let ty = el.attr("Type").unwrap_or_default();
     let decoded = |e: &Element, a: &str| e.attr_decoded(a).map(|v| v.into_owned());
     let place = |a: &str| {
@@ -714,7 +1327,9 @@ pub fn current(doc: &LoxoneDoc, op: &Op) -> Option<String> {
                 .find(|c| c.name == "Co" && c.attr("K") == Some(key))?;
             Some(co.attr("Def").unwrap_or("0").to_string())
         }
-        Op::Setting { name, .. } => decoded(el, name),
+        // A block setting may be stored under another name (`At:` is `Sec=`).
+        Op::Setting { name, .. } => decoded(el, connectors::attr_name(ty, name)),
+        Op::AddBlock { .. } | Op::RemoveBlock { .. } => None,
     }
 }
 
@@ -738,24 +1353,6 @@ pub fn module_files(dir: &Path, found: &mut dyn FnMut(&Path, std::time::SystemTi
             found(&path, t);
         }
     }
-}
-
-/// The UUIDs of the blocks the module manages, from its lockfile.
-pub fn managed(lock: &Path) -> HashSet<String> {
-    let Ok(bytes) = std::fs::read(lock) else {
-        return HashSet::new();
-    };
-    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
-        return HashSet::new();
-    };
-    v.get("objects")
-        .and_then(|o| o.as_object())
-        .map(|o| {
-            o.values()
-                .filter_map(|x| x.get("uuid")?.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -1051,12 +1648,423 @@ mod tests {
         check_module(&dir).unwrap();
     }
 
+    const EG: &str = "10000002-0000-0020-ffff504f94000001";
+    const OG: &str = "10000008-0000-0080-ffff504f94000001";
+
+    /// Compile vislox's files (by name, in `<module>/vislox`) with lox's own
+    /// compiler, as `lox logic compile` would, keeping the lock.
+    fn compile_files(
+        base: &LoxoneDoc,
+        files: &Files,
+        lock: &mut Lockfile,
+    ) -> Result<LoxoneDoc, String> {
+        let frags: Vec<Module> = files
+            .render()
+            .values()
+            .map(|t| Module::parse_fragment(t).map_err(|e| e.to_string()))
+            .collect::<Result<_, _>>()?;
+        let m = Module::from_fragments(frags);
+        logic::validate_ports(&m).map_err(|e| e.to_string())?;
+        let opts = CompileOptions {
+            machine: [0x50, 0x4f, 0x94, 0, 0, 1],
+            mint_time_unix: 0,
+            page_title: None,
+            allow_removals: false,
+            accept_version: None,
+            relayout: vec![],
+        };
+        let out = logic::compile(base, &m, lock, &opts).map_err(|e| e.to_string())?;
+        LoxoneDoc::parse(&out.to_bytes()).map_err(|e| e.to_string())
+    }
+
+    fn lock_of(l: &Lockfile) -> Lock {
+        Lock {
+            slugs: l
+                .objects
+                .iter()
+                .map(|(s, o)| (s.clone(), o.uuid.clone()))
+                .collect(),
+            tombstones: l.removed.values().map(|t| t.slug.clone()).collect(),
+        }
+    }
+
+    fn add(
+        page: &str,
+        ty: &str,
+        title: Option<&str>,
+        params: &[(&str, &str)],
+        settings: &[(&str, &str)],
+    ) -> Op {
+        let m = |v: &[(&str, &str)]| {
+            v.iter()
+                .map(|(k, x)| (k.to_string(), x.to_string()))
+                .collect()
+        };
+        Op::AddBlock {
+            page: page.into(),
+            ty: ty.into(),
+            title: title.map(Into::into),
+            params: m(params),
+            settings: m(settings),
+        }
+    }
+
+    /// The page an object is drawn on.
+    fn page_of(doc: &LoxoneDoc, uuid: &str) -> Option<String> {
+        fn walk(el: &Element, page: Option<&str>, uuid: &str) -> Option<String> {
+            let page = if el.attr("Type") == Some("Page") {
+                el.attr("U")
+            } else {
+                page
+            };
+            if el.attr("U") == Some(uuid) {
+                return page.map(String::from);
+            }
+            el.child_elements().find_map(|c| walk(c, page, uuid))
+        }
+        walk(&doc.xml.root, None, uuid)
+    }
+
+    #[test]
+    fn every_offered_type_is_created_by_lox() {
+        let d = doc("house.Loxone");
+        let names = BTreeSet::new();
+        let mut failed = Vec::new();
+        for t in connectors::BUILTIN_TYPES
+            .iter()
+            .filter(|t| blocks::offered(t))
+        {
+            let mut files = Files::default();
+            let lock = Lock::default();
+            let ctx = Ctx {
+                doc: &d,
+                lock: &lock,
+                base: &d,
+                deployed: None,
+                names: &names,
+            };
+            apply_op(&mut files, &ctx, &add(EG, t, None, &[], &[])).unwrap();
+            let mut l = Lockfile::default();
+            match compile_files(&d, &files, &mut l) {
+                Ok(out) => {
+                    let uuid = &l.objects.values().next().unwrap().uuid;
+                    let el = find(&out.xml.root, uuid).unwrap();
+                    assert_eq!(el.attr("Type"), Some(*t));
+                    assert_eq!(page_of(&out, uuid).as_deref(), Some(EG), "{t}");
+                }
+                Err(e) => failed.push(format!("{t}: {e}")),
+            }
+        }
+        assert!(failed.is_empty(), "{failed:#?}");
+    }
+
+    #[test]
+    fn a_block_is_added_named_and_given_values_then_taken_out() {
+        let d = doc("house.Loxone");
+        let names = BTreeSet::new();
+        let mut files = Files::default();
+        let mut l = Lockfile::default();
+        let lock = lock_of(&l);
+        let ctx = Ctx {
+            doc: &d,
+            lock: &lock,
+            base: &d,
+            deployed: None,
+            names: &names,
+        };
+        let a = apply_op(
+            &mut files,
+            &ctx,
+            &add(OG, "Monoflop", Some("Nachlauf"), &[("Time", "30")], &[]),
+        )
+        .unwrap();
+        assert_eq!(
+            a,
+            Applied {
+                previous: serde_json::Value::Null,
+                added: Some("vx_monoflop_1".into())
+            }
+        );
+        let b = apply_op(
+            &mut files,
+            &ctx,
+            &add(
+                OG,
+                "PulseAt",
+                None,
+                &[],
+                &[("Pulse", "time"), ("At", "7:05")],
+            ),
+        )
+        .unwrap();
+        assert_eq!(b.added.as_deref(), Some("vx_pulseat_1"));
+        let text = &files.render()["obergeschoss.loxl"];
+        assert!(text.starts_with("# Blocks added in vislox"), "{text}");
+        assert!(text.contains("page \"Obergeschoss\"\n"), "{text}");
+        assert!(
+            text.contains("vx_monoflop_1 = Monoflop(\"Nachlauf\", Time: 30)\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("vx_pulseat_1 = PulseAt(At: 07:05, Pulse: \"time\")\n"),
+            "{text}"
+        );
+        assert_eq!(
+            Files::from_texts(&files.render()).unwrap().pages,
+            files.pages
+        );
+
+        let out = compile_files(&d, &files, &mut l).unwrap();
+        let mono = l.objects["vx_monoflop_1"].uuid.clone();
+        let el = find(&out.xml.root, &mono).unwrap();
+        assert_eq!(el.attr("Title"), Some("Nachlauf"));
+        assert_eq!(page_of(&out, &mono).as_deref(), Some(OG));
+        let time = el
+            .child_elements()
+            .find(|c| c.attr("K") == Some("Time"))
+            .unwrap();
+        assert_eq!(time.attr("Def"), Some("30"));
+        let pulse = find(&out.xml.root, &l.objects["vx_pulseat_1"].uuid).unwrap();
+        assert_eq!(pulse.attr("Sec"), Some("25500"));
+
+        // Edited like any block, in its declaration; the module's own
+        // blocks are not.
+        let lock = lock_of(&l);
+        let ctx = Ctx {
+            doc: &out,
+            lock: &lock,
+            base: &d,
+            deployed: Some(&d),
+            names: &names,
+        };
+        let title = Op::Title {
+            uuid: mono.clone(),
+            value: Some("Treppe".into()),
+        };
+        assert_eq!(
+            apply_op(&mut files, &ctx, &title).unwrap().previous,
+            "Nachlauf"
+        );
+        let p = param(&mono, "Time", Some("45"));
+        assert_eq!(apply_op(&mut files, &ctx, &p).unwrap().previous, "30");
+        // A setting is written into the declaration too.
+        let pulse = l.objects["vx_pulseat_1"].uuid.clone();
+        let at = Op::Setting {
+            uuid: pulse.clone(),
+            name: "At".into(),
+            value: Some("8:00".into()),
+        };
+        assert_eq!(apply_op(&mut files, &ctx, &at).unwrap().previous, "07:05");
+        let bad = Op::Setting {
+            uuid: pulse.clone(),
+            name: "Pulse".into(),
+            value: Some("often".into()),
+        };
+        assert!(
+            apply_op(&mut files, &ctx, &bad)
+                .unwrap_err()
+                .contains("\"time\"")
+        );
+        assert!(files.claims.0.is_empty());
+        // Title, Time; At, Pulse.
+        assert_eq!(files.ops(&lock).len(), 4);
+        let room = Op::Room {
+            uuid: mono.clone(),
+            value: Some("Bad".into()),
+        };
+        assert!(
+            apply_op(&mut files, &ctx, &room)
+                .unwrap_err()
+                .contains("only its name")
+        );
+        let out = compile_files(&d, &files, &mut l).unwrap();
+        let el = find(&out.xml.root, &mono).unwrap();
+        assert_eq!(el.attr("Title"), Some("Treppe"));
+        let at = Op::Setting {
+            uuid: pulse.clone(),
+            name: "At".into(),
+            value: None,
+        };
+        assert_eq!(current(&out, &at).as_deref(), Some("28800"));
+
+        // Taken out: `removed` tells lox, and the op that adds it again comes back.
+        let lock = lock_of(&l);
+        let ctx = Ctx {
+            doc: &out,
+            lock: &lock,
+            base: &d,
+            deployed: Some(&d),
+            names: &names,
+        };
+        let r = apply_op(&mut files, &ctx, &Op::RemoveBlock { uuid: mono.clone() }).unwrap();
+        assert_eq!(
+            serde_json::from_value::<Op>(r.previous).unwrap(),
+            add(OG, "Monoflop", Some("Treppe"), &[("Time", "45")], &[])
+        );
+        assert!(files.render()["obergeschoss.loxl"].contains("removed vx_monoflop_1\n"));
+        let out = compile_files(&d, &files, &mut l).unwrap();
+        assert!(find(&out.xml.root, &mono).is_none());
+        // Once lox has forgotten it, the line goes.
+        files.tidy(&lock_of(&l));
+        assert!(!files.render()["obergeschoss.loxl"].contains("removed"));
+        // A deployed block is not taken out here.
+        let pulse = l.objects["vx_pulseat_1"].uuid.clone();
+        let lock = lock_of(&l);
+        let ctx = Ctx {
+            doc: &out,
+            lock: &lock,
+            base: &d,
+            deployed: Some(&out),
+            names: &names,
+        };
+        let e = apply_op(&mut files, &ctx, &Op::RemoveBlock { uuid: pulse }).unwrap_err();
+        assert!(e.contains("is deployed"), "{e}");
+        let e = apply_op(&mut files, &ctx, &Op::RemoveBlock { uuid: DIV.into() }).unwrap_err();
+        assert!(e.contains("only a block added here"), "{e}");
+    }
+
+    #[test]
+    fn a_page_file_follows_its_page_and_goes_with_its_last_block() {
+        let d = doc("house.Loxone");
+        let names = BTreeSet::new();
+        let mut files = Files::default();
+        let mut l = Lockfile::default();
+        let lock = lock_of(&l);
+        let ctx = Ctx {
+            doc: &d,
+            base: &d,
+            lock: &lock,
+            deployed: None,
+            names: &names,
+        };
+        apply_op(&mut files, &ctx, &add(OG, "And", Some("Licht"), &[], &[])).unwrap();
+        let text = files.render()["obergeschoss.loxl"].clone();
+        assert!(
+            text.contains(&format!("# page uuid: {OG}\npage \"Obergeschoss\"")),
+            "{text}"
+        );
+        compile_files(&d, &files, &mut l).unwrap();
+        // Loxone Config renames the page: the same file follows it, by UUID.
+        let renamed = LoxoneDoc::parse(
+            std::fs::read_to_string(format!(
+                "{}/tests/fixtures/house.Loxone",
+                env!("CARGO_MANIFEST_DIR")
+            ))
+            .unwrap()
+            .replace("Title=\"Obergeschoss\"", "Title=\"Oben\"")
+            .as_bytes(),
+        )
+        .unwrap();
+        let mut files = Files::from_texts(&files.render()).unwrap();
+        files.follow_pages(&renamed);
+        let lock = lock_of(&l);
+        let ctx = Ctx {
+            doc: &renamed,
+            base: &renamed,
+            lock: &lock,
+            deployed: None,
+            names: &names,
+        };
+        apply_op(&mut files, &ctx, &add(OG, "Or", None, &[], &[])).unwrap();
+        let r = files.render();
+        assert_eq!(r.keys().collect::<Vec<_>>(), ["obergeschoss.loxl"]);
+        assert!(r["obergeschoss.loxl"].contains("page \"Oben\"\n"), "{r:?}");
+        let out = compile_files(&renamed, &files, &mut l).unwrap();
+        for s in ["vx_and_1", "vx_or_1"] {
+            assert_eq!(
+                page_of(&out, &l.objects[s].uuid).as_deref(),
+                Some(OG),
+                "{s}"
+            );
+        }
+        // A file written before it had a UUID takes the page with its title.
+        let mut old = Files::from_texts(&BTreeMap::from([(
+            "oben.loxl".to_string(),
+            "page \"Oben\"\nvx_and_1 = And()\n".to_string(),
+        )]))
+        .unwrap();
+        old.follow_pages(&renamed);
+        assert_eq!(old.pages["oben.loxl"].uuid.as_deref(), Some(OG));
+
+        // Both taken out, and forgotten by lox: the file goes.
+        let lock = lock_of(&l);
+        let ctx = Ctx {
+            doc: &out,
+            base: &renamed,
+            lock: &lock,
+            deployed: Some(&renamed),
+            names: &names,
+        };
+        for s in ["vx_and_1", "vx_or_1"] {
+            let uuid = l.objects[s].uuid.clone();
+            apply_op(&mut files, &ctx, &Op::RemoveBlock { uuid }).unwrap();
+        }
+        assert!(files.render().contains_key("obergeschoss.loxl"));
+        compile_files(&renamed, &files, &mut l).unwrap();
+        files.tidy(&lock_of(&l));
+        assert!(files.render().is_empty(), "{:?}", files.render());
+    }
+
+    #[test]
+    fn a_new_block_is_checked_before_lox_sees_it() {
+        let d = doc("house.Loxone");
+        let names = BTreeSet::from(["vx_and_1".to_string()]);
+        let lock = Lock::default();
+        let ctx = Ctx {
+            doc: &d,
+            lock: &lock,
+            base: &d,
+            deployed: None,
+            names: &names,
+        };
+        let mut files = Files::default();
+        let err = |op: Op| apply_op(&mut files.clone(), &ctx, &op).unwrap_err();
+        assert!(err(add(DIV, "And", None, &[], &[])).contains("no page"));
+        assert!(err(add(EG, "VirtualIn", None, &[], &[])).contains("does not add"));
+        assert!(err(add(EG, "And", Some("a|b"), &[], &[])).contains("\"a_b\""));
+        assert!(err(add(EG, "And", Some(" "), &[], &[])).contains("cannot be empty"));
+        assert!(err(add(EG, "And", None, &[("Q", "1")], &[])).contains("no input Q"));
+        assert!(err(add(EG, "And", None, &[("I1", "1,5")], &[])).contains("decimal point"));
+        assert!(err(add(EG, "Memory", None, &[], &[("Type", "big")])).contains("\"digital\""));
+        assert!(err(add(EG, "PulseAt", None, &[], &[("At", "25:00")])).contains("time of day"));
+        assert!(err(add(EG, "Code16", None, &[], &[("Code", "x")])).contains("cannot be set"));
+        // A slug the module has is not picked again; a port by its key.
+        let a = apply_op(&mut files, &ctx, &add(EG, "And", None, &[("I2", "1")], &[])).unwrap();
+        assert_eq!(a.added.as_deref(), Some("vx_and_2"));
+        assert!(files.render()["erdgeschoss.loxl"].contains("vx_and_2 = And(In2: 1)"));
+
+        // Two pages with one title: lox would build on the first.
+        let xml = std::fs::read_to_string(format!(
+            "{}/tests/fixtures/house.Loxone",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap()
+        .replace("Title=\"Obergeschoss\"", "Title=\"Erdgeschoss\"");
+        let d = LoxoneDoc::parse(xml.as_bytes()).unwrap();
+        let ctx = Ctx {
+            doc: &d,
+            lock: &lock,
+            base: &d,
+            deployed: None,
+            names: &names,
+        };
+        let e = apply_op(&mut Files::default(), &ctx, &add(OG, "And", None, &[], &[])).unwrap_err();
+        assert!(e.contains("2 pages are titled"), "{e}");
+        apply_op(&mut Files::default(), &ctx, &add(EG, "And", None, &[], &[])).unwrap();
+    }
+
     #[test]
     fn managed_blocks_come_from_the_lock() {
         let tmp = tempfile::tempdir().unwrap();
         let lock = tmp.path().join("logic.lock.json");
-        std::fs::write(&lock, r#"{"objects":{"a":{"uuid":"U1","type":"And"}}}"#).unwrap();
-        assert_eq!(managed(&lock), HashSet::from(["U1".to_string()]));
-        assert!(managed(&tmp.path().join("none")).is_empty());
+        std::fs::write(
+            &lock,
+            r#"{"objects":{"a":{"uuid":"U1","type":"And"}},"removed":{"U0":{"slug":"b","type":"Or"}}}"#,
+        )
+        .unwrap();
+        let l = Lock::read(&lock);
+        assert_eq!((l.slug_of("U1"), l.uuid_of("a")), (Some("a"), Some("U1")));
+        assert!(l.tombstones.contains("b"));
+        assert!(Lock::read(&tmp.path().join("none")).slugs.is_empty());
     }
 }

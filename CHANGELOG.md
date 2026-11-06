@@ -9,6 +9,14 @@ published under the same version (see [docker/README.md](docker/README.md)).
   constant of an unwired input, and the settings of a physical input or output or a device. vislox writes them
   into its own file of the module (`<module>/vislox/edits.loxl`) and runs `lox logic compile`; they show as the
   pending revision, marked *not deployed*, with Revert. Editing never deploys (#58, see `docs/editing.md`).
+- Add blocks to a page: *Add block* on the page picks one of the types lox can create (searched by name and
+  purpose), then its name, settings and constants. vislox declares it in a file of its own for the page
+  (`<module>/vislox/<page>.loxl`) and runs `lox logic compile`, which mints the block and places it. It shows in
+  the pending revision and the Changes list as added, is edited in Properties like any block, and has *Remove*
+  until it is deployed. Never deploys (#59).
+- Fixed: Discard failed when the last commit had no lockfile (the first compile writes one), or one was staged
+  but not committed. Discard now reads the last commit, never deletes a lock vislox did not write (one not in git
+  goes back to how it was before vislox's first edit), and puts everything back when a step fails.
 - Fixed: Discard and the operate buttons ignored mouse clicks.
 
 ## 0.2.0
