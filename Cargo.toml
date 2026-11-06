@@ -3,7 +3,9 @@ name = "vislox"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.91"
-description = "Read-only visual viewer for Loxone configs managed by lox / loxone-config, with live reload, history and change review"
+description = "Loxone Config-style viewer and change review for Miniserver configs managed by lox, with live values and history"
+repository = "https://github.com/hakubo/vislox"
+readme = "README.md"
 license = "Apache-2.0"
 
 [dependencies]
