@@ -60,7 +60,7 @@ struct HttpSession(loxone_client::LoxClient);
 impl Port for Http {
     /// Builds a blocking client: call it off the async runtime.
     fn open(&self) -> Result<Box<dyn Session>, String> {
-        let c = loxone_client::LoxClient::new(self.0.clone()).map_err(|e| e.to_string())?;
+        let c = crate::tls::lox_client(&self.0)?;
         Ok(Box::new(HttpSession(c)))
     }
 }

@@ -192,7 +192,12 @@ impl LoxConf {
     }
 
     fn connection(&self, data_dir: &Path) -> Connection {
-        let host = if self.host.starts_with("http://") || self.host.starts_with("https://") {
+        // No host, only a serial: vislox finds it through Remote Connect
+        // (`route.rs`).
+        let host = if self.host.is_empty()
+            || self.host.starts_with("http://")
+            || self.host.starts_with("https://")
+        {
             self.host.clone()
         } else {
             format!("https://{}", self.host)
@@ -257,8 +262,11 @@ fn find_in(
             .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
         let c: LoxConf = serde_yaml::from_str(&text)
             .map_err(|e| format!("cannot parse {}: {e}", path.display()))?;
-        if c.host.is_empty() {
-            return Err(format!("{} names no host", path.display()));
+        if c.host.is_empty() && c.serial.trim().is_empty() {
+            return Err(format!(
+                "{} names no host (or, for Remote Connect, a serial)",
+                path.display()
+            ));
         }
         Ok(c.found(data_dir, path.display().to_string(), None))
     };
@@ -974,7 +982,7 @@ impl Live {
             self.set_status(generation, "connecting", None);
             let c = conn.clone();
             let structure = tokio::task::spawn_blocking(move || -> Result<Value, String> {
-                let mut client = loxone_client::LoxClient::new(c).map_err(|e| e.to_string())?;
+                let mut client = crate::tls::lox_client(&c)?;
                 client.get_structure().cloned().map_err(|e| e.to_string())
             })
             .await
@@ -1670,6 +1678,21 @@ mod tests {
         let f = find_in(None, &home, &start, None, Some("home")).unwrap();
         assert_eq!(f.conn.host, "https://192.168.1.120");
         assert!(find_in(None, &home, &start, None, Some("nope")).is_err());
+    }
+
+    #[test]
+    fn a_config_with_only_a_serial_is_for_remote_connect() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = tmp.path().join("env.yaml");
+        write(&env, "serial: 504F94A0E454\nuser: u\npass: p\n");
+        let f = find_in(Some(env.clone()), tmp.path(), tmp.path(), None, None).unwrap();
+        assert_eq!(f.conn.host, "");
+        assert_eq!(f.serial.as_deref(), Some("504F94A0E454"));
+        write(&env, "user: u\npass: p\n");
+        let e = find_in(Some(env), tmp.path(), tmp.path(), None, None)
+            .err()
+            .unwrap();
+        assert!(e.contains("names no host"), "{e}");
     }
 
     #[test]

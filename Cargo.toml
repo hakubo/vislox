@@ -13,6 +13,12 @@ serde_yaml = "0.9"
 # The status check's jdev/cfg/apiKey request. The same TLS features as loxone-client
 # (manual roots), so that adding it does not change loxone-client's TLS behaviour.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-manual-roots"] }
+# Checks the Miniserver's CloudDNS certificate (Let's Encrypt) against the
+# public web roots, which loxone-client's reqwest (manual roots) has none of.
+# The same rustls as reqwest and tokio-tungstenite, on lox's ring provider.
+rustls = { version = "0.23", default-features = false, features = ["logging", "ring", "std", "tls12"] }
+webpki-roots = "1"
+base64 = "0.22"
 anyhow = "1"
 axum = "0.8"
 tower-http = { version = "0.6", features = ["compression-gzip"] }

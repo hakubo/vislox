@@ -398,7 +398,7 @@ impl Structure {
         let conn = self.conn.clone()?;
         let _one = self.loading.lock().await;
         let res = tokio::task::spawn_blocking(move || -> Result<Value, String> {
-            let mut client = loxone_client::LoxClient::new(conn).map_err(|e| e.to_string())?;
+            let mut client = crate::tls::lox_client(&conn)?;
             client.get_structure().cloned().map_err(|e| e.to_string())
         })
         .await
@@ -499,7 +499,7 @@ impl Structure {
             .await
             .map_err(|e| Some(e.to_string()))?;
         let bytes = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, String> {
-            let client = loxone_client::LoxClient::new(conn).map_err(|e| e.to_string())?;
+            let client = crate::tls::lox_client(&conn)?;
             client.get_bytes(&file).map_err(|e| e.to_string())
         })
         .await

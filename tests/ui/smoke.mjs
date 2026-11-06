@@ -559,6 +559,8 @@ try {
     await page.waitForSelector("#ms-pop:not(.hidden)");
     assert.match(await page.textContent("#ms-body"), /FTP \(port \d+\) answers: 220 fake FTP/);
     assert.match(await page.textContent("#ms-body"), /Config belongs to504F94000001 \(the repository folder\) ✓/);
+    // A test host is taken as lox names it: no CloudDNS name, no Remote Connect.
+    assert.match(await page.textContent("#ms-body"), /Routelox's host · no TLS/);
     await page.keyboard.press("Escape");
     await page.waitForSelector("#ms-pop.hidden", { state: "attached" });
   });

@@ -53,7 +53,7 @@ impl Http {
 
     fn client(&self) -> Result<&LoxClient, String> {
         self.client
-            .get_or_init(|| LoxClient::new(self.conn.clone()).ok())
+            .get_or_init(|| crate::tls::lox_client(&self.conn).ok())
             .as_ref()
             .ok_or_else(|| "no HTTP client".to_string())
     }

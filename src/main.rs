@@ -20,10 +20,12 @@ mod pull;
 mod query;
 mod reason;
 mod restart;
+mod route;
 mod schedule;
 mod session;
 mod source;
 mod structure;
+mod tls;
 
 use anyhow::{Context, Result};
 use axum::extract::{Query, State};
@@ -112,6 +114,13 @@ struct Args {
     /// a string ID with parameters.
     #[arg(long, env = "VISLOX_MONITOR_STRINGS", value_name = "FILE")]
     monitor_strings: Option<PathBuf>,
+    /// How vislox reaches the Miniserver: `auto` connects under its CloudDNS
+    /// name with the certificate checked when it can, else at lox's host, and
+    /// through Remote Connect when that does not answer; `local` never uses
+    /// Remote Connect; `remote` always does. Pull, Apply and Sync always use
+    /// lox's host.
+    #[arg(long, env = "VISLOX_ROUTE", value_enum, default_value_t = route::Mode::Auto)]
+    route: route::Mode,
 }
 
 struct App {
@@ -176,6 +185,43 @@ async fn main() -> Result<()> {
     if let (Some(_), Err(why)) = (&args.ctx, &found) {
         anyhow::bail!("{why}");
     }
+    // vislox's own connection to the Miniserver (live values, the status
+    // chip, the structure file, Apply's restart probe, operating inputs):
+    // the route, chosen once. lox's commands keep lox's host.
+    let routed: Result<(loxone_client::Connection, Option<route::Route>), String> = match &found {
+        Err(why) => Err(why.clone()),
+        Ok(f) if args.no_live => Ok((f.conn.clone(), None)),
+        Ok(f) => {
+            let serial = expected_serial(&src, Some(f))
+                .map(|e| e.serial)
+                .or(f.serial.clone());
+            let resolve = route::resolve(&f.conn, serial.as_deref(), args.route);
+            match tokio::time::timeout(Duration::from_secs(30), resolve).await {
+                Ok(Ok((conn, r))) => {
+                    match r.kind {
+                        route::Kind::Clouddns => eprintln!(
+                            "vislox: connecting under the CloudDNS name {} (certificate checked)",
+                            r.url
+                        ),
+                        route::Kind::Remote => {
+                            eprintln!("vislox: connecting through Remote Connect: {}", r.url)
+                        }
+                        route::Kind::Local => {}
+                    }
+                    if let Some(w) = r.warning() {
+                        eprintln!("vislox: {w}");
+                    }
+                    Ok((conn, Some(r)))
+                }
+                Ok(Err(why)) => {
+                    eprintln!("vislox: no route to the Miniserver: {why}");
+                    Err(why)
+                }
+                Err(_) => Err("choosing the route to the Miniserver took more than 30 s".into()),
+            }
+        }
+    };
+    let own = routed.as_ref().map(|(c, _)| c).map_err(Clone::clone);
     let pull = pull::Pull::new(
         &args.lox,
         args.no_pull.then_some("turned off (--no-pull)"),
@@ -216,13 +262,13 @@ async fn main() -> Result<()> {
         };
         (live::Feed::Ndjson(f.clone()), name)
     } else {
-        match &found {
-            Ok(f) => {
-                let host = f.conn.host.clone();
+        match (&found, &own) {
+            (Ok(f), Ok(conn)) => {
+                let host = conn.host.clone();
                 eprintln!("vislox: live values from {host} (lox config {})", f.from);
-                (live::Feed::Miniserver(Box::new(f.conn.clone())), host)
+                (live::Feed::Miniserver(Box::new((*conn).clone())), host)
             }
-            Err(why) => {
+            (Err(why), _) | (_, Err(why)) => {
                 eprintln!("vislox: no live values: {why}");
                 (live::Feed::Off(why.clone()), String::new())
             }
@@ -234,16 +280,17 @@ async fn main() -> Result<()> {
         if args.no_live {
             Err("turned off (--no-live)".to_string())
         } else {
-            found.as_ref().map(|f| &f.conn).map_err(Clone::clone)
+            own.clone()
         },
         src.current.clone(),
         src.proposed.clone(),
         src.project.as_ref().map(|p| p.join("backups")),
     )
-    .expecting(expected_serial(&src, found.as_ref().ok()));
+    .expecting(expected_serial(&src, found.as_ref().ok()))
+    .routed(routed.as_ref().ok().and_then(|(_, r)| r.clone()));
     let operate = {
-        let conn = match (&found, args.no_live || args.live_from.is_some()) {
-            (Ok(f), false) => Some(f.conn.clone()),
+        let conn = match (&own, args.no_live || args.live_from.is_some()) {
+            (Ok(c), false) => Some((*c).clone()),
             _ => None,
         };
         let off = if !args.operate {
@@ -274,7 +321,7 @@ async fn main() -> Result<()> {
         if args.no_live {
             Err("turned off (--no-live)".to_string())
         } else {
-            found.as_ref().map(|f| f.conn.clone()).map_err(Clone::clone)
+            own.clone().cloned()
         },
         found.as_ref().ok().map(|f| f.ms_dir.as_str()),
     );
@@ -366,8 +413,8 @@ async fn main() -> Result<()> {
             lox: args.lox.clone(),
             // Follows Apply's program restart (read-only); --no-live means
             // vislox never talks to the Miniserver.
-            probe: match (&found, &src.project, args.no_live) {
-                (Ok(f), Some(_), false) => Some(Arc::new(restart::Http::new(f.conn.clone()))),
+            probe: match (&own, &src.project, args.no_live) {
+                (Ok(c), Some(_), false) => Some(Arc::new(restart::Http::new((*c).clone()))),
                 _ => None,
             },
         }),

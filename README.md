@@ -142,13 +142,20 @@ marked so you can review it before you deploy.
 - **Miniserver status and preflight**: a chip in the toolbar names the Miniserver lox talks to (serial and
   firmware) with a green, amber or red dot. Click it for the details: address, local or remote, TLS, whether a
   live-update slot is free, when lox's token expires, which Loxone Config version the deployed and pending
-  configs were saved with, and whether its web port and FTP (port 21) answer. Before Pull, Apply and Sync, and on
+  configs were saved with, whether its web port and FTP (port 21) answer, and the route vislox takes (see
+  *Verified TLS and Remote Connect*). Before Pull, Apply and Sync, and on
   start, vislox checks again, and refuses what could not work, with the reason: Pull, Apply and Sync when FTP is
   blocked (they copy the config over FTP, and live values only need the web port, so a firewall can block one and
   not the other), Apply also when the web port does not answer (lox restarts the program over it). The buttons
   stay on, since the cause may clear; their tooltip warns about what the last check found. A config saved with a
   different Loxone Config version than the firmware, an expired TLS certificate or token, a remote connection,
   no free live-update slot and a status reply that cannot be read are shown as warnings.
+- **Verified TLS and Remote Connect**: with the Miniserver's serial known, vislox connects to a local Gen 2
+  Miniserver under its CloudDNS name (`192-168-1-120.<serial>.dyndns.loxonecloud.com`) and checks its
+  certificate, instead of trusting whatever answers at the IP address. When that is not possible it connects as
+  lox does, and the chip warns that the certificate is not checked, and why. Away from home (lox's address does
+  not answer), or with a lox context that names only a serial, it connects through Loxone's Remote Connect; the
+  chip says *Remote Connect*, and Pull, Apply and Sync are refused there, with the reason.
 - **The right Miniserver**: the preflight also checks that the Miniserver at lox's address has the serial the
   config belongs to, so Pull, Apply and Sync never talk to another device that DHCP gave the address to, or to
   the wrong context of a repository with several Miniservers. Another serial makes the preflight refuse all
@@ -231,6 +238,40 @@ vislox ~/loxone-config --no-live       # never connect to the Miniserver
 lox stream -o json --initial --reconnect | vislox ~/loxone-config --live-from -   # values from lox
 vislox config.Loxone --live-from recorded.ndjson   # replay a recording (followed as it grows)
 ```
+
+### Verified TLS and Remote Connect
+
+vislox picks its route to the Miniserver once, at start (`--route auto`, the default; or `VISLOX_ROUTE`):
+
+| Route | When | Certificate |
+|---|---|---|
+| CloudDNS name | lox's host is `https://` and a LAN IPv4 address that answers, and the serial is known | checked |
+| lox's host | the CloudDNS name does not work (see below), there is no serial, or lox's host is a name or `http://` | not checked (`verify_ssl` in lox's context: checked) |
+| Remote Connect | lox's context names only a serial, lox's address does not answer, or `--route remote` | checked |
+
+The serial is the config's (repository folder, lox.toml), else the lox context's (`lox setup set --serial`).
+
+- **CloudDNS name**: a Gen 2 Miniserver with the CloudDNS certificate (Loxone gets it from Let's Encrypt for
+  `*.<serial>.dyndns.loxonecloud.com`) answers locally under `<ip-with-dashes>.<serial>.dyndns.loxonecloud.com`,
+  which Loxone's DNS resolves to the local address. vislox checks that the name resolves to lox's address and
+  that the certificate is valid for it (with the public web roots, as a browser does), with `jdev/cfg/apiKey`,
+  which needs no login. A router with DNS rebinding protection may refuse such names (allow
+  `dyndns.loxonecloud.com`); a custom or expired certificate, or the certificate of another serial, does not
+  check out. Then vislox uses lox's host and the chip's warning says which of these it was. A certificate for
+  another serial means another Miniserver may have the address.
+- **Remote Connect** (firmware 17.0 and later): vislox asks `connect.loxonecloud.com/getip?snr=<serial>` for the
+  relay URL and checks its certificate. The Connect Service's answers become plain messages: `404` no relay
+  (Remote Connect off, or firmware older than 17.0; the old `dns.loxonecloud.com` service is not used), `504`
+  the Miniserver is not connected to a relay, `409` an unsecure password blocks external access, and so on.
+  When the relay does not answer, outbound TCP 20000–49000 to `*.remcov3.loxonecloud.com` is probably blocked.
+  The relay carries only HTTPS and WSS: FTP does not go through it, so Pull, Apply and Sync are refused on
+  this route. Live values, the structure file and the status chip work.
+- `--route local` never uses Remote Connect; `--route remote` always does. A loopback host (`127.0.0.1`) is
+  always taken as it is.
+
+The route is for vislox's own connections: live values, the status chip and preflight, the structure file,
+Apply's restart probe and operating inputs. lox's commands (Pull, Apply, Sync, `lox log`, the Debug-Monitor's
+Start and Stop) use lox's host, and lox does not check certificates yet (see *How it works*).
 
 ### Apply, Sync and Discard
 
@@ -551,6 +592,14 @@ The binary is an `axum` server with the UI embedded (plain JS and SVG, no build 
   changed; `src/configdate.rs` finds the same date for the base, in the download it came from.
 - `src/structure.rs` keeps the Miniserver's structure file (`LoxAPP3.json`) for the In the app section
   (`GET /api/app`), caches it and its icons on disk (`GET /api/app/icon`), and reads it again on request.
+- `src/route.rs` picks how vislox reaches the Miniserver: its CloudDNS name, lox's host, or Remote Connect
+  (`connect.loxonecloud.com/getip`), and explains the Connect Service's codes. `src/tls.rs` builds the HTTP
+  and WebSocket clients that check the certificate on a verified route. `loxone-client` cannot do this yet:
+  its reqwest has no root certificates (`rustls-tls-manual-roots`), so its `verify_ssl` fails every request,
+  and its WebSocket never checks. vislox swaps the HTTP client inside lox's `LoxClient` and opens the
+  WebSocket itself. Only the RSA key that lox's login fetches comes over an unchecked request of lox's own;
+  the key exchange then runs over the checked WebSocket, so a swapped key makes the login fail but reveals
+  nothing.
 - `src/discover.rs` is Loxone's UDP discovery (`vislox --discover`, and finding a Miniserver whose address
   changed).
 - `src/operate.rs` sends the commands of `--operate` to virtual inputs (`POST /api/operate`, with the admin

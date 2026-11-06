@@ -12,7 +12,6 @@ use loxone_client::Connection;
 use loxone_client::stream::{Framer, StateEvent, ws_authenticate};
 use loxone_client::system::ll_code;
 use loxone_client::token::{WsStream, token_reuse_rejected};
-use loxone_client::ws::LoxWsClient;
 use std::collections::VecDeque;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -87,7 +86,7 @@ pub enum Ended {
 
 /// An error message with its causes, which `loxone_client` keeps out of
 /// `Display` (`WS connect` hides `HTTP error: 503 …`).
-fn chain(e: &(dyn std::error::Error + 'static)) -> String {
+pub(crate) fn chain(e: &(dyn std::error::Error + 'static)) -> String {
     let mut s = e.to_string();
     let mut cur = e.source();
     while let Some(c) = cur {
@@ -103,8 +102,13 @@ fn chain(e: &(dyn std::error::Error + 'static)) -> String {
 
 /// Connect, log in and subscribe to binary status updates.
 async fn open(conn: &Connection) -> Result<WsStream, String> {
-    let client = LoxWsClient::new(conn.clone());
-    let mut ws = client.connect_raw().await.map_err(|e| chain(&e))?.0;
+    // The socket checks the certificate when the route is verified
+    // (`tls.rs`); lox's login fetches the RSA key with a client of its own,
+    // which cannot check it.
+    let mut ws = crate::tls::ws_connect(conn).await?;
+    let reopen = conn.clone();
+    let lox_conn = crate::tls::for_lox(conn);
+    let conn = &lox_conn;
     let reuse_rejected_before = token_reuse_rejected();
     if let Err(e) = ws_authenticate(&mut ws, conn).await {
         // The stored token was just rejected and the fallback `gettoken`
@@ -113,7 +117,7 @@ async fn open(conn: &Connection) -> Result<WsStream, String> {
         if reuse_rejected_before || !token_reuse_rejected() {
             return Err(chain(&e));
         }
-        ws = client.connect_raw().await.map_err(|e| chain(&e))?.0;
+        ws = crate::tls::ws_connect(&reopen).await?;
         ws_authenticate(&mut ws, conn)
             .await
             .map_err(|e| chain(&e))?;
