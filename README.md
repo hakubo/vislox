@@ -37,13 +37,15 @@ marked so you can review it before you deploy.
 - **Heating and cooling periods** (live values on): the Miniserver's heating and cooling periods, which Intelligent
   Room Controllers and the Climate Controller use to decide whether to heat or cool. They are set in the app's
   operating-mode settings, not in the config, so vislox reads them from the Miniserver
-  (`jdev/sps/calendargetheatperiod` and `calendargetcoolperiod`, read-only) once each time the live connection
-  opens, which includes after the program restart of a deploy. The Operating modes view shows *Heating period: 1 Oct –
+  (`jdev/sps/calendargetheatperiod` and `calendargetcoolperiod`, read-only) each time the live connection
+  opens, which includes after the program restart of a deploy. A period that is not read (no answer within 10 s,
+  a refusal) is asked for again after 10 s, 30 s and then every 5 minutes; until then the last connection's value
+  shows, marked *from the previous connection*, and a failed read never replaces a good one. The Operating modes view shows *Heating period: 1 Oct –
   30 Apr · Cooling period: 1 Mar – 7 Sep* with a chip each (it hides or shows the period's days), marks their days
   with a red and a blue bar, and says whether today is in either period. An Intelligent Room Controller's or Climate
   Controller's Properties list the same under *Heating and cooling*, with a link to the year. A period the
-  Miniserver does not give (another code, no answer, or an answer that is not `MM-DD/MM-DD`) says why. Not with
-  `--live-from`.
+  Miniserver does not give (another code, no answer, or an answer that is not `MM-DD/MM-DD`) says why, and so
+  does the view while live values are not connected (offline, stopped). Not with `--live-from`.
 - **History** (right): every revision, newest first:
   - *Pending*: the compiled `out.Loxone` of a `lox.toml` project, compared with the deployed `base`.
     This is what `lox config push` would apply.
@@ -354,8 +356,9 @@ storage and is never logged. The command log is kept in memory.
 
 The Miniserver connection is opened when a browser turns live values on, and closed shortly after the last
 one turns them off. Each time it opens, vislox asks for the heating and cooling periods on it
-(`jdev/sps/calendargetheatperiod`, `jdev/sps/calendargetcoolperiod`), once, and sends them to the browsers with
-the live values (`periods` on `/api/live`). With **Query blocks on this page**, the browser asks for the page's queries with
+(`jdev/sps/calendargetheatperiod`, `jdev/sps/calendargetcoolperiod`, both at once, one 10 s deadline), again
+after 10 s, 30 s and every 5 minutes for one not read yet, and sends them to the browsers with the live values
+(`periods` on `/api/live`; a value of an earlier connection has `stale`, and `failed` when this one's read failed). With **Query blocks on this page**, the browser asks for the page's queries with
 `POST /api/live/query` (`{rev, page}`, only the current, deployed revision; it needs the `X-Vislox` header, so
 that no other web page can make vislox send requests), and holds `GET /api/live/query?token=…` open with the
 one-use token it gets while it shows the page. vislox sends `jdev/sps/io/<uuid>/all` for each block the page

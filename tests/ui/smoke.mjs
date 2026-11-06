@@ -381,6 +381,33 @@ try {
     await page.waitForFunction(() => document.querySelector('.md-pchip[data-mode="p:cool"]')?.disabled);
     assert.match(await page.getAttribute('.md-pchip[data-mode="p:cool"]', "title"), /cannot read: the Miniserver refused it \(Code 403\)/);
     assert.equal(await page.textContent(".md-ptoday"), "Today is in the heating period.");
+    // A hidden period that becomes unreadable can still be shown again.
+    await page.evaluate(() => { S.live.periods = { ...S.live.periods, cool: { date: { kind: "yearly", month: 3, day: 1, month2: 9, day2: 7 }, text: "1 Mar – 7 Sep", value: "03-01/09-07" } }; modesLive(); });
+    await page.click('.md-pchip[data-mode="p:cool"]');
+    await page.evaluate(() => { S.live.periods = { ...S.live.periods, cool: { why: "the Miniserver did not answer", value: "" } }; modesLive(); });
+    await page.waitForFunction(() => document.querySelector('.md-pchip[data-mode="p:cool"]')?.title.includes("cannot read"));
+    assert.ok(!(await page.$eval('.md-pchip[data-mode="p:cool"]', (b) => b.disabled)), "a hidden chip stays clickable");
+    await page.click('.md-pchip[data-mode="p:cool"]');
+    await page.waitForFunction(() => document.querySelector('.md-pchip[data-mode="p:cool"]')?.disabled);
+    // A period read on the previous connection says so, and why this one has not read it.
+    await page.evaluate(() => { S.live.periods = { ...S.live.periods, heat: { ...S.live.periods.heat, stale: true, failed: "the Miniserver did not answer" } }; modesLive(); });
+    await page.waitForSelector('.md-pchip.stale[data-mode="p:heat"]');
+    assert.match(await page.getAttribute('.md-pchip[data-mode="p:heat"]', "title"), /previous connection; reading it again failed: the Miniserver did not answer/);
+    assert.match(await page.evaluate(() => mdPeriodRows({ ty: "HVACController" }, (k, v) => `${k}=${v}`).join("\n")), /Heating period=.*from the previous connection/);
+    // Before any read, the live state says why there are none: reading, or not connected.
+    const pending = (state, label) => page.evaluate(([state, label]) => {
+      const keep = [S.live.periods, S.live.status];
+      S.live.periods = null; S.live.status = { state, label };
+      const r = mdPeriodRows({ ty: "HeatIRoomController2" }, (k, v) => v).join("");
+      [S.live.periods, S.live.status] = keep;
+      return r;
+    }, [state, label]);
+    assert.match(await pending("live"), /Reading the heating and cooling periods/);
+    assert.match(await pending("offline"), /read when live values connect \(live values: offline\)/);
+    assert.match(await pending("stopped", "blocked"), /live values: blocked/);
+    await page.evaluate(() => { const keep = S.live.periods; S.live.periods = null; S.live.status = { state: "offline" }; modesLive(); window.__keep = keep; });
+    assert.match(await page.textContent("#md-legend"), /live values: offline/);
+    await page.evaluate(() => { S.live.periods = window.__keep; S.live.status = { state: "live" }; modesLive(); });
     // A climate block's Properties list the periods, and link to the year.
     const props = await page.evaluate(() => mdPeriodRows({ ty: "HeatIRoomController2" }, (k, v) => `${k}=${v}`).join("\n"));
     assert.match(props, /Heating period=.*1 Oct – 30 Apr.*today/);

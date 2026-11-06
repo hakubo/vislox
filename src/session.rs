@@ -26,7 +26,7 @@ const DEAD_SOCKET: Duration = Duration::from_secs(90);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// A read-only request to send on the session's socket (a block query,
-/// `jdev/sps/io/<uuid>/all`, or one of [`ASKED`]), and where its answer
+/// `jdev/sps/io/<uuid>/all`, or one of [`COMMANDS`]), and where its answer
 /// goes: the `LL` object of the Miniserver's reply.
 pub struct Query {
     pub cmd: String,
@@ -35,13 +35,22 @@ pub struct Query {
     pub reply: oneshot::Sender<serde_json::Value>,
 }
 
-/// The `control`s of answers that go to their [`Query`], whatever their
-/// `Code`: block queries, and the heating and cooling periods.
-const ASKED: &[&str] = &[
-    "sps/io/",
-    "sps/calendargetheatperiod",
-    "sps/calendargetcoolperiod",
-];
+/// The commands other than block queries that a [`Query`] may send: the
+/// heating and cooling periods.
+const COMMANDS: &[&str] = &[crate::calendar::HEAT_PERIOD, crate::calendar::COOL_PERIOD];
+
+/// What a command's answer names in its `control`: its path without the
+/// leading `j` (`dev/sps/…` for `jdev/sps/…`).
+fn control_of(cmd: &str) -> &str {
+    cmd.strip_prefix('j').unwrap_or(cmd)
+}
+
+/// Whether an answer's `control` (or a whole message) is the answer to a
+/// [`Query`], which gets it whatever its `Code`: a block query's, or one of
+/// [`COMMANDS`].
+fn is_asked(control: &str) -> bool {
+    control.contains("sps/io/") || COMMANDS.iter().any(|c| control.contains(control_of(c)))
+}
 
 impl Query {
     /// The outputs of a block.
@@ -53,14 +62,13 @@ impl Query {
         }
     }
 
-    /// A command that names itself in its answer's `control` (its path
-    /// without the leading `j`); it must be one of [`ASKED`].
+    /// One of [`COMMANDS`]; panics for any other, whose answer would not
+    /// come back to it (and whose refusal would end the session).
     pub fn command(cmd: &str, reply: oneshot::Sender<serde_json::Value>) -> Query {
-        let key = cmd.strip_prefix('j').unwrap_or(cmd).to_string();
-        debug_assert!(ASKED.iter().any(|a| key.contains(a)));
+        assert!(COMMANDS.contains(&cmd), "{cmd} is not a query command");
         Query {
             cmd: cmd.to_string(),
-            key,
+            key: control_of(cmd).to_string(),
             reply,
         }
     }
@@ -164,15 +172,14 @@ fn step(framer: &mut Framer, msg: Message) -> Step {
     }
 }
 
-/// The `LL` object of an answer to a query ([`ASKED`]).
+/// The `LL` object of an answer to a query ([`is_asked`]).
 fn asked_reply(t: &str) -> Option<serde_json::Value> {
-    if !ASKED.iter().any(|a| t.contains(a)) {
+    if !is_asked(t) {
         return None;
     }
     let mut v = serde_json::from_str::<serde_json::Value>(t).ok()?;
     let ll = v.get_mut("LL")?.take();
-    let control = ll["control"].as_str()?;
-    ASKED.iter().any(|a| control.contains(a)).then_some(ll)
+    is_asked(ll["control"].as_str()?).then_some(ll)
 }
 
 /// Run one session. `on_live` is called once the Miniserver has accepted
@@ -279,6 +286,25 @@ mod tests {
 
     fn text(t: &str) -> Step {
         step(&mut Framer::default(), Message::Text(t.to_string()))
+    }
+
+    #[test]
+    fn a_command_query_is_matched_by_its_control() {
+        let (reply, _) = oneshot::channel();
+        let q = Query::command(crate::calendar::COOL_PERIOD, reply);
+        assert_eq!(q.cmd, "jdev/sps/calendargetcoolperiod");
+        assert_eq!(q.key, "dev/sps/calendargetcoolperiod");
+        assert!(is_asked("dev/sps/calendargetheatperiod"));
+        assert!(is_asked("dev/sps/io/0f1e/all"));
+        assert!(!is_asked("dev/sps/enablebinstatusupdate"));
+        assert!(!is_asked("dev/sps/calendargetentries"));
+    }
+
+    #[test]
+    #[should_panic(expected = "is not a query command")]
+    fn another_command_is_refused() {
+        let (reply, _) = oneshot::channel();
+        Query::command("jdev/sps/calendargetentries", reply);
     }
 
     #[test]

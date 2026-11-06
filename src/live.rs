@@ -20,12 +20,15 @@
 //! see `query.rs`. Those values are marked as queried: they are up to one
 //! round old.
 //!
-//! Each Miniserver session also reads the heating and cooling periods once,
-//! when it goes live (`jdev/sps/calendargetheatperiod` /
+//! Each Miniserver session also reads the heating and cooling periods when
+//! it goes live (`jdev/sps/calendargetheatperiod` /
 //! `calendargetcoolperiod`, read-only, on the same socket: see
-//! `calendar::Season`). They are set in the app, not in the config, and
-//! rarely change; a deploy restarts the program, which ends the session, so
-//! the next one reads them again.
+//! `calendar::Season`), and again after [`PERIOD_TIMING`] until both are
+//! read. They are set in the app, not in the config, and rarely change; a
+//! deploy restarts the program, which ends the session, so the next one
+//! reads them again. A failed read never replaces a good one: until this
+//! session has read a period, the last connection's value shows, marked
+//! stale.
 
 use crate::calendar::{self, Season};
 use crate::query;
@@ -55,6 +58,37 @@ const QUERY_WAIT: Duration = Duration::from_secs(3);
 /// [`QUERY_PAUSE`].
 const QUERY_MISSES: u32 = 3;
 const QUERY_PAUSE: Duration = Duration::from_secs(60);
+/// The heating and cooling periods: how long both answers may take (one
+/// deadline for the two; the Miniserver is busy with the first states when a
+/// session goes live), and when to ask again for one not read yet.
+const PERIOD_TIMING: PeriodTiming = PeriodTiming {
+    wait: Duration::from_secs(10),
+    retries: &[Duration::from_secs(10), Duration::from_secs(30)],
+    every: Duration::from_secs(300),
+};
+/// The periods' requests and their keys in `periods`, in that order.
+const PERIODS: [(&str, &str); 2] = [
+    (calendar::HEAT_PERIOD, "heat"),
+    (calendar::COOL_PERIOD, "cool"),
+];
+
+#[derive(Clone, Copy)]
+struct PeriodTiming {
+    wait: Duration,
+    /// The waits before the first asks again, then [`PeriodTiming::every`].
+    retries: &'static [Duration],
+    every: Duration,
+}
+
+/// What vislox knows of one period: the last good read and the connection
+/// (`St::connection`) that read it, and the current connection's last
+/// failed read.
+#[derive(Default, Clone, Debug)]
+struct PeriodState {
+    good: Option<(Season, u64)>,
+    failed: Option<(Season, u64)>,
+}
+
 /// How long a token from [`Live::offer`] waits for its stream.
 const OFFER_TTL: Duration = Duration::from_secs(30);
 
@@ -620,9 +654,14 @@ struct St {
     blocks: HashMap<String, BlockState>,
     /// Connectors with a queried value → their block.
     queried: HashMap<String, String>,
-    /// The heating and cooling periods this session read, serialized
-    /// (`{heat, cool}`, each a [`Season`]); `None` until it has.
-    periods: Option<Arc<String>>,
+    /// Counts Miniserver connections: each structure file read, and each
+    /// start or stop of a session. A period read on another than the current
+    /// one is stale.
+    connection: u64,
+    /// The heating and cooling periods, in [`PERIODS`] order.
+    periods: [PeriodState; 2],
+    /// The periods as last sent to the browsers.
+    periods_sent: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -633,7 +672,8 @@ pub enum Msg {
     /// Changed values: `{uuid: [value, text, label, kind?] | null}` (null:
     /// the value is gone).
     Values(Arc<String>),
-    /// The heating and cooling periods were read: `{heat, cool}`.
+    /// The heating and cooling periods changed: `{heat, cool}` (see
+    /// [`Live::snapshot_json`]).
     Periods(Arc<String>),
 }
 
@@ -673,7 +713,9 @@ impl Live {
                 offers: HashMap::new(),
                 blocks: HashMap::new(),
                 queried: HashMap::new(),
-                periods: None,
+                connection: 0,
+                periods: Default::default(),
+                periods_sent: None,
             }),
             structure: Mutex::new(None),
         });
@@ -725,8 +767,11 @@ impl Live {
     }
 
     /// Every value, the controls, the global states and the heating and
-    /// cooling periods (null until read):
-    /// `{values: {uuid: [v, text, label]}, controls, globals, periods}`.
+    /// cooling periods: `{values: {uuid: [v, text, label]}, controls,
+    /// globals, periods}`. `periods` is null while neither has been asked
+    /// for, else `{heat, cool}`, each a [`Season`] or null. A good read of an
+    /// earlier connection than the current one has `stale: true`; when this
+    /// connection's read failed as well, `failed` says why.
     pub fn snapshot_json(&self) -> String {
         let st = self.st.lock().unwrap();
         let values: serde_json::Map<String, Value> = st
@@ -739,7 +784,7 @@ impl Live {
             Value::Object(values),
             st.controls,
             st.globals,
-            st.periods.as_deref().map_or("null", String::as_str)
+            periods_json(&st)
         )
     }
 
@@ -760,6 +805,7 @@ impl Live {
             && !st.stopped
         {
             st.generation += 1;
+            st.connection += 1;
             let generation = st.generation;
             let (stop_tx, stop_rx) = watch::channel(false);
             st.run = Some((generation, stop_tx));
@@ -801,6 +847,7 @@ impl Live {
         }
         // Late writes of the session are dropped.
         st.generation += 1;
+        st.connection += 1;
         drop(st);
         let _ = self.tx.send(Msg::Status);
     }
@@ -827,7 +874,8 @@ impl Live {
                 st.values.clear();
                 st.owners.retain(|_, o| !o.queried);
                 st.queried.clear();
-                st.periods = None;
+                st.periods = Default::default();
+                st.periods_sent = None;
                 drop(st);
                 let _ = me.tx.send(Msg::Status);
             }
@@ -902,6 +950,7 @@ impl Live {
             let raw = structure.clone();
             tokio::task::spawn_blocking(move || shared.set(raw));
         }
+        st.connection += 1;
         st.owners = s.owners;
         st.controls = Arc::new(s.controls.to_string());
         st.globals = Arc::new(s.globals.to_string());
@@ -938,7 +987,10 @@ impl Live {
                 }
                 Ok(s) => {
                     self.load_structure(generation, &s);
-                    let went_live = AtomicBool::new(false);
+                    let connection = self.st.lock().unwrap().connection;
+                    // Set once the session is live: block queries and the
+                    // periods wait for it.
+                    let (went_live, live_rx) = watch::channel(false);
                     let going_offline = AtomicBool::new(false);
                     let (queries, asked) = mpsc::channel(1);
                     let ask_periods = queries.clone();
@@ -947,7 +999,7 @@ impl Live {
                             &conn,
                             stop.clone(),
                             || {
-                                went_live.store(true, Ordering::Relaxed);
+                                went_live.send_replace(true);
                                 self.set_status(generation, "live", None);
                             },
                             |events| {
@@ -962,15 +1014,15 @@ impl Live {
                         // Never ends: it stops with the session.
                         _ = async {
                             tokio::join!(
-                                self.query_blocks(generation, &went_live, queries),
-                                self.read_periods(generation, &went_live, ask_periods),
+                                self.query_blocks(generation, live_rx.clone(), queries),
+                                self.read_periods((generation, connection), live_rx.clone(), ask_periods, PERIOD_TIMING),
                             )
                         } => Ended::Stopped,
                     };
                     if *stop.borrow() {
                         return;
                     }
-                    if went_live.load(Ordering::Relaxed) {
+                    if *went_live.borrow() {
                         backoff.reset();
                     }
                     if going_offline.load(Ordering::Relaxed) {
@@ -1228,23 +1280,22 @@ impl Live {
     async fn query_blocks(
         &self,
         generation: u64,
-        live: &AtomicBool,
+        mut live: watch::Receiver<bool>,
         asked: mpsc::Sender<session::Query>,
     ) {
         use futures_util::StreamExt;
         use futures_util::stream::FuturesUnordered;
         // What the last connection learnt (failed, paused) is not kept.
         self.st.lock().unwrap().blocks.clear();
+        if live.wait_for(|on| *on).await.is_err() {
+            return std::future::pending().await;
+        }
         let mut gap = tokio::time::interval(QUERY_GAP);
         gap.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             let start = tokio::time::Instant::now();
-            let mut todo: std::collections::VecDeque<query::Block> = if live.load(Ordering::Relaxed)
-            {
-                self.to_query(Instant::now()).into()
-            } else {
-                Default::default()
-            };
+            let mut todo: std::collections::VecDeque<query::Block> =
+                self.to_query(Instant::now()).into();
             let idle = todo.is_empty();
             let mut waiting = FuturesUnordered::new();
             loop {
@@ -1279,56 +1330,79 @@ impl Live {
         }
     }
 
-    /// Read the heating and cooling periods once the session is live, then
-    /// wait for the session to end.
+    /// Read the heating and cooling periods once the connection is live, and
+    /// again after `t`'s waits for any not read on it yet; then wait for the
+    /// session to end. Both requests go out together and share one deadline.
+    /// `at` is the session's generation and the connection's number.
     async fn read_periods(
         &self,
-        generation: u64,
-        live: &AtomicBool,
+        at: (u64, u64),
+        mut live: watch::Receiver<bool>,
         asked: mpsc::Sender<session::Query>,
+        t: PeriodTiming,
     ) {
-        while !live.load(Ordering::Relaxed) {
-            tokio::time::sleep(Duration::from_millis(200)).await;
+        if live.wait_for(|on| *on).await.is_err() {
+            return std::future::pending().await;
         }
-        let mut answers = Vec::new();
-        for cmd in [calendar::HEAT_PERIOD, calendar::COOL_PERIOD] {
-            let (reply, answer) = oneshot::channel();
-            if asked
-                .send(session::Query::command(cmd, reply))
-                .await
-                .is_err()
-            {
+        let mut waits = t.retries.iter().copied();
+        loop {
+            let todo: Vec<usize> = {
+                let st = self.st.lock().unwrap();
+                (0..PERIODS.len())
+                    .filter(|&i| !matches!(&st.periods[i].good, Some((_, c)) if *c == at.1))
+                    .collect()
+            };
+            if todo.is_empty() {
                 return std::future::pending().await;
             }
-            answers.push(answer);
+            let deadline = tokio::time::Instant::now() + t.wait;
+            let mut answers = Vec::new();
+            for i in todo {
+                let (reply, answer) = oneshot::channel();
+                let q = session::Query::command(PERIODS[i].0, reply);
+                if asked.send(q).await.is_err() {
+                    return std::future::pending().await;
+                }
+                answers.push((i, answer));
+            }
+            let mut read = Vec::new();
+            for (i, a) in answers {
+                let ll = tokio::time::timeout_at(deadline, a)
+                    .await
+                    .ok()
+                    .and_then(Result::ok);
+                read.push((i, Season::from_reply(ll.as_ref())));
+            }
+            self.put_periods(at, read);
+            tokio::time::sleep(waits.next().unwrap_or(t.every)).await;
         }
-        let mut seasons = Vec::new();
-        for a in answers {
-            let ll = tokio::time::timeout(QUERY_WAIT, a)
-                .await
-                .ok()
-                .and_then(Result::ok);
-            seasons.push(Season::from_reply(ll.as_ref()));
-        }
-        let cool = seasons.pop().expect("two answers");
-        let heat = seasons.pop().expect("two answers");
-        self.put_periods(generation, &heat, &cool);
-        std::future::pending().await
     }
 
-    /// Store the periods session `generation` read, and tell the browsers.
-    fn put_periods(&self, generation: u64, heat: &Season, cool: &Season) {
-        let json = Arc::new(json!({ "heat": heat, "cool": cool }).to_string());
+    /// Store what connection `at` read of the periods (by [`PERIODS`]
+    /// index), and tell the browsers when that changes what they show. A
+    /// good read replaces the last; a failed one is kept beside it. A read of
+    /// an ended session or connection is dropped.
+    fn put_periods(&self, at: (u64, u64), read: Vec<(usize, Season)>) {
         let mut st = self.st.lock().unwrap();
-        if st.generation != generation {
+        if (st.generation, st.connection) != at {
             return;
         }
-        if st.periods.as_ref() == Some(&json) {
+        for (i, s) in read {
+            let p = &mut st.periods[i];
+            if s.date.is_some() {
+                p.good = Some((s, at.1));
+                p.failed = None;
+            } else {
+                p.failed = Some((s, at.1));
+            }
+        }
+        let json = periods_json(&st);
+        if st.periods_sent.as_ref() == Some(&json) {
             return;
         }
-        st.periods = Some(json.clone());
+        st.periods_sent = Some(json.clone());
         drop(st);
-        let _ = self.tx.send(Msg::Periods(json));
+        let _ = self.tx.send(Msg::Periods(Arc::new(json)));
     }
 
     /// Read `lox stream -o json` lines: from standard input until it ends,
@@ -1447,6 +1521,36 @@ impl Live {
                 .send(Msg::Values(Arc::new(Value::Object(out).to_string())));
         }
     }
+}
+
+/// The periods as the browsers get them (see [`Live::snapshot_json`]).
+fn periods_json(st: &St) -> String {
+    let one = |p: &PeriodState| -> Value {
+        let failed = p
+            .failed
+            .as_ref()
+            .filter(|(_, c)| *c == st.connection)
+            .map(|(s, _)| s);
+        match (&p.good, failed) {
+            (Some((s, g)), failed) => {
+                let mut v = json!(s);
+                if *g != st.connection {
+                    v["stale"] = Value::Bool(true);
+                }
+                if let Some(f) = failed {
+                    v["failed"] = json!(f.why);
+                }
+                v
+            }
+            (None, Some(f)) => json!(f),
+            (None, None) => Value::Null,
+        }
+    };
+    let (heat, cool) = (one(&st.periods[0]), one(&st.periods[1]));
+    if heat.is_null() && cool.is_null() {
+        return "null".into();
+    }
+    json!({ PERIODS[0].1: heat, PERIODS[1].1: cool }).to_string()
 }
 
 fn entry(v: &Val, owner: Option<&Owner>) -> Value {
@@ -1886,59 +1990,210 @@ mod tests {
         );
     }
 
+    fn heat_ll() -> Value {
+        json!({"control": "dev/sps/calendargetheatperiod", "value": "10-15/04-15", "Code": "200"})
+    }
+
+    fn cool_ll(code: &str) -> Value {
+        json!({"control": "dev/sps/calendargetcoolperiod", "value": "05-15/09-15", "Code": code})
+    }
+
+    /// The requests a fake Miniserver got, and when.
+    type Sent = Arc<Mutex<Vec<(String, Duration)>>>;
+
+    /// A fake Miniserver for the periods: `answer(n, cmd)` says what the
+    /// `n`th request (from 0) gets, `None` for silence. It logs when each
+    /// request came.
+    fn fake_periods(
+        mut queries: mpsc::Receiver<session::Query>,
+        answer: impl Fn(usize, &str) -> Option<Value> + Send + 'static,
+    ) -> (tokio::task::JoinHandle<()>, Sent) {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let log = sent.clone();
+        let t0 = Instant::now();
+        let task = tokio::spawn(async move {
+            let mut held = Vec::new();
+            let mut n = 0;
+            while let Some(q) = queries.recv().await {
+                log.lock().unwrap().push((q.cmd.clone(), t0.elapsed()));
+                match answer(n, &q.cmd) {
+                    Some(ll) => {
+                        let _ = q.reply.send(ll);
+                    }
+                    None => held.push(q),
+                }
+                n += 1;
+            }
+        });
+        (task, sent)
+    }
+
+    fn periods(live: &Live) -> Value {
+        serde_json::from_str::<Value>(&live.snapshot_json()).unwrap()["periods"].clone()
+    }
+
+    /// The live connection: generation 0, connection `c`.
+    fn on_connection(live: &Live, c: u64) -> (u64, u64) {
+        let mut st = live.st.lock().unwrap();
+        st.connection = c;
+        (st.generation, c)
+    }
+
+    const FAST: PeriodTiming = PeriodTiming {
+        wait: Duration::from_millis(300),
+        retries: &[Duration::from_millis(100)],
+        every: Duration::from_millis(100),
+    };
+
     #[tokio::test]
     async fn the_periods_are_read_once_the_session_is_live() {
         let live = Live::new(Feed::Off("test".into()), "test".into());
-        let (asked, mut queries) = mpsc::channel::<session::Query>(1);
+        let at = on_connection(&live, 1);
+        let (asked, queries) = mpsc::channel::<session::Query>(4);
         let mut rx = live.tx.subscribe();
-        // The Miniserver: a heating period, and a refused cooling period.
-        let sent = Arc::new(Mutex::new(Vec::new()));
-        let log = sent.clone();
-        let miniserver = tokio::spawn(async move {
-            while let Some(q) = queries.recv().await {
-                log.lock().unwrap().push(q.cmd.clone());
-                let ll = if q.cmd == calendar::HEAT_PERIOD {
-                    json!({"control": "dev/sps/calendargetheatperiod", "value": "10-15/04-15", "Code": "200"})
-                } else {
-                    json!({"control": "dev/sps/calendargetcoolperiod", "value": "", "Code": "403"})
-                };
-                let _ = q.reply.send(ll);
-            }
+        // A heating period, and a refused cooling period.
+        let (miniserver, sent) = fake_periods(queries, |_, cmd| {
+            Some(if cmd == calendar::HEAT_PERIOD {
+                heat_ll()
+            } else {
+                cool_ll("403")
+            })
         });
-        let on = AtomicBool::new(false);
+        let (on, live_rx) = watch::channel(false);
         let l = live.clone();
-        let run = async { l.read_periods(0, &on, asked).await };
+        let run = async { l.read_periods(at, live_rx, asked, FAST).await };
         tokio::select! {
             () = run => unreachable!(),
             () = async {
                 // Nothing is asked before the session is live.
-                tokio::time::sleep(Duration::from_millis(300)).await;
+                tokio::time::sleep(Duration::from_millis(200)).await;
                 assert!(sent.lock().unwrap().is_empty());
                 assert!(live.snapshot_json().ends_with(r#""periods":null}"#));
-                on.store(true, Ordering::Relaxed);
-                while live.st.lock().unwrap().periods.is_none() {
+                on.send_replace(true);
+                while periods(&live).is_null() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                // The refused one is asked again; the heating period is not.
+                while sent.lock().unwrap().len() < 4 {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
             } => {}
         }
+        let cmds: Vec<String> = sent
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(c, _)| c.clone())
+            .collect();
         assert_eq!(
-            *sent.lock().unwrap(),
-            [calendar::HEAT_PERIOD, calendar::COOL_PERIOD]
+            cmds,
+            [
+                calendar::HEAT_PERIOD,
+                calendar::COOL_PERIOD,
+                calendar::COOL_PERIOD,
+                calendar::COOL_PERIOD
+            ]
         );
-        let want = r#"{"cool":{"value":"","why":"the Miniserver refused it (Code 403)"},"heat":{"date":{"day":15,"day2":15,"kind":"yearly","month":10,"month2":4},"text":"15 Oct – 15 Apr","value":"10-15/04-15"}}"#;
-        let snap: Value = serde_json::from_str(&live.snapshot_json()).unwrap();
-        assert_eq!(
-            snap["periods"],
-            serde_json::from_str::<Value>(want).unwrap()
-        );
+        let want = r#"{"cool":{"value":"05-15/09-15","why":"the Miniserver refused it (Code 403)"},"heat":{"date":{"day":15,"day2":15,"kind":"yearly","month":10,"month2":4},"text":"15 Oct – 15 Apr","value":"10-15/04-15"}}"#;
+        assert_eq!(periods(&live), serde_json::from_str::<Value>(want).unwrap());
+        // Sent once: the same refusal again changes nothing.
         assert!(
-            matches!(rx.try_recv(), Ok(Msg::Periods(p)) if serde_json::from_str::<Value>(&p).unwrap() == snap["periods"])
+            matches!(rx.try_recv(), Ok(Msg::Periods(p)) if serde_json::from_str::<Value>(&p).unwrap() == periods(&live))
         );
-        // An ended session's late answer is dropped.
-        live.st.lock().unwrap().periods = None;
-        live.put_periods(7, &Season::from_reply(None), &Season::from_reply(None));
-        assert!(live.st.lock().unwrap().periods.is_none());
+        assert!(rx.try_recv().is_err());
+        // An ended session's, or an earlier connection's, late answer is dropped.
+        let before = periods(&live);
+        live.put_periods(
+            (at.0 + 1, at.1),
+            vec![(1, Season::from_reply(Some(&cool_ll("200"))))],
+        );
+        live.put_periods(
+            (at.0, at.1 - 1),
+            vec![(1, Season::from_reply(Some(&cool_ll("200"))))],
+        );
+        assert_eq!(periods(&live), before);
         miniserver.abort();
+    }
+
+    #[tokio::test]
+    async fn a_slow_miniserver_is_asked_again_with_one_deadline_for_both() {
+        let live = Live::new(Feed::Off("test".into()), "test".into());
+        let at = on_connection(&live, 1);
+        let (asked, queries) = mpsc::channel::<session::Query>(4);
+        // Silent the first time (the Miniserver is busy), then answers.
+        let (miniserver, sent) = fake_periods(queries, |n, cmd| {
+            (n >= 2).then(|| {
+                if cmd == calendar::HEAT_PERIOD {
+                    heat_ll()
+                } else {
+                    cool_ll("200")
+                }
+            })
+        });
+        let (_on, live_rx) = watch::channel(true);
+        let l = live.clone();
+        let run = async { l.read_periods(at, live_rx, asked, FAST).await };
+        tokio::select! {
+            () = run => unreachable!(),
+            () = async {
+                while periods(&live)["cool"]["date"].is_null() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            } => {}
+        }
+        let p = periods(&live);
+        assert_eq!(p["heat"]["text"], "15 Oct – 15 Apr");
+        assert_eq!(p["cool"]["text"], "15 May – 15 Sep");
+        let sent = sent.lock().unwrap().clone();
+        assert_eq!(sent.len(), 4, "{sent:?}");
+        // Asked again after one shared wait (300 ms) and the first retry
+        // (100 ms), not after a wait for each answer (600 ms).
+        let again = sent[2].1;
+        assert!(again >= Duration::from_millis(380), "{again:?}");
+        assert!(again < Duration::from_millis(650), "{again:?}");
+        miniserver.abort();
+    }
+
+    #[test]
+    fn a_failed_read_keeps_the_last_good_periods_marked_stale() {
+        let live = Live::new(Feed::Off("test".into()), "test".into());
+        let good = |ll: Value| Season::from_reply(Some(&ll));
+        let at = on_connection(&live, 1);
+        live.put_periods(at, vec![(0, good(heat_ll())), (1, good(cool_ll("200")))]);
+        assert!(periods(&live)["heat"]["stale"].is_null());
+        // A reconnect (a deploy): what the last connection read is stale…
+        let at = on_connection(&live, 2);
+        assert_eq!(periods(&live)["heat"]["stale"], true);
+        assert_eq!(periods(&live)["heat"]["text"], "15 Oct – 15 Apr");
+        // … and a silent or refused read does not replace it, but says so.
+        live.put_periods(
+            at,
+            vec![(0, Season::from_reply(None)), (1, good(cool_ll("403")))],
+        );
+        let p = periods(&live);
+        assert_eq!(p["heat"]["text"], "15 Oct – 15 Apr");
+        assert_eq!(p["heat"]["stale"], true);
+        assert_eq!(p["heat"]["failed"], "the Miniserver did not answer");
+        assert_eq!(p["cool"]["text"], "15 May – 15 Sep");
+        assert_eq!(p["cool"]["failed"], "the Miniserver refused it (Code 403)");
+        // A good read on this connection is fresh again.
+        live.put_periods(at, vec![(0, good(heat_ll()))]);
+        let p = periods(&live);
+        assert!(p["heat"]["stale"].is_null() && p["heat"]["failed"].is_null());
+        assert_eq!(p["cool"]["stale"], true);
+    }
+
+    #[test]
+    fn a_stopped_session_marks_its_periods_stale() {
+        let live = Live::new(Feed::Off("test".into()), "test".into());
+        let at = on_connection(&live, 1);
+        live.put_periods(at, vec![(0, Season::from_reply(Some(&heat_ll())))]);
+        assert!(periods(&live)["heat"]["stale"].is_null());
+        live.stop_for_good(at.0, Status::new("stopped", None));
+        assert_eq!(periods(&live)["heat"]["stale"], true);
+        // The stopped session's late answers are dropped.
+        live.put_periods(at, vec![(1, Season::from_reply(Some(&cool_ll("200"))))]);
+        assert!(periods(&live)["cool"].is_null());
     }
 
     #[tokio::test]
@@ -1961,10 +2216,10 @@ mod tests {
                 }
             }
         });
-        let on = AtomicBool::new(true);
+        let (_on, live_rx) = watch::channel(true);
         let l = live.clone();
         let started = Instant::now();
-        let run = async move { l.query_blocks(0, &on, asked).await };
+        let run = async move { l.query_blocks(0, live_rx, asked).await };
         tokio::select! {
             () = run => unreachable!(),
             () = async {

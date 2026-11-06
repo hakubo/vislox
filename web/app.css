@@ -665,3 +665,6 @@ button.chip { cursor: pointer; } button.chip:hover { border-color: var(--brand);
 .md-pchip.none { opacity: .7; cursor: default; }
 .md-ptoday { color: var(--muted); font-size: 12px; margin-left: 4px; }
 .pr-note { color: var(--muted); font-size: 12px; padding: 4px 0 2px; }
+.md-pchip.off.none { cursor: pointer; }
+.md-pchip.stale { border-style: dashed; }
+.md-pstale { color: var(--faint); font-size: 11px; }

@@ -2751,7 +2751,12 @@ function liveStart() {
   const es = new EventSource("/api/live");
   S.live.es = es;
   S.live.status = { state: "connecting" };
-  es.addEventListener("status", (e) => { S.live.status = JSON.parse(e.data); renderLiveSwitch(); });
+  es.addEventListener("status", (e) => {
+    S.live.status = JSON.parse(e.data);
+    renderLiveSwitch();
+    // A climate block's Properties say why the periods are not there yet.
+    if (!S.live.periods && mdClimate(S.view?.objects[S.sel])) renderProps();
+  });
   es.addEventListener("snapshot", (e) => {
     const d = JSON.parse(e.data);
     S.live.values = new Map(Object.entries(d.values));
@@ -2761,10 +2766,10 @@ function liveStart() {
     lvCache = new Map();
     liveQueue(null);
   });
-  // The heating and cooling periods, read once per Miniserver session (null until then).
+  // The heating and cooling periods, as each Miniserver connection reads them (null until asked).
   es.addEventListener("periods", (e) => {
     S.live.periods = JSON.parse(e.data);
-    if (S.sel) renderProps();
+    if (mdClimate(S.view?.objects[S.sel])) renderProps();
     modesLive();
   });
   es.addEventListener("values", (e) => {
