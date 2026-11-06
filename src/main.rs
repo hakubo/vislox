@@ -11,6 +11,8 @@ mod log;
 mod miniserver;
 mod model;
 mod operate;
+mod monframe;
+mod monitor;
 mod pull;
 mod query;
 mod reason;
@@ -86,6 +88,26 @@ struct Args {
     /// values from the Miniserver. Off by default: vislox only listens.
     #[arg(long)]
     operate: bool,
+    /// The Debug-Monitor: listen for the Miniserver's debug output (UDP) and
+    /// show it in the Log panel. Off by default.
+    #[arg(long, env = "VISLOX_MONITOR", value_parser = clap::builder::BoolishValueParser::new())]
+    monitor: bool,
+    /// The Debug-Monitor's UDP port: the Miniserver's Debug-Monitor port
+    /// (`LoxWATCHPort`, 7777 unless changed in Loxone Config).
+    #[arg(long, env = "VISLOX_MONITOR_PORT", default_value_t = 7777)]
+    monitor_port: u16,
+    /// The address the Miniserver sends the Debug-Monitor to: this host's, as
+    /// the Miniserver reaches it (needed in Docker). Default: this host's
+    /// address on the route to the Miniserver.
+    #[arg(long, env = "VISLOX_MONITOR_IP", value_name = "IPV4")]
+    monitor_ip: Option<std::net::Ipv4Addr>,
+    /// How long a Debug-Monitor started from the Log panel runs.
+    #[arg(long, env = "VISLOX_MONITOR_MINUTES", default_value_t = 60)]
+    monitor_minutes: u32,
+    /// A copy of the Miniserver's string table (`ENG.xml`), for lines sent as
+    /// a string ID with parameters.
+    #[arg(long, env = "VISLOX_MONITOR_STRINGS", value_name = "FILE")]
+    monitor_strings: Option<PathBuf>,
 }
 
 struct App {
@@ -98,6 +120,7 @@ struct App {
     structure: Arc<structure::Structure>,
     pull: pull::Pull,
     log: log::Log,
+    monitor: Arc<monitor::Monitor>,
     ms: miniserver::Miniserver,
     actions: actions::Actions,
     operate: Arc<operate::Operate>,
@@ -234,6 +257,33 @@ async fn main() -> Result<()> {
     );
     let live = live::Live::new(feed, live_source);
     live.share_structure(structure.clone());
+    // The Debug-Monitor, when asked for; --no-live means vislox never talks
+    // to the Miniserver.
+    let monitor = Arc::new(monitor::Monitor::new(
+        (args.monitor && !args.no_live).then_some(monitor::Settings {
+            port: args.monitor_port,
+            advertise: args.monitor_ip,
+            minutes: args.monitor_minutes,
+        }),
+        found.as_ref(),
+        expected_serial(&src, found.as_ref().ok()).map(|e| e.serial),
+    ));
+    if let Some(f) = &args.monitor_strings {
+        let xml =
+            std::fs::read_to_string(f).with_context(|| format!("cannot read {}", f.display()))?;
+        monitor.set_strings(monframe::Strings::parse(&xml));
+    }
+    match monitor.info()["reason"].as_str() {
+        _ if !args.monitor => {}
+        None => {
+            monitor.spawn();
+            eprintln!(
+                "vislox: Debug-Monitor on UDP port {} (Start it in the Log panel)",
+                args.monitor_port
+            );
+        }
+        Some(why) => eprintln!("vislox: no Debug-Monitor: {why}"),
+    }
     let (tx, _) = broadcast::channel(16);
     let app = Arc::new(App {
         label: src.label.clone(),
@@ -244,6 +294,7 @@ async fn main() -> Result<()> {
         structure,
         pull,
         log,
+        monitor: monitor.clone(),
         ms,
         actions: actions::Actions::new(actions::Settings {
             token: args
@@ -307,10 +358,7 @@ async fn main() -> Result<()> {
     }
 
     let router = Router::new()
-        .route(
-            "/",
-            get(|| async { asset("text/html", include_str!("../web/index.html")) }),
-        )
+        .route("/", get(root))
         .route(
             "/app.js",
             get(|| async { asset("text/javascript", include_str!("../web/app.js")) }),
@@ -337,6 +385,9 @@ async fn main() -> Result<()> {
         .route("/api/app", get(api_app))
         .route("/api/app/load", axum::routing::post(api_app_load))
         .route("/api/app/icon", get(api_app_icon))
+        .route("/api/monitor", get(api_monitor))
+        .route("/api/monitor/start", axum::routing::post(api_monitor_start))
+        .route("/api/monitor/stop", axum::routing::post(api_monitor_stop))
         .route("/api/pull", axum::routing::post(api_pull))
         .route("/api/apply", axum::routing::post(api_apply))
         .route("/api/discard", axum::routing::post(api_discard))
@@ -358,6 +409,10 @@ async fn main() -> Result<()> {
     tokio::select! {
         res = axum::serve(listener, router) => res?,
         _ = shutdown_signal() => {
+            // A Debug-Monitor started from here ends with vislox.
+            if monitor.started() {
+                let _ = tokio::time::timeout(Duration::from_secs(5), monitor.stop()).await;
+            }
             eprintln!("vislox: stopped");
             std::process::exit(0);
         }
@@ -494,6 +549,7 @@ async fn api_history(State(app): State<Arc<App>>) -> impl IntoResponse {
         "live": app.live.info(),
         "pull": app.pull.info(),
         "log": app.log.info(),
+        "monitor": app.monitor.info(),
         "actions": app.actions.info(),
         "operate": app.operate.info(),
     }))
@@ -842,6 +898,78 @@ async fn api_miniserver(State(app): State<Arc<App>>, Query(q): Query<MsQuery>) -
         app.ms.chip().await
     };
     Json(v.as_ref().clone()).into_response()
+}
+
+/// The page, or the Debug-Monitor's answer to a Monitor Server request
+/// (`GET /?<serial>`).
+async fn root(
+    State(app): State<Arc<App>>,
+    axum::extract::RawQuery(q): axum::extract::RawQuery,
+) -> Response {
+    if let Some(xml) = q.as_deref().and_then(|q| app.monitor.server_xml(q)) {
+        return (
+            [
+                (header::CONTENT_TYPE, "application/xml"),
+                (header::CACHE_CONTROL, "no-cache"),
+            ],
+            xml,
+        )
+            .into_response();
+    }
+    asset("text/html", include_str!("../web/index.html"))
+}
+
+/// The Debug-Monitor for one browser: `info`, then the `lines` kept, then
+/// new `lines` and `info` as they come.
+async fn api_monitor(
+    State(app): State<Arc<App>>,
+) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
+    let m = app.monitor.clone();
+    let rx = m.subscribe();
+    let first = [
+        Event::default().event("info").data(m.info().to_string()),
+        Event::default().event("lines").data(m.lines().to_string()),
+    ];
+    let rest = BroadcastStream::new(rx).map(move |msg| match msg {
+        Ok(monitor::Msg::Lines(l)) => Event::default().event("lines").data(l.as_str()),
+        Ok(monitor::Msg::Info) => Event::default().event("info").data(m.info().to_string()),
+        // Fell behind: everything again.
+        Err(_) => Event::default().event("reset").data(m.lines().to_string()),
+    });
+    Sse::new(tokio_stream::iter(first).chain(rest).map(Ok)).keep_alive(KeepAlive::default())
+}
+
+/// Tell the Miniserver to send its debug output here (`dev/sps/log/<ip>`).
+async fn api_monitor_start(
+    State(app): State<Arc<App>>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    if let Some(r) = not_from_vislox(&headers) {
+        return r;
+    }
+    match app.monitor.start().await {
+        Ok(m) => Json(serde_json::json!({ "message": m })).into_response(),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({ "error": reason::explain(&e) })),
+        )
+            .into_response(),
+    }
+}
+
+/// Tell the Miniserver to stop sending its debug output (`dev/sps/log`).
+async fn api_monitor_stop(State(app): State<Arc<App>>, headers: axum::http::HeaderMap) -> Response {
+    if let Some(r) = not_from_vislox(&headers) {
+        return r;
+    }
+    match app.monitor.stop().await {
+        Ok(m) => Json(serde_json::json!({ "message": m })).into_response(),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({ "error": reason::explain(&e) })),
+        )
+            .into_response(),
+    }
 }
 
 /// The Miniserver's system log (`lox log`), fetched now. Needs the

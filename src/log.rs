@@ -217,7 +217,7 @@ fn is_time(s: &str) -> bool {
         && (b.len() == 19 || (b[19] == b'.' && b[20..].iter().all(u8::is_ascii_digit)))
 }
 
-fn kind(text: &str) -> &'static str {
+pub(crate) fn kind(text: &str) -> &'static str {
     if is_program_change(text)
         || is_restart_command(text)
         || text.starts_with("PRG Start ")
