@@ -53,6 +53,12 @@ marked so you can review it before you deploy.
   - *Git commits*: the file's history, e.g. from `lox config pull`.
   - **Pull from Miniserver** (in a `lox config init` repository): runs `lox config pull`, which downloads the
     Miniserver's current config and commits it when it changed. The new backup appears at once.
+  - *Miniserver backups*: the Miniserver keeps a backup of each config it loads (`/prog/sps_<ver>_<stamp>.zip`;
+    one Miniserver kept its last 20). **Read** lists them and downloads each new one once (FTP, read-only). A backup with the
+    bytes of the Pull next to it shows as that Pull (a *Miniserver backup* pill); the others are listed under the Pulls they
+    were saved between (*Between Backup v273 and Backup v274*, *Since the last Pull*), each compared with the
+    save before it. So every save from Loxone Config can be reviewed on its own, even when nobody pulled in
+    between, and shift-click compares any two.
 - **Change review**: added (green), changed (amber), removed (red, dashed ghost) and moved (blue, ghost at
   the old place) blocks. Wires and parameters are marked too: changed values show old → new in the
   properties. The Changes list can be filtered by kind, and clicking an entry jumps to it.
@@ -408,6 +414,29 @@ The **Debug-Monitor** listens on UDP (`--monitor`, `--monitor-port 7777`, `--mon
 `POST /api/monitor/start` and `/stop` (with the `X-Vislox` header). `GET /?<serial>` answers a Monitor Server request
 with the XML that points the Miniserver at vislox. To turn it off: Stop, then start vislox without `--monitor`.
 
+**Miniserver backups** are read only when a user clicks *Read* in the History (`POST /api/backups/read`, with
+the `X-Vislox` header and the same preflight as Pull), and after a Pull once they were read. lox's
+`ftp::list_backups` lists `/prog`, and each backup vislox has not seen is downloaded with `ftp::download_backup`,
+one at a time with a pause between them, and decompressed with `archive::extract_and_decompress` (which checks
+the LoxCC size and CRC-32). Its program is the same bytes `lox config pull` commits, so its git blob id finds
+the Pull that took it. The program is cached by that blob id in `VISLOX_CACHE` (as the structure file), under
+`<serial or address>/backups/`, with `index.json` (file name to blob id) and the last listing (`list.json`). A
+backup is never downloaded twice, and one the Miniserver has deleted stays in the History (*no longer on the
+Miniserver*). The cache shows with `--no-live` too, and links to a backup keep working; reading needs a cache
+directory, and is refused without one. A backup that cannot be downloaded or read (one still being written) is
+listed under *Could not be read* with the reason, and tried again on the next Read; the others are read anyway.
+One FTP session at a time: a listing (30 s) or download (120 s) that takes too long stops the read, and the next
+one waits until that session has ended.
+
+Saves in a row with the same program are one. A backup shows as a Pull only when it is next to it in time (the
+Pull took it, or nothing changed in between); a save that goes back to an older program shows in its gap, *same
+as* that revision. The time in a file name is the Miniserver's local time, in the zone its config names
+(`Timezone="Europe/Warsaw"` in the `Document`, from the newest backup), never in the zone of the computer vislox
+runs on (in Docker that is UTC). A Pull is placed by the date in its subject (`Config backup 2026-11-05 23:55:04`,
+the backup it took), else by its commit time in that zone. With no zone known, stamps count as UTC, and a Pull
+without a date is placed by the backup with its bytes. `--no-live` turns reading off. vislox does not write
+backups to git: a Pull commits the newest one.
+
 **Pull from Miniserver** runs `lox config pull` (the `lox` on `PATH`, or `--lox <path>`), with the same lox
 configuration and context as live values. It is offered only when lox would commit to the repository vislox
 shows, into the folder of the Miniserver vislox shows (`config_repo` and the serial or address in lox's
@@ -452,6 +481,8 @@ The binary is an `axum` server with the UI embedded (plain JS and SVG, no build 
   `git commit`, `git push`) and Discard (`git checkout` of the module, lock and out). Apply's steps follow lox's
   progress lines as they come.
 - `src/restart.rs` follows the program restart during Apply: out of service, back online, new config loaded.
+- `src/backups.rs` lists and downloads the Miniserver's own backups for the History and caches their programs
+  by blob id; `history.rs` shows each with the Pull of the same bytes, or between the Pulls around it.
 - `src/pull.rs` runs `lox config pull` for the Pull button (`POST /api/pull`, which needs an `X-Vislox` header so
   that no other web page can trigger it), then refreshes the history.
 - `src/monitor.rs` is the Debug-Monitor: the UDP listener, the address filter, Start/Stop and the Monitor Server

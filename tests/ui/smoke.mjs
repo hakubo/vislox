@@ -12,6 +12,7 @@ import { createSocket } from "node:dgram";
 import { mkdtempSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, appendFileSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { crc32 } from "node:zlib";
+import { createHash } from "node:crypto";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import assert from "node:assert/strict";
@@ -41,6 +42,23 @@ writeFileSync(cfg, readFileSync(cfg, "utf8")
 \t\t\t</C>`));
 git("add", ".");
 git("commit", "-q", "-m", "[504F94000001] Config backup 2026-11-01 10:00:00 (v1)");
+// The Miniserver's own backups, as vislox caches them once downloaded (src/backups.rs): one with
+// the bytes of that Pull, and a save after it that no Pull took.
+const cacheDir = mkdtempSync(join(tmpdir(), "vislox-cache-"));
+{
+  const dir = join(cacheDir, "504F94000001", "backups");
+  mkdirSync(dir, { recursive: true });
+  const blob = (b) => createHash("sha1").update(`blob ${b.length}\0`).update(b).digest("hex");
+  const pulled = readFileSync(cfg), saved = Buffer.from(pulled.toString("utf8").replace('Title="Licht OG"', 'Title="Licht Flur"'));
+  const index = {}, files = [];
+  for (const [file, bytes] of [["sps_1_20261101100000.zip", pulled], ["sps_15_20261101120000.zip", saved]]) {
+    writeFileSync(join(dir, blob(bytes) + ".Loxone"), bytes);
+    index[file] = { blob: blob(bytes) };
+    files.push({ file, version: Number(file.split("_")[1]), stamp: file.split("_")[2].slice(0, 14), size: 1 });
+  }
+  writeFileSync(join(dir, "index.json"), JSON.stringify(index));
+  writeFileSync(join(dir, "list.json"), JSON.stringify({ at: 1793527200, files }));
+}
 // Uncommitted edits: a rename, a parameter and a calendar entry's date.
 const edit = (from, to) => writeFileSync(cfg, readFileSync(cfg, "utf8").replace(from, to));
 edit('Title="Licht OG"', 'Title="Licht oben"');
@@ -170,7 +188,7 @@ function monFrame(text, counter) {
 }
 const server = spawn(bin, [repo, "--listen", `127.0.0.1:${port}`, "--live-from", liveFile, "--lox", fakeLox], {
   stdio: ["ignore", "ignore", "pipe"],
-  env: { ...process.env, LOX_CONFIG: loxConfig, VISLOX_FTP_PORT: String(ftpPort), VISLOX_CACHE: mkdtempSync(join(tmpdir(), "vislox-cache-")), VISLOX_MONITOR: "1", VISLOX_MONITOR_PORT: String(monPort),
+  env: { ...process.env, LOX_CONFIG: loxConfig, VISLOX_FTP_PORT: String(ftpPort), VISLOX_CACHE: cacheDir, VISLOX_MONITOR: "1", VISLOX_MONITOR_PORT: String(monPort),
     // As Docker Compose passes it when unset: empty means "not set".
     VISLOX_MONITOR_IP: "" },
 });
@@ -621,6 +639,19 @@ try {
     // Pull reads the calendar entries again.
     for (let t = 0; calendarReads < readsBeforePull + 1 && t < 50; t++) await page.waitForTimeout(100);
     assert.equal(calendarReads, readsBeforePull + 1);
+  });
+  await step("the Miniserver's backups: one shows as its Pull, a save between Pulls on its own", async () => {
+    const v1 = await page.waitForSelector('.hrev.k-git:has(.lbl:text-is("Backup v1"))');
+    assert.match(await v1.textContent(), /Miniserver backup/);
+    assert.match(await v1.getAttribute("title"), /sps_1_20261101100000\.zip holds this config/);
+    await page.waitForSelector(".bk-sec");
+    assert.match(await page.textContent(".bk-gap"), /^Between Backup v1 · .* and Backup v2 · /);
+    const b = await page.waitForSelector(".hrev.k-backup");
+    assert.match(await b.textContent(), /Miniserver backup v15/);
+    await b.click();
+    await page.waitForFunction(() => [...document.querySelectorAll(".changes .chg .t")].some((n) => n.textContent.includes("Licht OG → Licht Flur")));
+    assert.match(await page.$eval("#sel-base", (s) => s.selectedOptions[0].textContent), /^Backup v1/);
+    assert.match(page.url(), /rev=backup%3Asps_15_20261101120000\.zip/);
   });
   await step("blocked FTP warns on Pull, and the server refuses it", async () => {
     await new Promise((ok) => { ftp.close(ok); for (const s of ftpSockets) s.destroy(); });

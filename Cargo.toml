@@ -30,6 +30,8 @@ hex = "0.4"
 # Checks a gzipped icon from the Miniserver is whole before it is cached.
 flate2 = "1"
 chrono = { version = "0.4", features = ["clock", "serde"] }
+# The Miniserver's time zone (its config's `Timezone`, e.g. `Europe/Warsaw`): backup times are in it.
+chrono-tz = "0.10"
 open = "5"
 socket2 = { version = "0.6", features = ["all"] }
 
