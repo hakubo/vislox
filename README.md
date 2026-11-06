@@ -59,13 +59,14 @@ marked so you can review it before you deploy.
   show on the current, deployed revision only.
 
 - **In the app**: what a block looks like in the Loxone app. Properties shows whether the config shows it in the
-  app, in which room and category (changes marked old → new, and a block newly shown or hidden counts as a change),
+  app, in which room and category (changes marked old → new; showing, hiding or moving a block to another room or
+  category counts as a change),
   and, from the Miniserver's structure file (`LoxAPP3.json`), the control type and the icons the app uses. Blocks
   shown in the app carry a blue phone on the canvas (legend: *in the app*): only they and the periphery have live
   values, and a block that is not in the app says so. The sidebar tree shows rooms and categories with the app's
   icons. On the revision the Miniserver runs, a block the config shows that the app lacks, or has in another room
   or category, gets a warning; after Apply, **Changed by this Apply** runs the same check on the changed blocks
-  against the new structure file.
+  (and on removed blocks the app still shows) against the first structure file read after the Apply started.
 
 - **Apply, Sync, Discard** (for a `lox.toml` project, when started with an admin token): edit the project's Lox
   Logic module and compile it with `lox logic`, by hand or with an agent of your own working in the repository
@@ -183,9 +184,11 @@ The structure file (`LoxAPP3.json`) is read, read-only and with lox's user, when
 session reads it anyway), and when a user clicks *Read from the Miniserver* in Properties (`POST /api/app/load`,
 which needs an `X-Vislox` header). vislox never reads it on its own. The last one is kept per Miniserver (serial,
 else address) in `VISLOX_CACHE`, else `$XDG_CACHE_HOME/vislox`, else `~/.cache/vislox`, so the next start has it;
-Properties says when it was read. Icons are downloaded by the name the structure file gives
+Properties says when it was read. Reading the same file again only counts the read, so browsers re-render only
+when it changed. Icons are downloaded by the name the structure file gives
 (`IconsFilled/lightbulb.svg`, or an older UUID, fetched as `<uuid>.svg`; SVG comes as text, often gzipped, PNG as
-binary) and cached next to it: a name keeps its icon. `GET /api/app/icon?name=…` serves only names the structure
+binary) and cached next to it once they arrived whole: a name keeps its icon, and one name is downloaded once at a
+time. `GET /api/app/icon?name=…` serves only names the structure
 file lists, so it cannot be used to read anything else from the Miniserver. With `--no-live` nothing is read.
 
 The structure file belongs to the config the Miniserver runs: mismatches are shown only on that revision (the

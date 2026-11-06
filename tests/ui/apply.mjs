@@ -12,8 +12,9 @@
 // greets, so that the preflight before Apply passes.
 import { chromium } from "playwright";
 import { spawn, execFileSync } from "node:child_process";
+import { createServer as createHttpServer } from "node:http";
 import { createServer as createTcpServer } from "node:net";
-import { mkdtempSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, chmodSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -27,10 +28,15 @@ const root = mkdtempSync(join(tmpdir(), "vislox-apply-"));
 const dir = join(root, "project");
 mkdirSync(join(dir, "pages"), { recursive: true });
 const git = (...a) => execFileSync("git", ["-C", dir, "-c", "user.name=t", "-c", "user.email=t@example.com", ...a]);
-copyFileSync(fixture, join(dir, "base.Loxone"));
-// The pending compile: a rename, and the renamed block shown in the app.
-writeFileSync(join(dir, "out.Loxone"), readFileSync(fixture, "utf8").replace('Title="Licht OG"', 'Title="Licht oben"')
-  .replace('<Co K="I1" Nc="1" U="10000009', '<IoData Visu="true"/><Co K="I1" Nc="1" U="10000009'));
+// The deployed config shows the Divide block in the app.
+const DIV = "10000006-0000-0060-ffff504f94000001";
+const base = readFileSync(fixture, "utf8").replace('<Co K="Input1" Nc="1"', '<IoData Visu="true"/><Co K="Input1" Nc="1"');
+writeFileSync(join(dir, "base.Loxone"), base);
+// The pending compile: a rename, the renamed block shown in the app, and the Divide block removed.
+const divBlock = base.match(/\t*<C Type="Div"[\s\S]*?<\/C>\n/)[0];
+writeFileSync(join(dir, "out.Loxone"), base.replace('Title="Licht OG"', 'Title="Licht oben"')
+  .replace('<Co K="I1" Nc="1" U="10000009', '<IoData Visu="true"/><Co K="I1" Nc="1" U="10000009')
+  .replace(divBlock, ""));
 writeFileSync(join(dir, "lox.toml"), 'base = "base.Loxone"\nmodule = "pages"\nout = "out.Loxone"\n');
 writeFileSync(join(dir, "pages", "main.lox"), "# module\n");
 execFileSync("git", ["init", "-q", "--bare", join(root, "remote.git")]);
@@ -40,14 +46,22 @@ git("commit", "-q", "-m", "Deployed");
 git("remote", "add", "origin", join(root, "remote.git"));
 git("push", "-q", "-u", "origin", "HEAD");
 
-// A lox configuration at a port that drops every connection, so no real
-// Miniserver is reached, and an FTP server that only greets.
+// A lox configuration at a port that drops every request but the structure file,
+// so no real Miniserver is reached, and an FTP server that only greets. The
+// structure file still lists the removed Divide block, and not the renamed one.
 const listen = (srv) => new Promise((ok) => srv.listen(0, "127.0.0.1", () => ok(srv.address().port)));
-const webPort = await listen(createTcpServer((s) => s.destroy()));
+let structureReads = 0;
+const webPort = await listen(createHttpServer((req, res) => {
+  if (req.url.toLowerCase() !== "/data/loxapp3.json") { req.socket.destroy(); return; }
+  structureReads++;
+  res.setHeader("Content-Type", "application/json");
+  res.end(JSON.stringify({ lastModified: "2026-11-06 12:00:00", msInfo: { serialNr: "504F94000001" }, rooms: {}, cats: {},
+    controls: { [DIV]: { name: "Divide", type: "InfoOnlyAnalog", defaultIcon: null } } }));
+}));
 const ftpPort = await listen(createTcpServer((s) => { s.on("error", () => {}); s.end("220 fake FTP\r\n"); }));
 const loxDir = mkdtempSync(join(tmpdir(), "vislox-lox-"));
 const loxConfig = join(loxDir, "config.yaml");
-writeFileSync(loxConfig, `host: 127.0.0.1:${webPort}\nuser: u\npass: p\nserial: 504F94000001\n`);
+writeFileSync(loxConfig, `host: http://127.0.0.1:${webPort}\nuser: u\npass: p\nserial: 504F94000001\n`);
 const fakeLox = join(loxDir, "lox");
 writeFileSync(fakeLox, `#!/bin/sh
 case "$1 $2" in
@@ -158,10 +172,23 @@ try {
     await page.waitForFunction(() => document.querySelector("#canvas").classList.contains("live"));
     if (process.env.SHOT) await page.screenshot({ path: process.env.SHOT + "-done.png" });
   });
-  await step("a block the Apply shows in the app offers to check the app", async () => {
+  await step("after Apply, the app is checked against the new config, also for a removed block", async () => {
     // Live values come from a file here, so the new structure file is read only when asked.
     await page.waitForSelector("#deploy-new .app-load");
     assert.match(await page.textContent("#deploy-new"), /Read what the app shows now/);
+    assert.equal(structureReads, 0);
+    await page.click("#deploy-new .app-load");
+    await page.waitForFunction(() => /In the app/.test(document.querySelector("#deploy-new")?.textContent || ""));
+    assert.equal(structureReads, 1);
+    const text = await page.textContent("#deploy-new");
+    assert.match(text, /Licht oben\s*not in the app/);
+    assert.match(text, /Divi?d?e?\s*removed, but still in the app/);
+    // The box keeps this Apply's changes when the view changes.
+    await page.click(".hrev >> nth=1");
+    await page.waitForFunction(() => document.querySelector(".hrev.sel") === document.querySelectorAll(".hrev")[1]);
+    assert.match(await page.textContent("#deploy-new"), /Licht oben\s*not in the app/);
+    await page.click(".hrev >> nth=0");
+    await page.waitForFunction(() => document.querySelector(".hrev.sel") === document.querySelectorAll(".hrev")[0]);
   });
   await step("after Apply the old log marks no block, and opening the panel reads it again", async () => {
     // The warning read before the Apply is about the old program.

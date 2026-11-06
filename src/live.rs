@@ -739,13 +739,17 @@ impl Live {
     }
 
     fn load_structure(&self, generation: u64, structure: &Value) {
-        if let Some(s) = self.structure.lock().unwrap().clone() {
-            s.set(structure);
-        }
         let s = read_structure(structure);
         let mut st = self.st.lock().unwrap();
         if st.generation != generation {
             return;
+        }
+        // The In the app section's copy: compared and cached off the
+        // runtime, and only for the running session.
+        let shared = self.structure.lock().unwrap().clone();
+        if let Some(shared) = shared {
+            let raw = structure.clone();
+            tokio::task::spawn_blocking(move || shared.set(raw));
         }
         st.owners = s.owners;
         st.controls = Arc::new(s.controls.to_string());

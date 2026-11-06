@@ -219,6 +219,25 @@ pub struct CalMode {
     pub target: Option<Target>,
 }
 
+/// The raw visualization settings of a block's `<IoData>`: `Visu`, and the
+/// room (`Pr`) and category (`Cr`) UUIDs. Cheap: no titles looked up.
+#[derive(PartialEq, Clone, Copy)]
+struct IoKey<'a> {
+    shown: bool,
+    room: Option<&'a str>,
+    category: Option<&'a str>,
+}
+
+fn io_key(el: &Element) -> Option<IoKey<'_>> {
+    let io = el.child_elements().find(|c| c.name == "IoData")?;
+    let id = |a: &str| io.attr(a).filter(|v| !v.is_empty());
+    Some(IoKey {
+        shown: io.attr("Visu") == Some("true"),
+        room: id("Pr"),
+        category: id("Cr"),
+    })
+}
+
 /// A block's visualization settings, as Loxone Config shows them: shown in
 /// the app or not (`Visu`), and its room (`Pr`) and category (`Cr`).
 #[derive(Serialize, Clone, PartialEq, Debug)]
@@ -486,26 +505,21 @@ impl<'a> Ctx<'a> {
 
     /// The block's visualization settings, from its `<IoData>` child.
     fn in_app(&self, el: &Element) -> Option<InApp> {
-        let io = el.child_elements().find(|c| c.name == "IoData")?;
-        let id = |a: &str| io.attr(a).filter(|v| !v.is_empty()).map(String::from);
+        let k = io_key(el)?;
         Some(InApp {
-            shown: io.attr("Visu") == Some("true"),
-            room: self.binding(el, "Pr"),
-            room_id: id("Pr"),
-            category: self.binding(el, "Cr"),
-            category_id: id("Cr"),
+            shown: k.shown,
+            room: k.room.map(|r| self.place_title(r)),
+            room_id: k.room.map(String::from),
+            category: k.category.map(|c| self.place_title(c)),
+            category_id: k.category.map(String::from),
         })
     }
 
-    /// Title of the Place/Category an `<IoData>` binding names.
-    fn binding(&self, el: &Element, attr: &str) -> Option<String> {
-        let io = el.child_elements().find(|c| c.name == "IoData")?;
-        let id = io.attr(attr)?;
-        Some(
-            self.el(id)
-                .map(|_| self.title(id))
-                .unwrap_or_else(|| id.to_string()),
-        )
+    /// Title of the Place/Category a binding names, else its UUID.
+    fn place_title(&self, id: &str) -> String {
+        self.el(id)
+            .map(|_| self.title(id))
+            .unwrap_or_else(|| id.to_string())
     }
 }
 
@@ -650,8 +664,8 @@ struct Delta {
     /// Calendar entries whose decoded date or operating mode changed,
     /// also when only the `Mode` object they name did.
     calendar: HashSet<String>,
-    /// Objects shown in the app now and not before, or the other way round.
-    visu: HashSet<String>,
+    /// Objects whose app settings changed: shown or not, room, category.
+    in_app: HashSet<String>,
 }
 
 impl Delta {
@@ -666,7 +680,7 @@ impl Delta {
             || self.attrs.contains_key(uuid)
             || self.placements.contains(uuid)
             || self.calendar.contains(uuid)
-            || self.visu.contains(uuid)
+            || self.in_app.contains(uuid)
             || self.params.keys().any(|(o, _)| o == uuid)
         {
             CHANGED
@@ -754,9 +768,16 @@ fn delta(new: &Ctx, old: &Ctx, d: &DocDiff) -> Delta {
         if !ch.is_empty() {
             x.attrs.insert(u.clone(), ch);
         }
-        let shown = |c: &Ctx, el: &Element| c.in_app(el).is_some_and(|a| a.shown);
-        if shown(new, nel) != shown(old, oel) {
-            x.visu.insert(u.clone());
+        // A block without `<IoData>` reads as one not shown, in no room.
+        let key = |el| {
+            io_key(el).unwrap_or(IoKey {
+                shown: false,
+                room: None,
+                category: None,
+            })
+        };
+        if key(nel) != key(oel) {
+            x.in_app.insert(u.clone());
         }
         let (np, op): (Vec<PortView>, Vec<PortView>) = (ports(nel), ports(oel));
         for p in &np {
@@ -1187,8 +1208,8 @@ fn obj_info(
         status,
         page: c.page_of.get(uuid).cloned(),
         path: c.path(uuid),
-        room: c.binding(el, "Pr"),
-        category: c.binding(el, "Cr"),
+        room: app.as_ref().and_then(|a| a.room.clone()),
+        category: app.as_ref().and_then(|a| a.category.clone()),
         app_changed: app_changed && !gone,
         app_old: app_old.filter(|_| app_changed && !gone),
         app,
@@ -1401,27 +1422,46 @@ fn changes(view: &mut View, nc: &Ctx, oc: &Ctx, d: &Delta) {
                 });
             }
         }
-        if d.visu.contains(&u) {
-            let shown = nc
-                .el(&u)
-                .and_then(|e| nc.in_app(e))
-                .is_some_and(|a| a.shown);
+        if d.in_app.contains(&u) {
+            let side = |c: &Ctx| c.el(&u).and_then(|e| c.in_app(e));
+            let (o, n) = (side(oc), side(nc));
+            let shown = |a: &Option<InApp>| a.as_ref().is_some_and(|a| a.shown);
+            let mut parts = Vec::new();
+            if shown(&o) != shown(&n) {
+                parts.push(if shown(&n) {
+                    "now shown in the app".to_string()
+                } else {
+                    "no longer shown in the app".to_string()
+                });
+            }
+            let place = |a: &Option<InApp>, room: bool| {
+                a.as_ref().and_then(|a| {
+                    if room {
+                        a.room.clone()
+                    } else {
+                        a.category.clone()
+                    }
+                })
+            };
+            for (what, room) in [("room", true), ("category", false)] {
+                let (a, b) = (place(&o, room), place(&n, room));
+                if a != b {
+                    parts.push(format!(
+                        "{what}: {} → {}",
+                        a.as_deref().unwrap_or("—"),
+                        b.as_deref().unwrap_or("—")
+                    ));
+                }
+            }
             v.push(Change {
                 kind: "attr",
-                text: format!(
-                    "{} · {}",
-                    nc.title(&u),
-                    if shown {
-                        "now shown in the app"
-                    } else {
-                        "no longer shown in the app"
-                    }
-                ),
+                text: format!("{} · {}", nc.title(&u), parts.join(", ")),
                 page: page_for(&u),
                 obj: Some(u.clone()),
             });
         }
-        if d.placements.contains(&u) {
+        // Said above, with the names, for what has an `<IoData>`.
+        if d.placements.contains(&u) && !d.in_app.contains(&u) {
             v.push(Change {
                 kind: "attr",
                 text: format!("{} · room/category binding", nc.title(&u)),
@@ -1988,6 +2028,47 @@ mod tests {
             "{:?}",
             v.changes.iter().map(|c| &c.text).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn moving_a_block_to_another_room_or_category_is_a_change() {
+        const R1: &str = "10000020-0000-00a1-ffff504f94000001";
+        const R2: &str = "10000021-0000-00a1-ffff504f94000001";
+        const CAT: &str = "10000010-0000-00b1-ffff504f94000001";
+        let meter = "<Co K=\"Pf\" Nc=\"1\" U=\"10000005-0000-0051-00ff504f94000001\">";
+        let places = format!(
+            "<C Type=\"Place\" V=\"178\" U=\"{R1}\" Title=\"Küche\"/><C Type=\"Place\" V=\"178\" U=\"{R2}\" Title=\"Keller\"/><C Type=\"Category\" V=\"178\" U=\"{CAT}\" Title=\"Energie\"/>\n\t\t<C Type=\"Page\" V=\"178\" U=\"10000002"
+        );
+        let with = |io: &str| {
+            edited(&[
+                ("<C Type=\"Page\" V=\"178\" U=\"10000002", &places),
+                (meter, &format!("{io}{meter}")),
+            ])
+        };
+        let base = doc(&with(&format!("<IoData Visu=\"true\" Pr=\"{R1}\"/>")));
+        let moved = doc(&with(&format!(
+            "<IoData Visu=\"true\" Pr=\"{R2}\" Cr=\"{CAT}\"/>"
+        )));
+        let v = build(&moved, Some(&base), "");
+        assert_eq!(obj(page(&v, PAGE_EG), METER).status, CHANGED);
+        let m = &v.objects[METER];
+        assert!(m.app_changed);
+        assert_eq!(m.app_old.as_ref().unwrap().room.as_deref(), Some("Küche"));
+        assert_eq!(m.room.as_deref(), Some("Keller"));
+        let texts: Vec<&str> = v.changes.iter().map(|c| c.text.as_str()).collect();
+        assert!(
+            texts.contains(&"Zähler · room: Küche → Keller, category: — → Energie"),
+            "{texts:?}"
+        );
+        // Said once, with the names: not again as a bare binding change.
+        assert!(
+            !texts.iter().any(|t| t.contains("room/category binding")),
+            "{texts:?}"
+        );
+
+        // The same settings: no change.
+        let same = build(&base, Some(&base), "");
+        assert_eq!(obj(page(&same, PAGE_EG), METER).status, "");
     }
 
     #[test]

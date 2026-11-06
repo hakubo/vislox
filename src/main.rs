@@ -579,10 +579,17 @@ async fn api_events(
             .event("operate")
             .data(o.operate.info().to_string()))
     });
-    // A new structure file: the In the app section reads it again.
-    let app_changed = BroadcastStream::new(app.structure.subscribe())
-        .map(|_| Ok(Event::default().event("app").data("")));
-    Sse::new(history.merge(actions).merge(operate).merge(app_changed)).keep_alive(KeepAlive::default())
+    // The structure file: `changed` (the In the app section reads it again),
+    // or `read` again unchanged (only a browser waiting after Apply cares).
+    let app_changed = BroadcastStream::new(app.structure.subscribe()).map(|e| {
+        let what = match e {
+            Ok(structure::Event::Read) => "read",
+            _ => "changed",
+        };
+        Ok(Event::default().event("app").data(what))
+    });
+    Sse::new(history.merge(actions).merge(operate).merge(app_changed))
+        .keep_alive(KeepAlive::default())
 }
 
 /// Requests that make vislox talk to the Miniserver carry an `X-Vislox`

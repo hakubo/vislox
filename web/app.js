@@ -14,7 +14,7 @@ const S = {
   follow: true, marks: true, vp: {}, open: new Set(["__pages"]), chgOff: new Set(),
   objPage: new Map(), pageOf: new Map(), loadSeq: 0, onlyChanged: false, chgIdx: -1,
   closed: new Set(["Advanced"]), dim: true, treeFocus: null, hash: null, applyingHash: false,
-  app: null, appBusy: false, appErr: "", applyAt: 0,
+  app: null, appBusy: false, appErr: "", applyReads: 0, deployed: null,
   live: { on: pref("live", false), dim: pref("liveDim", true), es: null, status: null, values: new Map(), controls: {}, globals: {} },
 };
 function pref(k, d) { try { const v = localStorage.getItem("vislox." + k); return v === null ? d : v === "1"; } catch { return d; } }
@@ -1625,21 +1625,26 @@ async function showDeployed() {
   await loadView();
   writeHash(true);
   if (S.hist.live?.available && !S.live.on) setLive(true, false); // not a retry after a stop
+  // What this Apply changed, kept: the view may change before the box does.
+  const v = S.view, seen = new Set(), rows = [], objs = {};
+  for (const c of v?.compared ? v.changes : []) {
+    if (!c.obj || seen.has(c.obj) || !v.objects[c.obj]) continue;
+    seen.add(c.obj);
+    rows.push(c);
+    objs[c.obj] = v.objects[c.obj];
+  }
+  S.deployed = { rows, objs };
   renderDeployed();
 }
 /** The changed blocks of the deployed revision, each with a link and its first live value. */
 function renderDeployed() {
-  const box = $("deploy-new"), v = S.view;
-  const seen = new Set(), rows = [];
-  for (const c of v?.compared ? v.changes : []) {
-    if (!c.obj || seen.has(c.obj) || c.kind === "removed" || !v.objects[c.obj]) continue;
-    seen.add(c.obj);
-    rows.push(c);
-  }
-  box.classList.toggle("hidden", !rows.length);
-  if (!rows.length) { box.innerHTML = ""; return; }
+  const box = $("deploy-new"), d = S.deployed;
+  const rows = (d?.rows || []).filter((c) => c.kind !== "removed");
+  const check = d ? deployedAppCheck(d) : "";
+  box.classList.toggle("hidden", !rows.length && !check);
+  if (!rows.length && !check) { box.innerHTML = ""; return; }
   const shown = rows.slice(0, 12).map((c) => {
-    const o = v.objects[c.obj];
+    const o = d.objs[c.obj];
     const q = o.ports.find((p) => p.conns.some((x) => x.dir === "out")) || o.ports[0];
     const name = autoTitle(o.title) ? prettyType(o.ty) : o.title;
     return `<div class="pr"><span class="k ${esc(c.kind)}">${esc(KIND[c.kind]?.[1] || c.kind)}</span>` +
@@ -1647,14 +1652,16 @@ function renderDeployed() {
   }).join("");
   box.innerHTML = `<div class="h">Changed by this Apply<button type="button" class="x" aria-label="Close">×</button></div>${shown}` +
     (rows.length > 12 ? `<div class="note">and ${rows.length - 12} more in Changes</div>` : "") +
-    '<div class="note">Values fill in as the Miniserver sends them; the canvas marks every change.</div>' + deployedAppCheck(rows);
+    (rows.length ? '<div class="note">Values fill in as the Miniserver sends them; the canvas marks every change.</div>' : "") + check;
 }
-/** After Apply: blocks the new config shows in the app that the Miniserver's new structure file lacks, or has elsewhere. */
-function deployedAppCheck(rows) {
+/** After Apply: blocks the new config shows in the app that the Miniserver's new structure file lacks, or has
+ *  elsewhere, and removed blocks it still shows. */
+function deployedAppCheck(d) {
   const a = S.app;
-  const objs = rows.map((c) => S.view.objects[c.obj]).filter((o) => o.app && (o.app.shown || a?.controls?.[o.uuid]));
+  const objs = Object.values(d.objs).filter((o) => o.status === "removed" ? o.app?.shown || a?.controls?.[o.uuid] : o.app && (o.app.shown || a?.controls?.[o.uuid]));
   if (!objs.length) return "";
-  if (!a?.loaded || !a.fetched || a.fetched < S.applyAt) {
+  // The server counts the structure files it read: one read after Apply started is the new config's.
+  if (!awaitedAppRead()) {
     // A live session with the Miniserver reads the new structure file itself.
     const viaLive = S.live.on && /^https?:/.test(S.hist?.live?.source || "");
     const why = a?.available && viaLive ? "Waiting for the Miniserver's new structure file…" : "";
@@ -1672,11 +1679,12 @@ function deployedAppCheck(rows) {
 // controls (by block UUID) with their type, room, category and icon.
 // vislox reads it with live values, or when asked; never on its own.
 
+function awaitedAppRead() { return !!S.app?.loaded && (S.app.reads ?? 0) > S.applyReads; }
 async function loadApp() {
   try { S.app = await api("/api/app"); } catch { return; }
   renderTree();
   if (S.view) { renderProps(); renderPage(); if (S.sel) applyFocus(); }
-  if (!$("deploy-new").classList.contains("hidden")) renderDeployed();
+  if (S.deployed) renderDeployed();
 }
 async function loadAppFromMs() {
   if (S.appBusy) return;
@@ -1701,6 +1709,8 @@ function viewingDeployed() {
 function appIssues(o) {
   const a = S.app, ctl = a?.controls?.[o.uuid], cfg = o.app;
   if (!a?.loaded || !cfg) return [];
+  // Removed from the config: only the app still showing it is wrong.
+  if (o.status === "removed") return ctl && !ctl.parent ? ["removed, but still in the app"] : [];
   const out = [];
   const name = (m, id) => m?.[id]?.name || id;
   if (cfg.shown && !ctl) out.push("not in the app");
@@ -1756,7 +1766,7 @@ function appRows(o, row, chg, marks) {
   return { rows, count: 0 };
 }
 $("deploy-new").addEventListener("click", (e) => {
-  if (e.target.closest(".x")) { $("deploy-new").classList.add("hidden"); return; }
+  if (e.target.closest(".x")) { $("deploy-new").classList.add("hidden"); S.deployed = null; return; }
   if (e.target.closest(".app-load")) { loadAppFromMs(); return; }
   const g = e.target.closest("[data-go]");
   if (!g) return;
@@ -1781,8 +1791,9 @@ async function apply() {
     "checks that it runs exactly the compiled config, then vislox commits and pushes to git.")) return;
   deployMsg("");
   $("deploy-new").classList.add("hidden");
-  // The structure file read after this is the new config's.
-  S.applyAt = Date.now();
+  S.deployed = null;
+  // The structure file the server reads after this is the new config's.
+  try { S.applyReads = (await api("/api/app")).reads ?? 0; } catch { S.applyReads = S.app?.reads ?? 0; }
   // lox refuses some pushes until the user allows them; ask, then retry with that allowed.
   const opts = {};
   for (let tries = 0; tries < 3; tries++) {
@@ -2432,7 +2443,8 @@ function connect() {
   // Changes while the stream was down (or before it opened) are not replayed: catch up.
   es.onopen = () => { setStatus("live", "live"); if (S.hist) loadHistory(); };
   es.addEventListener("history", () => loadHistory(true));
-  es.addEventListener("app", () => loadApp());
+  // `changed`: re-read it. `read` again unchanged: only an Apply waiting for a read cares.
+  es.addEventListener("app", (e) => { if (e.data !== "read" || (S.deployed && !awaitedAppRead())) loadApp(); });
   es.addEventListener("actions", (e) => { if (S.hist) { S.hist.actions = JSON.parse(e.data); renderActions(); } });
   es.addEventListener("operate", (e) => { if (S.hist) { S.hist.operate = JSON.parse(e.data); renderHistory(); } });
   es.onerror = () => setStatus("disconnected — retrying", "error");

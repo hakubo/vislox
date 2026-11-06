@@ -2245,6 +2245,7 @@ dependencies = [
  "axum",
  "chrono",
  "clap",
+ "flate2",
  "futures-util",
  "hex",
  "loxone-client",
