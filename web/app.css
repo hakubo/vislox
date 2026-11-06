@@ -431,6 +431,10 @@ button.chip { cursor: pointer; } button.chip:hover { border-color: var(--brand);
 .stale { flex: none; margin: 8px 10px 0; padding: 8px 10px; border: 1px solid var(--changed-dot); border-radius: 4px; background: var(--changed-bg); color: var(--changed); font-size: 12px; word-break: break-word; }
 .stale-row { display: flex; gap: 6px; margin-top: 6px; }
 .stale .pull-btn { margin-left: 0; }
+.cal-drift-list { margin: 6px 0 0; padding-left: 16px; }
+.cal-drift-list li { margin: 2px 0; }
+.cal-drift-list .lnk { color: inherit; font-weight: 600; }
+.cal-app { color: var(--changed); }
 .pull-msg { flex: none; margin: 6px 10px 0; padding: 6px 8px; border-radius: 4px; font-size: 12px; background: var(--brand-soft); color: var(--brand-strong); word-break: break-word; }
 .pull-msg.error { background: var(--removed-bg); color: var(--removed); }
 .pull-msg.info { background: var(--panel-2); color: var(--muted); }

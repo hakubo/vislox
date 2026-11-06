@@ -137,6 +137,14 @@
         <button type="button" id="stale-sync" class="pull-btn hidden">Sync from Miniserver</button>
       </div>
     </div>
+    <div class="stale hidden" id="cal-drift" role="status" aria-live="polite">
+      <div id="cal-drift-text"></div>
+      <ul class="cal-drift-list" id="cal-drift-list"></ul>
+      <div class="stale-row" id="cal-drift-row">
+        <button type="button" id="cal-drift-pull" class="pull-btn hidden">Pull from Miniserver</button>
+        <button type="button" id="cal-drift-sync" class="pull-btn hidden">Sync from Miniserver</button>
+      </div>
+    </div>
     <section class="pane hidden" id="deploy-pane" aria-labelledby="deploy-h">
       <h2 class="pane-title" id="deploy-h"><span>Deploy</span>
         <button type="button" id="btn-sync" class="pull-btn" title="Make the Miniserver's running config the project's base (lox config merge), then commit and push">

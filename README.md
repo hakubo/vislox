@@ -136,6 +136,13 @@ marked so you can review it before you deploy.
   **Sync from Miniserver**. Apply asks once more and warns in its confirmation. While the page is open it asks for
   the date every minute (the rest of the check every five minutes). An earlier date (an older config restored on
   the Miniserver) is shown in the chip's details, not as a warning.
+- **Calendar entries changed in the Loxone app**: admins can add, change and delete operating-mode calendar
+  entries in the app, and those edits live on the Miniserver only. vislox asks the Miniserver for the entries it
+  uses and compares them with the deployed revision by UUID: a notice above Deploy and History says how many were
+  *added*, *changed* (name, mode or date, read as *24 Dec → 26 Dec*) or *deleted* in the app, lists them (each a
+  link to the entry), and offers **Pull from Miniserver** or **Sync from Miniserver**. The entry's Properties say
+  *Changed in the app* or *Deleted in the app*, and the chip's details count them. Apply asks for them once more and
+  warns in its confirmation. Without admin rights the Miniserver refuses, and nothing shows.
 - **Miniserver log** (bottom right): the Miniserver's system log, as `lox log` reads it, newest first. It is read
   when you open the panel, on Refresh, and after an Apply. The entries since the last program change (an Apply, or
   a save from Loxone Config) are marked, so you see what the new program logged as it started. A line that names a
@@ -293,6 +300,33 @@ from the rest of the check, so the preflight before Pull, Apply and Sync never w
 Not shown yet: the token's rights (Config, FTP, program restart) and whether the password is weak. The
 Miniserver reports them only at login (`tokenRights`, `unsecurePass`), and lox does not keep them.
 
+### Calendar entries changed in the app
+
+The Miniserver lists the calendar entries it uses with `jdev/sps/calendargetentries` (lox's user, HTTP basic
+auth; Loxone's Operating Mode Schedule datasheet, "Administrative Commands"). vislox only reads: it never sends
+`calendarcreateentry`, `calendarupdateentry` or `calendardeleteentry`. It asks when a structure file was read
+successfully (each live session reads one, and so does *Read from the Miniserver*), at most once a minute; after Pull, Apply and
+Sync; and before Apply (`GET /api/calendar?fresh=1`, which needs an `X-Vislox` header, reuses a good read from the
+last 2 s; a failed one is never reused). One request is in flight at a time, also after vislox stopped waiting
+for it (8 s). It never asks on a timer. `GET /api/calendar` without `fresh` only reports the last read. With
+`--no-live` nothing is read.
+
+The command needs admin rights. When the Miniserver refuses (a code other than 200, HTTP 401 or 403), the chip's
+details say *can't tell* with the reason, and the notice never shows. When the check before Apply fails otherwise
+(no answer, the Miniserver restarting, vislox not answering), Apply's confirmation says it could not check.
+
+The answer numbers its dates differently from the `.Loxone` file (`calMode` 0 a day every year, 1 Easter, 2 one
+date, 3 one period, 4 a range every year, 5 a weekday of the month; the file's `Mode=` is absent, 1, 3 or 4), so
+entries are compared by their decoded dates, never by raw numbers: one date is a period of one day, and
+`operatingMode` is the file's `CalType=`. A date vislox cannot read on either side (`calMode` 5, which the file
+format does not document) is not compared; its name and mode still are. The comparison is with the deployed
+config: the newest commit of the watched file (the last Pull, Apply or Sync), not an uncommitted edit on disk or a
+pending compile; without git, the file on disk.
+
+Not verified yet: whether `lox config merge` (Sync) takes over entries edited in the app, or refuses because the
+base and the download differ in more than rules (Sync then makes the plain download the base). The notice offers
+both Pull and Sync, as the config-date notice does.
+
 ### Operate virtual inputs
 
 ```bash
@@ -393,7 +427,10 @@ The binary is an `axum` server with the UI embedded (plain JS and SVG, no build 
 - `src/calendar.rs` decodes a calendar entry's date from the `.Loxone` file's attributes (as lox's
   `loxone-format.md` documents them: `Mode=` the kind, `From`/`To` days since 2009-01-01, `CalType=` the mode's
   number) and words it. The view carries the decoded date by kind (`calendar.date`), and the config's modes by
-  number (`modes`), for `web/modes.js`, the Operating modes view, which lays the dates out on a year.
+  number (`modes`), for `web/modes.js`, the Operating modes view, which lays the dates out on a year. It
+  also decodes the entries of `calendargetentries` and compares them with a config's (`calendar::drift`).
+- `src/appcalendar.rs` reads the Miniserver's calendar entries (`calendargetentries`) when live values start,
+  after Pull, Apply and Sync and before Apply, for the *changed in the app* notice (`GET /api/calendar`).
 - `src/actions.rs` runs Apply (`lox config push --force`, `git commit`, `git push`), Sync (`lox config merge`,
   `git commit`, `git push`) and Discard (`git checkout` of the module, lock and out). Apply's steps follow lox's
   progress lines as they come.
