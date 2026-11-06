@@ -64,7 +64,11 @@ writeFileSync(liveFile, JSON.stringify({ control: "Temperatur", state: "value", 
 const port = 7990 + Math.floor(Math.random() * 9);
 const server = spawn(bin, [dir, "--listen", `127.0.0.1:${port}`, "--lox", fakeLox, "--admin-token-file", token, "--live-from", liveFile], {
   stdio: ["ignore", "ignore", "pipe"],
-  env: { ...process.env, LOX_CONFIG: loxConfig },
+  // Apply commits: a runner without a git identity needs one.
+  env: {
+    ...process.env, LOX_CONFIG: loxConfig,
+    GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@example.com", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@example.com",
+  },
 });
 let log = "";
 server.stderr.on("data", (d) => (log += d));
@@ -77,8 +81,9 @@ await new Promise((ok, fail) => {
 const browser = await chromium.launch(process.env.CHROMIUM_PATH ? { executablePath: process.env.CHROMIUM_PATH, args: ["--no-sandbox"] } : {});
 const errors = [];
 let failed = false;
+let page;
 try {
-  const page = await browser.newPage({ viewport: { width: 1400, height: 900 } });
+  page = await browser.newPage({ viewport: { width: 1400, height: 900 } });
   page.on("pageerror", (e) => errors.push(e.message));
   page.on("console", (m) => { if (m.type() === "error") errors.push(m.text()); });
   page.on("dialog", (d) => d.accept());
@@ -131,6 +136,7 @@ try {
   failed = true;
   console.error("FAILED:", e.message);
   if (errors.length) console.error("browser errors:", errors);
+  if (page) console.error("deploy message:", await page.textContent("#deploy-msg").catch(() => "?"));
   console.error(log);
 } finally {
   await browser.close();

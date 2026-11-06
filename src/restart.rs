@@ -16,7 +16,7 @@
 
 use loxone_client::{Connection, LoxClient};
 use serde_json::Value;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
 
@@ -34,17 +34,34 @@ pub trait Probe: Send + Sync {
 }
 
 /// The Miniserver over HTTP, with the connection lox uses.
-pub struct Http(LoxClient);
+///
+/// `LoxClient` is a blocking reqwest client, which must not be built or
+/// dropped on the async runtime. It is built on first use (the probe is only
+/// asked from `spawn_blocking`), and dropped on a thread of its own.
+pub struct Http {
+    conn: Connection,
+    client: OnceLock<Option<LoxClient>>,
+}
 
 impl Http {
-    pub fn new(conn: Connection) -> Option<Http> {
-        LoxClient::new(conn).ok().map(Http)
+    pub fn new(conn: Connection) -> Http {
+        Http {
+            conn,
+            client: OnceLock::new(),
+        }
+    }
+
+    fn client(&self) -> Result<&LoxClient, String> {
+        self.client
+            .get_or_init(|| LoxClient::new(self.conn.clone()).ok())
+            .as_ref()
+            .ok_or_else(|| "no HTTP client".to_string())
     }
 
     /// `LL.value` of a `jdev/…` answer that has HTTP status 200.
     fn value(&self, path: &str) -> Result<String, String> {
         // No retry: a failed request is what is being looked for.
-        let (status, body) = self.0.get_once(path, None).map_err(|e| {
+        let (status, body) = self.client()?.get_once(path, None).map_err(|e| {
             let e = e.to_string();
             if e.contains("timed out") || e.contains("timeout") {
                 "no answer".to_string()
@@ -59,6 +76,14 @@ impl Http {
             });
         }
         ll_value(&body).ok_or_else(|| "an answer without a value".to_string())
+    }
+}
+
+impl Drop for Http {
+    fn drop(&mut self) {
+        if let Some(Some(c)) = self.client.take() {
+            std::thread::spawn(move || drop(c));
+        }
     }
 }
 
@@ -222,6 +247,23 @@ pub async fn baseline(probe: &Arc<dyn Probe>) -> Option<Option<String>> {
 pub mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    /// The blocking client is built in a blocking task and may be dropped
+    /// on the runtime without "Cannot drop a runtime in a context where
+    /// blocking is not allowed".
+    #[tokio::test]
+    async fn the_http_probe_lives_on_the_runtime() {
+        let probe: Arc<dyn Probe> =
+            Arc::new(Http::new(Connection::new("http://127.0.0.1:9", "u", "p")));
+        assert_eq!(
+            baseline(&probe).await,
+            None,
+            "a closed port does not answer"
+        );
+        drop(probe);
+        // Built, never used: nothing to drop.
+        drop(Http::new(Connection::new("http://127.0.0.1:9", "u", "p")));
+    }
 
     #[test]
     fn values_come_from_ll() {

@@ -154,8 +154,7 @@ async fn main() -> Result<()> {
             // Follows Apply's program restart (read-only); --no-live means
             // vislox never talks to the Miniserver.
             probe: match (&found, &src.project, args.no_live) {
-                (Ok(f), Some(_), false) => restart::Http::new(f.conn.clone())
-                    .map(|h| Arc::new(h) as Arc<dyn restart::Probe>),
+                (Ok(f), Some(_), false) => Some(Arc::new(restart::Http::new(f.conn.clone()))),
                 _ => None,
             },
         }),
