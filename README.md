@@ -62,6 +62,15 @@ marked so you can review it before you deploy.
 - **Change review**: added (green), changed (amber), removed (red, dashed ghost) and moved (blue, ghost at
   the old place) blocks. Wires and parameters are marked too: changed values show old → new in the
   properties. The Changes list can be filtered by kind, and clicking an entry jumps to it.
+- **Changes that reconfigure hardware**: a change to an extension or a Tree, Air or bus device (its settings, its
+  serial, adding or removing it) makes the Miniserver send the device a new configuration, which the device
+  stores itself. Those changes carry a *hardware* tag, and the *hardware* chip next to the kind filters shows only
+  them. A new serial reads as *device replaced: 0x8003 Touch Tree, serial A → B*. Properties has a *Device*
+  section: the kind and its bus type code, the device an input belongs to, what the change does to the device, and
+  the settings matched to the device's own configuration, each with a tooltip on what it does there (*Threshold,
+  V: the AI Extension only sends a new value when …*). Apply's confirmation says *This reconfigures N devices*
+  and warns when a new serial is not on the bus; after Apply, *Changed by this Apply* lists the reconfigured
+  devices and whether they are online, for three minutes.
 - **Readable at every zoom**: zoomed out, each block shows only its name, at a readable size. From about 80 %
   the full detail appears. Gates show their operation (`AND`, `Less`, `Divide`) instead of Loxone's automatic names
   (`O208698`); a named gate keeps its operation in grey, as Loxone Config 16 shows it. Selecting a block highlights its wires and neighbours and dims the rest.
@@ -346,6 +355,45 @@ Not verified yet: whether `lox config merge` (Sync) takes over entries edited in
 base and the download differ in more than rules (Sync then makes the plain download the base). The notice offers
 both Pull and Sync, as the config-date notice does.
 
+### Hardware changes
+
+An object is a device when it carries a serial (`Serial=`; an Air device its `IP=`), except the Miniserver
+itself (`LoxLIVE`): the extensions (`LoxAin`, `LoxDigin`, `LoxREL`, `LoxTree`, `LoxAIR`, …), the bus interfaces
+(`Comm485`, …), Tree devices (`TreeDevice`, the kind from `TreeType=`) and Air devices (`LoxAIRDevice`). Its
+inputs and outputs belong to it. What counts as reconfiguring it (`src/hardware.rs`):
+
+- adding or removing the device, and a new serial (*replaced*);
+- any attribute of the device object, except those that stay in the Miniserver: `Title`, `Desc`, `Installation`,
+  `SwitchBoard`, `SwitchBoardRow`, `SwitchBoardPos`, `Cl`, `WF` and `TId`;
+- on an input or output, only the attributes matched to the device's configuration block.
+
+The device types and the configuration blocks come from
+[Inside-The-Loxone-Miniserver](https://github.com/sarnau/Inside-The-Loxone-Miniserver) (`NAT/`), bus captures
+of 2019–2021 firmware. The `.Loxone` attribute names were matched to them by hand, for the devices in the
+reference config so far:
+
+| Device | Attribute | Configuration field |
+|---|---|---|
+| AI Extension (`LoxAin`), its `VoltageIn` | `MinChange` (V), `MinTime` (ms), `AverageTime` (s) | threshold (mV), minimal time space (ms), mean value calculation time (s) |
+| Touch Tree `0x8003` (and the other Touches) | `AC` | audible acknowledgement |
+| Room Comfort Sensor Tree `0x8010` | `SSC` (s; lox's examples save `900`) | send interval for temperature and humidity (minutes, default 15) |
+| every device | `Serial`, `TreeType`/`SubType`, `HwVersion` | the device's identity and type |
+
+Not matched yet: the DI Extension's frequency inputs (a bitmask in its block; no saved config with one set), the
+Tree sensors' own `MinChange`/`MinTime` (they may be the Miniserver's filter, not the device's), and the other
+devices of the NAT folder (AO, Touch Pure, Valve Actuator, Damper, LED, RGBW 24V Dimmer, Alarm Siren, Leaf,
+Weather Station, Motion Sensor). The NAT table's `0x801A` is named *Presence Sensor Tree*, as lox's
+`tree_kinds` and Loxone Config saves have it.
+
+The devices on the bus come from `lox extensions -o json` (name, serial, online), run like `lox log` with
+lox's configuration and context (`GET /api/hardware`, which needs an `X-Vislox` header since lox logs in; one read
+at a time). It only reads. vislox asks before Apply, only when the pending change adds a device or gives one a
+new serial (`00000000`, a device not paired yet, is not checked), and after Apply, every 15 s for 3 minutes,
+only when the Apply reconfigured a device. Devices match by serial, a device not paired yet by name. lox 0.14
+has no `lox hw status`; when it does, it compares the config's serials with the Miniserver's `/data/status`
+itself. Not shown yet: the reset reason a device reports when it starts (power-on, watchdog, …), which would
+say why one went offline around an Apply; lox does not expose it. `--no-live` turns the bus reads off.
+
 ### Operate virtual inputs
 
 ```bash
@@ -488,7 +536,10 @@ The binary is an `axum` server with the UI embedded (plain JS and SVG, no build 
 - `src/monitor.rs` is the Debug-Monitor: the UDP listener, the address filter, Start/Stop and the Monitor Server
   answer. `src/monframe.rs` parses its frames (checksum, header, parameters, format strings, system stats).
 - `src/log.rs` runs `lox log` for the Log panel (`GET /api/log`), splits it into entries, marks the last program
-  change and picks out the UUIDs a line names.
+  change and picks out the UUIDs a line names. Its `LoxRead` runs one read-only `lox` command at a time.
+- `src/hardware.rs` knows which objects are devices, their kinds, which attributes reach the device and what
+  they do there, for the *hardware* tag (`model.rs` marks the changes, `view.hardware` lists the devices), and
+  reads the devices on the bus (`lox extensions`, `GET /api/hardware`).
 - `src/miniserver.rs` checks the Miniserver for the status chip and the preflight before Pull, Apply and Sync
   (`GET /api/miniserver`), including that the serial at the address is the config's, and when its config last
   changed; `src/configdate.rs` finds the same date for the base, in the download it came from.
@@ -516,7 +567,7 @@ copyright Loxone and are for internal reference only.
 
 ```bash
 cargo fmt --check && cargo clippy --all-targets -- -D warnings
-cargo test                                   # model, history, source; fixture: tests/fixtures/house.Loxone
+cargo test                                   # model, history, source; fixtures: tests/fixtures/*.Loxone
 cargo build --release
 cd tests/ui && npm ci && npx playwright install chromium && cd ../..
 VISLOX_BIN=target/release/vislox node tests/ui/smoke.mjs   # drives the UI in headless Chromium

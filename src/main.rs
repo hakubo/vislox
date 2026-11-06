@@ -7,6 +7,7 @@ mod backups;
 mod calendar;
 mod configdate;
 mod discover;
+mod hardware;
 mod history;
 mod live;
 mod log;
@@ -129,6 +130,8 @@ struct App {
     /// The Miniserver's own backups, read when a user asks.
     backups: Arc<backups::Backups>,
     log: log::Log,
+    /// The devices on the bus (`lox extensions`).
+    bus: hardware::Bus,
     monitor: Arc<monitor::Monitor>,
     ms: miniserver::Miniserver,
     actions: actions::Actions,
@@ -188,6 +191,13 @@ async fn main() -> Result<()> {
     // The Log panel reads `lox log`; --no-live means vislox never talks to
     // the Miniserver.
     let log = log::Log::new(
+        &args.lox,
+        args.no_live.then_some("turned off (--no-live)"),
+        found.as_ref(),
+        &start,
+    );
+    // The devices on the bus, the same way: `lox extensions`.
+    let bus = hardware::Bus::new(
         &args.lox,
         args.no_live.then_some("turned off (--no-live)"),
         found.as_ref(),
@@ -343,6 +353,7 @@ async fn main() -> Result<()> {
         pull,
         backups,
         log,
+        bus,
         monitor: monitor.clone(),
         ms,
         actions: actions::Actions::new(actions::Settings {
@@ -449,6 +460,7 @@ async fn main() -> Result<()> {
         )
         .route("/api/miniserver", get(api_miniserver))
         .route("/api/log", get(api_log))
+        .route("/api/hardware", get(api_hardware))
         .route("/api/app", get(api_app))
         .route("/api/app/load", axum::routing::post(api_app_load))
         .route("/api/app/icon", get(api_app_icon))
@@ -632,6 +644,7 @@ async fn api_history(State(app): State<Arc<App>>) -> impl IntoResponse {
         "live": app.live.info(),
         "pull": app.pull.info(),
         "log": app.log.info(),
+        "hardware": app.bus.info(),
         "monitor": app.monitor.info(),
         "actions": app.actions.info(),
         "operate": app.operate.info(),
@@ -1101,6 +1114,16 @@ async fn api_log(State(app): State<Arc<App>>, headers: axum::http::HeaderMap) ->
         return r;
     }
     Json(app.log.fetch().await).into_response()
+}
+
+/// The devices on the bus (`lox extensions -o json`), read now: their
+/// serials and whether they are online. Needs the `X-Vislox` header, as
+/// the log does: lox logs in to the Miniserver for it.
+async fn api_hardware(State(app): State<Arc<App>>, headers: axum::http::HeaderMap) -> Response {
+    if let Some(r) = not_from_vislox(&headers) {
+        return r;
+    }
+    Json(app.bus.fetch().await).into_response()
 }
 
 /// Refuse Pull, Apply and Sync when the Miniserver cannot be reached the

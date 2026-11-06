@@ -11,7 +11,7 @@ const K100 = 0.1;
 const $ = (id) => document.getElementById(id);
 const S = {
   hist: null, view: null, rev: null, base: null, page: null, sel: null,
-  follow: true, marks: true, vp: {}, open: new Set(["__pages"]), chgOff: new Set(),
+  follow: true, marks: true, vp: {}, open: new Set(["__pages"]), chgOff: new Set(), chgHw: false,
   objPage: new Map(), pageOf: new Map(), loadSeq: 0, onlyChanged: false, chgIdx: -1,
   closed: new Set(["Advanced"]), dim: true, treeFocus: null, hash: null, applyingHash: false,
   app: null, appBusy: false, appErr: "", applyReads: 0, deployed: null,
@@ -951,7 +951,7 @@ function calTip(cal) {
   return `${cal.when ?? "Date cannot be read"} · switches on ${cal.mode.title}`;
 }
 
-const propRow = (k, v, cls) => `<div class="pr ${cls || ""}"><div class="k">${esc(k)}</div><div class="v">${v}</div></div>`;
+const propRow = (k, v, cls, tip) => `<div class="pr ${cls || ""}"><div class="k${tip ? " hinted" : ""}"${tip ? ` title="${esc(tip)}"` : ""}>${esc(k)}</div><div class="v">${v}</div></div>`;
 function renderProps() {
   const box = $("props");
   const o = S.sel && S.view?.objects[S.sel];
@@ -1005,6 +1005,19 @@ function renderProps() {
   if (inApp) section("In the app", inApp.rows, inApp.count);
   const note = o.ty === "Text" ? o.attrs.find((a) => a.name === "Text") : null;
   if (note) section("Note", [`<div class="note-p${marks && note.changed ? " pr-chg" : ""}">${marks && note.changed ? chg(note.old, note.value, true) : esc(note.value || "")}</div>`]);
+  const dv = o.device;
+  if (dv) {
+    const rows = [row("Kind", esc(dv.kind) + (dv.code ? ` <span class="mono none-v">${esc(dv.code)}</span>` : ""))];
+    if (!dv.own) rows.push(row("Device", `<button type="button" class="lnk" data-go="${esc(dv.uuid)}">${esc(dv.title)}</button>`));
+    else if (!o.attrs.some((a) => a.hint && /^(Serial|IP)$/.test(a.name))) rows.push(row("Serial", val(dv.serial)));
+    if (marks && dv.how) rows.push(row("This change", `<span class="hw-how">${esc(HW_HOW[dv.how] || dv.how)}</span>`, "pr-chg"));
+    // The settings matched to the device's own configuration, with what they do there.
+    for (const a of o.attrs.filter((x) => x.hint)) {
+      rows.push(row(HW_LABEL[a.name] || a.name, marks && a.changed ? chg(a.old, a.value, true) : val(a.value), marks && a.changed ? (a.hw ? "pr-chg pr-hw" : "pr-chg") : "", a.hint));
+    }
+    if (dv.note) rows.push(`<div class="note-p hw-note">${esc(dv.note)}</div>`);
+    section("Device", rows);
+  }
   const params = o.ports.filter((q) => q.def != null || q.def_changed || q.inv)
     .map((q) => row(q.name + (q.inv ? " (inverted)" : ""), chg(q.old_def, q.def, q.def_changed), marks && q.def_changed ? "pr-chg" : ""));
   section("Parameters", params, params.length);
@@ -1041,7 +1054,7 @@ function renderProps() {
     else if (marks && a.changed) v = chg(a.old, a.value, true);
     else if (a.value && a.value.length > 160) v = `<span class="long">${esc(a.value)}</span><button type="button" class="more">Show all</button>`;
     else v = val(a.value);
-    return row(a.name, v, marks && a.changed ? (a.value == null ? "pr-rem" : "pr-chg") : "");
+    return row(a.name, v, marks && a.changed ? (a.value == null ? "pr-rem" : "pr-chg") : "", a.hint);
   });
   const rawChanged = marks && o.attrs.some((a) => a.changed);
   section("Advanced", raw, raw.length);
@@ -1052,6 +1065,7 @@ function renderProps() {
   if (o.room) facts.push(`<span class="chip" title="Room">⌂ ${esc(o.room)}</span>`);
   if (o.category) facts.push(`<span class="chip" title="Category">◆ ${esc(o.category)}</span>`);
   if (o.target) facts.push(`<span class="chip" title="Mirrors">↪ ${linkTarget(o.target)}</span>`);
+  if (marks && dv?.how) facts.push(`<span class="chip hw" title="${esc(HW_HOW[dv.how] || dv.how)}">⚙ hardware</span>`);
   const title = autoTitle(o.title) ? prettyType(o.ty) : o.title;
   if (note) S.closed.delete("Note");
   const st = marks && o.status ? ` <span class="st ${o.status}">${o.status}</span>` : "";
@@ -1088,6 +1102,15 @@ $("props").addEventListener("click", (e) => {
   if (a.dataset.page) gotoPage(a.dataset.page, { focus: a.dataset.go });
   select(a.dataset.go);
 });
+
+/** How a change reconfigures a device (`device.how`, `hardware[].how`). */
+const HW_HOW = {
+  added: "Added: the Miniserver configures this device once it finds it on the bus",
+  removed: "Removed: the Miniserver no longer configures this device",
+  replaced: "Device replaced: another serial is another physical device",
+  changed: "Reconfigures the device: the Miniserver sends it a new configuration, which the device stores",
+};
+const HW_LABEL = { AC: "Audible acknowledgement", SSC: "Send interval", MinChange: "Threshold", MinTime: "Minimal time between sends", AverageTime: "Mean value time", TreeType: "Device type", SubType: "Device subtype", HwVersion: "Hardware version" };
 
 // ── tree ───────────────────────────────────────────────────────────────
 const ICON = { Pages: ["#4f7fc4", "▦"], Page: ["#4f7fc4", "P"], Refs: ["#8a908a", "⇄"], Place: ["#8b6cc4", "R"], Category: ["#b5891f", "C"],
@@ -1255,7 +1278,7 @@ $("tree-filter").addEventListener("input", renderTree);
 
 // ── changes ────────────────────────────────────────────────────────────
 const KIND = { added: ["+", "added"], removed: ["−", "removed"], renamed: ["~", "renamed"], param: ["~", "parameters"], attr: ["~", "settings"], "wire+": ["+", "wires added"], "wire-": ["−", "wires removed"], moved: ["↔", "moved"] };
-function shownChanges() { return (S.view?.changes || []).filter((c) => !S.chgOff.has(c.kind)); }
+function shownChanges() { return (S.view?.changes || []).filter((c) => !S.chgOff.has(c.kind) && (!S.chgHw || c.hw)); }
 function renderChanges() {
   const v = S.view, box = $("changes"), filt = $("chg-filter");
   box.innerHTML = ""; filt.innerHTML = "";
@@ -1286,6 +1309,19 @@ function renderChanges() {
     p.onclick = () => { S.chgOff.has(k) ? S.chgOff.delete(k) : S.chgOff.add(k); S.chgIdx = -1; renderChanges(); };
     filt.appendChild(p);
   }
+  // Changes that reconfigure a device (an extension, a Tree or Air device): pressed, only those show.
+  const hwCount = v.changes.filter((c) => c.hw).length;
+  if (!hwCount) S.chgHw = false;
+  if (hwCount) {
+    const p = document.createElement("button");
+    p.type = "button";
+    p.className = "pill hw";
+    p.setAttribute("aria-pressed", String(S.chgHw));
+    p.textContent = `hardware ${hwCount}`;
+    p.title = `Show only the changes that reconfigure a device (${plural(v.stats.devices, "device")}): the Miniserver sends it a new configuration, which it stores itself`;
+    p.onclick = () => { S.chgHw = !S.chgHw; S.chgIdx = -1; renderChanges(); };
+    filt.appendChild(p);
+  }
   if (!v.changes.length) { box.innerHTML = '<div class="empty">No differences between these revisions.</div>'; return; }
   const list = shownChanges().slice(0, 2000);
   list.forEach((c, i) => {
@@ -1294,7 +1330,7 @@ function renderChanges() {
     d.className = "chg" + (i === S.chgIdx ? " cur" : "");
     d.setAttribute("role", "listitem");
     const where = c.page ? S.pageOf.get(c.page)?.title : c.obj ? v.objects[c.obj]?.path : "";
-    d.innerHTML = `<span class="k ${esc(c.kind)}" aria-label="${esc(KIND[c.kind]?.[1] || c.kind)}">${KIND[c.kind]?.[0] || "~"}</span><span class="x"><span class="t">${esc(c.text)}</span>${where ? `<span class="p">${esc(where)}</span>` : ""}</span>`;
+    d.innerHTML = `<span class="k ${esc(c.kind)}" aria-label="${esc(KIND[c.kind]?.[1] || c.kind)}">${KIND[c.kind]?.[0] || "~"}</span><span class="x"><span class="t">${esc(c.text)}</span>${where ? `<span class="p">${esc(where)}</span>` : ""}</span>${c.hw ? '<span class="hw-tag" title="Reconfigures a device">hardware</span>' : ""}`;
     d.onclick = () => gotoChange(i);
     box.appendChild(d);
   });
@@ -1832,16 +1868,106 @@ async function showDeployed() {
     rows.push(c);
     objs[c.obj] = v.objects[c.obj];
   }
-  S.deployed = { rows, objs };
+  // Removed devices are gone from the bus on purpose.
+  S.deployed = { rows, objs, hw: (v?.compared ? v.hardware || [] : []).filter((x) => x.how !== "removed") };
   renderDeployed();
+  watchBus(S.deployed);
+}
+// ── hardware ───────────────────────────────────────────────────────────
+// A change to an extension or a device object reconfigures hardware: the Miniserver sends the device a
+// new configuration, which the device stores. `view.hardware` lists those devices. The devices on the bus
+// come from `lox extensions` (GET /api/hardware, read-only): before Apply, a new serial that is not on the
+// bus is a warning; after Apply, the reconfigured devices show whether they are online.
+function hwInfo() { return S.hist?.hardware || { available: false }; }
+async function loadBus() {
+  const r = await fetch("/api/hardware", { headers: { "X-Vislox": "hardware" } });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error || r.statusText);
+  if (j.available === false) throw new Error(j.reason || "the bus cannot be read");
+  if (j.error) throw new Error(j.error);
+  return j.devices || [];
+}
+function hwSerial(s) { return String(s || "").replace(/[^0-9a-f]/gi, "").toUpperCase(); }
+/** A device of `view.hardware` on the bus: by serial, else (not paired yet) by name. */
+function onBus(d, bus) {
+  const s = hwSerial(d.serial);
+  return /^0*$/.test(s) ? bus.find((b) => b.name === d.title) : bus.find((b) => b.serial === s);
+}
+/** The devices the pending change reconfigures, and, for new serials, whether they are on the bus. */
+async function pendingHardware(pend) {
+  let devs;
+  try {
+    devs = (await api(`/api/view?rev=${encodeURIComponent(pend.id)}&base=${encodeURIComponent(pend.base || "")}`)).hardware || [];
+  } catch (e) { return { error: e.message, devs: [] }; }
+  const fresh = devs.filter((d) => (d.how === "added" || d.how === "replaced") && !/^0*$/.test(hwSerial(d.serial)));
+  if (!fresh.length || !hwInfo().available) return { devs, fresh: [] };
+  try {
+    const bus = await loadBus();
+    return { devs, fresh, missing: fresh.filter((d) => !onBus(d, bus)) };
+  } catch (e) { return { devs, fresh, busError: e.message }; }
+}
+function hwLine(d) {
+  const what = d.how === "replaced" ? `replaced, serial ${d.old_serial || "—"} → ${d.serial || "—"}` : d.how === "changed" ? "settings" : d.how;
+  return `  ${d.title} (${d.kind}): ${what}`;
+}
+/** Apply's confirmation: "This reconfigures 3 devices", and new serials that are not on the bus. */
+function hwApplyText(hw) {
+  if (!hw) return "";
+  if (hw.error) return `Could not check which devices this reconfigures: ${hw.error}\n\n`;
+  if (!hw.devs.length) return "";
+  const n = hw.devs.length;
+  let t = `This reconfigures ${plural(n, "device")}: ${n === 1 ? "it stores" : "they store"} the new configuration, and a device can drop offline while it does.\n` +
+    hw.devs.slice(0, 8).map(hwLine).join("\n") + (n > 8 ? `\n  and ${n - 8} more` : "") + "\n\n";
+  if (hw.missing?.length) {
+    t = `⚠ Not on the bus (lox extensions does not list ${hw.missing.length === 1 ? "it" : "them"}): ` +
+      hw.missing.map((d) => `${d.title} (${d.kind}), serial ${d.serial}`).join("; ") +
+      `. Until that device is connected, its inputs and outputs do not work.\n\n` + t;
+  } else if (hw.busError) {
+    t = `Could not check the new serials against the bus: ${hw.busError}\n\n` + t;
+  }
+  return t;
+}
+/** After Apply: ask the bus for the reconfigured devices' online state now and for a few minutes. */
+const BUS_EVERY = 15000, BUS_FOR = 180000;
+async function watchBus(d) {
+  if (!d.hw.length || !hwInfo().available) return;
+  d.bus = { at: 0, devices: null, error: "", offline: new Map(), until: Date.now() + BUS_FOR };
+  while (S.deployed === d) {
+    try {
+      const bus = await loadBus();
+      if (S.deployed !== d) return;
+      d.bus.devices = bus; d.bus.error = ""; d.bus.at = Date.now();
+      for (const x of d.hw) { const b = onBus(x, bus); if (b && !b.online && !d.bus.offline.has(x.uuid)) d.bus.offline.set(x.uuid, d.bus.at); }
+    } catch (e) { if (S.deployed !== d) return; d.bus.error = e.message; }
+    renderDeployed();
+    if (Date.now() >= d.bus.until) return;
+    await new Promise((ok) => setTimeout(ok, BUS_EVERY));
+  }
+}
+function deployedHardware(d) {
+  if (!d.hw?.length) return "";
+  const b = d.bus;
+  const rows = d.hw.slice(0, 12).map((x) => {
+    const on = b?.devices ? onBus(x, b.devices) : null;
+    const was = b?.offline.get(x.uuid);
+    const state = !b ? "" : !b.devices ? (b.error ? "" : "checking…") : !on ? "not on the bus" : on.online ? (was ? `online (was offline at ${new Date(was).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })})` : "online") : "offline";
+    const bad = b?.devices && (!on || !on.online || was);
+    return `<div class="pr hw-dev${bad ? " off" : ""}"><span class="k">${esc(x.how === "changed" ? "settings" : x.how)}</span>` +
+      `<button type="button" class="go" data-go="${esc(x.uuid)}" title="${esc(x.kind)}">${esc(x.title)}</button><span class="why">${esc(state)}</span></div>`;
+  }).join("");
+  const note = !hwInfo().available ? `The bus cannot be read: ${hwInfo().reason || "no lox"}.`
+    : b?.error ? `Cannot read the bus: ${b.error}`
+    : b && Date.now() < b.until ? "Checked every 15 s for 3 minutes (lox extensions)." : b ? "Checked with lox extensions." : "";
+  return `<div class="h">Reconfigured devices</div>${rows}` + (d.hw.length > 12 ? `<div class="note">and ${d.hw.length - 12} more</div>` : "") + (note ? `<div class="note">${esc(note)}</div>` : "");
 }
 /** The changed blocks of the deployed revision, each with a link and its first live value. */
 function renderDeployed() {
   const box = $("deploy-new"), d = S.deployed;
   const rows = (d?.rows || []).filter((c) => c.kind !== "removed");
   const check = d ? deployedAppCheck(d) : "";
-  box.classList.toggle("hidden", !rows.length && !check);
-  if (!rows.length && !check) { box.innerHTML = ""; return; }
+  const hw = d ? deployedHardware(d) : "";
+  box.classList.toggle("hidden", !rows.length && !check && !hw);
+  if (!rows.length && !check && !hw) { box.innerHTML = ""; return; }
   const shown = rows.slice(0, 12).map((c) => {
     const o = d.objs[c.obj];
     const q = o.ports.find((p) => p.conns.some((x) => x.dir === "out")) || o.ports[0];
@@ -1851,7 +1977,7 @@ function renderDeployed() {
   }).join("");
   box.innerHTML = `<div class="h">Changed by this Apply<button type="button" class="x" aria-label="Close">×</button></div>${shown}` +
     (rows.length > 12 ? `<div class="note">and ${rows.length - 12} more in Changes</div>` : "") +
-    (rows.length ? '<div class="note">Values fill in as the Miniserver sends them; the canvas marks every change.</div>' : "") + check;
+    (rows.length ? '<div class="note">Values fill in as the Miniserver sends them; the canvas marks every change.</div>' : "") + hw + check;
 }
 /** After Apply: blocks the new config shows in the app that the Miniserver's new structure file lacks, or has
  *  elsewhere, and removed blocks it still shows. */
@@ -1995,11 +2121,11 @@ async function apply() {
   if (!pend) return;
   // Ask the Miniserver once more whether its config changed after the base, and for the
   // calendar entries edited in the app.
-  const [, calNow] = await Promise.all([loadMs(true), loadCal(true)]);
+  const [, calNow, hw] = await Promise.all([loadMs(true), loadCal(true), pendingHardware(pend)]);
   const stale = staleText();
   const sched = await pendingScheduleText(pend);
   if (!window.confirm((stale ? `⚠ ${stale} Applying overwrites what changed there since.\n\n` : "") + sched +
-    calApplyWarning(calNow) +
+    calApplyWarning(calNow) + hwApplyText(hw) +
     "Deploy the pending changes to the Miniserver?\n\nlox config push uploads the config and restarts the Miniserver's program (a few seconds), " +
     "checks that it runs exactly the compiled config, then vislox commits and pushes to git.")) return;
   deployMsg("");

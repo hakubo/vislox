@@ -31,19 +31,31 @@ mkdirSync(join(dir, "pages"), { recursive: true });
 const git = (...a) => execFileSync("git", ["-C", dir, "-c", "user.name=t", "-c", "user.email=t@example.com", ...a]);
 // The deployed config shows the Divide block in the app.
 const DIV = "10000006-0000-0060-ffff504f94000001";
+// It has a Touch Tree on a Tree Extension.
+const TOUCH = "20000003-0000-0030-ffff504f94000001";
+const hardware = `\t\t<C Type="LoxLIVE" V="178" U="20000001-0000-0010-ffff504f94000001" Title="Miniserver" Serial="504F94000001">
+\t\t\t<C Type="LoxTree" V="178" U="20000002-0000-0020-ffff504f94000001" Title="Tree Extension" Serial="13000001">
+\t\t\t\t<C Type="TreeDevice" V="178" U="${TOUCH}" Title="Touch Küche" Serial="B03B368A" SubType="32771" TreeType="32771" AC="1"/>
+\t\t\t</C>
+\t\t</C>
+\t</C>
+</ControlList>`;
 // …and holds a Daytimer, whose Feiertag column the Miniserver runs from 07:00 (edited in the app).
 const TIMER = "10000030-0000-0300-ffff504f94000001";
 const base = readFileSync(fixture, "utf8").replace('<Co K="Input1" Nc="1"', '<IoData Visu="true"/><Co K="Input1" Nc="1"')
   .replace('<Co K="Q" U="10000009-0000-0093-02ff504f94000001"/>\n\t\t\t</C>', `<Co K="Q" U="10000009-0000-0093-02ff504f94000001"/>\n\t\t\t</C>
 \t\t\t<C Type="DayTimer" V="178" U="${TIMER}" Title="Uhr" Px="960" Py="2880" Px2="3648" Py2="3768" Nio="2" WF="16384" Analog="true" Modes="00000000-0000-0001-1500000000000000">
 \t\t\t\t<Co K="AQ" U="10000030-0000-0302-01ff504f94000001"/><Entry From="390" To="480" V="21"/>
-\t\t\t</C>`);
+\t\t\t</C>`)
+  .replace("\t</C>\n</ControlList>", hardware);
 writeFileSync(join(dir, "base.Loxone"), base);
-// The pending compile: a rename, the renamed block shown in the app, and the Divide block removed.
+// The pending compile: a rename, the renamed block shown in the app, the Divide block removed, and the
+// Touch replaced by another one (another serial), with its audible acknowledgement off.
 const divBlock = base.match(/\t*<C Type="Div"[\s\S]*?<\/C>\n/)[0];
 writeFileSync(join(dir, "out.Loxone"), base.replace('Title="Licht OG"', 'Title="Licht oben"')
   .replace('<Co K="I1" Nc="1" U="10000009', '<IoData Visu="true"/><Co K="I1" Nc="1" U="10000009')
-  .replace(divBlock, ""));
+  .replace(divBlock, "")
+  .replace('Serial="B03B368A" SubType="32771" TreeType="32771" AC="1"', 'Serial="B03B9999" SubType="32771" TreeType="32771" AC="0"'));
 writeFileSync(join(dir, "lox.toml"), 'base = "base.Loxone"\nmodule = "pages"\nout = "out.Loxone"\n');
 writeFileSync(join(dir, "pages", "main.lox"), "# module\n");
 execFileSync("git", ["init", "-q", "--bare", join(root, "remote.git")]);
@@ -90,6 +102,13 @@ case "$1 $2" in
       echo "2026-11-06 10:00:00.000;Program changed by user 'lox'"
       echo "2026-11-06 10:00:00.000;PRG got restart command; user: lox(127.0.0.1)"
       echo "2026-11-06 10:00:05.000;Warning 1167, Meter reading decreased, all, MeterAbsUni (Zähler,10000005-0000-0050-ffff504f94000001)"
+    fi ;;
+  "extensions -o")
+    # Before the push the old Touch is on the bus; after it, the new one, still offline.
+    if [ -f "${loxDir}/pushed" ]; then
+      echo '[{"name":"Tree Extension","online":true,"serial":"13000001","type":"Tree"},{"name":"Touch Küche","online":false,"parent":"Tree Extension","serial":"b03b9999","type":"Tree Device"}]'
+    else
+      echo '[{"name":"Tree Extension","online":true,"serial":"13000001","type":"Tree"},{"name":"Touch Küche","online":true,"parent":"Tree Extension","serial":"B03B368A","type":"Tree Device"}]'
     fi ;;
   *) echo "unexpected: $*" >&2; exit 2 ;;
 esac
@@ -168,6 +187,16 @@ try {
   await step("the compile is pending", async () => {
     await page.waitForSelector("#btn-apply:not([disabled])");
   });
+  await step("the pending Touch replacement is a hardware change", async () => {
+    await page.click('.hrev.k-pending');
+    await page.waitForSelector(".chg-filter .pill.hw");
+    assert.equal(await page.textContent(".chg-filter .pill.hw"), "hardware 2");
+    await page.click(".chg-filter .pill.hw");
+    const shown = await page.$$eval(".changes .chg .t", (n) => n.map((x) => x.textContent));
+    assert.deepEqual(shown.sort(), ["Touch Küche · AC: 1 → 0", "Touch Küche · device replaced: 0x8003 Touch Tree, serial B03B368A → B03B9999"]);
+    await page.click(".chg-filter .pill.hw");
+    await page.click('.hrev >> nth=0');
+  });
   await step("Apply shows its steps as they happen", async () => {
     // With live values on, the confirmation names the schedule the Miniserver runs differently.
     await page.click("#sw-live .track");
@@ -186,6 +215,10 @@ try {
     await page.waitForFunction(() => /^Applied/.test(document.querySelector("#deploy-msg")?.textContent || ""), null, { timeout: 20000 });
     assert.equal(dialogs, 1, "one confirmation");
     assert.match(asked[0], /The Miniserver runs other switching times than this config for:\n  Uhr: Feiertag\n/, asked[0]);
+    // The confirmation says which devices this reconfigures, and that the new serial is not on the bus.
+    assert.match(asked[0], /⚠ Not on the bus \(lox extensions does not list it\): Touch Küche \(Touch Tree\), serial B03B9999/);
+    assert.match(asked[0], /This reconfigures 1 device: it stores the new configuration/);
+    assert.match(asked[0], /Touch Küche \(Touch Tree\): replaced, serial B03B368A → B03B9999/);
     assert.equal(applies, 1, "one /api/apply request");
     for (const l of ["Download and drift check", "Upload", "Program restarting", "Back online", "New config loaded", "Verified", "Committed", "Pushed to git"]) {
       assert.equal(await state(l), "ok", l);
@@ -199,6 +232,10 @@ try {
     assert.match(await page.textContent("#deploy-new"), /Licht oben/);
     await page.waitForFunction(() => document.querySelector("#canvas").classList.contains("live"));
     if (process.env.SHOT) await page.screenshot({ path: process.env.SHOT + "-done.png" });
+  });
+  await step("after Apply, the reconfigured Touch shows that it is offline", async () => {
+    await page.waitForSelector("#deploy-new .hw-dev.off");
+    assert.match(await page.textContent("#deploy-new .hw-dev"), /replacedTouch Küche\s*offline/);
   });
   await step("after Apply, the app is checked against the new config, also for a removed block", async () => {
     // Live values come from a file here, so the new structure file is read only when asked.

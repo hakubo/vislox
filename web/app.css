@@ -679,3 +679,13 @@ button.chip { cursor: pointer; } button.chip:hover { border-color: var(--brand);
 .md-pchip.off.none { cursor: pointer; }
 .md-pchip.stale { border-style: dashed; }
 .md-pstale { color: var(--faint); font-size: 11px; }
+/* Hardware: changes that reconfigure a device (an extension, a Tree or Air device). */
+.chg-filter button.pill.hw { border-color: var(--changed-dot); }
+.changes .chg .hw-tag, .chip.hw { flex: none; align-self: flex-start; font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; color: var(--changed); }
+.changes .chg .hw-tag { padding: 1px 4px; border: 1px solid var(--changed-dot); border-radius: 3px; }
+.chip.hw { background: var(--changed-bg); border-color: var(--changed-dot); }
+#props .k.hinted { text-decoration: underline dotted; text-underline-offset: 2px; cursor: help; }
+#props .hw-how { color: var(--changed); }
+#props .hw-note { color: var(--muted); font-size: 12px; }
+.deploy-new .hw-dev .why { flex: none; color: var(--muted); font-size: 11px; }
+.deploy-new .hw-dev.off .why { color: var(--removed); font-weight: 600; }
