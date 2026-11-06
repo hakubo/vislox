@@ -58,8 +58,8 @@ sends to the Miniserver see [miniserver.md](miniserver.md).
   - *Miniserver backups*: the Miniserver keeps a backup of each config it loads (`/prog/sps_<ver>_<stamp>.zip`;
     one Miniserver kept its last 20). **Read** lists them and downloads each new one once (FTP, read-only). A backup with the
     bytes of the Pull next to it shows as that Pull (a *Miniserver backup* pill); the others are listed under the Pulls they
-    were saved between (*Between Backup v273 and Backup v274*, *Since the last Pull*), each compared with the
-    save before it. So every save from Loxone Config can be reviewed on its own, even when nobody pulled in
+    were saved between (*Between Backup v273 and Backup v274*, *Since the last Pull*). Click one to show it, and
+    *Compare with the revision before* (Changes) compares it with the save before it. So every save from Loxone Config can be reviewed on its own, even when nobody pulled in
     between, and shift-click compares any two.
 - **Change review**: added (green), changed (amber), removed (red, dashed ghost) and moved (blue, ghost at
   the old place) blocks. Wires and parameters are marked too: changed values show old → new in the
