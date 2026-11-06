@@ -26,7 +26,6 @@
 //! the browser's address nor the Miniserver user.
 
 use axum::http::StatusCode;
-use loxone_client::Connection;
 use loxone_config::LoxoneDoc;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -52,15 +51,15 @@ pub trait Session {
     fn get(&self, path: &str, mask: Option<(&str, &str)>) -> Result<(u16, String), String>;
 }
 
-/// The Miniserver over HTTP, with the connection lox uses.
-pub struct Http(pub Connection);
+/// The Miniserver over HTTP, the route's way (`route.rs`).
+pub struct Http(pub std::sync::Arc<crate::route::Handle>);
 
 struct HttpSession(loxone_client::LoxClient);
 
 impl Port for Http {
     /// Builds a blocking client: call it off the async runtime.
     fn open(&self) -> Result<Box<dyn Session>, String> {
-        let c = crate::tls::lox_client(&self.0)?;
+        let c = crate::tls::lox_client(&self.0.conn())?;
         Ok(Box::new(HttpSession(c)))
     }
 }

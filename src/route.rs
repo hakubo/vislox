@@ -1,4 +1,4 @@
-//! How vislox reaches the Miniserver: the route, chosen once at start.
+//! How vislox reaches the Miniserver: the route.
 //!
 //! - **CloudDNS** (verified, local): a Gen 2 Miniserver with the CloudDNS
 //!   certificate (`*.{serial}.dyndns.loxonecloud.com`, from Let's Encrypt) is
@@ -19,26 +19,46 @@
 //!   FTP, so Pull, Apply and Sync are refused on this route
 //!   (`miniserver.rs`).
 //!
+//! The route is chosen in the background after start ([`Handle::spawn`]);
+//! until then, and whenever choosing fails, vislox uses lox's host. It is
+//! checked again every minute while lox's address does not answer (a
+//! Miniserver that is still booting, a laptop back home), and when a
+//! connection fails ([`Handle::nudge`]). A working local route only gives way
+//! to Remote Connect when lox's address stays silent for a minute, so a
+//! program restart does not move vislox to the relay; and once the CloudDNS
+//! name was verified, vislox never falls back to an unchecked connection to
+//! the same address.
+//!
 //! The route is used by vislox's own connections: live values, the status
-//! chip and preflight, the structure file, Apply's restart probe and
-//! operating inputs. lox's commands (Pull, Apply, Sync, `lox log`) still use
-//! lox's own host and certificate setting.
+//! chip and preflight, the structure file, the app's calendar entries,
+//! Apply's restart probe and operating inputs. lox's commands (Pull, Apply,
+//! Sync, `lox log`) and the Debug-Monitor's Start and Stop use lox's host.
 
 use crate::discover::norm_serial;
 use loxone_client::Connection;
 use serde::Serialize;
 use serde_json::Value;
 use std::net::Ipv4Addr;
-use std::time::Duration;
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
+use tokio::sync::{Notify, watch};
 
 /// A TCP connect to lox's address.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 /// The DNS lookup of the CloudDNS name.
 const DNS_TIMEOUT: Duration = Duration::from_secs(3);
-/// The verified `jdev/cfg/apiKey` request, and the Connect Service's answer.
+/// The Connect Service's answer.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(6);
-/// Loxone's Connect Service (`VISLOX_REMOTE_CONNECT` replaces it in tests).
-const CONNECT_SERVICE: &str = "https://connect.loxonecloud.com";
+/// Choosing a route may take this long; then lox's host is used.
+const CHOOSE_TIMEOUT: Duration = Duration::from_secs(30);
+/// While lox's address does not answer: how often it is tried again.
+const RECHECK: Duration = Duration::from_secs(60);
+/// A failed connection asks for a new choice at most this often.
+const NUDGE_GAP: Duration = Duration::from_secs(30);
+/// How long a working local route may be silent before Remote Connect.
+const LOCAL_GRACE: Duration = Duration::from_secs(60);
+/// Loxone's Connect Service.
+pub const CONNECT_SERVICE: &str = "https://connect.loxonecloud.com";
 
 /// Which route `--route` allows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
@@ -73,6 +93,12 @@ pub struct Route {
     pub verified: bool,
     /// Why this route, and why the certificate is not checked when it is not.
     pub note: Option<String>,
+    /// lox's address did not answer when the route was chosen: it is tried
+    /// again, and the LAN is searched for the Miniserver.
+    pub local_down: bool,
+    /// The CloudDNS name was verified before and no longer is: vislox stays
+    /// on it rather than fall back to an unchecked connection.
+    pub failing: Option<String>,
 }
 
 impl Route {
@@ -84,12 +110,20 @@ impl Route {
             lox_host: conn.host.clone(),
             verified: conn.verify_ssl,
             note,
+            local_down: false,
+            failing: None,
         }
     }
 
-    /// The warning the chip shows when the connection is encrypted but the
-    /// Miniserver is not verified.
+    /// The warning the chip shows: the Miniserver is not verified, or its
+    /// verified name stopped checking out.
     pub fn warning(&self) -> Option<String> {
+        if let Some(f) = &self.failing {
+            return Some(format!(
+                "vislox reached the Miniserver under its verified CloudDNS name before, but now {f} \
+                 It does not fall back to an unchecked connection: restart vislox to accept one."
+            ));
+        }
         (self.url.starts_with("https://") && !self.verified).then(|| {
             format!(
                 "The connection is encrypted, but vislox does not check the Miniserver's \
@@ -156,24 +190,15 @@ async fn answers(addr: &str, port: u16) -> bool {
     )
 }
 
-/// A request with the certificate checked: the Miniserver's status, which
-/// needs no login.
-async fn verified_api_key(conn: &Connection) -> Result<(), String> {
-    let client = crate::tls::client(conn, HTTP_TIMEOUT)?;
-    let r = client
-        .get(conn.url("jdev/cfg/apiKey"))
-        .send()
-        .await
-        .map_err(|e| crate::session::chain(&e))?;
-    if r.status().is_success() {
-        Ok(())
-    } else {
-        Err(format!("it answered HTTP {}", r.status().as_u16()))
-    }
+/// Whether lox's address takes a TCP connection.
+async fn lox_answers(lox: &Connection) -> bool {
+    let (addr, port, _) = parts(&lox.host);
+    !no_host(&lox.host) && answers(&addr, port).await
 }
 
 /// The CloudDNS name for lox's `https://` LAN address, checked: it
-/// resolves to that address and the certificate is valid for it.
+/// resolves to that address, the certificate is valid for it, and the
+/// Miniserver there reports `serial`.
 async fn clouddns(
     conn: &Connection,
     ip: Ipv4Addr,
@@ -181,6 +206,8 @@ async fn clouddns(
     serial: &str,
 ) -> Result<Connection, String> {
     let name = clouddns_name(ip, serial);
+    let rebinding = "A router with DNS rebinding protection blocks names that point to a local \
+                     address: allow dyndns.loxonecloud.com";
     let resolved =
         tokio::time::timeout(DNS_TIMEOUT, tokio::net::lookup_host((name.as_str(), port)))
             .await
@@ -190,20 +217,13 @@ async fn clouddns(
                     DNS_TIMEOUT.as_secs()
                 )
             })?
-            .map_err(|e| {
-                format!(
-                    "the CloudDNS name {name} does not resolve ({e}). A router with DNS rebinding \
-                 protection blocks names that point to a local address: allow \
-                 dyndns.loxonecloud.com"
-                )
-            })?;
+            .map_err(|e| format!("the CloudDNS name {name} does not resolve ({e}). {rebinding}"))?;
     if !resolved
         .into_iter()
         .any(|a| a.ip() == std::net::IpAddr::V4(ip))
     {
         return Err(format!(
-            "the CloudDNS name {name} does not resolve to {ip}. A router with DNS rebinding \
-             protection blocks names that point to a local address: allow dyndns.loxonecloud.com"
+            "the CloudDNS name {name} does not resolve to {ip}. {rebinding}"
         ));
     }
     let port_part = if port == 443 {
@@ -216,7 +236,7 @@ async fn clouddns(
         verify_ssl: true,
         ..conn.clone()
     };
-    verified_api_key(&checked).await.map_err(|e| {
+    let key = crate::miniserver::api_key(&checked).await.map_err(|e| {
         let hint = if e.contains("not valid for name") {
             format!(
                 "The certificate is for another name: the Miniserver at {ip} may not be {}",
@@ -229,7 +249,13 @@ async fn clouddns(
         };
         format!("its certificate could not be verified for {name} ({e}). {hint}")
     })?;
-    Ok(checked)
+    match key.serial {
+        Some(s) if s != norm_serial(serial) => Err(format!(
+            "{name} reports serial {s}, not {}",
+            norm_serial(serial)
+        )),
+        _ => Ok(checked),
+    }
 }
 
 /// What the Connect Service's status code means.
@@ -247,7 +273,7 @@ pub fn connect_service_says(status: u16, serial: &str) -> String {
              *.remcov3.loxonecloud.com, 443 to registry.loxonecloud.com and 8443 to \
              eu.ccbroker.loxonecloud.com)"
         }
-        429 => "too many requests (it allows about 10 at a time); try again in a minute",
+        429 => "too many requests; try again in a minute",
         // The older services' codes, which the same address may still send.
         403 => "the Miniserver is not registered with Loxone, or CloudDNS is off",
         405 => "the Miniserver does not report to CloudDNS",
@@ -280,11 +306,12 @@ fn relay_url(body: &str) -> Result<String, String> {
     Ok(url.to_string())
 }
 
-/// Ask the Connect Service where the Miniserver `serial` is reachable.
-async fn get_ip(serial: &str) -> Result<String, String> {
-    let base = std::env::var("VISLOX_REMOTE_CONNECT").unwrap_or_else(|_| CONNECT_SERVICE.into());
-    let mut probe = Connection::new(base.trim_end_matches('/'), "", "");
-    probe.verify_ssl = probe.host.starts_with("https://");
+/// Ask the Connect Service (`service`) where the Miniserver `serial` is
+/// reachable. The service's certificate is checked (an `http://` stand-in
+/// in tests has none).
+async fn get_ip(service: &str, serial: &str) -> Result<String, String> {
+    let mut probe = Connection::new(service.trim_end_matches('/'), "", "");
+    probe.verify_ssl = true;
     let client = crate::tls::client(&probe, HTTP_TIMEOUT)?;
     let r = client
         .get(probe.url(&format!("getip?snr={serial}")))
@@ -307,14 +334,18 @@ async fn get_ip(serial: &str) -> Result<String, String> {
 }
 
 /// The Remote Connect route: the relay URL, checked.
-async fn remote(conn: &Connection, serial: &str) -> Result<(Connection, Route), String> {
-    let url = get_ip(serial).await?;
+async fn remote(
+    conn: &Connection,
+    serial: &str,
+    service: &str,
+) -> Result<(Connection, Route), String> {
+    let url = get_ip(service, serial).await?;
     let relay = Connection {
         host: url.clone(),
         verify_ssl: true,
         ..conn.clone()
     };
-    if let Err(e) = verified_api_key(&relay).await {
+    if let Err(e) = crate::miniserver::api_key(&relay).await {
         let (addr, port, _) = parts(&url);
         return Err(if answers(&addr, port).await {
             format!("Remote Connect for {serial}: the relay {url} could not be verified ({e})")
@@ -333,18 +364,21 @@ async fn remote(conn: &Connection, serial: &str) -> Result<(Connection, Route), 
             lox_host: conn.host.clone(),
             verified: true,
             note: None,
+            local_down: false,
+            failing: None,
         },
     ))
 }
 
 /// The route to take, and the connection vislox's own clients use for it.
 /// `serial`: the Miniserver the config belongs to, else the one lox names.
-/// Fails only when there is no route at all (Remote Connect failed, and
-/// there is no host to fall back to).
+/// `service`: the Connect Service. Fails only when there is no route at all
+/// (Remote Connect failed, and there is no host to fall back to).
 pub async fn resolve(
     conn: &Connection,
     serial: Option<&str>,
     mode: Mode,
+    service: &str,
 ) -> Result<(Connection, Route), String> {
     let serial = serial.map(norm_serial).filter(|s| !s.is_empty());
     let needs_serial = || {
@@ -356,7 +390,7 @@ pub async fn resolve(
             return Err("lox's configuration names no host (and --route local)".into());
         }
         let s = serial.as_deref().ok_or_else(needs_serial)?;
-        return remote(conn, s).await;
+        return remote(conn, s, service).await;
     }
     let (addr, port, https) = parts(&conn.host);
     if loopback(&addr) {
@@ -370,24 +404,29 @@ pub async fn resolve(
         });
         return Ok((conn.clone(), Route::local(conn, note)));
     };
-    let here = answers(&addr, port).await;
-    if !here && mode == Mode::Auto {
-        return match remote(conn, &serial).await {
+    if !answers(&addr, port).await {
+        let down = |note: String| {
+            let mut r = Route::local(conn, Some(note));
+            r.local_down = true;
+            (conn.clone(), r)
+        };
+        if mode == Mode::Local {
+            return Ok(down(format!(
+                "lox's address {} does not answer.",
+                conn.host
+            )));
+        }
+        return Ok(match remote(conn, &serial, service).await {
             Ok((c, mut r)) => {
                 r.note = Some(format!(
                     "lox's address {} does not answer, so vislox connects through Remote Connect",
                     conn.host
                 ));
-                Ok((c, r))
+                r.local_down = true;
+                (c, r)
             }
-            Err(e) => Ok((
-                conn.clone(),
-                Route::local(
-                    conn,
-                    Some(format!("lox's address does not answer, and {e}.")),
-                ),
-            )),
-        };
+            Err(e) => down(format!("lox's address does not answer, and {e}.")),
+        });
     }
     if conn.verify_ssl || !https {
         // As lox was told: verified already, or no TLS at all.
@@ -400,10 +439,6 @@ pub async fn resolve(
         );
         return Ok((conn.clone(), Route::local(conn, Some(note))));
     };
-    if !here {
-        let note = format!("lox's address {} does not answer.", conn.host);
-        return Ok((conn.clone(), Route::local(conn, Some(note))));
-    }
     match clouddns(conn, ip, port, &serial).await {
         Ok(c) => {
             let route = Route {
@@ -412,10 +447,248 @@ pub async fn resolve(
                 lox_host: conn.host.clone(),
                 verified: true,
                 note: None,
+                local_down: false,
+                failing: None,
             };
             Ok((c, route))
         }
         Err(e) => Ok((conn.clone(), Route::local(conn, Some(format!("{e}."))))),
+    }
+}
+
+/// What a new choice does to the current route.
+#[derive(Debug, PartialEq)]
+enum Take {
+    /// Use the new route.
+    New,
+    /// Keep the current one (the new choice is no better, or the same).
+    Keep,
+    /// Keep the current, verified name, and say why it fails.
+    Failing(String),
+}
+
+/// Whether to take `new` over `cur`. `first`: nothing was chosen yet.
+/// `silent_for`: how long lox's address has not answered.
+fn take(cur: &Route, new: &Route, first: bool, silent_for: Option<Duration>) -> Take {
+    if cur == new {
+        return Take::Keep;
+    }
+    if first {
+        return Take::New;
+    }
+    // A verified name that stopped checking out (another device at the
+    // address, a man in the middle) is not traded for an unchecked
+    // connection to the same address.
+    if cur.kind == Kind::Clouddns && new.kind == Kind::Local && !new.verified {
+        let why = new
+            .note
+            .clone()
+            .unwrap_or_else(|| "it does not check out.".into());
+        return Take::Failing(why);
+    }
+    // A local route that worked moves to the relay only when lox's address
+    // stays silent: a program restart is not a move.
+    if cur.kind != Kind::Remote
+        && !cur.local_down
+        && new.local_down
+        && silent_for.is_none_or(|d| d < LOCAL_GRACE)
+    {
+        return Take::Keep;
+    }
+    Take::New
+}
+
+/// The current route, shared by everything that talks to the Miniserver,
+/// and chosen again when it should be.
+pub struct Handle {
+    lox: Connection,
+    serial: Option<String>,
+    mode: Mode,
+    service: String,
+    /// `false`: lox's host, never another (`--live-from`, tests).
+    chooses: bool,
+    /// The connection, its route, and whether a route was chosen yet.
+    cur: RwLock<(Connection, Route, bool)>,
+    changed: watch::Sender<u64>,
+    nudged: Notify,
+    last_choice: Mutex<Option<Instant>>,
+    silent_since: Mutex<Option<Instant>>,
+}
+
+impl Handle {
+    /// lox's host, as it is.
+    pub fn fixed(lox: Connection) -> Arc<Handle> {
+        Handle::with(lox, None, Mode::Local, String::new(), false)
+    }
+
+    /// lox's host until [`Handle::spawn`] has chosen a route.
+    pub fn new(lox: Connection, serial: Option<String>, mode: Mode, service: &str) -> Arc<Handle> {
+        Handle::with(lox, serial, mode, service.to_string(), true)
+    }
+
+    fn with(
+        lox: Connection,
+        serial: Option<String>,
+        mode: Mode,
+        service: String,
+        chooses: bool,
+    ) -> Arc<Handle> {
+        let note = chooses.then(|| "vislox is still choosing its route.".to_string());
+        let route = Route::local(&lox, note);
+        Arc::new(Handle {
+            cur: RwLock::new((lox.clone(), route, !chooses)),
+            lox,
+            serial,
+            mode,
+            service,
+            chooses,
+            changed: watch::channel(0).0,
+            nudged: Notify::new(),
+            last_choice: Mutex::new(None),
+            silent_since: Mutex::new(None),
+        })
+    }
+
+    /// A handle already on `route` (tests).
+    #[cfg(test)]
+    pub fn on(lox: Connection, conn: Connection, route: Route) -> Arc<Handle> {
+        let h = Handle::with(lox, None, Mode::Auto, String::new(), true);
+        h.put(conn, route);
+        h
+    }
+
+    /// The connection vislox's own clients use now.
+    pub fn conn(&self) -> Connection {
+        self.cur.read().unwrap().0.clone()
+    }
+
+    pub fn route(&self) -> Route {
+        self.cur.read().unwrap().1.clone()
+    }
+
+    /// lox's own connection (Pull, Apply, Sync use its host).
+    pub fn lox(&self) -> &Connection {
+        &self.lox
+    }
+
+    /// Bumped whenever the route changes.
+    pub fn changes(&self) -> watch::Receiver<u64> {
+        self.changed.subscribe()
+    }
+
+    /// A connection on the route failed: choose again soon.
+    pub fn nudge(&self) {
+        self.nudged.notify_one();
+    }
+
+    /// Choose the route now. A failure or a timeout leaves lox's host.
+    async fn choose(&self) {
+        *self.last_choice.lock().unwrap() = Some(Instant::now());
+        let chosen = tokio::time::timeout(
+            CHOOSE_TIMEOUT,
+            resolve(&self.lox, self.serial.as_deref(), self.mode, &self.service),
+        )
+        .await;
+        let (conn, route) = match chosen {
+            Ok(Ok(c)) => c,
+            Ok(Err(e)) => (
+                self.lox.clone(),
+                Route::local(&self.lox, Some(format!("{e}."))),
+            ),
+            Err(_) => (
+                self.lox.clone(),
+                Route::local(
+                    &self.lox,
+                    Some(format!(
+                        "choosing the route took more than {} s, so vislox uses lox's host.",
+                        CHOOSE_TIMEOUT.as_secs()
+                    )),
+                ),
+            ),
+        };
+        self.put(conn, route);
+    }
+
+    fn put(&self, conn: Connection, route: Route) {
+        let silent_for = {
+            let mut s = self.silent_since.lock().unwrap();
+            if route.local_down {
+                Some(s.get_or_insert_with(Instant::now).elapsed())
+            } else {
+                *s = None;
+                None
+            }
+        };
+        let mut cur = self.cur.write().unwrap();
+        let first = !cur.2;
+        let mut old = cur.1.clone();
+        old.failing = None;
+        match take(&old, &route, first, silent_for) {
+            Take::Keep => {
+                cur.2 = true;
+                if cur.1.failing.take().is_some() {
+                    self.changed.send_modify(|n| *n += 1);
+                }
+                return;
+            }
+            Take::Failing(why) => {
+                if cur.1.failing.as_deref() != Some(why.as_str()) {
+                    eprintln!("vislox: the CloudDNS name no longer checks out: {why}");
+                    cur.1.failing = Some(why);
+                    self.changed.send_modify(|n| *n += 1);
+                }
+                return;
+            }
+            Take::New => {}
+        }
+        match route.kind {
+            Kind::Clouddns => eprintln!(
+                "vislox: connecting under the CloudDNS name {} (certificate checked)",
+                route.url
+            ),
+            Kind::Remote => eprintln!("vislox: connecting through Remote Connect: {}", route.url),
+            Kind::Local => eprintln!("vislox: connecting to lox's host {}", route.url),
+        }
+        if let Some(w) = route.warning() {
+            eprintln!("vislox: {w}");
+        }
+        *cur = (conn, route, true);
+        drop(cur);
+        self.changed.send_modify(|n| *n += 1);
+    }
+
+    /// Choose the route in the background, then again every minute while
+    /// lox's address does not answer, and after a failed connection.
+    pub fn spawn(self: &Arc<Self>) {
+        if !self.chooses {
+            return;
+        }
+        let h = self.clone();
+        tokio::spawn(async move {
+            h.choose().await;
+            loop {
+                let nudged = tokio::select! {
+                    _ = tokio::time::sleep(RECHECK) => false,
+                    _ = h.nudged.notified() => true,
+                };
+                let recent = h
+                    .last_choice
+                    .lock()
+                    .unwrap()
+                    .is_some_and(|t| t.elapsed() < NUDGE_GAP);
+                if nudged && recent {
+                    continue;
+                }
+                let r = h.route();
+                let worth = nudged || r.local_down || r.failing.is_some();
+                // Away from home the relay works: only lox's address coming
+                // back changes the choice, so the cloud is not asked.
+                if !worth || (r.kind == Kind::Remote && !nudged && !lox_answers(&h.lox).await) {
+                    continue;
+                }
+                h.choose().await;
+            }
+        });
     }
 }
 
@@ -479,12 +752,150 @@ mod tests {
         assert!(Route::local(&plain, None).warning().is_none());
     }
 
+    fn lan() -> Connection {
+        Connection::new("https://192.168.1.120", "u", "p")
+    }
+
+    fn clouddns_route() -> Route {
+        Route {
+            kind: Kind::Clouddns,
+            url: "https://192-168-1-120.504f94a0e454.dyndns.loxonecloud.com".into(),
+            lox_host: lan().host,
+            verified: true,
+            note: None,
+            local_down: false,
+            failing: None,
+        }
+    }
+
+    fn remote_route(local_down: bool) -> Route {
+        Route {
+            kind: Kind::Remote,
+            url: "https://relay.504f94a0e454.dyndns.loxonecloud.com:29235".into(),
+            lox_host: lan().host,
+            verified: true,
+            note: None,
+            local_down,
+            failing: None,
+        }
+    }
+
+    fn down() -> Route {
+        let mut r = Route::local(&lan(), Some("lox's address does not answer.".into()));
+        r.local_down = true;
+        r
+    }
+
+    #[test]
+    fn a_verified_name_never_falls_back_to_an_unchecked_connection() {
+        let bad = Route::local(
+            &lan(),
+            Some("its certificate could not be verified.".into()),
+        );
+        assert!(matches!(
+            take(&clouddns_route(), &bad, false, None),
+            Take::Failing(w) if w.contains("could not be verified")
+        ));
+        // At start, the fallback is taken (with the chip's warning).
+        assert_eq!(
+            take(&Route::local(&lan(), None), &bad, true, None),
+            Take::New
+        );
+    }
+
+    #[test]
+    fn a_working_local_route_waits_before_it_moves_to_the_relay() {
+        let away = remote_route(true);
+        assert_eq!(take(&clouddns_route(), &away, false, None), Take::Keep);
+        assert_eq!(
+            take(
+                &clouddns_route(),
+                &away,
+                false,
+                Some(Duration::from_secs(5))
+            ),
+            Take::Keep
+        );
+        assert_eq!(
+            take(&clouddns_route(), &away, false, Some(LOCAL_GRACE)),
+            Take::New
+        );
+        // At start (a Miniserver that does not answer yet), the relay at once.
+        assert_eq!(
+            take(&Route::local(&lan(), None), &away, true, None),
+            Take::New
+        );
+    }
+
+    #[test]
+    fn back_home_the_relay_gives_way_to_the_local_route() {
+        assert_eq!(
+            take(&remote_route(true), &clouddns_route(), false, None),
+            Take::New
+        );
+        assert_eq!(take(&down(), &clouddns_route(), false, None), Take::New);
+    }
+
+    /// The handle switches and tells its users; a verified name that fails
+    /// later stays, with the warning.
+    #[test]
+    fn the_handle_switches_back_and_tells_its_users() {
+        let h = Handle::new(lan(), Some("504F94A0E454".into()), Mode::Auto, "");
+        let mut changes = h.changes();
+        let relay = Connection {
+            host: remote_route(true).url,
+            verify_ssl: true,
+            ..lan()
+        };
+        h.put(relay, remote_route(true));
+        assert_eq!(h.route().kind, Kind::Remote);
+        assert!(changes.has_changed().unwrap());
+        changes.mark_unchanged();
+        let named = Connection {
+            host: clouddns_route().url,
+            verify_ssl: true,
+            ..lan()
+        };
+        h.put(named.clone(), clouddns_route());
+        assert_eq!(h.route().kind, Kind::Clouddns);
+        assert_eq!(h.conn().host, named.host);
+        assert!(changes.has_changed().unwrap());
+        h.put(
+            lan(),
+            Route::local(
+                &lan(),
+                Some("its certificate could not be verified.".into()),
+            ),
+        );
+        assert_eq!(h.conn().host, named.host, "no unchecked fallback");
+        assert!(h.route().warning().unwrap().contains("does not fall back"));
+    }
+
+    #[tokio::test]
+    async fn a_failed_choice_keeps_lox_s_host() {
+        // No host and no serial: no route at all. Live values, the chip and
+        // the rest still get lox's connection, with the reason.
+        let h = Handle::new(
+            Connection::new("", "u", "p"),
+            None,
+            Mode::Auto,
+            "http://127.0.0.1:9",
+        );
+        tokio::time::timeout(Duration::from_secs(10), h.choose())
+            .await
+            .expect("hard timeout");
+        let r = h.route();
+        assert_eq!(r.kind, Kind::Local);
+        assert_eq!(h.conn().host, "");
+        assert!(r.note.unwrap().contains("lox setup set --serial"));
+    }
+
     #[tokio::test]
     async fn a_test_host_is_taken_as_it_is() {
         let c = Connection::new("http://127.0.0.1:1", "u", "p");
         let (conn, r) = tokio::time::timeout(
             Duration::from_secs(10),
-            resolve(&c, Some("504F94000001"), Mode::Auto),
+            resolve(&c, Some("504F94000001"), Mode::Auto, "http://127.0.0.1:9"),
         )
         .await
         .expect("hard timeout")
@@ -495,19 +906,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn without_a_serial_there_is_no_remote_connect() {
-        let c = Connection::new("", "u", "p");
-        let e = tokio::time::timeout(Duration::from_secs(10), resolve(&c, None, Mode::Auto))
-            .await
-            .expect("hard timeout")
-            .unwrap_err();
-        assert!(e.contains("lox setup set --serial"), "{e}");
-    }
-
-    /// A stand-in Connect Service: the code it answers is explained.
-    #[tokio::test]
-    async fn a_relay_that_is_not_connected_is_explained() {
+    /// A stand-in Connect Service that answers `status`.
+    async fn service(status: &'static str) -> String {
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = l.local_addr().unwrap().port();
         tokio::spawn(async move {
@@ -516,21 +916,45 @@ mod tests {
                 let mut buf = [0u8; 1024];
                 let _ = s.read(&mut buf).await;
                 let _ = s
-                    .write_all(b"HTTP/1.1 504 Gateway Timeout\r\nContent-Length: 2\r\n\r\n{}")
+                    .write_all(
+                        format!("HTTP/1.1 {status}\r\nContent-Length: 2\r\n\r\n{{}}").as_bytes(),
+                    )
                     .await;
             }
         });
-        // SAFETY: only this test reads the variable.
-        unsafe { std::env::set_var("VISLOX_REMOTE_CONNECT", format!("http://127.0.0.1:{port}")) };
+        format!("http://127.0.0.1:{port}")
+    }
+
+    #[tokio::test]
+    async fn a_relay_that_is_not_connected_is_explained() {
+        let svc = service("504 Gateway Timeout").await;
         let c = Connection::new("", "u", "p");
         let e = tokio::time::timeout(
             Duration::from_secs(10),
-            resolve(&c, Some("504F94A0E454"), Mode::Auto),
+            resolve(&c, Some("504F94A0E454"), Mode::Auto, &svc),
         )
         .await
         .expect("hard timeout")
         .unwrap_err();
         assert!(e.contains("not connected to a relay"), "{e}");
+    }
+
+    /// A LAN address that does not answer: the route says so, and is
+    /// chosen again later.
+    #[tokio::test]
+    async fn an_address_that_does_not_answer_is_tried_again() {
+        let svc = service("404 Not Found").await;
+        let c = Connection::new("https://10.255.255.1", "u", "p");
+        let (_, r) = tokio::time::timeout(
+            Duration::from_secs(15),
+            resolve(&c, Some("504F94A0E454"), Mode::Auto, &svc),
+        )
+        .await
+        .expect("hard timeout")
+        .unwrap();
+        assert_eq!(r.kind, Kind::Local);
+        assert!(r.local_down);
+        assert!(r.note.unwrap().contains("Remote Connect is off"));
     }
 
     /// Against a real Miniserver (no login: only `jdev/cfg/apiKey` and the
@@ -548,9 +972,12 @@ mod tests {
             ("https://192.168.254.254", Mode::Auto),
         ] {
             let c = Connection::new(host, "", "");
-            let r = tokio::time::timeout(Duration::from_secs(40), resolve(&c, Some(&serial), mode))
-                .await
-                .expect("hard timeout");
+            let r = tokio::time::timeout(
+                Duration::from_secs(40),
+                resolve(&c, Some(&serial), mode, CONNECT_SERVICE),
+            )
+            .await
+            .expect("hard timeout");
             println!("{host:?} {mode:?}: {:?}", r.map(|(_, r)| r));
         }
     }

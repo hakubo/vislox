@@ -36,7 +36,7 @@
 use crate::configdate::BaseDate;
 use crate::discover;
 use crate::restart::Http;
-use crate::route::{Kind, Route};
+use crate::route::{Handle, Kind, Route};
 use loxone_client::Connection;
 use loxone_client::token::TokenStore;
 use serde_json::{Value, json};
@@ -101,8 +101,6 @@ pub struct Miniserver {
     /// The last config dates: when they were asked for, and what came back.
     dates: Mutex<Option<(Instant, Dates)>>,
     dating: tokio::sync::Mutex<()>,
-    /// How vislox reaches it (`route.rs`); `None`: lox's host as it is.
-    route: Option<Route>,
 }
 
 /// When the config last changed, on the Miniserver and in the base's download.
@@ -127,10 +125,8 @@ pub struct Expected {
 }
 
 struct Target {
-    conn: Connection,
-    /// The address to connect to: no scheme, port or IPv6 brackets.
-    addr: String,
-    http_port: u16,
+    /// How vislox reaches the Miniserver, and lox's own connection.
+    route: Arc<Handle>,
     ftp_port: u16,
     /// The config files whose Loxone Config version is compared with the
     /// firmware: the deployed one, and the pending one.
@@ -144,8 +140,8 @@ struct Target {
 
 /// What `jdev/cfg/apiKey` tells.
 #[derive(Debug, Default, PartialEq)]
-struct ApiKey {
-    serial: Option<String>,
+pub(crate) struct ApiKey {
+    pub(crate) serial: Option<String>,
     version: Option<String>,
     /// 0: no TLS, 1: TLS, 2: the certificate expired.
     https_status: Option<i64>,
@@ -154,26 +150,23 @@ struct ApiKey {
 }
 
 impl Miniserver {
-    /// `target`: the connection lox uses, or why there is none.
+    /// `target`: the route to the Miniserver lox uses, or why there is none.
     pub fn new(
-        target: Result<&Connection, String>,
+        target: Result<Arc<Handle>, String>,
         current: PathBuf,
         proposed: Option<PathBuf>,
         backups: Option<PathBuf>,
     ) -> Miniserver {
-        let target = target.map(|conn| {
-            let (addr, http_port) = split_host(&conn.host);
+        let target = target.map(|route| {
             Target {
-                conn: conn.clone(),
-                addr,
-                http_port,
                 // lox always uses 21; the override is for tests.
                 ftp_port: std::env::var("VISLOX_FTP_PORT")
                     .ok()
                     .and_then(|p| p.parse().ok())
                     .unwrap_or(21),
                 base_date: Arc::new(BaseDate::new(current.clone(), backups)),
-                http: Arc::new(Http::new(conn.clone())),
+                http: Arc::new(Http::routed(route.clone())),
+                route,
                 current,
                 proposed,
             }
@@ -191,15 +184,7 @@ impl Miniserver {
             generation: AtomicU64::new(0),
             dates: Mutex::new(None),
             dating: tokio::sync::Mutex::new(()),
-            route: None,
         }
-    }
-
-    /// The route the connection takes: shown in the chip, and Remote
-    /// Connect refuses what needs FTP.
-    pub fn routed(mut self, route: Option<Route>) -> Miniserver {
-        self.route = route;
-        self
     }
 
     /// Check that the Miniserver at the address is the one with this serial.
@@ -235,15 +220,7 @@ impl Miniserver {
         }
         let started = Instant::now();
         let generation = self.generation.load(Ordering::SeqCst);
-        let v = Arc::new(
-            probe(
-                t,
-                self.expected.as_ref(),
-                &self.discovery,
-                self.route.as_ref(),
-            )
-            .await,
-        );
+        let v = Arc::new(probe(t, self.expected.as_ref(), &self.discovery).await);
         if self.generation.load(Ordering::SeqCst) == generation {
             *self.last.lock().unwrap() = Some((started, v.clone()));
         }
@@ -522,7 +499,7 @@ async fn ftp_greeting(addr: &str, port: u16) -> Result<String, String> {
     }
 }
 
-async fn api_key(conn: &Connection) -> Result<ApiKey, String> {
+pub(crate) async fn api_key(conn: &Connection) -> Result<ApiKey, String> {
     // The certificate is checked on a verified route (`tls.rs`), and no
     // redirect goes to another host (a Gen 2 Miniserver sends local HTTP to
     // its *.dyndns.loxonecloud.com name), as lox's own client.
@@ -546,34 +523,47 @@ fn read_version(path: &PathBuf) -> Option<String> {
     config_version(&xml)
 }
 
-async fn probe(
-    t: &Target,
-    expected: Option<&Expected>,
-    discovery: &discover::Cache,
-    route: Option<&Route>,
-) -> Value {
-    let remote = route.is_some_and(|r| r.kind == Kind::Remote);
+async fn probe(t: &Target, expected: Option<&Expected>, discovery: &discover::Cache) -> Value {
+    let route = t.route.route();
+    let remote = route.kind == Kind::Remote;
+    // What is checked: lox's own host, which Pull, Apply and Sync use. Who
+    // answers there is read without a login and without checking the
+    // certificate (it is public): another device at the address shows its
+    // serial even when it fails the CloudDNS check, so the identity check
+    // still refuses what lox would run against it. On Remote Connect, the
+    // relay, checked.
+    let conn = if remote {
+        t.route.conn()
+    } else {
+        Connection {
+            verify_ssl: false,
+            ..t.route.lox().clone()
+        }
+    };
+    let (addr, http_port) = split_host(&conn.host);
+    let lox_host = t.route.lox().host.clone();
+    let (lan_addr, lan_port) = split_host(&lox_host);
     let (web, ftp) = tokio::join!(
         async {
-            match connect(&t.addr, t.http_port).await {
-                Ok(_) => (Ok(()), Some(api_key(&t.conn).await)),
+            match connect(&addr, http_port).await {
+                Ok(_) => (Ok(()), Some(api_key(&conn).await)),
                 Err(e) => (Err(e), None),
             }
         },
         async {
-            // The relay carries HTTPS and WSS only; there is no FTP to ask.
+            // The relay carries HTTPS and WSS only: no FTP to ask.
             if remote {
-                Err(String::new())
+                None
             } else {
-                ftp_greeting(&t.addr, t.ftp_port).await
+                Some(ftp_greeting(&addr, t.ftp_port).await)
             }
         },
     );
     let (web, key) = web;
-    let (conn, current, proposed) = (t.conn.clone(), t.current.clone(), t.proposed.clone());
+    let (token_conn, current, proposed) = (conn.clone(), t.current.clone(), t.proposed.clone());
     let (token, cfg_current, cfg_pending) = tokio::task::spawn_blocking(move || {
         (
-            TokenStore::load_for(&conn).map(|ts| ts.valid_until as i64),
+            TokenStore::load_for(&token_conn).map(|ts| ts.valid_until as i64),
             read_version(&current),
             proposed.as_ref().and_then(read_version),
         )
@@ -582,9 +572,15 @@ async fn probe(
     .unwrap_or_default();
     // When the address does not answer, or another Miniserver answers
     // there, look on the LAN: the right one may have a new address (DHCP),
-    // and its discovery reply names it.
-    let (search, addr_ip) = if !remote && look_on_lan(expected, &web, &key) {
-        let ip = tokio::net::lookup_host((t.addr.as_str(), t.http_port))
+    // and its discovery reply names it. On a relay chosen because lox's
+    // address did not answer, too: a moved Miniserver looks just like that.
+    let look = if remote {
+        route.local_down && expected.is_some()
+    } else {
+        look_on_lan(expected, &web, &key)
+    };
+    let (search, addr_ip) = if look {
+        let ip = tokio::net::lookup_host((lan_addr.as_str(), lan_port))
             .await
             .ok()
             .and_then(|mut a| a.find(|a| a.is_ipv4()))
@@ -594,9 +590,11 @@ async fn probe(
         (None, None)
     };
     report(Report {
-        host: &t.conn.host,
-        addr: &t.addr,
-        http_port: t.http_port,
+        host: &conn.host,
+        addr: &addr,
+        lox_host: &lox_host,
+        lan_addr: &lan_addr,
+        http_port,
         ftp_port: t.ftp_port,
         web,
         key,
@@ -609,7 +607,7 @@ async fn probe(
         discovered: search.as_ref().map(|s| s.found.clone()),
         discovery_note: search.as_ref().and_then(|s| s.note.clone()),
         addr_ip,
-        route,
+        route: Some(&route),
     })
 }
 
@@ -654,15 +652,21 @@ fn fix_host(e: &Expected, host: &str, ip: Option<&str>) -> String {
 }
 
 struct Report<'a> {
+    /// What was checked: lox's host, or the relay on Remote Connect.
     host: &'a str,
     addr: &'a str,
+    /// lox's host, and its address: what Pull, Apply and Sync use, and what
+    /// the LAN's discovery replies are matched with.
+    lox_host: &'a str,
+    lan_addr: &'a str,
     http_port: u16,
     ftp_port: u16,
     /// Whether the web port takes a connection.
     web: Result<(), String>,
     /// `jdev/cfg/apiKey`, when the web port took the connection.
     key: Option<Result<ApiKey, String>>,
-    ftp: Result<String, String>,
+    /// FTP's greeting; `None` where there is no FTP to ask (Remote Connect).
+    ftp: Option<Result<String, String>>,
     /// When lox's token expires (Unix seconds).
     token: Option<i64>,
     now: i64,
@@ -744,26 +748,10 @@ fn report(r: Report) -> Value {
     let remote = r.route.is_some_and(|r| r.kind == Kind::Remote);
     let mut checks = vec![json!({ "name": web_name, "ok": r.web.is_ok(),
           "detail": match &r.web { Ok(()) => "answers".to_string(), Err(e) => e.clone() } })];
-    if !remote {
-        checks.push(json!({ "name": ftp_name, "ok": r.ftp.is_ok(),
-          "detail": match &r.ftp { Ok(g) => g.clone(), Err(e) => e.clone() } }));
+    if let Some(ftp) = &r.ftp {
+        checks.push(json!({ "name": ftp_name, "ok": ftp.is_ok(),
+          "detail": match ftp { Ok(g) => g.clone(), Err(e) => e.clone() } }));
     }
-    let no_ftp = if remote {
-        Some(
-            "vislox reaches the Miniserver through Remote Connect, which carries only HTTPS: \
-             Pull, Apply and Sync copy the config over FTP and run lox, which talks to lox's own \
-             host. Do them on the Miniserver's network"
-                .to_string(),
-        )
-    } else {
-        r.ftp.as_ref().err().map(|e| {
-            format!(
-                "{ftp_name} is blocked between this host and the Miniserver ({e}). Pull, Apply \
-                 and Sync copy the config over FTP: allow TCP 21 and 20 to {}",
-                r.addr
-            )
-        })
-    };
     let no_web = r.web.as_ref().err().map(|e| {
         let why = if remote {
             ". Outbound TCP 20000–49000 to *.remcov3.loxonecloud.com may be blocked on this network"
@@ -791,7 +779,7 @@ fn report(r: Report) -> Value {
         .discovered
         .iter()
         .flatten()
-        .find(|d| r.addr_ip.as_deref() == Some(d.ip.as_str()) || d.ip == r.addr);
+        .find(|d| r.addr_ip.as_deref() == Some(d.ip.as_str()) || d.ip == r.lan_addr);
     let serial = key
         .and_then(|k| k.serial.clone())
         .or_else(|| at_addr.map(|d| d.serial.clone()));
@@ -805,6 +793,30 @@ fn report(r: Report) -> Value {
             .flatten()
             .find(|d| d.serial == e.serial && at_addr.is_none_or(|a| a.ip != d.ip))
     });
+    let no_ftp = match &r.ftp {
+        None => {
+            let found = match (r.expected, elsewhere) {
+                (Some(e), Some(d)) => format!(
+                    ". {} answers at {} on the local network: point lox at it with {}",
+                    e.serial,
+                    d.ip,
+                    fix_host(e, r.lox_host, Some(&d.ip))
+                ),
+                _ => String::new(),
+            };
+            Some(format!(
+                "vislox reaches the Miniserver through Remote Connect, which carries only HTTPS: \
+                 Pull, Apply and Sync copy the config over FTP and run lox, which talks to lox's \
+                 own host. Do them on the Miniserver's network{found}"
+            ))
+        }
+        Some(Err(e)) => Some(format!(
+            "{ftp_name} is blocked between this host and the Miniserver ({e}). Pull, Apply and \
+             Sync copy the config over FTP: allow TCP 21 and 20 to {}",
+            r.addr
+        )),
+        Some(Ok(_)) => None,
+    };
     let (identity, wrong, moved) = match (r.expected, &serial) {
         (None, _) => ("unchecked", None, None),
         (Some(e), Some(s)) if *s == e.serial => ("confirmed", None, None),
@@ -814,11 +826,11 @@ fn report(r: Report) -> Value {
                     "{} answers at {} on the local network: point lox at it with {}",
                     e.serial,
                     d.ip,
-                    fix_host(e, r.host, Some(&d.ip))
+                    fix_host(e, r.lox_host, Some(&d.ip))
                 ),
                 None => format!(
                     "Check the address in lox's configuration ({})",
-                    fix_host(e, r.host, None)
+                    fix_host(e, r.lox_host, None)
                 ),
             };
             let why = format!(
@@ -833,10 +845,10 @@ fn report(r: Report) -> Value {
                 format!(
                     "the Miniserver does not answer at {}, but {} answers at {} on the local \
                      network. If its address changed, point lox at it: {}",
-                    r.host,
+                    r.lox_host,
                     e.serial,
                     d.ip,
-                    fix_host(e, r.host, Some(&d.ip))
+                    fix_host(e, r.lox_host, Some(&d.ip))
                 )
             });
             ("unknown", None, moved)
@@ -1019,7 +1031,7 @@ mod tests {
         let v = report(Report {
             expected: Some(&e),
             // Even when FTP fails too: the wrong device is the reason to give.
-            ftp: Err("refused".into()),
+            ftp: Some(Err("refused".into())),
             ..base()
         });
         assert_eq!(v["identity"], "wrong");
@@ -1041,6 +1053,7 @@ mod tests {
         let e = expect("504F94000001");
         let v = report(Report {
             host: "https://192.168.1.120:8443",
+            lox_host: "https://192.168.1.120:8443",
             expected: Some(&e),
             discovered: Some(vec![
                 reply("192.168.1.120", "504F94A0E454"),
@@ -1069,7 +1082,7 @@ mod tests {
         let v = report(Report {
             web: Err("no answer within 4 s".into()),
             key: None,
-            ftp: Err("no answer within 4 s".into()),
+            ftp: Some(Err("no answer within 4 s".into())),
             expected: Some(&e),
             discovered: Some(vec![
                 reply("192.168.1.9", "504F94111111"),
@@ -1224,11 +1237,13 @@ mod tests {
         Report {
             host: "https://192.168.1.120",
             addr: "192.168.1.120",
+            lox_host: "https://192.168.1.120",
+            lan_addr: "192.168.1.120",
             http_port: 443,
             ftp_port: 21,
             web: Ok(()),
             key: Some(parse_api_key(REAL)),
-            ftp: Ok("220 Welcome".into()),
+            ftp: Some(Ok("220 Welcome".into())),
             token: Some(2_000),
             now: 1_000,
             cfg_current: Some("17.2.10.21".into()),
@@ -1248,7 +1263,43 @@ mod tests {
             lox_host: "https://192.168.1.120".into(),
             verified,
             note: note.map(String::from),
+            local_down: false,
+            failing: None,
         }
+    }
+
+    /// On a relay chosen because lox's address did not answer, the LAN is
+    /// searched, and a Miniserver that moved is named with the fix.
+    #[test]
+    fn a_moved_miniserver_is_named_on_remote_connect_too() {
+        let e = expect("504F94A0E454");
+        let mut r = route(
+            Kind::Remote,
+            "https://167-233-234-75.504F94A0E454.dyndns.loxonecloud.com:29235",
+            true,
+            None,
+        );
+        r.local_down = true;
+        let v = report(Report {
+            host: &r.url,
+            addr: "167-233-234-75.504F94A0E454.dyndns.loxonecloud.com",
+            ftp: None,
+            expected: Some(&e),
+            discovered: Some(vec![reply("192.168.1.130", "504F94A0E454")]),
+            addr_ip: Some("192.168.1.120".into()),
+            route: Some(&r),
+            ..base()
+        });
+        let why = v["blocked"]["pull"].as_str().unwrap();
+        assert!(why.contains("Remote Connect"), "{why}");
+        assert!(
+            why.contains("504F94A0E454 answers at 192.168.1.130 on the local network"),
+            "{why}"
+        );
+        assert!(
+            why.contains("`lox --ctx home setup set --host https://192.168.1.130`"),
+            "{why}"
+        );
     }
 
     #[test]
@@ -1263,7 +1314,7 @@ mod tests {
         let v = report(Report {
             host: &r.url,
             key: Some(parse_api_key(&reply)),
-            ftp: Err(String::new()),
+            ftp: None,
             route: Some(&r),
             ..base()
         });
@@ -1292,7 +1343,7 @@ mod tests {
             host: &r.url,
             web: Err("no answer within 4 s".into()),
             key: None,
-            ftp: Err(String::new()),
+            ftp: None,
             route: Some(&r),
             ..base()
         });
@@ -1349,7 +1400,7 @@ mod tests {
     #[test]
     fn blocked_ftp_is_named_as_such() {
         let v = report(Report {
-            ftp: Err("Connection refused (os error 111)".into()),
+            ftp: Some(Err("Connection refused (os error 111)".into())),
             ..base()
         });
         for what in ["pull", "apply", "sync"] {
@@ -1513,17 +1564,75 @@ mod tests {
             }
         });
         let conn = Connection::new(format!("http://127.0.0.1:{web_port}"), "u", "p");
+        let route = Handle::fixed(conn);
         let ms = Miniserver::with_target(Ok(Target {
-            http: Arc::new(Http::new(conn.clone())),
-            conn,
-            addr: "127.0.0.1".into(),
-            http_port: web_port,
+            http: Arc::new(Http::routed(route.clone())),
+            route,
             ftp_port,
             current: PathBuf::from("/nonexistent"),
             proposed: None,
             base_date: Arc::new(BaseDate::new(PathBuf::from("/nonexistent"), None)),
         }));
         (ms, count)
+    }
+
+    /// On the CloudDNS route, another device at lox's address (DHCP) fails
+    /// the certificate check, but its serial is still read at lox's address
+    /// (where Pull, Apply and Sync go), so they are refused as before.
+    #[tokio::test]
+    async fn another_device_at_the_address_is_refused_on_the_clouddns_route() {
+        let web = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = web.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = web.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 2048];
+                    let _ = s.read(&mut buf).await;
+                    let body = REAL.replace("50:4F:94:A0:E4:54", "50:4F:94:99:99:99");
+                    let _ = s
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                                body.len()
+                            )
+                            .as_bytes(),
+                        )
+                        .await;
+                });
+            }
+        });
+        let lox = Connection::new(format!("http://127.0.0.1:{port}"), "u", "p");
+        let named = Connection {
+            host: "https://192-168-1-120.504f94a0e454.dyndns.loxonecloud.com".into(),
+            verify_ssl: true,
+            ..lox.clone()
+        };
+        let route = Handle::on(
+            lox,
+            named.clone(),
+            route(Kind::Clouddns, &named.host, true, None),
+        );
+        let mut ms = Miniserver::with_target(Ok(Target {
+            http: Arc::new(Http::routed(route.clone())),
+            route,
+            ftp_port: 9,
+            current: PathBuf::from("/nonexistent"),
+            proposed: None,
+            base_date: Arc::new(BaseDate::new(PathBuf::from("/nonexistent"), None)),
+        }))
+        .expecting(Some(expect("504F94A0E454")));
+        ms.discovery = discover::Cache::primed(discover::Search::default());
+        let v = tokio::time::timeout(Duration::from_secs(20), ms.chip())
+            .await
+            .expect("hard timeout");
+        assert_eq!(v["identity"], "wrong", "{v}");
+        assert_eq!(v["serial"], "504F94999999");
+        assert!(
+            ms.preflight(Action::Apply)
+                .await
+                .unwrap_err()
+                .contains("this is not the Miniserver of this config")
+        );
     }
 
     #[tokio::test]

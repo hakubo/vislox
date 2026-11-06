@@ -241,7 +241,8 @@ vislox config.Loxone --live-from recorded.ndjson   # replay a recording (followe
 
 ### Verified TLS and Remote Connect
 
-vislox picks its route to the Miniserver once, at start (`--route auto`, the default; or `VISLOX_ROUTE`):
+vislox picks its route to the Miniserver in the background after start (`--route auto`, the default; or
+`VISLOX_ROUTE`); until then, and whenever picking fails or takes over 30 s, it uses lox's host:
 
 | Route | When | Certificate |
 |---|---|---|
@@ -267,11 +268,24 @@ The serial is the config's (repository folder, lox.toml), else the lox context's
   The relay carries only HTTPS and WSS: FTP does not go through it, so Pull, Apply and Sync are refused on
   this route. Live values, the structure file and the status chip work.
 - `--route local` never uses Remote Connect; `--route remote` always does. A loopback host (`127.0.0.1`) is
-  always taken as it is.
+  always taken as it is, and `--live-from` takes lox's host without picking.
+- **Picked again**: every minute while lox's address does not answer (a Miniserver still booting after a power
+  cut, a laptop back home: vislox goes back to the local route when it answers), and after a failed connection
+  (at most every 30 s). A local route that worked moves to Remote Connect only when lox's address stays silent
+  for a minute, so a program restart does not. Once the CloudDNS name was verified, vislox never falls back to
+  an unchecked connection to that address: it stays on the name, and the chip says why it fails (restart vislox
+  to accept the fallback). Live values reconnect on the new route.
+- **The right Miniserver**: the chip reads who answers at lox's host (where Pull, Apply and Sync go) without
+  checking the certificate (`jdev/cfg/apiKey` is public, and no password is sent), so another device at the
+  address still shows its serial and is refused. On a Remote Connect route picked because lox's address did not
+  answer, vislox still looks for the Miniserver on the LAN and names its new address with the `lox setup set`
+  command.
 
-The route is for vislox's own connections: live values, the status chip and preflight, the structure file,
-Apply's restart probe and operating inputs. lox's commands (Pull, Apply, Sync, `lox log`, the Debug-Monitor's
-Start and Stop) use lox's host, and lox does not check certificates yet (see *How it works*).
+The route is for vislox's own connections: live values, the status chip and preflight, the structure file, the
+app's calendar entries, Apply's restart probe and operating inputs. On a verified route all of them check the
+certificate, and no request that carries lox's user or password goes out unchecked (see *How it works*). lox's
+commands (Pull, Apply, Sync, `lox log`, the Debug-Monitor's Start and Stop) use lox's host, and lox does not
+check certificates yet.
 
 ### Apply, Sync and Discard
 
@@ -596,10 +610,11 @@ The binary is an `axum` server with the UI embedded (plain JS and SVG, no build 
   (`connect.loxonecloud.com/getip`), and explains the Connect Service's codes. `src/tls.rs` builds the HTTP
   and WebSocket clients that check the certificate on a verified route. `loxone-client` cannot do this yet:
   its reqwest has no root certificates (`rustls-tls-manual-roots`), so its `verify_ssl` fails every request,
-  and its WebSocket never checks. vislox swaps the HTTP client inside lox's `LoxClient` and opens the
-  WebSocket itself. Only the RSA key that lox's login fetches comes over an unchecked request of lox's own;
-  the key exchange then runs over the checked WebSocket, so a swapped key makes the login fail but reveals
-  nothing.
+  and its WebSocket never checks. vislox swaps the HTTP client inside lox's `LoxClient` (which keeps
+  `verify_ssl`, so a client lox might build from it fails rather than skip the check) and opens the WebSocket
+  itself. lox's login fetches the RSA key with a client of its own that sends the user and password: vislox
+  fetches the key itself, checked and without credentials, and gives lox's login a one-off loopback address
+  that serves it, so that request never leaves this host.
 - `src/discover.rs` is Loxone's UDP discovery (`vislox --discover`, and finding a Miniserver whose address
   changed).
 - `src/operate.rs` sends the commands of `--operate` to virtual inputs (`POST /api/operate`, with the admin

@@ -16,7 +16,7 @@
 
 use loxone_client::{Connection, LoxClient};
 use serde_json::Value;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
 
@@ -39,23 +39,53 @@ pub trait Probe: Send + Sync {
 /// dropped on the async runtime. It is built on first use (the probe is only
 /// asked from `spawn_blocking`), and dropped on a thread of its own.
 pub struct Http {
-    conn: Connection,
-    client: OnceLock<Option<LoxClient>>,
+    to: To,
+    /// The client, and the connection (host, TLS check) it was built for.
+    client: Mutex<Option<(String, Arc<LoxClient>)>>,
+}
+
+/// Where the requests go.
+enum To {
+    /// Always this connection (lox's, for the Debug-Monitor).
+    Fixed(Connection),
+    /// The current route (`route.rs`).
+    Route(Arc<crate::route::Handle>),
 }
 
 impl Http {
     pub fn new(conn: Connection) -> Http {
         Http {
-            conn,
-            client: OnceLock::new(),
+            to: To::Fixed(conn),
+            client: Mutex::new(None),
         }
     }
 
-    fn client(&self) -> Result<&LoxClient, String> {
-        self.client
-            .get_or_init(|| crate::tls::lox_client(&self.conn).ok())
-            .as_ref()
-            .ok_or_else(|| "no HTTP client".to_string())
+    /// Requests go the route's way, which may change while vislox runs.
+    pub fn routed(route: Arc<crate::route::Handle>) -> Http {
+        Http {
+            to: To::Route(route),
+            client: Mutex::new(None),
+        }
+    }
+
+    fn client(&self) -> Result<Arc<LoxClient>, String> {
+        let conn = match &self.to {
+            To::Fixed(c) => c.clone(),
+            To::Route(r) => r.conn(),
+        };
+        let key = format!("{}|{}", conn.host, conn.verify_ssl);
+        let mut slot = self.client.lock().unwrap();
+        if let Some((k, c)) = slot.as_ref()
+            && *k == key
+        {
+            return Ok(c.clone());
+        }
+        let c = Arc::new(crate::tls::lox_client(&conn)?);
+        if let Some((_, old)) = slot.replace((key, c.clone())) {
+            // A blocking client must not be dropped on the async runtime.
+            std::thread::spawn(move || drop(old));
+        }
+        Ok(c)
     }
 
     /// `LL.value` of a `jdev/…` answer that has HTTP status 200.
@@ -96,7 +126,7 @@ impl Http {
 
 impl Drop for Http {
     fn drop(&mut self) {
-        if let Some(Some(c)) = self.client.take() {
+        if let Some((_, c)) = self.client.get_mut().unwrap().take() {
             std::thread::spawn(move || drop(c));
         }
     }

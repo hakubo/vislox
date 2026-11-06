@@ -102,12 +102,12 @@ pub(crate) fn chain(e: &(dyn std::error::Error + 'static)) -> String {
 
 /// Connect, log in and subscribe to binary status updates.
 async fn open(conn: &Connection) -> Result<WsStream, String> {
-    // The socket checks the certificate when the route is verified
-    // (`tls.rs`); lox's login fetches the RSA key with a client of its own,
-    // which cannot check it.
+    // The socket checks the certificate when the route is verified, and
+    // lox's login gets the Miniserver's key without sending the user and
+    // password over a connection that does not (`tls.rs`).
     let mut ws = crate::tls::ws_connect(conn).await?;
     let reopen = conn.clone();
-    let lox_conn = crate::tls::for_lox(conn);
+    let (lox_conn, _key_server) = crate::tls::login(conn).await?;
     let conn = &lox_conn;
     let reuse_rejected_before = token_reuse_rejected();
     if let Err(e) = ws_authenticate(&mut ws, conn).await {

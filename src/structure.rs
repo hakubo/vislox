@@ -13,7 +13,6 @@
 //! structure file lists are fetched, so `/api/app/icon` cannot be used to
 //! read anything else from the Miniserver.
 
-use loxone_client::Connection;
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
@@ -55,7 +54,7 @@ pub enum Event {
 }
 
 pub struct Structure {
-    conn: Result<Connection, String>,
+    conn: Result<Arc<crate::route::Handle>, String>,
     /// This Miniserver's cache directory.
     dir: Option<PathBuf>,
     inner: Mutex<Inner>,
@@ -299,12 +298,18 @@ fn gunzip(bytes: &[u8]) -> Option<Vec<u8>> {
 impl Structure {
     /// `conn`: the Miniserver, or why there is none. `key`: what names it in
     /// the cache (its serial, else its address).
-    pub fn new(conn: Result<Connection, String>, key: Option<&str>) -> Arc<Structure> {
+    pub fn new(
+        conn: Result<Arc<crate::route::Handle>, String>,
+        key: Option<&str>,
+    ) -> Arc<Structure> {
         let dir = key.and_then(|k| Some(cache_root()?.join(file_name(k))));
         Self::with_dir(conn, dir)
     }
 
-    fn with_dir(conn: Result<Connection, String>, dir: Option<PathBuf>) -> Arc<Structure> {
+    fn with_dir(
+        conn: Result<Arc<crate::route::Handle>, String>,
+        dir: Option<PathBuf>,
+    ) -> Arc<Structure> {
         let (tx, _) = broadcast::channel(8);
         let s = Arc::new(Structure {
             conn,
@@ -395,7 +400,7 @@ impl Structure {
 
     /// Read the structure file from the Miniserver now.
     pub async fn load(self: &Arc<Self>) -> Result<(), String> {
-        let conn = self.conn.clone()?;
+        let conn = self.conn.clone()?.conn();
         let _one = self.loading.lock().await;
         let res = tokio::task::spawn_blocking(move || -> Result<Value, String> {
             let mut client = crate::tls::lox_client(&conn)?;
@@ -480,7 +485,7 @@ impl Structure {
         if let Some(b) = cached() {
             return Ok(b);
         }
-        let conn = self.conn.clone().map_err(Some)?;
+        let conn = self.conn.clone().map_err(Some)?.conn();
         // One download per name: the others wait, then find it cached.
         let lock = self
             .icon_locks
@@ -623,7 +628,12 @@ mod tests {
     #[tokio::test]
     async fn a_command_in_the_structure_file_is_never_requested() {
         let (host, hits) = icon_server(HashMap::new()).await;
-        let s = Structure::with_dir(Ok(Connection::new(host, "u", "p")), None);
+        let s = Structure::with_dir(
+            Ok(crate::route::Handle::fixed(loxone_client::Connection::new(
+                host, "u", "p",
+            ))),
+            None,
+        );
         s.set(json!({ "controls": {
             "a": { "name": "A", "type": "Switch", "defaultIcon": "jdev/sps/io/a/1.0" },
             "b": { "name": "B", "type": "Switch", "defaultIcon": "dev/sps/io/b/On" },
@@ -698,7 +708,14 @@ mod tests {
 
     #[test]
     fn a_new_structure_is_served_at_once_with_its_icons() {
-        let s = Structure::with_dir(Ok(Connection::new("http://127.0.0.1:9", "u", "p")), None);
+        let s = Structure::with_dir(
+            Ok(crate::route::Handle::fixed(loxone_client::Connection::new(
+                "http://127.0.0.1:9",
+                "u",
+                "p",
+            ))),
+            None,
+        );
         let mut rx = s.subscribe();
         s.set(sample());
         assert_eq!(rx.try_recv().unwrap(), Event::Changed);
@@ -720,7 +737,14 @@ mod tests {
 
     #[test]
     fn reading_the_same_structure_again_only_counts_the_read() {
-        let s = Structure::with_dir(Ok(Connection::new("http://127.0.0.1:9", "u", "p")), None);
+        let s = Structure::with_dir(
+            Ok(crate::route::Handle::fixed(loxone_client::Connection::new(
+                "http://127.0.0.1:9",
+                "u",
+                "p",
+            ))),
+            None,
+        );
         s.set(sample());
         let mut rx = s.subscribe();
         s.set(sample());
@@ -734,7 +758,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         // Nothing listens on port 9: loading fails.
         let s = Structure::with_dir(
-            Ok(Connection::new("http://127.0.0.1:9", "u", "p")),
+            Ok(crate::route::Handle::fixed(loxone_client::Connection::new(
+                "http://127.0.0.1:9",
+                "u",
+                "p",
+            ))),
             Some(tmp.path().to_path_buf()),
         );
         let threads: Vec<_> = (0..8)
@@ -779,7 +807,11 @@ mod tests {
 
         // A later run starts with the cached one.
         let again = Structure::with_dir(
-            Ok(Connection::new("http://127.0.0.1:9", "u", "p")),
+            Ok(crate::route::Handle::fixed(loxone_client::Connection::new(
+                "http://127.0.0.1:9",
+                "u",
+                "p",
+            ))),
             Some(tmp.path().to_path_buf()),
         );
         let v = read(&again);
@@ -802,7 +834,9 @@ mod tests {
         ]))
         .await;
         let s = Structure::with_dir(
-            Ok(Connection::new(host, "u", "p")),
+            Ok(crate::route::Handle::fixed(loxone_client::Connection::new(
+                host, "u", "p",
+            ))),
             Some(tmp.path().to_path_buf()),
         );
         s.set(sample());

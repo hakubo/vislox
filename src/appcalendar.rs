@@ -16,7 +16,6 @@
 
 use crate::calendar::{self, Entry};
 use crate::restart::Http;
-use loxone_client::Connection;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -58,11 +57,12 @@ pub struct AppCalendar {
 }
 
 impl AppCalendar {
-    /// `conn`: lox's Miniserver, or why vislox does not talk to it.
-    pub fn new(conn: Result<Connection, String>) -> AppCalendar {
+    /// `route`: the way to lox's Miniserver, or why vislox does not talk
+    /// to it.
+    pub fn new(route: Result<Arc<crate::route::Handle>, String>) -> AppCalendar {
         AppCalendar::with_ask(
-            conn.map(|c| {
-                let http = Arc::new(Http::new(c));
+            route.map(|r| {
+                let http = Arc::new(Http::routed(r));
                 Arc::new(move || http.value("jdev/sps/calendargetentries")) as Ask
             }),
             TIMEOUT,

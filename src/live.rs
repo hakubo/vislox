@@ -108,7 +108,8 @@ struct BlockState {
 pub enum Feed {
     /// None: why not.
     Off(String),
-    Miniserver(Box<Connection>),
+    /// The Miniserver, the route's way (`route.rs`).
+    Miniserver(Arc<crate::route::Handle>),
     /// NDJSON from `lox stream -o json`; `-` is standard input.
     Ndjson(PathBuf),
 }
@@ -808,7 +809,7 @@ impl Live {
 
     /// Start a Miniserver session, unless one runs or the last one stopped.
     fn start(self: &Arc<Self>, st: &mut St) {
-        if let Feed::Miniserver(conn) = &self.feed
+        if let Feed::Miniserver(route) = &self.feed
             && st.run.is_none()
             && !st.stopped
         {
@@ -820,7 +821,7 @@ impl Live {
             st.status = Status::new("connecting", None);
             tokio::spawn(
                 self.clone()
-                    .run_miniserver(generation, (**conn).clone(), stop_rx),
+                    .run_miniserver(generation, route.clone(), stop_rx),
             );
         }
     }
@@ -971,15 +972,19 @@ impl Live {
     async fn run_miniserver(
         self: Arc<Self>,
         generation: u64,
-        conn: Connection,
+        route: Arc<crate::route::Handle>,
         mut stop: watch::Receiver<bool>,
     ) {
         let mut backoff = Backoff::default();
+        let mut routes = route.changes();
         loop {
             if *stop.borrow() {
                 return;
             }
             self.set_status(generation, "connecting", None);
+            // The route's connection now: it may change while vislox runs.
+            routes.mark_unchanged();
+            let conn = route.conn();
             let c = conn.clone();
             let structure = tokio::task::spawn_blocking(move || -> Result<Value, String> {
                 let mut client = crate::tls::lox_client(&c)?;
@@ -1026,6 +1031,11 @@ impl Live {
                                 self.read_periods((generation, connection), live_rx.clone(), ask_periods, PERIOD_TIMING),
                             )
                         } => Ended::Stopped,
+                        // Another route: connect again, that way, at once.
+                        _ = routes.changed() => {
+                            backoff.reset();
+                            continue;
+                        }
                     };
                     if *stop.borrow() {
                         return;
@@ -1053,6 +1063,9 @@ impl Live {
                     (err, reason, false)
                 }
             };
+            // Perhaps the route changed (a Miniserver that moved, a laptop
+            // that left home): choose again.
+            route.nudge();
             let (reason, next) = backoff.next(reason, http);
             let detail = |tail: &str| match reason {
                 Some(r) => format!("{}\n({err}) · {tail}", r.sentence()),
@@ -1076,6 +1089,7 @@ impl Live {
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_secs(wait)) => {}
                 _ = stop.changed() => return,
+                _ = routes.changed() => backoff.reset(),
             }
         }
     }
@@ -2263,7 +2277,10 @@ mod tests {
     async fn a_stopped_session_stays_stopped_until_a_user_turns_live_on() {
         // Nothing listens there: attempts fail at once and are retried.
         let conn = Connection::new("http://127.0.0.1:9", "u", "p");
-        let live = Live::new(Feed::Miniserver(Box::new(conn)), "test".into());
+        let live = Live::new(
+            Feed::Miniserver(crate::route::Handle::fixed(conn)),
+            "test".into(),
+        );
         let (_rx, tab) = live.subscribe();
         assert!(running(&live));
         let generation = live.st.lock().unwrap().generation;
