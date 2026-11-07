@@ -4,8 +4,9 @@ vislox becomes an editor in steps: edit values (#58), add blocks (#59), move blo
 make and change connections (#61), undo and redo (#62), adopt the blocks Loxone Config drew (#72), edit a
 Daytimer's switching times (#73), a lighting controller's moods (#74), a central block's members (#75), who may
 open an NFC Code Touch (#76), push notifications: who gets them and what they say (#77), the tiles of a Touch
-Pure Flex (#78), and a managed block's label and settings, its program among them (#79). This page is the design
-they share. #58 to #62, #72 to #79 are built; the rest says where each step plugs in.
+Pure Flex (#78), a managed block's label and settings, its program among them (#79), and deleting and renaming a
+managed block (#80). This page is the design they share. #58 to #62, #72 to #80 are built; the rest says where each
+step plugs in.
 
 ## The rules
 
@@ -40,6 +41,8 @@ POST /api/edit
            { "op": "add_block", "page": "<page uuid>", "type": "Monoflop", "title": "Nachlauf",
              "params": { "Time": "30" }, "settings": {} },
            { "op": "remove_block", "uuid": "…" },
+           { "op": "rename", "uuid": "…", "slug": "vx_nachlauf" },
+           { "op": "tidy" },
            { "op": "move", "uuid": "…", "x": 1920, "y": 960 },
            { "op": "relayout", "page": "<page uuid>" },
            { "op": "place", "moves": [ { "uuid": "…", "x": 1920, "y": 960 } ] },
@@ -62,7 +65,8 @@ POST /api/edit
              "settings": { "mirrors": "<notification uuid>", "On": "Frost", "MinimumTime": "12h" } } ] }
 ```
 
-`adopt`, `adopt_page` and `unadopt` go in a request of their own (#72).
+`adopt`, `adopt_page` and `unadopt` go in a request of their own (#72), and so does `rename` (#80). `restore_block`
+is what undoes a `remove_block` of a deployed block (#80); vislox makes it, see *Deleting and renaming*.
 
 - `base` is the git blob id of what the browser showed: the newest compile, or the deployed config when nothing
   is pending. When the file on disk is another one (someone compiled, applied or discarded), the edit is refused
@@ -70,7 +74,9 @@ POST /api/edit
 - `value: null` drops vislox's claim: lox puts back the value Loxone Config had before.
 - The reply has, per op, what undoes it (`previous`), the new pending blob id, and the blocks it added with the
   UUIDs lox minted (`added: [{ slug, uuid }]`). For a value, `previous` is the value vislox claimed before: the
-  op with that value undoes it. For `remove_block` it is the `add_block` that adds the block again; for
+  op with that value undoes it. For `remove_block` it is the `add_block` that adds the block again (a deployed or
+  adopted block: the `restore_block` that brings it back with its UUIDs, and for `restore_block` the `remove_block`;
+  for `rename` the `rename` back; for `tidy` a `tidy`, #80); for
   `add_block` it is null, and `remove_block` with the new UUID undoes it. For `move` it is the `move` back to
   where the block was; for `relayout`, the `place` that puts each block back (one op however many
   blocks the page has; `place` moves several managed blocks as `move` does), and for `place`, the `place` back. For `wire` it is the
@@ -145,7 +151,8 @@ vx_pulseat_1 = PulseAt(At: 07:05, Pulse: "time")
 - **Remove** takes out a block added here that is not deployed yet: not in the deployed revision, the same one
   the browser marks *not deployed* (the newest commit of the base). Its declaration goes, and
   `removed vx_monoflop_1` tells lox the lockfile entry is meant to go (lox refuses a managed block the source
-  lost). vislox drops that line once the lockfile no longer has the block. A deployed block is deleted with #80.
+  lost). vislox drops that line once the lockfile no longer has the block. A deployed block is deleted, and any
+  block of vislox's files renamed, as *Deleting and renaming managed blocks (#80)* says.
 - **Discard** puts the module, lock and out back to the last commit. A lock or out the last commit does not have
   (never committed, or ignored by git) goes back to how it was before vislox's first edit since that commit,
   which vislox keeps in the git directory; one vislox never edited stays as it is, since a lost lock re-mints
@@ -202,7 +209,7 @@ unchanged in memory. lox has no structured edit command, so vislox works on what
   has it) and is a block of vislox's files: its name, unwired inputs' constants and settings change its
   declaration, it is moved (#60), and wired (#61) like a block added here (lox ORs a second wire into a bound
   input). The wires its declaration brought along are its declaration's now (`adopted_wires`, `wire_why.adopted`):
-  vislox does not take them out yet. Remove refuses it (it is deployed); deleting a managed block is #80.
+  vislox does not take them out yet. It is deleted and renamed as a deployed block added here is (#80).
 - **`unadopt`** (the undo, and *Hand back* in Properties) takes the declaration and its wires out of vislox's file,
   the entry out of the lockfile with every `extern_wires` entry from its ports (without its line lox would take
   those wires out of the config: they are Loxone Config's again), and drops the externs nothing else names. The
@@ -216,8 +223,59 @@ unchanged in memory. lox has no structured edit command, so vislox works on what
   pending: Apply has nothing to deploy. The Deploy pane says how many blocks adopted here are not committed yet;
   they go into git with the next Apply. Undo hands them back; Discard (with something pending) drops them too.
 
-Later: #80 deletes and renames adopted blocks, and taking out a wire an adopted declaration brought along is left
-to a later step. Its label and settings are edited as for a block added here (#79, see *Block settings*).
+Later: taking out a wire an adopted declaration brought along is left to a later step. Its label and settings are
+edited as for a block added here (#79, see *Block settings*); it is deleted and renamed as #80 says.
+
+## Deleting and renaming managed blocks (#80)
+
+A block of vislox's files, added here (#59) or adopted (#72), is deleted with `removed <slug>` and renamed with
+`moved <old> -> <new>`: without them lox refuses a lockfile entry the source lost, or mints a renamed block anew
+and every wire Loxone Config drew to it breaks. The blocks the module's own files declare are deleted and renamed
+there (`lox logic rename`); vislox refuses them, naming the file.
+
+```text
+# Deleted here: lox takes them out of the config.
+removed vx_monoflop_1
+
+# Renamed here: the blocks keep their UUIDs.
+moved vx_nach -> vx_nachlauf
+```
+
+- **Delete** (`remove_block` of a deployed or adopted block). Its declaration goes, with the wires out of it its file
+  wrote (an adopted block's `<-` lines) and the wires drawn here at it (#61), and `removed <slug>` is added to its
+  file. lox deletes the block from the pending config and moves its lockfile entry to a removal tombstone, which
+  keeps deleting it from the base until a base without it is compiled. The review shows the block removed (red, a
+  dashed ghost). Apply deletes it on the Miniserver, and asks first like any removal (#70: the tombstone is in the
+  project's lockfile, so *Review the removals* lists it). After the compile, vislox checks that the config no longer
+  has it. A block not deployed yet is taken out as before (#59).
+- **Refused** while vislox's file claims a set on it or names it in one (Revert that first), and while another block
+  of vislox's files takes a wire from it in its declaration (an adopted block bound to it: delete that one first, or
+  hand it back). `blocks[].delete` in `GET /api/edits` says why (the same op, tried on a copy), and *Delete* is off
+  with that reason. A wire into it from the module's own files is lox's to refuse, and its words come back.
+- **Undo** is `restore_block`: what `remove_block`'s `previous` names, never written by hand. It carries the
+  declaration and its wire lines as vislox wrote them (read back with vislox's own parser: one block, its slug the
+  tombstone's), its program, the wires drawn here (by UUID), vislox's externs its declaration names (UUID → type),
+  its lockfile entry (`objects.<slug>`: UUIDs, ports, layout, page) and its `extern_wires`. It is accepted only while
+  the lockfile keeps the block's tombstone and the base still has it: the entry goes back, the tombstone goes, the
+  entry's `extern_wires` come back (and leave `removed_wires`), and the `removed` line goes, so lox writes the block
+  with its old UUIDs and the config is as it was. After the compile vislox checks that the config has it again under
+  its UUID. Once the deletion was applied (or discarded) there is no tombstone, and it is refused.
+- **Rename** (`rename`, a request of its own): the slug is `vx_` and lowercase letters, digits and `_`, not a
+  reserved word, without `__` (lox's for expression blocks), not `vx_<uuid>` (vislox's name for an object of
+  Loxone Config's), and not a name of the module, its lockfile (tombstones too) or vislox's files. lox's own rename
+  (`rename_slug`, the engine of `lox logic rename`) runs over vislox's files, so the declaration, wires, bindings,
+  set claims and tile targets follow, and `moved <old> -> <new>` is added; a block's program file follows its slug
+  (`vx_nachlauf.c`). A rename of a rename lox has not applied yet is one rename, and one back to the old slug none.
+  lox moves the lockfile entry, so the block keeps its UUIDs, layout and wires.
+- **The config does not change.** A block without a name shows its slug, so it keeps the old slug as its name
+  (`vx_nachlauf = Monoflop("vx_nach")`); renamed back to a slug it shows by that name, the name goes again. After the
+  compile vislox compares the pending config with the one before (`loxone_config::diff`) and refuses a rename that
+  changed anything. Nothing is pending afterwards unless something else is.
+- **The lines afterwards.** A `removed` line is done once lox keeps the tombstone (the lockfile no longer has the
+  block), a `moved` line once lox moved the entry; `lox logic lint` reports them as `stale-lifecycle`. Every edit
+  drops them first (`Files::tidy`), so they never pile up. `GET /api/edits`' `stale_lines` lists them as written, the
+  Deploy pane offers *Drop them*, and `tidy` (a request that asks for nothing else) drops them and compiles; the
+  config does not change.
 
 ## Block settings (#79)
 
@@ -1158,6 +1216,8 @@ cannot express is left out, not worked around.
 | #77 recipients | `recipients vx_… end`, `x.recipients = vx_…` in `edits.loxl` | A Notification (an extern); users and groups by a title that names exactly one; Full access is never listed. |
 | #77 notification on a page | `slug = OutputRefLM(mirrors: vx_…, On: "…", Off: "…", MinimumTime: 12h)` | Mirrors a Notification Loxone Config made; no name, no constant; its `AI` wired with #61. |
 | #78 tiles | `tiles vx_… end`, `x.tiles = vx_…` in `edits.loxl` | A Touch Pure Flex (an extern `TreeDevice` with a tile layout); only the indices the layout has; targets API-linked externs or blocks added/adopted here; several devices may share a set. |
+| #80 delete a managed block | drop it, `removed slug` | A block added or adopted here; deployed, Apply deletes it on the Miniserver (asking, #70). Undone with its UUIDs while lox keeps the tombstone. |
+| #80 rename a managed block | `moved old -> new`, lox's rename over vislox's files | A block added or adopted here; the config does not change. |
 | #79 block settings | `slug = Type("Label", At: 06:58, Desc: "…", Code: file("slug.c"))` | Only a block added or adopted here; a program in `<module>/vislox/<slug>.c`. Constants take a unit (`Time: 30min`, `x.Time = 1h`). |
 
 Blocks the module already manages (they are in the lockfile) are refused: they are edited in their own `.loxl`.
@@ -1222,7 +1282,7 @@ Each of these plugs in as new op kinds on `POST /api/edit`, written into `<modul
 | #77 (built) | notification recipients and messages (`recipients`, `OutputRefLM`) |
 | #78 (built) | Touch Pure Flex tiles (`tiles`, `.tiles`) |
 | #79 (built) | a managed block's label and settings (`Desc:`, `Type:`, `Formula:`, `Code: file(…)`, …), constants with units |
-| #80 | delete and rename managed blocks (`removed`, `moved`) |
+| #80 (built) | delete and rename managed blocks (`removed`, `moved`) |
 | #81 | `let` and `defaults` |
 | #82 | expressions and named signals |
 | #83 | `template` instances |
@@ -1262,6 +1322,10 @@ lost is deleted only with consent to exactly that list, see [features.md](featur
 - Clicking a wire opens its card: its ends and kind, and *Delete* (also the Delete key) and the ends to drag
   elsewhere for a wire vislox drew, *Revert* for one drawn or taken out here and not deployed, or why it cannot be
   changed here (Loxone Config or the module drew it). The Deploy pane counts the wires drawn and taken out here.
+- A block of vislox's files shows its slug in the Edit section with *Rename* (a field: Enter renames, Escape
+  cancels; the draft closes when the selection or the pending config changes) and, once deployed or adopted,
+  *Delete* (asks first; off with `blocks[].delete` as the reason). The Deploy pane lists the `removed` and `moved`
+  lines lox needs no more, with *Drop them* (#80).
 - *Arrange*, next to *Add block*, lays out the page's managed blocks afresh. It is off, with the reason, where
   the server would refuse it (`arrange` in `GET /api/edits`).
 - A refused move puts the block back where it was. A move that compiled stays drawn even when showing the new

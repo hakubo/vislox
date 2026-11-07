@@ -456,6 +456,14 @@ const lockAt = process.argv.indexOf("--lock");
 const lockFile = lockAt > 0 ? process.argv[lockAt + 1] : "logic.lock.json";
 const lock = fs.existsSync(lockFile) ? JSON.parse(fs.readFileSync(lockFile, "utf8")) : { objects: {} };
 const objects = {};
+// vislox's lifecycle lines (#80): \`moved a -> b\` moves a's lock entry to b while the lock has a and not b (the
+// block keeps its UUIDs); \`removed x\` of a block the lock manages and the base has deletes it, with a tombstone.
+const mine = (fs.existsSync("pages/vislox") ? fs.readdirSync("pages/vislox") : []).filter((f) => f.endsWith(".loxl"))
+  .flatMap((f) => fs.readFileSync("pages/vislox/" + f, "utf8").split("\\n"));
+for (const line of mine) {
+  const m = line.match(/^moved (vx_\\w+) -> (vx_\\w+)$/);
+  if (m && lock.objects[m[1]] && !lock.objects[m[2]]) { lock.objects[m[2]] = lock.objects[m[1]]; delete lock.objects[m[1]]; }
+}
 // Like lox, a block added again gets a UUID it never had: the count of UUIDs minted is kept.
 const mintFile = ${JSON.stringify(join(loxDir, "minted"))};
 let n = fs.existsSync(mintFile) ? +fs.readFileSync(mintFile, "utf8") : 0;
@@ -496,9 +504,21 @@ for (const f of fs.existsSync("pages/vislox") ? fs.readdirSync("pages/vislox") :
 }
 // The blocks the rest of the module manages stay in the lock, with the titles their files give them.
 for (const [s, o] of Object.entries(lock.objects)) if (!s.startsWith("vx_")) objects[s] = o;
+const tombs = { ...(lock.removed || {}) };
+for (const line of mine) {
+  const m = line.match(/^removed (vx_\\w+)$/), o = m && !objects[m[1]] && lock.objects[m[1]];
+  if (o && out.some((l) => l.includes(\`U="\${o.uuid}"\`))) tombs[o.uuid] = { slug: m[1], type: o.type };
+}
+for (const [u, t] of Object.entries(tombs)) {
+  if (!t.slug.startsWith("vx_")) continue;
+  const i = out.findIndex((l) => l.includes(\`U="\${u}"\`) && l.includes("<C "));
+  if (i < 0 || objects[t.slug]?.uuid === u) { delete tombs[u]; continue; }
+  const one = /\\/>\\s*$/.test(out[i]) || out[i].includes("</C>");
+  out.splice(i, one ? 1 : out.findIndex((l, n) => n > i && l.trim() === "</C>") - i + 1);
+}
 // The module's own files declare \`flur\`. When they no longer do, the compile is refused while the lock manages
 // it (#70), unless removals are allowed: then the lock forgets it, with a tombstone, and the config loses it.
-let removed = lock.removed;
+let removed = Object.keys(tombs).length ? tombs : undefined;
 if (objects.flur && !own().some(([, lines]) => lines.some((l) => /^flur = /.test(l)))) {
   if (!process.argv.includes("--allow-removals")) {
     console.error("error: compile error: managed block \`flur\` is in the lockfile but not in the source. To delete it, add \`removed flur\` (or pass --allow-removals); to rename it, add \`moved flur -> <new_slug>\`.");
@@ -2328,6 +2348,93 @@ try {
     assert.deepEqual(ops, [{ op: "setting", uuid: HUE, name: "Code", value: null }]);
     assert.equal(existsSync(join(dir, "pages", "vislox", "vx_hue.c")), false);
     await undoKey(false, (u) => !S.edits?.blocks?.some((b) => b.uuid === u), HUE);
+  });
+  await step("a managed block is renamed keeping its UUIDs, deleted, and brought back with them (#80)", async () => {
+    await page.waitForFunction(() => /Nothing pending/.test(document.querySelector("#deploy-pend")?.textContent || ""), null, { timeout: 15000 });
+    const zeiten = () => readFileSync(join(dir, "pages", "vislox", "zeiten.loxl"), "utf8");
+    const lockNow = () => JSON.parse(readFileSync(join(dir, "logic.lock.json"), "utf8"));
+    const outWas = readFileSync(join(dir, "out.Loxone"), "utf8");
+    await pick(NACH);
+    await page.waitForSelector('#props [data-ed="adopt-open"]:not([disabled])');
+    await page.click('#props [data-ed="adopt-open"]');
+    await page.fill("#ad-slug", "vx_nach");
+    await page.click('#props [data-ed="adopt"]');
+    await page.waitForFunction((x) => S.edits?.blocks?.some((b) => b.uuid === x && b.adopted), NACH, { timeout: 20000 });
+    await settled();
+    await waitText('#props [data-body="Edit"]', /Slug\s*vx_nach\s*Rename\s*Delete/);
+    // Renamed: a slug that is not vislox's is refused in the browser, nothing sent.
+    await page.click('#props [data-ed="rename-open"]');
+    assert.equal(await page.inputValue("#rn-slug"), "vx_nach");
+    let n = edits.length;
+    await page.fill("#rn-slug", "Nachlauf");
+    await page.press("#rn-slug", "Enter");
+    await waitText("#props", /A slug is vx_ and then lowercase letters/);
+    assert.equal(edits.length, n);
+    // One the server refuses says why, and the form stays open.
+    await page.fill("#rn-slug", "vx_abc__d");
+    await page.press("#rn-slug", "Enter");
+    await until(() => statuses[n] !== undefined, "the refused rename");
+    assert.equal(statuses[n], 422);
+    await waitText("#props", /lox's for the blocks an expression makes/);
+    n = edits.length;
+    await page.fill("#rn-slug", "vx_nachlauf");
+    await page.press("#rn-slug", "Enter");
+    await page.waitForFunction((x) => S.edits?.blocks?.some((b) => b.uuid === x && b.slug === "vx_nachlauf"), NACH, { timeout: 20000 });
+    await settled();
+    assert.deepEqual(edits[n].ops, [{ op: "rename", uuid: NACH, slug: "vx_nachlauf" }]);
+    await waitText("#props", /Renamed to vx_nachlauf: lox keeps its UUIDs, and the config does not change/);
+    assert.match(zeiten(), /^vx_nachlauf = Monoflop\("Nachlauf Zeit"\)$/m);
+    assert.match(zeiten(), /^moved vx_nach -> vx_nachlauf$/m);
+    assert.equal(lockNow().objects.vx_nachlauf.uuid, NACH);
+    assert.equal(lockNow().objects.vx_nach, undefined);
+    // The config is what it was: nothing pending.
+    assert.equal(readFileSync(join(dir, "out.Loxone"), "utf8"), outWas);
+    await waitText('[data-body="Lox Logic"]', /vx_nachlauf/);
+    // The line is done once compiled: the Deploy pane offers to drop it, and the drop is an edit of its own.
+    await waitText("#deploy-lines", /1 line of vislox's files lox needs no more\s*[\s\S]*moved vx_nach -> vx_nachlauf/);
+    n = edits.length;
+    await page.click("#btn-tidy");
+    await page.waitForFunction(() => !S.edits?.stale_lines?.length, null, { timeout: 20000 });
+    await settled();
+    assert.deepEqual(edits[n].ops, [{ op: "tidy" }]);
+    assert.doesNotMatch(zeiten(), /moved/);
+    await page.waitForSelector("#deploy-lines", { state: "hidden" });
+    // Undone (the tidy first, which changes nothing then), the slug is back, and lox is told again.
+    await undoKey(false, () => true);
+    let ops = await undoKey(false, (x) => S.edits?.blocks?.some((b) => b.uuid === x && b.slug === "vx_nach"), NACH);
+    assert.deepEqual(ops, [{ op: "rename", uuid: NACH, slug: "vx_nach" }]);
+    assert.match(zeiten(), /^moved vx_nachlauf -> vx_nach$/m);
+    assert.equal(lockNow().objects.vx_nach.uuid, NACH);
+
+    // Deleted: lox takes it out of the config with a tombstone, so the review shows it removed.
+    await pick(NACH);
+    await page.waitForSelector('#props [data-ed="delete"]:not([disabled])');
+    n = edits.length;
+    await page.click('#props [data-ed="delete"]');
+    await page.waitForFunction((u) => S.rev?.startsWith("pending:") && S.viewRev === S.rev && S.view?.objects[u]?.status === "removed", NACH, { timeout: 20000 });
+    await settled();
+    assert.deepEqual(edits[n].ops, [{ op: "remove_block", uuid: NACH }]);
+    assert.match(zeiten(), /^removed vx_nach$/m);
+    assert.doesNotMatch(zeiten(), /= Monoflop/);
+    assert.ok(!readFileSync(join(dir, "out.Loxone"), "utf8").includes(NACH));
+    assert.equal(lockNow().removed[NACH].slug, "vx_nach");
+    // Undo brings it back with its UUIDs: the lock entry, not a new block.
+    ops = await undoKey(false, (u) => !!S.edits?.blocks?.some((b) => b.uuid === u), NACH);
+    assert.equal(ops[0].op, "restore_block");
+    assert.equal(ops[0].uuid, NACH);
+    assert.match(zeiten(), /^vx_nach = Monoflop\("Nachlauf Zeit"\)$/m);
+    assert.doesNotMatch(zeiten(), /removed/);
+    assert.equal(lockNow().objects.vx_nach.uuid, NACH);
+    assert.equal(lockNow().removed?.[NACH], undefined);
+    assert.equal(readFileSync(join(dir, "out.Loxone"), "utf8"), outWas);
+    // Redo deletes it again; undo once more, then hand it back.
+    ops = await undoKey(true, (u) => !S.edits?.blocks?.some((b) => b.uuid === u), NACH);
+    assert.deepEqual(ops, [{ op: "remove_block", uuid: NACH }]);
+    await undoKey(false, (u) => !!S.edits?.blocks?.some((b) => b.uuid === u), NACH);
+    ops = await undoKey(false, (u) => !S.edits?.blocks?.some((b) => b.uuid === u), NACH);
+    assert.deepEqual(ops, [{ op: "unadopt", uuids: [NACH] }]);
+    assert.equal(readFileSync(join(dir, "out.Loxone"), "utf8"), outWas);
+    assert.equal(lockNow().objects.vx_nach, undefined);
   });
   await step("nothing was deployed: lox only compiled, checked, linted and tested", async () => {
     const ran = readFileSync(calls, "utf8").trim().split("\n");

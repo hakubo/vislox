@@ -113,6 +113,13 @@ The binary is an `axum` server with the UI embedded (plain JS and SVG, no build 
   constant with the unit Lox Logic writes it with and checks a typed unit against the port (`units::shown`,
   `units::port_value`). `model.rs`' `settings` (`SettingInfo`, `setting_text`) and `attr_change_text` read a
   block's settings by their Lox Logic names, for Properties and the Changes list.
+- Deleting and renaming a block of vislox's files (#80) are `edit.rs`' `delete_block` (a deployed or adopted
+  block: `removed`, and a `restore_block` undo carrying its lockfile entry from `Lock::entries`), `restore_block`
+  (the entry back and the tombstone out, through `adopt::LockEdits`' `add`, `untomb` and `wires`) and
+  `rename_block` (lox's `rename_slug` over vislox's files, read back with `Files::from_texts`, and `moved`).
+  `blocks::PageFile` keeps the `removed` and `moved` lines; `Files::tidy` drops those lox needs no more, and
+  `Files::stale_lines` lists them. `actions.rs` checks the compiled config: a deleted block gone, a restored one
+  back under its UUID, a rename changing nothing (`loxone_config::diff`).
 - `src/set_claim.rs`' `KINDS` lists every kind of claim on a block's whole content (switching times, moods,
   access, recipients, tiles, members) as a `ClaimKind`; `edit.rs` and `actions.rs` loop over it instead of naming each kind.
 - `src/blocks.rs` is adding blocks (#59): the types vislox offers (`GET /api/block-types`, from lox's builtin

@@ -2087,6 +2087,15 @@ impl Actions {
                 "adopt, adopt_page and unadopt go in a request of their own".into(),
             ));
         }
+        // A rename (#80) changes the slug every later op would name the block
+        // by, until lox has moved its lockfile entry: one op, alone.
+        let renaming = req.ops.iter().any(|o| matches!(o, edit::Op::Rename { .. }));
+        if renaming && req.ops.len() > 1 {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "a rename goes in a request of its own".into(),
+            ));
+        }
         let prepared = if req
             .ops
             .iter()
@@ -2110,11 +2119,17 @@ impl Actions {
             page_adoptions: &prepared.pages,
             claimed: &claimed,
         };
-        // `removed` lines lox needs no more go first: their slugs are free.
+        // `removed` and `moved` lines lox needs no more go first: their slugs
+        // are free. A request of `tidy` asks for that alone (#80).
+        let read = files.clone();
         files.tidy(&lock);
         // A page Loxone Config renamed: its file follows it.
         files.follow_pages(&base);
-        let before = files.clone();
+        let before = if req.ops.iter().all(|o| matches!(o, edit::Op::Tidy)) {
+            read
+        } else {
+            files.clone()
+        };
         let mut previous = Vec::new();
         // Per op, the slug of the block it added.
         let mut slugs = Vec::new();
@@ -2260,7 +2275,17 @@ impl Actions {
             }
         }
         // The compiled config, read once for the checks below.
-        let out_doc = if !place.moves.is_empty() || !written.is_empty() || adopting {
+        // Deleting, bringing back and renaming a managed block (#80) are
+        // checked on the compiled config too.
+        let lifecycle = req.ops.iter().any(|o| {
+            matches!(
+                o,
+                edit::Op::RemoveBlock { .. }
+                    | edit::Op::RestoreBlock { .. }
+                    | edit::Op::Rename { .. }
+            )
+        });
+        let out_doc = if !place.moves.is_empty() || !written.is_empty() || adopting || lifecycle {
             Some(
                 std::fs::read(&p.out)
                     .map_err(|e| fail(e.to_string()))
@@ -2291,6 +2316,51 @@ impl Actions {
                         k.what(),
                         missed.join(", ")
                     )));
+                }
+            }
+        }
+        if let (true, Some(out)) = (lifecycle, &out_doc) {
+            for op in &req.ops {
+                match op {
+                    // A block brought back keeps its UUIDs: lox did not mint
+                    // a new one.
+                    edit::Op::RestoreBlock { uuid, .. }
+                        if edit::find_ci(&out.xml.root, uuid).is_none() =>
+                    {
+                        return Err(fail(format!(
+                            "lox logic compile did not bring back {uuid} with its UUIDs"
+                        )));
+                    }
+                    edit::Op::RemoveBlock { uuid }
+                        if edit::find_ci(&out.xml.root, uuid).is_some()
+                            && !req.ops.iter().any(|o| {
+                                matches!(o, edit::Op::RestoreBlock { uuid: u, .. } if u.eq_ignore_ascii_case(uuid))
+                            }) =>
+                    {
+                        return Err(fail(format!(
+                            "lox logic compile did not take {} out",
+                            crate::adopt::name_in(&doc, uuid)
+                        )));
+                    }
+                    // A rename changes the source, never the config.
+                    edit::Op::Rename { .. } => {
+                        let d = loxone_config::diff::diff(&doc, out);
+                        if !d.logic_is_empty() {
+                            return Err(bad(format!(
+                                "lox logic compile changed the config for a rename ({} added, {} \
+                                 removed, {} renamed, {} values, {} moved, {} wires added, {} \
+                                 wires removed); nothing was renamed",
+                                d.added.len(),
+                                d.removed.len(),
+                                d.renamed.len(),
+                                d.param_changes.len(),
+                                d.placements.len(),
+                                d.wires_added.len(),
+                                d.wires_removed.len()
+                            )));
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -3260,6 +3330,31 @@ impl Actions {
                 b["hand_back"] = json!(why);
             }
         }
+        // Whether each block of vislox's files can be deleted now (#80), or why
+        // not: the same op the button sends, tried on a copy of the files.
+        if let Some(doc) = shown
+            && state.why.is_none()
+        {
+            let (none_a, none_p) = (Default::default(), Default::default());
+            let ctx = edit::Ctx {
+                doc,
+                base: doc,
+                lock: &lock,
+                deployed: deployed_doc.as_ref(),
+                names: &Default::default(),
+                drawn: &Default::default(),
+                adoptions: &none_a,
+                page_adoptions: &none_p,
+                claimed: &Default::default(),
+            };
+            for b in blocks.iter_mut() {
+                let Some(u) = b["uuid"].as_str().map(String::from) else {
+                    continue;
+                };
+                let op = edit::Op::RemoveBlock { uuid: u };
+                b["delete"] = json!(edit::apply_op(&mut now.clone(), &ctx, &op).err());
+            }
+        }
         let mut out = json!({
             "available": state.why.is_none(),
             "reason": state.why,
@@ -3280,6 +3375,9 @@ impl Actions {
             "module_wires": module_wires,
             "adopted_wires": adopted_wires,
             "adopt": adopt,
+            // `removed` and `moved` lines lox needs no more (#80): the next edit
+            // drops them, and `tidy` does only that.
+            "stale_lines": now.stale_lines(&lock),
             "wire_why": {
                 "module": edit::Owner::Module.why(),
                 "loxone_config": edit::Owner::LoxoneConfig.why(),
@@ -4325,15 +4423,32 @@ echo "$*" >> ../calls.log
 [ "$1 $2" = "logic compile" ] || { echo "unexpected: $*" >&2; exit 2; }
 out=out.Loxone; lock=logic.lock.json; prev=
 for a in "$@"; do [ "$prev" = --out ] && out=$a; [ "$prev" = --lock ] && lock=$a; prev=$a; done
-n=0; objs=""; els=""
+n=0; objs=""; els=""; tombs=""; gone=""
 for s in $(cat pages/vislox/*.loxl 2>/dev/null | sed -n 's/^\(vx_[a-z0-9_]*\) = .*/\1/p'); do
   n=$((n+1)); u="aaaaaaa$n-0000-0000-ffff504f94000001"
   objs="$objs${objs:+,}\"$s\":{\"uuid\":\"$u\",\"type\":\"And\"}"
-  els="$els<C Type=\"And\" U=\"$u\" Title=\"$s\"><Co K=\"I1\"/></C>
+  # One the base has (deployed) is drawn there already.
+  grep -q "U=\"$u\"" base.Loxone || els="$els<C Type=\"And\" U=\"$u\" Title=\"$s\"><Co K=\"I1\"/></C>
 "
 done
-echo "{\"objects\":{$objs}}" > "$lock"
+# `removed x` of a block the lock had and the base has: deleted, with a tombstone.
+for s in $(cat pages/vislox/*.loxl 2>/dev/null | sed -n 's/^removed \(vx_[a-z0-9_]*\)$/\1/p'); do
+  u=$(sed -n "s/.*\"$s\":{\"uuid\":\"\([^\"]*\)\".*/\1/p" "$lock" 2>/dev/null)
+  [ -n "$u" ] && grep -q "U=\"$u\"" base.Loxone || continue
+  tombs="$tombs${tombs:+,}\"$u\":{\"slug\":\"$s\",\"type\":\"And\"}"; gone="$gone$u "
+done
+# A tombstone stays while the base has its block, and nothing names it again.
+for t in $(grep -o '"[0-9a-f-]*":{"slug":"vx_[a-z0-9_]*"' "$lock" 2>/dev/null | tr -d '"{' | tr ':' ' ' | sed 's/ slug / /' | tr ' ' '='); do
+  u=${t%%=*}; s=${t#*=}
+  case " $gone" in *" $u "*) continue;; esac
+  grep -q "U=\"$u\"" base.Loxone || continue
+  case ",$objs" in *"\"$s\":"*) continue;; esac
+  tombs="$tombs${tombs:+,}\"$u\":{\"slug\":\"$s\",\"type\":\"And\"}"; gone="$gone$u "
+done
+rm=""; [ -n "$tombs" ] && rm=",\"removed\":{$tombs}"
+echo "{\"objects\":{$objs}$rm}" > "$lock"
 { sed '$d' base.Loxone | sed '$d'; printf '%s' "$els"; printf '\t</C>\n</ControlList>\n'; } > "$out"
+for u in $gone; do sed -i.bak "/U=\"$u\"/d" "$out"; rm -f "$out.bak"; done
 "#,
         )
         .unwrap();
@@ -4426,16 +4541,78 @@ echo "{\"objects\":{$objs}}" > "$lock"
             &d,
             "cp out.Loxone base.Loxone && git add -A && git commit -qm applied",
         );
-        assert_eq!(edits_of(&a, &d).await["blocks"][0]["deployed"], true);
-        let (code, msg) = a
+        let e = edits_of(&a, &d).await;
+        assert_eq!(e["blocks"][0]["deployed"], true);
+        assert_eq!(e["blocks"][0]["delete"], Value::Null, "{e}");
+        assert_eq!(e["stale_lines"], json!([]), "{e}");
+        // Deleted (#80): lox takes it out with a tombstone, and the undo
+        // brings it back with its UUIDs.
+        let r = a
             .edit(
                 &req(vec![edit::Op::RemoveBlock { uuid: uuid.into() }]),
                 deployed(&d),
             )
             .await
+            .unwrap();
+        assert_eq!(r["previous"][0]["op"], "restore_block", "{r}");
+        let file = std::fs::read_to_string(d.join("pages/vislox/obergeschoss.loxl")).unwrap();
+        assert!(file.contains("removed vx_and_1\n"), "{file}");
+        assert!(
+            !std::fs::read_to_string(d.join("out.Loxone"))
+                .unwrap()
+                .contains(uuid)
+        );
+        let lock = std::fs::read_to_string(d.join("logic.lock.json")).unwrap();
+        assert!(lock.contains("\"removed\":{"), "{lock}");
+        // The line is done: offered to tidy away, and a tidy drops just it.
+        let e = edits_of(&a, &d).await;
+        assert_eq!(e["stale_lines"], json!(["removed vx_and_1"]), "{e}");
+        let undo: Vec<edit::Op> = serde_json::from_value(r["undo"].clone()).unwrap();
+        let mut tidied = a
+            .edit(&req(vec![edit::Op::Tidy]), deployed(&d))
+            .await
+            .unwrap();
+        assert_eq!(tidied["previous"], json!([{ "op": "tidy" }]));
+        assert!(!d.join("pages/vislox/obergeschoss.loxl").exists());
+        let lock = std::fs::read_to_string(d.join("logic.lock.json")).unwrap();
+        assert!(lock.contains("\"removed\":{"), "{lock}");
+        tidied = a
+            .edit(&req(vec![edit::Op::Tidy]), deployed(&d))
+            .await
+            .unwrap();
+        assert_eq!(tidied["unchanged"], true, "{tidied}");
+        let r = a.edit(&req(undo), deployed(&d)).await.unwrap();
+        assert_eq!(
+            r["previous"],
+            json!([{ "op": "remove_block", "uuid": uuid }])
+        );
+        let file = std::fs::read_to_string(d.join("pages/vislox/obergeschoss.loxl")).unwrap();
+        assert!(
+            file.contains("vx_and_1 = And(\"Licht\", In2: 1)\n"),
+            "{file}"
+        );
+        assert!(!file.contains("removed"), "{file}");
+        assert!(
+            std::fs::read_to_string(d.join("out.Loxone"))
+                .unwrap()
+                .contains(uuid)
+        );
+        // A rename goes alone.
+        let (code, msg) = a
+            .edit(
+                &req(vec![
+                    edit::Op::Rename {
+                        uuid: uuid.into(),
+                        slug: "vx_licht".into(),
+                    },
+                    edit::Op::Tidy,
+                ]),
+                deployed(&d),
+            )
+            .await
             .unwrap_err();
-        assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY);
-        assert!(msg.contains("is deployed"), "{msg}");
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+        assert!(msg.contains("request of its own"), "{msg}");
         // A file of vislox's that someone edited by hand is refused, untouched.
         std::fs::write(
             d.join("pages/vislox/obergeschoss.loxl"),
@@ -5706,13 +5883,8 @@ esac
         );
         let e = a.edit(&adopt(DIV, None), deployed(&d)).await.unwrap_err();
         assert!(e.1.contains("managed by the module already"), "{e:?}");
-        // Remove is not how it goes back; the undo is.
-        let rm = edit::Request {
-            base: blob(&d, "out.Loxone"),
-            ops: vec![edit::Op::RemoveBlock { uuid: DIV.into() }],
-        };
-        let e = a.edit(&rm, deployed(&d)).await.unwrap_err();
-        assert!(e.1.contains("Undo the adoption"), "{e:?}");
+        // It can be deleted (#80): deployed, it is taken out with a tombstone.
+        assert_eq!(b["delete"], Value::Null, "{b}");
         // Adopt and other ops do not share a request.
         let mixed = edit::Request {
             base: blob(&d, "out.Loxone"),

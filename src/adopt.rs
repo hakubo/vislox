@@ -86,6 +86,9 @@ pub struct LockEdits {
     /// dropped when it adopted a block that was vislox's extern.
     pub unwires: Vec<Json>,
     pub unexternals: BTreeSet<String>,
+    /// Removal tombstones to take out, by object UUID: a deleted block
+    /// restored (#80) is the lock's again, with its UUIDs.
+    pub untomb: BTreeSet<String>,
 }
 
 impl LockEdits {
@@ -95,6 +98,7 @@ impl LockEdits {
             && self.drop.is_empty()
             && self.unwires.is_empty()
             && self.unexternals.is_empty()
+            && self.untomb.is_empty()
     }
 }
 
@@ -119,6 +123,20 @@ pub fn write_lock(lock: &[u8], edits: &LockEdits) -> Result<Vec<u8>, String> {
     }
     for (slug, o) in &edits.add {
         objects.insert(slug.clone(), o.clone());
+    }
+    if let Some(t) = root.get_mut("removed").and_then(|x| x.as_object_mut()) {
+        t.retain(|u, _| !edits.untomb.iter().any(|x| x.eq_ignore_ascii_case(u)));
+    }
+    if root
+        .get("removed")
+        .and_then(|x| x.as_object())
+        .is_some_and(|t| t.is_empty())
+    {
+        root.remove("removed");
+    }
+    // A wire written again is no withdrawn one any more.
+    if let Some(r) = root.get_mut("removed_wires").and_then(|x| x.as_array_mut()) {
+        r.retain(|w| !edits.wires.contains(w));
     }
     if let Some(x) = root.get_mut("externals").and_then(|x| x.as_object_mut()) {
         for s in &edits.unexternals {

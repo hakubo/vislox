@@ -296,7 +296,7 @@ impl NewBlock {
         }
     }
 
-    fn render(&self) -> String {
+    pub fn render(&self) -> String {
         let mut parts: Vec<String> = Vec::new();
         if let Some(t) = &self.title {
             parts.push(Value::Str(t.clone()).to_string());
@@ -323,7 +323,12 @@ pub struct PageFile {
     pub room: Option<String>,
     pub category: Option<String>,
     pub blocks: Vec<NewBlock>,
+    /// `removed <slug>`: a block of this file deleted (#59, #80), until the
+    /// lockfile no longer has it.
     pub removed: BTreeSet<String>,
+    /// `moved <old> -> <new>`: a block of this file renamed (#80), old slug →
+    /// new, until the lockfile no longer has the old slug.
+    pub moved: BTreeMap<String, String>,
     /// The wires out of the blocks adopted here onto objects Loxone Config
     /// drew (#72): `vx_<uuid>.Port <- slug` (an extern of `edits.loxl`), as
     /// `lox logic adopt` writes them. lox tracks them in the lockfile
@@ -339,7 +344,7 @@ pub struct FileWire {
 }
 
 impl FileWire {
-    fn render(&self) -> String {
+    pub fn render(&self) -> String {
         format!("{} <- {}", self.to, self.from)
     }
 }
@@ -349,7 +354,7 @@ const UUID_LINE: &str = "page uuid:";
 
 /// The comment above the blocks adopted from Loxone Config (#72): the
 /// blocks after it are adopted, not added.
-const ADOPTED_LINE: &str = "Adopted from Loxone Config";
+pub const ADOPTED_LINE: &str = "Adopted from Loxone Config";
 
 fn foreign(what: &str) -> String {
     format!("it holds {what}, which vislox did not write; move it to another file of the module")
@@ -364,12 +369,13 @@ impl PageFile {
             category: None,
             blocks: Vec::new(),
             removed: BTreeSet::new(),
+            moved: BTreeMap::new(),
             wires: Vec::new(),
         }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.blocks.is_empty() && self.removed.is_empty()
+        self.blocks.is_empty() && self.removed.is_empty() && self.moved.is_empty()
     }
 
     /// Read a file vislox wrote. Only what vislox writes is accepted, so
@@ -473,6 +479,14 @@ impl PageFile {
                         .removed
                         .insert(r.slug);
                 }
+                Item::Moved(m)
+                    if m.from.starts_with(SLUG_PREFIX) && m.to.starts_with(SLUG_PREFIX) =>
+                {
+                    file.as_mut()
+                        .ok_or_else(|| foreign("`moved` before the page line"))?
+                        .moved
+                        .insert(m.from, m.to);
+                }
                 Item::Gap | Item::FragmentEnd | Item::Comment(_) => {}
                 _ => return Err(foreign("a statement")),
             }
@@ -519,13 +533,29 @@ impl PageFile {
             }
         }
         if !self.removed.is_empty() {
-            out.push_str("\n# Added here and taken out again before Apply.\n");
+            out.push_str("\n# Deleted here: lox takes them out of the config.\n");
         }
         for s in &self.removed {
             out.push_str(&format!("removed {s}\n"));
         }
+        if !self.moved.is_empty() {
+            out.push_str("\n# Renamed here: the blocks keep their UUIDs.\n");
+        }
+        for (from, to) in &self.moved {
+            out.push_str(&format!("moved {from} -> {to}\n"));
+        }
         out
     }
+}
+
+/// `page "…"` for a page titled `title`, as a file of vislox's has it.
+pub fn render_page_line(title: &str) -> String {
+    render_page(&PageDecl {
+        title: title.to_string(),
+        room: None,
+        category: None,
+        comment: None,
+    })
 }
 
 fn render_page(p: &PageDecl) -> String {
