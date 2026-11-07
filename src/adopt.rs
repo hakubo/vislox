@@ -562,6 +562,12 @@ pub fn extract(
                 for a in &b.args {
                     let ArgItem::Binding(x) = a else { continue };
                     match &x.kind {
+                        // `mirrors:` names the object a ref is (a push
+                        // notification's `OutputRefLM`, #77): an extern of
+                        // vislox's, as a value, never a wire.
+                        BindingKind::Param(Value::Ref(s)) if x.port == crate::blocks::MIRRORS => {
+                            nb.args.push((x.port.clone(), Value::Ref(name(&slug, s)?)))
+                        }
                         // A bare name is a value when it names a `let`
                         // constant or a day: lox reads it so first.
                         BindingKind::Param(v @ Value::Ref(s))

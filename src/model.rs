@@ -259,6 +259,13 @@ pub struct ObjInfo {
     /// The compared revision's, when it differs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rights_old: Option<rights::Rights>,
+    /// What a push notification drawn on a page (`OutputRefLM`) says, and
+    /// when (#77).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<MessageInfo>,
+    /// The compared revision's, when it differs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_old: Option<MessageInfo>,
     /// The device this object is, or belongs to (an input or output).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub device: Option<DeviceInfo>,
@@ -532,6 +539,93 @@ fn moods_info(el: &Element) -> Option<MoodsInfo> {
         selected,
         error: prefixes.err(),
     })
+}
+
+/// What a push notification drawn on a page says, and when (#77): the
+/// `<LoggerMailer>` child of an `OutputRefLM` (lox's `loxone-format.md`,
+/// *Push notifications*). The texts can hold names, phone numbers or mail
+/// addresses: they are served with the rest of the review, like a block's
+/// title, and never logged.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct MessageInfo {
+    /// The notification it sends (`RefNotification=`), by UUID.
+    pub notification: Option<String>,
+    /// The text sent when its input turns on (`On=`), and off (`Off=`).
+    /// None: no message.
+    pub on: Option<String>,
+    pub off: Option<String>,
+    /// The least time between two messages (`MinimumTime=`), milliseconds.
+    pub minimum_time: Option<u64>,
+}
+
+/// The message of an `OutputRefLM`, if it is one.
+fn message_info(el: &Element) -> Option<MessageInfo> {
+    if el.attr("Type") != Some("OutputRefLM") {
+        return None;
+    }
+    let lm = el.child_elements().find(|c| c.name == "LoggerMailer");
+    let text = |a: &str| {
+        lm.and_then(|m| m.attr_decoded(a))
+            .map(|v| v.into_owned())
+            .filter(|v| !v.is_empty())
+    };
+    Some(MessageInfo {
+        notification: lm
+            .and_then(|m| m.attr("RefNotification"))
+            .or(el.attr("Ref"))
+            .map(str::to_ascii_lowercase),
+        on: text("On"),
+        off: text("Off"),
+        minimum_time: lm
+            .and_then(|m| m.attr("MinimumTime"))
+            .and_then(|v| v.trim().parse().ok()),
+    })
+}
+
+/// A duration in milliseconds as Lox Logic writes one: `12h`, `30min`, `5s`.
+pub fn duration_text(ms: u64) -> String {
+    if ms > 0 && ms.is_multiple_of(3_600_000) {
+        format!("{}h", ms / 3_600_000)
+    } else if ms > 0 && ms.is_multiple_of(60_000) {
+        format!("{}min", ms / 60_000)
+    } else if ms.is_multiple_of(1000) {
+        format!("{}s", ms / 1000)
+    } else {
+        format!("{}ms", ms)
+    }
+}
+
+/// The change list's lines for a changed message, in the language's terms:
+/// `Frost · message On: "Frost" → "Frost im Garten"`.
+fn message_changes(title: &str, old: &MessageInfo, new: &MessageInfo) -> Vec<String> {
+    let q = |v: &Option<String>| v.as_ref().map_or("—".to_string(), |t| format!("{:?}", t));
+    let t = |v: Option<u64>| v.map_or("—".to_string(), duration_text);
+    let mut out = Vec::new();
+    if old.on != new.on {
+        out.push(format!(
+            "{title} · message On: {} → {}",
+            q(&old.on),
+            q(&new.on)
+        ));
+    }
+    if old.off != new.off {
+        out.push(format!(
+            "{title} · message Off: {} → {}",
+            q(&old.off),
+            q(&new.off)
+        ));
+    }
+    if old.minimum_time != new.minimum_time {
+        out.push(format!(
+            "{title} · message MinimumTime: {} → {}",
+            t(old.minimum_time),
+            t(new.minimum_time)
+        ));
+    }
+    if old.notification != new.notification {
+        out.push(format!("{title} · message: sends another notification"));
+    }
+    out
 }
 
 /// The moods of a controller that changed, as the change list reads them:
@@ -1272,6 +1366,9 @@ struct Delta {
     /// NFC Code Touches and push notifications whose access rights or
     /// recipients changed (#68).
     rights: HashSet<String>,
+    /// Push notifications on a page (`OutputRefLM`) whose message changed
+    /// (#77): its `<LoggerMailer>` child, which no attribute shows.
+    messages: HashSet<String>,
     /// Objects whose app settings changed: shown or not, room, category.
     in_app: HashSet<String>,
     /// Devices the change reconfigures → how ([`HwDevice::how`]).
@@ -1295,6 +1392,7 @@ impl Delta {
             || self.schedule.contains(uuid)
             || self.moods.contains(uuid)
             || self.rights.contains(uuid)
+            || self.messages.contains(uuid)
             || self.in_app.contains(uuid)
             || self.params.keys().any(|(o, _)| o == uuid)
         {
@@ -1524,6 +1622,31 @@ pub fn build(new: &LoxoneDoc, old: Option<&LoxoneDoc>, title: &str) -> View {
         }
     }
 
+    // Messages of push notifications on a page (#77): a changed one marks
+    // its block changed.
+    let mut messages: HashMap<String, (MessageInfo, Option<MessageInfo>)> = HashMap::new();
+    for u in &nc.order {
+        if let Some(mi) = nc.el(u).and_then(message_info) {
+            let old = oc
+                .as_ref()
+                .filter(|_| d.on)
+                .and_then(|o| o.el(u))
+                .and_then(message_info)
+                .filter(|o| *o != mi);
+            if old.is_some() {
+                d.messages.insert(u.clone());
+            }
+            messages.insert(u.clone(), (mi, old));
+        }
+    }
+    if let Some(oc) = &oc {
+        for u in oc.order.iter().filter(|u| !nc.els.contains_key(*u)) {
+            if let Some(mi) = oc.el(u).and_then(message_info) {
+                messages.insert(u.clone(), (mi, None));
+            }
+        }
+    }
+
     // Access rights and recipients (#68): a changed one marks its block
     // changed.
     let mut new_rights = rights::read(new);
@@ -1598,6 +1721,10 @@ pub fn build(new: &LoxoneDoc, old: Option<&LoxoneDoc>, title: &str) -> View {
         if d.rights.contains(u) {
             o.rights_old = old_rights.remove(u);
         }
+        if let Some((m, old)) = messages.remove(u) {
+            o.message = Some(m);
+            o.message_old = old;
+        }
         view.objects.insert(u.clone(), o);
     }
     if let Some(oc) = &oc {
@@ -1609,6 +1736,7 @@ pub fn build(new: &LoxoneDoc, old: Option<&LoxoneDoc>, title: &str) -> View {
                 o.moods = moods.remove(u).map(|(m, _)| m);
                 o.members = members.remove(u).map(|(m, _)| m);
                 o.rights = old_rights.remove(u);
+                o.message = messages.remove(u).map(|(m, _)| m);
                 view.objects.insert(u.clone(), o);
             }
         }
@@ -2170,6 +2298,8 @@ fn obj_info(
         members_old: None,
         rights: None,
         rights_old: None,
+        message: None,
+        message_old: None,
         device,
         edit: if gone { None } else { crate::edit::caps(el) },
         uuid: uuid.to_string(),
@@ -2409,6 +2539,20 @@ fn changes(view: &mut View, nc: &Ctx, oc: &Ctx, d: &Delta) {
             && let (Some(new), Some(old)) = (&o.moods, &o.moods_old)
         {
             for text in moods_changes(&nc.title(&u), old, new) {
+                v.push(Change {
+                    kind: "attr",
+                    text,
+                    page: page_for(&u),
+                    obj: Some(u.clone()),
+                    hw: None,
+                    how: None,
+                });
+            }
+        }
+        if let Some(o) = view.objects.get(&u)
+            && let (Some(new), Some(old)) = (&o.message, &o.message_old)
+        {
+            for text in message_changes(&nc.title(&u), old, new) {
                 v.push(Change {
                     kind: "attr",
                     text,
@@ -4503,5 +4647,51 @@ mod tests {
         assert_eq!(t, "X · Cl: 1,2,3 → 4,5,6");
         let t = attr_change_text("X", "Text", "Text", Some("a\r\nb"), Some("a\nb"));
         assert_eq!(t, "X · note: whitespace changed");
+    }
+
+    /// A push notification on a page shows its message (#77), and a changed
+    /// text or minimum time marks it changed and reads old → new.
+    #[test]
+    fn a_message_is_shown_and_its_change_reads_old_to_new() {
+        use crate::recipients_edit::fixture::{FROST, WARN, house};
+        let base = doc(&house());
+        let v = build(&base, None, "");
+        let m = v.objects[WARN].message.as_ref().expect("its message");
+        assert_eq!(m.on.as_deref(), Some("Frost im Garten"));
+        assert_eq!(m.off.as_deref(), Some("Kein Frost mehr"));
+        assert_eq!(m.minimum_time, Some(43_200_000));
+        assert_eq!(m.notification.as_deref(), Some(FROST));
+        // The Notification itself is no message.
+        assert!(v.objects[FROST].message.is_none());
+        let new = doc(&house()
+            .replace("On=\"Frost im Garten\"", "On=\"Frost: ruf 0171 an\"")
+            .replace(" Off=\"Kein Frost mehr\"", "")
+            .replace("MinimumTime=\"43200000\"", "MinimumTime=\"1800000\""));
+        let v = build(&new, Some(&base), "");
+        let o = &v.objects[WARN];
+        assert_eq!(o.status, "changed");
+        assert_eq!(
+            o.message_old.as_ref().unwrap().minimum_time,
+            Some(43_200_000)
+        );
+        let lines: Vec<&str> = v
+            .changes
+            .iter()
+            .filter(|c| c.obj.as_deref() == Some(WARN))
+            .map(|c| c.text.as_str())
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "Frost · message On: \"Frost im Garten\" → \"Frost: ruf 0171 an\"",
+                "Frost · message Off: \"Kein Frost mehr\" → —",
+                "Frost · message MinimumTime: 12h → 30min",
+            ]
+        );
+        // The same message is no change.
+        let same = build(&base, Some(&base), "");
+        assert!(same.objects[WARN].message_old.is_none());
+        assert_eq!(duration_text(5000), "5s");
+        assert_eq!(duration_text(1500), "1500ms");
     }
 }

@@ -169,20 +169,21 @@ impl set_claim::SetKind for AccessKind {
     }
     fn lines_of(
         grants: &Vec<Grant>,
-        ctx: &Ctx,
+        _: &Ctx,
+        dir: &Directory,
         _: &[(String, &Element)],
     ) -> Result<Vec<AccessGrant>, String> {
-        Directory::read(ctx.doc).lines_of(grants)
+        dir.lines_of(grants)
     }
     /// Every title names exactly one object of its kind in the pending
     /// config, and each principal is in the set once.
     fn check(
         lines: &[AccessGrant],
-        ctx: &Ctx,
+        _: &Ctx,
+        m: &Directory,
         set: &str,
         _: &[(String, &Element)],
     ) -> Result<(), String> {
-        let m = Directory::read(ctx.doc);
         let mut seen = BTreeSet::new();
         for l in lines {
             m.grant_of(l).map_err(|e| format!("`{set}`: {e}"))?;
@@ -207,6 +208,9 @@ pub struct Directory {
     pub groups: Vec<(String, String, Vec<String>)>,
     /// (UUID, title) of each access schedule.
     pub schedules: Vec<(String, String)>,
+    /// The UUIDs of the *Full access* groups (`UgType="4"`): their members
+    /// get every push notification whatever a set says (#77).
+    pub full_access: Vec<String>,
 }
 
 impl Directory {
@@ -236,14 +240,21 @@ impl Directory {
             .iter()
             .map(|s| (s.uuid.to_ascii_lowercase(), title(&s.title)))
             .collect();
+        let full_access = m
+            .groups
+            .iter()
+            .filter(|g| g.kind.as_deref() == Some("4"))
+            .map(|g| g.uuid.to_ascii_lowercase())
+            .collect();
         Directory {
             users,
             groups,
             schedules,
+            full_access,
         }
     }
 
-    fn principals(&self, kind: PrincipalKind) -> Vec<(&str, &str)> {
+    pub(crate) fn principals(&self, kind: PrincipalKind) -> Vec<(&str, &str)> {
         match kind {
             PrincipalKind::User => self
                 .users
@@ -266,7 +277,11 @@ impl Directory {
     }
 
     /// The title of `uuid` among `all`, when it names that one object.
-    fn title_of<'a>(what: &str, uuid: &str, all: &[(&str, &'a str)]) -> Result<&'a str, String> {
+    pub(crate) fn title_of<'a>(
+        what: &str,
+        uuid: &str,
+        all: &[(&str, &'a str)],
+    ) -> Result<&'a str, String> {
         let u = uuid.to_ascii_lowercase();
         let (_, t) = all
             .iter()
@@ -294,7 +309,11 @@ impl Directory {
     }
 
     /// The UUID the title `title` names among `all`: exactly one.
-    fn uuid_of<'a>(what: &str, title: &str, all: &[(&'a str, &str)]) -> Result<&'a str, String> {
+    pub(crate) fn uuid_of<'a>(
+        what: &str,
+        title: &str,
+        all: &[(&'a str, &str)],
+    ) -> Result<&'a str, String> {
         let hits: Vec<&str> = all
             .iter()
             .filter(|(_, t)| *t == title)
@@ -390,13 +409,14 @@ impl Directory {
     }
 
     /// The pickers' lists for the browser: users, groups (with the users
-    /// they reach) and access schedules, by UUID and title. Personal data:
-    /// served only to a request with the admin token.
+    /// they reach, and whether it is *Full access*) and access schedules, by
+    /// UUID and title. Personal data: served only to a request with the admin
+    /// token. The access editor (#76) and the recipients editor (#77) share it.
     pub fn choices(&self) -> Value {
         let reach = self.reach();
         json!({
             "users": self.users.iter().map(|(u, t)| json!({ "uuid": u, "title": t })).collect::<Vec<_>>(),
-            "groups": self.groups.iter().map(|(u, t, _)| json!({ "uuid": u, "title": t, "users": reach.get(u).cloned().unwrap_or_default() })).collect::<Vec<_>>(),
+            "groups": self.groups.iter().map(|(u, t, _)| json!({ "uuid": u, "title": t, "users": reach.get(u).cloned().unwrap_or_default(), "full_access": self.full_access.contains(u) })).collect::<Vec<_>>(),
             "schedules": self.schedules.iter().map(|(u, t)| json!({ "uuid": u, "title": t })).collect::<Vec<_>>(),
         })
     }

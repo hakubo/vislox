@@ -83,6 +83,11 @@ pub struct Rights {
     /// groups too), or, for a notification, as members of *Full access*.
     /// By title.
     pub users: Vec<Named>,
+    /// For a notification: the users of [`Rights::users`] who get it only as
+    /// members of *Full access* (#77). Loxone Config shows them as inherited
+    /// recipients that cannot be unticked, and a set cannot take them away.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub inherited: Vec<Named>,
     /// For an access right: each of those users (by UUID) → the access
     /// schedules (UUIDs) that let them in, directly or through a group. A
     /// user who keeps access under fewer of them loses opening times
@@ -134,6 +139,7 @@ pub fn read(doc: &LoxoneDoc) -> BTreeMap<String, Rights> {
                     kind,
                     list: Vec::new(),
                     users: Vec::new(),
+                    inherited: Vec::new(),
                     schedules: BTreeMap::new(),
                 },
             )
@@ -188,24 +194,35 @@ pub fn read(doc: &LoxoneDoc) -> BTreeMap<String, Rights> {
         .collect();
     for r in out.values_mut() {
         let holds: BTreeSet<&str> = r.list.iter().map(|p| p.uuid.as_str()).collect();
-        let mut users: Vec<Named> = m
-            .users
-            .iter()
-            .zip(&groups_of)
-            .filter(|(u, groups)| {
-                holds.contains(u.uuid.as_str())
-                    || groups.iter().any(|g| {
-                        holds.contains(g.uuid.as_str())
-                            || r.kind == RECIPIENTS && g.kind.as_deref() == Some(FULL_ACCESS)
-                    })
-            })
-            .map(|(u, _)| u)
-            .map(|u| Named {
-                title: title(&u.uuid, &u.title),
-                uuid: u.uuid.clone(),
-            })
-            .collect();
+        let named = |u: &loxone_config::access::User| Named {
+            title: title(&u.uuid, &u.title),
+            uuid: u.uuid.clone(),
+        };
+        let direct = |u: &loxone_config::access::User, groups: &[&loxone_config::access::Group]| {
+            holds.contains(u.uuid.as_str())
+                || groups.iter().any(|g| holds.contains(g.uuid.as_str()))
+        };
+        let full = |groups: &[&loxone_config::access::Group]| {
+            r.kind == RECIPIENTS
+                && groups
+                    .iter()
+                    .any(|g| g.kind.as_deref() == Some(FULL_ACCESS))
+        };
+        // One pass: who gets it in effect, and of them who only through Full access.
+        let (mut users, mut inherited) = (Vec::new(), Vec::new());
+        for (u, groups) in m.users.iter().zip(&groups_of) {
+            match (direct(u, groups), full(groups)) {
+                (true, _) => users.push(named(u)),
+                (false, true) => {
+                    users.push(named(u));
+                    inherited.push(named(u));
+                }
+                (false, false) => {}
+            }
+        }
         users.sort();
+        inherited.sort();
+        r.inherited = inherited;
         if r.kind == ACCESS {
             for (u, groups) in m.users.iter().zip(&groups_of) {
                 let by: BTreeSet<String> = r
@@ -366,6 +383,7 @@ pub fn changes(
         kind: ACCESS,
         list: Vec::new(),
         users: Vec::new(),
+        inherited: Vec::new(),
         schedules: BTreeMap::new(),
     };
     let mut uuids: Vec<&String> = new.keys().collect();

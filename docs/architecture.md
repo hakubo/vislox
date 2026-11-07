@@ -91,8 +91,16 @@ The binary is an `axum` server with the UI embedded (plain JS and SVG, no build 
   only to a request with the admin token (`POST /api/access/choices`, from the revision whose blob the draft is
   made on). The review and Apply's confirmation are #68's `rights.rs`, which also says who keeps a door under
   fewer access schedules (`narrowed`, a loss).
+- `src/recipients_edit.rs` is editing who gets a push notification (#77): the `recipients` op (users and groups by
+  UUID, no schedule), a `SetKind` of `set_claim.rs` written as `recipients vx_… end` sets and `.recipients` claims,
+  read with `access_edit.rs`' `Directory` (the same pickers' list, which also names the Full access groups), checked
+  after the compile against `rights.rs` (`missed`), and `GET /api/edits`' `recipients` and `recipient_sets`.
+  `rights.rs` names the users who get a notification only through Full access (`inherited`). A notification's block
+  on a page (`OutputRefLM`) is `model.rs`' `message`/`message_old` (its `<LoggerMailer>`), and is added with
+  `add_block` (`mirrors:` an extern of the `Notification`, `blocks::MESSAGE_REF`) and edited as a block of
+  vislox's files (`On`, `Off`, `MinimumTime` as settings).
 - `src/set_claim.rs`' `KINDS` lists every kind of claim on a block's whole content (switching times, moods,
-  access, members) as a `ClaimKind`; `edit.rs` and `actions.rs` loop over it instead of naming each kind.
+  access, recipients, members) as a `ClaimKind`; `edit.rs` and `actions.rs` loop over it instead of naming each kind.
 - `src/blocks.rs` is adding blocks (#59): the types vislox offers (`GET /api/block-types`, from lox's builtin
   table and its language server's descriptions), and vislox's file of new blocks per page
   (`<module>/vislox/<page>.loxl`). `edit.rs` applies `add_block` and `remove_block` to it.

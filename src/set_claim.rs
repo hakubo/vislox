@@ -1,7 +1,7 @@
 //! Claims on a block's whole set, shared by several blocks: a DayTimer's
 //! switching times (`schedule`, #73), a lighting controller's moods (`moods`,
-//! #74) and who may open an NFC Code Touch (`access`, #76), and the next ones
-//! (#77 recipients, #78 tiles).
+//! #74), who may open an NFC Code Touch (`access`, #76) and who gets a push
+//! notification (`recipients`, #77), and the next one (#78 tiles).
 //!
 //! Lox Logic writes each as a named set and a claim per block
 //! (`<slug>.<keyword> = <set>`). Several blocks may claim one set; a block
@@ -34,7 +34,7 @@ use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
 
 /// The blocks the rest of the module claims, per kind (its keyword:
-/// `schedule`, `moods`, `members`, `access`): UUID (lowercase) → the claim's
+/// `schedule`, `moods`, `members`, `access`, `recipients`): UUID (lowercase) → the claim's
 /// `file:line`.
 pub type Claimed = BTreeMap<&'static str, BTreeMap<String, String>>;
 
@@ -55,6 +55,7 @@ pub static KINDS: &[&dyn ClaimKind] = &[
     &Reg::<crate::sched_edit::SchedKind>(PhantomData),
     &Reg::<crate::mood_edit::MoodKind>(PhantomData),
     &Reg::<crate::access_edit::AccessKind>(PhantomData),
+    &Reg::<crate::recipients_edit::RecipientsKind>(PhantomData),
     &crate::member_edit::MemberKind,
 ];
 
@@ -288,16 +289,19 @@ pub trait SetKind: Clone + Debug + Default + PartialEq + 'static {
     /// worked out once per pair of configs.
     fn differ<'a>(a: &'a LoxoneDoc, b: &'a LoxoneDoc) -> Box<dyn Fn(&str) -> bool + 'a>;
     /// An op's content as lines, checked for its blocks (`members`: slug and
-    /// element; the block about to claim it first).
+    /// element; the block about to claim it first). `idx` is the pending
+    /// config's [`SetKind::index`], read once per op.
     fn lines_of(
         content: &Self::Content,
         ctx: &Ctx,
+        idx: &Self::Index<'_>,
         members: &[(String, &Element)],
     ) -> Result<Vec<Self::Line>, String>;
     /// Check a set's lines for every block that claims it.
     fn check(
         lines: &[Self::Line],
         ctx: &Ctx,
+        idx: &Self::Index<'_>,
         set: &str,
         members: &[(String, &Element)],
     ) -> Result<(), String>;
@@ -427,6 +431,7 @@ pub fn current<K: SetKind>(files: &Files, target: &str, idx: &K::Index<'_>) -> O
 fn write_set<K: SetKind>(
     files: &mut Files,
     ctx: &Ctx,
+    idx: &K::Index<'_>,
     set: &str,
     content: Option<&K::Content>,
     also: Option<(&str, &Element)>,
@@ -452,7 +457,7 @@ fn write_set<K: SetKind>(
         }
     }
     if let Some(c) = content {
-        let lines = K::lines_of(c, ctx, &members)?;
+        let lines = K::lines_of(c, ctx, idx, &members)?;
         K::store_mut(&mut files.claims)
             .sets
             .insert(set.to_string(), lines);
@@ -464,7 +469,7 @@ fn write_set<K: SetKind>(
             K::WHAT
         )
     })?;
-    K::check(lines, ctx, set, &members)
+    K::check(lines, ctx, idx, set, &members)
 }
 
 /// Apply an op of kind `K`: give the block `uuid` the set `value` says, or
@@ -521,7 +526,7 @@ pub fn apply<K: SetKind>(
                     K::WHAT
                 ));
             }
-            write_set::<K>(files, ctx, set, Some(content), None)?;
+            write_set::<K>(files, ctx, &idx, set, Some(content), None)?;
         }
     }
     match (value, el) {
@@ -564,7 +569,7 @@ pub fn apply<K: SetKind>(
                     ));
                 }
             }
-            write_set::<K>(files, ctx, &set, content, Some((&target, el))).map_err(|e| {
+            write_set::<K>(files, ctx, &idx, &set, content, Some((&target, el))).map_err(|e| {
                 if e.starts_with(&name) {
                     e
                 } else {

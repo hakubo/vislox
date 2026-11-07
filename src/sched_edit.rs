@@ -499,6 +499,7 @@ impl set_claim::SetKind for SchedKind {
     fn lines_of(
         cols: &Self::Content,
         ctx: &Ctx,
+        _idx: &Self::Index<'_>,
         timers: &[(String, &Element)],
     ) -> Result<Vec<ScheduleLine>, String> {
         let modes = Modes::new(ctx.doc, ctx.lock);
@@ -512,6 +513,7 @@ impl set_claim::SetKind for SchedKind {
     fn check(
         lines: &[ScheduleLine],
         ctx: &Ctx,
+        _idx: &Self::Index<'_>,
         set: &str,
         timers: &[(String, &Element)],
     ) -> Result<(), String> {

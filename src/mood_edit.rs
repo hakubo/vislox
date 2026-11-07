@@ -209,6 +209,7 @@ impl set_claim::SetKind for MoodKind {
     fn lines_of(
         rows: &Vec<MoodRow>,
         _: &Ctx,
+        _idx: &Self::Index<'_>,
         _: &[(String, &Element)],
     ) -> Result<Vec<MoodLine>, String> {
         lines_of(rows)
@@ -218,6 +219,7 @@ impl set_claim::SetKind for MoodKind {
     fn check(
         lines: &[MoodLine],
         _: &Ctx,
+        _idx: &Self::Index<'_>,
         set: &str,
         lcs: &[(String, &Element)],
     ) -> Result<(), String> {

@@ -156,6 +156,15 @@ pub enum Op {
         uuid: String,
         value: Option<crate::access_edit::AccessVal>,
     },
+    /// Who gets the push notification `uuid` (#77): a `recipients` set and
+    /// the notification's `.recipients` claim in [`FILE`]
+    /// ([`crate::recipients_edit`]). `None` drops vislox's claim: the
+    /// recipients stay as last written. Its `previous` is the `recipients`
+    /// op with what the notification claimed before.
+    Recipients {
+        uuid: String,
+        value: Option<crate::recipients_edit::RecipientsVal>,
+    },
 }
 
 /// Where a `place` puts one block: its top left corner, as `move` takes it.
@@ -180,7 +189,8 @@ impl Op {
             | Op::Schedule { uuid, .. }
             | Op::Moods { uuid, .. }
             | Op::Members { uuid, .. }
-            | Op::Access { uuid, .. } => Some(uuid),
+            | Op::Access { uuid, .. }
+            | Op::Recipients { uuid, .. } => Some(uuid),
             Op::AddBlock { .. }
             | Op::Relayout { .. }
             | Op::Place { .. }
@@ -213,7 +223,8 @@ impl Op {
             | Op::Schedule { .. }
             | Op::Moods { .. }
             | Op::Members { .. }
-            | Op::Access { .. } => None,
+            | Op::Access { .. }
+            | Op::Recipients { .. } => None,
         }
     }
 
@@ -239,7 +250,8 @@ impl Op {
             | Op::Schedule { .. }
             | Op::Moods { .. }
             | Op::Members { .. }
-            | Op::Access { .. } => {}
+            | Op::Access { .. }
+            | Op::Recipients { .. } => {}
         }
         op
     }
@@ -475,6 +487,8 @@ pub struct Claims(
     pub crate::member_edit::Members,
     /// Who may open the NFC Code Touches it claims (#76).
     pub crate::access_edit::AccessSets,
+    /// Who gets the push notifications it claims (#77).
+    pub crate::recipients_edit::RecipientSets,
 );
 
 /// A wire vislox draws: `to.port <- from.port`, each end a slug (an
@@ -527,6 +541,15 @@ pub fn slug(uuid: &str) -> String {
         "{SLUG_PREFIX}{}",
         uuid.to_ascii_lowercase().replace('-', "_")
     )
+}
+
+/// The UUID a slug of [`slug`] names (`vx_6000…_0001` → `6000…-0001`),
+/// lowercase.
+pub fn slug_uuid(s: &str) -> Option<String> {
+    let u = s.strip_prefix(SLUG_PREFIX)?.replace('_', "-");
+    // Loxone's UUIDs are 8-4-4-16 hex digits.
+    let groups: Vec<usize> = u.split('-').map(str::len).collect();
+    (groups == [8, 4, 4, 16] && u.bytes().all(|b| b == b'-' || b.is_ascii_hexdigit())).then_some(u)
 }
 
 /// A value as Properties shows it: a number or text, unquoted.
@@ -748,7 +771,8 @@ impl Claims {
             | Op::Schedule { .. }
             | Op::Moods { .. }
             | Op::Members { .. }
-            | Op::Access { .. } => None,
+            | Op::Access { .. }
+            | Op::Recipients { .. } => None,
         }
     }
 
@@ -857,6 +881,7 @@ pub fn apply(
                     | Op::Moods { .. }
                     | Op::Members { .. }
                     | Op::Access { .. }
+                    | Op::Recipients { .. }
             )
         })
         .ok_or_else(|| "not a value".to_string())?;
@@ -958,7 +983,8 @@ pub fn apply(
         | Op::Schedule { .. }
         | Op::Moods { .. }
         | Op::Members { .. }
-        | Op::Access { .. } => {
+        | Op::Access { .. }
+        | Op::Recipients { .. } => {
             unreachable!("not a value")
         }
     };
@@ -1255,13 +1281,21 @@ impl Files {
     }
 
     /// The names the blocks adopted here use for the objects they are wired
-    /// to (not themselves), with the file that names them.
+    /// to (not themselves), and the notifications the blocks here mirror,
+    /// with the file that names them.
     pub fn adopted_names(&self) -> Vec<(String, String)> {
         let mut out = Vec::new();
         for (name, p) in &self.pages {
             for b in p.blocks.iter().filter(|b| b.adopted) {
                 for (_, src) in &b.wires {
                     out.push((src.slug.clone(), name.clone()));
+                }
+            }
+            // The notification a push notification's block mirrors (#77),
+            // on a block added here too.
+            for b in &p.blocks {
+                if let Some(Value::Ref(n)) = b.get(blocks::MIRRORS) {
+                    out.push((n.clone(), name.clone()));
                 }
             }
             for w in &p.wires {
@@ -1355,6 +1389,14 @@ pub fn split_args(b: &NewBlock) -> (BTreeMap<String, String>, BTreeMap<String, S
     let (mut params, mut settings) = (BTreeMap::new(), BTreeMap::new());
     for (k, v) in &b.args {
         let key = blocks::port_key(&b.ty, k);
+        // The notification a push notification's block mirrors (#77): by
+        // UUID, as `add_block` takes it.
+        if k == blocks::MIRRORS
+            && let Value::Ref(r) = v
+        {
+            settings.insert(k.clone(), slug_uuid(r).unwrap_or_else(|| r.clone()));
+            continue;
+        }
         if blocks::port_name(&b.ty, key).is_some() {
             params.insert(key.to_string(), plain(v));
         } else {
@@ -1457,6 +1499,9 @@ pub fn apply_op(files: &mut Files, ctx: &Ctx, op: &Op) -> Result<Applied, String
         Op::Moods { uuid, value } => crate::mood_edit::apply(files, ctx, uuid, value.as_ref()),
         Op::Members { uuid, value } => crate::member_edit::apply(files, ctx, uuid, value.as_ref()),
         Op::Access { uuid, value } => crate::access_edit::apply(files, ctx, uuid, value.as_ref()),
+        Op::Recipients { uuid, value } => {
+            crate::recipients_edit::apply(files, ctx, uuid, value.as_ref())
+        }
         _ => {
             let uuid = op.uuid().unwrap_or_default();
             match ctx.lock.slug_of(uuid) {
@@ -1533,6 +1578,10 @@ pub fn undo_ops(
                 uuid: uuid.clone(),
                 value: serde_json::from_value(prev).map_err(bad)?,
             }),
+            Op::Recipients { uuid, .. } => undo.push(Op::Recipients {
+                uuid: uuid.clone(),
+                value: serde_json::from_value(prev).map_err(bad)?,
+            }),
             _ => undo.push(op.with_value(serde_json::from_value(prev).map_err(bad)?)),
         }
     }
@@ -1592,6 +1641,37 @@ fn setting_value(ty: &str, name: &str, kind: blocks::Kind, v: &str) -> Result<Va
                 .ok_or_else(|| format!("{name}: a time of day, like 19:00 or 06:30:15"))?,
         ),
         Kind::Number => Value::Number(number(v).map_err(|e| format!("{name}: {e}"))?),
+        Kind::Duration => duration(v.trim())
+            .ok_or_else(|| format!("{name}: a duration, like 12h, 30min, 5s or 90 (seconds)"))?,
+    })
+}
+
+/// A duration as Lox Logic writes one: `12h`, `30min`, `5s`, `500ms`, or
+/// seconds as a plain number (lox reads `MinimumTime: 90` as 90 s, its
+/// `output_ref_lm_defaults_follow_loxone_config`). Read with lox's own
+/// parser, so it is spelled the way lox keeps it. Never negative.
+fn duration(v: &str) -> Option<Value> {
+    let at = v
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(v.len());
+    let (n, u) = v.split_at(at);
+    // `at` stops at a sign, so `-5s` leaves `n` empty and is refused here.
+    if number(n).is_err() || !["", "ms", "s", "min", "h"].contains(&u) {
+        return None;
+    }
+    if u.is_empty() {
+        return Some(Value::Number(n.to_string()));
+    }
+    let m = Module::parse_fragment(&format!("vx_d = Monoflop(Time: {n}{u})\n")).ok()?;
+    m.items.into_iter().find_map(|i| match i {
+        Item::Block(b) => b.args.into_iter().find_map(|a| match a {
+            loxone_config::logic::ArgItem::Binding(loxone_config::logic::Binding {
+                kind: loxone_config::logic::BindingKind::Param(v @ Value::Unit { .. }),
+                ..
+            }) => Some(v),
+            _ => None,
+        }),
+        _ => None,
     })
 }
 
@@ -1625,9 +1705,61 @@ fn add_block(files: &mut Files, ctx: &Ctx, op: &Op) -> Result<Applied, String> {
             same.len()
         ));
     }
-    if !blocks::offered(ty) {
+    // A push notification drawn on the page (#77): an `OutputRefLM` that
+    // mirrors a `Notification` Loxone Config made, with its message.
+    let message_ref = ty == blocks::MESSAGE_REF;
+    if !blocks::offered(ty) && !message_ref {
         return Err(format!("vislox does not add blocks of type {ty}"));
     }
+    let mut settings = settings.clone();
+    let mirrors = if message_ref {
+        if title.is_some() {
+            return Err(
+                "a push notification's block takes the notification's name; rename the \
+                 notification in Loxone Config"
+                    .into(),
+            );
+        }
+        if !params.is_empty() {
+            return Err(
+                "a push notification's block takes no constants: wire its input from a block"
+                    .into(),
+            );
+        }
+        let u = settings
+            .remove(blocks::MIRRORS)
+            .ok_or("say which push notification it sends (`mirrors`)")?;
+        let el = find(&ctx.doc.xml.root, u.trim())
+            .filter(|e| e.attr("Type") == Some(blocks::NOTIFICATION))
+            .ok_or_else(|| {
+                format!(
+                    "no push notification {u} in the pending config; make it in Loxone Config \
+                     (Messages) first"
+                )
+            })?;
+        let u = el.attr("U").unwrap_or(u.trim());
+        // vislox's extern of it, keyed as the other claims key it (case aside:
+        // two keys of one UUID would be two `extern vx_…` lines).
+        let key = files
+            .claims
+            .0
+            .keys()
+            .find(|k| k.eq_ignore_ascii_case(u))
+            .cloned()
+            .unwrap_or_else(|| u.to_ascii_lowercase());
+        if let Some(c) = files.claims.0.get(&key)
+            && !c.ty.is_empty()
+            && c.ty != blocks::NOTIFICATION
+        {
+            return Err(format!(
+                "vislox's file names {u} as a {}, not a push notification",
+                c.ty
+            ));
+        }
+        Some(key)
+    } else {
+        None
+    };
     let title = title.as_deref().map(|t| block_title(ty, t)).transpose()?;
     if let Some(key) = params.keys().find(|k| blocks::port_name(ty, k).is_none()) {
         return Err(format!("{ty} has no input {key}"));
@@ -1639,8 +1771,12 @@ fn add_block(files: &mut Files, ctx: &Ctx, op: &Op) -> Result<Applied, String> {
     {
         return Err(format!("{ty}: {name} cannot be set here"));
     }
-    // In the order lox lists them: the ports, then the settings.
+    // In the order lox lists them: what it mirrors, the ports, then the
+    // settings.
     let mut args = Vec::new();
+    if let Some(u) = &mirrors {
+        args.push((blocks::MIRRORS.to_string(), Value::Ref(slug(u))));
+    }
     for spec in blocks::valued_ports(ty) {
         if let Some(v) = params.get(spec.key) {
             let n = spec.name;
@@ -1662,6 +1798,15 @@ fn add_block(files: &mut Files, ctx: &Ctx, op: &Op) -> Result<Applied, String> {
             || files.names(s)
     };
     let slug = blocks::new_slug(ty, &taken);
+    // Everything is checked: from here on `files` changes.
+    if let Some(u) = &mirrors {
+        // vislox's extern of the notification, kept while the block names it.
+        let c = files.claims.0.entry(u.clone()).or_default();
+        if c.ty.is_empty() {
+            c.ty = blocks::NOTIFICATION.into();
+        }
+        c.pinned = true;
+    }
     // The page's file: by its UUID (it may have been renamed), else a new one.
     let file = match files
         .pages
@@ -1785,9 +1930,10 @@ fn remove_block(files: &mut Files, ctx: &Ctx, uuid: &str) -> Result<Applied, Str
     };
     let p = files.pages.get_mut(&file).expect("found");
     p.blocks.retain(|x| x.slug != slug);
-    // Its wires go with it, as in Loxone Config.
+    // Its wires go with it, as in Loxone Config; so does the extern of the
+    // notification it mirrored (#77), when nothing else names it.
     files.claims.1.retain(|w| !w.touches(&slug));
-    files.claims.prune();
+    files.repin();
     let p = files.pages.get_mut(&file).expect("found");
     p.removed.insert(slug);
     Ok(Applied {
@@ -3072,7 +3218,8 @@ pub fn current(doc: &LoxoneDoc, op: &Op) -> Option<String> {
         | Op::Schedule { .. }
         | Op::Moods { .. }
         | Op::Members { .. }
-        | Op::Access { .. } => None,
+        | Op::Access { .. }
+        | Op::Recipients { .. } => None,
     }
 }
 
@@ -6170,7 +6317,398 @@ mod tests {
                 .unwrap_err()
                 .contains("neither an extern")
         );
-        // A recipients set is #77's: not vislox's yet.
-        assert!(read("recipients vx_r\n\tuser \"alice\"\nend\n".to_string()).is_err());
+        // A recipients set is the recipients kind's (#77), not access's.
+        assert!(
+            read("recipients vx_r\n\tuser \"alice\"\nend\n".to_string())
+                .unwrap()
+                .claims
+                .5
+                .is_empty()
+        );
+    }
+
+    // ── recipients of a push notification (#77) ───────────────────────
+
+    fn recipients_op(uuid: &str, set: Option<&str>, list: &[(&str, &str)]) -> Op {
+        Op::Recipients {
+            uuid: uuid.into(),
+            value: Some(crate::recipients_edit::RecipientsVal {
+                set: set.map(String::from),
+                recipients: (set.is_none() || !list.is_empty()).then(|| {
+                    list.iter()
+                        .map(|(k, u)| crate::recipients_edit::Recipient {
+                            kind: k.to_string(),
+                            uuid: u.to_string(),
+                        })
+                        .collect()
+                }),
+                restore: BTreeMap::new(),
+            }),
+        }
+    }
+
+    /// Who gets `n` in `doc` directly: titles.
+    fn gets(doc: &LoxoneDoc, n: &str) -> Vec<String> {
+        crate::rights::read(doc)[n]
+            .list
+            .iter()
+            .map(|p| p.title.clone())
+            .collect()
+    }
+
+    #[test]
+    fn recipients_are_a_set_lox_writes_onto_the_notification() {
+        use crate::recipients_edit::fixture::*;
+        let d = LoxoneDoc::parse(house().as_bytes()).unwrap();
+        let (names, claimed) = (BTreeSet::new(), BTreeMap::new());
+        let mut l = Lockfile::default();
+        let lock = lock_of(&l);
+        let ctx = access_ctx(&d, &lock, &names, &claimed);
+        let mut files = Files::default();
+        // alice is left out; bob and the family get it.
+        let op = recipients_op(FROST, None, &[("user", BOB), ("group", FAMILIE)]);
+        let a = apply_op(&mut files, &ctx, &op).unwrap();
+        assert_eq!(a.previous, serde_json::Value::Null);
+        let text = &files.render()["edits.loxl"];
+        let s = slug(FROST);
+        for want in [
+            format!("extern {s} = Notification(uuid: \"{FROST}\")\n"),
+            "recipients vx_frost_recipients\n\tuser \"bob\"\n\tgroup \"Familie\"\nend\n"
+                .to_string(),
+            format!("{s}.recipients = vx_frost_recipients\n"),
+        ] {
+            assert!(text.contains(&want), "{want} in\n{text}");
+        }
+        assert_eq!(
+            Files::from_texts(&files.render()).unwrap().claims,
+            files.claims
+        );
+        let out = compile_files(&d, &files, &mut l).unwrap();
+        assert_eq!(gets(&out, FROST), ["bob", "Familie"]);
+        // The review, and Apply's confirmation, say who stops getting it;
+        // carol keeps it through Full access, inherited.
+        let ch =
+            crate::rights::changes(&crate::rights::read(&d), &crate::rights::read(&out), |u| {
+                u.to_string()
+            });
+        let frost = ch.iter().find(|c| c.uuid == FROST).unwrap();
+        assert_eq!(frost.kind, "recipients");
+        assert_eq!(
+            frost
+                .lose
+                .iter()
+                .map(|u| u.title.as_str())
+                .collect::<Vec<_>>(),
+            ["alice"]
+        );
+        assert_eq!(frost.gain[0].title, "bob");
+        assert_eq!(crate::rights::read(&out)[FROST].inherited[0].title, "carol");
+        assert!(
+            crate::recipients_edit::missed(&files, &out, &lock, &[FROST.into()], &[]).is_empty()
+        );
+        assert_eq!(
+            crate::recipients_edit::missed(&files, &d, &lock, &[FROST.into()], &[]),
+            ["Frost"]
+        );
+        assert!(crate::recipients_edit::differs(&out, &d, FROST));
+        assert!(!crate::recipients_edit::differs(&out, &d, REGEN));
+
+        // Emptied: only Full access gets it. previous is the list by UUID.
+        let ctx2 = Ctx { doc: &out, ..ctx };
+        let op2 = recipients_op(FROST, None, &[]);
+        let a2 = apply_op(&mut files, &ctx2, &op2).unwrap();
+        let prev: crate::recipients_edit::RecipientsVal =
+            serde_json::from_value::<Option<_>>(a2.previous.clone())
+                .unwrap()
+                .unwrap();
+        assert_eq!(prev.set.as_deref(), Some("vx_frost_recipients"));
+        assert_eq!(prev.recipients.as_ref().unwrap()[1].uuid, FAMILIE);
+        let out2 = compile_files(&d, &files, &mut l).unwrap();
+        assert!(gets(&out2, FROST).is_empty());
+        assert_eq!(crate::rights::read(&out2)[FROST].users[0].title, "carol");
+        let undo = undo_ops(std::slice::from_ref(&op2), &[a2.previous], &[]).unwrap();
+        assert_eq!(
+            undo,
+            [Op::Recipients {
+                uuid: FROST.into(),
+                value: Some(prev)
+            }]
+        );
+        apply_op(&mut files, &Ctx { doc: &out2, ..ctx2 }, &undo[0]).unwrap();
+        assert_eq!(
+            gets(&compile_files(&d, &files, &mut l).unwrap(), FROST),
+            ["bob", "Familie"]
+        );
+        // Regen shares Frost's set: both get the family; the undo of a rewrite
+        // through Frost gives Regen its recipients back.
+        apply_op(
+            &mut files,
+            &ctx2,
+            &recipients_op(REGEN, Some("vx_frost_recipients"), &[]),
+        )
+        .unwrap();
+        let op3 = recipients_op(FROST, Some("vx_frost_recipients"), &[("user", ALICE)]);
+        let a3 = apply_op(&mut files, &ctx2, &op3).unwrap();
+        let out3 = compile_files(&d, &files, &mut l).unwrap();
+        assert_eq!(gets(&out3, REGEN), ["alice"]);
+        let undo = undo_ops(std::slice::from_ref(&op3), &[a3.previous], &[]).unwrap();
+        apply_op(&mut files, &Ctx { doc: &out3, ..ctx2 }, &undo[0]).unwrap();
+        assert_eq!(
+            gets(&compile_files(&d, &files, &mut l).unwrap(), REGEN),
+            ["bob", "Familie"]
+        );
+        // Recipient sets share the namespace with the other sets.
+        assert!(crate::set_claim::taken(
+            &files,
+            &ctx2,
+            "vx_frost_recipients"
+        ));
+        // Dropped: the sets and externs go, and the recipients stay as last written.
+        for n in [FROST, REGEN] {
+            apply_op(
+                &mut files,
+                &ctx2,
+                &Op::Recipients {
+                    uuid: n.into(),
+                    value: None,
+                },
+            )
+            .unwrap();
+        }
+        assert!(files.claims.6.is_empty() && files.claims.0.is_empty());
+    }
+
+    #[test]
+    fn recipients_lox_would_refuse_are_refused_first() {
+        use crate::recipients_edit::fixture::*;
+        let d = LoxoneDoc::parse(house().as_bytes()).unwrap();
+        let (names, claimed) = (BTreeSet::new(), BTreeMap::new());
+        let lock = Lock::default();
+        let ctx = access_ctx(&d, &lock, &names, &claimed);
+        let err = |op: Op| apply_op(&mut Files::default(), &ctx, &op).unwrap_err();
+        let e = err(recipients_op(FROST, None, &[("user", BOB), ("user", BOB)]));
+        assert!(
+            e.starts_with("Frost: ") && e.contains("listed twice"),
+            "{e}"
+        );
+        let e = err(recipients_op(FROST, None, &[("user", TWIN2)]));
+        assert!(e.contains("titled \"chris\""), "{e}");
+        // The notification's block on a page is no notification: the claim is on
+        // the Notification itself.
+        assert!(
+            err(recipients_op(WARN, None, &[("user", BOB)])).contains("only a push notification")
+        );
+        let elsewhere = BTreeMap::from([(
+            "recipients",
+            BTreeMap::from([(FROST.to_string(), "pages/meldungen.loxl:9".to_string())]),
+        )]);
+        let e = apply_op(
+            &mut Files::default(),
+            &access_ctx(&d, &lock, &names, &elsewhere),
+            &recipients_op(FROST, None, &[("user", BOB)]),
+        )
+        .unwrap_err();
+        assert!(
+            e.contains("pages/meldungen.loxl:9 claims its recipients"),
+            "{e}"
+        );
+        // Dropping vislox's claim on it is always let through.
+        apply_op(
+            &mut Files::default(),
+            &access_ctx(&d, &lock, &names, &elsewhere),
+            &Op::Recipients {
+                uuid: FROST.into(),
+                value: None,
+            },
+        )
+        .unwrap();
+    }
+
+    /// A push notification is drawn on a page as an `OutputRefLM` that
+    /// mirrors the notification, with its message; the message is edited in
+    /// its declaration, and a removal's `add_block` names the notification by
+    /// UUID.
+    #[test]
+    fn a_push_notification_is_added_to_a_page_and_its_message_edited() {
+        use crate::recipients_edit::fixture::*;
+        let d = LoxoneDoc::parse(house().as_bytes()).unwrap();
+        let (names, claimed) = (BTreeSet::new(), BTreeMap::new());
+        let mut l = Lockfile::default();
+        let lock = lock_of(&l);
+        let ctx = access_ctx(&d, &lock, &names, &claimed);
+        let mut files = Files::default();
+        let add = |settings: &[(&str, &str)], title: Option<&str>| Op::AddBlock {
+            page: PAGE.into(),
+            ty: "OutputRefLM".into(),
+            title: title.map(String::from),
+            params: BTreeMap::new(),
+            settings: settings
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            wires: vec![],
+            restores: None,
+        };
+        let a = apply_op(
+            &mut files,
+            &ctx,
+            &add(
+                &[
+                    ("mirrors", REGEN),
+                    ("On", "Es regnet"),
+                    ("MinimumTime", "30min"),
+                ],
+                None,
+            ),
+        )
+        .unwrap();
+        assert_eq!(a.added.as_deref(), Some("vx_outputreflm_1"));
+        let r = files.render();
+        let page = r
+            .values()
+            .find(|t| t.contains("page \"Meldungen\""))
+            .unwrap();
+        let s = slug(REGEN);
+        assert!(
+            page.contains(&format!(
+                "vx_outputreflm_1 = OutputRefLM(mirrors: {s}, On: \"Es regnet\", MinimumTime: 30min)"
+            )),
+            "{page}"
+        );
+        assert!(
+            r["edits.loxl"].contains(&format!("extern {s} = Notification(uuid: \"{REGEN}\")")),
+            "{}",
+            r["edits.loxl"]
+        );
+        // Read back, the extern stays: the block names it.
+        let back = Files::from_texts(&r).unwrap();
+        assert_eq!(back.render(), r);
+        let out = compile_files(&d, &files, &mut l).unwrap();
+        let lock = lock_of(&l);
+        let u = lock.uuid_of("vx_outputreflm_1").unwrap().to_string();
+        let el = find(&out.xml.root, &u).unwrap();
+        assert_eq!(el.attr("Type"), Some("OutputRefLM"));
+        assert!(el.attr("Ref").unwrap().eq_ignore_ascii_case(REGEN));
+        let lm = el
+            .child_elements()
+            .find(|c| c.name == "LoggerMailer")
+            .unwrap();
+        assert_eq!(lm.attr("On"), Some("Es regnet"));
+        assert_eq!(lm.attr("MinimumTime"), Some("1800000"));
+        // Its message is edited in its declaration.
+        let ctx2 = Ctx {
+            doc: &out,
+            lock: &lock,
+            ..ctx
+        };
+        let set = |name: &str, v: Option<&str>| Op::Setting {
+            uuid: u.clone(),
+            name: name.into(),
+            value: v.map(String::from),
+        };
+        let p = apply_op(&mut files, &ctx2, &set("Off", Some("Trocken"))).unwrap();
+        assert_eq!(p.previous, serde_json::Value::Null);
+        let p = apply_op(&mut files, &ctx2, &set("MinimumTime", Some("12h"))).unwrap();
+        assert_eq!(p.previous, serde_json::json!("30min"));
+        assert!(
+            apply_op(&mut files, &ctx2, &set("MinimumTime", Some("bald")))
+                .unwrap_err()
+                .contains("a duration")
+        );
+        let out2 = compile_files(&d, &files, &mut l).unwrap();
+        let lm = find(&out2.xml.root, &u)
+            .unwrap()
+            .child_elements()
+            .find(|c| c.name == "LoggerMailer")
+            .unwrap()
+            .clone();
+        assert_eq!(lm.attr("Off"), Some("Trocken"));
+        assert_eq!(lm.attr("MinimumTime"), Some("43200000"));
+        // Taken out again: the add_block that brings it back names the
+        // notification by UUID.
+        let ctx3 = Ctx { doc: &out2, ..ctx2 };
+        let rm = apply_op(&mut files, &ctx3, &Op::RemoveBlock { uuid: u.clone() }).unwrap();
+        let back: Op = serde_json::from_value(rm.previous).unwrap();
+        let Op::AddBlock { settings, .. } = &back else {
+            panic!("{back:?}")
+        };
+        assert_eq!(settings["mirrors"], REGEN);
+        assert_eq!(settings["Off"], "Trocken");
+        // The extern of the notification went with it.
+        assert!(files.claims.0.is_empty(), "{:?}", files.claims.0);
+        // A refused add changes nothing: no orphan extern of the notification.
+        let mut f = Files::default();
+        let before = f.clone();
+        assert!(
+            apply_op(
+                &mut f,
+                &ctx,
+                &add(&[("mirrors", REGEN), ("MinimumTime", "bald")], None)
+            )
+            .unwrap_err()
+            .contains("a duration")
+        );
+        assert_eq!(f, before);
+        for bad in ["-5", "-5s", "5 s", "5d", ""] {
+            assert!(duration(bad).is_none(), "{bad}");
+        }
+        assert_eq!(duration("90"), Some(Value::Number("90".into())));
+        // An extern of the notification already there, in another case: one key.
+        let mut f = Files::default();
+        f.claims.0.insert(
+            REGEN.to_ascii_uppercase(),
+            Claim {
+                ty: "Notification".into(),
+                ..Default::default()
+            },
+        );
+        apply_op(&mut f, &ctx, &add(&[("mirrors", REGEN)], None)).unwrap();
+        assert_eq!(f.claims.0.len(), 1);
+        assert_eq!(f.render()["edits.loxl"].matches("extern ").count(), 1);
+        // One of another type is refused, not overwritten.
+        let mut f = Files::default();
+        f.claims.0.insert(
+            REGEN.into(),
+            Claim {
+                ty: "DayTimer".into(),
+                ..Default::default()
+            },
+        );
+        let was = f.clone();
+        assert!(
+            apply_op(&mut f, &ctx, &add(&[("mirrors", REGEN)], None))
+                .unwrap_err()
+                .contains("not a push notification")
+        );
+        assert_eq!(f, was);
+        // Refused: no notification, a name, another object, a constant.
+        let err = |op: Op| apply_op(&mut Files::default(), &ctx, &op).unwrap_err();
+        assert!(err(add(&[], None)).contains("which push notification"));
+        assert!(err(add(&[("mirrors", REGEN)], Some("X"))).contains("notification's name"));
+        assert!(err(add(&[("mirrors", ALICE)], None)).contains("no push notification"));
+        assert!(err(add(&[("mirrors", REGEN), ("Sound", "1")], None)).contains("cannot be set"));
+    }
+
+    #[test]
+    fn a_recipients_claim_vislox_did_not_write_is_refused() {
+        use crate::recipients_edit::fixture::FROST;
+        let s = slug(FROST);
+        let ext = format!("extern {s} = Notification(uuid: \"{FROST}\")\n");
+        let set = "recipients vx_r\n\tuser \"alice\"\nend\n";
+        let read = |t: String| Files::from_texts(&BTreeMap::from([("edits.loxl".to_string(), t)]));
+        let f = read(format!("{ext}{set}{s}.recipients = vx_r\n")).unwrap();
+        assert_eq!(f.claims.6.claims[&s], "vx_r");
+        assert!(
+            read(format!(
+                "{ext}recipients familie\n\tuser \"alice\"\nend\n{s}.recipients = familie\n"
+            ))
+            .is_err()
+        );
+        assert!(read(format!("{ext}{s}.recipients = vx_b\n")).is_err());
+        assert!(
+            read(format!("{set}{s}.recipients = vx_r\n"))
+                .unwrap_err()
+                .contains("neither an extern")
+        );
     }
 }
