@@ -1045,6 +1045,14 @@ try {
     // Its button shows the block, marked as removed in the comparison.
     await page.click('#deploy-check .rm-list .go:has-text("Flur")');
     await page.waitForFunction((u) => S.sel === u && S.view.objects[u]?.status === "removed", FLUR);
+    // Cancelled from another tab: the server forgets the plan, and this tab's preview goes with it.
+    const other = await browser.newPage();
+    await other.goto(page.url());
+    const rev = await page.evaluate(() => S.removals.rev);
+    await other.evaluate((r) => fetch("/api/removals/cancel", { method: "POST", headers: { "Content-Type": "application/json", "X-Vislox": "removals" }, body: JSON.stringify({ rev: r }) }), rev);
+    await other.close();
+    await page.waitForFunction(() => !S.removals && !document.querySelector(".hrev.k-removals"), null, { timeout: 10000 });
+    await waitText("#deploy-check", /Review the removals/);
     // The review changed nothing in the project.
     assert.equal(readFileSync(join(dir, "logic.lock.json"), "utf8"), lockWas);
     assert.equal(readFileSync(join(dir, "out.Loxone"), "utf8"), outWas);

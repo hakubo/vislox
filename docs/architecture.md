@@ -33,12 +33,14 @@ The binary is an `axum` server with the UI embedded (plain JS and SVG, no build 
   Apply's steps (`POST /api/rollback`), checking that the in-place compile, lox's staged upload and its verified
   download are the reviewed program, and working out what runs when a push fails after its upload. `history.rs`
   keeps the plan as the `rollback:<commit>` revision, found by id only (the asking tab shows it).
-- `actions/removals.rs` handles managed blocks the module lost (#70): it recognises lox's refusal, plans a compile
-  with `--allow-removals` in a scratch directory (`POST /api/removals/plan`; the blocks are the lockfile objects
-  that compile drops, `model::removed_blocks` says where each is and what is wired to it), and is Apply's
-  *Removals you confirmed* step: it works the plan out again, compiles it into the project with the plan's
-  `--time`, and checks `out` and the lockfile against the consent. `history.rs` keeps the plan as the
-  `removals:<blob>` revision, compared with the deployed commit, found by id only.
+- `actions/removals.rs` handles blocks a push would delete (#70): lox's refusal for a block the module lost, and
+  lockfile tombstones for blocks the base has. It plans a compile with `--allow-removals` in a scratch directory
+  (`POST /api/removals/plan`, `POST /api/removals/cancel`; `model::removed_blocks` says where each block is, what
+  is wired to it and whose rights go with it), and is Apply's *Removals you confirmed* step: without consent it
+  refuses (from the check when it is current), with it it compiles the plan into the project with the plan's
+  `--time` and returns a `PutBack` that restores the lockfile and `out` unless the push goes through.
+  `history.rs` keeps the newest plan as the `removals:<blob>` revision, compared with the deployed revision,
+  found by id only, and drops it with its bytes when it is cancelled, replaced, too old or another revision runs.
 - `src/running.rs` reads `/prog` and `def.log` for the config the Miniserver runs (`GET /api/running`), and
   checks after an Apply that the upload loaded.
 - `src/edit.rs` is editing from Properties ([editing.md](editing.md)): the edit operations, what each object

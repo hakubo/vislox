@@ -535,6 +535,10 @@ async fn main() -> Result<()> {
         .route("/api/apply", axum::routing::post(api_apply))
         .route("/api/rollback/plan", axum::routing::post(api_rollback_plan))
         .route("/api/removals/plan", axum::routing::post(api_removals_plan))
+        .route(
+            "/api/removals/cancel",
+            axum::routing::post(api_removals_cancel),
+        )
         .route("/api/rollback", axum::routing::post(api_rollback))
         .route(
             "/api/rollback/cancel",
@@ -657,7 +661,10 @@ fn refresh(app: &App) {
         let mut h = app.history.lock().unwrap();
         let a = h.refresh_git();
         let b = h.poll_files();
-        (a || b).then_some(h.version)
+        // A removal plan (#70) goes once the server no longer keeps it, it is
+        // too old, or another revision runs.
+        let c = h.prune_removals(app.actions.removal_plan_id().as_deref());
+        (a || b || c).then_some(h.version)
     };
     if let Some(v) = version {
         let _ = app.tx.send(v);
@@ -1489,52 +1496,34 @@ async fn api_removals_plan(
         Err(e) => return refused((StatusCode::CONFLICT, e)),
     };
     let a = app.clone();
-    let p = plan.clone();
     let res = tokio::task::spawn_blocking(move || {
-        let deployed = a.history.lock().unwrap().deployed();
+        let deployed = deployed_revision(a.history.lock().unwrap().list().1)
+            .ok_or("no deployed config to compare with")?;
         // The blocks as the config they are deleted from has them: what runs.
-        let old = match &deployed {
-            Some(d) => load(&a, d)?.1,
-            None => {
-                // No commit yet: the base file, which the Miniserver runs.
-                let base = a
-                    .history
-                    .lock()
-                    .unwrap()
-                    .paths()
-                    .into_iter()
-                    .next()
-                    .ok_or("no deployed config")?;
-                let bytes = std::fs::read(&base).map_err(|e| e.to_string())?;
-                let xml = source::program_xml(&bytes).map_err(|e| e.to_string())?;
-                LoxoneDoc::parse(&xml).map_err(|e| e.to_string())?
-            }
-        };
-        let xml = source::program_xml(&p.compiled).map_err(|e| e.to_string())?;
+        let old = load(&a, &deployed.id)?.1;
+        let xml = source::program_xml(&plan.compiled).map_err(|e| e.to_string())?;
         let new = LoxoneDoc::parse(&xml).map_err(|e| format!("the plan: {e}"))?;
-        let ids: Vec<String> = p.blocks.iter().map(|b| b.uuid.clone()).collect();
-        let shown = model::removed_blocks(&old, &ids);
-        let rights: Vec<_> = model::apply_changes(&new, &old)
-            .rights
-            .into_iter()
-            .filter(|c| ids.contains(&c.uuid))
-            .collect();
-        let n = p.blocks.len();
-        let rev = a.history.lock().unwrap().set_removals(
-            deployed.clone(),
+        let ids: Vec<String> = plan.blocks.iter().map(|b| b.uuid.clone()).collect();
+        let (shown, rights) = model::removed_blocks(&old, &new, &ids);
+        let mut h = a.history.lock().unwrap();
+        let rev = h.set_removals(
+            Some(deployed.id.clone()),
             "Removals allowed".into(),
             format!(
-                "The module compiled with --allow-removals: {n} managed block{} deleted",
-                if n == 1 { "" } else { "s" }
+                "The module compiled with --allow-removals: {} deleted",
+                actions::plural(plan.blocks.len(), "managed block")
             ),
-            p.compiled.clone(),
+            plan.compiled,
         );
+        // Another tab's preview of an older plan goes.
+        let _ = a.tx.send(h.version);
+        drop(h);
         Ok::<_, String>(serde_json::json!({
             "revision": rev,
             "rev": rev.id,
             "blob": rev.blob,
-            "base": deployed,
-            "blocks": p.blocks.iter().zip(&shown).map(|(b, s)| serde_json::json!({
+            "base": deployed.id,
+            "blocks": plan.blocks.iter().zip(&shown).map(|(b, s)| serde_json::json!({
                 "slug": b.slug,
                 "uuid": b.uuid,
                 "type": b.ty,
@@ -1561,6 +1550,26 @@ async fn api_removals_plan(
 #[derive(Deserialize)]
 struct RollbackCancel {
     rev: String,
+}
+
+/// The user cancelled a removal plan (#70): forgotten, with its bytes.
+async fn api_removals_cancel(
+    State(app): State<Arc<App>>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<RollbackCancel>,
+) -> Response {
+    if let Some(r) = not_from_vislox(&headers) {
+        return r;
+    }
+    app.actions.drop_removal_plan(&body.rev);
+    let v = {
+        let mut h = app.history.lock().unwrap();
+        h.clear_removals(&body.rev);
+        h.version
+    };
+    // Every tab drops its preview of it.
+    let _ = app.tx.send(v);
+    Json(serde_json::json!({ "cleared": true })).into_response()
 }
 
 /// The user cancelled a Roll back: its plan is forgotten.
@@ -1668,11 +1677,7 @@ async fn api_calendar(
 /// Apply or Sync), not an uncommitted edit on disk, which the Miniserver
 /// does not run; without git, the file on disk. Never a pending compile.
 fn deployed_revision(hist: Vec<history::Revision>) -> Option<history::Revision> {
-    let i = hist
-        .iter()
-        .position(|r| r.kind == "git")
-        .or_else(|| hist.iter().position(|r| r.current))?;
-    hist.into_iter().nth(i)
+    history::deployed_of(&hist).cloned()
 }
 
 /// The last read of the Miniserver's calendar entries against the deployed

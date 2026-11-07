@@ -1316,10 +1316,20 @@ pub struct RemovedWire {
     pub other: Target,
 }
 
-/// The blocks `uuids` as `doc` has them, for the removal's confirmation.
-pub fn removed_blocks(doc: &LoxoneDoc, uuids: &[String]) -> Vec<RemovedBlock> {
-    let c = Ctx::new(doc);
-    uuids
+/// The blocks `uuids` as `old` (what runs) has them, for the removal's
+/// confirmation, and who loses or gains access or a notification with them
+/// in `new` (#68).
+pub fn removed_blocks(
+    old: &LoxoneDoc,
+    new: &LoxoneDoc,
+    uuids: &[String],
+) -> (Vec<RemovedBlock>, Vec<rights::Change>) {
+    let c = Ctx::new(old);
+    let rights = rights_of(&Ctx::new(new), &c, &rights::read(old), &rights::read(new))
+        .into_iter()
+        .filter(|r| uuids.contains(&r.uuid))
+        .collect();
+    let blocks = uuids
         .iter()
         .map(|u| {
             let mut wires = Vec::new();
@@ -1355,7 +1365,8 @@ pub fn removed_blocks(doc: &LoxoneDoc, uuids: &[String]) -> Vec<RemovedBlock> {
                 refs: c.mirrors.get(u).map_or(0, Vec::len),
             }
         })
-        .collect()
+        .collect();
+    (blocks, rights)
 }
 
 /// Which devices the change reconfigures, and with which attributes.
@@ -2674,7 +2685,8 @@ mod tests {
     #[test]
     fn a_removed_block_says_where_it_is_and_what_is_wired_to_it() {
         let d = doc(HOUSE);
-        let r = removed_blocks(&d, &[AND.to_string(), "gone".to_string()]);
+        let (r, rights) = removed_blocks(&d, &d, &[AND.to_string(), "gone".to_string()]);
+        assert!(rights.is_empty());
         let and = &r[0];
         assert!(and.found);
         assert_eq!((and.title.as_str(), and.ty.as_str()), ("O1001", "And"));

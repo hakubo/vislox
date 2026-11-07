@@ -23,7 +23,7 @@ use crate::{check, edit, restart};
 
 mod removals;
 mod rollback;
-pub use removals::{RemovalConsent, refused_slug};
+pub use removals::{NEEDS_CONSENT, RemovalConsent, plan_id as removal_plan_id, refused_slug};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -101,16 +101,15 @@ pub struct Actions {
 
 /// Whether `out` is the module compiled as it is now ([`Actions::freshness`]).
 enum Fresh {
-    Yes,
+    /// `removals`: the blocks the push of that compile deletes (#70).
+    Yes { removals: Vec<removals::Removed> },
     /// It compiles to another config: `out` is from before `changed`.
     Stale {
         changed: Vec<String>,
+        removals: Vec<removals::Removed>,
     },
     /// It does not compile against the base (lox's message).
-    Broken {
-        changed: Vec<String>,
-        error: String,
-    },
+    Broken { changed: Vec<String>, error: String },
 }
 
 /// The module and base as a compile read them, and the config it wrote,
@@ -915,6 +914,9 @@ impl Actions {
             "running": st.running,
             "last": st.last,
             "progress": st.progress,
+            // The removal plan the server keeps (#70): a tab's own preview
+            // goes when it is another.
+            "removals": self.removal_plan_id(),
         })
     }
 
@@ -1037,13 +1039,18 @@ impl Actions {
         // them, compiled into the project before the tests run on it.
         self.progress(|p| p.start("removals"));
         let consent = opts.allow_removals.as_ref();
-        match self.removals_step(consent).await {
-            Ok((state, detail)) => self.progress(|p| p.finish("removals", state, Some(detail))),
+        // Puts the lockfile and out back on any failure before the push
+        // went through: the consent never outlives this request.
+        let mut put_back = match self.removals_step(consent).await {
+            Ok((state, detail, guard)) => {
+                self.progress(|p| p.finish("removals", state, Some(detail)));
+                guard
+            }
             Err(why) => {
                 self.end_with("apply", &Err(why.clone()), None);
                 return Err((StatusCode::CONFLICT, why));
             }
-        }
+        };
         // Then its tests (#67) must pass, on the config Apply deploys: the
         // check's run when it is of the files as they are, else run now.
         self.progress(|p| p.start("tests"));
@@ -1051,21 +1058,20 @@ impl Actions {
         match tests_verdict(&tests) {
             Ok((state, detail)) => self.progress(|p| p.finish("tests", state, Some(detail))),
             Err(why) => {
+                drop(put_back.take());
                 self.end_with("apply", &Err(why.clone()), None);
                 return Err((StatusCode::CONFLICT, why));
             }
         }
         // The removals were compiled in: what is pushed must still be that
         // compile, the module and lockfile untouched since.
-        if consent.is_some() {
+        if put_back.is_some() {
             let fresh = match self.project() {
-                Ok(p) => matches!(
-                    self.freshness(&p, self.s.project.as_deref().unwrap()).await,
-                    Ok(Fresh::Yes)
-                ),
+                Ok(p) => matches!(self.freshness(&p).await, Ok(Fresh::Yes { .. })),
                 Err(_) => false,
             };
             if !fresh {
+                drop(put_back.take());
                 let why = "The module or its lockfile changed after the removals you confirmed \
                            were compiled. Nothing was deployed: review the pending config again."
                     .to_string();
@@ -1073,7 +1079,10 @@ impl Actions {
                 return Err((StatusCode::CONFLICT, why));
             }
         }
-        let res = self.apply_steps(opts).await;
+        let res = self.apply_steps(opts, put_back.as_mut()).await;
+        // Failed before the push went through: put back now, before the end
+        // is reported (the check reads the project then).
+        drop(put_back);
         let (res, deployed) = match res {
             Ok((m, d)) => (Ok(m), d),
             Err(e) => (Err(e), None),
@@ -1082,7 +1091,11 @@ impl Actions {
         res.map_err(|e| (StatusCode::BAD_GATEWAY, e))
     }
 
-    async fn apply_steps(&self, opts: &ApplyOpts) -> Result<(String, Option<Deployed>), String> {
+    async fn apply_steps(
+        &self,
+        opts: &ApplyOpts,
+        put_back: Option<&mut removals::PutBack<'_>>,
+    ) -> Result<(String, Option<Deployed>), String> {
         let dir = self.s.project.as_deref().unwrap();
         let mut args = vec!["config", "push", "--force"];
         push_opts(opts, &mut args)?;
@@ -1105,6 +1118,10 @@ impl Actions {
             .ok()
             .map(|b| crate::history::blob_id(&b));
         let (pushed, ran_before) = self.push_config(&args).await?;
+        // Pushed and verified: lox wrote the lockfile of what runs now.
+        if let Some(g) = put_back {
+            g.keep();
+        }
         let c = Commit {
             subject: &subject,
             body: None,
@@ -1564,7 +1581,7 @@ impl Actions {
         }
         // An edit compiles the whole module: it must not take along changes
         // someone else made to it and has not compiled.
-        self.uncompiled(&p, dir).await?;
+        self.uncompiled(&p).await?;
         // Discard puts the lock and out back as they were before vislox's
         // first edit, where the last commit does not have them.
         snapshot_before_edit(dir, &p).await;
@@ -1672,7 +1689,7 @@ impl Actions {
     /// Refuse when the module holds changes that are not compiled into the
     /// pending config: an edit's compile would fold them in. See
     /// [`Self::freshness`].
-    async fn uncompiled(&self, p: &loxone_config::Project, dir: &Path) -> Result<(), Refusal> {
+    async fn uncompiled(&self, p: &loxone_config::Project) -> Result<(), Refusal> {
         use axum::http::StatusCode;
         let refuse = |msg: String| (StatusCode::CONFLICT, msg);
         let files = |changed: &[String]| {
@@ -1682,15 +1699,15 @@ impl Actions {
                 changed.join(", ")
             }
         };
-        match self.freshness(p, dir).await.map_err(refuse)? {
-            Fresh::Yes => Ok(()),
+        match self.freshness(p).await.map_err(refuse)? {
+            Fresh::Yes { .. } => Ok(()),
             Fresh::Broken { changed, error } => Err(refuse(format!(
                 "The module does not compile as it is ({} changed since the last compile). \
                  Fix or discard that, then edit:\n{}",
                 files(&changed),
                 last_lines(&error, 6)
             ))),
-            Fresh::Stale { changed } => Err(refuse(format!(
+            Fresh::Stale { changed, .. } => Err(refuse(format!(
                 "The module has changes that are not compiled yet ({}). An edit compiles the \
                  whole module and would take them along: compile them (lox logic compile) or \
                  discard them first.",
@@ -1705,19 +1722,23 @@ impl Actions {
     /// compiled; anything else is compiled as it is into a scratch copy and
     /// compared with `out`. `Err`: it cannot be told (no config to compare
     /// with, no scratch directory).
-    async fn freshness(&self, p: &loxone_config::Project, dir: &Path) -> Result<Fresh, String> {
+    async fn freshness(&self, p: &loxone_config::Project) -> Result<Fresh, String> {
         let module = module_blobs(p);
         let out_blob = file_blob(&p.out);
         let base_blob = file_blob(&p.base);
         let lock_blob = file_blob(&p.lock);
         let last = self.compiled.lock().unwrap().clone();
+        let base_bytes = std::fs::read(&p.base).unwrap_or_default();
         if let (Some(last), Some(o)) = (&last, &out_blob)
             && last.module == module
             && &last.out == o
             && last.base == base_blob
             && last.lock == lock_blob
         {
-            return Ok(Fresh::Yes);
+            let lock = std::fs::read(&p.lock).ok();
+            return Ok(Fresh::Yes {
+                removals: removals::pending(lock.as_deref(), &base_bytes),
+            });
         }
         // The files that changed: since vislox's last compile, else those
         // written no earlier than out (a guess, for the message only).
@@ -1758,17 +1779,14 @@ impl Actions {
         let reference = std::fs::read(&p.out)
             .or_else(|_| std::fs::read(&p.base))
             .map_err(|e| format!("cannot read the pending config: {e}"))?;
-        let scratch = removals::scratch_dir("vislox-check")?;
-        let _gone = RemoveDir(scratch.clone());
-        let (lock, out) = (scratch.join("lock.json"), scratch.join("out.Loxone"));
-        if p.lock.exists() {
-            std::fs::copy(&p.lock, &lock).map_err(|e| format!("cannot copy the lock: {e}"))?;
-        }
-        let (lock_s, out_s) = (lock.to_string_lossy(), out.to_string_lossy());
-        let args = ["logic", "compile", "--lock", &lock_s, "--out", &out_s];
-        match run(&self.s.lox, &args, dir, COMPILE_TIMEOUT).await {
+        let (scratch, res) = self.scratch_compile(p, &[]).await?;
+        let removals = || {
+            let lock = std::fs::read(&scratch.lock).ok();
+            removals::pending(lock.as_deref(), &base_bytes)
+        };
+        match res {
             Err(error) => Ok(Fresh::Broken { changed, error }),
-            Ok(_) if std::fs::read(&out).ok().as_deref() == Some(reference.as_slice()) => {
+            Ok(_) if std::fs::read(&scratch.out).ok().as_deref() == Some(reference.as_slice()) => {
                 // Compiled as it is: remembered, so the next edit need not
                 // compile it again; unless the module changed meanwhile (an
                 // edit while `GET /api/check` compiled), when what compiled
@@ -1785,9 +1803,14 @@ impl Actions {
                         lock: lock_blob,
                     });
                 }
-                Ok(Fresh::Yes)
+                Ok(Fresh::Yes {
+                    removals: removals(),
+                })
             }
-            Ok(_) => Ok(Fresh::Stale { changed }),
+            Ok(_) => Ok(Fresh::Stale {
+                changed,
+                removals: removals(),
+            }),
         }
     }
 
@@ -2165,21 +2188,28 @@ impl Actions {
         // Is the pending config the module as it is? Not asked while the
         // module does not compile (it cannot be). Else by content: the
         // record of vislox's last compile, or a scratch compile.
-        let stale = if !checked.errors.is_empty() {
-            Value::Null
+        // And what its push would remove (#70): lox's refusal for a block
+        // the module lost, or the blocks it deletes. Apply asks for them.
+        let removal = |refused: Option<String>, blocks: &[removals::Removed]| {
+            if refused.is_none() && blocks.is_empty() {
+                Value::Null
+            } else {
+                json!({ "refused": refused, "blocks": blocks })
+            }
+        };
+        let (stale, removals) = if !checked.errors.is_empty() {
+            (Value::Null, Value::Null)
         } else {
-            match self.freshness(&p, dir).await {
-                Ok(Fresh::Yes) | Err(_) => Value::Null,
-                Ok(Fresh::Stale { changed }) => json!({ "files": changed }),
-                Ok(Fresh::Broken { changed, error }) => {
-                    // A block the module lost (#70): lox compiles it only with
-                    // the removals allowed, which Apply asks for.
-                    json!({
-                        "files": changed,
-                        "error": last_lines(&error, 6),
-                        "removals": refused_slug(&error),
-                    })
+            match self.freshness(&p).await {
+                Err(_) => (Value::Null, Value::Null),
+                Ok(Fresh::Yes { removals }) => (Value::Null, removal(None, &removals)),
+                Ok(Fresh::Stale { changed, removals }) => {
+                    (json!({ "files": changed }), removal(None, &removals))
                 }
+                Ok(Fresh::Broken { changed, error }) => (
+                    json!({ "files": changed, "error": last_lines(&error, 6) }),
+                    removal(refused_slug(&error), &[]),
+                ),
             }
         };
         json!({
@@ -2189,6 +2219,7 @@ impl Actions {
             "truncated": checked.truncated,
             "unformatted": unformatted,
             "stale": stale,
+            "removals": removals,
             "lint": Value::Null,
             "test": Value::Null,
         })
@@ -2643,7 +2674,8 @@ pub fn apply_hints(msg: &str) -> Value {
         "accept_version": accept_version,
         "custom_changes": (!custom.is_empty() && msg.contains("--discard-custom-changes")).then_some(custom),
         // A block the module lost (#70): the browser asks for the plan.
-        "removals": refused_slug(msg),
+        "removals": refused_slug(msg)
+            .or_else(|| msg.contains(NEEDS_CONSENT).then(|| "pending".to_string())),
     })
 }
 
@@ -2840,10 +2872,7 @@ fn tests_verdict(t: &Value) -> Result<(&'static str, String), String> {
     let bad: Vec<&Value> = tests.iter().filter(|t| t["status"] != "pass").collect();
     if bad.is_empty() {
         let n = tests.len();
-        return Ok((
-            "ok",
-            format!("{n} test{} passed", if n == 1 { "" } else { "s" }),
-        ));
+        return Ok(("ok", format!("{} passed", plural(n, "test"))));
     }
     let mut list = Vec::new();
     for t in bad.iter().take(5) {
@@ -2880,6 +2909,11 @@ fn tests_verdict(t: &Value) -> Result<(&'static str, String), String> {
         list.join("\n"),
         if n > 5 { "\n  …" } else { "" }
     ))
+}
+
+/// `3 blocks`, `1 block`.
+pub(crate) fn plural(n: usize, what: &str) -> String {
+    format!("{n} {what}{}", if n == 1 { "" } else { "s" })
 }
 
 /// Why Apply must not run: the module has errors (#65), the first five of

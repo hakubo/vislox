@@ -1,31 +1,34 @@
-//! Managed blocks the module no longer has (#70). lox refuses to compile a
-//! module that lost a block its lockfile manages, unless the removal is
-//! allowed: `removed <slug>` in the module, or `--allow-removals`, which
-//! deletes *every* vanished block. Apply never passes that flag by default,
-//! nor again on a retry by itself:
+//! Managed blocks a push would delete (#70). lox refuses to compile a module
+//! that lost a block its lockfile manages, unless the removal is allowed:
+//! `removed <slug>` in the module, or `--allow-removals`, which deletes
+//! *every* vanished block. Either way the compile leaves a tombstone in the
+//! lockfile for each block the base has, and the next push deletes those
+//! blocks from the Miniserver, flag or not. So vislox asks for every one:
 //!
 //! - **The plan** ([`Actions::removal_plan`]) changes nothing: the module
 //!   compiled in a scratch directory with `--allow-removals` and a fixed
-//!   `--time`, onto a copy of the lockfile. The blocks it removes are the
-//!   lockfile's objects the compile drops, each with the UUID the lockfile
-//!   pins. The browser shows the result as a revision and lists the blocks.
+//!   `--time`, onto a copy of the lockfile. The blocks it deletes are the
+//!   tombstones it leaves for blocks the base has, and the managed blocks it
+//!   drops that were never deployed. The browser shows the result as a
+//!   revision and lists the blocks.
+//! - **Without consent** Apply refuses when lox would refuse the module, or
+//!   when the push would delete a block: a tombstone in the project's
+//!   lockfile, or one a compile of the module as it is would leave.
 //! - **The consent** names the plan's program (its blob id) and exactly its
-//!   blocks. Apply works the plan out again from the files as they are now,
-//!   and refuses unless both are the same.
-//! - **What is deployed is what was confirmed.** Apply then compiles in the
-//!   project with `--allow-removals` and the plan's time: `out` must be the
-//!   confirmed program, and the lockfile must have dropped exactly the
-//!   confirmed blocks (lox keeps a tombstone for each one the Miniserver
-//!   runs). Otherwise the lockfile and `out` are put back. The tests then run
-//!   on it, and `lox config push` deletes the tombstoned blocks *without*
-//!   `--allow-removals`: a block that vanishes after the confirmation is
-//!   refused by lox again, not deleted.
+//!   blocks. Apply compiles in the project with `--allow-removals` and the
+//!   plan's `--time`: `out` must be the confirmed program, and the blocks it
+//!   deletes the confirmed ones. Until the push succeeds, a guard
+//!   ([`PutBack`]) puts the lockfile and `out` back on any failure, so the
+//!   tombstones never outlive the request. The push runs *without*
+//!   `--allow-removals`: a block that vanishes after the compile is refused
+//!   by lox again, not deleted.
 
 use super::*;
 use std::collections::{BTreeMap, BTreeSet};
 
-/// How long a plan can be confirmed (seconds): then it is worked out again.
-pub const PLAN_TTL: i64 = 15 * 60;
+/// Says an Apply was refused for blocks it would delete without consent;
+/// [`apply_hints`] reads it back.
+pub const NEEDS_CONSENT: &str = "lox deletes them only when you allow it";
 
 /// The managed block lox names when it refuses a compile because the module
 /// lost it: "managed block `x` is in the lockfile but not in the source".
@@ -39,7 +42,7 @@ pub fn refused_slug(msg: &str) -> Option<String> {
     })
 }
 
-/// A managed block a compile with `--allow-removals` drops.
+/// A block a push would delete, or a managed block the lockfile forgets.
 #[derive(Clone, Serialize, PartialEq, Debug)]
 pub struct Removed {
     pub slug: String,
@@ -47,9 +50,9 @@ pub struct Removed {
     /// The block type the lockfile records.
     #[serde(rename = "type")]
     pub ty: String,
-    /// The base has it, so the Miniserver runs it: lox keeps a tombstone and
-    /// deletes it there. Else it was never deployed, and only the lockfile
-    /// forgets it.
+    /// The base has it, so the Miniserver runs it: the lockfile keeps a
+    /// tombstone and the push deletes it there. Else it was never deployed,
+    /// and only the lockfile forgets it.
     pub deployed: bool,
 }
 
@@ -59,6 +62,8 @@ pub struct RemovalPlan {
     pub blocks: Vec<Removed>,
     /// The module compiled with the removals allowed.
     pub compiled: Vec<u8>,
+    /// Its blob id.
+    pub blob: String,
     /// The `--time` it was compiled with, so that the deploy's compile mints
     /// the same UUIDs for blocks the module adds.
     time: i64,
@@ -67,9 +72,14 @@ pub struct RemovalPlan {
 }
 
 impl RemovalPlan {
-    pub fn blob(&self) -> String {
-        crate::history::blob_id(&self.compiled)
+    /// The revision that shows it (`removals:<blob>`).
+    pub fn id(&self) -> String {
+        plan_id(&self.blob)
     }
+}
+
+pub fn plan_id(blob: &str) -> String {
+    format!("removals:{}", &blob[..12.min(blob.len())])
 }
 
 /// The user's consent to the removals of a plan, with Apply.
@@ -81,44 +91,65 @@ pub struct RemovalConsent {
     pub blocks: Vec<String>,
 }
 
-/// A lockfile's managed objects (slug → UUID and type) and tombstones (UUIDs).
-fn lock_objects(path: &Path) -> (BTreeMap<String, (String, String)>, BTreeSet<String>) {
-    let v: Value = std::fs::read(path)
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
+/// A lockfile's managed objects (slug → UUID and type) and tombstones
+/// (UUID → slug and type).
+type Objects = BTreeMap<String, (String, String)>;
+fn lock_objects(bytes: Option<&[u8]>) -> (Objects, Objects) {
+    let v: Value = bytes
+        .and_then(|b| serde_json::from_slice(b).ok())
         .unwrap_or(Value::Null);
-    let objects = v["objects"]
-        .as_object()
-        .map(|o| {
-            o.iter()
-                .filter_map(|(s, x)| {
-                    let uuid = x["uuid"].as_str()?.to_string();
-                    let ty = x["type"].as_str().unwrap_or("").to_string();
-                    Some((s.clone(), (uuid, ty)))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    let removed = v["removed"]
-        .as_object()
-        .map(|o| o.keys().cloned().collect())
-        .unwrap_or_default();
-    (objects, removed)
+    let read = |o: &Value, key: &str| -> Objects {
+        o.as_object()
+            .map(|o| {
+                o.iter()
+                    .filter_map(|(k, x)| {
+                        let v = x[key].as_str()?.to_string();
+                        let ty = x["type"].as_str().unwrap_or("").to_string();
+                        Some((k.clone(), (v, ty)))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    (read(&v["objects"], "uuid"), read(&v["removed"], "slug"))
 }
 
-/// The blocks a compile dropped: in the lockfile `before`, not in `after`.
-fn dropped(before: &Path, after: &Path) -> Vec<Removed> {
-    let (was, _) = lock_objects(before);
-    let (now, tombs) = lock_objects(after);
-    was.into_iter()
-        .filter(|(slug, _)| !now.contains_key(slug))
-        .map(|(slug, (uuid, ty))| Removed {
-            deployed: tombs.contains(&uuid),
+/// The tombstones of lockfile `lock` whose object `base` still has: the
+/// blocks a push of its compile deletes.
+pub fn pending(lock: Option<&[u8]>, base: &[u8]) -> Vec<Removed> {
+    let base = String::from_utf8_lossy(base);
+    let (_, tombs) = lock_objects(lock);
+    tombs
+        .into_iter()
+        .filter(|(uuid, _)| base.contains(&format!("U=\"{uuid}\"")))
+        .map(|(uuid, (slug, ty))| Removed {
             slug,
             uuid,
             ty,
+            deployed: true,
         })
         .collect()
+}
+
+/// What a compile from lockfile `before` to `after` against `base`
+/// removes: the blocks its push deletes ([`pending`]), and the managed
+/// blocks it drops that were never deployed. By slug.
+fn removals(before: Option<&[u8]>, after: Option<&[u8]>, base: &[u8]) -> Vec<Removed> {
+    let mut out = pending(after, base);
+    let (was, _) = lock_objects(before);
+    let (now, _) = lock_objects(after);
+    for (slug, (uuid, ty)) in was {
+        if !now.contains_key(&slug) && !out.iter().any(|b| b.uuid == uuid) {
+            out.push(Removed {
+                slug,
+                uuid,
+                ty,
+                deployed: false,
+            });
+        }
+    }
+    out.sort_by(|a, b| a.slug.cmp(&b.slug));
+    out
 }
 
 /// A new, empty directory of its own: two never share one, even when
@@ -131,19 +162,86 @@ pub(super) fn scratch_dir(prefix: &str) -> Result<PathBuf, String> {
         std::process::id(),
         now_nanos()
     ));
-    std::fs::create_dir(&d).map_err(|e| format!("cannot create {}: {e}", d.display()))?;
+    std::fs::create_dir_all(&d).map_err(|e| format!("cannot create {}: {e}", d.display()))?;
     Ok(d)
+}
+
+/// A compile of the module into a scratch directory ([`Actions::scratch_compile`]):
+/// its lockfile and out, removed with it.
+pub(super) struct Scratch {
+    pub lock: PathBuf,
+    pub out: PathBuf,
+    _gone: RemoveDir,
 }
 
 fn uuids(blocks: &[Removed]) -> BTreeSet<&str> {
     blocks.iter().map(|b| b.uuid.as_str()).collect()
 }
 
+/// The lockfile and out as they were before Apply compiled the removals in:
+/// put back on drop, and the compile forgotten, unless [`PutBack::keep`] was
+/// called (once the push went through). So a consent never outlives its
+/// request: a failure at any step before the push leaves no tombstone.
+pub(super) struct PutBack<'a> {
+    a: &'a Actions,
+    saved: Vec<(PathBuf, Option<Vec<u8>>)>,
+    keep: bool,
+}
+
+impl PutBack<'_> {
+    pub(super) fn keep(&mut self) {
+        self.keep = true;
+    }
+}
+
+impl Drop for PutBack<'_> {
+    fn drop(&mut self) {
+        if self.keep {
+            return;
+        }
+        for (path, bytes) in &self.saved {
+            let _ = match bytes {
+                Some(b) => std::fs::write(path, b),
+                None => std::fs::remove_file(path),
+            };
+        }
+        *self.a.compiled.lock().unwrap() = None;
+    }
+}
+
 impl Actions {
+    /// `lox logic compile` of the module as it is, onto a scratch copy of
+    /// the lockfile, with `extra` flags. `Err`: no scratch directory; the
+    /// inner `Err` is lox's message.
+    pub(super) async fn scratch_compile(
+        &self,
+        p: &loxone_config::Project,
+        extra: &[&str],
+    ) -> Result<(Scratch, Result<(), String>), String> {
+        let dir = self.s.project.as_deref().unwrap();
+        let d = scratch_dir("vislox-compile")?;
+        let s = Scratch {
+            lock: d.join("lock.json"),
+            out: d.join("out.Loxone"),
+            _gone: RemoveDir(d),
+        };
+        if p.lock.exists() {
+            std::fs::copy(&p.lock, &s.lock).map_err(|e| format!("cannot copy the lock: {e}"))?;
+        }
+        let (l, o) = (s.lock.to_string_lossy(), s.out.to_string_lossy());
+        let mut args = vec!["logic", "compile", "--lock", &l, "--out", &o];
+        args.extend(extra);
+        let res = run(&self.s.lox, &args, dir, COMPILE_TIMEOUT)
+            .await
+            .map(|_| ());
+        Ok((s, res))
+    }
+
     /// What Apply would deploy if the removals were allowed (see the
     /// module's documentation). Runs while no action runs, holding the
     /// compile lock; changes nothing in the project. Kept for
-    /// [`PLAN_TTL`], for the consent to name.
+    /// [`crate::history::PREVIEW_TTL`], for the consent to name; a newer plan
+    /// replaces it.
     pub async fn removal_plan(&self) -> Result<RemovalPlan, String> {
         let _one = self
             .busy
@@ -154,88 +252,147 @@ impl Actions {
         }
         let _compiling = self.compile_lock.lock().await;
         let p = self.project()?;
-        let plan = self.plan_removals(&p, now()).await?;
-        if plan.blocks.is_empty() {
+        let time = now();
+        let t = time.to_string();
+        let (s, res) = self
+            .scratch_compile(&p, &["--time", &t, "--allow-removals"])
+            .await?;
+        res.map_err(|e| {
+            format!(
+                "The module does not compile even with its removals allowed:\n{}",
+                last_lines(&e, 6)
+            )
+        })?;
+        let compiled =
+            std::fs::read(&s.out).map_err(|e| format!("lox logic compile wrote no config: {e}"))?;
+        let base = std::fs::read(&p.base).map_err(|e| format!("cannot read the base: {e}"))?;
+        let blocks = removals(
+            std::fs::read(&p.lock).ok().as_deref(),
+            std::fs::read(&s.lock).ok().as_deref(),
+            &base,
+        );
+        if blocks.is_empty() {
             return Err(
                 "The module removes no managed block: there is nothing to allow.".to_string(),
             );
         }
+        let plan = RemovalPlan {
+            blob: crate::history::blob_id(&compiled),
+            blocks,
+            compiled,
+            time,
+            at: now(),
+        };
         *self.removals.lock().unwrap() = Some(plan.clone());
         Ok(plan)
     }
 
-    /// The module compiled with `--allow-removals --time <time>` onto a
-    /// scratch copy of the lockfile, and the blocks it drops.
-    async fn plan_removals(
+    /// The plan the server keeps, for the browsers: its revision id.
+    pub fn removal_plan_id(&self) -> Option<String> {
+        self.removals
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|k| now() - k.at < crate::history::PREVIEW_TTL)
+            .map(RemovalPlan::id)
+    }
+
+    /// The browser cancelled plan `id`: forget it.
+    pub fn drop_removal_plan(&self, id: &str) {
+        let mut k = self.removals.lock().unwrap();
+        if k.as_ref().is_some_and(|k| k.id() == id) {
+            *k = None;
+        }
+    }
+
+    /// What the push of the project as it is would remove without consent:
+    /// lox's refusal for a block the module lost, or the blocks it deletes.
+    /// From the check when it is of the files as they are, else a scratch
+    /// compile (as the check's). The project's own lockfile is read anyway:
+    /// its tombstones are deleted by any push.
+    async fn unasked_removals(
         &self,
         p: &loxone_config::Project,
-        time: i64,
-    ) -> Result<RemovalPlan, String> {
-        let dir = self.s.project.as_deref().unwrap();
-        let scratch = scratch_dir("vislox-removals")?;
-        let _gone = RemoveDir(scratch.clone());
-        let (lock, out) = (scratch.join("lock.json"), scratch.join("out.Loxone"));
-        if p.lock.exists() {
-            std::fs::copy(&p.lock, &lock).map_err(|e| format!("cannot copy the lock: {e}"))?;
+    ) -> Result<(Option<String>, Vec<Removed>), String> {
+        let base = std::fs::read(&p.base).map_err(|e| format!("cannot read the base: {e}"))?;
+        let mut blocks = pending(std::fs::read(&p.lock).ok().as_deref(), &base);
+        let mut refused = None;
+        let cached = {
+            let k = self.check_key();
+            let files = self.edit_state.lock().unwrap().files.clone();
+            let c = self.check_cache.lock().unwrap();
+            c.as_ref()
+                .filter(|c| c.key == k && c.v["available"] == true && c.v["ok"] == true)
+                .map(|c| (c.v["removals"].clone(), files))
+        };
+        let from_check = match cached {
+            Some((v, files)) if self.files_key_now().await == files => Some(v),
+            _ => None,
+        };
+        match from_check {
+            Some(v) => {
+                refused = v["refused"].as_str().map(String::from);
+                for b in v["blocks"].as_array().into_iter().flatten() {
+                    if let Ok(b) = serde_json::from_value::<RemovedIn>(b.clone()) {
+                        blocks.push(Removed {
+                            slug: b.slug,
+                            uuid: b.uuid,
+                            ty: b.ty,
+                            deployed: true,
+                        });
+                    }
+                }
+            }
+            None => match self.freshness(p).await {
+                Ok(Fresh::Broken { error, .. }) => refused = refused_slug(&error),
+                Ok(Fresh::Yes { removals } | Fresh::Stale { removals, .. }) => {
+                    blocks.extend(removals)
+                }
+                Err(_) => {}
+            },
         }
-        let (l, o, t) = (
-            lock.to_string_lossy(),
-            out.to_string_lossy(),
-            time.to_string(),
-        );
-        let args = [
-            "logic",
-            "compile",
-            "--lock",
-            &l,
-            "--out",
-            &o,
-            "--time",
-            &t,
-            "--allow-removals",
-        ];
-        run(&self.s.lox, &args, dir, COMPILE_TIMEOUT)
-            .await
-            .map_err(|e| {
-                format!(
-                    "The module does not compile even with its removals allowed:\n{}",
-                    last_lines(&e, 6)
-                )
-            })?;
-        let compiled =
-            std::fs::read(&out).map_err(|e| format!("lox logic compile wrote no config: {e}"))?;
-        Ok(RemovalPlan {
-            blocks: dropped(&p.lock, &lock),
-            compiled,
-            time,
-            at: now(),
-        })
+        blocks.sort_by(|a, b| a.uuid.cmp(&b.uuid));
+        blocks.dedup_by(|a, b| a.uuid == b.uuid);
+        blocks.sort_by(|a, b| a.slug.cmp(&b.slug));
+        Ok((refused, blocks))
     }
 
     /// Apply's *Removals* step. Without consent: refuse when lox would refuse
-    /// the module for a block it lost (a scratch compile, as the check's),
-    /// with lox's words, so that the browser asks. With it: the plan worked
-    /// out again must be the confirmed one, and is compiled into the project
-    /// (see the module's documentation). Returns the step's state and detail.
+    /// the module for a block it lost, or the push would delete a block
+    /// ([`Self::unasked_removals`]), so that the browser asks. With it: the
+    /// plan the consent names is compiled into the project, and must be it
+    /// (see the module's documentation); the [`PutBack`] it returns puts the
+    /// project back unless the push goes through.
     pub(super) async fn removals_step(
         &self,
         consent: Option<&RemovalConsent>,
-    ) -> Result<(&'static str, String), String> {
+    ) -> Result<(&'static str, String, Option<PutBack<'_>>), String> {
         let dir = self.s.project.as_deref().unwrap();
         let p = self.project()?;
         let Some(c) = consent else {
-            return match self.freshness(&p, dir).await {
-                Ok(Fresh::Broken { error, .. }) if refused_slug(&error).is_some() => Err(format!(
-                    "The module no longer has blocks the Miniserver runs, and lox deletes them \
-                     only when you allow it. Nothing was deployed: review the removals, then \
-                     apply.\n{}",
-                    last_lines(&error, 3)
-                )),
-                _ => Ok(("skip", "the module removes no managed block".into())),
-            };
+            let (refused, blocks) = self.unasked_removals(&p).await?;
+            if refused.is_none() && blocks.is_empty() {
+                return Ok(("skip", "the push removes no block".into(), None));
+            }
+            let mut msg = format!(
+                "The push would delete blocks the Miniserver runs, and {NEEDS_CONSENT}. Nothing \
+                 was deployed: review the removals, then apply."
+            );
+            for b in &blocks {
+                msg.push_str(&format!("\n  {} ({})", b.slug, b.ty));
+            }
+            if let Some(slug) = refused {
+                msg.push_str(&format!(
+                    "\ncompile error: managed block `{slug}` is in the lockfile but not in the \
+                     source."
+                ));
+            }
+            return Err(msg);
         };
         let kept = self.removals.lock().unwrap().clone();
-        let Some(kept) = kept.filter(|k| k.blob() == c.reviewed && now() - k.at < PLAN_TTL) else {
+        let Some(kept) =
+            kept.filter(|k| k.blob == c.reviewed && now() - k.at < crate::history::PREVIEW_TTL)
+        else {
             return Err(
                 "The removals you confirmed are not the ones vislox worked out last, or are too \
                  old. Nothing was deployed: review the removals again."
@@ -250,66 +407,52 @@ impl Actions {
                     .into(),
             );
         }
-        // Worked out again from the files as they are now.
-        let again = self.plan_removals(&p, kept.time).await?;
-        if again.blob() != c.reviewed || uuids(&again.blocks) != confirmed {
-            return Err(format!(
-                "The module, its lockfile or the base changed since you confirmed the removals \
-                 (the plan is now {}, you reviewed {}). Nothing was deployed: review the removals \
-                 again.",
-                &again.blob()[..10],
-                &c.reviewed[..10.min(c.reviewed.len())]
-            ));
-        }
-        // In the project, with the plan's time: out must be what was confirmed.
+        // In the project, with the plan's time: out must be what was
+        // confirmed, which binds the module, lockfile and base to the plan's.
         snapshot_before_edit(dir, &p).await;
         let module = module_blobs(&p);
-        let base = file_blob(&p.base);
-        let (lock_was, out_was) = (std::fs::read(&p.lock).ok(), std::fs::read(&p.out).ok());
-        let put_back = || {
-            for (path, was) in [(&p.lock, &lock_was), (&p.out, &out_was)] {
-                let _ = match was {
-                    Some(b) => std::fs::write(path, b),
-                    None => std::fs::remove_file(path),
-                };
-            }
+        let base = std::fs::read(&p.base).map_err(|e| format!("cannot read the base: {e}"))?;
+        let lock_was = std::fs::read(&p.lock).ok();
+        let guard = PutBack {
+            a: self,
+            saved: vec![
+                (p.lock.clone(), lock_was.clone()),
+                (p.out.clone(), std::fs::read(&p.out).ok()),
+            ],
+            keep: false,
         };
-        let scratch = scratch_dir("vislox-removals-lock")?;
-        let _gone = RemoveDir(scratch.clone());
-        let before = scratch.join("lock.json");
-        if let Some(b) = &lock_was {
-            std::fs::write(&before, b).map_err(|e| format!("cannot copy the lock: {e}"))?;
-        }
         let t = kept.time.to_string();
         let args = ["logic", "compile", "--time", &t, "--allow-removals"];
         if let Err(e) = run(&self.s.lox, &args, dir, COMPILE_TIMEOUT).await {
-            put_back();
             return Err(format!(
                 "lox logic compile --allow-removals failed, so nothing was deployed:\n{}",
                 last_lines(&e, 6)
             ));
         }
         let out = file_blob(&p.out);
-        let gone = dropped(&before, &p.lock);
+        let gone = removals(
+            lock_was.as_deref(),
+            std::fs::read(&p.lock).ok().as_deref(),
+            &base,
+        );
         if out.as_deref() != Some(c.reviewed.as_str()) || uuids(&gone) != confirmed {
-            put_back();
             return Err(format!(
-                "The compile with the removals allowed is not the one you confirmed (out {}, \
-                 {} blocks dropped). The lockfile and out were put back; nothing was deployed.",
+                "The module, its lockfile or the base changed since you confirmed the removals: \
+                 the compile is not the one you reviewed (out {}, {} removed). The lockfile and \
+                 out were put back; nothing was deployed. Review the removals again.",
                 out.as_deref().map(|o| &o[..10]).unwrap_or("missing"),
-                gone.len()
+                plural(gone.len(), "block")
             ));
         }
         if module_blobs(&p) == module
-            && file_blob(&p.base) == base
+            && std::fs::read(&p.base).ok().as_deref() == Some(base.as_slice())
             && let Some(out) = out
         {
-            let lock = file_blob(&p.lock);
             *self.compiled.lock().unwrap() = Some(Compiled {
                 module,
                 out,
-                base,
-                lock,
+                base: Some(crate::history::blob_id(&base)),
+                lock: file_blob(&p.lock),
             });
         }
         *self.removals.lock().unwrap() = None;
@@ -320,12 +463,18 @@ impl Actions {
                 "{} removed in the compile you confirmed ({on_ms} from the Miniserver)",
                 plural(gone.len(), "block")
             ),
+            Some(guard),
         ))
     }
 }
 
-fn plural(n: usize, what: &str) -> String {
-    format!("{n} {what}{}", if n == 1 { "" } else { "s" })
+/// A removed block as the check lists it.
+#[derive(serde::Deserialize)]
+struct RemovedIn {
+    slug: String,
+    uuid: String,
+    #[serde(rename = "type", default)]
+    ty: String,
 }
 
 #[cfg(test)]
@@ -346,6 +495,8 @@ mod tests {
         );
     }
 
+    /// The base: the Miniserver runs `licht` (U1).
+    const BASE: &str = "<C U=\"U1\"/>\n";
     /// The lockfile before: `licht` (on the Miniserver) and `bleibt`.
     const LOCK: &str =
         r#"{"objects":{"licht":{"uuid":"U1","type":"Or"},"bleibt":{"uuid":"U3","type":"And"}}}"#;
@@ -357,13 +508,20 @@ mod tests {
     /// lockfile still manages `licht`. It logs every call.
     #[cfg(unix)]
     fn project() -> (tempfile::TempDir, PathBuf, Actions) {
+        project_with(LOCK)
+    }
+
+    /// [`project`] with this lockfile. `lox logic test` fails while the
+    /// file `failtest` exists, and `lox config push` while `pushfail` does.
+    #[cfg(unix)]
+    fn project_with(lock: &str) -> (tempfile::TempDir, PathBuf, Actions) {
         use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
         let d = tmp.path().join("project");
         std::fs::create_dir_all(d.join("pages")).unwrap();
-        std::fs::write(d.join("base.Loxone"), "base\n").unwrap();
+        std::fs::write(d.join("base.Loxone"), BASE).unwrap();
         std::fs::write(d.join("out.Loxone"), "compiled before\n").unwrap();
-        std::fs::write(d.join("logic.lock.json"), LOCK).unwrap();
+        std::fs::write(d.join("logic.lock.json"), lock).unwrap();
         std::fs::write(d.join("pages/main.loxl"), "bleibt = And()\n").unwrap();
         std::fs::write(
             d.join("lox.toml"),
@@ -400,9 +558,12 @@ case "$1 $2" in
       printf '%s' '{{"objects":{{"bleibt":{{"uuid":"U3","type":"And"}}}},"removed":{{"U1":{{"slug":"licht","type":"Or"}}}}}}' > "$lock"
     fi
     cat pages/main.loxl base.Loxone > "$out" ;;
-  'logic test') echo 'no tests in pages' ;;
+  'logic test')
+    if [ -f '{dir}/failtest' ]; then echo 'test "t" ... FAILED'; echo '1 tests: 0 passed, 1 failed'; exit 1; fi
+    echo 'no tests in pages' ;;
   'logic diff') echo 'Remove the light' ;;
   'config push')
+    [ -f '{dir}/pushfail' ] && {{ echo 'Downloading the live config...' >&2; echo 'Error: no answer' >&2; exit 1; }}
     lost logic.lock.json && {{ printf 'Error: Compiling the module failed
 
 Caused by:
@@ -417,7 +578,8 @@ Caused by:
   *) exit 2 ;;
 esac
 "#,
-                calls = calls.display()
+                calls = calls.display(),
+                dir = tmp.path().display()
             ),
         )
         .unwrap();
@@ -458,7 +620,7 @@ esac
     fn consent(plan: &RemovalPlan) -> ApplyOpts {
         ApplyOpts {
             allow_removals: Some(RemovalConsent {
-                reviewed: plan.blob(),
+                reviewed: plan.blob.clone(),
                 blocks: plan.blocks.iter().map(|b| b.uuid.clone()).collect(),
             }),
             ..Default::default()
@@ -502,12 +664,12 @@ esac
                 deployed: true
             }]
         );
-        assert_eq!(plan.compiled, b"bleibt = And()\nbase\n");
+        assert_eq!(plan.compiled, format!("bleibt = And()\n{BASE}").as_bytes());
         assert_eq!(read(&lock), LOCK);
         assert_eq!(read(&d.join("out.Loxone")), "compiled before\n");
         let unchanged = |what: &str| {
             assert_eq!(read(&lock), LOCK, "{what}");
-            assert_eq!(read(&d.join("base.Loxone")), "base\n", "{what}");
+            assert_eq!(read(&d.join("base.Loxone")), BASE, "{what}");
             assert!(!calls(&tmp).contains("config push"), "{what}");
         };
         // Other blocks than the plan's: refused.
@@ -570,7 +732,7 @@ esac
         );
         std::fs::write(&lox, s).unwrap();
         let e = a.apply(&consent(&plan)).await.err().unwrap().1;
-        assert!(e.contains("not the one you confirmed"), "{e}");
+        assert!(e.contains("not the one you reviewed"), "{e}");
         assert_eq!(read(&d.join("logic.lock.json")), LOCK);
         assert_eq!(read(&d.join("out.Loxone")), "compiled before\n");
         assert!(!calls(&tmp).contains("config push"));
@@ -605,38 +767,87 @@ esac
     }
 
     #[test]
-    fn the_blocks_dropped_are_read_from_the_lockfiles() {
-        let t = tempfile::tempdir().unwrap();
-        let (a, b) = (t.path().join("a.json"), t.path().join("b.json"));
-        std::fs::write(
-            &a,
-            r#"{"objects":{"licht":{"uuid":"u1","type":"Or"},"neu":{"uuid":"u2","type":"And"},"bleibt":{"uuid":"u3","type":"And"}}}"#,
-        )
-        .unwrap();
-        std::fs::write(
-            &b,
-            r#"{"objects":{"bleibt":{"uuid":"u3","type":"And"}},"removed":{"u1":{"slug":"licht","type":"Or"}}}"#,
-        )
-        .unwrap();
-        let d = dropped(&a, &b);
-        assert_eq!(
-            d,
-            vec![
-                Removed {
-                    slug: "licht".into(),
-                    uuid: "u1".into(),
-                    ty: "Or".into(),
-                    deployed: true
-                },
-                Removed {
-                    slug: "neu".into(),
-                    uuid: "u2".into(),
-                    ty: "And".into(),
-                    deployed: false
-                },
-            ]
+    fn the_blocks_removed_are_read_from_the_lockfiles() {
+        let a = br#"{"objects":{"licht":{"uuid":"u1","type":"Or"},"neu":{"uuid":"u2","type":"And"},"bleibt":{"uuid":"u3","type":"And"}},"removed":{"u9":{"slug":"alt","type":"Or"}}}"#;
+        let b = br#"{"objects":{"bleibt":{"uuid":"u3","type":"And"}},"removed":{"u1":{"slug":"licht","type":"Or"},"u9":{"slug":"alt","type":"Or"},"u8":{"slug":"weg","type":"Or"}}}"#;
+        // The base runs u1, u3 and u9; u8 is gone already.
+        let base = br#"<C U="u1"/><C U="u3"/><C U="u9"/>"#;
+        let r = removals(Some(a), Some(b), base);
+        let got: Vec<(&str, bool)> = r.iter().map(|b| (b.slug.as_str(), b.deployed)).collect();
+        // A tombstone from before is deleted by the push too: it is listed.
+        assert_eq!(got, [("alt", true), ("licht", true), ("neu", false)]);
+        assert_eq!(pending(Some(a), base).len(), 1);
+        // No lockfile: nothing managed, nothing removed.
+        assert!(removals(None, None, base).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_consent_never_outlives_a_failed_apply() {
+        let (tmp, d, a) = project();
+        let lock = d.join("logic.lock.json");
+        let as_before = |what: &str| {
+            assert_eq!(read(&lock), LOCK, "{what}: no tombstone left");
+            assert_eq!(read(&d.join("out.Loxone")), "compiled before\n", "{what}");
+            assert_eq!(read(&d.join("base.Loxone")), BASE, "{what}");
+        };
+        // The tests fail after the removals were compiled in: put back.
+        std::fs::write(tmp.path().join("failtest"), "").unwrap();
+        let plan = a.removal_plan().await.unwrap();
+        let e = a.apply(&consent(&plan)).await.err().unwrap().1;
+        assert!(e.contains("1 of 1 test fails"), "{e}");
+        assert_eq!(step(&a, "removals").0, "ok");
+        as_before("tests failed");
+        assert!(!calls(&tmp).contains("config push"));
+        std::fs::remove_file(tmp.path().join("failtest")).unwrap();
+        // The push fails: put back too.
+        std::fs::write(tmp.path().join("pushfail"), "").unwrap();
+        let plan = a.removal_plan().await.unwrap();
+        let e = a.apply(&consent(&plan)).await.err().unwrap().1;
+        assert!(e.contains("lox config push failed"), "{e}");
+        as_before("push failed");
+        std::fs::remove_file(tmp.path().join("pushfail")).unwrap();
+        // A later Apply without consent removes nothing: it asks again.
+        let e = a.apply(&ApplyOpts::default()).await.err().unwrap().1;
+        assert_eq!(apply_hints(&e)["removals"], "licht");
+        as_before("plain Apply");
+        let pushes = calls(&tmp)
+            .lines()
+            .filter(|l| l.starts_with("config push"))
+            .count();
+        assert_eq!(pushes, 1, "only the push that failed");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_tombstone_in_the_lockfile_is_deleted_only_with_consent() {
+        // The lockfile already deletes `licht` (an earlier compile), the
+        // module compiles: a plain push would delete it.
+        let lock = r#"{"objects":{"bleibt":{"uuid":"U3","type":"And"}},"removed":{"U1":{"slug":"licht","type":"Or"}}}"#;
+        let (tmp, d, a) = project_with(lock);
+        let e = a.apply(&ApplyOpts::default()).await.err().unwrap().1;
+        assert!(
+            e.contains(NEEDS_CONSENT) && e.contains("\n  licht (Or)"),
+            "{e}"
         );
-        // No lockfile: nothing managed, nothing dropped.
-        assert!(dropped(&t.path().join("none"), &b).is_empty());
+        assert_eq!(apply_hints(&e)["removals"], "pending");
+        assert_eq!(step(&a, "removals").0, "fail");
+        assert!(!calls(&tmp).contains("config push"));
+        // The plan lists it, and with consent it goes.
+        let plan = a.removal_plan().await.unwrap();
+        assert_eq!(
+            plan.blocks
+                .iter()
+                .map(|b| (b.slug.as_str(), b.deployed))
+                .collect::<Vec<_>>(),
+            [("licht", true)]
+        );
+        a.apply(&consent(&plan)).await.unwrap();
+        let c = calls(&tmp);
+        assert!(
+            c.contains("config push") && !c.contains("config push --force --allow"),
+            "{c}"
+        );
+        assert_eq!(std::fs::read(d.join("base.Loxone")).unwrap(), plan.compiled);
     }
 }

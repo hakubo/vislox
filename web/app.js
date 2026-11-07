@@ -71,6 +71,8 @@ function setStatus(text, cls) {
   $("status").className = "status " + (cls || "");
   $("status").title = text;
 }
+/** How long a Roll back's or a removal's plan (#69, #70) is shown: the server keeps it as long. */
+const PREVIEW_TTL = 15 * 60 * 1000;
 function allRevs() { return S.hist ? [...(rollbackPreview() ? [S.rollbackRev] : []), ...(removalsPreview() ? [S.removals.revision] : []), ...S.hist.pending, ...S.hist.history, ...(S.hist.backups || [])] : []; }
 function revById(id) { return allRevs().find((r) => r.id === id); }
 function lightColor(rgb) {
@@ -2459,48 +2461,69 @@ async function pendingScheduleText(pend) {
   const c = scheduleConflicts(blocks);
   return c.length ? `⚠ The Miniserver runs other switching times than this config for:\n  ${c.join("\n  ")}\nApplying replaces them with the config's (an edit in the app among them).\n\n` : "";
 }
-/** The module lost managed blocks, so lox compiles it only with their removal allowed (#70). */
-function removing() { return !!(S.check?.available && S.check.ok && S.check.stale?.removals); }
+/** The push would remove blocks (#70): lox refuses the module for a block it lost, or the lockfile deletes blocks
+ *  the Miniserver runs. Apply asks for exactly those first. */
+function removing() { return S.check?.available && S.check.ok && S.check.removals ? S.check.removals : null; }
 async function apply() {
-  let pend = pendingChange(), consent = null;
-  // Blocks the module lost (#70): first exactly which, with consent; then the rest is reviewed on the program
-  // Apply deploys with them removed (the plan), not on the compile from before.
+  // Blocks the push would remove (#70): first exactly which, with consent; then Apply's confirmation is about the
+  // program deployed with them removed (the plan), not the compile from before.
   if (removing()) {
-    consent = await askRemovals("applying");
+    const consent = await askRemovals("applying");
     if (!consent) return;
-    pend = S.removals?.revision;
+    if (!(await confirmApply(S.removals.revision, true))) { await dropRemovals(); return; }
+    await deploy("/api/apply", { allow_removals: consent }, "applying");
+    return;
   }
-  if (!pend) return;
+  const pend = pendingChange();
+  if (!pend || !(await confirmApply(pend, false))) return;
+  await deploy("/api/apply", {}, "applying");
+}
+/** Apply's confirmation for the program `pend` would deploy: what changed on the Miniserver since, who loses access
+ *  (#68), switching times, calendar entries, devices. `plan`: it is a removal plan (#70), deployed exactly. */
+async function confirmApply(pend, plan) {
   // Ask the Miniserver once more whether its config changed after the base, and for the
   // calendar entries edited in the app.
   const [, calNow, hw] = await Promise.all([loadMs(true), loadCal(true), pendingHardware(pend)]);
   const stale = staleText();
   const sched = await pendingScheduleText(pend);
   const rights = rightsApplyText(hw);
-  const src = !consent && S.check?.available && S.check.ok && S.check.stale;
+  const src = !plan && S.check?.available && S.check.ok && S.check.stale;
   const srcText = src ? `⚠ The pending revision is from before the latest edit to ${src.files?.length ? src.files.join(", ") : "the module"}. ` +
     "lox config push compiles the module as it is, so Apply deploys changes this review does not show. Compile first to review them.\n\n" : "";
-  if (!window.confirm((stale ? `⚠ ${stale} Applying overwrites what changed there since.\n\n` : "") + srcText + rights + sched +
+  return window.confirm((stale ? `⚠ ${stale} Applying overwrites what changed there since.\n\n` : "") + srcText + rights + sched +
     calApplyWarning(calNow) + hwApplyText(hw) +
-    "Deploy the pending changes to the Miniserver?\n\nFirst the module must compile and its tests pass (lox logic test). Then lox config push uploads the config and restarts the Miniserver's program (a few seconds), " +
-    "checks that it runs exactly the compiled config, then vislox commits and pushes to git.")) return;
-  await deploy("/api/apply", consent ? { allow_removals: consent } : {}, "applying");
+    (plan ? `Deploy "${pend.label}" to the Miniserver, with the removals you confirmed?\n\nvislox compiles exactly this program into the project (it refuses if anything changed since), ` +
+      "then the tests must pass (lox logic test). "
+      : "Deploy the pending changes to the Miniserver?\n\nFirst the module must compile and its tests pass (lox logic test). ") +
+    "Then lox config push uploads the config and restarts the Miniserver's program (a few seconds), " +
+    "checks that it runs exactly the compiled config, then vislox commits and pushes to git.");
 }
 // ── removed managed blocks (#70) ───────────────────────────────────────
-// A module that lost a block its lockfile manages compiles only with the removal allowed (lox's --allow-removals
-// deletes every block the module lost). The server works out what Apply would deploy then, changing nothing
-// (POST /api/removals/plan): the blocks it deletes, where they are, what is wired to them, who loses access or a
-// notification with them (#68), and the program, shown here as the revision "Removals allowed" compared with what
-// runs. Apply sends the program's blob id and exactly those blocks back; the server works the plan out again and
-// refuses unless both are the same. A retry never carries the consent over by itself.
-const REMOVALS_TTL = 15 * 60 * 1000;
-/** The removal plan this tab asked for, while it is about the deployed commit and younger than the server keeps it. */
+// A push deletes every block its lockfile tombstones: those the module lost (lox compiles it only with the removal
+// allowed, --allow-removals), and those an earlier compile tombstoned. The server works out what Apply would deploy
+// with them removed, changing nothing (POST /api/removals/plan): the blocks it deletes, where they are, what is
+// wired to them, who loses access or a notification with them (#68), and the program, shown here as the revision
+// "Removals allowed" compared with what runs. Apply sends the program's blob id and exactly those blocks back; the
+// server compiles exactly that, and puts the project back if anything fails before the push. A consent is for one
+// request: a retry asks again.
+/** The removal plan this tab asked for, while the server keeps it (one at a time: another tab's replaces it), it
+ *  is about what runs, and younger than the server keeps it. */
 function removalsPreview() {
   const p = S.removals;
   if (!p) return null;
-  const deployed = S.hist?.history.find((x) => x.kind === "git");
-  if ((deployed?.id ?? null) !== (p.base ?? null) || Date.now() - S.removalsAt > REMOVALS_TTL) { S.removals = null; return null; }
+  const deployed = S.hist?.history.find((x) => x.kind === "git") || S.hist?.history.find((x) => x.current);
+  const kept = S.hist?.actions ? S.hist.actions.removals : p.rev;
+  if (kept !== p.rev || (deployed?.id ?? null) !== (p.base ?? null) || Date.now() - S.removalsAt > PREVIEW_TTL) { S.removals = null; return null; }
   return p;
+}
+/** Forget this tab's plan, here and on the server; show the newest revision again if the plan was shown. */
+async function dropRemovals() {
+  const p = S.removals;
+  if (!p) return;
+  S.removals = null;
+  try { await fetch("/api/removals/cancel", { method: "POST", headers: { "Content-Type": "application/json", "X-Vislox": "removals" }, body: JSON.stringify({ rev: p.rev }) }); } catch { /* the server forgets it anyway */ }
+  if (S.rev === p.rev) { S.rev = editRev()?.id || p.base; S.base = null; renderSelects(); await loadView(); writeHash(true); }
+  renderHistory(); renderCheck();
 }
 /** `Licht (Or) on page "EG": from Taster.Q, to Lampe.I1`: where a block is and what is wired to it. */
 function removalLine(b) {
@@ -2517,25 +2540,27 @@ function removalLine(b) {
 async function removalsPlan() {
   const plan = await act("/api/removals/plan");
   S.removals = plan; S.removalsAt = Date.now();
+  // The server keeps this plan now (the next history read says so too).
+  if (S.hist?.actions) S.hist.actions.removals = plan.rev;
   S.rev = plan.rev; S.base = plan.base; S.follow = false; $("chk-follow").checked = false;
   renderHistory(); renderSelects(); renderCheck(); await loadView(); writeHash(true);
   return plan;
 }
-/** The confirmation: exactly the blocks the plan deletes. The consent, or null. */
+/** The confirmation: exactly the blocks the plan deletes. The consent, or null (the plan is then forgotten). */
 async function askRemovals(doing) {
   let plan;
   try { plan = await removalsPlan(); } catch (err) { deployMsg(`Cannot work out the removals: ${err.message}`, true); return null; }
   const on = plan.blocks.filter((b) => b.deployed), off = plan.blocks.filter((b) => !b.deployed);
   const lose = rightsApplyText({ rights: plan.rights });
   const text = (on.length ? `Remove ${plural(on.length, "block")} from the Miniserver?\n\n` +
-    "The module no longer has them, so lox deletes them only when you allow it (--allow-removals):\n" +
+    "The module no longer has them, or its lockfile deletes them, so lox removes them only when you allow it:\n" +
     on.map((b) => `  • ${removalLine(b)}`).join("\n") + (off.length ? "\n\n" : "")
     : `Let the lockfile forget ${plural(off.length, "block")} the module no longer has?\n\n`) +
     (off.length ? `Never deployed, only the lockfile forgets ${off.length === 1 ? "it" : "them"}:\n` + off.map((b) => `  • ${removalLine(b)}`).join("\n") : "") +
     (lose ? `\n\n${lose.trim()}` : "") +
-    `\n\nThe revision "${plan.revision.label}" shows what would run then. Apply compiles exactly this and refuses if the module, ` +
+    `\n\nThe revision "${plan.revision.label}" shows what would run then. Apply deploys exactly this and refuses if the module, ` +
     `its lockfile or the base change before the push. Remove ${plan.blocks.length === 1 ? "it" : "them"} and go on ${doing}?`;
-  if (!window.confirm(text)) return null;
+  if (!window.confirm(text)) { await dropRemovals(); return null; }
   return { reviewed: plan.blob, blocks: plan.blocks.map((b) => b.uuid) };
 }
 /** Apply's and Roll back's request (#69): lox refuses some pushes until the user allows them; ask, then retry
@@ -2551,7 +2576,7 @@ async function deploy(path, body, doing) {
     // Deployed: the plan is history, and the view switches to what runs now.
     try { await act(path, opts); if (opts.allow_removals) S.removals = null; await showDeployed(); return; } catch (err) {
       const h = err.data?.hints || {};
-      // A consent is for one request: the server compiled it in (the lockfile keeps it) or refused it.
+      // A consent is for one request: refused, the server put the project back. A retry asks again.
       const consented = !!opts.allow_removals;
       delete opts.allow_removals;
       if (h.accept_version && !opts.accept_version && window.confirm(
@@ -2567,9 +2592,11 @@ async function deploy(path, body, doing) {
         opts.discard_custom_changes = true; continue;
       }
       // A block the module lost (#70): asked each time, never carried over by itself. A Roll back takes none.
+      // The full confirmation again, now about the plan's program: that is what the retry deploys.
       if (h.removals && !consented && path === "/api/apply") {
         const consent = await askRemovals(doing);
-        if (consent) { opts.allow_removals = consent; continue; }
+        if (consent && await confirmApply(S.removals.revision, true)) { opts.allow_removals = consent; continue; }
+        if (consent) await dropRemovals();
       }
       deployMsg(err.message, true);
       return;
@@ -2604,12 +2631,11 @@ async function rollBack(r) {
 }
 /** The Roll back's plan this tab asked for (#69), shown only here, while it is about the deployed commit and
  *  younger than the server keeps it. */
-const ROLLBACK_TTL = 15 * 60 * 1000;
 function rollbackPreview() {
   const r = S.rollbackRev;
   if (!r) return null;
   const deployed = S.hist?.history.find((x) => x.kind === "git");
-  if (deployed?.id !== r.base || Date.now() - S.rollbackAt > ROLLBACK_TTL) { S.rollbackRev = null; return null; }
+  if (deployed?.id !== r.base || Date.now() - S.rollbackAt > PREVIEW_TTL) { S.rollbackRev = null; return null; }
   return r;
 }
 /** Forget the plan, here and on the server; show what runs again if the plan was shown. */
@@ -2872,8 +2898,9 @@ function checkErrors(uuid) { return checkBroken() ? S.check.errors.filter((e) =>
 function renderCheck() {
   const box = $("deploy-check"), c = S.check;
   const stale = c?.available && c.ok && c.stale;
+  const rm = removing();
   const fmt = c?.available ? c.unformatted || [] : [];
-  box.className = "deploy-check" + (checkBroken() || stale?.error ? " error" : stale ? "" : " hint") + (checkBroken() || stale || fmt.length ? "" : " hidden");
+  box.className = "deploy-check" + (checkBroken() || stale?.error || rm ? " error" : stale ? "" : " hint") + (checkBroken() || stale || rm || fmt.length ? "" : " hidden");
   const parts = [];
   if (checkBroken()) {
     const n = c.errors.length + (c.truncated || 0);
@@ -2883,13 +2910,16 @@ function renderCheck() {
     parts.push(`<div class="ck-h">The module doesn't compile: ${plural(n, "error")}</div>`,
       `<div class="ck-sub">${pendingChange() ? "The pending revision is from the last compile that worked, not from the module as it is." : "Nothing new is compiled until it does."} Apply is off until it compiles.</div>`,
       `<ul>${items.join("")}</ul>`);
-  } else if (stale?.removals) {
-    // lox compiles the module only with its removals allowed (#70): review them; Apply asks.
+  } else if (rm) {
+    // The push would remove blocks (#70): review them; Apply asks.
     const a = S.hist?.actions, busy = !!a?.running;
     const why = !a?.apply?.available ? `Cannot review: ${a?.apply?.reason || ""}` : "";
     const plan = removalsPreview();
-    parts.push(`<div class="ck-h">The module no longer has managed blocks: lox deletes them only when you allow it.</div>`,
-      `<div class="ck-sub">lox refuses to compile it (<span class="mono">${esc(stale.removals)}</span> is in the lockfile but not in the source). ` +
+    const tombs = (rm.blocks || []).map((b) => `${b.slug} (${b.type})`).join(", ");
+    parts.push(rm.refused ? `<div class="ck-h">The module no longer has managed blocks: lox deletes them only when you allow it.</div>`
+      : `<div class="ck-h">The push would delete ${plural(rm.blocks.length, "block")} the Miniserver runs: only when you allow it.</div>`,
+      `<div class="ck-sub">${rm.refused ? `lox refuses to compile it (<span class="mono">${esc(rm.refused)}</span> is in the lockfile but not in the source). `
+        : `The lockfile deletes them: <span class="mono">${esc(tombs)}</span>. `}` +
       "Review what Apply would delete, and what is wired to it; Apply asks you to confirm exactly these blocks.</div>",
       plan ? `<ul class="rm-list">${plan.blocks.map((b) => `<li>${esc(removalLine(b))} ${goButtons([b.uuid])}</li>`).join("")}</ul>` : "",
       `<div class="ck-row"><button type="button" id="btn-removals" class="ghost small"${why || busy ? " disabled" : ""}

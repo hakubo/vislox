@@ -372,11 +372,11 @@ try {
     // Exactly which block, where it is and what is wired to it.
     assert.match(asked[1], /^Remove 1 block from the Miniserver\?/, asked[1]);
     assert.match(asked[1], /• O1002 \(Div, teiler\) on page "Erdgeschoss": wired from Temperatur\.\S+ → \S+/, asked[1]);
-    assert.match(asked[1], /The revision "Removals allowed" shows what would run then\. Apply compiles exactly this/, asked[1]);
-    // The plan shows, compared with what runs.
-    await page.waitForSelector(".hrev.k-removals.sel");
-    assert.match(await page.textContent(".hrev.k-removals"), /Removals allowed[\s\S]*would be deployed with the removals/);
-    // Dismissed: the server refused the one request, at its Removals step, and nothing was removed or pushed.
+    assert.match(asked[1], /The revision "Removals allowed" shows what would run then\. Apply deploys exactly this/, asked[1]);
+    // Dismissed: the plan is forgotten, here and on the server (#70).
+    await page.waitForFunction(() => !S.removals && !document.querySelector(".hrev.k-removals"));
+    await page.waitForFunction(async () => (await (await fetch("/api/history")).json()).actions?.removals == null);
+    // The server refused the one request, at its Removals step, and nothing was removed or pushed.
     await page.waitForFunction(() => /lox deletes them only when you allow it/.test(document.querySelector("#deploy-msg")?.textContent || ""), null, { timeout: 20000 });
     assert.equal(applies, 1);
     assert.equal(await state("Removals you confirmed"), "fail");
@@ -408,9 +408,14 @@ try {
   });
   await step("every step ends done", async () => {
     await page.waitForFunction(() => /^Applied/.test(document.querySelector("#deploy-msg")?.textContent || ""), null, { timeout: 20000 });
-    // The Apply's confirmation, then the removal's (#70): the server refused the first request for it.
-    assert.equal(dialogs, 2, asked.join("\n---\n"));
+    // The Apply's confirmation, then the removal's (#70): the server refused the first request for it. Then Apply's
+    // confirmation again, now about the plan's program, which the retry deploys: its devices and rights too.
+    assert.equal(dialogs, 3, asked.join("\n---\n"));
     assert.match(asked[1], /^Remove 1 block from the Miniserver\?/, asked[1]);
+    assert.match(asked[2], /Deploy "Removals allowed" to the Miniserver, with the removals you confirmed\?/, asked[2]);
+    assert.match(asked[2], /This reconfigures 1 device/, asked[2]);
+    assert.match(asked[2], /⚠ alice loses access to Haustür/, asked[2]);
+    assert.doesNotMatch(asked[2], /pending revision is from before/, asked[2]);
     assert.match(asked[0], /The Miniserver runs other switching times than this config for:\n  Uhr: Feiertag \(claimed by pages\/access\.loxl:14\)\n/, asked[0]);
     // …and who loses a right, with the claim that takes it away (#68).
     assert.match(asked[0], /⚠ alice loses access to Haustür \(pages\/access\.loxl:12\)\n⚠ alice stops getting Frostwarnung \(pages\/access\.loxl:13\)\n\nbob starts getting Frostwarnung\n\n/, asked[0]);
