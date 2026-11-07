@@ -2259,7 +2259,7 @@ fn setting_value(ty: &str, name: &str, kind: blocks::Kind, v: &str) -> Result<Va
         match kind {
             Kind::Text => return Ok(Value::Str(crate::periphery::text_value(name, v)?)),
             Kind::Number => {
-                return crate::units::port_value(ty, name, v).map_err(|e| format!("{name}: {e}"));
+                return crate::periphery::number_value(ty, name, v);
             }
             _ => {}
         }
@@ -2606,10 +2606,7 @@ fn add_object(
     let f = files
         .pages
         .entry(crate::periphery::FILE.to_string())
-        .or_insert_with(|| PageFile {
-            periphery: true,
-            ..PageFile::new("")
-        });
+        .or_insert_with(PageFile::periphery);
     f.blocks.push(NewBlock {
         slug: slug.clone(),
         ty: ty.clone(),
@@ -2636,7 +2633,7 @@ fn block_page(files: &Files, ctx: &Ctx, file: &str, b: &NewBlock) -> String {
 }
 
 fn remove_block(files: &mut Files, ctx: &Ctx, uuid: &str) -> Result<Applied, String> {
-    let r = removal(files, ctx, uuid)?;
+    let r = removal(files, ctx, uuid, &crate::periphery::below(files))?;
     if r.delete {
         return delete_block(files, ctx, &r.slug, r.wires);
     }
@@ -2682,12 +2679,29 @@ struct Removal {
 }
 
 /// Whether `remove_block` of `uuid` is refused now, and why (`None`: it is
-/// not). Changes nothing: `GET /api/edits` asks it for every block.
+/// not). Changes nothing: `GET /api/edits` asks it for every block
+/// ([`delete_refusals`]).
+#[cfg(test)]
 pub fn delete_refusal(files: &Files, ctx: &Ctx, uuid: &str) -> Option<String> {
-    removal(files, ctx, uuid).err()
+    removal(files, ctx, uuid, &crate::periphery::below(files)).err()
 }
 
-fn removal(files: &Files, ctx: &Ctx, uuid: &str) -> Result<Removal, String> {
+/// [`delete_refusal`] of each of `uuids`, with what hangs below each device
+/// (#84) worked out once.
+pub fn delete_refusals(files: &Files, ctx: &Ctx, uuids: &[String]) -> Vec<Option<String>> {
+    let below = crate::periphery::below(files);
+    uuids
+        .iter()
+        .map(|u| removal(files, ctx, u, &below).err())
+        .collect()
+}
+
+fn removal(
+    files: &Files,
+    ctx: &Ctx,
+    uuid: &str,
+    below: &crate::periphery::Below,
+) -> Result<Removal, String> {
     let el = find_ci(&ctx.doc.xml.root, uuid)
         .ok_or_else(|| format!("no object {uuid} in the pending config"))?;
     let name = el.attr_decoded("Title").unwrap_or_default().into_owned();
@@ -2716,7 +2730,7 @@ fn removal(files: &Files, ctx: &Ctx, uuid: &str) -> Result<Removal, String> {
     }
     // A device the objects of vislox's files hang below (#84): lox would
     // find no device for them.
-    if let Some(o) = crate::periphery::below(files, &slug).first() {
+    if let Some(o) = below.get(&slug).and_then(|v| v.first()) {
         let other = ctx
             .lock
             .uuid_of(o)
@@ -2725,6 +2739,18 @@ fn removal(files: &Files, ctx: &Ctx, uuid: &str) -> Result<Removal, String> {
             .filter(|t| !t.trim().is_empty())
             .unwrap_or_else(|| o.to_string());
         return Err(format!("{name}: {other} hangs below it; delete that first"));
+    }
+    // Objects Loxone Config made below a device of vislox's would go with
+    // it, and whatever reads them: refused, naming them.
+    let others = crate::periphery::others_below(files, ctx, uuid);
+    if !others.is_empty() {
+        return Err(format!(
+            "{name}: {} below it {} made in Loxone Config, and would be deleted with it; delete \
+             or move {} there first",
+            others.join(", "),
+            if others.len() == 1 { "was" } else { "were" },
+            if others.len() == 1 { "it" } else { "them" },
+        ));
     }
     let (_, b) = files.block(&slug).expect("checked");
     let wires = wires_at(files, ctx, &slug, &b.ty).map_err(|w| {
@@ -3082,8 +3108,16 @@ fn restore_block(files: &mut Files, ctx: &Ctx, op: &Op) -> Result<Applied, Strin
     let consts: BTreeSet<String> = files.claims.8.keys().cloned().collect();
     // An object of the object tree (#84) is in vislox's periphery file, which
     // has no page: `page` is its folder or device.
+    let adopted_line = if *adopted {
+        format!("# {}\n", blocks::ADOPTED_LINE)
+    } else {
+        String::new()
+    };
+    // Read once as the periphery file reads it, when it may be one.
+    let periph = (crate::periphery::of(&ty).is_some() || ty.is_empty())
+        .then(|| PageFile::parse_periphery(&format!("{adopted_line}{source}\n"), &consts));
     let object = crate::periphery::of(&ty).is_some()
-        || (ty.is_empty() && PageFile::parse_periphery(source, &consts).is_ok());
+        || (ty.is_empty() && periph.as_ref().is_some_and(Result::is_ok));
     let page_title = if object {
         String::new()
     } else {
@@ -3104,13 +3138,8 @@ fn restore_block(files: &mut Files, ctx: &Ctx, op: &Op) -> Result<Applied, Strin
         page_title
     };
     // Read as vislox reads its files: only what it writes.
-    let adopted_line = if *adopted {
-        format!("# {}\n", blocks::ADOPTED_LINE)
-    } else {
-        String::new()
-    };
-    let pf = if object {
-        PageFile::parse_periphery(&format!("{adopted_line}{source}\n"), &consts)
+    let pf = if let (true, Some(p)) = (object, periph) {
+        p
     } else {
         PageFile::parse_with(
             &format!(
@@ -3218,10 +3247,15 @@ fn restore_block(files: &mut Files, ctx: &Ctx, op: &Op) -> Result<Applied, Strin
     for p in files.pages.values_mut() {
         p.removed.remove(&slug);
     }
-    let f = files.pages.entry(file).or_insert_with(|| PageFile {
-        periphery: object,
-        uuid: (!object).then(|| page.clone()),
-        ..PageFile::new(&page_title)
+    let f = files.pages.entry(file).or_insert_with(|| {
+        if object {
+            PageFile::periphery()
+        } else {
+            PageFile {
+                uuid: Some(page.clone()),
+                ..PageFile::new(&page_title)
+            }
+        }
     });
     if !object {
         f.page = page_title;
@@ -10836,6 +10870,47 @@ mod tests {
                 ),
                 "no object",
             ),
+            // A unit only where lox documents one, and checked in it.
+            (
+                add(VI_FOLDER, "VirtualUdpIn", None, &[], &[("Port", "30min")]),
+                "plain number",
+            ),
+            (
+                add(
+                    VI_FOLDER,
+                    "VirtualHttpIn",
+                    None,
+                    &[],
+                    &[("Address", "x"), ("Poll", "5s")],
+                ),
+                "write 10 s",
+            ),
+            (
+                add(
+                    VI_FOLDER,
+                    "VirtualHttpIn",
+                    None,
+                    &[],
+                    &[("Address", "x"), ("Poll", "200h")],
+                ),
+                "write 604800 s",
+            ),
+            (
+                add(WP, "ModbusDev", None, &[], &[("Channel", "70%")]),
+                "plain number",
+            ),
+            // Text by type: a virtual output's command separator is text, its
+            // CloseAfterSend on or off.
+            (
+                add(
+                    VO_FOLDER,
+                    "VirtualOut",
+                    None,
+                    &[],
+                    &[("Address", "x"), ("CloseAfterSend", "maybe")],
+                ),
+                "on or off",
+            ),
         ] {
             let mut f = files.clone();
             let e = apply_op(&mut f, &ctx, &op).unwrap_err();
@@ -11002,5 +11077,112 @@ mod tests {
         assert!(text.contains("moved vx_virtualudpin_1 -> vx_udp"), "{text}");
         let renamed = compile_files(&base, &files, &mut l).unwrap();
         assert!(loxone_config::diff::diff(&back, &renamed).logic_is_empty());
+    }
+
+    #[test]
+    fn a_device_is_not_deleted_with_what_loxone_config_hung_below_it() {
+        let d = periphery_house();
+        let names = BTreeSet::new();
+        let mut files = Files::default();
+        let mut l = Lockfile::default();
+        let lock = lock_of(&l);
+        let ctx = ctx_of(&d, &d, &lock, None, &names);
+        apply_op(
+            &mut files,
+            &ctx,
+            &add(
+                VO_FOLDER,
+                "VirtualOut",
+                Some("Out"),
+                &[],
+                &[("Address", "http://192.0.2.20"), ("CmdSep", ";")],
+            ),
+        )
+        .unwrap();
+        let out = compile_files(&d, &files, &mut l).unwrap();
+        let vo = l.objects["vx_virtualout_1"].uuid.clone();
+        // Deployed, then Loxone Config hung a command below it.
+        let text = String::from_utf8(out.to_bytes()).unwrap();
+        let at = text.find(&format!("U=\"{vo}\"")).unwrap();
+        let end = at + text[at..].find('>').unwrap() + 1;
+        let with = format!(
+            "{}\n<C Type=\"VirtualOutCmd\" V=\"178\" U=\"a0000003-0000-0000-ffff504f94000001\" Title=\"Licht an\" CmdOn=\"/on\"><Co K=\"I\" U=\"a0000003-0000-0001-ffff504f94000001\"/></C>{}",
+            &text[..end],
+            &text[end..]
+        );
+        let base = LoxoneDoc::parse(with.as_bytes()).unwrap();
+        let lock = lock_of(&l);
+        let ctx = ctx_of(&base, &base, &lock, Some(&base), &names);
+        let e = delete_refusal(&files, &ctx, &vo).unwrap();
+        assert!(
+            e.contains("Licht an below it was made in Loxone Config"),
+            "{e}"
+        );
+        let mut f = files.clone();
+        let e = apply_op(&mut f, &ctx, &Op::RemoveBlock { uuid: vo.clone() }).unwrap_err();
+        assert!(e.contains("Licht an"), "{e}");
+        assert_eq!(f, files);
+        // Only in the base (the pending config lost it): refused all the same.
+        let ctx = ctx_of(&out, &base, &lock, Some(&base), &names);
+        assert!(
+            delete_refusal(&files, &ctx, &vo)
+                .unwrap()
+                .contains("Licht an")
+        );
+        // A command of vislox's own below it is named as such.
+        let ctx = ctx_of(&base, &base, &lock, Some(&base), &names);
+        apply_op(
+            &mut files,
+            &ctx,
+            &add(
+                &vo,
+                "VirtualOutCmd",
+                Some("Aus"),
+                &[],
+                &[("CmdOff", "/off")],
+            ),
+        )
+        .unwrap();
+        assert!(
+            delete_refusal(&files, &ctx, &vo)
+                .unwrap()
+                .contains("hangs below it")
+        );
+    }
+
+    #[test]
+    fn where_an_object_can_be_added_is_served_with_the_reason() {
+        let d = periphery_house();
+        let names = BTreeSet::new();
+        let lock = Lock::default();
+        let ctx = ctx_of(&d, &d, &lock, None, &names);
+        let m = crate::periphery::add_refusals(&Files::default(), &ctx);
+        assert_eq!(m[VI_FOLDER], serde_json::Value::Null);
+        assert_eq!(m[WP], serde_json::Value::Null);
+        assert!(!m.contains_key(EG), "a page takes none");
+        // Two Virtual Outputs folders: lox adds to the one there is, so neither takes one.
+        let text = String::from_utf8(d.to_bytes()).unwrap().replacen(
+            "<C Type=\"VirtualOutCaption\"",
+            "<C Type=\"VirtualOutCaption\" V=\"178\" U=\"a0000009-0000-0000-ffff504f94000001\" Title=\"Zwei\"></C>\n<C Type=\"VirtualOutCaption\"",
+            1,
+        );
+        let two = LoxoneDoc::parse(text.as_bytes()).unwrap();
+        let ctx = ctx_of(&two, &two, &lock, None, &names);
+        let m = crate::periphery::add_refusals(&Files::default(), &ctx);
+        assert!(
+            m[VO_FOLDER].as_str().unwrap().contains("2 folders"),
+            "{m:?}"
+        );
+        // A device not in the base: lox resolves an extern there.
+        let plain = doc("house.Loxone");
+        let ctx = ctx_of(&d, &plain, &lock, None, &names);
+        let m = crate::periphery::add_refusals(&Files::default(), &ctx);
+        assert!(
+            m[WP]
+                .as_str()
+                .unwrap()
+                .contains("not in the project's base"),
+            "{m:?}"
+        );
     }
 }

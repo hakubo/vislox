@@ -3542,6 +3542,7 @@ impl Actions {
         // has a table for, that the module does not manage yet.
         // One walk of each config (an index), and the base parsed once per blob.
         let mut adopt = serde_json::Map::new();
+        let mut add_under = serde_json::Map::new();
         if let (Some(doc), Some(base)) = (shown, self.adopt_base(&p))
             && state.why.is_none()
         {
@@ -3579,6 +3580,9 @@ impl Actions {
                 let why = edit::apply_op(&mut now.clone(), &ctx, &op).err();
                 b["hand_back"] = json!(why);
             }
+            // Each folder and device that takes new objects of the object tree
+            // (#84): null, or why `add_block` there would be refused.
+            add_under = crate::periphery::add_refusals(&now, &ctx);
         }
         // Whether each block of vislox's files can be deleted now (#80), or why
         // not: the checks `remove_block` makes first, which change nothing.
@@ -3599,11 +3603,13 @@ impl Actions {
                 claimed: &Default::default(),
                 templates: &Default::default(),
             };
-            for b in blocks.iter_mut() {
-                let Some(u) = b["uuid"].as_str().map(String::from) else {
-                    continue;
-                };
-                b["delete"] = json!(edit::delete_refusal(&now, &ctx, &u));
+            let uuids: Vec<String> = blocks
+                .iter()
+                .filter_map(|b| b["uuid"].as_str().map(String::from))
+                .collect();
+            let mut why = edit::delete_refusals(&now, &ctx, &uuids).into_iter();
+            for b in blocks.iter_mut().filter(|b| b["uuid"].is_string()) {
+                b["delete"] = json!(why.next().flatten());
             }
         }
         let mut out = json!({
@@ -3629,6 +3635,7 @@ impl Actions {
             "module_wires": module_wires,
             "adopted_wires": adopted_wires,
             "adopt": adopt,
+            "add_under": add_under,
             // `removed` and `moved` lines lox needs no more (#80): the next edit
             // drops them, and `tidy` does only that.
             "stale_lines": now.stale_lines(&lock),

@@ -521,6 +521,14 @@ impl PageFile {
         }
     }
 
+    /// vislox's empty file of the objects of the object tree (#84).
+    pub fn periphery() -> PageFile {
+        PageFile {
+            periphery: true,
+            ..PageFile::new("")
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.blocks.is_empty()
             && self.removed.is_empty()
@@ -555,10 +563,7 @@ impl PageFile {
     ) -> Result<PageFile, String> {
         // A fragment: an adopted block names the externs of `edits.loxl`.
         let m = Module::parse_fragment(text).map_err(|e| e.to_string())?;
-        let mut file: Option<PageFile> = periphery.then(|| PageFile {
-            periphery: true,
-            ..PageFile::new("")
-        });
+        let mut file: Option<PageFile> = periphery.then(PageFile::periphery);
         let mut uuid = None;
         let mut adopted = false;
         // Under the comment of the signals dropped here (#82).

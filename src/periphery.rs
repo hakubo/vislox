@@ -25,6 +25,7 @@ use crate::edit::{Ctx, Files, extern_key, find_ci, slug};
 use loxone_config::connectors;
 use loxone_config::logic::Value;
 use serde_json::{Value as Json, json};
+use std::collections::BTreeMap;
 
 /// vislox's file of the objects of the object tree, in its directory. A
 /// page file is named after its page's title in letters, digits and dashes
@@ -45,12 +46,15 @@ pub enum Home {
 }
 
 /// One type vislox adds to the object tree: where it lives, the settings a
-/// new one cannot do without (lox refuses it without them), and the
-/// settings that take text.
+/// new one cannot do without (lox refuses it without them), and its
+/// settings that take text (an address, a command, a check pattern, a text
+/// input's value, the name the app shows). Its other settings are numbers
+/// (in the unit lox documents, if any) or `on`/`off`.
 pub struct Type {
     pub ty: &'static str,
     pub home: Home,
     pub required: &'static [&'static str],
+    pub text: &'static [&'static str],
 }
 
 /// The types, as lox's table has them (`lox logic types`); operating modes
@@ -60,83 +64,87 @@ pub const TYPES: &[Type] = &[
         ty: "VirtualIn",
         home: Home::Folder("VirtualInCaption"),
         required: &[],
+        text: &["Desc"],
     },
     Type {
         ty: "VirtualHttpIn",
         home: Home::Folder("VirtualInCaption"),
         required: &["Address", "Poll"],
+        text: &["Address"],
     },
     Type {
         ty: "VirtualHttpInCmd",
         home: Home::Device(&["VirtualHttpIn"]),
         required: &["Check"],
+        text: &["Check", "Desc"],
     },
     Type {
         ty: "VirtualUdpIn",
         home: Home::Folder("VirtualInCaption"),
         required: &["Port"],
+        text: &["Address"],
     },
     Type {
         ty: "VirtualUdpInCmd",
         home: Home::Device(&["VirtualUdpIn"]),
         required: &["Check"],
+        text: &["Check", "Desc"],
     },
     Type {
         ty: "VirtualTextIn",
         home: Home::Folder("VirtualInCaption"),
         required: &[],
+        text: &["Def"],
     },
     Type {
         ty: "VirtualOut",
         home: Home::Folder("VirtualOutCaption"),
         required: &["Address"],
+        text: &["Address", "CmdSep"],
     },
     Type {
         ty: "VirtualOutCmd",
         home: Home::Device(&["VirtualOut"]),
         required: &[],
+        text: &[
+            "CmdOn",
+            "CmdOnHTTP",
+            "CmdOnPost",
+            "CmdOff",
+            "CmdAnswer",
+            "Desc",
+        ],
     },
     Type {
         ty: "ModbusServer",
         home: Home::Folder("WeatherCaption"),
         required: &["Address"],
+        text: &["Address"],
     },
     Type {
         ty: "ModbusDev",
         home: Home::Device(&["ModbusServer"]),
         required: &[],
+        text: &["Desc"],
     },
     Type {
         ty: "ModbusASensor",
         home: Home::Device(&["ModbusDev"]),
         required: &["ModbusAddress"],
+        text: &["Desc"],
     },
     Type {
         ty: "ModbusSensor",
         home: Home::Device(&["ModbusDev"]),
         required: &["ModbusAddress"],
+        text: &[],
     },
     Type {
         ty: "ModbusAActor",
         home: Home::Device(&["ModbusDev"]),
         required: &["ModbusAddress"],
+        text: &["Desc"],
     },
-];
-
-/// The settings of these types that take text: an address, a command, a
-/// check pattern, a text input's value, the name the app shows. The rest
-/// are numbers (with a unit where lox documents one) or `on`/`off`.
-const TEXT: &[&str] = &[
-    "Address",
-    "Check",
-    "CmdOn",
-    "CmdOnHTTP",
-    "CmdOnPost",
-    "CmdOff",
-    "CmdAnswer",
-    "CmdSep",
-    "Def",
-    "Desc",
 ];
 
 /// The most text one setting takes: a command or a check pattern may be a
@@ -150,7 +158,7 @@ pub fn of(ty: &str) -> Option<&'static Type> {
 
 /// Whether a setting of `ty` takes text.
 pub fn text_setting(ty: &str, name: &str) -> bool {
-    of(ty).is_some() && TEXT.contains(&name)
+    of(ty).is_some_and(|t| t.text.contains(&name))
 }
 
 /// The types added under an object of type `parent_ty`: a folder or a
@@ -165,6 +173,18 @@ fn added_under(parent_ty: &str) -> Vec<&'static str> {
         })
         .map(|t| t.ty)
         .collect()
+}
+
+/// A number for setting `name` of `ty`: with a unit only where lox
+/// documents one for it (`Poll: 1min`), plain elsewhere (`Port`,
+/// `ModbusAddress`): lox would read `70%` there as 70.
+pub fn number_value(ty: &str, name: &str, v: &str) -> Result<Value, String> {
+    if connectors::port_unit(ty, name).is_none() {
+        return crate::edit::number(v)
+            .map(Value::Number)
+            .map_err(|e| format!("{name}: {e}; it takes a plain number, no unit"));
+    }
+    crate::units::port_value(ty, name, v).map_err(|e| format!("{name}: {e}"))
 }
 
 /// A setting's text value: one line, not empty, not too long.
@@ -193,15 +213,17 @@ pub fn rewritten(ty: &str, args: &[(String, Value)]) -> Option<String> {
         Some(Value::Bool(true))
     );
     for (k, v) in args {
-        let raw = match v {
-            Value::Number(n) => n.clone(),
-            // A value with a unit is checked by lox in the attribute's own
-            // unit; a whole number of it is what a save keeps.
-            _ => continue,
+        // A time with its unit is checked in the attribute's own unit
+        // (`Poll: 5s` is 5 seconds), as lox checks it.
+        let Some(raw) = crate::units::in_own_unit(ty, k, v) else {
+            continue;
         };
         if let Some((w, rule)) = connectors::save_rewrite(ty, k, &raw, digital) {
+            let unit = connectors::port_unit(ty, k)
+                .map(|u| format!(" {}", crate::edit::unit_suffix(u)))
+                .unwrap_or_default();
             return Some(format!(
-                "{k}: {rule}, so a Loxone Config save would write {w}; write that instead"
+                "{k}: {rule}, so a Loxone Config save would write {w}{unit}; write that instead"
             ));
         }
     }
@@ -344,14 +366,68 @@ pub fn parent_uuid(files: &Files, ctx: &Ctx, b: &crate::blocks::NewBlock) -> Str
     }
 }
 
-/// The objects of vislox's files that hang below the device `slug`.
-pub fn below<'a>(files: &'a Files, slug: &str) -> Vec<&'a str> {
-    files
-        .pages
-        .values()
-        .flat_map(|p| p.blocks.iter())
-        .filter(|b| matches!(b.get(DEVICE), Some(Value::Ref(n)) if n == slug))
-        .map(|b| b.slug.as_str())
+/// The objects of vislox's files below each device they name: device
+/// name → their slugs. Built once per request, not once per block.
+pub type Below = BTreeMap<String, Vec<String>>;
+
+pub fn below(files: &Files) -> Below {
+    let mut out = Below::new();
+    for b in files.pages.values().flat_map(|p| p.blocks.iter()) {
+        if let Some(Value::Ref(n)) = b.get(DEVICE) {
+            out.entry(n.clone()).or_default().push(b.slug.clone());
+        }
+    }
+    out
+}
+
+/// The objects below the device `uuid` (in the pending config or the
+/// base) that vislox's files do not declare: Loxone Config made them, and
+/// deleting the device would delete them with it. By name, each once.
+pub fn others_below(files: &Files, ctx: &Ctx, uuid: &str) -> Vec<String> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut out = Vec::new();
+    for doc in [ctx.doc, ctx.base] {
+        let Some(el) = find_ci(&doc.xml.root, uuid) else {
+            continue;
+        };
+        for c in el.child_elements().filter(|c| c.name == "C") {
+            let Some(u) = c.attr("U") else { continue };
+            let ours = ctx
+                .lock
+                .slug_of(u)
+                .is_some_and(|s| files.block(s).is_some());
+            if !ours && seen.insert(u.to_ascii_lowercase()) {
+                out.push(named(c));
+            }
+        }
+    }
+    out
+}
+
+/// For each folder and device of the config shown that takes new objects,
+/// whether one can be added there now (`null`), or why not: the checks
+/// `add_block` makes on where it goes (`GET /api/edits`' `add_under`).
+pub fn add_refusals(files: &Files, ctx: &Ctx) -> serde_json::Map<String, Json> {
+    fn walk(el: &loxone_config::xml::Element, out: &mut Vec<(String, &'static Type)>) {
+        if let (Some(u), Some(ty)) = (el.attr("U"), el.attr("Type"))
+            && let Some(t) = TYPES.iter().find(|t| match t.home {
+                Home::Folder(f) => f == ty,
+                Home::Device(ds) => ds.contains(&ty),
+            })
+        {
+            out.push((u.to_string(), t));
+        }
+        for c in el.child_elements() {
+            walk(c, out);
+        }
+    }
+    let mut at = Vec::new();
+    walk(&ctx.doc.xml.root, &mut at);
+    at.into_iter()
+        .map(|(u, t)| {
+            let why = parent(files, ctx, t, &u).err();
+            (u, json!(why))
+        })
         .collect()
 }
 
@@ -443,10 +519,10 @@ mod tests {
             for r in t.required {
                 assert!(settings.contains(r), "{} {r}", t.ty);
             }
-            for s in &settings {
-                let text = TEXT.contains(s);
-                let bool = connectors::bool_params(t.ty).contains(s);
-                assert!(!(text && bool), "{} {s}", t.ty);
+            for s in t.text {
+                assert!(settings.contains(s), "{} {s}", t.ty);
+                assert!(!connectors::bool_params(t.ty).contains(s), "{} {s}", t.ty);
+                assert!(connectors::port_unit(t.ty, s).is_none(), "{} {s}", t.ty);
             }
         }
         // Every periphery type lox creates but modes and calendar entries (#86).

@@ -1467,7 +1467,7 @@ function renderTree() {
     const tipText = calTip(S.view.objects[n.uuid]?.calendar);
     const year = MODES_FOLDERS.has(n.ty) ? '<button type="button" class="tn-year" data-modes tabindex="-1" title="Operating modes: a year calendar of when each mode is on">Year</button>' : "";
     // A folder or device of the object tree takes new virtual inputs, outputs and Modbus devices (#84).
-    const pst = !n.synthetic && PERIPH_PARENTS.has(n.ty) ? periphAddState(n) : null;
+    const pst = n.synthetic ? null : periphAddState(n);
     const add = pst ? `<button type="button" class="tn-year tn-add" data-add-under tabindex="-1"${pst.ok ? "" : " disabled"} title="${esc(pst.ok ? `Add to ${name} (it is compiled, not deployed)` : pst.why)}">Add</button>` : "";
     const num = n.ty === "Page" || n.ty === "Refs" ? `<span class="tn-n">${n.ty === "Page" ? treeChildren(n).reduce((a, c) => a + (c.synthetic ? 0 : 1), 0) : n.children.length}</span>` : "";
     return `<div class="tn-row ${marks ? n.status : ""}${n.uuid === S.sel ? " sel" : ""}${n.uuid === S.treeFocus ? " kfocus" : ""}" role="treeitem" aria-level="${depth + 1}"${kids ? ` aria-expanded="${open}"` : ""} aria-selected="${n.uuid === S.sel}" data-uuid="${esc(n.uuid)}"${tipText ? ` title="${esc(tipText)}"` : ""} style="padding-left:${4 + depth * 14}px">` +
@@ -3170,7 +3170,7 @@ S.edits = null; // GET /api/edits: what vislox's file claims, and which of it is
 S.edit = { uuid: null, open: false, draft: {}, bad: {}, busy: false, msg: "", err: "" };
 S.editsKey = null; // the server's key of what /api/edits says (vislox's file, deployed and pending config)
 async function loadEdits() {
-  const was = managedSet(), consts = JSON.stringify(S.edits?.constants || null), exprs = JSON.stringify([S.edits?.expressions || null, S.edits?.templates?.instances || null, S.edits?.templates?.templates || null]);
+  const was = managedSet(), under = JSON.stringify(S.edits?.add_under || null), consts = JSON.stringify(S.edits?.constants || null), exprs = JSON.stringify([S.edits?.expressions || null, S.edits?.templates?.instances || null, S.edits?.templates?.templates || null]);
   if (!S.hist?.actions?.shown) { S.edits = null; managedRefresh(was); return; }
   try { S.edits = await api("/api/edits"); } catch { S.edits = null; S.editsKey = null; }
   // The managed blocks' badges and the legend follow the lockfile and the module (#64); the expressions'
@@ -3181,6 +3181,8 @@ async function loadEdits() {
   // The claims' λ file:line in Rights and schedules too (#68); the changes a constant causes, grouped (#81).
   if (S.view) S.view.compared && (JSON.stringify(S.edits?.constants || null) !== consts || exprsNow !== exprs) ? renderChanges() : renderRights();
   renderActions();
+  // Where the tree offers Add (#84) follows the server's `add_under`.
+  if (S.view && JSON.stringify(S.edits?.add_under || null) !== under) renderTree();
   if (S.sel && S.view) renderProps();
 }
 /** Fetch the edits again only when the server says they may have changed. */
@@ -6444,19 +6446,19 @@ wcard.addEventListener("mousedown", (e) => e.stopPropagation());
 S.types = null;
 const AB = { open: false, ty: null, items: [], idx: 0, draft: {}, bad: {}, busy: false, err: "", parent: null };
 // Objects of the object tree (#84) are added from the project tree: a folder (Virtual Inputs, Virtual Outputs,
-// Netzwerkperipherie) or a device takes them. The server's palette (`periphery`) says which types go where; these
-// are the folder and device types it names, so the tree can offer Add before it has loaded.
+// Netzwerkperipherie) or a device takes them. GET /api/edits' `add_under` names each folder and device of the config
+// shown that takes new objects, with why `add_block` there would be refused (null: it would not); the palette's
+// `periphery` says which types go where.
 S.periph = null;
-const PERIPH_PARENTS = new Set(["VirtualInCaption", "VirtualOutCaption", "WeatherCaption", "VirtualHttpIn", "VirtualUdpIn", "VirtualOut", "ModbusServer", "ModbusDev"]);
 /** Whether an object can be added under the tree node `n`: `{ ok, rev }`, or `{ why }`; null: not offered at all. */
 function periphAddState(n) {
-  const a = S.hist?.actions;
-  if (!a?.shown || !a.edit?.available || MD.open) return null;
+  const a = S.hist?.actions, under = S.edits?.add_under;
+  if (!a?.shown || !a.edit?.available || MD.open || !under || !(n.uuid in under)) return null;
   const r = editRev();
   if (!r) return { why: "The config on disk is not in the History yet." };
   if (S.rev !== r.id) return { why: `Objects are added on the newest config (${r.kind === "pending" ? "Pending" : "deployed"}).` };
   if (n.status === "removed") return { why: "This is not in the config any more." };
-  if (S.edits?.managed?.includes(n.uuid)) return { why: `The project's module manages ${n.title || "it"}: add to it in ${srcPath(managedSrc(n.uuid)) || "its .loxl file"}.` };
+  if (under[n.uuid]) return { why: under[n.uuid] };
   if (a.running) return { why: `${a.running} is running.` };
   if (UNDO.busy) return { why: "Undo or redo is compiling." };
   return { ok: true, rev: r };

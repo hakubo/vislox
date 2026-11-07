@@ -604,7 +604,9 @@ vx_modbusdev_1 = ModbusDev("Regler", device: vx_7e000002_0000_0000_ffff504f94000
 - **Edited** in Properties as a block of vislox's files is (#79): its name and its settings; a setting lox needs
   cannot be emptied. `Files::ops` lists each (never `device:`, which is where it is), so each is not deployed with
   Revert. Renamed and deleted as #80 says: what hangs below a device follows its rename (lox's `rename_slug`), and a
-  device is not taken out or deleted while an object of vislox's files hangs below it (`blocks[].delete`). A
+  device is not taken out or deleted while an object of vislox's files hangs below it, nor while one Loxone Config
+  made hangs below it in the pending config or the base (it would be deleted with it; the refusal names them)
+  (`blocks[].delete`). A
   deleted one comes back with `restore_block`, whose `page` is its folder or device, checked against what its
   declaration says; its lockfile entry has no layout.
 - **Reviewed** like any change: the Changes list and the tree mark it added, with each I/O of a device added with it
@@ -1595,7 +1597,9 @@ lost is deleted only with consent to exactly that list, see [features.md](featur
 - *Add* on a folder of the project tree (*Virtual Inputs*, *Virtual Outputs*, *Netzwerkperipherie*) or on a virtual
   or Modbus device opens the same dialog for the types that go there (`GET /api/block-types`' `periphery`: each type's
   `folder` or `devices`, and its settings with their unit and whether a new one needs them), the settings lox needs
-  first; it is off, with the reason, where an edit would be refused (#84). The new object is selected in the tree.
+  first; it is off, with the reason, where an edit would be refused (`GET /api/edits`' `add_under`: each folder and
+  device that takes new objects, null or why `add_block` there would be refused) (#84). A number takes a unit only
+  where lox documents one (`Poll: 1min`, not `Port: 30min`), and is range-checked in that unit. The new object is selected in the tree.
 - *Add block* (top left of the page, on the newest revision) lists the types vislox offers (`GET /api/block-types`:
   each type's purpose and link to Loxone's documentation, its ports with their units, canvas labels and the value
   Loxone Config places them with, and its settings), searched by name, type and purpose. The form asks for the
