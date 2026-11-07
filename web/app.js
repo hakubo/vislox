@@ -3734,7 +3734,7 @@ function tpParamHint(p) {
   const what = p.kind === "object" ? `an object${p.type && p.type !== "any" ? ` (${p.type})` : ""}: vx_ and its UUID, or a block of vislox's`
     : p.kind === "input" ? "a source: a port, a block, or an expression; open when not given"
     : p.kind === "set" ? `a ${p.type} set of vislox's, by its name`
-    : p.type === "string" ? "a text" : p.type === "duration" ? "a duration, like 3min" : p.type === "bool" ? "on or off" : "a number";
+    : p.type === "string" ? 'a text ("…"; typed without quotes it is quoted, unless it names a constant)' : p.type === "duration" ? "a duration, like 3min" : p.type === "bool" ? "on or off" : "a number";
   return `${what}${p.default != null ? `; default ${p.default}` : p.required ? "; required" : ""}`;
 }
 /** The fields of a call of template `t`: its label (when it takes one), then each parameter. */

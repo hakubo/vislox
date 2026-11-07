@@ -445,8 +445,10 @@ pub fn set_expr(
 }
 
 /// The page UUID of vislox's page file `file`.
-fn page_of(files: &Files, ctx: &Ctx, file: &str) -> String {
-    let pf = &files.pages[file];
+pub(crate) fn page_of(files: &Files, ctx: &Ctx, file: &str) -> String {
+    let Some(pf) = files.pages.get(file) else {
+        return String::new();
+    };
     match &pf.uuid {
         Some(u) => u.clone(),
         None => {

@@ -2791,7 +2791,7 @@ try {
     await waitText(tp, /Not deployed: vx_treppenlicht_1 is new/);
     await page.fill(`${tp} [data-tp-field="e:a:dauer"]`, "5min");
     ops = await send(() => page.press(`${tp} [data-tp-field="e:a:dauer"]`, "Enter"), "change an argument");
-    assert.deepEqual(ops, [{ op: "instance", slug: "vx_treppenlicht_1", page: VORLAGEN, value: { template: "Treppenlicht", args: { taster: vi, dauer: "5min", titel: "Flur" } } }]);
+    assert.deepEqual(ops, [{ op: "instance", slug: "vx_treppenlicht_1", page: VORLAGEN, value: { template: "Treppenlicht", args: { taster: vi, dauer: "5min", titel: '"Flur"' } } }]);
     assert.match(vfile("vorlagen.loxl"), /vx_treppenlicht_1 = Treppenlicht\(taster: \w+, dauer: 5min, titel: "Flur"\)/);
     // A value of the wrong kind: lox's words, nothing changed.
     await page.waitForFunction(() => document.querySelector('#props [data-tp-field="e:a:dauer"]'));

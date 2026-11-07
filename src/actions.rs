@@ -462,11 +462,8 @@ impl Rollback {
     }
 }
 
-/// Read objects (`<commit>:<path>`) with one `git cat-file --batch`: each
-/// one's bytes, or `None` where git has none.
-/// The module's `.loxl` files at a commit: path and text; `None` when git
-/// cannot list them.
-type ModuleAt = Option<Vec<(String, String)>>;
+/// The module's `.loxl` files at a commit: path and text.
+type ModuleAt = Vec<(String, String)>;
 
 /// The module's `.loxl` files as `commit` has them (`module`: its path from
 /// the project), by their path from the top of the repository; `None` when
@@ -498,6 +495,8 @@ async fn module_texts_at(dir: &Path, commit: &str, module: &str) -> Option<Vec<(
     )
 }
 
+/// Read objects (`<commit>:<path>`) with one `git cat-file --batch`: each
+/// one's bytes, or `None` where git has none.
 async fn git_objects(dir: &Path, specs: &[String]) -> Result<Vec<Option<Vec<u8>>>, String> {
     Ok(git_typed_objects(dir, specs)
         .await?
@@ -2099,6 +2098,18 @@ impl Actions {
                 // A value that would name a constant cannot be told from a typo:
                 // say why. A new name is checked again once written.
                 Err(e) => {
+                    // Nor a template of the module from lox's library's of that
+                    // name (#83): copying the library's would declare it twice.
+                    if req
+                        .ops
+                        .iter()
+                        .any(|o| matches!(o, edit::Op::Instance { value: Some(_), .. }))
+                    {
+                        return Err(bad(format!(
+                            "the module does not read, so its templates cannot be told from lox's \
+                             library: {e}"
+                        )));
+                    }
                     if let Some(v) = req.ops.iter().find_map(|o| match o {
                         edit::Op::Param { value: Some(v), .. }
                             if edit::bare_name(v)
@@ -3363,10 +3374,13 @@ impl Actions {
                     .filter(|(k, _)| *k == key)
                     .map(|(_, v)| v.clone());
                 match kept {
-                    Some(v) => v,
+                    Some(v) => Some(v),
+                    // Kept only when git read them: a failure is tried again.
                     None => {
                         let v = module_texts_at(dir, &commit, &module_rel).await;
-                        *self.module_at.lock().unwrap() = Some((key, v.clone()));
+                        if let Some(v) = &v {
+                            *self.module_at.lock().unwrap() = Some((key, v.clone()));
+                        }
                         v
                     }
                 }
@@ -5891,6 +5905,37 @@ esac
         assert_eq!(x[1]["title"], "Warm");
         assert_eq!(x[1]["top"], "u-warm");
         assert!(x[1].get("revert").is_none(), "{e}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_instance_is_refused_while_the_module_does_not_read() {
+        let (tmp, a) = project_for_edits();
+        let d = tmp.path().join("project");
+        // The module may declare a template named like one of lox's library:
+        // unread, it is not taken for the library's.
+        std::fs::write(d.join("pages/main.loxl"), "template Treppenlicht(\n").unwrap();
+        let (code, msg) = a
+            .edit(
+                &edit::Request {
+                    base: blob(&d, "out.Loxone"),
+                    ops: vec![edit::Op::Instance {
+                        slug: "vx_t".into(),
+                        page: "10000008-0000-0080-ffff504f94000001".into(),
+                        value: Some(crate::template_edit::Call {
+                            template: "Treppenlicht".into(),
+                            label: None,
+                            args: [("taster".to_string(), "vx_x".to_string())].into(),
+                        }),
+                    }],
+                },
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(code, axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(msg.contains("the module does not read"), "{msg}");
+        assert!(!d.join("pages/vislox/templates.loxl").exists());
     }
 
     #[cfg(unix)]

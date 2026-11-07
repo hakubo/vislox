@@ -506,7 +506,7 @@ vx_ost = Fassade("Ost", sonne: vx_10000006_0000_0060_ffff504f94000001.AQ, pos: 5
   which lox made an expression block of that body (`<prefix>_<name>__…`, `<prefix>_<name>_<port>__…`). An
   expression in a body onto an object parameter (`jalousie.AutoShade <- …`) is named after the object passed, not
   the instance, and is no instance's. What the deployed revision had is the module's `.loxl` files at its commit
-  (`git ls-tree` and `cat-file`, kept per commit). Like `sources`, it is the module as it is now: shown on the
+  (`git ls-tree` and `cat-file`, kept per commit once git read them). Like `sources`, it is the module as it is now: shown on the
   newest config only.
 - **The canvas** frames each instance's blocks in a dashed box behind them, headed by `sued: Fassade "Süd"` and its
   arguments and outputs (`sonne: teiler.AQ · pos: 55  → Q, Hitze`); a nested instance's box sits inside its parent's.
@@ -526,16 +526,23 @@ vx_ost = Fassade("Ost", sonne: vx_10000006_0000_0060_ffff504f94000001.AQ, pos: 5
   `previous` is the `instance` op that puts back what was (`value: null` when the op made it).
   - The template is one of the module's own, or of lox's library: vislox copies a library template into its
     directory (`<module>/vislox/templates.loxl`, which holds only such copies) for the first instance that calls it,
-    and drops the copy with the last one, or when the module declares that name itself.
+    and drops the copy with the last one, or when the module declares that name itself. While the module's own
+    files do not read, an instance is refused with lox's error rather than taken for the library's template of that
+    name. `templates.loxl` is no page's file name (a page titled *Templates* gets `page-templates.loxl`); a page file
+    of vislox's that already has the name (it has a `page` line) stays a page file, and a library template is then
+    refused (copy it into the module).
   - The name is `vx_` and lowercase letters, digits and `_`, without `__`, not `vx_<uuid>`, not taken, and no other
     name of the module, its lockfile or vislox's files may start with `<name>_` (its blocks are named so).
   - Checked as `lox logic check` checks a call, before anything is written: an unknown parameter (the error lists
     the template's), a missing one (an object, a value or set without a default), a label for a template without
     `label: string`, a value of the wrong kind (`number`, `duration`, `string`, `bool`; a constant's name is taken).
-    A text parameter's value is given unquoted. An object parameter names an object vislox's files may name: one
-    Loxone Config drew as `vx_<uuid>` (an extern of `edits.loxl`, added with the instance and dropped with the last
-    name of it), or a block, signal or instance's block (`vx_ost.b`) of vislox's; an input parameter a port, a bare
-    name or an expression over such names; a set parameter a set of vislox's file of that kind. lox checks the rest
+    Each argument is kept as written, so a quoted text stays a text and a constant's name a reference through Save,
+    Revert and undo; a text parameter's value typed without quotes is quoted unless it names a constant. An object
+    parameter names an object vislox's files may name: one Loxone Config drew as `vx_<uuid>` (an extern of
+    `edits.loxl`, added with the instance and dropped with the last name of it), or a block or signal of vislox's, or
+    a block of an instance of vislox's (`vx_ost.b`, checked against its template's body; the bare instance is no
+    object); an input parameter a port, a bare name or an expression over such names (of an instance: bare for its
+    first output, an output or a block); a set parameter a set of vislox's file of that kind. lox checks the rest
     (the object's type, the ports the body uses) when the module is checked and compiled.
   - The template of an existing instance is not changed: lox keeps its blocks' types (make a new instance, then drop
     this one).

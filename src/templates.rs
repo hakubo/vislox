@@ -212,6 +212,12 @@ fn outputs(t: &TemplateDecl) -> Vec<Output> {
         .collect()
 }
 
+/// The names of the blocks and signals a template's body declares (`hoch`):
+/// what `<instance>.<name>` names.
+pub fn body_names(t: &TemplateDecl) -> Vec<String> {
+    body(t).names.iter().map(|n| n.to_string()).collect()
+}
+
 /// The lockfile keys of the blocks and signals an instance with blocks'
 /// prefix `prefix` of template `t` makes, nested instances' too (`lookup`
 /// finds a template by name).
@@ -290,43 +296,45 @@ fn call_text(b: &loxone_config::logic::BlockDecl) -> String {
     .to_text()
 }
 
-/// The templates of lox's library, each with its parameters.
-pub fn library() -> Vec<LibraryTemplate> {
-    let mut out = Vec::new();
-    for (file, src) in loxone_config::library::FILES {
-        let Ok(m) = Module::parse_fragment(src) else {
-            continue;
-        };
-        for item in m.items {
-            if let Item::Template(t) = item {
-                out.push(LibraryTemplate {
-                    file,
-                    name: t.name.clone(),
-                    params: params(&t),
-                    outputs: outputs(&t),
-                    description: description(&t),
-                });
+/// lox's library parsed once: each template with its file.
+fn parsed_library() -> &'static [(&'static str, TemplateDecl)] {
+    static LIB: std::sync::OnceLock<Vec<(&'static str, TemplateDecl)>> = std::sync::OnceLock::new();
+    LIB.get_or_init(|| {
+        let mut out = Vec::new();
+        for (file, src) in loxone_config::library::FILES {
+            let Ok(m) = Module::parse_fragment(src) else {
+                continue;
+            };
+            for item in m.items {
+                if let Item::Template(t) = item {
+                    out.push((*file, t));
+                }
             }
         }
-    }
-    out
+        out
+    })
+}
+
+/// The templates of lox's library, each with its parameters.
+pub fn library() -> Vec<LibraryTemplate> {
+    parsed_library()
+        .iter()
+        .map(|(file, t)| LibraryTemplate {
+            file,
+            name: t.name.clone(),
+            params: params(t),
+            outputs: outputs(t),
+            description: description(t),
+        })
+        .collect()
 }
 
 /// The library's template `name`, as lox's library file declares it.
 pub fn library_template(name: &str) -> Option<(&'static str, TemplateDecl)> {
-    for (file, src) in loxone_config::library::FILES {
-        let Ok(m) = Module::parse_fragment(src) else {
-            continue;
-        };
-        for item in m.items {
-            if let Item::Template(t) = item
-                && t.name == name
-            {
-                return Some((file, t));
-            }
-        }
-    }
-    None
+    parsed_library()
+        .iter()
+        .find(|(_, t)| t.name == name)
+        .map(|(f, t)| (*f, t.clone()))
 }
 
 /// The library file a template is, when lox's library has one of its name
@@ -539,11 +547,21 @@ pub fn read<T: AsRef<str>>(
             }
         }
     }
+    // Each template's line (1-based) in the file that declares it: where its
+    // nested calls are looked for.
+    let tlines: BTreeMap<&str, usize> = decls
+        .iter()
+        .filter_map(|(n, (_, f))| {
+            let p = parsed.iter().find(|p| p.file == *f)?;
+            Some((*n, *p.template_lines.get(*n)?))
+        })
+        .collect();
     let mut out = Templates::default();
     // (instance, template) top-level first, then nested ones (depth first).
     fn walk<'t>(
         decls: &BTreeMap<&str, (&'t TemplateDecl, &str)>,
         texts: &BTreeMap<&str, &str>,
+        tlines: &BTreeMap<&str, usize>,
         call: &loxone_config::logic::BlockDecl,
         w: Walk,
         strings: &BTreeMap<String, String>,
@@ -592,14 +610,9 @@ pub fn read<T: AsRef<str>>(
             .map(|(_, f)| *f)
             .unwrap_or_default();
         for inner in body(t).nested.values() {
-            let line = texts.get(tfile).and_then(|text| {
-                let tl = scan(text, Path::new(tfile))
-                    .into_iter()
-                    .find(|d| d.kind == "template" && d.slug == t.name)?
-                    .span
-                    .line;
-                nested_line(text, tl + 1, &inner.slug)
-            });
+            let line = texts
+                .get(tfile)
+                .and_then(|text| nested_line(text, *tlines.get(t.name.as_str())?, &inner.slug));
             let w = Walk {
                 path: format!("{path}.{}", inner.slug),
                 prefix: format!("{prefix}_{}", inner.slug),
@@ -608,7 +621,7 @@ pub fn read<T: AsRef<str>>(
                 ours,
                 depth: depth + 1,
             };
-            walk(decls, texts, inner, w, &mine, out);
+            walk(decls, texts, tlines, inner, w, &mine, out);
         }
     }
     let mut found: Vec<(Instance, Option<&TemplateDecl>)> = Vec::new();
@@ -623,7 +636,15 @@ pub fn read<T: AsRef<str>>(
                     ours: ours(p.file),
                     depth: 0,
                 };
-                walk(&decls, &texts, call, w, &BTreeMap::new(), &mut found);
+                walk(
+                    &decls,
+                    &texts,
+                    &tlines,
+                    call,
+                    w,
+                    &BTreeMap::new(),
+                    &mut found,
+                );
             }
         }
     }

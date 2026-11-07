@@ -19,6 +19,7 @@
 
 use crate::blocks::{self, InstanceDef, PageFile};
 use crate::edit::{Applied, Ctx, Files, Op, find, op_value, own_constant, pages_titled, slug_uuid};
+use crate::expr_edit::page_of;
 use crate::templates::{expanded, library_template, owns, text_of};
 use loxone_config::logic::{
     self, BindingKind, Item, Module, Operand, TemplateDecl, TemplateParam, Value, ValueKind,
@@ -66,6 +67,12 @@ pub fn parse_templates(text: &str) -> Result<BTreeMap<String, TemplateDecl>, Str
     Ok(out)
 }
 
+/// Whether a file of vislox's directory named like [`crate::edit::TEMPLATES`]
+/// is a page file (it has a `page` line) rather than the templates file.
+pub fn is_page_file(text: &str) -> bool {
+    Module::parse_fragment(text).is_ok_and(|m| m.items.iter().any(|i| matches!(i, Item::Page(_))))
+}
+
 pub fn render_templates(t: &BTreeMap<String, TemplateDecl>) -> String {
     let mut out = String::from(HEADER);
     for x in t.values() {
@@ -104,47 +111,14 @@ fn lookup<'a>(files: &'a Files, ctx: &'a Ctx<'a>) -> impl Fn(&str) -> Option<Tem
     move |n: &str| template(files, ctx, n).map(|(t, _)| t)
 }
 
-/// What an instance of vislox's calls, as the `instance` op writes it.
+/// What an instance of vislox's calls, as the `instance` op writes it: each
+/// argument as written, so a quoted text stays a text and a constant's name a
+/// reference through Save, Revert and undo.
 pub fn call_of(x: &InstanceDef) -> Call {
     Call {
         template: x.template.clone(),
         label: x.label.clone(),
-        args: x
-            .args
-            .iter()
-            .map(|(k, v)| {
-                // A quoted text is typed unquoted.
-                let shown = match Module::parse_fragment(&format!("vx_x = T(p: {v})"))
-                    .ok()
-                    .and_then(|m| m.items.into_iter().next())
-                {
-                    Some(Item::Block(b)) => match b.bindings().next().map(|b| &b.kind) {
-                        Some(BindingKind::Param(Value::Str(s))) => s.clone(),
-                        _ => v.clone(),
-                    },
-                    _ => v.clone(),
-                };
-                (k.clone(), shown)
-            })
-            .collect(),
-    }
-}
-
-/// The page UUID of vislox's page file `file`.
-fn page_of(files: &Files, ctx: &Ctx, file: &str) -> String {
-    let Some(pf) = files.pages.get(file) else {
-        return String::new();
-    };
-    match &pf.uuid {
-        Some(u) => u.clone(),
-        None => {
-            let mut same = Vec::new();
-            pages_titled(&ctx.base.xml.root, &pf.page, &mut same);
-            same.first()
-                .and_then(|e| e.attr("U"))
-                .unwrap_or_default()
-                .to_string()
-        }
+        args: x.args.iter().cloned().collect(),
     }
 }
 
@@ -172,13 +146,13 @@ fn argument(
     let name = param.name();
     let consts = &files.claims.8;
     let is_const = |n: &str| consts.contains_key(n) || ctx.lets.contains(n);
-    // A text parameter's value is typed unquoted; a constant's name stays a
-    // name.
+    // A text parameter's value: a quoted text stays a text, a constant's name
+    // a reference; any other text typed without quotes is quoted.
     let text = match param {
         TemplateParam::Value {
             kind: ValueKind::Str,
             ..
-        } if !is_const(text) => Value::Str(text.to_string()).to_string(),
+        } if !text.starts_with('"') && !is_const(text) => Value::Str(text.to_string()).to_string(),
         _ => text.to_string(),
     };
     if text.contains(['\n', '\r']) {
@@ -225,11 +199,14 @@ fn argument(
             ));
         }
         (TemplateParam::Object { .. }, BindingKind::Param(Value::Ref(n))) => {
-            object(files, ctx, slug, name, n)?;
+            object(files, ctx, slug, name, n, None, true)?;
         }
         // A block of an instance of vislox's: `vx_ost.b`.
         (TemplateParam::Object { .. }, BindingKind::Wire(p))
-            if files.instance(&p.slug).is_some() && p.slug != slug => {}
+            if files.instance(&p.slug).is_some() =>
+        {
+            object(files, ctx, slug, name, &p.slug, Some(&p.port), true)?;
+        }
         (TemplateParam::Object { .. }, _) => {
             return Err(format!(
                 "{name} takes an object by its name: one Loxone Config drew as vx_ and its UUID \
@@ -254,23 +231,26 @@ fn argument(
             ));
         }
         (TemplateParam::Input { .. }, k) => {
-            let mut names: Vec<String> = Vec::new();
+            // Each name it reads, with the port it reads of it.
+            let mut names: Vec<(String, Option<String>)> = Vec::new();
             match k {
-                BindingKind::Param(Value::Ref(n)) if !is_const(n) => names.push(n.clone()),
+                BindingKind::Param(Value::Ref(n)) if !is_const(n) => names.push((n.clone(), None)),
                 BindingKind::Param(_) => {}
-                BindingKind::Wire(p) => names.push(p.slug.clone()),
+                BindingKind::Wire(p) => names.push((p.slug.clone(), Some(p.port.clone()))),
                 BindingKind::Expr(e) => {
                     for o in e.operands() {
                         match o {
-                            Operand::Port(p) => names.push(p.slug.clone()),
-                            Operand::Value(Value::Ref(n)) if !is_const(n) => names.push(n.clone()),
+                            Operand::Port(p) => names.push((p.slug.clone(), Some(p.port.clone()))),
+                            Operand::Value(Value::Ref(n)) if !is_const(n) => {
+                                names.push((n.clone(), None))
+                            }
                             _ => {}
                         }
                     }
                 }
             }
-            for n in names {
-                object(files, ctx, slug, name, &n)?;
+            for (n, port) in names {
+                object(files, ctx, slug, name, &n, port.as_deref(), false)?;
             }
         }
     }
@@ -278,13 +258,57 @@ fn argument(
 }
 
 /// Check one name an argument gives: vislox's block, signal or instance, or
-/// an object of Loxone Config's as `vx_<uuid>`.
-fn object(files: &Files, ctx: &Ctx, slug: &str, param: &str, n: &str) -> Result<(), String> {
+/// an object of Loxone Config's as `vx_<uuid>`. Of an instance of vislox's,
+/// an object parameter takes one of its blocks (`vx_ost.b`), never the bare
+/// instance; an input reads its first output (bare), an output or a block's
+/// default output (`vx_ost.Q`, `vx_ost.b`).
+fn object(
+    files: &Files,
+    ctx: &Ctx,
+    slug: &str,
+    param: &str,
+    n: &str,
+    port: Option<&str>,
+    as_object: bool,
+) -> Result<(), String> {
     if n == slug {
         return Err(format!("{param}: an instance does not read itself"));
     }
-    if files.instance(n).is_some() {
-        return Ok(());
+    if let Some((_, x)) = files.instance(n) {
+        let Some((t, _)) = template(files, ctx, &x.template) else {
+            return Err(format!("{param}: `{n}`'s template {} is gone", x.template));
+        };
+        let blocks = crate::templates::body_names(&t);
+        let outputs: Vec<&str> = t.outputs.iter().map(|o| o.name.as_str()).collect();
+        let list = |v: &[&str]| {
+            if v.is_empty() {
+                "none".to_string()
+            } else {
+                v.join(", ")
+            }
+        };
+        let block_list = list(&blocks.iter().map(String::as_str).collect::<Vec<_>>());
+        return match (port, as_object) {
+            (None, true) => Err(format!(
+                "{param}: `{n}` is an instance, no object: name one of its blocks, `{n}.<block>` \
+                 (its blocks: {block_list})"
+            )),
+            (None, false) if outputs.is_empty() => Err(format!(
+                "{param}: `{n}` ({}) has no outputs to read",
+                x.template
+            )),
+            (Some(p), true) if !blocks.iter().any(|b| b == p) => Err(format!(
+                "{param}: `{n}` has no block `{p}`; its blocks: {block_list}"
+            )),
+            (Some(p), false) if !outputs.contains(&p) && !blocks.iter().any(|b| b == p) => {
+                Err(format!(
+                    "{param}: `{n}` has no output or block `{p}`; its outputs: {}, its blocks: \
+                     {block_list}",
+                    list(&outputs)
+                ))
+            }
+            _ => Ok(()),
+        };
     }
     crate::expr_edit::operands(files, ctx, &[n.to_string()])
         .map(|_| ())
@@ -316,12 +340,6 @@ pub fn set_instance(files: &mut Files, ctx: &Ctx, op: &Op) -> Result<Applied, St
         let Some((file, x)) = existing else {
             return Err(format!("vislox's files have no instance `{s}`"));
         };
-        if let Some(w) = files.claims.1.iter().find(|w| w.from.0 == s) {
-            return Err(format!(
-                "{s}: the wire into {}.{} reads it; take that out first",
-                w.to.0, w.to.1
-            ));
-        }
         if let Some(what) = crate::expr_edit::read_by_expression(files, &s) {
             return Err(format!("{s}: {what} reads it; take that out first"));
         }
@@ -378,6 +396,15 @@ pub fn set_instance(files: &mut Files, ctx: &Ctx, op: &Op) -> Result<Applied, St
             "`{tname}` is no template of the module or of lox's library (`lox logic templates`)"
         )
     })?;
+    // A library template is copied into vislox's templates file: refused
+    // while a page's file of vislox's has that name.
+    if matches!(from, From::Library) && files.pages.contains_key(crate::edit::TEMPLATES) {
+        return Err(format!(
+            "{tname} is lox's library's, and vislox copies it into {}, which is a page's file \
+             here; copy the template into the module yourself",
+            crate::edit::TEMPLATES
+        ));
+    }
     if existing.is_none() {
         logic::valid_slug(&s).map_err(|e| e.to_string())?;
         if !own_constant(&s) || slug_uuid(&s).is_some() {

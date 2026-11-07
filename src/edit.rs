@@ -1579,7 +1579,9 @@ impl Files {
         for (name, text) in texts {
             if name.ends_with(PROGRAM_EXT) {
                 programs.insert(name.clone(), text.replace("\r\n", "\n"));
-            } else if name == TEMPLATES {
+            } else if name == TEMPLATES && !crate::template_edit::is_page_file(text) {
+                // A page titled "Templates" before #83 reserved the name keeps
+                // its file: a page file has a page line, the templates file none.
                 f.templates = crate::template_edit::parse_templates(text)
                     .map_err(|e| format!("{name}: {e}"))?;
             } else if name != CLAIMS {
@@ -1706,7 +1708,7 @@ impl Files {
                 out.insert(name.clone(), p.render());
             }
         }
-        if !self.templates.is_empty() {
+        if !self.templates.is_empty() && !self.pages.contains_key(TEMPLATES) {
             out.insert(
                 TEMPLATES.to_string(),
                 crate::template_edit::render_templates(&self.templates),
@@ -9589,7 +9591,8 @@ mod tests {
         // Its call as the op takes it: the text unquoted.
         let (_, def) = files.instance("vx_treppe").unwrap();
         let call = crate::template_edit::call_of(def);
-        assert_eq!(call.args["titel"], "Flur");
+        // As written: a quoted text stays one.
+        assert_eq!(call.args["titel"], "\"Flur\"");
         assert_eq!(call.args["dauer"], "5min");
         // Changed: the same blocks.
         let lock = lock_of(&l);
@@ -9605,7 +9608,16 @@ mod tests {
             ),
         )
         .unwrap();
-        assert_eq!(serde_json::from_value::<Op>(a.previous).unwrap(), op);
+        // What was, as written: the text quoted.
+        assert_eq!(
+            serde_json::from_value::<Op>(a.previous).unwrap(),
+            inst(
+                "vx_treppe",
+                "Treppenlicht",
+                &[("taster", &vi), ("dauer", "5min"), ("titel", "\"Flur\"")],
+                None
+            )
+        );
         let out2 = compile_files(&d, &files, &mut l).unwrap();
         assert_eq!(l.objects["vx_treppe_ausgang"].uuid, mono);
         let el = find(&out2.xml.root, &mono).unwrap();
@@ -9714,6 +9726,102 @@ mod tests {
                 .values()
                 .any(|t| t.contains("removed vx_treppe"))
         );
+    }
+
+    #[test]
+    fn an_argument_keeps_whether_it_was_a_text_or_a_constant_s_name() {
+        let d = doc("house.Loxone");
+        let names = BTreeSet::new();
+        let lets: BTreeSet<String> = ["hell".to_string()].into();
+        let mut files = Files::default();
+        let lock = Lock::default();
+        let mut ctx = ctx_of(&d, &d, &lock, None, &names);
+        ctx.lets = &lets;
+        let vi = slug(VI);
+        for (typed, written) in [
+            ("\"hell\"", "\"hell\""),
+            ("hell", "hell"),
+            ("Flur oben", "\"Flur oben\""),
+        ] {
+            let mut f = files.clone();
+            apply_op(
+                &mut f,
+                &ctx,
+                &inst(
+                    "vx_t",
+                    "Treppenlicht",
+                    &[("taster", &vi), ("titel", typed)],
+                    None,
+                ),
+            )
+            .unwrap();
+            let (_, def) = f.instance("vx_t").unwrap();
+            assert_eq!(
+                def.args[1],
+                ("titel".to_string(), written.to_string()),
+                "{typed}"
+            );
+            // Saved again as Properties shows it, and through `previous` (Revert, undo): unchanged.
+            let call = crate::template_edit::call_of(def);
+            let again = Op::Instance {
+                slug: "vx_t".into(),
+                page: OG.into(),
+                value: Some(call),
+            };
+            let a = apply_op(&mut f, &ctx, &again).unwrap();
+            assert_eq!(f.instance("vx_t").unwrap().1.args[1].1, written);
+            apply_op(&mut f, &ctx, &serde_json::from_value(a.previous).unwrap()).unwrap();
+            assert_eq!(f.instance("vx_t").unwrap().1.args[1].1, written);
+        }
+        apply_op(
+            &mut files,
+            &ctx,
+            &inst("vx_t", "Treppenlicht", &[("taster", &vi)], None),
+        )
+        .unwrap();
+        // Another instance's blocks: by name, never the bare instance.
+        let bad = [
+            ("vx_t", "is an instance, no object: name one of its blocks"),
+            ("vx_t.nope", "has no block `nope`; its blocks: ausgang"),
+        ];
+        for (arg, why) in bad {
+            let e = apply_op(
+                &mut files.clone(),
+                &ctx,
+                &inst("vx_u", "Treppenlicht", &[("taster", arg)], None),
+            )
+            .unwrap_err();
+            assert!(e.contains(why), "{arg}: {e}");
+        }
+        apply_op(
+            &mut files.clone(),
+            &ctx,
+            &inst("vx_u", "Treppenlicht", &[("taster", "vx_t.ausgang")], None),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_page_file_called_templates_stays_a_page_file() {
+        let d = doc("house.Loxone");
+        let names = BTreeSet::new();
+        let texts: BTreeMap<String, String> = [(
+            TEMPLATES.to_string(),
+            "page \"Templates\"\n\nvx_and_1 = And()\n".to_string(),
+        )]
+        .into();
+        let mut files = Files::from_texts(&texts).unwrap();
+        assert!(files.pages.contains_key(TEMPLATES) && files.templates.is_empty());
+        assert_eq!(files.render()[TEMPLATES], files.pages[TEMPLATES].render());
+        let lock = Lock::default();
+        let ctx = ctx_of(&d, &d, &lock, None, &names);
+        let e = apply_op(
+            &mut files,
+            &ctx,
+            &inst("vx_t", "Treppenlicht", &[("taster", &slug(VI))], None),
+        )
+        .unwrap_err();
+        assert!(e.contains("which is a page's file here"), "{e}");
     }
 
     #[test]

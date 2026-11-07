@@ -848,8 +848,9 @@ pub fn file_name(title: &str, taken: &dyn Fn(&str) -> bool) -> String {
     }
     let mut stem: String = s.trim_matches('-').chars().take(40).collect();
     stem = stem.trim_end_matches('-').to_string();
-    // `edits.loxl` is the file of #58's claims.
-    if stem.is_empty() || stem == "edits" {
+    // `edits.loxl` is the file of #58's claims, `templates.loxl` that of the
+    // library templates vislox copies in (#83).
+    if stem.is_empty() || stem == "edits" || stem == "templates" {
         stem = format!("page-{stem}").trim_end_matches('-').to_string();
     }
     let mut name = format!("{stem}.loxl");
@@ -1093,6 +1094,8 @@ mod tests {
         assert_eq!(file_name("Küche Licht", &none), "kueche-licht.loxl");
         assert_eq!(file_name("  ", &none), "page.loxl");
         assert_eq!(file_name("Edits", &none), "page-edits.loxl");
+        // `templates.loxl` is vislox's file of library templates (#83).
+        assert_eq!(file_name("Templates", &none), "page-templates.loxl");
         let taken = |n: &str| n == "bad.loxl" || n == "bad-2.loxl";
         assert_eq!(file_name("Bad", &taken), "bad-3.loxl");
         let used = |s: &str| s == "vx_greaterequal_1";
