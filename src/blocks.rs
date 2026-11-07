@@ -31,6 +31,15 @@ use std::collections::{BTreeMap, BTreeSet};
 /// The slugs vislox picks start with this; nothing else in a module should.
 pub const SLUG_PREFIX: &str = "vx_";
 
+/// The argument that says which object a ref mirrors (`mirrors: frost`).
+pub const MIRRORS: &str = "mirrors";
+
+/// A push notification drawn on a page (#77): the block, and the object of
+/// Loxone Config's *Messages* it mirrors. Not in lox's builtin table (it is a
+/// ref), so not in the palette's list of types; added with `mirrors:`.
+pub const MESSAGE_REF: &str = "OutputRefLM";
+pub const NOTIFICATION: &str = loxone_config::connectors::MESSAGE_REF_TARGET;
+
 // ── the palette ─────────────────────────────────────────────────────────
 
 /// Whether vislox offers `ty` as a new block on a page: a type of lox's
@@ -73,11 +82,23 @@ pub enum Kind {
     Time,
     /// A number.
     Number,
+    /// A duration: a number with `ms`, `s`, `min` or `h`, or seconds as a
+    /// plain number (`12h`, `30min`, `90`).
+    Duration,
 }
 
 /// How `param`, a setting of `ty`, is written; `None` for one vislox does
 /// not offer: a program's text, which lox takes only as `file(…)`.
 pub fn setting_kind(ty: &str, param: &str) -> Option<Kind> {
+    // A push notification's message (#77): its texts, and the least time
+    // between two messages.
+    if connectors::message_params(ty).contains(&param) {
+        return Some(if param == "MinimumTime" {
+            Kind::Duration
+        } else {
+            Kind::Text
+        });
+    }
     if connectors::file_params(ty).contains(&param) {
         None
     } else if connectors::clock_params(ty).contains(&param) {
@@ -98,6 +119,7 @@ pub fn setting_kind(ty: &str, param: &str) -> Option<Kind> {
 pub fn settings(ty: &str) -> Vec<(&'static str, Kind)> {
     connectors::attr_params(ty)
         .into_iter()
+        .chain(connectors::message_params(ty).iter().copied())
         .filter_map(|p| Some((p, setting_kind(ty, p)?)))
         .collect()
 }
@@ -206,7 +228,33 @@ pub fn palette() -> Json {
             })
         })
         .collect();
+    let mut types = types;
+    types.push(message_ref_type());
     json!({ "types": types })
+}
+
+/// The palette's push notification (#77): an `OutputRefLM` that mirrors a
+/// `Notification` of Loxone Config's *Messages* (`mirrors`, picked from the
+/// config's notifications by the browser), with its message. Its input is
+/// wired once it is on the page (#61); it takes no name (the notification's)
+/// and no constant.
+fn message_ref_type() -> Json {
+    let mut list =
+        vec![json!({ "name": MIRRORS, "kind": "notification", "choices": null, "empty": false })];
+    list.extend(settings(MESSAGE_REF).into_iter().map(|(name, kind)| {
+        json!({ "name": name, "kind": kind, "choices": null, "empty": name != "On" })
+    }));
+    json!({
+        "type": MESSAGE_REF,
+        "summary": "Push notification: sends the notification's message when its input turns on, and off",
+        "docs": null,
+        "ports": [
+            { "key": "AI", "name": "AI", "dir": "input", "unit": null, "label": null, "default": null, "wire_only": true },
+            { "key": "AQ", "name": "AQ", "dir": "output", "unit": null, "label": null, "default": null },
+        ],
+        "settings": list,
+        "mirrors": NOTIFICATION,
+    })
 }
 
 // ── the files ───────────────────────────────────────────────────────────
@@ -356,6 +404,14 @@ impl PageFile {
                     let mut wires = Vec::new();
                     for a in &b.args {
                         match a {
+                            // `mirrors:` names the object a ref is (a push
+                            // notification's `OutputRefLM`, #77): a value,
+                            // never a wire.
+                            ArgItem::Binding(Binding {
+                                port,
+                                kind: BindingKind::Param(v @ Value::Ref(_)),
+                                ..
+                            }) if port == MIRRORS => args.push((port.clone(), v.clone())),
                             // A bare name of vislox's on an adopted block: the
                             // default output of the object it names. Any other
                             // bare name is a value: a `let` constant, a day word.
@@ -557,6 +613,16 @@ mod tests {
         assert!(!offered("Banana"));
         let p = palette();
         let types = p["types"].as_array().unwrap();
+        // A push notification (#77): picked by the notification it mirrors.
+        let lm = types.iter().find(|t| t["type"] == "OutputRefLM").unwrap();
+        let names: Vec<_> = lm["settings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["mirrors", "On", "Off", "MinimumTime"]);
+        assert_eq!(lm["settings"][3]["kind"], "duration");
         let and = types.iter().find(|t| t["type"] == "And").unwrap();
         assert!(
             and["summary"].as_str().unwrap().contains("AND"),
@@ -688,6 +754,34 @@ mod tests {
             PageFile::parse("page \"A\"\n# Adopted from Loxone Config\nvx_b.In1 <- vx_c\n")
                 .unwrap_err()
                 .contains("did not write")
+        );
+    }
+
+    /// `mirrors:` on a push notification's block is a value naming
+    /// vislox's extern, on a block added or adopted here, never a wire (#77).
+    #[test]
+    fn mirrors_is_a_value_not_a_wire() {
+        let text = "page \"Meldungen\"\n\nvx_outputreflm_1 = OutputRefLM(mirrors: vx_6000, On: \"a\")\n\n\
+                    # Adopted from Loxone Config: drawn there, managed here since; they keep their UUIDs.\n\
+                    vx_frost = OutputRefLM(mirrors: vx_6001, AI: vx_x.Q, On: \"b\", MinimumTime: 12h)\n";
+        let f = PageFile::parse(text).unwrap();
+        for (b, n) in f.blocks.iter().zip(["vx_6000", "vx_6001"]) {
+            assert_eq!(b.get(MIRRORS), Some(&Value::Ref(n.into())));
+            assert!(b.wires.iter().all(|(p, _)| p != MIRRORS));
+        }
+        assert_eq!(f.blocks[1].wires.len(), 1);
+        assert!(f.render().contains(
+            "vx_frost = OutputRefLM(mirrors: vx_6001, On: \"b\", MinimumTime: 12h, AI: vx_x.Q)"
+        ));
+        assert_eq!(PageFile::parse(&f.render()).unwrap(), f);
+        // The message is edited as settings: texts and a duration.
+        assert_eq!(
+            settings("OutputRefLM"),
+            [
+                ("On", Kind::Text),
+                ("Off", Kind::Text),
+                ("MinimumTime", Kind::Duration)
+            ]
         );
     }
 

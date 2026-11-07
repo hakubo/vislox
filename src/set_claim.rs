@@ -1,7 +1,7 @@
 //! Claims on a block's whole set, shared by several blocks: a DayTimer's
 //! switching times (`schedule`, #73), a lighting controller's moods (`moods`,
-//! #74) and who may open an NFC Code Touch (`access`, #76), and the next ones
-//! (#77 recipients, #78 tiles).
+//! #74), who may open an NFC Code Touch (`access`, #76) and who gets a push
+//! notification (`recipients`, #77), and the next one (#78 tiles).
 //!
 //! Lox Logic writes each as a named set and a claim per block
 //! (`<slug>.<keyword> = <set>`). Several blocks may claim one set; a block
@@ -34,7 +34,7 @@ use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
 
 /// The blocks the rest of the module claims, per kind (its keyword:
-/// `schedule`, `moods`, `members`, `access`): UUID (lowercase) → the claim's
+/// `schedule`, `moods`, `members`, `access`, `recipients`): UUID (lowercase) → the claim's
 /// `file:line`.
 pub type Claimed = BTreeMap<&'static str, BTreeMap<String, String>>;
 
@@ -55,6 +55,7 @@ pub static KINDS: &[&dyn ClaimKind] = &[
     &Reg::<crate::sched_edit::SchedKind>(PhantomData),
     &Reg::<crate::mood_edit::MoodKind>(PhantomData),
     &Reg::<crate::access_edit::AccessKind>(PhantomData),
+    &Reg::<crate::recipients_edit::RecipientsKind>(PhantomData),
     &crate::member_edit::MemberKind,
 ];
 

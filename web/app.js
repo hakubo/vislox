@@ -1191,11 +1191,13 @@ function renderPropsBody() {
       `<div class="ed-note">Change it in the module: an edit made in Loxone Config is overwritten on the next push.</div>`);
     section("Lox Logic", rows, ce.length + lf.length + access.length + tf.length || undefined);
   }
+  const msg = msgRows(o, marks);
+  if (msg) section("Message", msg.rows, msg.count);
   if (o.rights) {
     const rr = rightsRows(o, marks);
-    // Editing who may open an NFC Code Touch (#76).
-    if (o.rights.kind === "access") rr.rows.push(...acRows(o));
-    section(o.rights.kind === "access" ? "Access" : "Recipients", rr.rows, rr.count + (accessEdit(o.uuid)?.pending ? 1 : 0));
+    // Editing who may open an NFC Code Touch (#76), and who gets a push notification (#77).
+    rr.rows.push(...acRows(o));
+    section(o.rights.kind === "access" ? "Access" : "Recipients", rr.rows, rr.count + (accessEdit(o.uuid, o.rights.kind)?.pending ? 1 : 0));
   }
   const opT = opTarget(o);
   if (opT) section("Operate", [opControls(opT)]);
@@ -2167,6 +2169,7 @@ function editsHere() {
   if (moodsPending().length) parts.push(`moods of ${plural(moodsPending().length, "lighting controller")} edited here`);
   if (membersPending().length) parts.push(`members of ${plural(membersPending().length, "central block")} edited here`);
   if (accessPending().length) parts.push(`access to ${accessPending().length} NFC Code Touch${accessPending().length === 1 ? "" : "es"} edited here`);
+  if (accessPending("recipients").length) parts.push(`recipients of ${plural(accessPending("recipients").length, "push notification")} edited here`);
   const drawn = editsWires().filter((w) => w.now).length, out = editsWires().length - drawn;
   if (drawn) parts.push(`${plural(drawn, "wire")} drawn here`);
   if (out) parts.push(`${plural(out, "wire")} taken out here`);
@@ -2913,6 +2916,9 @@ function rightsRows(o, marks) {
   const label = r.kind === "access" ? "Opens for" : "Sent to";
   rows.push(propRow(label, users.length ? esc(users.join(", ")) : '<span class="none-v">nobody</span>', "",
     r.kind === "access" ? "The users who may open it: directly, or through a group" : "The users who get it: directly, through a group, or as members of Full access"));
+  // Members of Full access get every notification (#77): inherited, as Loxone Config shows them; no set takes it away.
+  if (r.inherited?.length) rows.push(propRow("Inherited", `${esc(r.inherited.map((u) => u.title).join(", "))} <span class="none-v">(Full access)</span>`, "",
+    "Members of Full access get every push notification, whatever a set says"));
   if (old) {
     const ids = (l) => new Set(l.map((u) => u.uuid));
     const now = ids(r.users), then = ids(old.users);
@@ -2923,6 +2929,39 @@ function rightsRows(o, marks) {
   }
   return { rows, count: r.list.length };
 }
+/** What a push notification says, and when (#77): on its block on a page (`OutputRefLM`), its texts and minimum
+ *  time, marked against the compared revision; on the notification, the blocks that send it. The texts are shown
+ *  as the review shows a title: in Properties and the change list, never in a URL, the page title or a log. Its
+ *  message is edited on a block vislox added or adopted (*Edit values*); one Loxone Config drew keeps it there. */
+function msgRows(o, marks) {
+  if (o.ty === "Notification") {
+    const refs = (o.mirrored_by || []).map(([, u]) => S.view?.objects[u]).filter((x) => x?.message);
+    if (!refs.length) return null;
+    return { rows: refs.map((x) => propRow("Sent by", `<button type="button" class="lnk" data-go="${esc(x.uuid)}" data-page="${esc(x.page || "")}">${esc(S.pageOf.get(x.page)?.title || displayTitle(x))}</button>` +
+      `<span class="where">${esc(msgSummary(x.message))}</span>`)) };
+  }
+  const m = o.message;
+  if (!m) return null;
+  const old = marks ? o.message_old : null;
+  const txt = (v) => (v == null ? '<span class="none-v">no message</span>' : esc(v));
+  const dur = (v) => (v == null ? '<span class="none-v">5s (default)</span>' : esc(msgDuration(v)));
+  const cell = (k, f) => (old && old[k] !== m[k] ? [`<span class="old">${f(old[k])}</span><span class="new">${f(m[k])}</span>`, "pr-chg"] : [f(m[k]), ""]);
+  const n = m.notification && S.view?.objects[m.notification];
+  const rows = [
+    propRow("Notification", n ? `<button type="button" class="lnk" data-go="${esc(n.uuid)}">${esc(displayTitle(n))}</button>` : '<span class="none-v">none</span>', "", "The push notification it sends: made in Loxone Config (Messages)"),
+    propRow("On", ...cell("on", txt), "Sent when its input turns on"),
+    propRow("Off", ...cell("off", txt), "Sent when its input turns off"),
+    propRow("Minimum time", ...cell("minimum_time", dur), "The least time between two messages"),
+  ];
+  if (S.rev === editRev()?.id && !editsBlock(o.uuid) && !S.edits?.managed?.includes(o.uuid))
+    rows.push(`<div class="ed-note">Drawn in Loxone Config: its message is changed there. A push notification added here (Add block) is edited here.</div>`);
+  return { rows, count: old ? ["on", "off", "minimum_time"].filter((k) => old[k] !== m[k]).length || undefined : undefined };
+}
+/** Milliseconds as Lox Logic writes a duration: 12h, 30min, 5s. */
+function msgDuration(ms) {
+  return ms > 0 && ms % 3600000 === 0 ? `${ms / 3600000}h` : ms > 0 && ms % 60000 === 0 ? `${ms / 60000}min` : ms % 1000 === 0 ? `${ms / 1000}s` : `${ms}ms`;
+}
+function msgSummary(m) { return [m.on != null ? `on: ${m.on}` : "", m.off != null ? `off: ${m.off}` : ""].filter(Boolean).join(" · ") || "no message"; }
 /** For Apply's confirmation: who loses or gains a right the pending config changes, against the deployed one
  *  (`rights` of `/api/apply/changes`, fetched with the devices). Never silently empty: when that request failed,
  *  it says so. */
@@ -3211,7 +3250,7 @@ function editsPending(uuid) { return (S.edits?.claims || []).filter((c) => c.pen
 /** Whether `o` can be edited now: `{ ok }`, or `{ why }` and maybe `{ newest }` to go to. */
 function editState(o) {
   const a = S.hist?.actions;
-  if (!a?.shown || !o.edit) return null;
+  if (!a?.shown || (!o.edit && !editsBlock(o.uuid))) return null;
   if (!a.edit?.available) return { why: `Editing is off: ${a.edit?.reason || "unknown"}.` };
   if (S.edits?.managed?.includes(o.uuid)) return { why: `The project's module manages this block: change its values in ${srcPath(managedSrc(o.uuid)) || "its .loxl file"}.` };
   const r = editRev();
@@ -3236,6 +3275,11 @@ function editFields(o) {
   // (a Formula's text, a PulseAt's time, …); lox has no room or category for it.
   const nb = editsBlock(o.uuid);
   if (nb) {
+    // A push notification's block (#77) takes the notification's name, and no constant: only its message.
+    if (o.ty === "OutputRefLM") {
+      for (const st of nb.settings || []) f.push([`s:${st.name}`, st.name === "MinimumTime" ? "Minimum time" : st.name, st.value ?? "", st.kind]);
+      return f;
+    }
     f.push(["title", "Name", o.title || "", "text"]);
     for (const p of o.edit.params) f.push([`p:${p.key}`, portName(o, p.key), o.ports.find((q) => q.key === p.key)?.def ?? "0", "number", p.unit]);
     for (const st of nb.settings || []) f.push([`s:${st.name}`, st.name, st.value ?? "", st.kind, null, st.choices]);
@@ -3280,7 +3324,7 @@ function editRows(o, row) {
         ? `<select ${attrs}>${editPlaces(kind).map(([t, n]) => `<option value="${esc(t)}"${t === v ? " selected" : ""}${n > 1 ? ' disabled title="Two of them have this title: rename one in Loxone Config to pick it"' : ""}>${esc(t)}</option>`).join("")}</select>`
         : kind === "choice" || kind === "on_off"
         ? `<select ${attrs}><option value="">as Loxone Config places it</option>${(kind === "on_off" ? ["on", "off"] : choices || []).map((c) => `<option${c === v ? " selected" : ""}>${esc(c)}</option>`).join("")}</select>`
-        : `<input ${attrs} value="${esc(v)}" ${kind === "number" || kind === "time" ? `inputmode="decimal" class="num"${kind === "time" ? ' placeholder="HH:MM"' : ""}` : ""} autocomplete="off" spellcheck="false">`;
+        : `<input ${attrs} value="${esc(v)}" ${kind === "number" || kind === "time" ? `inputmode="decimal" class="num"${kind === "time" ? ' placeholder="HH:MM"' : ""}` : kind === "duration" ? 'class="num" placeholder="5s"' : ""} autocomplete="off" spellcheck="false">`;
       rows.push(`<div class="pr ed-row"><label class="k" for="${id}">${esc(label)}</label><div class="v">${input}` +
         (unit ? `<span class="ed-unit">${esc(unit)}</span>` : "") + (bad ? `<div class="ed-bad" id="${id}-e">${esc(bad)}</div>` : "") + "</div></div>");
     }
@@ -3310,12 +3354,13 @@ async function editSave() {
   for (const [field, , now, kind] of editFields(o)) {
     const v = S.edit.draft[field];
     if (v == null || v === now) continue;
-    const t = kind === "number" || kind === "time" ? v.trim() : v;
+    const t = kind === "number" || kind === "time" || kind === "duration" ? v.trim() : v;
     const [k, key] = field.split(/:(.*)/s);
     // On a block added here an empty setting is dropped: Loxone Config's value again.
     if (added && k === "s" && !t.trim()) { ops.push({ op: "setting", uuid: o.uuid, name: key, value: null }); continue; }
     if (kind === "number" && !EDIT_NUMBER.test(t)) { bad[field] = /,/.test(t) ? "Write a decimal point, not a comma." : "A number, like 12 or -2.5."; continue; }
     if (kind === "time" && !AB_TIME.test(t)) { bad[field] = "A time of day, like 19:00."; continue; }
+    if (kind === "duration" && !AB_DURATION.test(t.trim())) { bad[field] = "A duration, like 12h, 30min, 5s or 90 (seconds)."; continue; }
     if (field === "title" && !t.trim()) { bad[field] = "The name cannot be empty."; continue; }
     ops.push(EDIT_ATTR[field] ? { op: field, uuid: o.uuid, value: t } : k === "p" ? { op: "param", uuid: o.uuid, port: key, value: t } : { op: "setting", uuid: o.uuid, name: key, value: t });
   }
@@ -4188,41 +4233,55 @@ $("props").addEventListener("click", (e) => {
   ($("props").querySelector(`[data-me="${what}"][data-i="${j}"]:not([disabled])`) || $("props").querySelector(`[data-me="del"][data-i="${j}"]`) || $("props").querySelector('[data-me="add"]'))?.focus();
 }, true);
 
-// ── who may open an NFC Code Touch (#76) ───────────────────────────────
+// ── who may open an NFC Code Touch (#76), who gets a push notification (#77) ──
 // A Code Touch's access rights are a Lox Logic `access` set (users and groups, each with an access schedule) and
-// the Code Touch's `.access` claim, written into vislox's file of claims. The set is the whole list: whoever it
-// leaves out loses access. Properties' *Access* shows who holds the right (the review's, #68); *Edit access* adds or
-// removes a user or group and picks its schedule. The pickers' lists (every user, group and access schedule of the
-// config, by title) are personal data: they are asked for with the admin token (`POST /api/access/choices`), kept
-// in memory only while the editor is open, and never put in an address, the page title or storage. The draft and
-// every op name them by UUID. Before a save that takes access away, the editor names who loses it (*Save anyway*);
-// Apply's confirmation says it again (#68). Saving sends one `access` op: compiled, never deployed, undone through
-// `undo`. The draft belongs to one Code Touch and one pending config (`blob`): when either changes, it is dropped,
-// and a save sends the blob it was made on, which the server checks.
-const AC = { uuid: null, blob: null, open: false, rows: [], choices: null, busy: false, msg: "", err: "", warned: "", shareAll: true, dup: [], same: null };
-/** What `GET /api/edits` says of this Code Touch's access rights (#76), or null. */
-function accessEdit(uuid) { return (S.edits?.access || []).find((m) => m.uuid === uuid) || null; }
-/** The Code Touches whose access rights were edited here and are not deployed. */
-function accessPending() { return (S.edits?.access || []).filter((m) => m.pending); }
-/** Whether this Code Touch's access rights can be edited here now: `{ ok, rev }`, or null. */
+// the Code Touch's `.access` claim; a push notification's recipients a `recipients` set (users and groups, no
+// schedule) and the notification's `.recipients` claim. Both are written into vislox's file of claims, and the set
+// is the whole list: whoever it leaves out loses the right (members of Full access get every notification anyway:
+// inherited, never listed). Properties' *Access* or *Recipients* shows who holds the right (the review's, #68);
+// *Edit access* / *Edit recipients* adds or removes a user or group (and, for a door, picks its schedule). The
+// pickers' lists (every user, group and access schedule of the config, by title) are personal data: they are asked
+// for with the admin token (`POST /api/access/choices`), kept in memory only while the editor is open, and never put
+// in an address, the page title or storage. The draft and every op name them by UUID. Before a save that takes a
+// right away, the editor names who loses it (*Save anyway*); Apply's confirmation says it again (#68). Saving sends
+// one `access` or `recipients` op: compiled, never deployed, undone through `undo`. The draft belongs to one block
+// and one pending config (`blob`): when either changes, it is dropped, and a save sends the blob it was made on,
+// which the server checks.
+const AC = { uuid: null, kind: null, blob: null, open: false, rows: [], choices: null, busy: false, msg: "", err: "", warned: "", shareAll: true, dup: [], same: null };
+/** Per kind: the block type, the op and `GET /api/edits` keys, and the words. */
+const AC_KIND = {
+  access: { ty: "NfcCodeTouch", op: "access", sets: "access_sets", members: "code_touches", content: "grants", sec: "Access", sched: true,
+    what: "access rights", edit: "Edit access", same: "Same rights as", block: "Code Touch", none: "No user or group: saving revokes everyone's access.",
+    leaves: "Whoever the set leaves out loses access." },
+  recipients: { ty: "Notification", op: "recipients", sets: "recipient_sets", members: "notifications", content: "recipients", sec: "Recipients", sched: false,
+    what: "recipients", edit: "Edit recipients", same: "Same recipients as", block: "notification", none: "No user or group: saving leaves only the members of Full access getting it.",
+    leaves: "Whoever the set leaves out stops getting it (Full access aside)." },
+};
+function acKindOf(o) { return o?.rights && AC_KIND[o.rights.kind] ? o.rights.kind : null; }
+/** What `GET /api/edits` says of this block's access rights (#76) or recipients (#77), or null. */
+function accessEdit(uuid, kind = "access") { return (S.edits?.[AC_KIND[kind].op] || []).find((m) => m.uuid === uuid) || null; }
+/** The blocks whose access rights (or recipients) were edited here and are not deployed. */
+function accessPending(kind = "access") { return (S.edits?.[AC_KIND[kind].op] || []).filter((m) => m.pending); }
+/** Whether this block's access rights or recipients can be edited here now: `{ ok, rev }`, or null. */
 function acState(o) {
-  if (o.ty !== "NfcCodeTouch" || o.rights?.kind !== "access") return null;
-  const st = editState(o);
+  const kind = acKindOf(o);
+  if (!kind || o.ty !== AC_KIND[kind].ty) return null;
+  const st = editState({ ...o, edit: o.edit || {} });
   return st?.ok ? st : null;
 }
-/** The module's own claim on its access rights (a file other than vislox's), if any. */
-function acOther(o) { return claimsOf(o.uuid).find((c) => c.kind === "access" && !c.file.startsWith(`${S.edits?.dir}/`)) || null; }
+/** The module's own claim on it (a file other than vislox's), if any. */
+function acOther(o) { const kind = acKindOf(o); return claimsOf(o.uuid).find((c) => c.kind === kind && !c.file.startsWith(`${S.edits?.dir}/`)) || null; }
 function acReset(extra) { Object.assign(AC, { open: false, rows: [], choices: null, dup: [], warned: "", same: null, msg: "", err: "" }, extra || {}); }
-/** Drop a draft made on another Code Touch or another pending config than the one shown now. */
+/** Drop a draft made on another block or another pending config than the one shown now. */
 function acSync() {
   if (AC.busy) return;
   if (S.sel !== AC.uuid) { if (AC.open || AC.same || AC.msg || AC.err) acReset(); }
-  else if ((AC.open || AC.same) && editRev()?.blob !== AC.blob) acReset({ msg: "The pending config changed while editing: the draft was dropped. Edit access again." });
+  else if ((AC.open || AC.same) && editRev()?.blob !== AC.blob) acReset({ msg: `The pending config changed while editing: the draft was dropped. ${AC_KIND[AC.kind || "access"].edit} again.` });
 }
 async function acOpen(uuid) {
-  const o = S.view?.objects[uuid], st = o && acState(o);
+  const o = S.view?.objects[uuid], st = o && acState(o), kind = acKindOf(o);
   if (!st || AC.busy) return;
-  Object.assign(AC, { uuid, blob: st.rev.blob, busy: true, msg: "", err: "", warned: "", same: null });
+  Object.assign(AC, { uuid, kind, blob: st.rev.blob, busy: true, msg: "", err: "", warned: "", same: null });
   renderProps();
   let choices;
   try { choices = await acChoices(AC.blob); } catch (err) { AC.busy = false; AC.err = `Cannot list the users: ${err.message}`; renderProps(); return; }
@@ -4237,7 +4296,7 @@ async function acOpen(uuid) {
     rows.push({ kind: p.kind, uuid: u, schedule: (p.schedule_uuid || "").toLowerCase() });
   }
   Object.assign(AC, { open: true, rows, choices, dup, shareAll: true });
-  S.closed.delete("Access");
+  S.closed.delete(AC_KIND[kind].sec);
   renderProps();
   $("props").querySelector('[data-ac-p="0"], [data-ac="add"]')?.focus();
 }
@@ -4252,62 +4311,66 @@ function acWho(kind, uuid) { return (kind === "group" ? AC.choices?.groups : AC.
 /** The pickers' lists of the config the draft is made on (its blob): the server answers from that revision, or
  *  refuses when it is gone, never from another one. */
 function acChoices(blob) { return act("/api/access/choices", { base: blob }); }
-/** A Code Touch's rights as draft rows: one per right (a user or group may hold two, under two schedules). */
+/** A block's rights as draft rows: one per right (a user or group may hold two, under two schedules). */
 function acRowsOf(x) { return (x?.rights?.list || []).map((p) => ({ kind: p.kind, uuid: p.uuid.toLowerCase(), schedule: (p.schedule_uuid || "").toLowerCase() })); }
-/** Each user a set of rights lets in → the access schedules that do: directly, or through a group (`choices`). */
-function acUserScheds(rows, choices) {
+/** Each user a set of rights reaches → the access schedules that do (directly, or through a group); for
+ *  recipients, the schedule is empty, and the members of Full access always get it. */
+function acUserScheds(rows, choices, recipients) {
   const m = new Map();
   const add = (u, sch) => { if (!m.has(u)) m.set(u, new Set()); m.get(u).add(sch); };
   for (const r of rows) {
     if (r.kind === "user") add(r.uuid, r.schedule);
     else for (const u of choices.groups.find((g) => g.uuid === r.uuid)?.users || []) add(u, r.schedule);
   }
+  if (recipients) for (const g of choices.groups.filter((x) => x.full_access)) for (const u of g.users) add(u, "");
   return m;
 }
-/** What going from the rights `was` to `now` takes away on the Code Touch `door`, in sentences: who loses access,
- *  and who keeps it under fewer access schedules. vislox cannot tell whether one schedule's times cover another's,
- *  so any schedule taken from a user counts as a loss. */
-function acLossesOf(door, was, now, choices) {
-  const before = acUserScheds(was, choices), after = acUserScheds(now, choices);
+/** What going from the rights `was` to `now` takes away on the block `title`, in sentences: who loses access (or
+ *  stops getting the notification), and who keeps a door under fewer access schedules. vislox cannot tell whether
+ *  one schedule's times cover another's, so any schedule taken from a user counts as a loss. */
+function acLossesOf(title, was, now, choices, kind = "access") {
+  const rec = kind === "recipients";
+  const before = acUserScheds(was, choices, rec), after = acUserScheds(now, choices, rec);
   const name = (u) => choices.users.find((x) => x.uuid === u)?.title || u;
   const sch = (id) => choices.schedules.find((x) => x.uuid === id)?.title || id;
   const out = [];
   const lost = [...before.keys()].filter((u) => !after.has(u)).map(name);
-  if (lost.length) out.push(`${lost.join(", ")} ${lost.length === 1 ? "loses" : "lose"} access to ${door}`);
+  if (lost.length) out.push(rec ? `${lost.join(", ")} ${lost.length === 1 ? "stops" : "stop"} getting ${title}` : `${lost.join(", ")} ${lost.length === 1 ? "loses" : "lose"} access to ${title}`);
+  if (rec) return out;
   for (const [u, b] of before) {
     const a = after.get(u);
     if (!a) continue;
     const gone = [...b].filter((x) => !a.has(x));
-    if (gone.length) out.push(`${name(u)} may open ${door} only at ${[...a].map(sch).join(", ")}, no longer at ${gone.map(sch).join(", ")}`);
+    if (gone.length) out.push(`${name(u)} may open ${title} only at ${[...a].map(sch).join(", ")}, no longer at ${gone.map(sch).join(", ")}`);
   }
   return out;
 }
-/** The losses of saving the draft: on this Code Touch, and on those sharing its set when they change too. */
+/** The losses of saving the draft: on this block, and on those sharing its set when they change too. */
 function acLosses(o) {
-  const e = accessEdit(o.uuid);
-  const doors = [o.uuid, ...(e?.set && e.shared?.length && AC.shareAll ? e.shared : [])];
-  return doors.flatMap((d) => { const x = S.view?.objects[d]; return acLossesOf(x ? displayTitle(x) : d, acRowsOf(x), AC.rows, AC.choices); });
+  const kind = acKindOf(o), e = accessEdit(o.uuid, kind);
+  const blocks = [o.uuid, ...(e?.set && e.shared?.length && AC.shareAll ? e.shared : [])];
+  return blocks.flatMap((d) => { const x = S.view?.objects[d]; return acLossesOf(x ? displayTitle(x) : d, acRowsOf(x), AC.rows, AC.choices, kind); });
 }
-/** The rows of *Edit access*, below who holds the right. */
+/** The rows of *Edit access* or *Edit recipients*, below who holds the right. */
 function acRows(o) {
-  const rows = [], st = acState(o), e = accessEdit(o.uuid), mine = AC.uuid === o.uuid ? AC : null;
+  const rows = [], st = acState(o), kind = acKindOf(o), K = AC_KIND[kind], e = st && accessEdit(o.uuid, kind), mine = AC.uuid === o.uuid ? AC : null;
   if (!st) return rows;
   const other = acOther(o), dis = mine?.busy ? " disabled" : "";
   const title = (u) => { const x = S.view?.objects[u]; return x ? displayTitle(x) : u; };
   const msg = () => (mine?.msg || mine?.err ? `<span class="ed-msg${mine.err ? " err" : ""}" role="status">${esc(mine.err || mine.msg)}</span>` : "");
   if (other && e?.set) {
-    rows.push(`<div class="sch-note warn">⚠ Claimed twice: ${esc(claimAt(other))} and vislox's ${esc(S.edits?.file || "")} both claim its access rights, and lox compiles neither until one goes.</div>`,
-      `<div class="ed-bar"><button type="button" class="ed-btn small" data-ac="drop"${dis} title="Take vislox's claim out and compile: ${esc(claimAt(other))} keeps the Code Touch">Remove vislox's claim</button>${msg()}</div>`);
+    rows.push(`<div class="sch-note warn">⚠ Claimed twice: ${esc(claimAt(other))} and vislox's ${esc(S.edits?.file || "")} both claim its ${K.what}, and lox compiles neither until one goes.</div>`,
+      `<div class="ed-bar"><button type="button" class="ed-btn small" data-ac="drop"${dis} title="Take vislox's claim out and compile: ${esc(claimAt(other))} keeps the ${K.block}">Remove vislox's claim</button>${msg()}</div>`);
     return rows;
   }
-  if (other) { rows.push(`<div class="ed-note">${esc(claimAt(other))} claims its access rights: change them there.</div>`); return rows; }
+  if (other) { rows.push(`<div class="ed-note">${esc(claimAt(other))} claims its ${K.what}: change them there.</div>`); return rows; }
   if (e?.set) {
-    rows.push(`<div class="ed-note">Written by vislox as <span class="mono">${esc(e.set)}</span> in ${esc(S.edits?.file || "")}${e.shared?.length ? `, shared with ${esc(e.shared.map(title).join(", "))}` : ""}. Whoever the set leaves out loses access.</div>`);
-    rows.push(...staleRows((S.edits?.access_sets || []).find((x) => x.name === e.set), "ac", mine));
+    rows.push(`<div class="ed-note">Written by vislox as <span class="mono">${esc(e.set)}</span> in ${esc(S.edits?.file || "")}${e.shared?.length ? `, shared with ${esc(e.shared.map(title).join(", "))}` : ""}. ${K.leaves}</div>`);
+    rows.push(...staleRows((S.edits?.[K.sets] || []).find((x) => x.name === e.set), "ac", mine));
   }
   if (e?.pending) {
-    const back = e.deployed ? "Back to the access rights deployed" : "Back to the access rights as last written: vislox's claim goes";
-    rows.push(propRow("Access", `<span class="ed-v">edited here</span><span class="ed-tag" title="Saved into the module and compiled, not on the Miniserver yet: Apply deploys it, Discard drops it">not deployed</span>` +
+    const back = e.deployed ? `Back to the ${K.what} deployed` : `Back to the ${K.what} as last written: vislox's claim goes`;
+    rows.push(propRow(K.sec, `<span class="ed-v">edited here</span><span class="ed-tag" title="Saved into the module and compiled, not on the Miniserver yet: Apply deploys it, Discard drops it">not deployed</span>` +
       `<button type="button" class="ed-btn small" data-ac="revert"${dis} title="${esc(back)}">Revert</button>`, "pr-chg"));
   }
   if (mine?.same) {
@@ -4316,34 +4379,34 @@ function acRows(o) {
     return rows;
   }
   if (!mine?.open) {
-    const sets = (S.edits?.access_sets || []).filter((x) => x.name !== e?.set && x.code_touches.length && !x.code_touches.includes(o.uuid));
-    rows.push(`<div class="ed-bar"><button type="button" class="ed-btn small" data-ac="open"${dis}>${mine?.busy ? "Listing users…" : "Edit access"}</button>` +
-      (sets.length ? `<label class="se-same">Same rights as <select data-ac="same"${dis}><option value="">…</option>${sets.map((x) => `<option value="${esc(x.name)}">${esc(x.code_touches.map(title).join(", "))}</option>`).join("")}</select></label>` : "") +
+    const sets = (S.edits?.[K.sets] || []).filter((x) => x.name !== e?.set && x[K.members].length && !x[K.members].includes(o.uuid));
+    rows.push(`<div class="ed-bar"><button type="button" class="ed-btn small" data-ac="open"${dis}>${mine?.busy ? "Listing users…" : K.edit}</button>` +
+      (sets.length ? `<label class="se-same">${K.same} <select data-ac="same"${dis}><option value="">…</option>${sets.map((x) => `<option value="${esc(x.name)}">${esc(x[K.members].map(title).join(", "))}</option>`).join("")}</select></label>` : "") +
       msg() + "</div>");
     return rows;
   }
-  // The editor: a row per user or group, its schedule, ✕; *Add user or group*.
+  // The editor: a row per user or group, its schedule (a door's), ✕; *Add user or group*.
   const c = AC.choices, uWhy = acTitles(c.users), gWhy = acTitles(c.groups), sWhy = acTitles(c.schedules);
   const taken = new Set(AC.rows.map((r) => r.uuid));
-  const opt = (x, kind, sel, why) => `<option value="${kind}|${esc(x.uuid)}"${sel ? " selected" : ""}${why && !sel ? " disabled" : ""}${!sel && taken.has(x.uuid) ? " disabled" : ""}>${esc(x.title || x.uuid)}${why ? ` (${esc(why)})` : ""}</option>`;
+  const opt = (x, k, sel, why) => `<option value="${k}|${esc(x.uuid)}"${sel ? " selected" : ""}${why && !sel ? " disabled" : ""}${!sel && taken.has(x.uuid) ? " disabled" : ""}>${esc(x.title || x.uuid)}${why ? ` (${esc(why)})` : ""}${!K.sched && x.full_access ? " (gets every notification anyway)" : ""}</option>`;
   if (AC.dup.length) rows.push(`<div class="sch-note warn">⚠ ${esc(AC.dup.join(", "))} ${AC.dup.length === 1 ? "holds" : "hold"} a second right under another schedule: a set gives each user or group one schedule, so saving keeps the first.</div>`);
   const items = AC.rows.map((r, i) => {
     const who = acWho(r.kind, r.uuid), name = who?.title || r.uuid;
     const pSel = `<select data-ac-p="${i}" aria-label="User or group ${i + 1}"${dis}>` +
       `<optgroup label="Users">${c.users.map((x) => opt(x, "user", r.kind === "user" && x.uuid === r.uuid, uWhy(x))).join("")}</optgroup>` +
       `<optgroup label="Groups">${c.groups.map((x) => opt(x, "group", r.kind === "group" && x.uuid === r.uuid, gWhy(x))).join("")}</optgroup></select>`;
-    const sSel = `<select data-ac-s="${i}" aria-label="Access schedule of ${esc(name)}"${dis}>${r.schedule && !c.schedules.some((x) => x.uuid === r.schedule) ? `<option value="" selected>—</option>` : ""}` +
+    const sSel = !K.sched ? "" : `<span class="none-v">at</span><select data-ac-s="${i}" aria-label="Access schedule of ${esc(name)}"${dis}>${r.schedule && !c.schedules.some((x) => x.uuid === r.schedule) ? `<option value="" selected>—</option>` : ""}` +
       c.schedules.map((x) => { const why = sWhy(x), sel = x.uuid === r.schedule; return `<option value="${esc(x.uuid)}"${sel ? " selected" : ""}${why && !sel ? " disabled" : ""}>${esc(x.title || x.uuid)}${why ? ` (${esc(why)})` : ""}</option>`; }).join("") + "</select>";
-    const bad = !who ? "not in this config" : (r.kind === "group" ? gWhy(who) : uWhy(who)) || (!c.schedules.some((x) => x.uuid === r.schedule) ? "no access schedule" : sWhy(c.schedules.find((x) => x.uuid === r.schedule)));
+    const bad = !who ? "not in this config" : (r.kind === "group" ? gWhy(who) : uWhy(who)) || (!K.sched ? "" : !c.schedules.some((x) => x.uuid === r.schedule) ? "no access schedule" : sWhy(c.schedules.find((x) => x.uuid === r.schedule)));
     const tip = r.kind === "group" && who?.users?.length ? ` title="${esc(`Members: ${who.users.map((u) => acWho("user", u)?.title || u).join(", ")}`)}"` : "";
-    return `<li class="ac-item${bad ? " bad" : ""}"${tip}>${pSel}<span class="none-v">at</span>${sSel}` +
+    return `<li class="ac-item${bad ? " bad" : ""}"${tip}>${pSel}${sSel}` +
       `<button type="button" class="se-x" data-ac="del" data-i="${i}" aria-label="Remove ${esc(name)}"${dis}>✕</button>${bad ? `<span class="ed-msg err">${esc(bad)}</span>` : ""}</li>`;
   }).join("");
-  rows.push(AC.rows.length ? `<ul class="ac-list">${items}</ul>` : `<div class="sch-note warn">No user or group: saving revokes everyone's access.</div>`);
+  rows.push(AC.rows.length ? `<ul class="ac-list">${items}</ul>` : `<div class="sch-note warn">${esc(K.none)}</div>`);
   const free = c.users.some((x) => !taken.has(x.uuid) && !uWhy(x)) || c.groups.some((x) => !taken.has(x.uuid) && !gWhy(x));
-  rows.push(`<div class="ed-bar"><button type="button" class="ed-btn small" data-ac="add"${free && c.schedules.length ? "" : " disabled"}${dis}>Add user or group</button>` +
-    `<span class="none-v">Users, groups and access schedules come from Loxone Config and the app.</span></div>`);
-  if (e?.shared?.length) rows.push(`<label class="se-share"><input type="checkbox" data-ac="shareall"${AC.shareAll ? " checked" : ""}${dis}> Change ${esc(e.shared.map(title).join(", "))} too: ${e.shared.length === 1 ? "it shares" : "they share"} these rights (${esc(e.set)}). Off: this Code Touch gets a set of its own.</label>`);
+  rows.push(`<div class="ed-bar"><button type="button" class="ed-btn small" data-ac="add"${free && (!K.sched || c.schedules.length) ? "" : " disabled"}${dis}>Add user or group</button>` +
+    `<span class="none-v">Users, groups${K.sched ? " and access schedules" : ""} come from Loxone Config and the app.</span></div>`);
+  if (e?.shared?.length) rows.push(`<label class="se-share"><input type="checkbox" data-ac="shareall"${AC.shareAll ? " checked" : ""}${dis}> Change ${esc(e.shared.map(title).join(", "))} too: ${e.shared.length === 1 ? "it shares" : "they share"} these ${K.what} (${esc(e.set)}). Off: this ${K.block} gets a set of its own.</label>`);
   if (AC.warned) rows.push(`<div class="sch-note warn" role="alert">⚠ ${esc(AC.warned)}</div>`);
   rows.push(`<div class="ed-bar"><button type="button" class="primary small" data-ac="save"${dis}>${AC.busy ? "Compiling…" : AC.warned ? "Save anyway" : "Save"}</button>` +
     `<button type="button" class="ed-btn small" data-ac="cancel"${dis}>Cancel</button>` +
@@ -4351,7 +4414,7 @@ function acRows(o) {
   return rows;
 }
 async function acSend(o, base, op, label) {
-  AC.uuid = o.uuid; AC.busy = true; AC.err = ""; AC.msg = ""; renderProps();
+  AC.uuid = o.uuid; AC.kind = acKindOf(o); AC.busy = true; AC.err = ""; AC.msg = ""; renderProps();
   try {
     const res = await editAct(base, [op], label);
     AC.busy = false;
@@ -4363,37 +4426,38 @@ async function acSend(o, base, op, label) {
   renderProps();
 }
 async function acSave() {
-  const o = S.view?.objects[AC.uuid], st = o && acState(o);
+  const o = S.view?.objects[AC.uuid], st = o && acState(o), kind = acKindOf(o), K = AC_KIND[kind];
   if (!st || AC.busy || !AC.open) return;
   // Never save a draft over a newer config: the draft goes against the config it was made on.
-  if (st.rev.blob !== AC.blob) { acReset({ err: "The pending config changed while editing: the draft was dropped. Edit access again." }); renderProps(); return; }
-  if (AC.rows.some((r) => !acWho(r.kind, r.uuid) || !AC.choices.schedules.some((x) => x.uuid === r.schedule))) {
-    AC.err = "Pick a user or group and an access schedule on every row, or remove it.";
+  if (st.rev.blob !== AC.blob) { acReset({ err: `The pending config changed while editing: the draft was dropped. ${K.edit} again.` }); renderProps(); return; }
+  if (AC.rows.some((r) => !acWho(r.kind, r.uuid) || (K.sched && !AC.choices.schedules.some((x) => x.uuid === r.schedule)))) {
+    AC.err = K.sched ? "Pick a user or group and an access schedule on every row, or remove it." : "Pick a user or group on every row, or remove it.";
     renderProps();
     return;
   }
-  // Warned once: taking access away is said before the save, as Apply's confirmation says it again.
+  // Warned once: taking a right away is said before the save, as Apply's confirmation says it again.
   const lose = acLosses(o);
   if (lose.length && !AC.warned) { AC.warned = `${lose.join("; ")}.`; renderProps(); return; }
-  const e = accessEdit(o.uuid);
-  const value = { grants: AC.rows.map((r) => ({ kind: r.kind, uuid: r.uuid, schedule: r.schedule })), ...(e?.set && e.shared?.length && AC.shareAll ? { set: e.set } : {}) };
-  await acSend(o, AC.blob, { op: "access", uuid: o.uuid, value });
+  const e = accessEdit(o.uuid, kind);
+  const list = AC.rows.map((r) => (K.sched ? { kind: r.kind, uuid: r.uuid, schedule: r.schedule } : { kind: r.kind, uuid: r.uuid }));
+  const value = { [K.content]: list, ...(e?.set && e.shared?.length && AC.shareAll ? { set: e.set } : {}) };
+  await acSend(o, AC.blob, { op: K.op, uuid: o.uuid, value });
 }
-/** *Same rights as …*: claim another Code Touch's set as it is; who loses access, or opening times, is said first. */
+/** *Same rights as …* / *Same recipients as …*: claim another block's set as it is; who loses a right is said first. */
 async function acSame(o, set) {
-  const st = acState(o), x = (S.edits?.access_sets || []).find((s) => s.name === set);
+  const st = acState(o), kind = acKindOf(o), K = AC_KIND[kind], x = (S.edits?.[K.sets] || []).find((s) => s.name === set);
   if (!st || !x || AC.busy) return;
   const blob = st.rev.blob;
-  const label = `Same access as ${x.code_touches.map((u) => { const y = S.view?.objects[u]; return y ? displayTitle(y) : u; }).join(", ")} for ${displayTitle(o)}`;
-  Object.assign(AC, { uuid: o.uuid, blob, busy: true, open: false, msg: "", err: "", same: null });
+  const label = `${K.same} ${x[K.members].map((u) => { const y = S.view?.objects[u]; return y ? displayTitle(y) : u; }).join(", ")} for ${displayTitle(o)}`;
+  Object.assign(AC, { uuid: o.uuid, kind, blob, busy: true, open: false, msg: "", err: "", same: null });
   renderProps();
   let choices;
   try { choices = await acChoices(blob); } catch (err) { AC.busy = false; AC.err = `Cannot list the users: ${err.message}`; renderProps(); return; }
   AC.busy = false;
   if (S.sel !== o.uuid || editRev()?.blob !== blob) { acReset(); renderProps(); return; }
-  // The set's rights as a Code Touch claiming it has them now.
-  const lose = acLossesOf(displayTitle(o), acRowsOf(o), acRowsOf(S.view?.objects[x.code_touches[0]]), choices);
-  if (!lose.length) return acSend(o, blob, { op: "access", uuid: o.uuid, value: { set } }, label);
+  // The set's rights as a block claiming it has them now.
+  const lose = acLossesOf(displayTitle(o), acRowsOf(o), acRowsOf(S.view?.objects[x[K.members][0]]), choices, kind);
+  if (!lose.length) return acSend(o, blob, { op: K.op, uuid: o.uuid, value: { set } }, label);
   AC.same = { set, label, lose };
   renderProps();
   $("props").querySelector('[data-ac="sameok"]')?.focus();
@@ -4407,23 +4471,23 @@ $("props").addEventListener("click", (e) => {
   if (what === "open") return acOpen(S.sel);
   if (what === "cancel") { if (!AC.busy) { acReset(); renderProps(); $("props").querySelector('[data-ac="open"]')?.focus(); } return; }
   if (what === "save") return acSave();
-  const st = acState(o), ed = accessEdit(o.uuid);
+  const st = acState(o), kind = acKindOf(o), K = AC_KIND[kind] || AC_KIND.access, ed = kind && accessEdit(o.uuid, kind);
   if (what === "samecancel") { if (!AC.busy) { acReset(); renderProps(); } return; }
   if (what === "sameok") {
     if (!st || AC.busy || !AC.same) return;
     if (st.rev.blob !== AC.blob) { acReset({ err: "The pending config changed: nothing was saved. Pick again." }); renderProps(); return; }
     const { set, label } = AC.same;
     AC.same = null;
-    return acSend(o, AC.blob, { op: "access", uuid: o.uuid, value: { set } }, label);
+    return acSend(o, AC.blob, { op: K.op, uuid: o.uuid, value: { set } }, label);
   }
   if (what === "revert") {
     if (!st || !ed) return;
-    const r = setRevertValue("access", ed, S.edits?.access_sets || [], o.uuid);
-    if (r.why) { AC.uuid = o.uuid; AC.err = r.why; AC.msg = ""; renderProps(); return; }
-    return acSend(o, st.rev.blob, { op: "access", uuid: o.uuid, value: r.value }, `Revert the access rights of ${displayTitle(o)}`);
+    const r = setRevertValue(K.op, ed, S.edits?.[K.sets] || [], o.uuid);
+    if (r.why) { AC.uuid = o.uuid; AC.kind = kind; AC.err = r.why; AC.msg = ""; renderProps(); return; }
+    return acSend(o, st.rev.blob, { op: K.op, uuid: o.uuid, value: r.value }, `Revert the ${K.what} of ${displayTitle(o)}`);
   }
-  if (what === "drop") { if (st) acSend(o, st.rev.blob, { op: "access", uuid: o.uuid, value: null }, `Remove vislox's claim on the access rights of ${displayTitle(o)}`); return; }
-  if (what === "dropstale") { if (st) acSend(o, st.rev.blob, { op: "access", uuid: b.dataset.u, value: null }, "Drop a stale claim on access rights"); return; }
+  if (what === "drop") { if (st) acSend(o, st.rev.blob, { op: K.op, uuid: o.uuid, value: null }, `Remove vislox's claim on the ${K.what} of ${displayTitle(o)}`); return; }
+  if (what === "dropstale") { if (st) acSend(o, st.rev.blob, { op: K.op, uuid: b.dataset.u, value: null }, `Drop a stale claim on ${K.what}`); return; }
   if (AC.busy || !AC.open) return;
   const i = +b.dataset.i;
   if (what === "del") AC.rows.splice(i, 1);
@@ -4432,7 +4496,7 @@ $("props").addEventListener("click", (e) => {
     const taken = new Set(AC.rows.map((r) => r.uuid));
     const u = c.users.find((x) => !taken.has(x.uuid) && !uWhy(x)), g = c.groups.find((x) => !taken.has(x.uuid) && !gWhy(x));
     const s = c.schedules.find((x) => !sWhy(x));
-    if ((u || g) && s) AC.rows.push({ kind: u ? "user" : "group", uuid: (u || g).uuid, schedule: s.uuid });
+    if ((u || g) && (s || !K.sched)) AC.rows.push({ kind: u ? "user" : "group", uuid: (u || g).uuid, schedule: K.sched ? s.uuid : "" });
   }
   AC.err = ""; AC.warned = "";
   renderProps();
@@ -5422,12 +5486,21 @@ function abChoose(i) {
 }
 /** The fields of a new block of type `t`: [field, label, kind, unit, default, group, choices]. */
 function abFields(t) {
+  // A push notification (#77) takes the notification's name, and its input is wired once it is on the page.
+  if (t.mirrors) return t.settings.map((s) => [`s:${s.name}`, s.name === "mirrors" ? "Notification" : s.name === "MinimumTime" ? "Minimum time" : s.name, s.kind, null, "", "main", s.kind === "notification" ? abNotifications() : s.choices]);
   const f = [["title", "Name", "text", null, "", "main"]];
   for (const s of t.settings) f.push([`s:${s.name}`, s.name, s.kind, null, "", "main", s.choices]);
   for (const p of t.ports.filter((q) => q.dir === "param")) f.push([`p:${p.key}`, p.label ? `${p.name} (${p.label})` : p.name, "number", p.unit, p.default, "main"]);
   for (const p of t.ports.filter((q) => q.dir === "input")) f.push([`p:${p.key}`, p.label ? `${p.name} (${p.label})` : p.name, "number", p.unit, p.default, "inputs"]);
   return f;
 }
+/** The push notifications of the config shown (Loxone Config's Messages), for a new notification block: [uuid, title]. */
+function abNotifications() {
+  return Object.values(S.view?.objects || {}).filter((x) => x.ty === "Notification" && x.status !== "removed")
+    .map((x) => [x.uuid, displayTitle(x)]).sort((a, b) => a[1].localeCompare(b[1]));
+}
+/** A duration as Lox Logic writes one: 12h, 30min, 5s, 500ms, or seconds. */
+const AB_DURATION = /^\d+(\.\d+)?(ms|s|min|h)?$/;
 /** Step two: its name, settings and values. */
 function abForm() {
   const t = AB.ty;
@@ -5435,9 +5508,11 @@ function abForm() {
     const v = AB.draft[field] ?? "", bad = AB.bad[field];
     const id = `ab-${field.replace(/[^\w-]/g, "_")}`;
     const attrs = `id="${id}" data-ab-field="${esc(field)}"${bad ? ` aria-invalid="true" aria-describedby="${id}-e"` : ""}${AB.busy ? " disabled" : ""}`;
-    const input = kind === "choice" || kind === "on_off"
+    const input = kind === "notification"
+      ? `<select ${attrs}><option value="">${choices.length ? "Pick a push notification…" : "The config has no push notification: make one in Loxone Config (Messages)"}</option>${choices.map(([u, n]) => `<option value="${esc(u)}"${u === v ? " selected" : ""}>${esc(n)}</option>`).join("")}</select>`
+      : kind === "choice" || kind === "on_off"
       ? `<select ${attrs}><option value="">as Loxone Config places it</option>${(kind === "on_off" ? ["on", "off"] : choices).map((c) => `<option${c === v ? " selected" : ""}>${esc(c)}</option>`).join("")}</select>`
-      : `<input ${attrs} value="${esc(v)}"${kind === "number" ? ` inputmode="decimal" class="num" placeholder="${esc(def)}"` : kind === "time" ? ' class="num" placeholder="HH:MM"' : field === "title" ? ` placeholder="${esc(prettyType(t.type))}"` : ""} autocomplete="off" spellcheck="false">`;
+      : `<input ${attrs} value="${esc(v)}"${kind === "number" ? ` inputmode="decimal" class="num" placeholder="${esc(def)}"` : kind === "time" ? ' class="num" placeholder="HH:MM"' : kind === "duration" ? ' class="num" placeholder="5s"' : field === "title" ? ` placeholder="${esc(prettyType(t.type))}"` : ""} autocomplete="off" spellcheck="false">`;
     return `<div class="pr ed-row"><label class="k" for="${id}">${esc(label)}</label><div class="v">${input}${unit ? `<span class="ed-unit">${esc(unit)}</span>` : ""}${bad ? `<div class="ed-bad" id="${id}-e">${esc(bad)}</div>` : ""}</div></div>`;
   };
   const fs = abFields(t), main = fs.filter((f) => f[5] === "main"), inputs = fs.filter((f) => f[5] === "inputs");
@@ -5448,7 +5523,7 @@ function abForm() {
     ${inputs.length ? `<details${inputsOpen ? " open" : ""}><summary>Constants of the inputs (${inputs.length}): used until something is wired</summary>${inputs.map(field).join("")}</details>` : ""}
     <div class="ed-bar"><button type="button" class="primary small" data-ab="add"${AB.busy ? " disabled" : ""}>${AB.busy ? "Compiling…" : "Add"}</button>
       <button type="button" class="ed-btn small" data-ab="back"${AB.busy ? " disabled" : ""}>Other type</button>
-      <span class="ed-msg${AB.err ? " err" : ""}" role="status" aria-live="polite">${esc(AB.err || "Empty values get what Loxone Config places the block with. Adding compiles the module; nothing is deployed.")}</span></div>
+      <span class="ed-msg${AB.err ? " err" : ""}" role="status" aria-live="polite">${esc(AB.err || (t.mirrors ? "No text means no message. Wire its input from a block once it is on the page. Adding compiles the module; nothing is deployed." : "Empty values get what Loxone Config places the block with. Adding compiles the module; nothing is deployed."))}</span></div>
   </div>`;
 }
 $("ab-body").addEventListener("input", (e) => {
@@ -5479,11 +5554,13 @@ async function abAdd() {
     if (v === "" && !(kind === "text" && raw !== "")) continue;
     if (kind === "number" && !EDIT_NUMBER.test(v)) { bad[field] = /,/.test(v) ? "Write a decimal point, not a comma." : "A number, like 12 or -2.5."; continue; }
     if (kind === "time" && !AB_TIME.test(v)) { bad[field] = "A time of day, like 19:00."; continue; }
+    if (kind === "duration" && !AB_DURATION.test(v)) { bad[field] = "A duration, like 12h, 30min, 5s or 90 (seconds)."; continue; }
     if (kind === "choice" && !choices.includes(v)) continue;
     if (field === "title") { if (!v.trim()) bad[field] = "A name, or nothing."; else op.title = v; continue; }
     const [k, key] = field.split(/:(.*)/s);
     (k === "p" ? op.params : op.settings)[key] = v;
   }
+  if (t.mirrors && !op.settings.mirrors) bad["s:mirrors"] = "Pick the push notification it sends.";
   AB.bad = bad; AB.err = "";
   if (Object.keys(bad).length) { AB.err = "Fix the marked values."; abForm(); $("ab-body").querySelector('[aria-invalid="true"]')?.focus(); return; }
   AB.busy = true; abForm();

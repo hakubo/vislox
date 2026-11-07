@@ -2,9 +2,9 @@
 
 vislox becomes an editor in steps: edit values (#58), add blocks (#59), move blocks, inputs and outputs (#60),
 make and change connections (#61), undo and redo (#62), adopt the blocks Loxone Config drew (#72), edit a
-Daytimer's switching times (#73), a lighting controller's moods (#74), a central block's members (#75) and who may
-open an NFC Code Touch (#76). This page is the design they share. #58 to #62, #72 to #76 are built; the rest says
-where each step plugs in.
+Daytimer's switching times (#73), a lighting controller's moods (#74), a central block's members (#75), who may
+open an NFC Code Touch (#76) and push notifications: who gets them and what they say (#77). This page is the design
+they share. #58 to #62, #72 to #77 are built; the rest says where each step plugs in.
 
 ## The rules
 
@@ -54,7 +54,11 @@ POST /api/edit
                { "name": "Lesen", "values": "AQ1 on, AQ2 40%" } ] } },
            { "op": "members", "uuid": "…", "value": [ "<member uuid>", "<member uuid>" ] },
            { "op": "access", "uuid": "…", "value": { "grants": [
-               { "kind": "group", "uuid": "<group uuid>", "schedule": "<access schedule uuid>" } ] } } ] }
+               { "kind": "group", "uuid": "<group uuid>", "schedule": "<access schedule uuid>" } ] } },
+           { "op": "recipients", "uuid": "…", "value": { "recipients": [
+               { "kind": "user", "uuid": "<user uuid>" }, { "kind": "group", "uuid": "<group uuid>" } ] } },
+           { "op": "add_block", "page": "<page uuid>", "type": "OutputRefLM",
+             "settings": { "mirrors": "<notification uuid>", "On": "Frost", "MinimumTime": "12h" } } ] }
 ```
 
 `adopt`, `adopt_page` and `unadopt` go in a request of their own (#72).
@@ -75,7 +79,7 @@ POST /api/edit
   no claim; when the op rewrote a set other timers still claim, it also carries that set's old switching times
   (`restore`), so the undo gives them back too. `moods` is the same for a controller's moods (#74). For
   `members` it is the list vislox claimed before, or null (#75). `access` is as `moods`, for a Code Touch's
-  rights (#76).
+  rights (#76), and `recipients` for a notification's recipients (#77).
   A reconnected wire is one request, `unwire` then `wire`:
   undone, the reverse list. The ops of one request see each other: `unwire` then `wire` of the same wire is
   accepted (and changes nothing). `remove_block`'s `add_block` carries the wires the removal took out
@@ -483,8 +487,8 @@ Later: the same simulator could drive an offline Liveview (simulated values on t
 A Lox Logic module can claim more than blocks and wires: `haustuer.access = bewohner` owns who may open an NFC
 Code Touch (and when), `frost.recipients = familie` who gets a push notification, and `uhr.schedule = abend` a
 Daytimer's switching times. None of these is on a logic page, and whoever a set leaves out loses the right on the
-next push, so the review shows them on their own. vislox reviews them, and edits switching times (#73) and access
-(#76, below); recipients are #77.
+next push, so the review shows them on their own. vislox reviews them, and edits switching times (#73), access
+(#76) and recipients (#77, below).
 
 - **From the compiled config, not the source.** `rights.rs` reads, with lox's own `AccessModel`, the `<PRM>`
   lists of every user and group: a `TIM=` on an `NfcCodeTouch` is an access right under that access schedule,
@@ -534,10 +538,8 @@ revision, *Opens for* or *Sent to* (in effect), and who loses or gains it here. 
 names its claim the same way.
 
 Hooks for the editing issues: #73 (switching times, built) adds the `schedule` op, #76 (access, built) the
-`access` op; #77 (recipients) adds an op to `POST /api/edit` that writes its claims into `<module>/vislox/` the
-same way (a `SetKind` of `set_claim.rs`: `AccessKind` with `recipients`, `Notification` and no schedule); the
-review, `set_claims` and Apply's warning need nothing more, since they read the compiled config and the module's
-files.
+`access` op, #77 (recipients, built) the `recipients` op; the review, `set_claims` and Apply's warning needed
+nothing more, since they read the compiled config and the module's files.
 
 ## Switching times (#73)
 
@@ -613,7 +615,7 @@ the timers whose switching times are edited and not deployed.
 
 ## Shared sets (#73, #74)
 
-Switching times, moods and access (#76), and the claims #77 (recipients) and #78 (tiles) will add, share one
+Switching times, moods, access (#76) and recipients (#77), and the claims #78 (tiles) will add, share one
 shape: a named set, claims on blocks, several blocks per set, one set per block. `set_claim.rs` does what is the
 same for every kind, parameterised by a `SetKind` (its keyword, block type, content as an op carries it, how
 content becomes lines and how lines are checked for each block): resolve the block, choose the set (named, the
@@ -630,7 +632,8 @@ Every kind of claim on a block's whole content, members too, is one entry of `se
 reading and rendering vislox's file, the names a new set must not take (the module's names are loaded for any op
 of a kind that makes sets), the blocks the rest of the module claims (`Ctx::claimed`, by kind), the refusals of
 Remove and Hand back, mending a claim made twice, the check after the compile, and `GET /api/edits` go through it.
-A new kind (#77, #78) is a `SetKind`, its slot in `Claims`, its `Op` variant, and one line in `KINDS`.
+A new kind (#78) is a `SetKind`, its slot in `Claims`, its `Op` variant, and one line in `KINDS`; #77's
+`recipients` was built so.
 A central block's members (#75) are no such set: each claim holds its own list, and a block is in as many lists
 as name it. `member_edit.rs` takes only `set_claim.rs`'s naming of vislox's blocks (`member_of`, `target_of`).
 
@@ -845,8 +848,8 @@ vx_50000009_0000_0090_ffff504f94000001.access = vx_haustuer_access
   Code Touch sharing its set, exactly the set's rights (principal and schedule, by UUID, as `rights.rs` reads
   them); otherwise the edit is refused and the files, lock and out are put back.
 - **Read back.** vislox reads the sets and claims of `edits.loxl` with lox's parser; an `access` set or claim not
-  named `vx_…`, a claim without its set, a claim on a slug that is neither an extern of the file nor a block of
-  vislox's files, and a `recipients` set (#77's) are refused. Handing an adopted block back is refused while vislox
+  named `vx_…`, a claim without its set, and a claim on a slug that is neither an extern of the file nor a block of
+  vislox's files are refused (a `recipients` set is #77's kind, below). Handing an adopted block back is refused while vislox
   claims its rights.
 - **Adopting a Code Touch** (#72): `lox logic adopt` lifts its rights as a set and a claim. vislox leaves both out,
   so the door opens for the same people (a dropped claim leaves the rights as last written); editing them later
@@ -879,6 +882,87 @@ op. *Same rights as …* (a Code Touch whose rights vislox claims) does the same
 anything, else asks (*Use anyway*). *Revert*, and *Remove vislox's claim* when claimed twice, as for moods. The draft belongs to
 one Code Touch and one pending config: selecting another block, or a new pending config, drops it, and *Save*
 sends the blob it was made on. The Deploy pane counts the Code Touches whose access is edited and not deployed.
+
+## Push notifications (#77)
+
+A push notification (*Benachrichtigung*, type `Notification`) is made in Loxone Config, under *Messages*. Two things
+about it are Lox Logic's: who gets it (a `recipients` set and the notification's claim), and what it says and when
+(an `OutputRefLM` block on a page, which mirrors the notification and carries its message). vislox writes both into
+its own files:
+
+```text
+extern vx_60000010_0000_0100_ffff504f94000001 = Notification(uuid: "60000010-0000-0100-ffff504f94000001")
+
+# Recipients edited in vislox. A claim makes the set everyone who gets the push
+# notification (Full access aside): whoever it leaves out stops getting it. Deleting it leaves the recipients as last written.
+recipients vx_frost_recipients
+	user "alice"
+	group "Familie"
+end
+
+vx_60000010_0000_0100_ffff504f94000001.recipients = vx_frost_recipients
+```
+
+```text
+page "Meldungen"
+
+vx_outputreflm_1 = OutputRefLM(mirrors: vx_60000011_0000_0110_ffff504f94000001, On: "Es regnet", MinimumTime: 30min)
+```
+
+- **Shown from the compiled config.** `objects[…].message` (`model.rs`) is an `OutputRefLM`'s `<LoggerMailer>`:
+  the notification it sends (`notification`, a UUID), the texts sent when its input turns on and off (`on`,
+  `off`; none: no message) and the least time between two messages (`minimum_time`, milliseconds).
+  `message_old` is the compared revision's when it differs, and such a block is marked changed (the message is
+  a child element, which no attribute change shows). The Changes list says it in the language's terms:
+  `Frost · message On: "Frost" → "Frost im Garten"`, `… message Off: "…" → —`, `… message MinimumTime: 12h → 30min`.
+  Properties of a notification lists the blocks that send it (`mirrored_by`), and its *Recipients* (#68) name the
+  users who get it only as members of *Full access* (`rights.inherited`): Loxone Config shows them as inherited
+  recipients, writes nothing for them, and no set takes it from them.
+- **The `recipients` op** is `{ "op": "recipients", "uuid": <Notification>, "value": … }`. `value.recipients` is the
+  whole list, each `{ kind, uuid }` (`user` or `group`, no schedule). An empty list is a set too: only Full access
+  gets it then. `value.set`, `value: null` and `value.restore` are as for access (#76): write vislox's set of that
+  name and claim it, or with no `recipients` claim it as it is (*Same recipients as …*); drop the claim; write sets
+  back first (an undo's). A new set is `vx_<name>_recipients`. `previous` carries UUIDs (lowercase). It is a
+  `SetKind` of `set_claim.rs` (`recipients_edit.rs`), with `access_edit.rs`' directory of users and groups, so
+  everything #76 says of sharing, *Change … too*, stale claimants, *Claimed twice* and the check after the compile
+  holds the same.
+- **Checked before lox sees it**, with lox's rules: a `Notification` only (the claim is on the notification, not on
+  its block on a page); each user or group once; every title, for every notification on the set, names exactly one
+  user or group in the pending config; at most 500. One set per notification: one the rest of the module claims is
+  refused, naming that `file:line` (`set_claims`). Dropping vislox's claim is always let through.
+- **Checked after the compile.** The pending config must give each notification the request changed, and every
+  notification sharing its set, exactly the set's recipients (`ACT=`, by UUID, as `rights.rs` reads them).
+- **A push notification on a page** is `add_block` with `type: "OutputRefLM"` and `settings.mirrors` the
+  notification's UUID, which must be a `Notification` of the pending config; its message is the settings `On`,
+  `Off` (text) and `MinimumTime` (a duration: `12h`, `30min`, `5s`, `500ms`, or seconds). vislox writes `mirrors:`
+  an extern of the notification in `edits.loxl`, kept while a block names it. It takes no name (the notification's)
+  and no constant: its `AI` is wired from a block once it is on the page (#61), since the parameters take values,
+  never wires. Removing it before Apply takes the extern along; its `add_block` names the notification by UUID.
+  Its message is edited like any setting of a block of vislox's files (`setting` op on `On`, `Off`,
+  `MinimumTime`; empty drops it: no text, no message).
+- **Who may see it.** `GET /api/edits` sends `recipients` (per notification vislox's file claims now or claimed in
+  the deployed revision: `set`, `recipients`, `shared`, `deployed`, `pending`) and `recipient_sets` (each set with
+  its `notifications`, `recipients` and `stale` claimants), by UUID only, and never a message's text. The pickers'
+  list is #76's `POST /api/access/choices` (admin token, `no-store`, never logged), whose groups now say whether
+  they are *Full access* (`full_access`). Message texts can hold names, phone numbers or mail addresses: they are
+  served with the rest of the review, as a block's title is, and never in a URL, the page title, the event stream
+  or vislox's log.
+- **Every loss shows in the review and Apply's confirmation** (#68): *⚠ Anna stops getting Frostwarnung
+  (pages/vislox/edits.loxl:12)*, through a shared set or a group the set drops too. A member of Full access never
+  stops getting one.
+- **What stays with Loxone Config.** The notification itself (no compile writes into *Messages*), the phones and
+  their push settings, and the message of a block Loxone Config drew: lox writes the message only in the
+  declaration of a block it manages, and `lox logic adopt --uuid` of an `OutputRefLM` fails in lox 0.83 (it writes
+  a label that its own check refuses), so such a block is not adopted here yet. vislox keeps `mirrors:` a value of
+  an adopted block's declaration (never a wire), so adopting works once lox does.
+
+The browser: *Message* in Properties of a notification's block, on any revision (the notification, *On*, *Off*,
+*Minimum time*, old → new against the compared revision), and *Sent by* on the notification. *Recipients* has
+*Edit recipients* on the newest config: the access editor without the schedule column, Full access named (*gets
+every notification anyway*); *Save* names who stops getting it first (*Save anyway*), *Same recipients as …*,
+*Change … too*, *Revert* and *Remove vislox's claim* as for access. *Add block* lists *Push notification*: the
+notification (a choice of the config's), *On*, *Off* and *Minimum time*. Its *Edit values* edits the message. The
+Deploy pane counts the notifications whose recipients are edited and not deployed.
 
 ## Undo and redo (#62)
 
@@ -938,6 +1022,8 @@ cannot express is left out, not worked around.
 | #74 moods | `moods vx_… end`, `x.moods = vx_…` in `edits.loxl`; `Circuit<n>:` | A LightController2, extern or added/adopted here; several controllers may share a set. Circuits only on one added/adopted here. |
 | #75 members | `x.members = (a, b)` in `edits.loxl` | A CentralLight or CentralShade, extern or added/adopted here; members externs or blocks added/adopted here. An alarm's `Objects=` stays with Loxone Config. |
 | #76 access | `access vx_… end`, `x.access = vx_…` in `edits.loxl` | An NfcCodeTouch; users, groups and access schedules by a title that names exactly one; several Code Touches may share a set. |
+| #77 recipients | `recipients vx_… end`, `x.recipients = vx_…` in `edits.loxl` | A Notification (an extern); users and groups by a title that names exactly one; Full access is never listed. |
+| #77 notification on a page | `slug = OutputRefLM(mirrors: vx_…, On: "…", Off: "…", MinimumTime: 12h)` | Mirrors a Notification Loxone Config made; no name, no constant; its `AI` wired with #61. |
 
 Blocks the module already manages (they are in the lockfile) are refused: they are edited in their own `.loxl`.
 The blocks vislox added or adopted (#72) are the exception: their `.loxl` is vislox's.
@@ -976,6 +1062,8 @@ The blocks vislox added or adopted (#72) are the exception: their `.loxl` is vis
   a position when it is added (lox places it; it can be moved after), and a room or category (lox has no claim for them on a managed block). Its settings
   (`Formula:`, `Type:`, `At:`, …) are given when it is added; changing them later is #79.
 - A block on a page whose title an earlier page has, and a new page (#88).
+- A push notification itself (lox never writes into *Messages*), and adopting a notification's block Loxone Config
+  drew (`lox logic adopt` of an `OutputRefLM` fails in lox 0.83): its message is changed in Loxone Config (#77).
 
 ## The rest of the language
 
@@ -992,7 +1080,7 @@ Each of these plugs in as new op kinds on `POST /api/edit`, written into `<modul
 | #74 (built) | lighting moods and circuits (`moods`, `.moods`, `Circuit<n>:`) |
 | #75 (built) | members of a central block (`.members`) |
 | #76 (built) | NFC Code Touch access (`access`, `.access`) |
-| #77 | notification recipients and messages (`recipients`, `OutputRefLM`) |
+| #77 (built) | notification recipients and messages (`recipients`, `OutputRefLM`) |
 | #78 | Touch Pure Flex tiles (`tiles`, `.tiles`) |
 | #79 | a managed block's label and settings (`Desc:`, `Type:`, `Formula:`, `Code: file(…)`, …) |
 | #80 | delete and rename managed blocks (`removed`, `moved`) |

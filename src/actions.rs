@@ -8154,6 +8154,238 @@ esac
         );
     }
 
+    // ── recipients of a push notification (#77) ───────────────────────
+
+    fn recipients_val(list: &[(&str, &str)]) -> Option<crate::recipients_edit::RecipientsVal> {
+        Some(crate::recipients_edit::RecipientsVal {
+            recipients: Some(
+                list.iter()
+                    .map(|(k, u)| crate::recipients_edit::Recipient {
+                        kind: k.to_string(),
+                        uuid: u.to_string(),
+                    })
+                    .collect(),
+            ),
+            ..Default::default()
+        })
+    }
+
+    /// `GET /api/edits` lists a claimed notification by UUIDs only.
+    #[test]
+    fn recipients_are_listed_by_uuid_and_pending() {
+        use crate::recipients_edit::fixture::{BOB, FROST, house};
+        let doc = edit::parse_doc(house().as_bytes()).unwrap();
+        let s = edit::slug(FROST);
+        let files = edit::Files::from_texts(&std::collections::BTreeMap::from([(
+            "edits.loxl".to_string(),
+            format!(
+                "extern {s} = Notification(uuid: \"{FROST}\")\nrecipients vx_r\n\tuser \"bob\"\nend\n{s}.recipients = vx_r\n"
+            ),
+        )]))
+        .unwrap();
+        let lock = edit::Lock::default();
+        let none = edit::Files::default();
+        let (v, sets) = crate::set_claim::edits_section::<crate::recipients_edit::RecipientsKind>(
+            &files,
+            &none,
+            &lock,
+            Some(&doc),
+            None,
+        );
+        assert_eq!(v[0]["uuid"], FROST);
+        assert_eq!(v[0]["pending"], true);
+        assert_eq!(v[0]["recipients"], json!([{ "kind": "user", "uuid": BOB }]));
+        assert_eq!(sets[0]["notifications"][0], FROST);
+        let text = format!("{v}{sets}");
+        assert!(!text.contains("bob"), "{text}");
+        assert!(needs_module_names(&[edit::Op::Recipients {
+            uuid: FROST.into(),
+            value: recipients_val(&[]),
+        }]));
+    }
+
+    /// A compile that does not write the claim onto its notification is
+    /// refused, and the module, lock and out are put back; nothing is deployed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn recipients_lox_did_not_write_are_refused_and_put_back() {
+        use crate::recipients_edit::fixture::{BOB, FROST, house};
+        let (tmp, a) = project_for_edits();
+        let d = tmp.path().join("project");
+        std::fs::write(d.join("base.Loxone"), house()).unwrap();
+        std::fs::write(d.join("out.Loxone"), house()).unwrap();
+        sh(&d, "git add -A && git commit -qm notifications");
+        std::fs::write(
+            tmp.path().join("lox"),
+            "#!/bin/sh\necho \"$*\" >> ../calls.log\n[ \"$1 $2\" = \"logic compile\" ] || exit 2\n\
+             out=out.Loxone; prev=\nfor a in \"$@\"; do [ \"$prev\" = --out ] && out=$a; prev=$a; done\n\
+             cp base.Loxone \"$out\"\n",
+        )
+        .unwrap();
+        let req = edit::Request {
+            base: blob(&d, "out.Loxone"),
+            ops: vec![edit::Op::Recipients {
+                uuid: FROST.into(),
+                value: recipients_val(&[("user", BOB)]),
+            }],
+        };
+        let out_was = std::fs::read(d.join("out.Loxone")).unwrap();
+        let (code, msg) = a.edit(&req, None).await.unwrap_err();
+        assert_eq!(code, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            msg.contains("did not write the recipients of Frost"),
+            "{msg}"
+        );
+        assert!(!d.join("pages/vislox/edits.loxl").exists());
+        assert_eq!(std::fs::read(d.join("out.Loxone")).unwrap(), out_was);
+        let calls = std::fs::read_to_string(tmp.path().join("calls.log")).unwrap();
+        assert!(
+            calls.lines().all(|l| l.starts_with("logic compile")),
+            "{calls}"
+        );
+    }
+
+    /// Recipients and a push notification's block with the real lox (#77):
+    /// set `VISLOX_TEST_LOX` to a lox binary (v0.83.0) to run it; it never
+    /// talks to a Miniserver. The set and claim are compiled onto the
+    /// notification (alice stops getting it, bob gets it, carol keeps it
+    /// through Full access), Apply's comparison says so, the undo puts alice
+    /// back, and a new `OutputRefLM` mirrors the notification with its message.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn recipients_and_a_notification_block_are_compiled_by_lox() {
+        use crate::recipients_edit::fixture::{BOB, FROST, PAGE, REGEN, house};
+        let Some(lox) = std::env::var_os("VISLOX_TEST_LOX") else {
+            eprintln!("VISLOX_TEST_LOX is not set: skipped");
+            return;
+        };
+        let (tmp, a) = project_with_lox_base(Path::new(&lox), house().as_bytes());
+        let d = tmp.path().join("project");
+        let doc = |p: &str| edit::parse_doc(&std::fs::read(d.join(p)).unwrap()).unwrap();
+        let gets = |p: &str| {
+            crate::rights::read(&doc(p))[FROST]
+                .list
+                .iter()
+                .map(|x| x.title.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(gets("out.Loxone"), ["alice"]);
+        let r = a
+            .edit(
+                &edit::Request {
+                    base: blob(&d, "out.Loxone"),
+                    ops: vec![edit::Op::Recipients {
+                        uuid: FROST.into(),
+                        value: recipients_val(&[("user", BOB)]),
+                    }],
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(r["undo"][0]["op"], "recipients");
+        assert_eq!(r["undo"][0]["value"], Value::Null);
+        let file = std::fs::read_to_string(d.join("pages").join(edit::FILE)).unwrap();
+        assert!(
+            file.contains("recipients vx_frost_recipients\n\tuser \"bob\"\nend\n"),
+            "{file}"
+        );
+        assert_eq!(gets("out.Loxone"), ["bob"]);
+        let ch = crate::model::apply_changes(&doc("out.Loxone"), &doc("base.Loxone")).rights;
+        let frost = ch.iter().find(|c| c.uuid == FROST).unwrap();
+        assert_eq!(frost.lose[0].title, "alice");
+        assert_eq!(frost.gain[0].title, "bob");
+        assert!(frost.lose.iter().all(|u| u.title != "carol"));
+        let e = edits_of(&a, &d).await;
+        assert_eq!(e["recipients"][0]["uuid"], FROST);
+        assert_eq!(e["recipients"][0]["pending"], true);
+        assert_eq!(e["recipient_sets"][0]["notifications"][0], FROST);
+        assert_eq!(e["set_kinds"]["recipients"]["content"], "recipients");
+        let undo: Vec<edit::Op> = serde_json::from_value(r["undo"].clone()).unwrap();
+        a.edit(
+            &edit::Request {
+                base: blob(&d, "out.Loxone"),
+                ops: undo,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(gets("out.Loxone"), ["alice"]);
+        // A push notification drawn on the page: Regen, with its message.
+        let r = a
+            .edit(
+                &edit::Request {
+                    base: blob(&d, "out.Loxone"),
+                    ops: vec![edit::Op::AddBlock {
+                        page: PAGE.into(),
+                        ty: "OutputRefLM".into(),
+                        title: None,
+                        params: Default::default(),
+                        settings: [
+                            ("mirrors".to_string(), REGEN.to_string()),
+                            ("On".to_string(), "Es regnet".to_string()),
+                            ("MinimumTime".to_string(), "30min".to_string()),
+                        ]
+                        .into(),
+                        wires: vec![],
+                        restores: None,
+                    }],
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let u = r["added"][0]["uuid"].as_str().unwrap().to_string();
+        let v = crate::model::build(&doc("out.Loxone"), Some(&doc("base.Loxone")), "");
+        let m = v.objects[&u].message.as_ref().expect("its message");
+        assert_eq!(m.on.as_deref(), Some("Es regnet"));
+        assert_eq!(m.minimum_time, Some(1_800_000));
+        assert!(
+            m.notification
+                .as_deref()
+                .is_some_and(|n| n.eq_ignore_ascii_case(REGEN))
+        );
+        // Its message edited: compiled anew.
+        a.edit(
+            &edit::Request {
+                base: blob(&d, "out.Loxone"),
+                ops: vec![edit::Op::Setting {
+                    uuid: u.clone(),
+                    name: "On".into(),
+                    value: Some("Regen!".into()),
+                }],
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        let v = crate::model::build(&doc("out.Loxone"), Some(&doc("base.Loxone")), "");
+        assert_eq!(
+            v.objects[&u].message.as_ref().unwrap().on.as_deref(),
+            Some("Regen!")
+        );
+        // Frost's block, drawn in Loxone Config, cannot be adopted yet: lox
+        // 0.83's `logic adopt` writes a label on an OutputRefLM that its own
+        // check refuses. vislox says why, and changes nothing.
+        let (_, msg) = a
+            .edit(
+                &edit::Request {
+                    base: blob(&d, "out.Loxone"),
+                    ops: vec![edit::Op::Adopt {
+                        blocks: vec![crate::adopt::Pick {
+                            uuid: crate::recipients_edit::fixture::WARN.into(),
+                            slug: None,
+                        }],
+                    }],
+                },
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(msg.contains("lox cannot adopt Frost"), "{msg}");
+    }
+
     // ── members of a central block (#75) ───────────────────────────────
 
     fn members_op(uuid: &str, list: Option<&[&str]>) -> edit::Op {

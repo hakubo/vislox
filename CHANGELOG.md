@@ -128,6 +128,16 @@ published under the same version (see [docker/README.md](docker/README.md)).
   Code Touches; *Change … too* rewrites a shared set, its undo gives the others theirs back. Built on
   `set_claim.rs`. `ACT=` (operating it in the app) is kept. Credentials never leave the server; `GET /api/edits`
   names users, groups and schedules by UUID only. Adopting a Code Touch leaves its rights as they are. Never deploys.
+- Push notifications (#77): Properties of a notification's block on a page (`OutputRefLM`) has *Message*: the
+  notification it sends, the *On* and *Off* texts and the minimum time between messages, marked against the
+  compared revision; a changed text or time reads old → new in the Changes list (`Frost · message On: "…" → "…"`).
+  A notification lists the blocks that send it, and *Recipients* names the members of Full access as inherited.
+  *Edit recipients* is the access editor without schedules: the new op `recipients` writes a `recipients vx_… end`
+  set and the notification's `.recipients` claim into `edits.loxl` (a `SetKind`, shared sets, undo, Revert, the
+  Deploy pane), warns who stops getting it before the save (*Save anyway*) and in Apply's confirmation with ⚠.
+  *Add block* offers *Push notification*: an `OutputRefLM` that `mirrors:` a notification Loxone Config made, with
+  its message (`add_block` with `settings.mirrors`); its input is wired by dragging (#61). Its message is edited in
+  Properties (*Edit values*: On, Off, Minimum time as a duration). Never deploys.
 - Fixed: Revert of switching times, moods or access whose deployed content could not be read sent the set's name
   alone, which claimed the set as it was and changed nothing; it is now refused with the reason. One Revert
   serves every set kind, from the keys the server sends (`set_kinds`).

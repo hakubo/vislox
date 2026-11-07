@@ -415,6 +415,17 @@ sends to the Miniserver see [miniserver.md](miniserver.md).
   deployed, the section says so, with *Revert*. Users, groups, schedules, tags and codes stay with Loxone Config
   and the app; no tag or code is ever shown. How: [editing.md](editing.md#who-may-open-an-nfc-code-touch-76).
 
+- **Push notifications** (#77): a notification's block on a page shows its *Message*: the notification it sends, the
+  text sent when its input turns on and off (none: no message) and the minimum time between messages; the Changes
+  list says a changed text or time as old → new. The notification lists the blocks that send it, and *Recipients*
+  names those who get it as members of Full access (*Inherited*: no set takes it from them). *Edit recipients* adds
+  or removes users and groups (no schedule) and writes a Lox Logic `recipients` set and the notification's claim;
+  whoever it leaves out stops getting it, said before the save (*Anna stops getting Frostwarnung*, *Save anyway*)
+  and again in Apply's confirmation. *Add block* → *Push notification* draws a notification Loxone Config made on
+  the page with its message; wire its input from a block, and edit its message in Properties. The notification
+  itself, and the message of a block Loxone Config drew, stay with Loxone Config. How:
+  [editing.md](editing.md#push-notifications-77).
+
 For a `lox.toml` project:
 
 ```bash

@@ -27,6 +27,7 @@ mod operate;
 mod pull;
 mod query;
 mod reason;
+mod recipients_edit;
 mod restart;
 mod rights;
 mod rollback;

@@ -35,10 +35,15 @@ const ZUGANG = "40000000-0000-0000-ffff504f94000001", TOUCH = "40000001-0000-000
 // Ben is in Bewohner; Garage, a second Code Touch, opens for nobody. Anna has an NFC tag and a code, never shown.
 const ANNA = "40000011-0000-0000-ffff504f94000001", BEN = "40000012-0000-0000-ffff504f94000001", BEWOHNER = "40000013-0000-0000-ffff504f94000001";
 const ALWAYS = "40000016-0000-0000-ffff504f94000001", WERKTAGS = "40000017-0000-0000-ffff504f94000001", GARAGE = "40000002-0000-0000-ffff504f94000001";
+// Push notifications (#77): Frostwarnung, which Anna gets, and Regen, which nobody does, in Messages; Ben is in Full
+// access, so he gets every notification (inherited). Frostwarnung is drawn on the page Meldungen with its message.
+const FULL = "40000018-0000-0000-ffff504f94000001", FROST = "40000021-0000-0000-ffff504f94000001", REGEN = "40000022-0000-0000-ffff504f94000001";
+const MELDUNGEN = "40000030-0000-0000-ffff504f94000001", WARN = "40000031-0000-0000-ffff504f94000001";
 const usersXml = `\t\t<C Type="LoxCaption" V="178" U="40000010-0000-0000-ffff504f94000001" Title="Users and Permissions" CaptionType="20" SubType="20">
 \t\t\t<C Type="User" V="178" U="${ANNA}" Title="Anna" UsR="-1" NFCArr="0A1B2C3D4E5F" CodeArr="00112233">
-\t\t\t\t<PH NUM="1">
+\t\t\t\t<PH NUM="2">
 \t\t\t\t\t<PRM REF="${TOUCH}" TIM="${ALWAYS}" ACT="3"/>
+\t\t\t\t\t<PRM REF="${FROST}" ACT="3"/>
 \t\t\t\t</PH>
 \t\t\t</C>
 \t\t\t<C Type="User" V="178" U="${BEN}" Title="Ben" UsR="129">
@@ -49,8 +54,13 @@ const usersXml = `\t\t<C Type="LoxCaption" V="178" U="40000010-0000-0000-ffff504
 \t\t\t\t<PH NUM="0">
 \t\t\t\t</PH>
 \t\t\t</C>
+\t\t\t<C Type="UserGroup" V="178" U="${FULL}" Title="Full access" Rights="-1" UgType="4" User="${BEN}" UserGroups=""/>
 \t\t\t<C Type="SwitchingTimer" V="178" U="${ALWAYS}" Title="Always" M="3" FIX="1"/>
 \t\t\t<C Type="SwitchingTimer" V="178" U="${WERKTAGS}" Title="Werktags" M="3"/>
+\t\t</C>
+\t\t<C Type="LoxCaption" V="178" U="40000020-0000-0000-ffff504f94000001" Title="Messages" CaptionType="9" SubType="9">
+\t\t\t<C Type="Notification" V="178" U="${FROST}" Title="Frostwarnung" WF="16400" Entries="10"/>
+\t\t\t<C Type="Notification" V="178" U="${REGEN}" Title="Regen" WF="16384" Entries="10"/>
 \t\t</C>
 `;
 const KITCHEN = "30000a01-0000-0000-ffff504f94000001", BATH = "30000a02-0000-0000-ffff504f94000001";
@@ -116,6 +126,9 @@ const base = readFileSync(fixture, "utf8").replace('<Co K="Q" U="10000009-0000-0
     `\t\t<C Type="Page" V="178" U="${ZUGANG}" Title="Zugang" WF="16384">\n` +
     `\t\t\t<C Type="NfcCodeTouch" V="178" U="${TOUCH}" Title="Haustür" Px="960" Py="960" Px2="2304" Py2="1656" Cl="141,255,112" Nio="0" WF="16384"/>\n` +
     `\t\t\t<C Type="NfcCodeTouch" V="178" U="${GARAGE}" Title="Garage" Px="960" Py="2880" Px2="2304" Py2="3576" Cl="141,255,112" Nio="0" WF="16384"/>\n` +
+    "\t\t</C>\n" +
+    `\t\t<C Type="Page" V="178" U="${MELDUNGEN}" Title="Meldungen" WF="16384">\n` +
+    `\t\t\t<C Type="OutputRefLM" V="178" U="${WARN}" Title="Frostwarnung" Px="960" Py="960" Px2="2304" Py2="1656" Cl="0,0,0" Nio="2" Ref="${FROST}"><Co K="AI" U="40000031-0000-0001-ffff504f94000001"/><Co K="AQ" U="40000031-0000-0002-ffff504f94000001"/><LoggerMailer RefNotification="${FROST}" On="Frost im Garten" MinimumTime="43200000" NL="1"/></C>\n` +
     "\t\t</C>\n\t</C>\n</ControlList>");
 assert.ok(base.includes(lagerUuid(LAGER_N - 1)), "the Lager page is in the base");
 writeFileSync(join(dir, "base.Loxone"), base);
@@ -248,7 +261,7 @@ for (const line of src.split("\\n")) {
   if ((m = line.match(/^extern (\\w+) = \\w+\\(uuid: "([^"]+)"\\)/))) { slugs[m[1]] = m[2]; continue; }
   if (!(m = line.match(/^(\\w+)\\.(\\w+) = (.*)$/))) continue;
   if (m[2] === "schedule") { claimed.push([slugs[m[1]], m[3]]); continue; }
-  if (m[2] === "moods" || m[2] === "members" || m[2] === "access") continue; // below (#74, #75, #76)
+  if (m[2] === "moods" || m[2] === "members" || m[2] === "access" || m[2] === "recipients") continue; // below (#74–#77)
   const uuid = slugs[m[1]], i = out.findIndex((l) => l.includes(\`U="\${uuid}"\`));
   if (m[2] === "title") { out[i] = out[i].replace(/Title="[^"]*"/, \`Title="\${xml(unq(m[3]))}"\`); continue; }
   if (m[2] === "room") {
@@ -378,6 +391,16 @@ for (const f of fs.existsSync("pages/vislox") ? fs.readdirSync("pages/vislox") :
     const uuid = lock.objects[slug]?.uuid || \`bbbbbb\${String(++n).padStart(2, "0")}-0000-0000-ffff504f94000001\`;
     const page_uuid = out[pageAt].match(/U="([^"]+)"/)[1];
     objects[slug] = { uuid, type: ty, page_uuid, layout: lock.objects[slug]?.layout || { px: 96, py: 96, px2: 1440, py2: 792 } };
+    // A push notification's block (#77): it mirrors the notification (its title, Ref=) and carries the message.
+    if (ty === "OutputRefLM") {
+      const notif = slugs[rest.match(/mirrors: (\\w+)/)[1]];
+      const ntitle = out.find((l) => l.includes(\`U="\${notif}"\`)).match(/Title="([^"]*)"/)[1];
+      const txt = (k) => { const x = rest.match(new RegExp(\`\${k}: "((?:[^"\\\\\\\\]|\\\\\\\\.)*)"\`)); return x ? \` \${k}="\${xml(JSON.parse('"' + x[1] + '"'))}"\` : ""; };
+      const mt = rest.match(/MinimumTime: (\\d+)(ms|s|min|h)?/);
+      const ms = mt ? +mt[1] * { ms: 1, s: 1000, min: 60000, h: 3600000 }[mt[2] || "s"] : 5000;
+      out.splice(pageAt + 1, 0, \`\\t\\t\\t<C Type="OutputRefLM" V="178" U="\${uuid}" Title="\${ntitle}" Px="96" Py="96" Px2="1440" Py2="792" Cl="0,0,0" Nio="2" Ref="\${notif}"><Co K="AI" U="\${uuid.slice(0, 9)}0000-0010-ffff504f94000001"/><Co K="AQ" U="\${uuid.slice(0, 9)}0000-0020-ffff504f94000001"/><LoggerMailer RefNotification="\${notif}"\${txt("On")}\${txt("Off")} MinimumTime="\${ms}" NL="1"/></C>\`);
+      continue;
+    }
     const title = rest.match(/^"((?:[^"\\\\]|\\\\.)*)"/);
     const cos = [...rest.matchAll(/(\\w+): (-?[\\d.]+)/g)].map(([, k, v], i) => \`<Co K="\${KEYS[k] || k}" Def="\${v}" U="\${uuid.slice(0, 9)}0000-00\${i}0-ffff504f94000001"/>\`);
     out.splice(pageAt + 1, 0, \`\\t\\t\\t<C Type="\${ty}" V="178" U="\${uuid}" Title="\${xml(title ? JSON.parse('"' + title[1] + '"') : slug)}" Px="96" Py="96" Px2="1440" Py2="792" Nio="2">\${cos.join("")}</C>\`);
@@ -460,6 +483,37 @@ for (const [, slug, list] of src.matchAll(/^(\\w+)\\.members = \\(([^)]*)\\)$/gm
       const k = out.findIndex((l, n) => n > i && n < j && l.includes(\`<PRM REF="\${door}"\`));
       if (k >= 0) out[k] = out[k].replace(\`<PRM REF="\${door}"\`, \`<PRM REF="\${door}" TIM="\${sch}"\`);
       else out.splice(j, 0, \`\\t\\t\\t\\t\\t<PRM REF="\${door}" TIM="\${sch}"/>\`);
+    }
+  }
+}
+// Recipients (#77): \`x.recipients = set\` makes the set the notification's recipients, as lox writes them: every
+// ACT= on it goes, and each principal the set names by title gets <PRM REF="…" ACT="3"/>. Full access is never listed.
+{
+  const rsets = {};
+  let cur = null;
+  for (const line of src.split("\\n")) {
+    const m = line.match(/^recipients (\\w+)$/);
+    if (m) cur = rsets[m[1]] = [];
+    else if (line === "end") cur = null;
+    else if (cur && line.trim()) { const x = line.trim().match(/^(user|group) "([^"]*)"$/); cur.push([x[1], x[2]]); }
+  }
+  const one = (type, title) => {
+    const hits = out.filter((l) => l.includes(\`<C Type="\${type}"\`) && l.includes(\` Title="\${xml(title)}"\`));
+    if (hits.length !== 1) { console.error(\`error: compile error: \${hits.length} \${type} titled "\${title}"\`); process.exit(1); }
+    return hits[0].match(/ U="([^"]+)"/)[1];
+  };
+  for (const [, slug, set] of src.matchAll(/^(\\w+)\\.recipients = (\\w+)$/gm)) {
+    const n = slugs[slug];
+    const want = rsets[set].map(([k, p]) => one(k === "user" ? "User" : "UserGroup", p));
+    out = out.flatMap((l) => {
+      if (!l.includes(\`<PRM REF="\${n}"\`)) return [l];
+      const kept = l.replace(/ ACT="[^"]*"/, "");
+      return / TIM="/.test(kept) ? [kept] : [];
+    });
+    for (const who of want) {
+      const i = out.findIndex((l) => l.includes(\` U="\${who}"\`) && l.includes("<C "));
+      const j = out.findIndex((l, k) => k > i && l.includes("</PH>"));
+      out.splice(j, 0, \`\\t\\t\\t\\t\\t<PRM REF="\${n}" ACT="3"/>\`);
     }
   }
 }
@@ -1751,7 +1805,7 @@ try {
     await page.click(`${sec} [data-ac="open"]`);
     await page.waitForSelector(`${sec} [data-ac-p="0"]`);
     assert.deepEqual(await page.evaluate(() => AC.rows), [{ kind: "user", uuid: ANNA, schedule: ALWAYS }]);
-    assert.deepEqual(await page.$$eval(`${sec} [data-ac-p="0"] option`, (n) => n.map((x) => x.textContent)), ["Anna", "Ben", "Bewohner"]);
+    assert.deepEqual(await page.$$eval(`${sec} [data-ac-p="0"] option`, (n) => n.map((x) => x.textContent)), ["Anna", "Ben", "Bewohner", "Full access"]);
     assert.deepEqual(await page.$$eval(`${sec} [data-ac-s="0"] option`, (n) => n.map((x) => x.textContent)), ["Always", "Werktags"]);
     // Bewohner instead of Anna, on workdays: Anna loses access, said before anything is sent.
     await page.selectOption(`${sec} [data-ac-p="0"]`, `group|${BEWOHNER}`);
@@ -1842,6 +1896,107 @@ try {
     await page.click(`${sec} [data-ac="revert"]`);
     await page.waitForFunction(() => !S.edits?.access?.length, null, { timeout: 15000 });
     await page.waitForFunction(() => /Nothing pending/.test(document.querySelector("#deploy-pend")?.textContent || ""), null, { timeout: 10000 });
+  });
+  await step("a push notification's recipients are edited as a set, warned, undone; its message is shown, added and edited (#77)", async () => {
+    await page.waitForFunction(() => /Nothing pending/.test(document.querySelector("#deploy-pend")?.textContent || ""), null, { timeout: 10000 });
+    await page.evaluate(() => editGoNewest());
+    await settled();
+    const sec = '#props [data-body="Recipients"]';
+    await page.evaluate((u) => select(u), FROST);
+    await page.waitForFunction((u) => S.sel === u && document.querySelector('#props [data-body="Recipients"] [data-ac="open"]'), FROST, { timeout: 15000 });
+    // Anna gets it directly; Ben as a member of Full access, inherited.
+    await waitText(sec, /Anna[\s\S]*Sent to\s*Anna, Ben[\s\S]*Inherited\s*Ben \(Full access\)/);
+    // The block that sends it, with its message.
+    await waitText('#props [data-body="Message"]', /Sent by\s*Meldungen\s*on: Frost im Garten/);
+    // The editor: a user or group per row, no schedule; Full access is said to get it anyway.
+    await page.click(`${sec} [data-ac="open"]`);
+    await page.waitForSelector(`${sec} [data-ac-p="0"]`);
+    assert.deepEqual(await page.evaluate(() => AC.rows.map((r) => [r.kind, r.uuid])), [["user", ANNA]]);
+    assert.equal(await page.$(`${sec} [data-ac-s="0"]`), null);
+    assert.deepEqual(await page.$$eval(`${sec} [data-ac-p="0"] option`, (n) => n.map((x) => x.textContent)), ["Anna", "Ben", "Bewohner", "Full access (gets every notification anyway)"]);
+    // Bewohner instead of Anna: Anna stops getting it, said before anything is sent; Ben keeps it.
+    await page.selectOption(`${sec} [data-ac-p="0"]`, `group|${BEWOHNER}`);
+    const n0 = edits.length;
+    await page.click(`${sec} [data-ac="save"]`);
+    await waitText(sec, /⚠ Anna stops getting Frostwarnung\./);
+    assert.doesNotMatch(await page.textContent(sec), /Ben stops/);
+    assert.equal(edits.length, n0);
+    await page.click(`${sec} [data-ac="save"]`);
+    await until(() => edits.length > n0 && statuses[n0] !== undefined, "the recipients request");
+    assert.equal(statuses[n0], 200);
+    assert.deepEqual(edits[n0].ops, [{ op: "recipients", uuid: FROST, value: { recipients: [{ kind: "group", uuid: BEWOHNER }] } }]);
+    await settled();
+    const file = () => readFileSync(join(dir, "pages", "vislox", "edits.loxl"), "utf8");
+    assert.match(file(), /^recipients vx_frostwarnung_recipients\n\tgroup "Bewohner"\nend$/m);
+    assert.match(file(), /^vx_40000021_0000_0000_ffff504f94000001\.recipients = vx_frostwarnung_recipients$/m);
+    await page.waitForFunction((u) => S.view.objects[u].rights.list.map((p) => p.title).join() === "Bewohner", FROST, { timeout: 10000 });
+    await waitText(sec, /edited here[\s\S]*not deployed[\s\S]*Revert/);
+    await waitText("#deploy-pend", /recipients of 1 push notification edited here/);
+    const changes = await page.evaluate(() => S.view.changes.map((c) => c.text));
+    assert.ok(changes.includes("Frostwarnung · recipients: Anna removed"), changes.join(" | "));
+    // Apply's confirmation warns with ⚠, naming the claim; nothing is deployed here.
+    const confirm = await page.evaluate(async () => rightsApplyText(await pendingHardware(editRev())));
+    assert.match(confirm, /⚠ Anna stops getting Frostwarnung \(pages\/vislox\/edits\.loxl:\d+\)/, confirm);
+    assert.doesNotMatch(confirm, /Ben stops/, confirm);
+    // No name in /api/edits or the page title.
+    assert.doesNotMatch(await page.title(), /Anna|Ben/);
+    const ed = await page.evaluate(async () => JSON.stringify(await (await fetch("/api/edits")).json()));
+    assert.doesNotMatch(ed, /Anna|Bewohner|Frost im Garten/);
+    // Undone through the reply's undo: Anna again, no claim.
+    const ops = await undoKey(false, (u) => S.view.objects[u].rights.list.map((p) => p.title).join() === "Anna" && !S.edits?.recipients?.length, FROST);
+    assert.deepEqual(ops, [{ op: "recipients", uuid: FROST, value: null }]);
+    assert.doesNotMatch(file(), /recipients/);
+    // Frostwarnung's block on Meldungen: its message, drawn in Loxone Config, so not edited here.
+    await page.evaluate((u) => { gotoPage(S.objPage.get(u), { focus: u }); select(u); }, WARN);
+    const msg = '#props [data-body="Message"]';
+    await waitText(msg, /Notification\s*Frostwarnung[\s\S]*On\s*Frost im Garten[\s\S]*Off\s*no message[\s\S]*Minimum time\s*12h[\s\S]*Drawn in Loxone Config/);
+    // A push notification added to the page: Regen, with its message; its name is the notification's.
+    await page.waitForSelector("#btn-add-block:not([disabled])");
+    await page.click("#btn-add-block");
+    await page.waitForSelector("#ab-q");
+    await page.fill("#ab-q", "push notification");
+    await page.press("#ab-q", "Enter");
+    await page.waitForSelector('#ab-body [data-ab-field="s:mirrors"]');
+    assert.deepEqual(await page.$$eval("#ab-body [data-ab-field]", (n) => n.map((x) => x.dataset.abField)), ["s:mirrors", "s:On", "s:Off", "s:MinimumTime"]);
+    assert.deepEqual(await page.$$eval('#ab-body [data-ab-field="s:mirrors"] option', (n) => n.map((x) => x.textContent)), ["Pick a push notification…", "Frostwarnung", "Regen"]);
+    // Not sent without a notification, nor with a duration lox would refuse.
+    await page.fill('#ab-body [data-ab-field="s:MinimumTime"]', "bald");
+    const n1 = edits.length;
+    await page.click('#ab-body [data-ab="add"]');
+    await waitText("#ab-body", /Pick the push notification it sends[\s\S]*A duration, like 12h/);
+    assert.equal(edits.length, n1);
+    await page.selectOption('#ab-body [data-ab-field="s:mirrors"]', REGEN);
+    await page.dispatchEvent('#ab-body [data-ab-field="s:mirrors"]', "input");
+    await page.fill('#ab-body [data-ab-field="s:On"]', "Es regnet");
+    await page.fill('#ab-body [data-ab-field="s:MinimumTime"]', "30min");
+    await page.click('#ab-body [data-ab="add"]');
+    await until(() => edits.length > n1 && statuses[n1] !== undefined, "the add request");
+    assert.equal(statuses[n1], 200);
+    assert.deepEqual(edits[n1].ops, [{ op: "add_block", page: MELDUNGEN, type: "OutputRefLM", params: {}, settings: { mirrors: REGEN, On: "Es regnet", MinimumTime: "30min" } }]);
+    await settled();
+    const pf = readFileSync(join(dir, "pages", "vislox", "meldungen.loxl"), "utf8");
+    assert.match(pf, /^vx_outputreflm_1 = OutputRefLM\(mirrors: vx_40000022_0000_0000_ffff504f94000001, On: "Es regnet", MinimumTime: 30min\)$/m);
+    assert.match(file(), /^extern vx_40000022_0000_0000_ffff504f94000001 = Notification\(uuid: "40000022-0000-0000-ffff504f94000001"\)$/m);
+    const added = await page.evaluate(() => S.sel);
+    await waitText(msg, /Notification\s*Regen[\s\S]*On\s*Es regnet[\s\S]*Minimum time\s*30min/);
+    // Its message is edited in its declaration: no name field, the texts and the minimum time.
+    await page.click('#props [data-body="Edit"] [data-ed="open"]');
+    assert.deepEqual(await page.$$eval("#props [data-ed-field]", (n) => n.map((x) => x.dataset.edField)), ["s:On", "s:Off", "s:MinimumTime"]);
+    await page.fill('#props [data-ed-field="s:Off"]', "Trocken");
+    await page.fill('#props [data-ed-field="s:MinimumTime"]', "1h");
+    const n2 = edits.length;
+    await page.click('#props [data-ed="save"]');
+    await until(() => edits.length > n2 && statuses[n2] !== undefined, "the message request");
+    assert.equal(statuses[n2], 200);
+    assert.deepEqual(edits[n2].ops, [{ op: "setting", uuid: added, name: "Off", value: "Trocken" }, { op: "setting", uuid: added, name: "MinimumTime", value: "1h" }]);
+    await settled();
+    await waitText(msg, /Off\s*Trocken[\s\S]*Minimum time\s*1h/);
+    assert.match(readFileSync(join(dir, "pages", "vislox", "meldungen.loxl"), "utf8"), /MinimumTime: 1h, Off: "Trocken"|Off: "Trocken", MinimumTime: 1h|MinimumTime: 1h.*Off: "Trocken"/);
+    // Taken out again: nothing pending, the extern of Regen gone with it.
+    await page.click('#props [data-ed="remove"]');
+    await page.waitForFunction(() => /Nothing pending/.test(document.querySelector("#deploy-pend")?.textContent || ""), null, { timeout: 15000 });
+    await settled();
+    assert.doesNotMatch(existsSync(join(dir, "pages", "vislox", "edits.loxl")) ? file() : "", /40000022/);
   });
   await step("nothing was deployed: lox only compiled, checked, linted and tested", async () => {
     const ran = readFileSync(calls, "utf8").trim().split("\n");
