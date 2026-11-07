@@ -332,3 +332,7 @@ upload line, vislox downloads what the Miniserver runs (`lox config download`, F
 to tell whether anything changed. Working out what it would deploy (`POST
 /api/rollback/plan`) reads only the project's `backups/` and git, and runs `lox logic compile` in a scratch
 directory: nothing goes to the Miniserver. See [features.md](features.md#apply-sync-and-discard).
+
+Removing managed blocks (#70) adds nothing either: the plan (`POST /api/removals/plan`) and Apply's *Removals
+you confirmed* step run `lox logic compile` only, and the push is Apply's (`lox config push --force`, never
+`--allow-removals`).

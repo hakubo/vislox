@@ -33,6 +33,12 @@ The binary is an `axum` server with the UI embedded (plain JS and SVG, no build 
   Apply's steps (`POST /api/rollback`), checking that the in-place compile, lox's staged upload and its verified
   download are the reviewed program, and working out what runs when a push fails after its upload. `history.rs`
   keeps the plan as the `rollback:<commit>` revision, found by id only (the asking tab shows it).
+- `actions/removals.rs` handles managed blocks the module lost (#70): it recognises lox's refusal, plans a compile
+  with `--allow-removals` in a scratch directory (`POST /api/removals/plan`; the blocks are the lockfile objects
+  that compile drops, `model::removed_blocks` says where each is and what is wired to it), and is Apply's
+  *Removals you confirmed* step: it works the plan out again, compiles it into the project with the plan's
+  `--time`, and checks `out` and the lockfile against the consent. `history.rs` keeps the plan as the
+  `removals:<blob>` revision, compared with the deployed commit, found by id only.
 - `src/running.rs` reads `/prog` and `def.log` for the config the Miniserver runs (`GET /api/running`), and
   checks after an Apply that the upload loaded.
 - `src/edit.rs` is editing from Properties ([editing.md](editing.md)): the edit operations, what each object

@@ -83,6 +83,9 @@ writeFileSync(join(dir, "out.Loxone"), base.replace('Title="Licht OG"', 'Title="
   .replace(users(prm(DOOR, ALWAYS) + prm(FROST, null, "3"), "", prm(DOOR, WORKDAYS)), users("", prm(DOOR, WORKDAYS), prm(FROST, null, "3") + prm(DOOR, WORKDAYS2)))
   .replace('<Entry From="390" To="480" V="21"/>', '<Entry From="360" To="480" V="21"/>'));
 writeFileSync(join(dir, "lox.toml"), 'base = "base.Loxone"\nmodule = "pages"\nout = "out.Loxone"\n');
+// The lockfile manages no block at first; later it manages the Divide block, which the module no longer has (#70).
+const lockFile = join(dir, "logic.lock.json");
+writeFileSync(lockFile, '{"objects":{}}');
 writeFileSync(join(dir, "pages", "main.lox"), "# module\n");
 // The module's claims on the Code Touch, the notification and the Daytimer (#68): lines 12, 13 and 14.
 writeFileSync(join(dir, "pages", "access.loxl"), `extern haustuer = NfcCodeTouch(uuid: "${DOOR}")
@@ -126,6 +129,7 @@ const loxDir = mkdtempSync(join(tmpdir(), "vislox-lox-"));
 const loxConfig = join(loxDir, "config.yaml");
 writeFileSync(loxConfig, `host: http://127.0.0.1:${webPort}\nuser: u\npass: p\nserial: 504F94000001\n`);
 const fakeLox = join(loxDir, "lox");
+const refusal = "compile error: managed block \\`teiler\\` is in the lockfile but not in the source. To delete it, add \\`removed teiler\\` (or pass --allow-removals); to rename it, add \\`moved teiler -> <new_slug>\\`.";
 writeFileSync(fakeLox, `#!/bin/sh
 case "$1 $2" in
   "logic diff") echo "Rename Licht OG to Licht oben" ;;
@@ -136,7 +140,22 @@ case "$1 $2" in
       echo '1 tests: 0 passed, 1 failed'; exit 1
     fi
     echo 'test "Licht oben" ... ok'; echo '1 tests: 1 passed, 0 failed' ;;
+  "logic compile")
+    # The module lost the Divide block (#70) while the lockfile manages it: refused, unless removals are allowed;
+    # then the lockfile keeps its tombstone. The program is the pending one, which has no Divide block.
+    lock=logic.lock.json; out=out.Loxone; allow=; shift 2
+    while [ $# -gt 0 ]; do
+      case "$1" in --lock) lock=$2; shift ;; --out) out=$2; shift ;; --time) shift ;; --allow-removals) allow=1 ;; esac
+      shift
+    done
+    if grep -q '"teiler":{' "$lock"; then
+      [ -n "$allow" ] || { echo "${refusal}" >&2; exit 1; }
+      printf '%s' '{"objects":{},"removed":{"${DIV}":{"slug":"teiler","type":"Div"}}}' > "$lock"
+    fi
+    [ "$out" = out.Loxone ] || cp out.Loxone "$out" ;;
   "config push")
+    echo "$*" >> "${loxDir}/pushes"
+    if grep -q '"teiler":{' logic.lock.json; then printf 'Error: Compiling the module failed\n\nCaused by:\n    %s\n' "${refusal}" >&2; exit 1; fi
     echo "Downloading the live config..." >&2; sleep 1
     echo "Uploading as sps_new.zip..." >&2; sleep 1
     echo "Restarting the program..." >&2; sleep 2
@@ -214,7 +233,15 @@ try {
   let dialogs = 0, applies = 0;
   const asked = [];
   let dismissNext = false;
-  page.on("dialog", (d) => { dialogs++; asked.push(d.message()); if (dismissNext) { dismissNext = false; d.dismiss(); } else d.accept(); });
+  // The answers to the next dialogs, in order (true: accept); then dismissNext, else accept.
+  const answers = [];
+  page.on("dialog", (d) => {
+    dialogs++; asked.push(d.message());
+    let yes = true;
+    if (answers.length) yes = answers.shift();
+    else if (dismissNext) { dismissNext = false; yes = false; }
+    if (yes) d.accept(); else d.dismiss();
+  });
   page.on("request", (r) => { if (r.method() === "POST" && new URL(r.url()).pathname === "/api/apply") applies++; });
   await page.addInitScript(() => localStorage.setItem("vislox.token", "secret"));
   await page.goto(`http://127.0.0.1:${port}/`);
@@ -335,6 +362,36 @@ try {
     unlinkSync(failTest());
     dialogs = 0; applies = 0; asked.length = 0;
   });
+  await step("a block the module lost: Apply asks to remove exactly it, and nothing is removed unasked (#70)", async () => {
+    // The lockfile manages the Divide block, which the module no longer has: lox refuses it without consent.
+    writeFileSync(lockFile, `{"objects":{"teiler":{"uuid":"${DIV}","type":"Div"}}}`);
+    answers.push(true, false);
+    await page.click("#btn-apply");
+    for (const end = Date.now() + 20000; asked.length < 2 && Date.now() < end;) await new Promise((ok) => setTimeout(ok, 50));
+    assert.equal(asked.length, 2, asked.join("\n---\n"));
+    // Exactly which block, where it is and what is wired to it.
+    assert.match(asked[1], /^Remove 1 block from the Miniserver\?/, asked[1]);
+    assert.match(asked[1], /• O1002 \(Div, teiler\) on page "Erdgeschoss": wired from Temperatur\.\S+ → \S+/, asked[1]);
+    assert.match(asked[1], /The revision "Removals allowed" shows what would run then\. Apply compiles exactly this/, asked[1]);
+    // The plan shows, compared with what runs.
+    await page.waitForSelector(".hrev.k-removals.sel");
+    assert.match(await page.textContent(".hrev.k-removals"), /Removals allowed[\s\S]*would be deployed with the removals/);
+    // Dismissed: the server refused the one request, at its Removals step, and nothing was removed or pushed.
+    await page.waitForFunction(() => /lox deletes them only when you allow it/.test(document.querySelector("#deploy-msg")?.textContent || ""), null, { timeout: 20000 });
+    assert.equal(applies, 1);
+    assert.equal(await state("Removals you confirmed"), "fail");
+    assert.equal(await state("Tests pass"), "wait");
+    assert.match(readFileSync(lockFile, "utf8"), /"teiler":\{/);
+    assert.equal(existsSync(join(loxDir, "pushes")), false);
+    let i = -1;
+    for (const end = Date.now() + 10000; (i = errors.findIndex((e) => /status of 409/.test(e))) < 0 && Date.now() < end;) {
+      await new Promise((ok) => setTimeout(ok, 50));
+    }
+    assert.ok(i >= 0, "the 409 was logged: " + errors.join(" | "));
+    errors.splice(i, 1);
+    await page.click('.hrev >> nth=0');
+    dialogs = 0; applies = 0; asked.length = 0;
+  });
   await step("Apply shows its steps as they happen", async () => {
     // With live values on, the confirmation names the schedule the Miniserver runs differently.
     await page.click("#sw-live .track");
@@ -351,7 +408,9 @@ try {
   });
   await step("every step ends done", async () => {
     await page.waitForFunction(() => /^Applied/.test(document.querySelector("#deploy-msg")?.textContent || ""), null, { timeout: 20000 });
-    assert.equal(dialogs, 1, "one confirmation");
+    // The Apply's confirmation, then the removal's (#70): the server refused the first request for it.
+    assert.equal(dialogs, 2, asked.join("\n---\n"));
+    assert.match(asked[1], /^Remove 1 block from the Miniserver\?/, asked[1]);
     assert.match(asked[0], /The Miniserver runs other switching times than this config for:\n  Uhr: Feiertag \(claimed by pages\/access\.loxl:14\)\n/, asked[0]);
     // …and who loses a right, with the claim that takes it away (#68).
     assert.match(asked[0], /⚠ alice loses access to Haustür \(pages\/access\.loxl:12\)\n⚠ alice stops getting Frostwarnung \(pages\/access\.loxl:13\)\n\nbob starts getting Frostwarnung\n\n/, asked[0]);
@@ -359,9 +418,18 @@ try {
     assert.match(asked[0], /⚠ Not on the bus \(lox extensions does not list it\): Touch Küche \(Touch Tree\), serial B03B9999/);
     assert.match(asked[0], /This reconfigures 1 device: it stores the new configuration/);
     assert.match(asked[0], /Touch Küche \(Touch Tree\): replaced, serial B03B368A → B03B9999/);
-    assert.equal(applies, 1, "one /api/apply request");
+    assert.equal(applies, 2, "the Apply, then once more with the removal confirmed");
+    assert.equal(await state("Removals you confirmed"), "ok");
+    assert.match(await page.textContent("#deploy-steps"), /1 block removed in the compile you confirmed \(1 from the Miniserver\)/);
+    // Compiled in with the consent; the push itself never gets --allow-removals.
+    assert.doesNotMatch(readFileSync(join(loxDir, "pushes"), "utf8"), /allow-removals/);
+    assert.match(readFileSync(lockFile, "utf8"), /"removed":\{"10000006/);
     assert.equal(await state("Tests pass"), "ok");
     assert.match(await page.textContent("#deploy-steps"), /Tests pass.*1 test passed/);
+    // The first request's refusal (409) is the only error the browser logs for it.
+    const i = errors.findIndex((e) => /status of 409/.test(e));
+    assert.ok(i >= 0, "the 409 was logged: " + errors.join(" | "));
+    errors.splice(i, 1);
     for (const l of ["Download and drift check", "Upload", "Program restarting", "Back online", "New config loaded", "Verified", "Committed", "Pushed to git"]) {
       assert.equal(await state(l), "ok", l);
     }

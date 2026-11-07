@@ -1288,6 +1288,76 @@ pub fn apply_changes(new: &LoxoneDoc, old: &LoxoneDoc) -> ApplyChanges {
     }
 }
 
+/// A block a removal deletes (#70), as the config it is deleted from has
+/// it: where it is and what is wired to it.
+#[derive(Serialize)]
+pub struct RemovedBlock {
+    pub uuid: String,
+    /// The block is in the config.
+    pub found: bool,
+    pub title: String,
+    #[serde(rename = "type")]
+    pub ty: String,
+    pub page: Option<String>,
+    pub page_title: Option<String>,
+    /// Its wires, each with the block at the other end.
+    pub wires: Vec<RemovedWire>,
+    /// How many references to it other pages show.
+    pub refs: usize,
+}
+
+#[derive(Serialize)]
+pub struct RemovedWire {
+    /// `in`: the other block drives it; `out`: it drives the other block.
+    pub dir: &'static str,
+    /// Its own port.
+    pub port: String,
+    /// The block (and port) at the other end.
+    pub other: Target,
+}
+
+/// The blocks `uuids` as `doc` has them, for the removal's confirmation.
+pub fn removed_blocks(doc: &LoxoneDoc, uuids: &[String]) -> Vec<RemovedBlock> {
+    let c = Ctx::new(doc);
+    uuids
+        .iter()
+        .map(|u| {
+            let mut wires = Vec::new();
+            for w in &c.wires {
+                let (from, to) = (c.port_owner.get(&w.from_port), c.port_owner.get(&w.to_port));
+                let (dir, own, other) = match (from, to) {
+                    (Some((f, k)), _) if f == u && to.is_none_or(|(t, _)| t != u) => {
+                        ("out", k, &w.to_port)
+                    }
+                    (_, Some((t, k))) if t == u && from.is_none_or(|(f, _)| f != u) => {
+                        ("in", k, &w.from_port)
+                    }
+                    _ => continue,
+                };
+                let Some(other) = c.port_target(other) else {
+                    continue;
+                };
+                wires.push(RemovedWire {
+                    dir,
+                    port: port_names::name_of(&c.ty(u), own).to_string(),
+                    other,
+                });
+            }
+            let page = c.page_of.get(u).cloned();
+            RemovedBlock {
+                uuid: u.clone(),
+                found: c.el(u).is_some(),
+                title: c.title(u),
+                ty: c.ty(u),
+                page_title: page.as_ref().map(|p| c.title(p)),
+                page,
+                wires,
+                refs: c.mirrors.get(u).map_or(0, Vec::len),
+            }
+        })
+        .collect()
+}
+
 /// Which devices the change reconfigures, and with which attributes.
 fn hw_delta(nc: &Ctx, oc: &Ctx, d: &mut Delta) {
     let is_dev = |c: &Ctx, u: &str| c.device_of(u).as_deref() == Some(u);
@@ -2599,6 +2669,38 @@ mod tests {
 
     fn doc(src: &str) -> LoxoneDoc {
         LoxoneDoc::parse(src.as_bytes()).expect("fixture parses")
+    }
+
+    #[test]
+    fn a_removed_block_says_where_it_is_and_what_is_wired_to_it() {
+        let d = doc(HOUSE);
+        let r = removed_blocks(&d, &[AND.to_string(), "gone".to_string()]);
+        let and = &r[0];
+        assert!(and.found);
+        assert_eq!((and.title.as_str(), and.ty.as_str()), ("O1001", "And"));
+        assert_eq!(and.page.as_deref(), Some(PAGE_EG));
+        assert_eq!(and.page_title.as_deref(), Some("Erdgeschoss"));
+        let ends: Vec<(&str, &str, Option<&str>)> = and
+            .wires
+            .iter()
+            .map(|w| (w.dir, w.other.title.as_str(), w.other.page_title.as_deref()))
+            .collect();
+        assert!(
+            ends.contains(&("in", "Temperatur", Some("Erdgeschoss"))),
+            "{ends:?}"
+        );
+        assert!(
+            ends.contains(&("out", "Zähler", Some("Erdgeschoss"))),
+            "{ends:?}"
+        );
+        assert!(
+            ends.contains(&("out", "Licht OG", Some("Obergeschoss"))),
+            "{ends:?}"
+        );
+        assert_eq!(and.wires.len(), 3, "{ends:?}");
+        // One the config does not have is named as such, not guessed at.
+        assert!(!r[1].found);
+        assert!(r[1].wires.is_empty());
     }
 
     fn page<'a>(v: &'a View, uuid: &str) -> &'a Page {

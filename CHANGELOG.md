@@ -42,6 +42,19 @@ published under the same version (see [docker/README.md](docker/README.md)).
   different programs, an untracked or ignored file in the way, a module that does not give it back. Files git does
   not track are never touched. A push that fails after its upload is judged by what the Miniserver runs (recorded
   as deployed, put back, or reported as unknown); before it, the project is put back.
+- Removed managed blocks on Apply (#70): when the module no longer has a block its lockfile manages, lox compiles
+  it only with the removal allowed, and Apply used to fail with lox's error. The Deploy pane now says so and
+  offers *Review the removals*: vislox compiles the module with `--allow-removals` in a scratch copy, changing
+  nothing, and shows the result as the revision *Removals allowed*, compared with what runs, with each block it
+  deletes (its name, type and page, what is wired to it, references on other pages, and who loses access or a
+  notification with it, #68). Apply asks *Remove N blocks from the Miniserver?* with exactly that list, before its
+  own confirmation, which is then about that program; also when lox refuses an Apply for it. The consent names
+  the program reviewed and its blocks: the server works the plan out again and refuses unless both are the same,
+  then compiles it into the project (`lox logic compile --allow-removals` with the plan's `--time`, so `out`
+  must be the reviewed program and the lockfile must drop exactly those blocks, else both are put back), runs
+  the tests on it, and pushes without `--allow-removals`: lox deletes the blocks its lockfile tombstoned, and
+  refuses a block the module loses after the consent. Apply never allows removals by default, and a retry never
+  carries a consent over. A Roll back takes none.
 - Fixed: Discard failed when the last commit had no lockfile (the first compile writes one), or one was staged
   but not committed. Discard now reads the last commit, never deletes a lock vislox did not write (one not in git
   goes back to how it was before vislox's first edit), and puts everything back when a step fails.

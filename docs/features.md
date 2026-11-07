@@ -209,6 +209,34 @@ sends to the Miniserver see [miniserver.md](miniserver.md).
     too, and deploys the Apply's config again).
   - A program restart loads the upload, as for Apply; lox's `--reboot` is not used.
 
+- **Removed managed blocks** (#70; the same project and token): lox refuses to compile a module that no longer
+  has a block its lockfile manages, unless the removal is allowed (`removed <slug>` in the module, or
+  `--allow-removals`, which deletes *every* block the module lost). The check finds it (a scratch compile of the
+  module as it is), and the Deploy pane says *The module no longer has managed blocks: lox deletes them only when
+  you allow it*, with lox's words and **Review the removals**:
+  - vislox works out what Apply would deploy then, changing nothing (`POST /api/removals/plan`, while no other
+    action runs, holding the compile lock): the module compiled with `--allow-removals` and a fixed `--time` onto
+    a scratch copy of the lockfile. The blocks it deletes are the lockfile's objects that compile drops. The
+    result shows as the revision *Removals allowed*, compared with what runs, in the browser that asked only, and
+    the Deploy pane lists each block: its name, type and page, what is wired to it (from which block and port,
+    to which), its references on other pages, or that it was never deployed (then only the lockfile forgets it).
+  - Apply asks first: *Remove N blocks from the Miniserver?*, with exactly that list and who loses access or a
+    notification with them (#68). Its own confirmation follows, about the program with the blocks removed. When
+    lox refuses an Apply for a block the module lost (the check had not seen it), the browser asks the same way
+    and sends the Apply once more with the consent; it never sends a consent the user did not give for that
+    request.
+  - The consent names the plan's program (its blob id) and its blocks. Apply's *Removals you confirmed* step works
+    the plan out again from the files as they are: the program and the blocks must be the ones confirmed, else it
+    refuses and nothing changes. Then it compiles in the project (`lox logic compile --allow-removals --time
+    <the plan's>`): `out` must be the reviewed program and the lockfile must have dropped exactly those blocks
+    (lox keeps a tombstone for each one the Miniserver runs), else the lockfile and `out` are put back. The tests
+    run on that, then `lox config push` **without** `--allow-removals`: lox deletes the tombstoned blocks, and a
+    block the module loses after the consent is refused by lox again. Before the push, the module and lockfile
+    must still be that compile.
+  - Without consent, Apply's *Removals you confirmed* step refuses (with lox's words) before the tests; with
+    nothing to remove it is skipped. A Roll back never takes a consent. Discard puts the lockfile and `out` back
+    as for an edit.
+
 - **Does the module compile?** (a `lox.toml` project): vislox runs `lox logic check` on the module whenever it
   changes. While it has errors, `out.Loxone` stays at the last compile that worked, so the Deploy pane says *The
   module doesn't compile: N errors*, lists each one with its file, line and message, and links the blocks its line

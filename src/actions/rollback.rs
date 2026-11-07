@@ -427,6 +427,14 @@ impl Actions {
     ) -> Result<String, Refusal> {
         // Everything the request says is checked before any file is touched.
         push_opts(opts, &mut Vec::new()).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+        // The module from before compiles onto what ran before: it removes
+        // nothing that needs consent (#70), and none is taken.
+        if opts.allow_removals.is_some() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "A Roll back never removes blocks by consent; nothing was sent.".to_string(),
+            ));
+        }
         let _one = self
             .busy
             .try_lock()

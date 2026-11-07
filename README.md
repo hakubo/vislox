@@ -52,6 +52,8 @@ Then open <http://127.0.0.1:7878>. Started without a path or `--ctx` in a direct
   tag opens no Code Touch, …) as a warning badge on each block and a *Lint* list in the Deploy pane. Hints only.
 - For a `lox.toml` project: *Roll back* an Apply from the History, onto the download `lox config push` kept from
   before it, through Apply's own steps and checks.
+- For a `lox.toml` project: when the module no longer has a block it manages, the removal is reviewed before Apply
+  (what it deletes, where, what is wired to it, who loses access) and deployed only with consent to exactly that list.
 - For a `lox.toml` project: the module's `lox logic test` scenarios run in lox's simulator, each with pass, fail or
   couldn't run, the failing `expect` with expected and actual values, and the blocks it checks. Apply stops while
   a test fails.

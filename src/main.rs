@@ -534,6 +534,7 @@ async fn main() -> Result<()> {
         .route("/api/backups/read", axum::routing::post(api_backups_read))
         .route("/api/apply", axum::routing::post(api_apply))
         .route("/api/rollback/plan", axum::routing::post(api_rollback_plan))
+        .route("/api/removals/plan", axum::routing::post(api_removals_plan))
         .route("/api/rollback", axum::routing::post(api_rollback))
         .route(
             "/api/rollback/cancel",
@@ -1469,6 +1470,92 @@ async fn api_rollback_plan(
         "same_bytes": plan.same_bytes,
     }))
     .into_response()
+}
+
+/// What Apply would deploy with the module's removals allowed (#70): the
+/// blocks it deletes, where they are, what is wired to them and who loses
+/// access or notifications with them, and the program, shown as a revision
+/// (`removals:<blob>`) compared with the deployed commit. Deploys nothing,
+/// and changes nothing in the project.
+async fn api_removals_plan(
+    State(app): State<Arc<App>>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    if let Err(r) = app.actions.check(&headers) {
+        return refused(r);
+    }
+    let plan = match app.actions.removal_plan().await {
+        Ok(p) => p,
+        Err(e) => return refused((StatusCode::CONFLICT, e)),
+    };
+    let a = app.clone();
+    let p = plan.clone();
+    let res = tokio::task::spawn_blocking(move || {
+        let deployed = a.history.lock().unwrap().deployed();
+        // The blocks as the config they are deleted from has them: what runs.
+        let old = match &deployed {
+            Some(d) => load(&a, d)?.1,
+            None => {
+                // No commit yet: the base file, which the Miniserver runs.
+                let base = a
+                    .history
+                    .lock()
+                    .unwrap()
+                    .paths()
+                    .into_iter()
+                    .next()
+                    .ok_or("no deployed config")?;
+                let bytes = std::fs::read(&base).map_err(|e| e.to_string())?;
+                let xml = source::program_xml(&bytes).map_err(|e| e.to_string())?;
+                LoxoneDoc::parse(&xml).map_err(|e| e.to_string())?
+            }
+        };
+        let xml = source::program_xml(&p.compiled).map_err(|e| e.to_string())?;
+        let new = LoxoneDoc::parse(&xml).map_err(|e| format!("the plan: {e}"))?;
+        let ids: Vec<String> = p.blocks.iter().map(|b| b.uuid.clone()).collect();
+        let shown = model::removed_blocks(&old, &ids);
+        let rights: Vec<_> = model::apply_changes(&new, &old)
+            .rights
+            .into_iter()
+            .filter(|c| ids.contains(&c.uuid))
+            .collect();
+        let n = p.blocks.len();
+        let rev = a.history.lock().unwrap().set_removals(
+            deployed.clone(),
+            "Removals allowed".into(),
+            format!(
+                "The module compiled with --allow-removals: {n} managed block{} deleted",
+                if n == 1 { "" } else { "s" }
+            ),
+            p.compiled.clone(),
+        );
+        Ok::<_, String>(serde_json::json!({
+            "revision": rev,
+            "rev": rev.id,
+            "blob": rev.blob,
+            "base": deployed,
+            "blocks": p.blocks.iter().zip(&shown).map(|(b, s)| serde_json::json!({
+                "slug": b.slug,
+                "uuid": b.uuid,
+                "type": b.ty,
+                "deployed": b.deployed,
+                "found": s.found,
+                "title": s.title,
+                "page": s.page,
+                "page_title": s.page_title,
+                "wires": s.wires,
+                "refs": s.refs,
+            })).collect::<Vec<_>>(),
+            "rights": rights,
+        }))
+    })
+    .await
+    .map_err(|e| e.to_string())
+    .and_then(|r| r);
+    match res {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => refused((StatusCode::UNPROCESSABLE_ENTITY, e)),
+    }
 }
 
 #[derive(Deserialize)]

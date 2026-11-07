@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Revision {
     pub id: String,
-    /// `pending`, `live`, `git`, `backup` or `rollback`.
+    /// `pending`, `live`, `git`, `backup`, `rollback` or `removals`.
     pub kind: &'static str,
     pub label: String,
     pub detail: String,
@@ -112,6 +112,9 @@ pub struct History {
     on_disk: (Option<String>, Option<String>),
     /// What a Roll back would deploy, [`History::set_rollback`].
     rollback: Option<Revision>,
+    /// What Apply would deploy with the removals allowed (#70),
+    /// [`History::set_removals`].
+    removals: Option<Revision>,
 }
 
 /// How long a Roll back's plan can be looked at (seconds): then it is
@@ -386,11 +389,19 @@ impl History {
             .filter(|r| r.base.is_some() && r.base == deployed)
             .cloned()
             .collect();
+        // The same for a removal plan (#70): compared with what runs.
+        let removals: Vec<Revision> = self
+            .removals
+            .iter()
+            .filter(|r| r.base == deployed)
+            .cloned()
+            .collect();
         let by_id = pending
             .iter()
             .chain(&hist)
             .chain(&backups)
             .chain(&rollback)
+            .chain(&removals)
             .map(|r| (r.id.clone(), r.clone()))
             .collect();
         Lists {
@@ -405,7 +416,7 @@ impl History {
         self.lists()
             .by_id
             .get(id)
-            .filter(|r| r.kind != "rollback" || now() - r.time < ROLLBACK_TTL)
+            .filter(|r| !matches!(r.kind, "rollback" | "removals") || now() - r.time < ROLLBACK_TTL)
             .cloned()
     }
 
@@ -456,6 +467,44 @@ impl History {
             self.rollback = None;
             self.version += 1;
         }
+    }
+
+    /// What Apply would deploy with the module's removals allowed (#70):
+    /// found as `removals:<blob>`, compared with the deployed commit
+    /// (`base`), while it is the newest one, for [`ROLLBACK_TTL`]. Another
+    /// plan replaces it; like a Roll back's, it is in no list.
+    pub fn set_removals(
+        &mut self,
+        base: Option<String>,
+        label: String,
+        detail: String,
+        bytes: Vec<u8>,
+    ) -> Revision {
+        let blob = blob_id(&bytes);
+        self.contents.insert(blob.clone(), Arc::new(bytes));
+        let r = Revision {
+            id: format!("removals:{}", &blob[..12]),
+            kind: "removals",
+            label,
+            detail,
+            time: now(),
+            blob,
+            base,
+            ..Revision::default()
+        };
+        self.removals = Some(r.clone());
+        self.version += 1;
+        r
+    }
+
+    /// The newest commit, which the Miniserver runs: what a plan is
+    /// compared with.
+    pub fn deployed(&self) -> Option<String> {
+        self.lists()
+            .history
+            .iter()
+            .find(|r| r.kind == "git")
+            .map(|r| r.id.clone())
     }
 
     /// Something else the History shows changed (a backup's download
@@ -724,6 +773,39 @@ mod tests {
         assert_eq!(hist.len(), 3);
         assert!(hist.iter().all(|r| r.kind == "git"));
         assert!(hist[0].current);
+    }
+
+    #[test]
+    fn a_removal_plan_is_found_while_it_is_about_the_deployed_commit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().canonicalize().unwrap();
+        let base = dir.join("base.Loxone");
+        git(&dir, &["init", "-q"]);
+        fs::write(&base, "deployed").unwrap();
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-qm", "one"]);
+        let mut h = History::new(base.clone(), None);
+        let deployed = h.deployed();
+        assert!(deployed.as_deref().is_some_and(|d| d.starts_with("git:")));
+        let plan = h.set_removals(
+            deployed.clone(),
+            "Removals allowed".into(),
+            String::new(),
+            b"removed".to_vec(),
+        );
+        assert!(plan.id.starts_with("removals:"));
+        let (pending, hist) = h.list();
+        assert!(pending.iter().chain(&hist).all(|r| r.kind != "removals"));
+        let r = h.find(&plan.id).unwrap();
+        assert_eq!((r.kind, r.base.clone()), ("removals", deployed));
+        assert_eq!(h.content(&r.blob).unwrap().as_slice(), b"removed");
+        // Another deploy: the plan is about what ran before it, so gone.
+        fs::write(&base, "applied").unwrap();
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-qm", "Apply"]);
+        h.refresh_git();
+        h.version += 1;
+        assert!(h.find(&plan.id).is_none());
     }
 
     #[test]

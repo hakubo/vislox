@@ -565,7 +565,8 @@ Each of these plugs in as new op kinds on `POST /api/edit`, written into `<modul
 | #88 | new pages (`page "…" (room: …)`) |
 
 Around the module: #64 (mark managed blocks, built), #65 (`lox logic check` errors, built), #66 (lint, built), #67 (`lox logic test`, built),
-#68 (review claimed access, recipients and schedules, built), #70 (removals on Apply).
+#68 (review claimed access, recipients and schedules, built), #70 (removals on Apply, built: a block the module
+lost is deleted only with consent to exactly that list, see [features.md](features.md#apply-sync-and-discard)).
 
 ## The browser
 

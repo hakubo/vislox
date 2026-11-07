@@ -21,7 +21,9 @@
 
 use crate::{check, edit, restart};
 
+mod removals;
 mod rollback;
+pub use removals::{RemovalConsent, refused_slug};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -93,6 +95,8 @@ pub struct Actions {
     project_cache: Mutex<Option<(Vec<u8>, loxone_config::Project)>>,
     /// The pushes in the project's `backups/`, for Roll back (#69).
     pushes: crate::rollback::Pushes,
+    /// The last removal plan worked out (#70), for Apply's consent to name.
+    removals: Mutex<Option<removals::RemovalPlan>>,
 }
 
 /// Whether `out` is the module compiled as it is now ([`Actions::freshness`]).
@@ -116,6 +120,9 @@ struct Compiled {
     module: std::collections::BTreeMap<String, String>,
     out: String,
     base: Option<String>,
+    /// The lockfile as the compile left it: one changed since (by hand, or
+    /// git) can make the module compile otherwise, or not at all (#70).
+    lock: Option<String>,
 }
 
 /// A file's blob id, if it can be read.
@@ -509,8 +516,9 @@ struct Step {
 }
 
 /// Apply's steps, in order.
-const APPLY_STEPS: [(&str, &str); 10] = [
+const APPLY_STEPS: [(&str, &str); 11] = [
     ("module", "Module compiles"),
+    ("removals", "Removals you confirmed"),
     ("tests", "Tests pass"),
     ("check", "Download and drift check"),
     ("upload", "Upload"),
@@ -748,6 +756,7 @@ impl Actions {
             disk: Mutex::new((None, None)),
             project_cache: Mutex::new(None),
             pushes: Default::default(),
+            removals: Mutex::new(None),
         };
         a.edit_state.lock().unwrap().why = a.why_not_edit_now();
         a
@@ -1024,6 +1033,17 @@ impl Actions {
                 }
             },
         }
+        // Blocks the module lost (#70): deleted only as the user confirmed
+        // them, compiled into the project before the tests run on it.
+        self.progress(|p| p.start("removals"));
+        let consent = opts.allow_removals.as_ref();
+        match self.removals_step(consent).await {
+            Ok((state, detail)) => self.progress(|p| p.finish("removals", state, Some(detail))),
+            Err(why) => {
+                self.end_with("apply", &Err(why.clone()), None);
+                return Err((StatusCode::CONFLICT, why));
+            }
+        }
         // Then its tests (#67) must pass, on the config Apply deploys: the
         // check's run when it is of the files as they are, else run now.
         self.progress(|p| p.start("tests"));
@@ -1031,6 +1051,24 @@ impl Actions {
         match tests_verdict(&tests) {
             Ok((state, detail)) => self.progress(|p| p.finish("tests", state, Some(detail))),
             Err(why) => {
+                self.end_with("apply", &Err(why.clone()), None);
+                return Err((StatusCode::CONFLICT, why));
+            }
+        }
+        // The removals were compiled in: what is pushed must still be that
+        // compile, the module and lockfile untouched since.
+        if consent.is_some() {
+            let fresh = match self.project() {
+                Ok(p) => matches!(
+                    self.freshness(&p, self.s.project.as_deref().unwrap()).await,
+                    Ok(Fresh::Yes)
+                ),
+                Err(_) => false,
+            };
+            if !fresh {
+                let why = "The module or its lockfile changed after the removals you confirmed \
+                           were compiled. Nothing was deployed: review the pending config again."
+                    .to_string();
                 self.end_with("apply", &Err(why.clone()), None);
                 return Err((StatusCode::CONFLICT, why));
             }
@@ -1585,6 +1623,7 @@ impl Actions {
             module: module_blobs(&p),
             out: blob.clone(),
             base: file_blob(&p.base),
+            lock: file_blob(&p.lock),
         };
         // The UUIDs lox minted for the new blocks.
         let lock = edit::Lock::read(&p.lock);
@@ -1670,11 +1709,13 @@ impl Actions {
         let module = module_blobs(p);
         let out_blob = file_blob(&p.out);
         let base_blob = file_blob(&p.base);
+        let lock_blob = file_blob(&p.lock);
         let last = self.compiled.lock().unwrap().clone();
         if let (Some(last), Some(o)) = (&last, &out_blob)
             && last.module == module
             && &last.out == o
             && last.base == base_blob
+            && last.lock == lock_blob
         {
             return Ok(Fresh::Yes);
         }
@@ -1717,13 +1758,7 @@ impl Actions {
         let reference = std::fs::read(&p.out)
             .or_else(|_| std::fs::read(&p.base))
             .map_err(|e| format!("cannot read the pending config: {e}"))?;
-        let scratch = std::env::temp_dir().join(format!(
-            "vislox-check-{}-{}",
-            std::process::id(),
-            now_nanos()
-        ));
-        std::fs::create_dir_all(&scratch)
-            .map_err(|e| format!("cannot create {}: {e}", scratch.display()))?;
+        let scratch = removals::scratch_dir("vislox-check")?;
         let _gone = RemoveDir(scratch.clone());
         let (lock, out) = (scratch.join("lock.json"), scratch.join("out.Loxone"));
         if p.lock.exists() {
@@ -1741,11 +1776,13 @@ impl Actions {
                 if let Some(o) = out_blob
                     && module_blobs(p) == module
                     && file_blob(&p.base) == base_blob
+                    && file_blob(&p.lock) == lock_blob
                 {
                     *self.compiled.lock().unwrap() = Some(Compiled {
                         module,
                         out: o,
                         base: base_blob,
+                        lock: lock_blob,
                     });
                 }
                 Ok(Fresh::Yes)
@@ -2135,7 +2172,13 @@ impl Actions {
                 Ok(Fresh::Yes) | Err(_) => Value::Null,
                 Ok(Fresh::Stale { changed }) => json!({ "files": changed }),
                 Ok(Fresh::Broken { changed, error }) => {
-                    json!({ "files": changed, "error": last_lines(&error, 6) })
+                    // A block the module lost (#70): lox compiles it only with
+                    // the removals allowed, which Apply asks for.
+                    json!({
+                        "files": changed,
+                        "error": last_lines(&error, 6),
+                        "removals": refused_slug(&error),
+                    })
                 }
             }
         };
@@ -2183,7 +2226,13 @@ impl Actions {
         if let Some(out) = file_blob(&p.out)
             && module_blobs(&p) == module
         {
-            *self.compiled.lock().unwrap() = Some(Compiled { module, out, base });
+            let lock = file_blob(&p.lock);
+            *self.compiled.lock().unwrap() = Some(Compiled {
+                module,
+                out,
+                base,
+                lock,
+            });
         }
         Ok(
             "Compiled the module as it is: the pending revision shows it. Nothing was deployed."
@@ -2559,11 +2608,15 @@ pub struct ApplyOpts {
     /// Delete the custom changes the Miniserver holds (`--discard-custom-changes`).
     #[serde(default)]
     pub discard_custom_changes: bool,
+    /// Delete the managed blocks the module lost (#70): exactly these, of
+    /// the plan reviewed. Never a flag of the push (see `removals`).
+    #[serde(default)]
+    pub allow_removals: Option<RemovalConsent>,
 }
 
 /// What a refused Apply could be retried with, from lox's message: the
-/// Loxone Config release to accept, and the custom changes an upload would
-/// delete.
+/// Loxone Config release to accept, the custom changes an upload would
+/// delete, and a managed block the module lost (#70).
 pub fn apply_hints(msg: &str) -> Value {
     let accept_version = msg.split("--accept-version").nth(1).and_then(|rest| {
         let v: String = rest
@@ -2589,6 +2642,8 @@ pub fn apply_hints(msg: &str) -> Value {
     json!({
         "accept_version": accept_version,
         "custom_changes": (!custom.is_empty() && msg.contains("--discard-custom-changes")).then_some(custom),
+        // A block the module lost (#70): the browser asks for the plan.
+        "removals": refused_slug(msg),
     })
 }
 
@@ -4121,8 +4176,10 @@ esac
         assert_eq!(runs(), before, "{}", calls_in(&tmp));
         let steps = a.info()["progress"]["steps"].clone();
         assert_eq!(steps[0]["state"], "ok", "{steps}");
-        assert_eq!(steps[1]["id"], "tests", "{steps}");
-        assert_eq!(steps[1]["state"], "fail", "{steps}");
+        assert_eq!(steps[1]["id"], "removals", "{steps}");
+        assert_eq!(steps[1]["state"], "skip", "{steps}");
+        assert_eq!(steps[2]["id"], "tests", "{steps}");
+        assert_eq!(steps[2]["state"], "fail", "{steps}");
         assert!(!calls_in(&tmp).contains("config push"), "nothing deployed");
         assert!(!calls_in(&tmp).contains("logic diff"), "{}", calls_in(&tmp));
 
@@ -4149,8 +4206,8 @@ esac
         let (code, msg) = a.apply(&ApplyOpts::default()).await.unwrap_err();
         assert_eq!(code, StatusCode::BAD_GATEWAY, "{msg}");
         let steps = a.info()["progress"]["steps"].clone();
-        assert_eq!(steps[1]["state"], "ok", "{steps}");
-        assert_eq!(steps[1]["detail"], "1 test passed", "{steps}");
+        assert_eq!(steps[2]["state"], "ok", "{steps}");
+        assert_eq!(steps[2]["detail"], "1 test passed", "{steps}");
         assert!(calls_in(&tmp).contains("config push"));
     }
 
@@ -4231,7 +4288,7 @@ esac
             "Tests couldn't run (lox logic test), so nothing was deployed: the simulator crashed"
         );
         assert_eq!(runs(), before + 1, "{}", calls_in(&tmp));
-        assert_eq!(a.info()["progress"]["steps"][1]["state"], "fail");
+        assert_eq!(a.info()["progress"]["steps"][2]["state"], "fail");
         assert!(!calls_in(&tmp).contains("config push"));
         // lox answers again (nothing in the project changed, so the check's
         // run stays the one without an answer): Apply's own run passes.
@@ -4240,7 +4297,7 @@ esac
         let (code, msg) = a.apply(&ApplyOpts::default()).await.unwrap_err();
         assert_eq!(code, StatusCode::BAD_GATEWAY, "{msg}");
         let steps = a.info()["progress"]["steps"].clone();
-        assert_eq!(steps[1]["state"], "ok", "{steps}");
+        assert_eq!(steps[2]["state"], "ok", "{steps}");
         assert_eq!(runs(), before + 2, "{}", calls_in(&tmp));
         // And it is kept for the browsers.
         assert_eq!(a.check_result()["test"]["passed"], 1);
@@ -4313,7 +4370,7 @@ esac
         let (_, msg) = a.apply(&ApplyOpts::default()).await.unwrap_err();
         assert!(msg.contains("lox config push failed"), "{msg}");
         let steps = a.info()["progress"]["steps"].clone();
-        assert_eq!(steps[1]["state"], "skip", "{steps}");
+        assert_eq!(steps[2]["state"], "skip", "{steps}");
         let runs = calls_in(&tmp)
             .lines()
             .filter(|l| *l == "logic test .")
