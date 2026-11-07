@@ -51,7 +51,8 @@ published under the same version (see [docker/README.md](docker/README.md)).
   blocks from the Miniserver?* with exactly that list, then shows its full confirmation for that program; also
   when lox refuses an Apply for it. The consent names the program and its blocks; Apply compiles exactly that into
   the project (`lox logic compile --allow-removals` with the plan's `--time`), puts the lockfile and `out` back on
-  any failure before the push goes through, and pushes without `--allow-removals`. Without consent Apply refuses,
+  any failure before the push goes through, and pushes without `--allow-removals`. A push that fails after its
+  upload is judged by what the Miniserver runs, as for a Roll back (kept as deployed, put back, or unknown). Without consent Apply refuses,
   also for a tombstone already in the lockfile. A retry asks again; a Roll back takes no consent.
 - Fixed: Discard failed when the last commit had no lockfile (the first compile writes one), or one was staged
   but not committed. Discard now reads the last commit, never deletes a lock vislox did not write (one not in git

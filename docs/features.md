@@ -235,8 +235,13 @@ sends to the Miniserver see [miniserver.md](miniserver.md).
     refuses. The tests run on that compile, the module and lockfile must still be it before the push, and
     `lox config push` runs **without** `--allow-removals`: lox deletes the tombstoned blocks, and refuses a block
     the module loses after the compile. **Until the push goes through, any failure** (the tests, a refusal to
-    accept a Loxone Config version or delete custom changes, the push itself) **puts the lockfile and `out` back**,
-    so no tombstone outlives the request: a later Apply asks again.
+    accept a Loxone Config version or delete custom changes, the push before its upload line) **puts the lockfile
+    and `out` back**, so no tombstone outlives the request: a later Apply asks again. A push that fails after lox's
+    upload line is judged as a Roll back's (#69, the same code): vislox downloads what the Miniserver runs
+    (`lox config download`, read-only). The program you confirmed: it is kept and committed as deployed, *not
+    verified*. The previous program with no upload waiting in `/prog`: nothing changed, put back. Anything else
+    (no answer, a third program, an upload waiting): reported as unknown, the lockfile and `out` put back, and how
+    to find out (*Which config the Miniserver runs*, then Pull or Sync).
   - Without consent, the step refuses, with the blocks or lox's words, before the tests: also for a tombstone
     already in the project's lockfile. With nothing to remove it is skipped. A Roll back never takes a consent.
 

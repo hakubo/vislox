@@ -102,17 +102,6 @@ fn point_base(p: &loxone_config::Project, base: &Path) -> Result<(), String> {
     std::fs::write(&toml, set_base(&text, &rel)).map_err(|e| format!("cannot write lox.toml: {e}"))
 }
 
-/// What the Miniserver runs after a push that failed after its upload.
-#[derive(Debug, PartialEq)]
-enum Runs {
-    /// The rolled-back program.
-    RolledBack,
-    /// Still the Apply's, and no upload is waiting to load.
-    Unchanged,
-    /// Cannot tell: why.
-    Unknown(String),
-}
-
 /// The `compiled` path of lox's "Staged <zip> (extracts to exactly <path>)".
 fn staged_path(out: &str) -> Option<PathBuf> {
     let rest = out.split("extracts to exactly ").nth(1)?;
@@ -597,14 +586,7 @@ impl Actions {
                 (pushed, ran_before, check)
             }
             Err(why) => {
-                let uploaded = self
-                    .st
-                    .lock()
-                    .unwrap()
-                    .progress
-                    .as_mut()
-                    .is_some_and(|p| p.get("upload").state != "wait");
-                if !uploaded {
+                if !self.upload_started() {
                     return fail(
                         format!(
                             "{why}\nlox stopped before the upload: nothing changed on the Miniserver, and the project is as it was."
@@ -612,8 +594,15 @@ impl Actions {
                         StatusCode::BAD_GATEWAY,
                     );
                 }
-                match self.what_runs(&plan).await {
-                    Runs::Unchanged => {
+                match self
+                    .what_runs(
+                        &want,
+                        &plan.deployed,
+                        ("the Apply's", "the rolled-back one"),
+                    )
+                    .await
+                {
+                    Runs::Before => {
                         return fail(
                             format!(
                                 "{why}\nThe Miniserver still runs the Apply's config, and no upload is waiting: nothing changed, and the project is as it was."
@@ -632,7 +621,7 @@ impl Actions {
                             StatusCode::BAD_GATEWAY,
                         );
                     }
-                    Runs::RolledBack => {
+                    Runs::Pushed => {
                         // It runs what was reviewed: record that, unverified.
                         let rec = std::fs::write(&p.base, &plan.compiled)
                             .map_err(|e| format!("cannot write the base: {e}"))
@@ -687,69 +676,6 @@ impl Actions {
         };
         self.end_with("rollback", &res, deployed);
         res.map_err(|e| (StatusCode::BAD_GATEWAY, e))
-    }
-
-    /// After a push that failed once lox began the upload: download what the
-    /// Miniserver runs (read-only, `lox config download`) and compare.
-    async fn what_runs(&self, plan: &RollbackPlan) -> Runs {
-        let dir = self.s.project.as_deref().unwrap();
-        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let scratch = std::env::temp_dir().join(format!(
-            "vislox-runs-{}-{}-{n}",
-            std::process::id(),
-            now_nanos()
-        ));
-        if let Err(e) = std::fs::create_dir_all(&scratch) {
-            return Runs::Unknown(format!("cannot create {}: {e}", scratch.display()));
-        }
-        let _gone = RemoveDir(scratch.clone());
-        let zip = scratch.join("now.zip");
-        let z = zip.to_string_lossy();
-        if let Err(e) = run(
-            &self.s.lox,
-            &["config", "download", "--save-as", &z],
-            dir,
-            PUSH_TIMEOUT,
-        )
-        .await
-        {
-            return Runs::Unknown(format!("lox config download: {}", last_lines(&e, 1)));
-        }
-        let xml = match std::fs::read(&zip)
-            .map_err(|e| e.to_string())
-            .and_then(|z| {
-                loxone_config::archive::extract_and_decompress(&z).map_err(|e| e.to_string())
-            }) {
-            Ok(x) => x,
-            Err(e) => return Runs::Unknown(format!("its download cannot be read: {e}")),
-        };
-        let blob = crate::history::blob_id(&xml);
-        if blob == plan.blob() {
-            return Runs::RolledBack;
-        }
-        if blob != plan.deployed {
-            return Runs::Unknown(format!(
-                "its newest program ({}) is neither the Apply's nor the rolled-back one",
-                &blob[..10]
-            ));
-        }
-        // The Apply's program: unless an upload waits to load on the next start.
-        if !self.s.running.available() {
-            return Runs::Unknown(
-                "it runs the Apply's program, but whether an upload waits cannot be checked".into(),
-            );
-        }
-        let r = self.s.running.get(true).await;
-        match (&r.error, &r.waiting) {
-            (Some(e), _) => Runs::Unknown(format!(
-                "it runs the Apply's program, but /prog cannot be read: {e}"
-            )),
-            (None, Some(w)) => Runs::Unknown(format!(
-                "it runs the Apply's program, but {w} waits to be loaded"
-            )),
-            (None, None) => Runs::Unchanged,
-        }
     }
 }
 

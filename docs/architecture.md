@@ -38,7 +38,10 @@ The binary is an `axum` server with the UI embedded (plain JS and SVG, no build 
   (`POST /api/removals/plan`, `POST /api/removals/cancel`; `model::removed_blocks` says where each block is, what
   is wired to it and whose rights go with it), and is Apply's *Removals you confirmed* step: without consent it
   refuses (from the check when it is current), with it it compiles the plan into the project with the plan's
-  `--time` and returns a `PutBack` that restores the lockfile and `out` unless the push goes through.
+  `--time` and returns a `PutBack` that restores the lockfile and `out` unless the push goes through. A push
+  that fails after its upload line is judged by `Actions::what_runs` (in `actions.rs`, shared with Roll back):
+  the pushed program is kept as deployed, the previous one with nothing waiting is put back, anything else is
+  reported as unknown.
   `history.rs` keeps the newest plan as the `removals:<blob>` revision, compared with the deployed revision,
   found by id only, and drops it with its bytes when it is cancelled, replaced, too old or another revision runs.
 - `src/running.rs` reads `/prog` and `def.log` for the config the Miniserver runs (`GET /api/running`), and

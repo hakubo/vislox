@@ -97,6 +97,22 @@ pub struct Actions {
     pushes: crate::rollback::Pushes,
     /// The last removal plan worked out (#70), for Apply's consent to name.
     removals: Mutex<Option<removals::RemovalPlan>>,
+    /// Tests: what `/prog` says of an upload waiting ([`Actions::upload_waiting`]).
+    #[cfg(test)]
+    waiting: Mutex<Option<Result<Option<String>, String>>>,
+}
+
+/// What the Miniserver runs after a push that failed once lox began its
+/// upload ([`Actions::what_runs`]): Roll back (#69) and Apply with removals
+/// (#70) record it the same way.
+#[derive(Debug, PartialEq)]
+enum Runs {
+    /// The program the push uploaded.
+    Pushed,
+    /// Still the program from before, and no upload is waiting to load.
+    Before,
+    /// Cannot tell: why.
+    Unknown(String),
 }
 
 /// Whether `out` is the module compiled as it is now ([`Actions::freshness`]).
@@ -756,6 +772,8 @@ impl Actions {
             project_cache: Mutex::new(None),
             pushes: Default::default(),
             removals: Mutex::new(None),
+            #[cfg(test)]
+            waiting: Mutex::new(None),
         };
         a.edit_state.lock().unwrap().why = a.why_not_edit_now();
         a
@@ -1117,17 +1135,97 @@ impl Actions {
         let before = std::fs::read(&p.base)
             .ok()
             .map(|b| crate::history::blob_id(&b));
-        let (pushed, ran_before) = self.push_config(&args).await?;
-        // Pushed and verified: lox wrote the lockfile of what runs now.
-        if let Some(g) = put_back {
-            g.keep();
-        }
+        let (pushed, ran_before, note) = match self.push_config(&args).await {
+            Ok((pushed, ran_before)) => {
+                // Pushed and verified: lox wrote the lockfile of what runs now.
+                if let Some(g) = put_back {
+                    g.keep();
+                }
+                (pushed, ran_before, None)
+            }
+            // Removals compiled in (#70): what runs decides what is kept.
+            Err(why) => match put_back {
+                None => return Err(why),
+                Some(g) => {
+                    let (pushed, note) = self.removals_pushed(&p, &why, before.as_deref()).await?;
+                    // It runs what was confirmed: the lockfile and out stay.
+                    g.keep();
+                    let ran_before = crate::running::Report::failed("no check before".into());
+                    (pushed, ran_before, Some(note))
+                }
+            },
+        };
         let c = Commit {
             subject: &subject,
             body: None,
             force_add: &[],
         };
-        self.after_push(&p, &pushed, &ran_before, before, &c).await
+        self.after_push(&p, &pushed, &ran_before, before, &c)
+            .await
+            .map(|(m, d)| match note {
+                Some(n) => (format!("{n}\n{m}"), d),
+                None => (m, d),
+            })
+    }
+
+    /// A push of removals the user confirmed (#70) failed: as for a Roll back
+    /// (#69), before lox's upload line nothing changed; after it, what the
+    /// Miniserver runs decides. The program confirmed: recorded as the base,
+    /// not verified, and `Ok` with the push's message and the note. Anything
+    /// else is `Err`, and the caller's guard puts the lockfile and out back.
+    async fn removals_pushed(
+        &self,
+        p: &loxone_config::Project,
+        why: &str,
+        before: Option<&str>,
+    ) -> Result<(String, String), String> {
+        if !self.upload_started() {
+            return Err(format!(
+                "{why}\nlox stopped before the upload: nothing changed on the Miniserver. The \
+                 lockfile and out were put back, so the removals are not kept."
+            ));
+        }
+        let confirmed =
+            std::fs::read(&p.out).map_err(|e| format!("{why}\ncannot read out: {e}"))?;
+        let runs = self
+            .what_runs(
+                &crate::history::blob_id(&confirmed),
+                before.unwrap_or(""),
+                ("the previous", "the one you confirmed"),
+            )
+            .await;
+        match runs {
+            Runs::Before => Err(format!(
+                "{why}\nThe Miniserver still runs the previous config, and no upload is waiting: \
+                 nothing changed. The lockfile and out were put back, so the removals are not kept."
+            )),
+            Runs::Unknown(how) => Err(format!(
+                "{why}\n⚠ lox failed after it started the upload, and vislox cannot tell which config \
+                 the Miniserver runs now ({how}). It may run the previous config or the one you \
+                 confirmed, with the blocks removed. The lockfile and out were put back, so the \
+                 project is at its last commit and what was pending, which may not be what runs: \
+                 check \"Which config the Miniserver runs\" in the History, then Pull or Sync."
+            )),
+            Runs::Pushed => {
+                std::fs::write(&p.base, &confirmed).map_err(|e| {
+                    format!(
+                        "{why}\n⚠ The Miniserver runs the config you confirmed, but vislox could \
+                         not record it ({e}). Pull or Sync."
+                    )
+                })?;
+                Ok((
+                    format!(
+                        "lox config push failed after the upload:\n{}",
+                        last_lines(why, 4)
+                    ),
+                    format!(
+                        "{UNVERIFIED}: lox failed after the upload, but the Miniserver runs the \
+                         program you confirmed, with the blocks removed (vislox downloaded it and \
+                         compared)."
+                    ),
+                ))
+            }
+        }
     }
 
     /// `lox config push` with `args`, followed (see [`Self::push_followed`]),
@@ -1282,6 +1380,86 @@ impl Actions {
             }
         }
         format!("{UNVERIFIED} by load: {}.", why.join("; "))
+    }
+
+    /// The running push got as far as lox's upload line: from then on the
+    /// Miniserver may run what it uploaded.
+    fn upload_started(&self) -> bool {
+        self.st
+            .lock()
+            .unwrap()
+            .progress
+            .as_mut()
+            .is_some_and(|p| p.get("upload").state != "wait")
+    }
+
+    /// Whether an upload waits in `/prog` to load on the next program start
+    /// (its name), from the Miniserver's own listing.
+    async fn upload_waiting(&self) -> Result<Option<String>, String> {
+        #[cfg(test)]
+        if let Some(w) = self.waiting.lock().unwrap().clone() {
+            return w;
+        }
+        if !self.s.running.available() {
+            return Err("whether an upload waits cannot be checked".into());
+        }
+        let r = self.s.running.get(true).await;
+        match (r.error, r.waiting) {
+            (Some(e), _) => Err(format!("/prog cannot be read: {e}")),
+            (None, w) => Ok(w),
+        }
+    }
+
+    /// After a push that failed once lox began the upload: download what the
+    /// Miniserver runs (read-only, `lox config download`) and compare it with
+    /// the program the push uploaded (`pushed`) and the one before
+    /// (`before`), each by blob id. `names`: how the messages call them.
+    async fn what_runs(&self, pushed: &str, before: &str, names: (&str, &str)) -> Runs {
+        let (before_name, pushed_name) = names;
+        let dir = self.s.project.as_deref().unwrap();
+        let scratch = match removals::scratch_dir("vislox-runs") {
+            Ok(d) => d,
+            Err(e) => return Runs::Unknown(e),
+        };
+        let _gone = RemoveDir(scratch.clone());
+        let zip = scratch.join("now.zip");
+        let z = zip.to_string_lossy();
+        if let Err(e) = run(
+            &self.s.lox,
+            &["config", "download", "--save-as", &z],
+            dir,
+            PUSH_TIMEOUT,
+        )
+        .await
+        {
+            return Runs::Unknown(format!("lox config download: {}", last_lines(&e, 1)));
+        }
+        let xml = match std::fs::read(&zip)
+            .map_err(|e| e.to_string())
+            .and_then(|z| {
+                loxone_config::archive::extract_and_decompress(&z).map_err(|e| e.to_string())
+            }) {
+            Ok(x) => x,
+            Err(e) => return Runs::Unknown(format!("its download cannot be read: {e}")),
+        };
+        let blob = crate::history::blob_id(&xml);
+        if blob == pushed {
+            return Runs::Pushed;
+        }
+        if blob != before {
+            return Runs::Unknown(format!(
+                "its newest program ({}) is neither {before_name} nor {pushed_name}",
+                &blob[..10]
+            ));
+        }
+        // The program from before: unless an upload waits to load on the next start.
+        match self.upload_waiting().await {
+            Err(e) => Runs::Unknown(format!("it runs {before_name} program, but {e}")),
+            Ok(Some(w)) => Runs::Unknown(format!(
+                "it runs {before_name} program, but {w} waits to be loaded"
+            )),
+            Ok(None) => Runs::Before,
+        }
     }
 
     /// Make the Miniserver's running config the project's base
@@ -5205,7 +5383,7 @@ esac
         DOC_A.replace("Haus", "Haus B")
     }
 
-    fn zip_of(xml: &[u8]) -> Vec<u8> {
+    pub(super) fn zip_of(xml: &[u8]) -> Vec<u8> {
         use std::io::Write;
         let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
         w.start_file("sps0.LoxCC", zip::write::SimpleFileOptions::default())
@@ -5728,6 +5906,19 @@ esac
             "{e}"
         );
         as_the_apply_left_it(&d, &head);
+        // It runs the Apply's, and nothing waits: nothing changed, put back.
+        *a.waiting.lock().unwrap() = Some(Ok(None));
+        let (_, e) = a
+            .rollback(&head, None, &ApplyOpts::default())
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            e.contains("The Miniserver still runs the Apply's config, and no upload is waiting"),
+            "{e}"
+        );
+        as_the_apply_left_it(&d, &head);
+        *a.waiting.lock().unwrap() = None;
         // It runs the rolled-back program: recorded as deployed, not verified.
         std::fs::write(t.join("runs.zip"), zip_of(DOC_A.as_bytes())).unwrap();
         let msg = a

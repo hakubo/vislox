@@ -335,4 +335,5 @@ directory: nothing goes to the Miniserver. See [features.md](features.md#apply-s
 
 Removing managed blocks (#70) adds nothing either: the plan (`POST /api/removals/plan`) and Apply's *Removals
 you confirmed* step run `lox logic compile` only, and the push is Apply's (`lox config push --force`, never
-`--allow-removals`).
+`--allow-removals`). Only when that push fails after its upload line, vislox downloads what the Miniserver runs
+and reads `/prog`, as for a Roll back.

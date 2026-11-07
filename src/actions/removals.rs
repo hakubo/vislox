@@ -512,7 +512,9 @@ mod tests {
     }
 
     /// [`project`] with this lockfile. `lox logic test` fails while the
-    /// file `failtest` exists, and `lox config push` while `pushfail` does.
+    /// file `failtest` exists, and `lox config push` while `pushfail` does
+    /// (before its upload) or `uploadfail` does (after it). `lox config
+    /// download` copies `runs.zip`, or fails while `download-fails` exists.
     #[cfg(unix)]
     fn project_with(lock: &str) -> (tempfile::TempDir, PathBuf, Actions) {
         use std::os::unix::fs::PermissionsExt;
@@ -564,6 +566,7 @@ case "$1 $2" in
   'logic diff') echo 'Remove the light' ;;
   'config push')
     [ -f '{dir}/pushfail' ] && {{ echo 'Downloading the live config...' >&2; echo 'Error: no answer' >&2; exit 1; }}
+    [ -f '{dir}/uploadfail' ] && {{ echo 'Downloading the live config...' >&2; echo 'Uploading as sps_new.zip...' >&2; echo 'Restarting the program...' >&2; echo 'Error: the Miniserver did not load the upload' >&2; exit 1; }}
     lost logic.lock.json && {{ printf 'Error: Compiling the module failed
 
 Caused by:
@@ -575,6 +578,9 @@ Caused by:
     echo 'Downloading the config again to verify...' >&2
     cp out.Loxone base.Loxone
     echo 'Pushed and verified.' >&2 ;;
+  'config download')
+    [ -f '{dir}/download-fails' ] && {{ echo 'Error: FTP: connection refused' >&2; exit 1; }}
+    cp '{dir}/runs.zip' "$4" ;;
   *) exit 2 ;;
 esac
 "#,
@@ -849,5 +855,87 @@ esac
             "{c}"
         );
         assert_eq!(std::fs::read(d.join("base.Loxone")).unwrap(), plan.compiled);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_push_with_removals_that_fails_after_its_upload_keeps_what_runs() {
+        let (tmp, d, a) = project();
+        let t = tmp.path();
+        let lock = d.join("logic.lock.json");
+        let as_before = |what: &str| {
+            assert_eq!(read(&lock), LOCK, "{what}: no tombstone left");
+            assert_eq!(read(&d.join("out.Loxone")), "compiled before\n", "{what}");
+            assert_eq!(read(&d.join("base.Loxone")), BASE, "{what}");
+        };
+        std::fs::write(t.join("uploadfail"), "").unwrap();
+        // vislox cannot tell what runs: it says so, and puts the project back.
+        std::fs::write(t.join("download-fails"), "").unwrap();
+        let plan = a.removal_plan().await.unwrap();
+        let e = a.apply(&consent(&plan)).await.err().unwrap().1;
+        assert!(e.contains("did not load the upload"), "{e}");
+        assert!(
+            e.contains("cannot tell which config the Miniserver runs now (lox config download: Error: FTP: connection refused)"),
+            "{e}"
+        );
+        assert!(
+            e.contains("\"Which config the Miniserver runs\" in the History, then Pull or Sync"),
+            "{e}"
+        );
+        as_before("download failed");
+        std::fs::remove_file(t.join("download-fails")).unwrap();
+        // It runs the previous program, but an upload waits to load: the same.
+        std::fs::write(
+            t.join("runs.zip"),
+            crate::actions::tests::zip_of(BASE.as_bytes()),
+        )
+        .unwrap();
+        *a.waiting.lock().unwrap() = Some(Ok(Some("sps_new.zip".into())));
+        let plan = a.removal_plan().await.unwrap();
+        let e = a.apply(&consent(&plan)).await.err().unwrap().1;
+        assert!(
+            e.contains("it runs the previous program, but sps_new.zip waits to be loaded"),
+            "{e}"
+        );
+        as_before("upload waiting");
+        // It runs the previous program, nothing waits: nothing changed, put back.
+        *a.waiting.lock().unwrap() = Some(Ok(None));
+        let plan = a.removal_plan().await.unwrap();
+        let e = a.apply(&consent(&plan)).await.err().unwrap().1;
+        assert!(
+            e.contains("still runs the previous config, and no upload is waiting"),
+            "{e}"
+        );
+        as_before("nothing changed");
+        assert!(a.info()["last"]["ok"] != true);
+        // It runs the program confirmed: kept, recorded as deployed, not verified.
+        let plan = a.removal_plan().await.unwrap();
+        std::fs::write(
+            t.join("runs.zip"),
+            crate::actions::tests::zip_of(&plan.compiled),
+        )
+        .unwrap();
+        let msg = a.apply(&consent(&plan)).await.unwrap();
+        assert!(
+            msg.contains("Not verified: lox failed after the upload, but the Miniserver runs the program you confirmed"),
+            "{msg}"
+        );
+        assert_eq!(a.info()["last"]["warn"], true);
+        assert_eq!(std::fs::read(d.join("base.Loxone")).unwrap(), plan.compiled);
+        assert!(
+            read(&lock).contains(r#""removed":{"U1""#),
+            "{}",
+            read(&lock)
+        );
+        let git = |args: &[&str]| {
+            let o = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&d)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        };
+        assert_eq!(git(&["status", "--porcelain"]), "");
+        assert_eq!(git(&["log", "-1", "--format=%s"]), "Remove the light");
     }
 }
