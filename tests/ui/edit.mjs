@@ -81,6 +81,8 @@ writeFileSync(fakeLox, `#!/usr/bin/env node
 const fs = require("fs");
 fs.appendFileSync(${JSON.stringify(calls)}, process.argv.slice(2).join(" ") + "\\n");
 if (process.argv.slice(2, 4).join(" ") !== "logic compile") { console.error("unexpected: " + process.argv.slice(2).join(" ")); process.exit(2); }
+// VISLOX_TEST_LOX_DELAY (ms): compile as slowly as a busy CI runner does.
+for (const end = Date.now() + (+process.env.VISLOX_TEST_LOX_DELAY || 0); Date.now() < end;);
 let out = fs.readFileSync("base.Loxone", "utf8").split("\\n");
 const file = "pages/vislox/edits.loxl";
 const src = fs.existsSync(file) ? fs.readFileSync(file, "utf8") : "";
@@ -199,9 +201,18 @@ try {
   // A refused edit answers 422 (the browser logs it as a failed request); anything else is an error.
   page.on("console", (m) => { if (m.type() === "error" && !/status of 422/.test(m.text())) errors.push(m.text()); });
   const edits = [];
-  page.on("request", (r) => { if (new URL(r.url()).pathname === "/api/edit") edits.push(JSON.parse(r.postData())); });
-  const statuses = [];
-  page.on("response", (r) => { if (new URL(r.url()).pathname === "/api/edit") statuses.push(r.status()); });
+  // Each edit request, and the status its response came back with (by request: a response event may
+  // reach this script after the next request's).
+  const reqs = [], statuses = [];
+  page.on("request", (r) => { if (new URL(r.url()).pathname === "/api/edit") { reqs.push(r); edits.push(JSON.parse(r.postData())); } });
+  page.on("response", (r) => { const i = reqs.indexOf(r.request()); if (i >= 0) statuses[i] = r.status(); });
+  /** Wait in this script until `ok()` holds. */
+  const until = async (ok, what, ms = 20000) => {
+    for (const end = Date.now() + ms; !ok();) {
+      if (Date.now() > end) throw new Error(`timed out waiting for ${what}`);
+      await new Promise((r) => setTimeout(r, 50));
+    }
+  };
   page.on("dialog", (d) => d.accept());
   await page.addInitScript(() => localStorage.setItem("vislox.token", "secret"));
   await page.goto(`http://127.0.0.1:${port}/`);
@@ -216,16 +227,23 @@ try {
   const waitText = (sel, re) => page.waitForFunction(([s, src]) => new RegExp(src).test(document.querySelector(s)?.textContent || ""), [sel, re.source], { timeout: 10000 });
   // Undo and redo (#62): the key, then the one request it sent, once the page settled on what it
   // compiled (`done`: what the page shows then).
-  const settled = () => page.waitForFunction(() => !UNDO.busy && S.viewRev === S.rev && S.rev === editRev()?.id, null, { timeout: 10000 });
+  // Settled: no undo or redo queued or sent, nothing compiling on the server, the newest config shown,
+  // and Properties not waiting for a compile.
+  const SETTLED = `!UNDO.busy && !UNDO.inflight && !S.hist?.actions?.running && S.viewRev === S.rev && S.rev === editRev()?.id &&
+    !/Compiling…|Undo or redo is compiling/.test(document.querySelector("#props")?.textContent || "")`;
+  const settled = () => page.waitForFunction(SETTLED, null, { timeout: 20000 });
   const undoKey = async (redo, done, arg) => {
     const n = edits.length;
     await page.evaluate(() => document.activeElement?.blur());
     await page.keyboard.press(redo ? "Control+Shift+z" : "Control+z");
-    await page.waitForFunction(done, arg, { timeout: 10000 });
+    await until(() => edits.length > n && statuses[n] !== undefined, `the ${redo ? "redo" : "undo"} request`);
+    await page.waitForFunction(done, arg, { timeout: 20000 });
     await settled();
     assert.equal(edits.length, n + 1, "one request");
+    assert.equal(statuses[n], 200);
     return edits[n].ops;
   };
+
 
   await step("nothing is pending, and Properties offers to edit the Divide block", async () => {
     await page.waitForSelector("#deploy-pane:not(.hidden)");
@@ -315,13 +333,15 @@ try {
     await page.fill(field("title"), t);
     await page.press(field("title"), "Enter");
   };
-  const titleIs = (t) => page.waitForFunction((t) => S.view?.objects["10000006-0000-0060-ffff504f94000001"]?.title === t && !UNDO.busy && !UNDO.inflight && S.viewRev === S.rev && S.rev === editRev()?.id, t, { timeout: 15000 });
+  // The Divide block named `t`, and the page settled (both at once: a name read mid-compile is no answer).
+  const titleIs = (t) => page.waitForFunction(`S.view?.objects["${DIV}"]?.title === ${JSON.stringify(t)} && ${SETTLED}`, null, { timeout: 20000 });
   await step("a quick Ctrl+Z right after a save undoes that save, and quick steps wait their turn", async () => {
-    const n = edits.length, k = statuses.length;
+    const n = edits.length;
     await saveTitle("Schnell");
     // At once: the save is still compiling, and the History has not shown it.
     await page.evaluate(() => document.activeElement?.blur());
     await page.keyboard.press("Control+z");
+    await until(() => edits.length >= n + 2 && statuses[n + 1] !== undefined, "the save, then its undo");
     await titleIs("Teiler");
     assert.equal(edits.length, n + 2, "the save, then its undo");
     assert.deepEqual(edits[n + 1].ops, [{ op: "title", uuid: DIV, value: "Teiler" }]);
@@ -329,12 +349,11 @@ try {
     await page.keyboard.press("Control+Shift+z");
     await page.keyboard.press("Control+z");
     await page.keyboard.press("Control+Shift+z");
+    await until(() => edits.length >= n + 5 && statuses[n + 4] !== undefined, "three steps");
     await titleIs("Schnell");
-    await page.waitForFunction(() => !UNDO.busy);
     assert.equal(edits.length, n + 5);
-    assert.deepEqual(statuses.slice(k), [200, 200, 200, 200, 200], "no stale base, no 409");
-    await page.keyboard.press("Control+z");
-    await titleIs("Teiler");
+    assert.deepEqual(statuses.slice(n, n + 5), [200, 200, 200, 200, 200], "no stale base, no 409");
+    await undoKey(false, (u) => S.view?.objects[u]?.title === "Teiler", DIV);
   });
   await step("an undo that changes nothing is done, and its redo kept", async () => {
     await saveTitle("Gleich");
@@ -343,13 +362,12 @@ try {
     await page.route("**/api/edit", (r) => r.continue({ postData: JSON.stringify({ ...JSON.parse(r.request().postData()), ops: [{ op: "title", uuid: DIV, value: "Gleich" }] }) }), { times: 1 });
     await page.keyboard.press("Control+z");
     await waitText("#deploy-msg", /Undone: Name of .*Nothing changed/);
-    await page.waitForFunction(() => !UNDO.busy && /Gleich/.test(UNDO.undone.at(-1)?.label || ""));
+    await page.waitForFunction(`/Gleich/.test(UNDO.undone.at(-1)?.label || "") && ${SETTLED}`, null, { timeout: 20000 });
     assert.equal(await page.evaluate(() => UNDO.note), "");
     // Its redo is the edit as made (the config already is that way), and the undo after it is real.
     await page.keyboard.press("Control+Shift+z");
-    await page.waitForFunction(() => !UNDO.busy && /Gleich/.test(UNDO.done.at(-1)?.label || "") && !UNDO.undone.length);
-    await page.keyboard.press("Control+z");
-    await titleIs("Teiler");
+    await page.waitForFunction(`/Gleich/.test(UNDO.done.at(-1)?.label || "") && !UNDO.undone.length && ${SETTLED}`, null, { timeout: 20000 });
+    await undoKey(false, (u) => S.view?.objects[u]?.title === "Teiler", DIV);
   });
   await step("a redo whose reply has no undo clears the history and says why", async () => {
     await page.route("**/api/edit", async (r) => {
@@ -360,7 +378,7 @@ try {
     }, { times: 1 });
     await page.keyboard.press("Control+Shift+z");
     await titleIs("Gleich");
-    await page.waitForFunction(() => !UNDO.done.length && !UNDO.undone.length);
+    await page.waitForFunction(`!UNDO.done.length && !UNDO.undone.length && ${SETTLED}`, null, { timeout: 20000 });
     assert.match(await page.evaluate(() => UNDO.note), /cannot be undone: op 1 \(title\): no way back for the test\. The undo history was cleared\./);
     await waitText("#deploy-msg", /cannot be undone/);
     await page.waitForSelector("#btn-undo[disabled]", { state: "attached" });
@@ -768,6 +786,7 @@ try {
     // The key sends nothing now.
     const n = edits.length;
     await page.keyboard.press("Control+z");
+    await page.waitForTimeout(500);
     assert.equal(edits.length, n);
   });
   await step("a compile made outside this tab clears it too", async () => {
