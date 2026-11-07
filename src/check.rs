@@ -163,36 +163,31 @@ pub struct Finding {
 }
 
 /// `lox logic lint`'s standard output, read: each kind (`unused-let (2)`),
-/// its findings (`  pages/a.loxl: `slug` — detail`, the file only in a
-/// directory module), and the count it ends with (`lint: 3 findings …` or
-/// `lint: clean`). `None` without that count: lox failed (it exits 1 for
-/// findings and for errors alike) or is not one vislox can read. lox has
-/// no JSON for lint yet, so this reads the text it prints.
+/// its findings (`` pages/a.loxl: `slug` — detail ``, indented by two, the
+/// file only in a directory module), and the count it ends with (`lint: 3
+/// findings …` or `lint: clean`). Any other line after a finding goes on
+/// with that finding's detail, up to the next kind. `None` without the
+/// count: lox failed (it exits 1 for findings and for errors alike) or is
+/// not one vislox can read. lox has no JSON for lint yet, so this reads the
+/// text it prints.
 pub fn parse_lint(stdout: &str, file: impl Fn(&str) -> String) -> Option<Vec<Finding>> {
     let mut out: Vec<Finding> = Vec::new();
     let mut kind: Option<String> = None;
-    let mut done = false;
+    // Whether the last finding is of the current kind: a line that goes on
+    // goes on with it.
+    let mut open = false;
     for l in stdout.lines() {
         if l == "lint: clean" || (l.starts_with("lint: ") && l.contains(" finding")) {
-            done = true;
-            break;
+            return Some(out);
         }
-        if let Some(rest) = l.strip_prefix("  ") {
-            let Some(k) = &kind else { continue };
-            let (f, rest) = match rest.find('`') {
-                Some(i) => (rest[..i].strip_suffix(": "), &rest[i + 1..]),
-                None => {
-                    // A detail that goes on over more lines.
-                    if let Some(last) = out.last_mut() {
-                        last.message.push('\n');
-                        last.message.push_str(rest.trim());
-                    }
-                    continue;
-                }
-            };
-            let Some((name, message)) = rest.split_once("` — ") else {
-                continue;
-            };
+        if let Some(k) = lint_kind(l) {
+            kind = Some(k.to_string());
+            open = false;
+            continue;
+        }
+        if let Some(k) = &kind
+            && let Some((f, name, message)) = lint_finding(l)
+        {
             out.push(Finding {
                 kind: k.clone(),
                 name: name.to_string(),
@@ -201,21 +196,58 @@ pub fn parse_lint(stdout: &str, file: impl Fn(&str) -> String) -> Option<Vec<Fin
                 line: None,
                 blocks: Vec::new(),
             });
-        } else if let Some((k, n)) = l
-            .trim_end()
-            .strip_suffix(')')
-            .and_then(|l| l.split_once(" ("))
-            && !k.is_empty()
-            && !k.contains(' ')
-            && n.parse::<usize>().is_ok()
+            open = true;
+            continue;
+        }
+        if open
+            && !l.trim().is_empty()
+            && let Some(last) = out.last_mut()
         {
-            kind = Some(k.to_string());
-        } else if !l.starts_with(' ') && l.contains("` — ") {
-            // An indented line that lost its indent: not lox's format.
-            return None;
+            last.message.push('\n');
+            last.message.push_str(l.trim());
         }
     }
-    done.then_some(out)
+    None
+}
+
+/// A kind's header, `dead-outputs (2)`: its kind.
+fn lint_kind(l: &str) -> Option<&str> {
+    let (k, n) = l.strip_suffix(')')?.split_once(" (")?;
+    let ok = k.starts_with(|c: char| c.is_ascii_lowercase())
+        && k.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && !n.is_empty()
+        && n.bytes().all(|b| b.is_ascii_digit());
+    ok.then_some(k)
+}
+
+/// A finding's line: two spaces, the file and `: ` when lox names one,
+/// then `` `name` — `` and the detail. The file and the name hold no
+/// backtick.
+fn lint_finding(l: &str) -> Option<(Option<&str>, &str, &str)> {
+    let rest = l.strip_prefix("  ")?;
+    let (file, rest) = match rest.strip_prefix('`') {
+        Some(r) => (None, r),
+        None => {
+            let (f, r) = rest.split_once(": `")?;
+            if f.is_empty() || f.contains('`') || f.starts_with(' ') {
+                return None;
+            }
+            (Some(f), r)
+        }
+    };
+    let (name, message) = rest.split_once("` — ")?;
+    if name.is_empty() || name.contains('`') {
+        return None;
+    }
+    Some((file, name, message))
+}
+
+/// Whether a `lox logic lint` that gave no count is a lox without it:
+/// lox's usage error (exit 2, `unknown command`), not a lint that failed.
+pub fn lint_unsupported(code: Option<i32>, stdout: &str, stderr: &str) -> bool {
+    let said = |t: &str| t.contains("unknown command") || t.contains("unrecognized subcommand");
+    code == Some(2) || said(stdout) || said(stderr)
 }
 
 /// Pin each finding to where its name is declared (the file lox named, or
@@ -550,6 +582,92 @@ mod tests {
             parse_lint("unused-let (1)\n  `c` — x\n", str::to_string),
             None
         );
+    }
+
+    /// lox 0.83's own output (`lox logic lint .` on a project of two files).
+    const REAL: &str = "unused-template (1)
+  pages/b.loxl: `Unbenutzt` — declared but never instantiated
+unit-suffix (1)
+  pages/a.loxl: `m` — `Time: 10800` reads better with its unit. Write `Time: 3h` instead of `Time: 10800`.
+unused-let (1)
+  pages/a.loxl: `unused_c` — constant is never referenced
+unused-extern (1)
+  pages/a.loxl: `e2` — extern Div is never referenced
+dead-outputs (1)
+  pages/a.loxl: `x` — no wire draws from any of its ports (compiled config, GUI wires included)
+unused-allow (1)
+  pages/b.loxl: `y` — `# lint: allow dead-outputs because why not` covers no finding. Remove it, or check that it names the right kind.
+lint: 6 findings (1 fixable with `loxl lint --fix`)
+";
+
+    #[test]
+    fn lox_s_own_output_is_read_finding_by_finding() {
+        let f = parse_lint(REAL, str::to_string).unwrap();
+        let k: Vec<_> = f
+            .iter()
+            .map(|f| (f.kind.as_str(), f.name.as_str(), f.file.as_deref().unwrap()))
+            .collect();
+        assert_eq!(
+            k,
+            vec![
+                ("unused-template", "Unbenutzt", "pages/b.loxl"),
+                ("unit-suffix", "m", "pages/a.loxl"),
+                ("unused-let", "unused_c", "pages/a.loxl"),
+                ("unused-extern", "e2", "pages/a.loxl"),
+                ("dead-outputs", "x", "pages/a.loxl"),
+                ("unused-allow", "y", "pages/b.loxl"),
+            ]
+        );
+        assert_eq!(
+            f[5].message,
+            "`# lint: allow dead-outputs because why not` covers no finding. Remove it, or check that it names the right kind."
+        );
+    }
+
+    #[test]
+    fn a_detail_over_several_lines_stays_with_its_finding_and_its_kind() {
+        // Wrapped lines, one with backticks and a dash, one indented like a
+        // finding but not one; and none that goes on across a kind.
+        let out = "dead-outputs (1)
+  pages/a.loxl: `x` — no wire draws from any of its ports;
+the `Q` — output feeds nothing
+  and `x.Q` goes nowhere
+unused-let (1)
+stray line before any finding of this kind
+  `c` — constant is never referenced
+lint: 2 findings
+";
+        let f = parse_lint(out, str::to_string).unwrap();
+        assert_eq!(f.len(), 2, "{f:?}");
+        assert_eq!(
+            f[0].message,
+            "no wire draws from any of its ports;\nthe `Q` — output feeds nothing\nand `x.Q` goes nowhere"
+        );
+        assert_eq!(
+            (f[1].kind.as_str(), f[1].name.as_str()),
+            ("unused-let", "c")
+        );
+        assert_eq!(f[1].message, "constant is never referenced");
+    }
+
+    #[test]
+    fn a_lox_without_lint_is_told_from_a_lint_that_failed() {
+        assert!(lint_unsupported(
+            Some(2),
+            "",
+            "unknown command `lint`. Run `lox logic help`."
+        ));
+        assert!(lint_unsupported(
+            Some(2),
+            "",
+            "error: unrecognized subcommand 'logic'"
+        ));
+        assert!(!lint_unsupported(
+            Some(1),
+            "",
+            "error: compile for dead-output analysis failed: boom"
+        ));
+        assert!(!lint_unsupported(None, "", ""));
     }
 
     #[test]

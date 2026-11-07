@@ -247,7 +247,9 @@ and the review would show an older change than the one in the source. So vislox 
 - **Kept under the files lox read.** The key's module and lock part is taken when the watcher or the poll looks.
   A file changed since (and maybe changed back before the next look) would keep what lox said of the change under
   the key of the files after it. So the worker looks at the module and lock itself before and after lox runs, and
-  keeps the check only when both looks are the key's; when the key lags, the look that catches up wakes it again.
+  keeps the check only when both looks are the key's. When the key lags the files, the worker brings its module
+  and lock part up to date itself and checks again, rather than waiting for the next look. Its own look rereads
+  and rehashes only a file (or the lock) whose size or time changed, off the async worker.
 - The worker never checks while an action (an edit, Compile, Apply, Sync, Discard) runs: that check would be of a
   project half written. It keeps nothing then, and the action's end wakes it, so a check skipped during an Apply
   that failed and changed no file comes back as it was.
@@ -298,13 +300,22 @@ blocks whose outputs feed nothing in the compiled config, Touch Pure Flex comman
 none, users whose NFC tag or code opens no Code Touch, values outside a port's range, bare times that read better
 with a unit, and more. vislox shows them; it never runs `--fix`.
 
-- **Same check, same key.** The check worker runs `lox logic lint .` in the project beside `check` and `fmt
-  --check`, under the same compile lock and on the same key (module files, lock, base, out), so a request never
-  runs it. Lint compiles the module in memory for its dead-output analysis and writes nothing. While the module
-  does not compile, lint's result is dropped (`lint: null`): it would only repeat the errors.
+- **Same check, same key, second step.** The check worker runs `lox logic lint .` in the project on the same key
+  (module files, lock, base, out), so a request never runs it; but only after `check` and `fmt --check` came back
+  without errors, and after that check is kept and told to the browsers. So errors never wait for lint (which
+  compiles, and may take long). While the module does not compile, lint does not run (`lint: null`).
+- **Lint gives way.** Lint compiles the module in memory for its dead-output analysis and writes nothing, so it
+  does not hold the compile lock: an edit, Compile or Apply never waits for it. An action that starts while it
+  runs stops it (the process is killed); the action's end wakes the worker, which lints the files as they are
+  then. A lint whose files changed while it ran is not kept. Until lint is done, `lint` is `{ available: true,
+  running: true, findings }` with the last lint's findings, so badges don't flicker on every change.
+- **A lox without lint** (usage error: exit 2, `unknown command`) is found out once, by the lox binary's path,
+  time and size: `lint` is `{ available: false, unsupported: true, reason }`, the browser says so in one quiet
+  line, and lint is not asked again until that binary changes.
 - **What lox prints.** lox has no JSON for lint (yet), so `check::parse_lint` reads its text: a header per kind
-  (`dead-outputs (2)`), a line per finding (`` pages/a.loxl: `slug` — detail ``, indented; the file only in a directory
-  module), and the count it ends with (`lint: 3 findings`, or `lint: clean`). Without that count the run failed
+  (`dead-outputs (2)`), a line per finding (two spaces, then `` pages/a.loxl: `slug` — detail ``; the file only in a
+  directory module), and the count it ends with (`lint: 3 findings`, or `lint: clean`). Any other line after a
+  finding goes on with its detail, up to the next kind's header. Without that count the run failed
   (lox exits 1 for findings and for errors alike), and `lint` is `{ available: false, reason }` with lox's last
   lines.
 - **Pinned like errors.** `check::locate_findings` gives each finding the line of its name's one top-level
@@ -320,8 +331,8 @@ with a unit, and more. vislox shows them; it never runs `--fix`.
 The browser, on the newest config only (as errors): an amber warning badge at the upper right of each block a
 finding names, its tooltip the findings; the findings in Properties' *Lox Logic* section; on an NFC Code Touch,
 the `no-access-right` findings (lox names the user, not a Code Touch); and *Lint: N findings* below Apply, folded,
-by kind, each with `file:line`, the name, lox's message and a button per block that shows it on its page. When
-lint didn't run, that box says why.
+by kind, each with `file:line`, the name, lox's message and a button per block that shows it on its page. The
+list, too, shows only while the newest config is shown. When lint didn't run, that box says why.
 
 ## Undo and redo (#62)
 

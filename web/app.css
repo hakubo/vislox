@@ -547,6 +547,7 @@ rect.ghost, line.ghost { fill: #1f6fd10a; stroke: var(--moved); stroke-opacity: 
 .deploy-check .ck-fmt { margin-top: 4px; color: var(--muted); font-weight: 400; }
 .ck-err { color: var(--removed); }
 .deploy-lint summary { cursor: pointer; }
+.deploy-lint.quiet { background: none; padding: 2px 0; font-size: 11px; }
 .deploy-lint .lt-kind > ul { margin-top: 2px; padding-left: 10px; }
 .deploy-lint .lt-k { font-family: ui-monospace, "DejaVu Sans Mono", monospace; font-weight: 600; }
 .lt-note { color: var(--changed); }

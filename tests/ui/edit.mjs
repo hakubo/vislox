@@ -99,6 +99,8 @@ if (process.argv.slice(2, 5).join(" ") === "logic fmt --check") process.exit(0);
 // \`logic lint .\` (#66): dead outputs on each block of the module's own files declared on a line that ends
 // in "# dead", and a user whose tag opens no Code Touch when a file says NOTAG; printed as lox prints them.
 if (process.argv.slice(2, 5).join(" ") === "logic lint .") {
+  // Lint compiles in memory: as slow as a compile (VISLOX_TEST_LOX_DELAY, below).
+  for (const end = Date.now() + (+process.env.VISLOX_TEST_LOX_DELAY || 0); Date.now() < end;);
   const dead = own().flatMap(([path, lines]) => lines.flatMap((l) => { const m = l.match(/^(\\w+) = .*# dead$/); return m ? [\`  \${path}: \\\`\${m[1]}\\\` — no wire draws from any of its ports (compiled config, GUI wires included)\`] : []; }));
   const access = own().some(([, lines]) => lines.some((l) => l.includes("NOTAG")))
     ? ["  \\\`Anna\\\` — user with an NFC tag has no access right on any NFC Code Touch, so the tag or code opens nothing."] : [];

@@ -1691,7 +1691,7 @@ $("sel-base").onchange = (e) => { S.base = e.target.value || null; S.follow = fa
 $("chk-changes").onchange = (e) => {
   S.marks = e.target.checked;
   if (!S.view) return;
-  renderLegend(); renderTabs(); renderTree(); renderPage(); renderProps(); applyFocus(); renderModes();
+  renderLegend(); renderTabs(); renderTree(); renderPage(); renderProps(); applyFocus(); renderModes(); renderLint();
 };
 $("chk-live").onchange = (e) => setLive(e.target.checked);
 $("chk-live-dim").checked = S.live.dim;
@@ -2517,7 +2517,13 @@ S.checkKey = null;
 S.checkSeq = 0;
 async function loadCheck() {
   const seq = ++S.checkSeq;
-  if (!S.hist?.actions?.shown) { S.check = null; renderActions(); return; }
+  if (!S.hist?.actions?.shown) {
+    const was = lintSet();
+    S.check = null;
+    if (S.view && lintSet() !== was) { renderPage(); applyFocus(); }
+    renderActions();
+    return;
+  }
   let c;
   try { c = await api("/api/check"); } catch { c = null; }
   // An older request answering late does not overwrite a newer one.
@@ -2581,12 +2587,16 @@ function goButtons(uuids) {
 // outputs feed nothing, users whose tag opens no Code Touch, and more. The Deploy pane lists every finding
 // by kind with its file, line and blocks; each block gets a warning badge and the finding in Properties.
 // Findings are hints: Apply never waits for them.
+// Like the badges, the list is about the newest config only: it shows while that revision is shown.
+// While lint runs again, the last findings stay up; a lox without lint says so once, quietly.
 function renderLint() {
   const box = $("deploy-lint"), c = S.check;
-  const l = c?.available && !checkBroken() ? c.lint : null;
+  const l = c?.available && !checkBroken() && S.rev === editRev()?.id ? c.lint : null;
   const list = l?.available ? l.findings || [] : [];
   box.classList.toggle("hidden", !l || (l.available && !list.length));
+  box.classList.toggle("quiet", !!l?.unsupported);
   if (!l) { box.innerHTML = ""; return; }
+  if (l.unsupported) { box.innerHTML = `<div class="ck-sub">No lint findings: ${esc(l.reason || "this lox has no lox logic lint")}.</div>`; return; }
   if (!l.available) { box.innerHTML = `<div class="ck-h">Lint didn't run</div><div class="ck-sub">${esc(l.reason || "")}</div>`; return; }
   const open = box.querySelector("details")?.open ?? false;
   const kinds = [...new Set(list.map((f) => f.kind))];
@@ -2595,7 +2605,7 @@ function renderLint() {
     return `<li class="lt-kind"><span class="lt-k">${esc(k)}</span> (${of.length})<ul>${of.map((f) =>
       `<li>${f.file ? `<span class="ck-at">${esc(checkAt(f))}</span>` : ""}<span class="mono">${esc(f.name)}</span>: ${esc(f.message)} ${goButtons(f.blocks)}</li>`).join("")}</ul></li>`;
   });
-  box.innerHTML = `<details${open ? " open" : ""}><summary><span class="ck-h">Lint: ${plural(list.length, "finding")}</span> · hints from lox logic lint; Apply doesn't wait for them</summary><ul>${items.join("")}</ul></details>`;
+  box.innerHTML = `<details${open ? " open" : ""}><summary><span class="ck-h">Lint: ${plural(list.length, "finding")}</span>${l.running ? " · linting the latest change…" : ""} · hints from lox logic lint; Apply doesn't wait for them</summary><ul>${items.join("")}</ul></details>`;
 }
 /** Show the block a button of the check or lint list names, on its page. */
 function goClicked(e) {
