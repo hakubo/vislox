@@ -347,6 +347,19 @@ sends to the Miniserver see [miniserver.md](miniserver.md).
   shows as added in the pending revision. Drag an end of a wire drawn here to reconnect it; click a wire for its
   card, with *Delete* (or the Delete key) and *Revert*. A wire Loxone Config drew is removed in Loxone Config.
 
+- **Adopt blocks** (the same project and token, #72): Properties of a block Loxone Config drew offers *Manage with
+  Lox Logic*, with the slug it gets (`vx_…`, from its name if left empty). *Adopt* runs `lox logic adopt` on a
+  copy of the module and lockfile, moves the declaration lox writes into vislox's file of the page (its wired
+  neighbours as vislox's externs, pinned by UUID), adds the block to the lockfile and compiles. The block keeps its
+  UUIDs; vislox checks that the config is exactly what it was, the block exactly as the base has it, and refuses
+  otherwise. From then on the block is managed (λ): it is moved, renamed, given constants and settings, and wired
+  like a block added here. *Adopt all*, next to *Arrange*, adopts every block of the page lox can rebuild and
+  says why the rest stay Loxone Config's (lox's own reason, or a warning). Nothing is pending afterwards, since
+  nothing the Miniserver runs changed: the adoption goes into git with the next Apply, and Undo (or *Hand back*)
+  gives the block back to Loxone Config. Properties says why a block cannot be adopted (values or wires edited
+  here, an extern of the module's own files), and *Hand back* why it is off. How:
+  [editing.md](editing.md#adopting-blocks-72).
+
 For a `lox.toml` project:
 
 ```bash

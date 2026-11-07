@@ -134,6 +134,35 @@ if (process.argv.slice(2, 5).join(" ") === "logic test .") {
   console.log(out.join("\\n") + \`\\n\${n} tests: \${n - failed} passed, \${failed} failed\`);
   process.exit(failed ? 1 : 0);
 }
+// \`logic adopt <base> --uuid U --as S --module M --lock L\` (#72): as lox, it appends the block's declaration to
+// M's file of its page (opened by its page line) and pins its UUID, layout and page in L; the Divide block's
+// dividend comes from the virtual input, an extern lox names by its iname. It refuses an input reference.
+if (process.argv.slice(2, 4).join(" ") === "logic adopt") {
+  const [cfg, uuid, slug, mod, lockPath] = [4, 6, 8, 10, 12].map((i) => process.argv[i]);
+  const lines = fs.readFileSync(cfg, "utf8").split("\\n");
+  const i = lines.findIndex((l) => l.includes(\`U="\${uuid}"\`) && l.includes("<C "));
+  const ty = lines[i].match(/Type="(\\w+)"/)[1], title = lines[i].match(/Title="([^"]*)"/)?.[1] || "";
+  if (ty === "InputRef") {
+    console.error(\`error: compile error: cannot adopt InputRef "\${title}" (uuid \${uuid}): attribute \\\`Ref\\\` is not understood by the rebuild and would be lost\`);
+    process.exit(1);
+  }
+  let p = i;
+  while (p >= 0 && !lines[p].includes('Type="Page"')) p--;
+  const pageTitle = lines[p].match(/Title="([^"]*)"/)[1], pageUuid = lines[p].match(/U="([^"]+)"/)[1];
+  const file = \`\${mod}/\${pageTitle.toLowerCase().replace(/[^a-z0-9]+/g, "_")}.loxl\`;
+  const lk = JSON.parse(fs.readFileSync(lockPath, "utf8"));
+  const wired = uuid === ${JSON.stringify(DIV)};
+  let text = fs.existsSync(file) ? fs.readFileSync(file, "utf8") + "\\n" : \`page "\${pageTitle}"\\n\\n\`;
+  if (wired) text += 'extern temperatur = VirtualIn(iname: "VI1")\\n';
+  text += \`\${slug} = \${ty}("\${title}"\${wired ? ", In1: temperatur" : ""})\\n\`;
+  fs.writeFileSync(file, text);
+  const at = lines[i].match(/Px="(-?\\d+)" Py="(-?\\d+)" Px2="(-?\\d+)" Py2="(-?\\d+)"/);
+  lk.objects = { ...lk.objects, [slug]: { uuid, type: ty, page_uuid: pageUuid, layout: { px: +at[1], py: +at[2], px2: +at[3], py2: +at[4] } } };
+  if (wired) lk.externals = { ...lk.externals, temperatur: { uuid: "10000001-0000-0010-ffff504f94000001", matched_by: "iname" } };
+  fs.writeFileSync(lockPath, JSON.stringify(lk));
+  console.log(\`adopted uuid \${uuid} as \\\`\${slug}\\\` on page "\${pageTitle}"\`);
+  process.exit(0);
+}
 if (process.argv.slice(2, 4).join(" ") !== "logic compile") { console.error("unexpected: " + process.argv.slice(2).join(" ")); process.exit(2); }
 // VISLOX_TEST_LOX_DELAY (ms): compile as slowly as a busy CI runner does.
 for (const end = Date.now() + (+process.env.VISLOX_TEST_LOX_DELAY || 0); Date.now() < end;);
@@ -178,6 +207,14 @@ for (const f of fs.existsSync("pages/vislox") ? fs.readdirSync("pages/vislox") :
     if ((m = line.match(/^page "(.*)"$/))) { pageAt = out.findIndex((l) => l.includes('Type="Page"') && l.includes(\`Title="\${m[1]}"\`)); continue; }
     if (!(m = line.match(/^(vx_\\w+) = (\\w+)\\((.*)\\)$/))) continue;
     const [, slug, ty, rest] = m;
+    // A block adopted here (#72) is drawn in the base already: it keeps it, with the name its declaration gives.
+    const kept = lock.objects[slug]?.uuid, k = kept ? out.findIndex((l) => l.includes(\`U="\${kept}"\`) && l.includes("<C ")) : -1;
+    if (k >= 0) {
+      objects[slug] = { ...lock.objects[slug] };
+      const t = rest.match(/^"((?:[^"\\\\]|\\\\.)*)"/);
+      if (t) out[k] = out[k].replace(/Title="[^"]*"/, \`Title="\${xml(JSON.parse('"' + t[1] + '"'))}"\`);
+      continue;
+    }
     const uuid = lock.objects[slug]?.uuid || \`bbbbbb\${String(++n).padStart(2, "0")}-0000-0000-ffff504f94000001\`;
     const page_uuid = out[pageAt].match(/U="([^"]+)"/)[1];
     objects[slug] = { uuid, type: ty, page_uuid, layout: lock.objects[slug]?.layout || { px: 96, py: 96, px2: 1440, py2: 792 } };
@@ -943,6 +980,87 @@ try {
     await page.waitForFunction(() => /Nothing pending/.test(document.querySelector("#deploy-pend")?.textContent || ""), null, { timeout: 10000 });
     assert.equal(existsSync(join(dir, "pages/vislox")), false);
   });
+  await step("a block Loxone Config drew is adopted into the module, and the config stays as it is (#72)", async () => {
+    const outWas = readFileSync(join(dir, "out.Loxone"), "utf8"), lockWas = readFileSync(join(dir, "logic.lock.json"), "utf8");
+    await pick(DIV);
+    await page.waitForSelector('#props [data-ed="adopt-open"]:not([disabled])');
+    await page.click('#props [data-ed="adopt-open"]');
+    // A slug that is not vislox's is refused in the browser.
+    const n = edits.length;
+    await page.fill("#ad-slug", "Teiler");
+    await page.press("#ad-slug", "Enter");
+    await waitText("#props", /A slug is vx_ and then lowercase letters/);
+    assert.equal(edits.length, n);
+    await page.fill("#ad-slug", "vx_teiler");
+    await page.click('#props [data-ed="adopt"]');
+    await page.waitForFunction((u) => S.edits?.blocks?.some((b) => b.uuid === u && b.adopted), DIV, { timeout: 20000 });
+    await settled();
+    assert.deepEqual(edits.at(-1).ops, [{ op: "adopt", blocks: [{ uuid: DIV, slug: "vx_teiler" }] }]);
+    await waitText("#props", /Adopted as vx_teiler: the config is unchanged/);
+    await waitText('[data-body="Edit"]', /Lox Logic\s*adopted here/);
+    // Managed now, declared in vislox's file of its page; its wire's source is vislox's extern, by UUID.
+    await page.waitForSelector(`.blk.managed[data-uuid="${DIV}"] .mbadge`);
+    await waitText('[data-body="Lox Logic"]', /vx_teiler[\s\S]*pages\/vislox\/erdgeschoss\.loxl:\d+/);
+    const file = readFileSync(join(dir, "pages/vislox/erdgeschoss.loxl"), "utf8");
+    assert.match(file, /^# page uuid: 10000002-0000-0020-ffff504f94000001\npage "Erdgeschoss"$/m);
+    assert.match(file, /^vx_teiler = Div\("O1002", In1: vx_10000001_0000_0010_ffff504f94000001\)$/m);
+    assert.match(readFileSync(join(dir, "pages/vislox/edits.loxl"), "utf8"), /^extern vx_10000001_0000_0010_ffff504f94000001 = VirtualIn\(uuid: "10000001-0000-0010-ffff504f94000001"\)$/m);
+    assert.equal(JSON.parse(readFileSync(join(dir, "logic.lock.json"), "utf8")).objects.vx_teiler.uuid, DIV);
+    // Nothing the Miniserver runs changed: nothing pending, and the adoption goes into git with the next Apply.
+    assert.equal(readFileSync(join(dir, "out.Loxone"), "utf8"), outWas);
+    await waitText("#deploy-pend", /1 block adopted here goes into git with the next Apply/);
+    // Its name is edited in its declaration, like a block added here; undone, the declaration has it back.
+    await page.click('#props [data-ed="open"]');
+    assert.deepEqual(await page.$$eval("#props [data-ed-field]", (x) => x.map((f) => f.dataset.edField)), ["title", "p:Input2"]);
+    await page.fill(field("title"), "Teiler");
+    await page.press(field("title"), "Enter");
+    await page.waitForFunction(() => S.rev?.startsWith("pending:") && S.viewRev === S.rev, null, { timeout: 15000 });
+    assert.match(readFileSync(join(dir, "pages/vislox/erdgeschoss.loxl"), "utf8"), /^vx_teiler = Div\("Teiler", In1: /m);
+    await settled();
+    await undoKey(false, () => !S.rev?.startsWith("pending:"));
+    assert.match(readFileSync(join(dir, "pages/vislox/erdgeschoss.loxl"), "utf8"), /^vx_teiler = Div\("O1002", In1: /m);
+    // Undo hands it back to Loxone Config: vislox's file and the lock as they were.
+    const ops = await undoKey(false, (u) => !S.edits?.blocks?.some((b) => b.uuid === u), DIV);
+    assert.deepEqual(ops, [{ op: "unadopt", uuids: [DIV] }]);
+    assert.equal(existsSync(join(dir, "pages/vislox/erdgeschoss.loxl")), false);
+    assert.deepEqual(JSON.parse(readFileSync(join(dir, "logic.lock.json"), "utf8")).objects, JSON.parse(lockWas).objects);
+    assert.equal(readFileSync(join(dir, "out.Loxone"), "utf8"), outWas);
+    await page.waitForSelector('#props [data-ed="adopt-open"]');
+  });
+  await step("Adopt all takes what lox rebuilds on the page and says what stays Loxone Config's (#72)", async () => {
+    const lockWas = readFileSync(join(dir, "logic.lock.json"), "utf8");
+    await page.waitForSelector("#btn-adopt-page:not([disabled])");
+    const n = edits.length;
+    // While an undo compiles it is not sent, and the Deploy pane says why.
+    await page.evaluate(() => { UNDO.busy++; try { adoptPage(); } finally { UNDO.busy--; } });
+    await waitText("#deploy-msg", /^Cannot adopt now: An edit is compiling\.$/);
+    assert.equal(edits.length, n);
+    await page.click("#btn-adopt-page");
+    // lox adopts each block, then the module compiles (slowly with VISLOX_TEST_LOX_DELAY).
+    await until(() => statuses[n] !== undefined, "the adopt_page request");
+    assert.equal(statuses[n], 200);
+    assert.deepEqual(edits[n].ops, [{ op: "adopt_page", page: EG }]);
+    await settled();
+    await waitText("#deploy-msg", /Adopted 3 blocks on Erdgeschoss: the config is unchanged\. 1 block stays Loxone Config's: Temperatur \(cannot adopt InputRef/);
+    await settled();
+    const objs = JSON.parse(readFileSync(join(dir, "logic.lock.json"), "utf8")).objects;
+    assert.deepEqual([objs.vx_o1001?.uuid, objs.vx_zaehler?.uuid, objs.vx_o1002?.uuid], [AND, METER, DIV]);
+    await page.waitForSelector(`.blk.managed[data-uuid="${METER}"] .mbadge`);
+    // A wire into an adopted block: its declaration draws it now, and vislox does not take it out.
+    await page.waitForFunction(([f, t]) => S.edits?.adopted_wires?.some((w) => w.from.join() === f.join() && w.to.join() === t.join()),
+      [[AND, "Q"], [METER, "Pf"]], { timeout: 20000 });
+    await clickWire([AND, "Q"], [METER, "Pf"]);
+    await waitText("#wcard", /brought along when the block was adopted/);
+    assert.equal(await page.locator('#wcard [data-wc="unwire"]').count(), 0);
+    await page.click('#wcard [data-wc="close"]');
+    // Only the input reference is still offered: lox says why not when it is asked.
+    await page.waitForFunction(() => adoptOnPage(addState().page).map((o) => o.title).join() === "Temperatur");
+    // One undo hands them all back.
+    const ops = await undoKey(false, () => !S.edits?.blocks?.length);
+    assert.deepEqual(ops, [{ op: "unadopt", uuids: [AND, METER, DIV] }]);
+    assert.deepEqual(JSON.parse(readFileSync(join(dir, "logic.lock.json"), "utf8")).objects, JSON.parse(lockWas).objects);
+    assert.equal(existsSync(join(dir, "pages/vislox/erdgeschoss.loxl")), false);
+  });
   await step("a module that does not compile is listed, error by error, and Apply is off (#65)", async () => {
     const flur = join(dir, "pages", "flur.loxl"), was = readFileSync(flur, "utf8");
     writeFileSync(flur, was + "flur.In1 <- BROKEN.Q\n");
@@ -1064,7 +1182,9 @@ try {
   await step("nothing was deployed: lox only compiled, checked, linted and tested", async () => {
     const ran = readFileSync(calls, "utf8").trim().split("\n");
     assert.ok(ran.length >= 2, ran.join(" | "));
-    assert.ok(ran.every((l) => /^logic (compile|check --json|fmt --check|lint \.|test \.)( |$)/.test(l)), ran.join(" | "));
+    assert.ok(ran.every((l) => /^logic (compile|check --json|fmt --check|lint \.|test \.|adopt)( |$)/.test(l)), ran.join(" | "));
+    // lox adopts on a copy of the module and lock, never the project's.
+    assert.ok(ran.filter((l) => l.startsWith("logic adopt")).every((l) => !l.includes(join(dir, "logic.lock.json")) && !l.includes(" --module pages ")), ran.join(" | "));
   });
   await step("no errors in the browser", async () => {
     assert.deepEqual(errors, []);

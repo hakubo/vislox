@@ -42,8 +42,9 @@ Then open <http://127.0.0.1:7878>. Started without a path or `--ctx` in a direct
 - A Miniserver status chip and a preflight before Pull, Apply and Sync (right serial, FTP and web port reachable,
   config changed since the base, calendar entries changed in the app).
 - The Miniserver log and, opt-in, its Debug-Monitor.
-- For a `lox.toml` project: edit values in Properties, add blocks to a page, move the blocks the module manages and
-  draw wires, then Apply, Sync and Discard from the browser.
+- For a `lox.toml` project: edit values in Properties, add blocks to a page, adopt the blocks Loxone Config drew into
+  the module (`lox logic adopt`, the config unchanged), move the blocks the module manages and draw wires, then
+  Apply, Sync and Discard from the browser.
 - For a `lox.toml` project: the blocks its Lox Logic module manages marked, each with the `.loxl` file and line that
   makes it.
 - For a `lox.toml` project: `lox logic check` errors listed by file, line and block when the module doesn't compile
@@ -113,7 +114,7 @@ commands always use lox's host. Details: [docs/miniserver.md](docs/miniserver.md
 
 By default vislox only reads. It never writes to a config file itself: lox and git do, on Pull, Apply, Sync and
 Discard. Editing values and adding blocks write files of vislox's own into a project's module (`<module>/vislox/`),
-and moving a block writes its position into the module's lockfile; `lox logic compile` turns them into the pending
+and moving or adopting a block writes its position or its entry into the module's lockfile; `lox logic compile` turns them into the pending
 config ([docs/editing.md](docs/editing.md)).
 
 Without any opt-in, vislox sends the Miniserver read-only requests: the live value stream, the structure file and
@@ -132,7 +133,7 @@ Opt-ins:
 | Sync, Discard | `--admin-token-file`, then the token | nothing; they change the project and its git repository |
 | Push to git | `--admin-token-file`, then the token | nothing; it pushes the commits git's remote lacks, after `lox logic scan` finds no personal data in them |
 | Compile (a module changed outside vislox) | `--admin-token-file`, then the token | nothing; it runs `lox logic compile` |
-| Edit values, add and move blocks, draw wires | `--admin-token-file`, then the token | nothing; vislox writes its files in the module (and positions in the lockfile) and runs `lox logic compile` |
+| Edit values, add, adopt and move blocks, draw wires | `--admin-token-file`, then the token | nothing; vislox writes its files in the module (and positions and adopted blocks in the lockfile; `lox logic adopt` runs on a copy) and runs `lox logic compile` |
 | Operate virtual inputs | `--operate` with `--admin-token-file` | `jdev/sps/io/<uuid>/<cmd>`, only to `VirtualIn` objects, each confirmed |
 | Query blocks on this page | a toggle in the legend, off by default | read-only `jdev/sps/io/<uuid>/all`, at most 20 a second |
 | Debug-Monitor | `--monitor`, then Start | `dev/sps/log/<address>`: the Miniserver sends its debug output to vislox until Stop or the time limit |

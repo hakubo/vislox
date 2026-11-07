@@ -1297,6 +1297,8 @@ function renderPropsBody() {
     }).join("");
 }
 $("props").addEventListener("keydown", (e) => {
+  if (e.target.id === "ad-slug" && e.key === "Enter") { e.preventDefault(); adoptSave(S.sel); return; }
+  if (e.target.id === "ad-slug" && e.key === "Escape") { e.preventDefault(); e.stopPropagation(); adoptClose(); return; }
   const f = e.target.closest("[data-ed-field]");
   if (f && e.key === "Enter") { e.preventDefault(); editSave(); return; }
   if (f && e.key === "Escape") { e.preventDefault(); e.stopPropagation(); editClose(); return; }
@@ -1304,6 +1306,7 @@ $("props").addEventListener("keydown", (e) => {
   if (i && e.key === "Enter") { e.preventDefault(); operate(i.dataset.opUuid, i.value); }
 });
 $("props").addEventListener("input", (e) => {
+  if (e.target.id === "ad-slug") { AD.slug = e.target.value; return; }
   const f = e.target.closest("[data-ed-field]");
   if (!f || S.edit.uuid !== S.sel) return;
   S.edit.draft[f.dataset.edField] = f.value;
@@ -1319,6 +1322,10 @@ $("props").addEventListener("click", (e) => {
     else if (what === "revert") editRevert(eb.dataset.key);
     else if (what === "remove") editRemove(S.sel);
     else if (what === "unmove") mvRevert(S.sel);
+    else if (what === "adopt-open") adoptOpen(S.sel);
+    else if (what === "adopt") adoptSave(S.sel);
+    else if (what === "adopt-cancel") adoptClose();
+    else if (what === "unadopt") adoptHandBack(S.sel);
     else if (what === "newest") editGoNewest();
     return;
   }
@@ -2124,6 +2131,7 @@ function renderActions() {
     : a.running ? `${a.running}…` : pend ? `Compiled changes are pending (${fmtWhen(pend.time)}), not deployed.` +
       editsHere() + " Review them, then apply."
     : !a.apply.available ? `Apply is off: ${a.apply.reason}.`
+    : adoptedUncommitted().length ? `Nothing pending: adopting changes nothing the Miniserver runs. ${plural(adoptedUncommitted().length, "block")} adopted here ${adoptedUncommitted().length === 1 ? "goes" : "go"} into git with the next Apply; Undo hands ${adoptedUncommitted().length === 1 ? "it" : "them"} back.`
     : `Nothing pending. ${a.edit?.available ? "Edit values in Properties, add blocks to a page, or edit" : "Edit"} the project's module and compile it (lox logic …); the result shows here for review.`;
   $("deploy-row").classList.toggle("hidden", !pend && !a.running && !removing());
   $("btn-apply").disabled = !a.apply.available || busy || (!pend && !removing()) || applyAsking || checkBroken() || !!testsFailing();
@@ -3115,6 +3123,8 @@ function editRev() {
 }
 /** The block added here (#59) with UUID `uuid`, deployed or not. */
 function editsBlock(uuid) { return (S.edits?.blocks || []).find((b) => b.uuid && b.uuid === uuid) || null; }
+/** The blocks adopted here (#72) that the deployed revision's commit does not have yet. */
+function adoptedUncommitted() { return (S.edits?.blocks || []).filter((b) => b.adopted && !b.committed); }
 /** The blocks added here (#59) that are not deployed yet, or the one with UUID `uuid`. */
 function editsAdded(uuid) { return (S.edits?.blocks || []).filter((b) => b.uuid && !b.deployed && (!uuid || b.uuid === uuid)); }
 /** The values vislox edited and has not deployed yet, of one object or of all; not those of a new block, which is new as a whole. */
@@ -3161,9 +3171,10 @@ function editFields(o) {
 }
 function editRows(o, row) {
   const mv = moveRows(o, row);
+  const ad = adoptRows(o, row);
   const st = editState(o);
-  if (!st) return mv.rows.length ? mv : null;
-  const rows = [...mv.rows];
+  if (!st) return mv.rows.length || ad.length ? { rows: [...ad, ...mv.rows], count: mv.count } : null;
+  const rows = [...ad, ...mv.rows];
   const mine = S.edit.uuid === o.uuid ? S.edit : null;
   // A block added here and not deployed: Remove takes it out again.
   for (const b of editsAdded(o.uuid)) {
@@ -3264,6 +3275,111 @@ async function editRevert(key) {
   const op = EDIT_ATTR[c.op] ? { op: c.op, uuid: c.uuid } : c.op === "param" ? { op: "param", uuid: c.uuid, port: c.port } : { op: "setting", uuid: c.uuid, name: c.name };
   await editSend(c.uuid, st.rev, [{ ...op, value: c.deployed }], `Revert ${editLabel(o, c)} of ${displayTitle(o)}`);
 }
+// ── adopting blocks (#72) ──────────────────────────────────────────────
+// `lox logic adopt` puts a block Loxone Config drew under the module: its declaration goes into vislox's
+// file of the page, it keeps its UUIDs, and the config stays exactly as it is (the server checks). It is
+// an edit like any other: compiled, never deployed, undone through its reply's `undo`.
+const AD = { uuid: null, open: false, slug: "", busy: false, msg: "", err: "" };
+/** Whether adopting can be asked now: `{ ok, rev }`, or `{ why }`. */
+function adoptState() {
+  const a = S.hist?.actions;
+  if (!a?.shown || !a.edit?.available) return null;
+  const r = editRev();
+  if (!r || S.rev !== r.id) return null;
+  if (a.running) return { why: `${a.running} is running.` };
+  if (UNDO.busy || AD.busy) return { why: "An edit is compiling." };
+  return { ok: true, rev: r };
+}
+/** The Edit rows about Lox Logic: adopt an unmanaged block, or why not; hand an adopted one back. */
+function adoptRows(o, row) {
+  const st = adoptState(), nb = editsBlock(o.uuid);
+  if (!st) return [];
+  const mine = AD.uuid === o.uuid ? AD : null;
+  const msg = mine?.msg || mine?.err ? `<span class="ed-msg${mine.err ? " err" : ""}" role="status">${esc(mine.err || mine.msg)}</span>` : "";
+  if (nb?.adopted) {
+    return [row("Lox Logic", `<span class="ed-v">adopted here</span><span class="ed-tag" title="Declared in ${esc(nb.file)}: the module manages it now, with the UUIDs Loxone Config gave it">managed</span>` +
+      (st.ok ? `<button type="button" class="ed-btn small" data-ed="unadopt"${nb.hand_back ? " disabled" : ""} title="${esc(nb.hand_back || "Take its declaration out of vislox's file: Loxone Config owns it again, as the base has it")}">Hand back</button>` : "")),
+      ...(st.ok && nb.hand_back ? [`<div class="ed-note">Hand back: ${esc(nb.hand_back)}</div>`] : []),
+      ...(msg ? [`<div class="ed-bar">${msg}</div>`] : [])];
+  }
+  const ad = S.edits?.adopt;
+  if (!ad || !(o.uuid in ad)) return [];
+  if (ad[o.uuid]) return [`<div class="ed-note ad-note">Manage with Lox Logic: ${esc(ad[o.uuid])}</div>`];
+  if (!mine?.open) {
+    return [`<div class="ed-bar"><button type="button" class="ed-btn small" data-ed="adopt-open"${st.ok ? "" : ` disabled title="${esc(st.why)}"`} title="Put this block under the project's module (lox logic adopt). The config stays as it is.">Manage with Lox Logic</button>${msg}</div>`];
+  }
+  return [`<div class="pr ed-row"><label class="k" for="ad-slug">Slug</label><div class="v"><input id="ad-slug" value="${esc(AD.slug)}" placeholder="vx_… (from its name)" autocomplete="off" spellcheck="false"${AD.busy ? " disabled" : ""}></div></div>`,
+    `<div class="ed-bar"><button type="button" class="primary small" data-ed="adopt"${AD.busy || !st.ok ? " disabled" : ""}>${AD.busy ? "Adopting…" : "Adopt"}</button>` +
+    `<button type="button" class="ed-btn small" data-ed="adopt-cancel"${AD.busy ? " disabled" : ""}>Cancel</button>` +
+    `<span class="ed-msg${AD.err ? " err" : ""}" role="status" aria-live="polite">${esc(AD.err || "lox declares it in vislox's file of this page; it keeps its UUIDs, and nothing changes on the Miniserver.")}</span></div>`];
+}
+function adoptOpen(uuid) {
+  Object.assign(AD, { uuid, open: true, slug: "", busy: false, msg: "", err: "" });
+  S.closed.delete("Edit");
+  renderProps();
+  $("ad-slug")?.focus();
+}
+function adoptClose() {
+  if (AD.busy) return;
+  Object.assign(AD, { open: false, msg: "", err: "" });
+  renderProps();
+  $("props").querySelector('[data-ed="adopt-open"]')?.focus();
+}
+/** Send adopt ops (or unadopt); on success show the newest config. Returns the reply, or null. */
+async function adoptSend(uuid, ops) {
+  const st = adoptState();
+  if (!st?.ok) return null;
+  Object.assign(AD, { uuid, busy: true, err: "", msg: "" });
+  renderProps(); renderAddHud();
+  let res = null;
+  try {
+    res = await editAct(st.rev.blob, ops);
+  } catch (err) {
+    AD.err = err.message;
+  }
+  AD.busy = false;
+  if (res) {
+    AD.open = false;
+    try { await editShowNewest(res.blob); } catch (err) { AD.err = `Done, but the page could not show it: ${err.message}`; }
+  }
+  // The config is the same revision, so no new view redraws the page: its badges, and the wire targets
+  // a draw while the edit ran left out.
+  if (S.view) renderPage();
+  renderProps(); renderAddHud();
+  return res;
+}
+async function adoptSave(uuid) {
+  if (AD.busy || !AD.open || AD.uuid !== uuid) return;
+  const slug = AD.slug.trim();
+  if (slug && !/^vx_[a-z0-9_]+$/.test(slug)) { AD.err = "A slug is vx_ and then lowercase letters, digits and _."; renderProps(); $("ad-slug")?.focus(); return; }
+  const res = await adoptSend(uuid, [{ op: "adopt", blocks: [slug ? { uuid, slug } : { uuid }] }]);
+  if (res) AD.msg = `Adopted as ${res.adopted?.[0]?.slug || "a managed block"}: the config is unchanged. ${UNDO_KEYS[0]} hands it back.`;
+  renderProps();
+}
+async function adoptHandBack(uuid) {
+  if (editsBlock(uuid)?.hand_back) return;
+  const res = await adoptSend(uuid, [{ op: "unadopt", uuids: [uuid] }]);
+  if (res) { AD.msg = "Handed back to Loxone Config: the config is unchanged."; renderProps(); }
+}
+/** The blocks of page `pg` Properties would offer to adopt. */
+function adoptOnPage(pg) {
+  const ad = S.edits?.adopt || {};
+  return Object.values(S.view?.objects || {}).filter((o) => o.page === pg.uuid && ad[o.uuid] === null);
+}
+/** "Adopt all": every block of the page lox can rebuild exactly; the reply names the rest. */
+async function adoptPage() {
+  // Not now (an older revision, an edit or undo compiling): say why, rather than send nothing silently.
+  const now = adoptState(), st = addState();
+  const why = !now ? "blocks are adopted on the newest config: show it first." : !now.ok ? now.why : !st?.ok ? st?.why : null;
+  if (why) { deployMsg(`Cannot adopt now: ${why}`, true); return; }
+  if (!adoptOnPage(st.page).length) return;
+  const res = await adoptSend(null, [{ op: "adopt_page", page: st.page.uuid }]);
+  if (!res) { deployMsg(AD.err || "Nothing was adopted.", true); return; }
+  const n = res.adopted?.length || 0, sk = res.skipped || [];
+  deployMsg(`Adopted ${plural(n, "block")} on ${st.page.title || "this page"}: the config is unchanged.` +
+    (sk.length ? ` ${plural(sk.length, "block")} stay${sk.length === 1 ? "s" : ""} Loxone Config's: ${sk.map((x) => `${x.title} (${x.why})`).join("; ")}` : ""), false, !!sk.length);
+}
+$("btn-adopt-page").onclick = adoptPage;
 /** Take out a block added here that is not deployed yet. */
 async function editRemove(uuid) {
   const o = S.view?.objects[uuid], st = o && editState(o);
@@ -3326,6 +3442,9 @@ function undoLabel(ops) {
   if (ops.length === 1 && op.op === "remove_block") return `Remove ${obj(op.uuid)}`;
   if (kinds.size === 1 && op.op === "move") return ops.length === 1 ? `Move ${obj(op.uuid)}` : `Move ${plural(ops.length, "block")}`;
   if (ops.length === 1 && op.op === "relayout") return `Arrange ${S.pageOf?.get(op.page)?.title || "the page"}`;
+  if (ops.length === 1 && op.op === "adopt") return op.blocks.length === 1 ? `Adopt ${obj(op.blocks[0].uuid)}` : `Adopt ${plural(op.blocks.length, "block")}`;
+  if (ops.length === 1 && op.op === "adopt_page") return `Adopt the blocks of ${S.pageOf?.get(op.page)?.title || "the page"}`;
+  if (ops.length === 1 && op.op === "unadopt") return op.uuids.length === 1 ? `Hand ${obj(op.uuids[0])} back to Loxone Config` : `Hand ${plural(op.uuids.length, "block")} back to Loxone Config`;
   if (ops.length === 1 && op.op === "wire") return `Wire ${wire(op)}`;
   if (ops.length === 1 && op.op === "unwire") return `Delete wire ${wire(op)}`;
   if (ops.length === 2 && op.op === "unwire" && ops[1].op === "wire") return `Reconnect ${wire(op)} to ${end(sameEnd(op.from, ops[1].from) ? ops[1].to : ops[1].from)}`;
@@ -3738,11 +3857,14 @@ const wireKey = (f, t) => `${f[0]}|${f[1]}>${t[0]}|${t[1]}`;
 function editsWire(w) { return (S.edits?.wires || []).find((x) => sameEnd(x.from, w.from) && sameEnd(x.to, w.to)) || null; }
 /** The wires vislox drew or took out and has not deployed yet. */
 function editsWires() { return (S.edits?.wires || []).filter((w) => w.now !== w.deployed); }
-/** Who draws the wire `w`, by the server's rule (the one `unwire` refuses by): `vislox`, `module` or
- *  `loxone_config`. */
+/** Who draws the wire `w`, by the server's rule (the one `unwire` refuses by): `vislox`, `adopted`,
+ *  `module` or `loxone_config`. */
 function wireOwner(w) {
   if (editsWire(w)?.now) return "vislox";
-  return (S.edits?.module_wires || []).some((x) => sameEnd(x.from, w.from) && sameEnd(x.to, w.to)) ? "module" : "loxone_config";
+  const has = (list) => (list || []).some((x) => sameEnd(x.from, w.from) && sameEnd(x.to, w.to));
+  // A wire a block adopted here brought along (#72): its declaration draws it.
+  if (has(S.edits?.adopted_wires)) return "adopted";
+  return has(S.edits?.module_wires) ? "module" : "loxone_config";
 }
 /** The ports of `o` a wire can start or end at, as the page draws them. */
 function wrPorts(o) {
@@ -4032,6 +4154,11 @@ function renderAddHud() {
   // The server says per page whether lox can lay it out (null) or why not.
   const why = st.ok && n ? S.edits?.arrange?.[st.page.uuid] : undefined;
   r.disabled = !st.ok || !n || why !== null || S.mvBusy;
+  const ap = $("btn-adopt-page"), na = st.ok ? adoptOnPage(st.page).length : 0;
+  ap.disabled = !st.ok || !na || AD.busy;
+  ap.title = !st.ok ? st.why
+    : !na ? "No block of this page can be adopted: the module manages them, or Properties says why not"
+    : `Put the ${plural(na, "block")} of this page the module does not manage under it (lox logic adopt); the config stays as it is`;
   r.title = !st.ok ? st.why
     : !n ? "lox lays out only the blocks the project's module manages, and this page has none"
     : why !== null ? (why || "lox cannot lay out this page")

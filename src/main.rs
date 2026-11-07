@@ -2,6 +2,7 @@
 //! `loxone-config` manage, with live reload, history and change review.
 
 mod actions;
+mod adopt;
 mod appcalendar;
 mod backups;
 mod blocks;
