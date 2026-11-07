@@ -3394,8 +3394,9 @@ function editRows(o, row) {
         ? `<select ${attrs}>${editPlaces(kind).map(([t, n]) => `<option value="${esc(t)}"${t === v ? " selected" : ""}${n > 1 ? ' disabled title="Two of them have this title: rename one in Loxone Config to pick it"' : ""}>${esc(t)}</option>`).join("")}</select>`
         : kind === "choice" || kind === "on_off"
         ? `<select ${attrs}><option value="">as Loxone Config places it</option>${(kind === "on_off" ? ["on", "off"] : choices || []).map((c) => `<option${c === v ? " selected" : ""}>${esc(c)}</option>`).join("")}</select>`
+        // After a line break: HTML drops the first one after <textarea>, so a program starting with a blank line keeps it.
         : kind === "program"
-        ? `<textarea ${attrs} class="prog" rows="14" autocomplete="off" spellcheck="false" placeholder="Empty: Loxone Config's program">${esc(v)}</textarea>`
+        ? `<textarea ${attrs} class="prog" rows="14" autocomplete="off" spellcheck="false" placeholder="Empty: Loxone Config's program">\n${esc(v)}</textarea>`
         : `<input ${attrs} value="${esc(v)}" ${kind === "number" || kind === "time" ? `inputmode="decimal" class="num"${kind === "time" ? ' placeholder="HH:MM"' : ""}` : kind === "quantity" ? 'class="num" title="A number, or one with its unit: 30min, 250ms, 70%"' : kind === "duration" ? 'class="num" placeholder="5s"' : ""} autocomplete="off" spellcheck="false">`;
       rows.push(`<div class="pr ed-row${kind === "program" ? " ed-prog" : ""}"><label class="k" for="${id}">${esc(label)}</label><div class="v">${input}` +
         (unit ? `<span class="ed-unit">${esc(unit)}</span>` : "") + (bad ? `<div class="ed-bad" id="${id}-e">${esc(bad)}</div>` : "") + "</div></div>");
@@ -3436,7 +3437,7 @@ async function editSave() {
     if (kind === "duration" && !AB_DURATION.test(t.trim())) { bad[field] = "A duration, like 12h, 30min, 5s or 90 (seconds)."; continue; }
     if (field === "title" && !t.trim()) { bad[field] = "The name cannot be empty."; continue; }
     // A program the block already runs, sent back unchanged but for line endings, changes nothing.
-    if (kind === "program" && t.replace(/\r\n/g, "\n") === now) continue;
+    if (kind === "program" && t.replace(/\r\n/g, "\n") === (now ?? "").replace(/\r\n/g, "\n")) continue;
     ops.push(EDIT_ATTR[field] ? { op: field, uuid: o.uuid, value: t } : k === "p" ? { op: "param", uuid: o.uuid, port: key, value: t } : { op: "setting", uuid: o.uuid, name: key, value: t });
   }
   S.edit.bad = bad; S.edit.err = ""; S.edit.msg = "";
@@ -5820,7 +5821,7 @@ function abForm() {
       : kind === "choice" || kind === "on_off"
       ? `<select ${attrs}><option value="">as Loxone Config places it</option>${(kind === "on_off" ? ["on", "off"] : choices).map((c) => `<option${c === v ? " selected" : ""}>${esc(c)}</option>`).join("")}</select>`
       : kind === "program"
-      ? `<textarea ${attrs} class="prog" rows="10" autocomplete="off" spellcheck="false" placeholder="Empty: Loxone Config's program">${esc(v)}</textarea>`
+      ? `<textarea ${attrs} class="prog" rows="10" autocomplete="off" spellcheck="false" placeholder="Empty: Loxone Config's program">\n${esc(v)}</textarea>`
       : `<input ${attrs} value="${esc(v)}"${kind === "number" || kind === "quantity" ? ` inputmode="decimal" class="num" placeholder="${esc(def)}"` : kind === "time" ? ' class="num" placeholder="HH:MM"' : kind === "duration" ? ' class="num" placeholder="5s"' : field === "title" ? ` placeholder="${esc(prettyType(t.type))}"` : ""} autocomplete="off" spellcheck="false">`;
     return `<div class="pr ed-row"><label class="k" for="${id}">${esc(label)}</label><div class="v">${input}${unit ? `<span class="ed-unit">${esc(unit)}</span>` : ""}${bad ? `<div class="ed-bad" id="${id}-e">${esc(bad)}</div>` : ""}</div></div>`;
   };

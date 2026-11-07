@@ -2169,7 +2169,18 @@ impl Actions {
                     .map_err(|e| fail(format!("cannot write {shown}/{name}: {e}")))?;
             }
         }
-        for name in old.keys().filter(|n| !new.contains_key(*n)) {
+        // The programs (#79): written only when they changed.
+        let programs = files.programs();
+        for (name, text) in &programs {
+            if old.get(*name).map(String::as_str) != Some(*text) {
+                std::fs::write(dir_path.join(name), text)
+                    .map_err(|e| fail(format!("cannot write {shown}/{name}: {e}")))?;
+            }
+        }
+        for name in old
+            .keys()
+            .filter(|n| !new.contains_key(*n) && !programs.contains_key(n.as_str()))
+        {
             std::fs::remove_file(dir_path.join(name))
                 .map_err(|e| fail(format!("cannot remove {shown}/{name}: {e}")))?;
         }

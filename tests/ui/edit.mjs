@@ -2273,6 +2273,21 @@ try {
     await page.waitForSelector('#props textarea[data-ed-field="s:Code"]');
     // It starts from the program the block runs.
     assert.equal(await page.inputValue(field("s:Code")), "setoutput(0, 1);");
+    // A program Loxone Config wrote with CRLF, saved unchanged (the text area shows LF): nothing is sent, and the
+    // program stays Loxone Config's.
+    const code = await page.evaluate((u) => S.view.objects[u].settings.find((x) => x.name === "Code").value, HUE);
+    await page.evaluate((u) => { S.view.objects[u].settings.find((x) => x.name === "Code").value = "setoutput(0, 1);\r\nsetoutput(2, 0);"; }, HUE);
+    await page.click('#props [data-ed="cancel"]');
+    await page.click('#props [data-ed="open"]');
+    await page.fill(field("s:Code"), "setoutput(0, 1);\nsetoutput(2, 0);");
+    n = edits.length;
+    await page.click('#props [data-ed="save"]');
+    await waitText("#props", /Nothing changed\./);
+    assert.equal(edits.length, n);
+    await page.click('#props [data-ed="cancel"]');
+    await page.evaluate(([u, c]) => { S.view.objects[u].settings.find((x) => x.name === "Code").value = c; }, [HUE, code]);
+    await page.click('#props [data-ed="open"]');
+    assert.equal(await page.inputValue(field("s:Code")), "setoutput(0, 1);");
     // Enter is a line break in a program; Ctrl+Enter saves.
     await page.click(field("s:Code"));
     await page.keyboard.press("End");
@@ -2292,6 +2307,22 @@ try {
     await waitText('#props [data-body="Edit"]', /Program\s*edited here, 2 lines\s*not deployed/);
     const changes = await page.evaluate(() => S.view.changes.map((c) => c.text));
     assert.ok(changes.some((c) => /^Hue · program: .*\+ setoutput\(1, 0\);/.test(c)), changes.join(" | "));
+    // A program that starts with a blank line keeps it, saved and shown again in the form.
+    await page.click('#props [data-ed="open"]');
+    assert.equal(await page.inputValue(field("s:Code")), "setoutput(0, 1);\nsetoutput(1, 0);");
+    await page.fill(field("s:Code"), "\nsetoutput(0, 1);\nsetoutput(1, 0);");
+    n = edits.length;
+    await page.click('#props [data-ed="save"]');
+    await until(() => edits.length > n && statuses[n] !== undefined, "the blank-line request");
+    assert.equal(statuses[n], 200);
+    assert.equal(edits[n].ops[0].value, "\nsetoutput(0, 1);\nsetoutput(1, 0);");
+    await settled();
+    assert.equal(readFileSync(join(dir, "pages", "vislox", "vx_hue.c"), "utf8"), "\nsetoutput(0, 1);\nsetoutput(1, 0);");
+    await page.waitForFunction((u) => S.edits?.blocks?.find((b) => b.uuid === u)?.settings?.find((x) => x.name === "Code")?.value?.startsWith("\n"), HUE, { timeout: 10000 });
+    await page.click('#props [data-ed="open"]');
+    assert.equal(await page.inputValue(field("s:Code")), "\nsetoutput(0, 1);\nsetoutput(1, 0);");
+    await page.click('#props [data-ed="cancel"]');
+    await undoKey(false, (u) => S.view.objects[u].settings.find((x) => x.name === "Code").value === "setoutput(0, 1);\nsetoutput(1, 0);", HUE);
     // Undone: the binding and its file go, and the block runs Loxone Config's program again.
     const ops = await undoKey(false, (u) => S.view.objects[u].settings.find((x) => x.name === "Code").value === "setoutput(0, 1);", HUE);
     assert.deepEqual(ops, [{ op: "setting", uuid: HUE, name: "Code", value: null }]);

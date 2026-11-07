@@ -1205,23 +1205,33 @@ impl Files {
             }
         }
         // A program (#79) is in a file of vislox's directory that its block
-        // names, `Code: file("vx_code16_1.c")`; each file is one block's.
+        // names, `Code: file("vx_code16_1.c")`; each file is one block's: an
+        // edit of one block's program must not change another's.
+        let mut named: BTreeMap<String, String> = BTreeMap::new();
         for (name, p) in f.pages.iter_mut() {
             for b in &mut p.blocks {
                 for (k, v) in &mut b.args {
                     if let Value::File { path, text } = v {
-                        let t = programs.remove(path.as_str()).ok_or_else(|| {
+                        if let Some(other) = named.insert(path.clone(), b.slug.clone()) {
+                            return Err(format!(
+                                "{name}: `{other}` and `{}` both name file(\"{path}\"); a program \
+                                 file is one block's, so give each block its own",
+                                b.slug
+                            ));
+                        }
+                        let t = programs.get(path.as_str()).ok_or_else(|| {
                             format!(
                                 "{name}: `{}`'s {k} names file(\"{path}\"), which is not a program \
                                  in vislox's directory; put it back or delete the setting",
                                 b.slug
                             )
                         })?;
-                        *text = Some(t);
+                        *text = Some(t.clone());
                     }
                 }
             }
         }
+        programs.retain(|n, _| !named.contains_key(n));
         if let Some(name) = programs.keys().next() {
             return Err(format!(
                 "{name}: no block of vislox's files names this program; delete it, or put back \
@@ -1291,7 +1301,7 @@ impl Files {
         out
     }
 
-    /// Each file's text, by name. A page file with no block and no
+    /// Each `.loxl` file's text, by name (the programs: [`Files::programs`]). A page file with no block and no
     /// `removed` line is left out (deleted); [`FILE`] only while it was never
     /// written and claims nothing.
     pub fn render(&self) -> BTreeMap<String, String> {
@@ -1309,7 +1319,15 @@ impl Files {
             if !p.is_empty() {
                 out.insert(name.clone(), p.render());
             }
-            // Each program (#79) in the file its block names.
+        }
+        out
+    }
+
+    /// Each program (#79) by the file its block names, borrowed: a program
+    /// may be long, and is written only when it changed.
+    pub fn programs(&self) -> BTreeMap<&str, &str> {
+        let mut out = BTreeMap::new();
+        for p in self.pages.values() {
             for b in &p.blocks {
                 for (_, v) in &b.args {
                     if let Value::File {
@@ -1317,10 +1335,21 @@ impl Files {
                         text: Some(t),
                     } = v
                     {
-                        out.insert(path.clone(), t.clone());
+                        out.insert(path.as_str(), t.as_str());
                     }
                 }
             }
+        }
+        out
+    }
+
+    /// Every file's text, the programs among them (tests, and what a scratch
+    /// copy needs).
+    #[cfg(test)]
+    pub fn all_texts(&self) -> BTreeMap<String, String> {
+        let mut out = self.render();
+        for (n, t) in self.programs() {
+            out.insert(n.to_string(), t.to_string());
         }
         out
     }
@@ -1785,17 +1814,7 @@ fn duration(v: &str) -> Option<Value> {
     if u.is_empty() {
         return Some(Value::Number(n.to_string()));
     }
-    let m = Module::parse_fragment(&format!("vx_d = Monoflop(Time: {n}{u})\n")).ok()?;
-    m.items.into_iter().find_map(|i| match i {
-        Item::Block(b) => b.args.into_iter().find_map(|a| match a {
-            loxone_config::logic::ArgItem::Binding(loxone_config::logic::Binding {
-                kind: loxone_config::logic::BindingKind::Param(v @ Value::Unit { .. }),
-                ..
-            }) => Some(v),
-            _ => None,
-        }),
-        _ => None,
-    })
+    crate::units::lox_value(&format!("{n}{u}")).filter(|v| matches!(v, Value::Unit { .. }))
 }
 
 fn add_block(files: &mut Files, ctx: &Ctx, op: &Op) -> Result<Applied, String> {
@@ -3686,7 +3705,7 @@ mod tests {
         let module = tmp.path().join("module");
         let dir = module.join(DIR);
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-        let mut texts = files.render();
+        let mut texts = files.all_texts();
         if texts.is_empty() {
             texts.extend([Files::placeholder()]);
         }
@@ -4168,7 +4187,7 @@ mod tests {
             &add(EG, "Code16", Some("Hue"), &[], &[("Code", prog)]),
         )
         .unwrap();
-        let texts = files.render();
+        let texts = files.all_texts();
         assert!(
             texts["erdgeschoss.loxl"]
                 .contains(r#"vx_code16_1 = Code16("Hue", Code: file("vx_code16_1.c"))"#),
@@ -4206,13 +4225,13 @@ mod tests {
             a.previous,
             serde_json::json!("int main() {\n  setoutput(0, 1);\n}\n")
         );
-        assert_eq!(files.render()["vx_code16_1.c"], "int main() {}\n");
+        assert_eq!(files.all_texts()["vx_code16_1.c"], "int main() {}\n");
         // The op carries the text, so undo puts it back.
         assert!(files.ops(&lock).contains(&setting(Some("int main() {}\n"))));
         // Dropped: the binding and the file go; Loxone Config's program again.
         let a = apply_op(&mut files, &ctx, &setting(None)).unwrap();
         assert_eq!(a.previous, serde_json::json!("int main() {}\n"));
-        let texts = files.render();
+        let texts = files.all_texts();
         assert!(!texts.contains_key("vx_code16_1.c"));
         assert!(texts["erdgeschoss.loxl"].contains(r#"vx_code16_1 = Code16("Hue")"#));
         // A program no block names, or a block whose program is gone, is
@@ -4227,6 +4246,18 @@ mod tests {
                 .replace(r#"Code16("Hue")"#, r#"Code16("Hue", Code: file("gone.c"))"#),
         );
         assert!(Files::from_texts(&lost).unwrap_err().contains("gone.c"));
+        // Two blocks naming one program file: refused, saying so.
+        let mut shared = texts.clone();
+        shared.insert("vx_code16_1.c".into(), "x".into());
+        shared.insert(
+            "erdgeschoss.loxl".into(),
+            texts["erdgeschoss.loxl"].replace(
+                r#"vx_code16_1 = Code16("Hue")"#,
+                "vx_code16_1 = Code16(\"Hue\", Code: file(\"vx_code16_1.c\"))\nvx_code16_2 = Code16(\"Zwei\", Code: file(\"vx_code16_1.c\"))",
+            ),
+        );
+        let e = Files::from_texts(&shared).unwrap_err();
+        assert!(e.contains("both name file(\"vx_code16_1.c\")"), "{e}");
     }
 
     /// A constant takes a unit the port is documented in (#79), on a block

@@ -584,7 +584,9 @@ pub fn extract(
                         )),
                         BindingKind::Param(Value::File { .. }) => {
                             return Err(format!(
-                                "{slug}: its {} is in a file of its own; vislox does not write those",
+                                "{slug}: lox put its {} into a file of its own, which vislox does not \
+                                 move across when adopting; adopt it without, then edit the program \
+                                 here (vislox keeps it in a file next to the block's)",
                                 x.port
                             ));
                         }

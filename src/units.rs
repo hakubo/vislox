@@ -150,9 +150,15 @@ pub fn port_value(ty: &str, key: &str, v: &str) -> Result<Value, String> {
             };
             // It must be a whole number of the port's own unit, as lox
             // writes it (`10s` on a minutes port is not).
-            let (neg, m, frac) = decimal(n).expect("checked");
-            let den = 10u128.pow(frac) * per;
-            if render(neg, m * size, den).is_none() {
+            // Checked: a number too long to scale is refused, never a panic.
+            let too_long = || format!("`{v}` has too many digits");
+            let (neg, m, frac) = decimal(n).ok_or_else(too_long)?;
+            let den = 10u128
+                .checked_pow(frac)
+                .and_then(|d| d.checked_mul(per))
+                .ok_or_else(too_long)?;
+            let ms = m.checked_mul(*size).ok_or_else(too_long)?;
+            if render(neg, ms, den).is_none() {
                 return Err(format!("`{v}` is not an exact number of {}", u.describe()));
             }
         }
@@ -167,21 +173,23 @@ pub fn port_value(ty: &str, key: &str, v: &str) -> Result<Value, String> {
         }
     }
     // Read back with lox's own parser, so it is spelled the way lox keeps it.
-    let m = Module::parse_fragment(&format!("vx_u = Monoflop(Time: {n}{suffix})\n"))
-        .map_err(|e| format!("`{v}`: {e}"))?;
-    m.items
-        .into_iter()
-        .find_map(|i| match i {
-            Item::Block(b) => b.args.into_iter().find_map(|a| match a {
-                ArgItem::Binding(Binding {
-                    kind: BindingKind::Param(v),
-                    ..
-                }) => Some(v),
-                _ => None,
-            }),
+    lox_value(&format!("{n}{suffix}")).ok_or_else(|| format!("`{v}` is not a number with a unit"))
+}
+
+/// `text` as lox's parser reads it in an argument (`30min` → a unit value),
+/// `None` when it is not one value.
+pub fn lox_value(text: &str) -> Option<Value> {
+    let m = Module::parse_fragment(&format!("vx_u = Monoflop(Time: {text})\n")).ok()?;
+    m.items.into_iter().find_map(|i| match i {
+        Item::Block(b) => b.args.into_iter().find_map(|a| match a {
+            ArgItem::Binding(Binding {
+                kind: BindingKind::Param(v),
+                ..
+            }) => Some(v),
             _ => None,
-        })
-        .ok_or_else(|| format!("`{v}` is not a number with a unit"))
+        }),
+        _ => None,
+    })
 }
 
 #[cfg(test)]
@@ -218,5 +226,20 @@ mod tests {
         // An undocumented port takes any unit, as lox reads it.
         assert!(port_value("Add", "I1", "70%").is_ok());
         assert!(port_value("Add", "I1", "2h").is_ok());
+        // Too long to scale: refused, never a panic or a wrong value.
+        let long = format!("{}s", "9".repeat(40));
+        assert!(
+            port_value("Monoflop", "Time", &long)
+                .unwrap_err()
+                .contains("too many digits")
+        );
+        let frac = format!("1.{}1s", "0".repeat(40));
+        assert!(
+            port_value("Monoflop", "Time", &frac)
+                .unwrap_err()
+                .contains("too many digits")
+        );
+        let frac = format!("0.{}1min", "0".repeat(30));
+        assert!(port_value("Monoflop", "Time", &frac).is_err());
     }
 }

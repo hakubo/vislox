@@ -3175,7 +3175,9 @@ fn attr_change_text(
     // A block setting (#79) reads as Lox Logic writes it: `At: 18:58 →
     // 06:58`, `Pulse: time → sunset`, the program as a line diff.
     if let Some(param) = connectors::attr_param(ty, name) {
-        let (o, n) = (setting_text(ty, param, old), setting_text(ty, param, new));
+        // An absent attribute reads as absent (`—`), not as its default.
+        let text = |v: Option<&str>| v.and_then(|v| setting_text(ty, param, Some(v)));
+        let (o, n) = (text(old), text(new));
         let label = if connectors::file_params(ty).contains(&param) {
             "program"
         } else {
@@ -3230,7 +3232,11 @@ fn settings_of(ty: &str, attrs: &[AttrInfo]) -> Vec<SettingInfo> {
                 attr: attr.to_string(),
                 kind: crate::blocks::setting_kind(ty, param),
                 value: setting_text(ty, param, value),
-                old: setting_text(ty, param, old).filter(|_| a.is_some_and(|a| a.changed)),
+                // An attribute the compared revision did not have reads as
+                // absent (`— → new`), as Advanced shows it, not as its default.
+                old: old
+                    .and_then(|o| setting_text(ty, param, Some(o)))
+                    .filter(|_| a.is_some_and(|a| a.changed)),
                 changed: a.is_some_and(|a| a.changed),
             }
         })
@@ -3636,6 +3642,18 @@ mod tests {
         );
         assert_eq!(lines(CODE), ["Hue · program: - b · + B"]);
         assert_eq!(lines(MF), ["Nachlauf · Time: 30min → 1h"]);
+        // A setting the old revision did not have reads — → new.
+        let bare = doc(&with_settings("68280", "0", "a", "1800").replace(" Typ=\"0\"", ""));
+        let v = build(&new, Some(&bare), "");
+        assert_eq!(
+            at(&v.objects[PA], "Pulse"),
+            (Some("sunset".into()), None, true)
+        );
+        let texts: Vec<&String> = v.changes.iter().map(|c| &c.text).collect();
+        assert!(
+            texts.iter().any(|t| *t == "Abends · Pulse: — → sunset"),
+            "{texts:?}"
+        );
     }
 
     trait ClonedInfo {
