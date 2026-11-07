@@ -34,7 +34,8 @@ The binary is an `axum` server with the UI embedded (plain JS and SVG, no build 
   declaration, the expression lox made it for, or the template instance, with lox's own declaration scan.
   `GET /api/edits` sends it as `sources`.
 - `src/check.rs` reads `lox logic check --json` and `lox logic fmt --check` (#65) and points each error at the
-  blocks its line names. `actions.rs` runs them in a check worker when the module, lock, base or out changes
+  blocks its line names; it reads `lox logic lint`'s findings (#66) too and points each at its declaration and
+  the block it names. `actions.rs` runs them in a check worker when the module, lock, base or out changes
   (`GET /api/check` reads the result), makes *Module compiles* Apply's first step, and compiles on request
   (`POST /api/compile`). Every compile and write of the project holds one compile lock. The module's directory is
   watched recursively, so a change there is checked at once.

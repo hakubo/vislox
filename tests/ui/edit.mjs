@@ -29,6 +29,8 @@ const FLUR = "1000000b-0000-00b0-ffff504f94000001";
 const LAGER = "20000000-0000-0000-ffff504f94000001", LAGER_N = 210;
 const lagerUuid = (i) => `2${String(i).padStart(7, "0")}-0000-0001-ffff504f94000001`;
 const lagerAt = (i) => { const px = 960 + 1920 * (i % 15), py = 960 + 960 * Math.floor(i / 15); return { px, py, px2: px + 1344, py2: py + 696 }; };
+// An NFC Code Touch on a page of its own (Zugang), for the users lox logic lint says it opens for none of (#66).
+const ZUGANG = "40000000-0000-0000-ffff504f94000001", TOUCH = "40000001-0000-0000-ffff504f94000001";
 const KITCHEN = "30000a01-0000-0000-ffff504f94000001", BATH = "30000a02-0000-0000-ffff504f94000001";
 const root = mkdtempSync(join(tmpdir(), "vislox-edit-"));
 const dir = join(root, "project");
@@ -54,6 +56,9 @@ const base = readFileSync(fixture, "utf8").replace('<Co K="Q" U="10000009-0000-0
   .replace('<Co K="Input1" Nc="1" U="10000006', `<IoData Visu="true" Pr="${KITCHEN}"/>\n\t\t\t\t<Co K="Input1" Nc="1" U="10000006`)
   .replace("\t\t</C>\n\t</C>\n</ControlList>", `\t\t</C>\n\t\t<C Type="Page" V="178" U="${LAGER}" Title="Lager" WF="16384">\n` +
     Array.from({ length: LAGER_N }, (_, i) => { const L = lagerAt(i); return `\t\t\t<C Type="And" V="178" U="${lagerUuid(i)}" Title="Lager ${i}" Px="${L.px}" Py="${L.py}" Px2="${L.px2}" Py2="${L.py2}" Cl="141,255,112" Nio="3" WF="16384"/>\n`; }).join("") +
+    "\t\t</C>\n" +
+    `\t\t<C Type="Page" V="178" U="${ZUGANG}" Title="Zugang" WF="16384">\n` +
+    `\t\t\t<C Type="NfcCodeTouch" V="178" U="${TOUCH}" Title="Haustür" Px="960" Py="960" Px2="2304" Py2="1656" Cl="141,255,112" Nio="0" WF="16384"/>\n` +
     "\t\t</C>\n\t</C>\n</ControlList>");
 assert.ok(base.includes(lagerUuid(LAGER_N - 1)), "the Lager page is in the base");
 writeFileSync(join(dir, "base.Loxone"), base);
@@ -91,6 +96,18 @@ if (process.argv.slice(2, 5).join(" ") === "logic check --json") {
   process.exit(errors.length ? 1 : 0);
 }
 if (process.argv.slice(2, 5).join(" ") === "logic fmt --check") process.exit(0);
+// \`logic lint .\` (#66): dead outputs on each block of the module's own files declared on a line that ends
+// in "# dead", and a user whose tag opens no Code Touch when a file says NOTAG; printed as lox prints them.
+if (process.argv.slice(2, 5).join(" ") === "logic lint .") {
+  const dead = own().flatMap(([path, lines]) => lines.flatMap((l) => { const m = l.match(/^(\\w+) = .*# dead$/); return m ? [\`  \${path}: \\\`\${m[1]}\\\` — no wire draws from any of its ports (compiled config, GUI wires included)\`] : []; }));
+  const access = own().some(([, lines]) => lines.some((l) => l.includes("NOTAG")))
+    ? ["  \\\`Anna\\\` — user with an NFC tag has no access right on any NFC Code Touch, so the tag or code opens nothing."] : [];
+  if (dead.length) console.log(\`dead-outputs (\${dead.length})\\n\${dead.join("\\n")}\`);
+  if (access.length) console.log(\`no-access-right (1)\\n\${access[0]}\`);
+  const n = dead.length + access.length;
+  console.log(n ? \`lint: \${n} finding\${n === 1 ? "" : "s"}\` : "lint: clean");
+  process.exit(n ? 1 : 0);
+}
 if (process.argv.slice(2, 4).join(" ") !== "logic compile") { console.error("unexpected: " + process.argv.slice(2).join(" ")); process.exit(2); }
 // VISLOX_TEST_LOX_DELAY (ms): compile as slowly as a busy CI runner does.
 for (const end = Date.now() + (+process.env.VISLOX_TEST_LOX_DELAY || 0); Date.now() < end;);
@@ -909,10 +926,38 @@ try {
     await page.waitForFunction(() => /Nothing pending/.test(document.querySelector("#deploy-pend")?.textContent || ""), null, { timeout: 10000 });
     assert.equal(readFileSync(flur, "utf8"), was);
   });
-  await step("nothing was deployed: lox only compiled and checked", async () => {
+  await step("lint findings are marked on their blocks, listed, and on the Code Touch (#66)", async () => {
+    const flur = join(dir, "pages", "flur.loxl"), was = readFileSync(flur, "utf8");
+    writeFileSync(flur, was.replace('flur = And("Flur")', 'flur = And("Flur") # dead') + "# NOTAG\n");
+    await waitText("#deploy-lint", /Lint: 2 findings/);
+    await page.evaluate((u) => { gotoPage(S.objPage.get(u), { focus: u }); }, FLUR);
+    await page.waitForSelector(`.blk.linted[data-uuid="${FLUR}"] .lbadge`);
+    assert.match(await page.textContent(`.blk[data-uuid="${FLUR}"] .lbadge title`), /Lint \(dead-outputs\): no wire draws/);
+    assert.equal(await page.$(`.blk[data-uuid="${MONO}"] .lbadge`), null);
+    // The list, by kind: each finding with its file and line, and a button that shows its block.
+    await page.click("#deploy-lint summary");
+    assert.match(await page.textContent("#deploy-lint"), /dead-outputs \(1\)[\s\S]*pages\/flur\.loxl:3flur: no wire draws/);
+    assert.match(await page.textContent("#deploy-lint"), /no-access-right \(1\)[\s\S]*Anna: user with an NFC tag/);
+    await page.click('#deploy-lint .go:has-text("Flur")');
+    await page.waitForFunction((u) => S.sel === u, FLUR);
+    await waitText('[data-body="Lox Logic"]', /Lint \(dead-outputs, pages\/flur\.loxl:3\): no wire draws/);
+    // A hint only: Apply is not turned off for it.
+    assert.doesNotMatch(await page.getAttribute("#btn-apply", "title"), /lint/i);
+    // The Code Touch says whose tag opens nothing.
+    await page.evaluate((u) => { gotoPage(S.objPage.get(u), { focus: u }); select(u); }, TOUCH);
+    await waitText('[data-body="Lox Logic"]', /Lint \(no-access-right\): Anna, user with an NFC tag has no access right/);
+    // Fixed: the badge and the list go.
+    writeFileSync(flur, was);
+    await page.waitForSelector("#deploy-lint.hidden", { state: "attached" });
+    await page.evaluate((u) => { gotoPage(S.objPage.get(u), { focus: u }); }, FLUR);
+    await page.waitForSelector(`.blk[data-uuid="${FLUR}"]`);
+    assert.equal(await page.$(`.blk[data-uuid="${FLUR}"] .lbadge`), null);
+    await page.waitForSelector("#deploy-check.hidden", { state: "attached" });
+  });
+  await step("nothing was deployed: lox only compiled, checked and linted", async () => {
     const ran = readFileSync(calls, "utf8").trim().split("\n");
     assert.ok(ran.length >= 2, ran.join(" | "));
-    assert.ok(ran.every((l) => /^logic (compile|check --json|fmt --check)\b/.test(l)), ran.join(" | "));
+    assert.ok(ran.every((l) => /^logic (compile|check --json|fmt --check|lint \.)( |$)/.test(l)), ran.join(" | "));
   });
   await step("no errors in the browser", async () => {
     assert.deepEqual(errors, []);
@@ -923,6 +968,7 @@ try {
   if (errors.length) console.error("browser errors:", errors);
   if (page) console.error("props:", await page.textContent("#props").catch(() => "?"));
   if (page) console.error("check:", await page.evaluate(() => JSON.stringify(S.check)).catch(() => "?"));
+  if (page) console.error("server check:", await page.evaluate(async () => JSON.stringify([S.checkKey, S.hist?.actions?.edit, await (await fetch("/api/check")).json()])).catch(() => "?"));
   if (page) console.error("add block:", await page.textContent("#ab-body").catch(() => "?"));
   if (page) console.error("wire card:", await page.textContent("#wcard").catch(() => "?"), "| deploy:", await page.textContent("#deploy-msg").catch(() => "?"));
   console.error(log);

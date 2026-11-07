@@ -32,7 +32,8 @@ const PUSH_TIMEOUT: Duration = Duration::from_secs(600);
 const GIT_TIMEOUT: Duration = Duration::from_secs(120);
 /// Starts an Apply message whose upload the Miniserver may not run.
 const UNVERIFIED: &str = "Not verified";
-/// `lox logic compile` reads the base and the module and writes out and the lock.
+/// `lox logic compile` reads the base and the module and writes out and the lock;
+/// `lox logic lint` compiles them too, in memory.
 const COMPILE_TIMEOUT: Duration = Duration::from_secs(120);
 /// `lox logic check` and `lox logic fmt --check` read only the module.
 const CHECK_TIMEOUT: Duration = Duration::from_secs(60);
@@ -147,6 +148,8 @@ struct EditState {
     why: Option<String>,
     /// vislox's file, the deployed and the pending config, by blob id.
     key: String,
+    /// The module's files and the lock as `key` has them ([`Actions::files_key`]).
+    files: Option<String>,
 }
 
 /// The revision the Miniserver runs, for `GET /api/edits`.
@@ -749,39 +752,18 @@ impl Actions {
     /// Tells the browsers when either changed.
     pub fn refresh_edit(&self, deployed: Option<&str>, pending: Option<&str>) {
         let why = self.why_not_edit_now();
-        // vislox's files: each one's name and blob id.
-        let file = self
-            .s
-            .project
-            .as_deref()
-            .and_then(|d| loxone_config::Project::load(&d.join("lox.toml")).ok())
-            .map(|p| {
-                // The module's files, vislox's among them: where each managed
-                // block is declared (#64) moves with them, compiled or not.
-                // And the lockfile: which blocks lox can move comes from it,
-                // and lox or a Discard may change it alone.
-                let mut all: Vec<String> = self
-                    .module_files
-                    .lock()
-                    .unwrap()
-                    .refresh(&p.root, &p.module)
-                    .into_iter()
-                    .map(|(n, b)| format!("{n}={b}"))
-                    .collect();
-                if let Ok(lock) = std::fs::read(&p.lock) {
-                    all.push(format!("lock={}", crate::history::blob_id(&lock)));
-                }
-                all
-            })
-            .filter(|all| !all.is_empty())
-            .map(|all| crate::history::blob_id(all.join("\n").as_bytes()));
+        let file = self.files_key();
         let key = format!(
             "{}:{}:{}",
             file.as_deref().unwrap_or("-"),
             deployed.unwrap_or("-"),
             pending.unwrap_or("-")
         );
-        let new = EditState { why, key };
+        let new = EditState {
+            why,
+            key,
+            files: file,
+        };
         let mut st = self.edit_state.lock().unwrap();
         if *st != new {
             *st = new;
@@ -790,6 +772,27 @@ impl Actions {
         }
         // The check worker compares its key and works only on a change.
         self.check_wake.notify_one();
+    }
+
+    /// The module's files (vislox's among them) and the lockfile as they are
+    /// on disk now, as one blob id: where each managed block is declared
+    /// (#64) moves with them, compiled or not, and which blocks lox can move
+    /// comes from the lock, which lox or a Discard may change alone.
+    fn files_key(&self) -> Option<String> {
+        let d = self.s.project.as_deref()?;
+        let p = loxone_config::Project::load(&d.join("lox.toml")).ok()?;
+        let mut all: Vec<String> = self
+            .module_files
+            .lock()
+            .unwrap()
+            .refresh(&p.root, &p.module)
+            .into_iter()
+            .map(|(n, b)| format!("{n}={b}"))
+            .collect();
+        if let Ok(lock) = std::fs::read(&p.lock) {
+            all.push(format!("lock={}", crate::history::blob_id(&lock)));
+        }
+        (!all.is_empty()).then(|| crate::history::blob_id(all.join("\n").as_bytes()))
     }
 
     /// The base and out on disk, by blob id, as the history read them (it
@@ -1700,8 +1703,19 @@ impl Actions {
         let Ok(_compiling) = self.compile_lock.try_lock() else {
             return false;
         };
+        // The key must be of the files lox reads. It is taken when the
+        // watcher or the poll looks (`refresh_edit`); a file changed since,
+        // and maybe changed back before it looks again, would keep what lox
+        // said of the change under the key of the files as they are after
+        // it. So the files are looked at now, before and after lox: kept
+        // only when both are the key's. If the key lags, the look that
+        // catches up wakes the worker again.
+        let files = self.edit_state.lock().unwrap().files.clone();
+        if self.files_key() != files {
+            return false;
+        }
         let v = self.check_now().await;
-        if self.check_key() != k {
+        if self.check_key() != k || self.files_key() != files {
             return true;
         }
         *self.check_cache.lock().unwrap() = Some((k, v));
@@ -1713,7 +1727,9 @@ impl Actions {
 
     /// Whether the module compiles (#65): lox's errors with the blocks each
     /// one's line names, the files `lox logic fmt --check` would format, and
-    /// whether the pending config is the module compiled as it is (`stale`).
+    /// whether the pending config is the module compiled as it is (`stale`);
+    /// and `lox logic lint`'s findings (#66), each with the line and blocks
+    /// of what it names. Findings are hints: they never stop Apply.
     /// The caller holds the compile lock.
     async fn check_now(&self) -> Value {
         let off = |why: String| json!({ "available": false, "reason": why });
@@ -1726,24 +1742,57 @@ impl Actions {
         };
         let arg = check::module_arg(&p.root, &p.module);
         let fmt_args = ["logic", "fmt", "--check", arg.as_str()];
-        let (checked, fmt) = tokio::join!(
+        // lox logic lint (#66) compiles the module in memory (for its
+        // dead-output analysis) and writes nothing; it reads the project, so
+        // it is given the project's directory.
+        let lint_args = ["logic", "lint", "."];
+        let (checked, fmt, lint) = tokio::join!(
             self.check_module(&p, dir),
-            run_out(&self.s.lox, &fmt_args, dir, CHECK_TIMEOUT)
+            run_out(&self.s.lox, &fmt_args, dir, CHECK_TIMEOUT),
+            run_out(&self.s.lox, &lint_args, dir, COMPILE_TIMEOUT)
         );
         let Some(mut checked) = checked else {
             return off("lox logic check gave no answer vislox can read".into());
         };
-        if !checked.errors.is_empty() {
+        let shown = |f: &str| crate::managed::shown(&p.root, &p.module, &dir.join(f));
+        // Not linted while the module does not compile: lint would only
+        // fail on the same errors.
+        let mut lint = if checked.errors.is_empty() {
+            Some(match lint {
+                Ok((_, o, e)) => check::parse_lint(&o, shown).ok_or_else(|| {
+                    let e = last_lines(e.trim(), 3);
+                    if e.is_empty() {
+                        "lox logic lint gave no answer vislox can read".to_string()
+                    } else {
+                        e
+                    }
+                }),
+                Err(e) => Err(e),
+            })
+        } else {
+            None
+        };
+        let findings = matches!(&lint, Some(Ok(f)) if !f.is_empty());
+        if !checked.errors.is_empty() || findings {
             let texts = {
                 let mut m = self.module_files.lock().unwrap();
                 m.refresh(&p.root, &p.module);
                 m.texts()
             };
             let lock = edit::Lock::read(&p.lock);
-            let sources = crate::managed::sources(&texts, &lock.slugs);
-            check::locate(&mut checked.errors, &texts, &lock, &sources);
+            if !checked.errors.is_empty() {
+                let sources = crate::managed::sources(&texts, &lock.slugs);
+                check::locate(&mut checked.errors, &texts, &lock, &sources);
+            }
+            if let Some(Ok(f)) = &mut lint {
+                check::locate_findings(f, &texts, &lock);
+            }
         }
-        let shown = |f: &str| crate::managed::shown(&p.root, &p.module, &dir.join(f));
+        let lint = match lint {
+            None => Value::Null,
+            Some(Ok(findings)) => json!({ "available": true, "findings": findings }),
+            Some(Err(reason)) => json!({ "available": false, "reason": reason }),
+        };
         let unformatted = match fmt {
             Ok((_, o, e)) => check::unformatted(&o, &e, shown),
             Err(_) => Vec::new(),
@@ -1769,6 +1818,7 @@ impl Actions {
             "truncated": checked.truncated,
             "unformatted": unformatted,
             "stale": stale,
+            "lint": lint,
         })
     }
 
@@ -3213,7 +3263,10 @@ sed "s/Title=\"Testhaus\"/Title=\"Testhaus $w\"/" base.Loxone > "$out"
     /// error on each line of `pages/main.loxl` that says BROKEN, whose
     /// `logic fmt --check` finds a file with two spaces in a row not
     /// formatted (main.loxl's on standard output, without a last newline;
-    /// other.loxl's on standard error), whose `logic compile` writes the base
+    /// other.loxl's on standard error), whose `logic lint .` finds an unused
+    /// extern on main.loxl's `extern` line and dead outputs on `teiler` when
+    /// main.loxl says `# dead` (and fails when it says LINTFAIL), whose
+    /// `logic compile` writes the base
     /// and the module's files into out (taking as many seconds as `../slow`
     /// says, and logging CONCURRENT when another compile runs), and whose
     /// `config push` fails. It logs its calls, and fails on anything else.
@@ -3267,6 +3320,14 @@ case "$1 $2 $3" in
     for a in "$@"; do [ "$prev" = --out ] && out=$a; prev=$a; done
     cat base.Loxone pages/*.loxl > "$out"
     rmdir ../compiling 2>/dev/null ;;
+  "logic lint .")
+    grep -q LINTFAIL pages/main.loxl && { echo 'error: compile for dead-output analysis failed: boom' >&2; exit 1; }
+    n=0
+    ext=$(sed -n 's/^extern \([a-z_0-9]*\) = .*/\1/p' pages/main.loxl)
+    if [ -n "$ext" ]; then echo 'unused-extern (1)'; echo "  pages/main.loxl: \`$ext\` — extern Div is never referenced"; n=1; fi
+    if grep -q '# dead' pages/main.loxl; then echo 'dead-outputs (1)'; echo '  pages/main.loxl: `teiler` — no wire draws from any of its ports'; n=$((n+1)); fi
+    [ $n = 0 ] && { echo 'lint: clean'; exit 0; }
+    echo "lint: $n findings"; exit 1 ;;
   "config push"*) echo 'The Miniserver refused the upload.' >&2; exit 1 ;;
   *) echo "unexpected: $*" >&2; exit 2 ;;
 esac
@@ -3318,6 +3379,11 @@ esac
         assert_eq!(c["errors"], json!([]));
         assert_eq!(c["stale"], Value::Null, "{c}");
         assert_eq!(c["unformatted"], json!([]));
+        assert_eq!(
+            c["lint"],
+            json!({ "available": true, "findings": [] }),
+            "{c}"
+        );
 
         // An error on line 2, which names the managed block `teiler`.
         std::fs::write(
@@ -3332,8 +3398,9 @@ esac
             json!([{ "file": "pages/main.loxl", "line": 2,
                      "message": "unknown block type BROKEN", "blocks": [DIV] }]),
         );
-        // Not compiled into a scratch copy: it cannot compile.
+        // Not compiled into a scratch copy: it cannot compile. Nor linted.
         assert_eq!(c["stale"], Value::Null);
+        assert_eq!(c["lint"], Value::Null);
         let compiles = || {
             calls_in(&tmp)
                 .lines()
@@ -3396,6 +3463,80 @@ esac
             "{c}"
         );
         assert!(!calls_in(&tmp).contains("config push"), "nothing deployed");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn lint_findings_are_pinned_to_their_blocks_and_never_stop_apply() {
+        const AND: &str = "10000004-0000-0040-ffff504f94000001";
+        let (tmp, d, a) = project_to_check();
+        std::fs::write(
+            d.join("pages/main.loxl"),
+            format!("teiler = Div(\"Teiler\") # dead\nextern vx_e = Div(uuid: \"{AND}\")\n"),
+        )
+        .unwrap();
+        a.compile().await.unwrap();
+        let c = check_of(&a, &d).await;
+        assert_eq!(c["ok"], true, "{c}");
+        assert_eq!(
+            c["lint"],
+            json!({ "available": true, "findings": [
+                { "kind": "unused-extern", "name": "vx_e", "message": "extern Div is never referenced",
+                  "file": "pages/main.loxl", "line": 2, "blocks": [AND] },
+                { "kind": "dead-outputs", "name": "teiler", "message": "no wire draws from any of its ports",
+                  "file": "pages/main.loxl", "line": 1, "blocks": [DIV] },
+            ] }),
+            "{c}"
+        );
+        // A hint only: Apply passes its first step and goes on (to a push
+        // the stand-in refuses).
+        let (_, msg) = a.apply(&ApplyOpts::default()).await.unwrap_err();
+        assert!(!msg.contains("doesn't compile"), "{msg}");
+        let progress = a.info()["progress"].clone();
+        assert_eq!(progress["steps"][0]["id"], "module", "{progress}");
+        assert_eq!(progress["steps"][0]["state"], "ok", "{progress}");
+        // lint fails: said, with lox's message, and nothing else changes.
+        std::fs::write(
+            d.join("pages/main.loxl"),
+            "teiler = Div(\"Teiler\") # LINTFAIL\n",
+        )
+        .unwrap();
+        let c = check_of(&a, &d).await;
+        assert_eq!(c["ok"], true, "{c}");
+        assert_eq!(
+            c["lint"],
+            json!({ "available": false, "reason": "error: compile for dead-output analysis failed: boom" }),
+            "{c}"
+        );
+        let lints = calls_in(&tmp)
+            .lines()
+            .filter(|l| *l == "logic lint .")
+            .count();
+        assert!(lints >= 2, "{}", calls_in(&tmp));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_check_is_kept_only_under_the_key_of_the_files_lox_read() {
+        let (_tmp, d, a) = project_to_check();
+        a.compile().await.unwrap();
+        let c = check_of(&a, &d).await;
+        assert_eq!(c["lint"]["findings"], json!([]), "{c}");
+        let main = std::fs::read_to_string(d.join("pages/main.loxl")).unwrap();
+        // A file changes, and the worker runs (for another reason: out on
+        // disk) before the watcher looks at the files.
+        std::fs::write(d.join("pages/main.loxl"), format!("{main}# dead\n")).unwrap();
+        a.set_disk(file_blob(&d.join("base.Loxone")), None);
+        while a.check_once().await {}
+        // It changes back, and only then does the watcher look: the key is
+        // the one from before the change, and what lox said of the change
+        // must not be kept under it.
+        std::fs::write(d.join("pages/main.loxl"), &main).unwrap();
+        a.refresh_edit(None, None);
+        while a.check_once().await {}
+        let c = a.check_result();
+        assert_eq!(c["current"], true, "{c}");
+        assert_eq!(c["lint"]["findings"], json!([]), "{c}");
     }
 
     #[cfg(unix)]

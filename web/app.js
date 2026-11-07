@@ -888,6 +888,15 @@ function drawBlock(parent, o) {
   if (S.view.objects[o.uuid]?.app?.shown) drawAppBadge(g, x, y + h);
   const m = !o.moved_to && managedSrc(o.uuid);
   if (m) { g.classList.add("managed"); drawManagedBadge(g, x, y, m); }
+  const lf = !o.moved_to ? lintFindings(o.uuid) : [];
+  if (lf.length) { g.classList.add("linted"); drawLintBadge(g, x + w, y, lf); }
+}
+/** A warning badge at the block's upper right: lox logic lint has findings on it (#66). Never blocks Apply. */
+function drawLintBadge(g, x, y, list) {
+  const b = el("g", { class: "lbadge" }, g);
+  el("title", {}, b, list.map((f) => `Lint (${f.kind}): ${f.message}`).join("\n"));
+  el("path", { d: `M ${x} ${y - 110} L ${x + 115} ${y + 80} L ${x - 115} ${y + 80} Z` }, b);
+  el("text", { x, y: y + 60, "text-anchor": "middle" }, b, "!");
 }
 /** A small badge at the block's upper left: the project's Lox Logic module manages it. */
 function drawManagedBadge(g, x, y, m) {
@@ -1133,16 +1142,21 @@ function renderPropsBody() {
   const ms = managedSrc(o.uuid);
   // The errors of lox logic check whose line names this block (#65): on the newest config only.
   const ce = S.rev === editRev()?.id ? checkErrors(o.uuid) : [];
-  if (ms || ce.length) {
+  // lox logic lint's findings on it (#66); on an NFC Code Touch also the users whose tag or code opens none.
+  const lf = lintFindings(o.uuid);
+  const access = o.ty === "NfcCodeTouch" && S.rev === editRev()?.id ? lintAll().filter((f) => f.kind === "no-access-right") : [];
+  if (ms || ce.length || lf.length || access.length) {
     const path = srcPath(ms);
     const rows = ce.map((e) => `<div class="ed-note ck-err">⚠ Doesn't compile${e.file ? ` (${esc(checkAt(e))})` : ""}: ${esc(e.message)}</div>`);
+    rows.push(...lf.map((f) => `<div class="ed-note lt-note">⚠ Lint (${esc(f.kind)}${f.file ? `, ${esc(checkAt(f))}` : ""}): ${esc(f.message)}</div>`));
+    rows.push(...access.map((f) => `<div class="ed-note lt-note">⚠ Lint (${esc(f.kind)}): ${esc(f.name)}, ${esc(f.message)}</div>`));
     if (ms) rows.push(
       row("Slug", `<span class="mono">${esc(ms.slug)}</span>`),
       row("Source", path
         ? `<span class="mono src-path">${esc(path)}</span><button type="button" class="copy" data-copy="${esc(path)}" data-label="Copy path" title="Copy the file and line, for an editor or a prompt">Copy path</button><div class="src-how">${esc(srcHow(ms))}</div>`
         : `<span class="none-v">${esc(srcHow(ms))}</span>`),
       `<div class="ed-note">Change it in the module: an edit made in Loxone Config is overwritten on the next push.</div>`);
-    section("Lox Logic", rows, ce.length || undefined);
+    section("Lox Logic", rows, ce.length + lf.length + access.length || undefined);
   }
   const opT = opTarget(o);
   if (opT) section("Operate", [opControls(opT)]);
@@ -2508,10 +2522,19 @@ async function loadCheck() {
   try { c = await api("/api/check"); } catch { c = null; }
   // An older request answering late does not overwrite a newer one.
   if (seq !== S.checkSeq) return;
+  const was = lintSet();
   S.check = c;
+  // The lint badges follow the findings (#66).
+  if (S.view && lintSet() !== was) { renderPage(); applyFocus(); }
   renderActions();
   if (S.sel && S.view) renderProps();
 }
+/** lox logic lint's findings (#66), when the last check has them; else none. */
+function lintAll() { return S.check?.available && S.check.lint?.available ? S.check.lint.findings || [] : []; }
+/** The findings about block `uuid`, shown on the newest config only (as the check's errors are). */
+function lintFindings(uuid) { return S.rev === editRev()?.id ? lintAll().filter((f) => f.blocks?.includes(uuid)) : []; }
+/** The findings on blocks, to redraw the page (badges and their tooltips) only when they change. */
+function lintSet() { return S.rev === editRev()?.id ? JSON.stringify(lintAll().filter((f) => f.blocks?.length).map((f) => [f.blocks, f.kind, f.message])) : ""; }
 /** The module does not compile (lox logic check found errors). */
 function checkBroken() { return !!(S.check?.available && S.check.ok === false); }
 /** `pages/a.loxl:5`, or the file alone. */
@@ -2526,11 +2549,8 @@ function renderCheck() {
   const parts = [];
   if (checkBroken()) {
     const n = c.errors.length + (c.truncated || 0);
-    const items = c.errors.map((e) => {
-      const blocks = (e.blocks || []).filter((u) => S.view?.objects[u]).map((u) =>
-        `<button type="button" class="go" data-go="${esc(u)}" title="Show this block">${esc(displayTitle(S.view.objects[u]))}</button>`).join("");
-      return `<li>${e.file ? `<span class="ck-at">${esc(checkAt(e))}</span>` : ""}${esc(e.message)} ${blocks}</li>`;
-    });
+    const items = c.errors.map((e) =>
+      `<li>${e.file ? `<span class="ck-at">${esc(checkAt(e))}</span>` : ""}${esc(e.message)} ${goButtons(e.blocks)}</li>`);
     if (c.truncated) items.push(`<li>… and ${plural(c.truncated, "more error")}</li>`);
     parts.push(`<div class="ck-h">The module doesn't compile: ${plural(n, "error")}</div>`,
       `<div class="ck-sub">${pendingChange() ? "The pending revision is from the last compile that worked, not from the module as it is." : "Nothing new is compiled until it does."} Apply is off until it compiles.</div>`,
@@ -2549,18 +2569,50 @@ function renderCheck() {
   }
   if (fmt.length) parts.push(`<div class="ck-fmt">Not formatted as lox logic fmt writes it: ${esc(fmt.join(", "))}. A hint only; lox logic fmt --write formats it.</div>`);
   box.innerHTML = parts.join("");
+  renderLint();
 }
+/** The block buttons of an error or finding: each shows its block, on its page. */
+function goButtons(uuids) {
+  return (uuids || []).filter((u) => S.view?.objects[u]).map((u) =>
+    `<button type="button" class="go" data-go="${esc(u)}" title="Show this block">${esc(displayTitle(S.view.objects[u]))}</button>`).join("");
+}
+// ── lox logic lint (#66) ──────────────────────────────────────────────
+// The same check runs lox logic lint on the project when the module compiles: unused names, blocks whose
+// outputs feed nothing, users whose tag opens no Code Touch, and more. The Deploy pane lists every finding
+// by kind with its file, line and blocks; each block gets a warning badge and the finding in Properties.
+// Findings are hints: Apply never waits for them.
+function renderLint() {
+  const box = $("deploy-lint"), c = S.check;
+  const l = c?.available && !checkBroken() ? c.lint : null;
+  const list = l?.available ? l.findings || [] : [];
+  box.classList.toggle("hidden", !l || (l.available && !list.length));
+  if (!l) { box.innerHTML = ""; return; }
+  if (!l.available) { box.innerHTML = `<div class="ck-h">Lint didn't run</div><div class="ck-sub">${esc(l.reason || "")}</div>`; return; }
+  const open = box.querySelector("details")?.open ?? false;
+  const kinds = [...new Set(list.map((f) => f.kind))];
+  const items = kinds.map((k) => {
+    const of = list.filter((f) => f.kind === k);
+    return `<li class="lt-kind"><span class="lt-k">${esc(k)}</span> (${of.length})<ul>${of.map((f) =>
+      `<li>${f.file ? `<span class="ck-at">${esc(checkAt(f))}</span>` : ""}<span class="mono">${esc(f.name)}</span>: ${esc(f.message)} ${goButtons(f.blocks)}</li>`).join("")}</ul></li>`;
+  });
+  box.innerHTML = `<details${open ? " open" : ""}><summary><span class="ck-h">Lint: ${plural(list.length, "finding")}</span> · hints from lox logic lint; Apply doesn't wait for them</summary><ul>${items.join("")}</ul></details>`;
+}
+/** Show the block a button of the check or lint list names, on its page. */
+function goClicked(e) {
+  const g = e.target.closest("[data-go]");
+  if (!g) return;
+  const u = g.dataset.go, pg = S.view?.objects[u]?.page;
+  if (pg) gotoPage(pg, { focus: u });
+  select(u);
+}
+$("deploy-lint").addEventListener("click", goClicked);
 $("deploy-check").addEventListener("click", async (e) => {
   if (e.target.closest("#btn-compile")) {
     deployMsg("");
     try { const j = await act("/api/compile"); deployMsg(j.message); } catch (err) { deployMsg(err.message, true); }
     return;
   }
-  const g = e.target.closest("[data-go]");
-  if (!g) return;
-  const u = g.dataset.go, pg = S.view?.objects[u]?.page;
-  if (pg) gotoPage(pg, { focus: u });
-  select(u);
+  goClicked(e);
 });
 /** One claimed value, whatever the order of the list: its op, object and port or setting. */
 function editKey(c) { return [c.op, c.uuid, c.port ?? c.name ?? ""].join("|"); }

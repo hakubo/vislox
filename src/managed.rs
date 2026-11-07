@@ -174,6 +174,30 @@ pub fn sources<T: AsRef<str>>(
         .collect()
 }
 
+/// Where the module declares each top-level name (any kind: a block, an
+/// extern, a `let`, a template, …), for what lox names by it (#66).
+pub struct Declarations<'a>(Index<'a>);
+
+impl<'a> Declarations<'a> {
+    pub fn new<T: AsRef<str>>(files: &'a [(String, T)]) -> Self {
+        Declarations(Index::new(files))
+    }
+
+    /// `name`'s one top-level declaration (in `file`, when given): its file
+    /// and 1-based line. `None` when there is none, or more than one.
+    pub fn at(&self, name: &str, file: Option<&str>) -> Option<(String, usize)> {
+        let d = self.0.decls.get(name)?;
+        let at: Vec<&At> =
+            d.at.iter()
+                .filter(|(f, _)| file.is_none_or(|x| x == *f))
+                .collect();
+        match at.as_slice() {
+            [(f, l)] => Some((f.to_string(), *l)),
+            _ => None,
+        }
+    }
+}
+
 type At<'a> = (&'a str, usize);
 
 enum Found<'a> {

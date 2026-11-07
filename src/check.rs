@@ -109,26 +109,154 @@ pub fn locate(
     sources: &BTreeMap<String, Source>,
 ) {
     for e in errors {
-        let (Some(file), Some(line)) = (&e.file, e.line) else {
-            continue;
-        };
-        let mut blocks: Vec<String> = sources
-            .iter()
-            .filter(|(_, s)| s.file.as_deref() == Some(file) && s.line == Some(line))
-            .map(|(u, _)| u.clone())
-            .collect();
-        let text = texts
-            .iter()
-            .find(|(f, _)| f == file)
-            .and_then(|(_, t)| t.as_ref().lines().nth(line - 1));
-        if let Some(text) = text {
-            for u in named(text, lock) {
-                if !blocks.contains(&u) {
-                    blocks.push(u);
-                }
+        if let (Some(file), Some(line)) = (&e.file, e.line) {
+            e.blocks = blocks_at(file, line, texts, lock, sources);
+        }
+    }
+}
+
+/// The blocks line `line` of `file` makes or names: what it declares
+/// (`sources`) and the managed slugs and extern UUIDs written on it.
+fn blocks_at(
+    file: &str,
+    line: usize,
+    texts: &[(String, impl AsRef<str>)],
+    lock: &Lock,
+    sources: &BTreeMap<String, Source>,
+) -> Vec<String> {
+    let mut blocks: Vec<String> = sources
+        .iter()
+        .filter(|(_, s)| s.file.as_deref() == Some(file) && s.line == Some(line))
+        .map(|(u, _)| u.clone())
+        .collect();
+    let text = texts
+        .iter()
+        .find(|(f, _)| f == file)
+        .and_then(|(_, t)| t.as_ref().lines().nth(line - 1));
+    if let Some(text) = text {
+        for u in named(text, lock) {
+            if !blocks.contains(&u) {
+                blocks.push(u);
             }
         }
-        e.blocks = blocks;
+    }
+    blocks
+}
+
+/// One finding of `lox logic lint` (#66): never an error, and never a
+/// reason to refuse Apply.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Finding {
+    /// lox's kind (`unused-extern`, `dead-outputs`, `no-access-right`, …).
+    pub kind: String,
+    /// What it is about, as lox names it: a slug, a constant, a template, a
+    /// block type (`unused-default`), a user (`no-access-right`).
+    pub name: String,
+    pub message: String,
+    /// The `.loxl` file that declares `name`, shown as [`Error::file`] is.
+    pub file: Option<String>,
+    /// 1-based: the declaration's line.
+    pub line: Option<usize>,
+    /// The blocks it is about, by UUID: the managed block or extern `name`
+    /// is, and what the declaration's line names.
+    pub blocks: Vec<String>,
+}
+
+/// `lox logic lint`'s standard output, read: each kind (`unused-let (2)`),
+/// its findings (`  pages/a.loxl: `slug` — detail`, the file only in a
+/// directory module), and the count it ends with (`lint: 3 findings …` or
+/// `lint: clean`). `None` without that count: lox failed (it exits 1 for
+/// findings and for errors alike) or is not one vislox can read. lox has
+/// no JSON for lint yet, so this reads the text it prints.
+pub fn parse_lint(stdout: &str, file: impl Fn(&str) -> String) -> Option<Vec<Finding>> {
+    let mut out: Vec<Finding> = Vec::new();
+    let mut kind: Option<String> = None;
+    let mut done = false;
+    for l in stdout.lines() {
+        if l == "lint: clean" || (l.starts_with("lint: ") && l.contains(" finding")) {
+            done = true;
+            break;
+        }
+        if let Some(rest) = l.strip_prefix("  ") {
+            let Some(k) = &kind else { continue };
+            let (f, rest) = match rest.find('`') {
+                Some(i) => (rest[..i].strip_suffix(": "), &rest[i + 1..]),
+                None => {
+                    // A detail that goes on over more lines.
+                    if let Some(last) = out.last_mut() {
+                        last.message.push('\n');
+                        last.message.push_str(rest.trim());
+                    }
+                    continue;
+                }
+            };
+            let Some((name, message)) = rest.split_once("` — ") else {
+                continue;
+            };
+            out.push(Finding {
+                kind: k.clone(),
+                name: name.to_string(),
+                message: message.trim().to_string(),
+                file: f.map(&file),
+                line: None,
+                blocks: Vec::new(),
+            });
+        } else if let Some((k, n)) = l
+            .trim_end()
+            .strip_suffix(')')
+            .and_then(|l| l.split_once(" ("))
+            && !k.is_empty()
+            && !k.contains(' ')
+            && n.parse::<usize>().is_ok()
+        {
+            kind = Some(k.to_string());
+        } else if !l.starts_with(' ') && l.contains("` — ") {
+            // An indented line that lost its indent: not lox's format.
+            return None;
+        }
+    }
+    done.then_some(out)
+}
+
+/// Pin each finding to where its name is declared (the file lox named, or
+/// the only file that declares it) and to the blocks that name is: the
+/// managed block or device the lockfile pins by it, or the object an extern
+/// of that name pins (`uuid: "…"`, or the UUID vislox names it after). Not
+/// the blocks the declaration only refers to.
+pub fn locate_findings<T: AsRef<str>>(
+    findings: &mut [Finding],
+    texts: &[(String, T)],
+    lock: &Lock,
+) {
+    let decls = crate::managed::Declarations::new(texts);
+    for f in findings {
+        if let Some((file, line)) = decls.at(&f.name, f.file.as_deref()) {
+            f.file = Some(file);
+            f.line = Some(line);
+        }
+        let mut blocks: Vec<String> = lock
+            .uuid_of(&f.name)
+            .map(String::from)
+            .into_iter()
+            .collect();
+        blocks.extend(as_uuid(f.name.strip_prefix("vx_").unwrap_or(&f.name)));
+        let text = match (&f.file, f.line) {
+            (Some(file), Some(line)) => texts
+                .iter()
+                .find(|(t, _)| t == file)
+                .and_then(|(_, t)| t.as_ref().lines().nth(line - 1)),
+            _ => None,
+        };
+        if let Some(text) = text
+            && let [Tok::Ident(kw), Tok::Ident(n), ..] = tokens(text).as_slice()
+            && kw == "extern"
+            && *n == f.name
+        {
+            blocks.extend(names(text).1.iter().filter_map(|u| as_uuid(u)));
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        blocks.retain(|u| seen.insert(u.clone()));
+        f.blocks = blocks;
     }
 }
 
@@ -390,6 +518,86 @@ mod tests {
                 vec![],
                 vec![DIV.to_string()],
                 vec![]
+            ]
+        );
+    }
+
+    #[test]
+    fn lint_findings_are_read_by_kind() {
+        let out = "unit-suffix (1)\n  pages/a.loxl: `m` — `Time: 10800` reads better with its unit.\n\
+                   unused-let (2)\n  pages/a.loxl: `c` — constant is never referenced\n  `d` — constant is never referenced\n\
+                   no-access-right (1)\n  `Anna Muster` — user with an NFC tag has no access right on any NFC Code Touch.\n\
+                   lint: 4 findings (1 fixable with `loxl lint --fix`)\n";
+        let f = parse_lint(out, |f| format!("./{f}")).unwrap();
+        let k: Vec<_> = f
+            .iter()
+            .map(|f| (f.kind.as_str(), f.name.as_str(), f.file.as_deref()))
+            .collect();
+        assert_eq!(
+            k,
+            vec![
+                ("unit-suffix", "m", Some("./pages/a.loxl")),
+                ("unused-let", "c", Some("./pages/a.loxl")),
+                ("unused-let", "d", None),
+                ("no-access-right", "Anna Muster", None),
+            ]
+        );
+        assert_eq!(f[0].message, "`Time: 10800` reads better with its unit.");
+        assert_eq!(parse_lint("lint: clean\n", str::to_string), Some(vec![]));
+        // No count at the end: lox failed, or is not one vislox reads.
+        assert_eq!(parse_lint("", str::to_string), None);
+        assert_eq!(
+            parse_lint("unused-let (1)\n  `c` — x\n", str::to_string),
+            None
+        );
+    }
+
+    #[test]
+    fn a_finding_points_at_its_declaration_and_the_block_it_names() {
+        let lock = Lock {
+            slugs: [("flur".to_string(), FLUR.to_string())].into(),
+            ..Lock::default()
+        };
+        let texts = vec![
+            (
+                "pages/a.loxl".to_string(),
+                "page \"OG\"\nlet c = 5\nflur = And(\"Flur\", In1: teiler.Q)\n".to_string(),
+            ),
+            (
+                "pages/b.loxl".to_string(),
+                format!("extern e = Div(uuid: \"{DIV}\")\nlet c = 6\n"),
+            ),
+        ];
+        let f = |name: &str, file: Option<&str>| Finding {
+            kind: "k".into(),
+            name: name.into(),
+            message: String::new(),
+            file: file.map(String::from),
+            line: None,
+            blocks: vec![],
+        };
+        let mut fs = vec![
+            f("flur", None),
+            f("e", Some("pages/b.loxl")),
+            f("c", Some("pages/a.loxl")),
+            f("c", None),
+            f("Anna", None),
+        ];
+        locate_findings(&mut fs, &texts, &lock);
+        let at: Vec<_> = fs
+            .iter()
+            .map(|f| (f.file.as_deref(), f.line, f.blocks.clone()))
+            .collect();
+        assert_eq!(
+            at,
+            vec![
+                // Not `teiler`, which the line only refers to.
+                (Some("pages/a.loxl"), Some(3), vec![FLUR.to_string()]),
+                (Some("pages/b.loxl"), Some(1), vec![DIV.to_string()]),
+                (Some("pages/a.loxl"), Some(2), vec![]),
+                // Declared in two files, and lox named neither: no line.
+                (None, None, vec![]),
+                (None, None, vec![]),
             ]
         );
     }
