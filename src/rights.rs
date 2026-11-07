@@ -83,6 +83,12 @@ pub struct Rights {
     /// groups too), or, for a notification, as members of *Full access*.
     /// By title.
     pub users: Vec<Named>,
+    /// For an access right: each of those users (by UUID) → the access
+    /// schedules (UUIDs) that let them in, directly or through a group. A
+    /// user who keeps access under fewer of them loses opening times
+    /// (#76). Not served: the review says it per user.
+    #[serde(skip)]
+    pub schedules: BTreeMap<String, BTreeSet<String>>,
 }
 
 /// The rights of every NFC Code Touch and push notification in `doc`, by the
@@ -128,6 +134,7 @@ pub fn read(doc: &LoxoneDoc) -> BTreeMap<String, Rights> {
                     kind,
                     list: Vec::new(),
                     users: Vec::new(),
+                    schedules: BTreeMap::new(),
                 },
             )
         })
@@ -199,9 +206,35 @@ pub fn read(doc: &LoxoneDoc) -> BTreeMap<String, Rights> {
             })
             .collect();
         users.sort();
+        if r.kind == ACCESS {
+            for (u, groups) in m.users.iter().zip(&groups_of) {
+                let by: BTreeSet<String> = r
+                    .list
+                    .iter()
+                    .filter(|p| p.uuid == u.uuid || groups.iter().any(|g| g.uuid == p.uuid))
+                    .filter_map(|p| p.schedule_uuid.clone())
+                    .collect();
+                if !by.is_empty() {
+                    r.schedules.insert(u.uuid.clone(), by);
+                }
+            }
+        }
         r.users = users;
     }
     out
+}
+
+/// A user who may still open a door, but under fewer access schedules than
+/// before: one was taken away or replaced by another. vislox cannot tell
+/// whether the new schedule's times cover the old one's, so this is a loss
+/// and warned about like one (#76).
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct Narrowed {
+    pub title: String,
+    pub uuid: String,
+    /// The schedules (titles) that let the user in before, and now.
+    pub from: Vec<String>,
+    pub to: Vec<String>,
 }
 
 /// A holder whose access schedule changed.
@@ -234,6 +267,9 @@ pub struct Change {
     /// only in the new one: what Apply's confirmation warns about.
     pub lose: Vec<Named>,
     pub gain: Vec<Named>,
+    /// The users who keep access, but not under every schedule they had:
+    /// warned about as a loss too.
+    pub narrowed: Vec<Narrowed>,
 }
 
 impl Change {
@@ -251,6 +287,7 @@ impl Change {
             rescheduled: Vec::new(),
             lose: Vec::new(),
             gain: Vec::new(),
+            narrowed: Vec::new(),
         }
     }
 
@@ -329,6 +366,7 @@ pub fn changes(
         kind: ACCESS,
         list: Vec::new(),
         users: Vec::new(),
+        schedules: BTreeMap::new(),
     };
     let mut uuids: Vec<&String> = new.keys().collect();
     uuids.extend(old.keys().filter(|u| !new.contains_key(*u)));
@@ -406,6 +444,30 @@ pub fn changes(
             .filter(|x| !a.contains(&x.uuid))
             .cloned()
             .collect();
+        // Who keeps access under fewer schedules: a schedule's titles from
+        // either config.
+        let sched_title = |id: &str| {
+            w.list
+                .iter()
+                .chain(&n.list)
+                .find(|p| p.schedule_uuid.as_deref() == Some(id))
+                .and_then(|p| p.schedule.clone())
+                .unwrap_or_else(|| id.to_string())
+        };
+        let narrowed: Vec<Narrowed> = n
+            .users
+            .iter()
+            .filter_map(|u| {
+                let before = w.schedules.get(&u.uuid)?;
+                let after = n.schedules.get(&u.uuid).cloned().unwrap_or_default();
+                (!before.is_subset(&after)).then(|| Narrowed {
+                    title: u.title.clone(),
+                    uuid: u.uuid.clone(),
+                    from: before.iter().map(|s| sched_title(s)).collect(),
+                    to: after.iter().map(|s| sched_title(s)).collect(),
+                })
+            })
+            .collect();
         if now.is_none() && w.list.is_empty() && lose.is_empty() {
             // A block nobody held a right on: its removal is in the change list.
             continue;
@@ -416,6 +478,7 @@ pub fn changes(
             && rescheduled.is_empty()
             && lose.is_empty()
             && gain.is_empty()
+            && narrowed.is_empty()
         {
             // Only a member's or a group's title changed.
             continue;
@@ -431,6 +494,7 @@ pub fn changes(
             rescheduled,
             lose,
             gain,
+            narrowed,
         });
     }
     out
@@ -664,5 +728,47 @@ mod tests {
         let mut gone = none.clone();
         gone.remove(DOOR);
         assert!(changes(&none, &gone, |_| String::new()).is_empty());
+    }
+
+    /// A schedule replaced is a loss of opening times, even though the user
+    /// still may open the door; another schedule added is not (#76).
+    #[test]
+    fn a_narrower_schedule_is_a_loss() {
+        let at = |who: &str, d: &LoxoneDoc| {
+            changes(
+                &read(&doc("", "", &prm(DOOR, Some(ALWAYS), None))),
+                &read(d),
+                |u| u.to_string(),
+            )
+            .into_iter()
+            .find(|c| c.uuid == DOOR)
+            .map(|c| {
+                c.narrowed
+                    .into_iter()
+                    .filter(|n| n.title == who)
+                    .map(|n| (n.from, n.to))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+        };
+        // Residents (bob, carol) on workdays instead of always.
+        let narrower = doc("", "", &prm(DOOR, Some(WORKDAYS), None));
+        assert_eq!(
+            at("bob", &narrower),
+            [(vec!["Always".to_string()], vec!["Workdays".to_string()])]
+        );
+        let c = changes(
+            &read(&doc("", "", &prm(DOOR, Some(ALWAYS), None))),
+            &read(&narrower),
+            |u| u.to_string(),
+        );
+        assert!(c[0].lose.is_empty(), "nobody loses the door, only times");
+        // bob on workdays too, the group still always: nothing taken.
+        let wider = doc(
+            "",
+            &prm(DOOR, Some(WORKDAYS), None),
+            &prm(DOOR, Some(ALWAYS), None),
+        );
+        assert!(at("bob", &wider).is_empty());
     }
 }

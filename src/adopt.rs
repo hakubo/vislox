@@ -538,6 +538,11 @@ pub fn extract(
             // changes nothing; editing them later claims them in vislox's
             // file of claims, by the block's slug.
             Item::MembersClaim(_) => {}
+            // An NFC Code Touch's access rights (#76): lox lifts them as a
+            // set and a claim. Left out for the same reason: a dropped claim
+            // leaves the rights as last written, so the door opens for the
+            // same people; editing them later claims them in vislox's file.
+            Item::Access(_) | Item::AccessClaim(_) => {}
             Item::Block(b) => {
                 let slug = rename.get(&b.slug).cloned().ok_or_else(|| {
                     format!(

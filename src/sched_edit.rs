@@ -35,7 +35,7 @@
 use crate::edit::{self, Applied, Claims, Ctx, Files, Lock};
 use crate::set_claim;
 use loxone_config::LoxoneDoc;
-use loxone_config::logic::{Day, Interval, ScheduleLine};
+use loxone_config::logic::{Day, Interval, Item, ScheduleLine};
 use loxone_config::xml::Element;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -426,15 +426,15 @@ impl set_claim::SetKind for SchedKind {
          # deleting it leaves the timer as the deployed config has it.\n";
     const CONTENT_KEY: &'static str = "modes";
     const MEMBERS_KEY: &'static str = "timers";
+    const ENTRIES_KEY: &'static str = "schedules";
+    const SETS_KEY: &'static str = "schedule_sets";
+    type Index<'a> = (&'a LoxoneDoc, &'a Lock);
 
     fn store(c: &Claims) -> &Scheds {
         &c.2
     }
     fn store_mut(c: &mut Claims) -> &mut Scheds {
         &mut c.2
-    }
-    fn claimed_elsewhere<'a>(ctx: &'a Ctx) -> &'a BTreeMap<String, String> {
-        ctx.sched_claimed
     }
     fn wrong_type(name: &str) -> String {
         format!(
@@ -456,8 +456,43 @@ impl set_claim::SetKind for SchedKind {
             restore,
         }
     }
-    fn content_of(lines: &[ScheduleLine], doc: &LoxoneDoc, lock: &Lock) -> Option<Self::Content> {
-        modes_of(lines, &Modes::new(doc, lock)).ok()
+    fn index<'a>(doc: &'a LoxoneDoc, lock: &'a Lock) -> Self::Index<'a> {
+        (doc, lock)
+    }
+    fn content_of(lines: &[ScheduleLine], idx: &Self::Index<'_>) -> Option<Self::Content> {
+        modes_of(lines, &Modes::new(idx.0, idx.1)).ok()
+    }
+    fn read_item(item: &Item) -> Option<set_claim::SetItem<Self::Line>> {
+        let vx = |n: &str| n.starts_with(crate::blocks::SLUG_PREFIX);
+        match item {
+            Item::Schedule(s) if vx(&s.name) => Some(set_claim::SetItem::Set(
+                s.name.clone(),
+                s.lines().cloned().collect(),
+            )),
+            Item::ScheduleClaim(c) if vx(&c.slug) => Some(set_claim::SetItem::Claim(
+                c.slug.clone(),
+                c.schedule.clone(),
+            )),
+            _ => None,
+        }
+    }
+    fn op(op: &crate::edit::Op) -> Option<(&str, Option<&Self::Val>)> {
+        match op {
+            crate::edit::Op::Schedule { uuid, value } => Some((uuid, value.as_ref())),
+            _ => None,
+        }
+    }
+    fn missed(
+        files: &Files,
+        out: &LoxoneDoc,
+        lock: &Lock,
+        uuids: &[String],
+        restored: &[String],
+    ) -> Vec<String> {
+        missed(files, out, lock, uuids, restored)
+    }
+    fn differ<'a>(a: &'a LoxoneDoc, b: &'a LoxoneDoc) -> Box<dyn Fn(&str) -> bool + 'a> {
+        Box::new(move |u| differs(a, b, u))
     }
     /// The timer about to claim it first: its kind (analog or digital)
     /// decides, and names the errors.

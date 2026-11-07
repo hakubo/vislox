@@ -1,6 +1,7 @@
 //! Claims on a block's whole set, shared by several blocks: a DayTimer's
-//! switching times (`schedule`, #73) and a lighting controller's moods
-//! (`moods`, #74), and the next ones (#76 access, #77 recipients, #78 tiles).
+//! switching times (`schedule`, #73), a lighting controller's moods (`moods`,
+//! #74) and who may open an NFC Code Touch (`access`, #76), and the next ones
+//! (#77 recipients, #78 tiles).
 //!
 //! Lox Logic writes each as a named set and a claim per block
 //! (`<slug>.<keyword> = <set>`). Several blocks may claim one set; a block
@@ -21,14 +22,211 @@
 //!   (`restore`), so an undo gives them back too;
 //! - and the section of `GET /api/edits` that lists them.
 
-use crate::edit::{self, Applied, Claims, Ctx, Files, Lock};
+use crate::edit::{self, Applied, Claims, Ctx, Files, Lock, Op};
 use loxone_config::LoxoneDoc;
+use loxone_config::logic::Item;
 use loxone_config::xml::Element;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{Debug, Display};
+use std::marker::PhantomData;
+
+/// The blocks the rest of the module claims, per kind (its keyword:
+/// `schedule`, `moods`, `members`, `access`): UUID (lowercase) → the claim's
+/// `file:line`.
+pub type Claimed = BTreeMap<&'static str, BTreeMap<String, String>>;
+
+/// What a statement of vislox's file of claims is to a [`SetKind`].
+pub enum SetItem<L> {
+    /// `<keyword> <name> … end`.
+    Set(String, Vec<L>),
+    /// `<slug>.<keyword> = <set>`.
+    Claim(String, String),
+}
+
+/// Every kind of claim vislox writes on a block's whole content, in the
+/// order its file lists them. A new kind is one entry here (and its slot in
+/// [`Claims`]): reading and writing the file, the names a new set must not
+/// take, the edit's checks before and after the compile, the refusals of
+/// Remove and Hand back, and `GET /api/edits` go through this list.
+pub static KINDS: &[&dyn ClaimKind] = &[
+    &Reg::<crate::sched_edit::SchedKind>(PhantomData),
+    &Reg::<crate::mood_edit::MoodKind>(PhantomData),
+    &Reg::<crate::access_edit::AccessKind>(PhantomData),
+    &crate::member_edit::MemberKind,
+];
+
+/// One kind of claim, as the code that is the same for every kind sees it.
+pub trait ClaimKind: Sync {
+    /// `schedule`, `moods`, `access`, `members`: the claim's port.
+    fn keyword(&self) -> &'static str;
+    /// What it claims, in messages: `switching times`, `members`.
+    fn what(&self) -> &'static str;
+    /// Whether it writes named sets, whose new names must not be the
+    /// module's.
+    fn makes_sets(&self) -> bool;
+    /// The block an op of this kind is on, and whether it only drops
+    /// vislox's claim.
+    fn op<'a>(&self, op: &'a Op) -> Option<(&'a str, bool)>;
+    /// The sets an op of this kind writes back (`restore`).
+    fn restored(&self, op: &Op) -> Vec<String>;
+    fn is_empty(&self, c: &Claims) -> bool;
+    /// Its part of the file: the sets, then the claims.
+    fn render(&self, c: &Claims) -> String;
+    /// What the file claims on the block `slug`, said after "vislox's file
+    /// claims ", and the pronoun for it (`them`, `it`).
+    fn on(&self, c: &Claims, slug: &str) -> Option<(String, &'static str)>;
+    /// The names of its sets (one namespace for every kind).
+    fn set_names<'a>(&self, c: &'a Claims) -> Vec<&'a str>;
+    /// Read a statement of the file into `c`; `None`: not this kind's.
+    fn read(&self, c: &mut Claims, item: &Item) -> Option<Result<(), String>>;
+    /// What a read file must hold together (a claim names one of its sets).
+    fn check_read(&self, c: &Claims) -> Result<(), String>;
+    /// Each claim's statement and a slug it names, for the check that every
+    /// slug is an extern of the file or a block of vislox's files.
+    fn names(&self, c: &Claims) -> Vec<(String, String)>;
+    /// After the compile: the blocks among `uuids` (and those sharing sets
+    /// with them, or on the sets `restored`) the config does not have as
+    /// their claim says.
+    fn missed(
+        &self,
+        files: &Files,
+        out: &LoxoneDoc,
+        lock: &Lock,
+        uuids: &[String],
+        restored: &[String],
+    ) -> Vec<String>;
+    /// Its keys of `GET /api/edits`, and their values.
+    fn edits_section(
+        &self,
+        now: &Files,
+        was: &Files,
+        lock: &Lock,
+        pending: Option<&LoxoneDoc>,
+        deployed: Option<&LoxoneDoc>,
+    ) -> Vec<(&'static str, Value)>;
+    /// For the browser: the keys a set kind's section uses (null for one
+    /// that has no sets).
+    fn keys(&self) -> Value;
+}
+
+/// The kind of claim `op` is, if it is one.
+pub fn kind_of(op: &Op) -> Option<&'static dyn ClaimKind> {
+    KINDS.iter().copied().find(|k| k.op(op).is_some())
+}
+
+/// A [`SetKind`] as a [`ClaimKind`].
+pub struct Reg<K>(pub PhantomData<fn() -> K>);
+
+impl<K: SetKind> ClaimKind for Reg<K> {
+    fn keyword(&self) -> &'static str {
+        K::KEYWORD
+    }
+    fn what(&self) -> &'static str {
+        K::WHAT
+    }
+    fn makes_sets(&self) -> bool {
+        true
+    }
+    fn op<'a>(&self, op: &'a Op) -> Option<(&'a str, bool)> {
+        K::op(op).map(|(u, v)| {
+            let claiming = v.is_some_and(|v| {
+                let (set, content, _) = K::parts(v);
+                set.is_some() || content.is_some()
+            });
+            (u, !claiming)
+        })
+    }
+    fn restored(&self, op: &Op) -> Vec<String> {
+        K::op(op)
+            .and_then(|(_, v)| v)
+            .map(|v| K::parts(v).2.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+    fn is_empty(&self, c: &Claims) -> bool {
+        K::store(c).is_empty()
+    }
+    fn render(&self, c: &Claims) -> String {
+        K::store(c).render()
+    }
+    fn on(&self, c: &Claims, slug: &str) -> Option<(String, &'static str)> {
+        K::store(c)
+            .claims
+            .contains_key(slug)
+            .then(|| (format!("its {}", K::WHAT), "them"))
+    }
+    fn set_names<'a>(&self, c: &'a Claims) -> Vec<&'a str> {
+        K::store(c).sets.keys().map(String::as_str).collect()
+    }
+    fn read(&self, c: &mut Claims, item: &Item) -> Option<Result<(), String>> {
+        let s = K::store_mut(c);
+        Some(match K::read_item(item)? {
+            SetItem::Set(name, lines) => {
+                if s.sets.insert(name.clone(), lines).is_some() {
+                    Err(format!("a second `{} {name}`", K::KEYWORD))
+                } else {
+                    Ok(())
+                }
+            }
+            SetItem::Claim(slug, set) => {
+                if s.claims.insert(slug.clone(), set).is_some() {
+                    Err(format!("a second `{slug}.{}`", K::KEYWORD))
+                } else {
+                    Ok(())
+                }
+            }
+        })
+    }
+    fn check_read(&self, c: &Claims) -> Result<(), String> {
+        let s = K::store(c);
+        for (t, set) in &s.claims {
+            if !s.sets.contains_key(set) {
+                return Err(format!("`{t}.{} = {set}` without its set", K::KEYWORD));
+            }
+        }
+        Ok(())
+    }
+    fn names(&self, c: &Claims) -> Vec<(String, String)> {
+        K::store(c)
+            .claims
+            .keys()
+            .map(|t| (format!("{t}.{}", K::KEYWORD), t.clone()))
+            .collect()
+    }
+    fn missed(
+        &self,
+        files: &Files,
+        out: &LoxoneDoc,
+        lock: &Lock,
+        uuids: &[String],
+        restored: &[String],
+    ) -> Vec<String> {
+        K::missed(files, out, lock, uuids, restored)
+    }
+    fn edits_section(
+        &self,
+        now: &Files,
+        was: &Files,
+        lock: &Lock,
+        pending: Option<&LoxoneDoc>,
+        deployed: Option<&LoxoneDoc>,
+    ) -> Vec<(&'static str, Value)> {
+        let (entries, sets) = edits_section::<K>(now, was, lock, pending, deployed);
+        vec![(K::ENTRIES_KEY, entries), (K::SETS_KEY, sets)]
+    }
+    fn keys(&self) -> Value {
+        json!({
+            "op": K::KEYWORD,
+            "entries": K::ENTRIES_KEY,
+            "sets": K::SETS_KEY,
+            "content": K::CONTENT_KEY,
+            "members": K::MEMBERS_KEY,
+            "what": K::WHAT,
+        })
+    }
+}
 
 /// One kind of set claim.
 pub trait SetKind: Clone + Debug + Default + PartialEq + 'static {
@@ -48,14 +246,18 @@ pub trait SetKind: Clone + Debug + Default + PartialEq + 'static {
     const STEM: &'static str;
     /// The comment above the sets in the file.
     const HEADER: &'static str;
-    /// The keys of `GET /api/edits`: an entry's content, a set's blocks.
+    /// The keys of `GET /api/edits`: an entry's content, a set's blocks,
+    /// the list of entries and the list of sets.
     const CONTENT_KEY: &'static str;
     const MEMBERS_KEY: &'static str;
+    const ENTRIES_KEY: &'static str;
+    const SETS_KEY: &'static str;
+    /// What reading a set's content against one config needs, worked out
+    /// once per config rather than once per set.
+    type Index<'a>;
 
     fn store(c: &Claims) -> &SetStore<Self>;
     fn store_mut(c: &mut Claims) -> &mut SetStore<Self>;
-    /// The blocks the rest of the module claims: UUID → `file:line`.
-    fn claimed_elsewhere<'a>(ctx: &'a Ctx) -> &'a BTreeMap<String, String>;
     /// Why `name` takes no such claim.
     fn wrong_type(name: &str) -> String;
 
@@ -66,9 +268,25 @@ pub trait SetKind: Clone + Debug + Default + PartialEq + 'static {
         content: Option<Self::Content>,
         restore: BTreeMap<String, Self::Content>,
     ) -> Self::Val;
+    fn index<'a>(doc: &'a LoxoneDoc, lock: &'a Lock) -> Self::Index<'a>;
     /// A set's lines as an op carries them; `None` when they cannot be read
-    /// against `doc`.
-    fn content_of(lines: &[Self::Line], doc: &LoxoneDoc, lock: &Lock) -> Option<Self::Content>;
+    /// against the config `idx` was made of.
+    fn content_of(lines: &[Self::Line], idx: &Self::Index<'_>) -> Option<Self::Content>;
+    /// A statement of the file, if it is this kind's and vislox's (`vx_…`).
+    fn read_item(item: &Item) -> Option<SetItem<Self::Line>>;
+    /// The block an op of this kind is on, and its value.
+    fn op(op: &Op) -> Option<(&str, Option<&Self::Val>)>;
+    /// After the compile: see [`ClaimKind::missed`].
+    fn missed(
+        files: &Files,
+        out: &LoxoneDoc,
+        lock: &Lock,
+        uuids: &[String],
+        restored: &[String],
+    ) -> Vec<String>;
+    /// Whether a block has other content in `a` than in `b`: the test,
+    /// worked out once per pair of configs.
+    fn differ<'a>(a: &'a LoxoneDoc, b: &'a LoxoneDoc) -> Box<dyn Fn(&str) -> bool + 'a>;
     /// An op's content as lines, checked for its blocks (`members`: slug and
     /// element; the block about to claim it first).
     fn lines_of(
@@ -183,24 +401,20 @@ pub fn taken(files: &Files, ctx: &Ctx, s: &str) -> bool {
         || ctx.lock.tombstones.contains(s)
         || ctx.lock.externals.contains_key(s)
         || files.names(s)
-        || files.claims.2.sets.contains_key(s)
-        || files.claims.3.sets.contains_key(s)
+        || KINDS
+            .iter()
+            .any(|k| k.set_names(&files.claims).contains(&s))
         || files.claims.0.keys().any(|u| edit::slug(u) == s)
 }
 
 /// What `files` give the block `target`: its set and the set's content
 /// (none when it cannot be read against `doc`).
-pub fn current<K: SetKind>(
-    files: &Files,
-    target: &str,
-    doc: &LoxoneDoc,
-    lock: &Lock,
-) -> Option<K::Val> {
+pub fn current<K: SetKind>(files: &Files, target: &str, idx: &K::Index<'_>) -> Option<K::Val> {
     let s = K::store(&files.claims);
     let set = s.claims.get(target)?;
     Some(K::make(
         Some(set.clone()),
-        s.sets.get(set).and_then(|l| K::content_of(l, doc, lock)),
+        s.sets.get(set).and_then(|l| K::content_of(l, idx)),
         BTreeMap::new(),
     ))
 }
@@ -296,7 +510,8 @@ pub fn apply<K: SetKind>(
         }
     }
     let before = K::store(&files.claims).clone();
-    let mut previous = current::<K>(files, &target, ctx.doc, ctx.lock);
+    let idx = K::index(ctx.doc, ctx.lock);
+    let mut previous = current::<K>(files, &target, &idx);
     // Sets of vislox's written back first (an undo's).
     if let Some(v) = value {
         for (set, content) in K::parts(v).2 {
@@ -314,7 +529,7 @@ pub fn apply<K: SetKind>(
             let (set, content, _) = K::parts(v);
             // A block takes one set. Dropping vislox's claim is always let
             // through: it is how a block the module claims too is mended.
-            if let Some(at) = K::claimed_elsewhere(ctx).get(&uuid.to_ascii_lowercase()) {
+            if let Some(at) = ctx.claimed(K::KEYWORD).get(&uuid.to_ascii_lowercase()) {
                 return Err(format!(
                     "{name}: {at} claims its {}; change them there (a {} takes one {} set)",
                     K::WHAT,
@@ -379,7 +594,7 @@ pub fn apply<K: SetKind>(
     for (set, lines) in &before.sets {
         let others = now.claimants(set).iter().any(|t| *t != target);
         if now.sets.get(set).is_some_and(|n| n != lines) && others && own.as_ref() != Some(set) {
-            let c = K::content_of(lines, ctx.doc, ctx.lock)
+            let c = K::content_of(lines, &idx)
                 .ok_or_else(|| format!("`{set}`: its {} cannot be read", K::WHAT))?;
             restore.insert(set.clone(), c);
         }
@@ -432,10 +647,15 @@ pub fn edits_section<K: SetKind>(
     lock: &Lock,
     pending: Option<&LoxoneDoc>,
     deployed: Option<&LoxoneDoc>,
-    differs: fn(&LoxoneDoc, &LoxoneDoc, &str) -> bool,
 ) -> (Value, Value) {
     let Some(doc) = pending.or(deployed) else {
         return (json!([]), json!([]));
+    };
+    // Each config read once, not once per block.
+    let idx = K::index(doc, lock);
+    let differs = match (pending, deployed) {
+        (Some(p), Some(d)) => Some(K::differ(p, d)),
+        _ => None,
     };
     // Block UUID → its slug in vislox's files now, and in the deployed ones.
     let mut blocks: BTreeMap<String, (Option<&str>, Option<&str>)> = BTreeMap::new();
@@ -463,8 +683,8 @@ pub fn edits_section<K: SetKind>(
     let list: Vec<Value> = blocks
         .into_iter()
         .map(|(u, (tn, tw))| {
-            let cur = tn.and_then(|t| current::<K>(now, t, doc, lock));
-            let dep = tw.and_then(|t| current::<K>(was, t, doc, lock));
+            let cur = tn.and_then(|t| current::<K>(now, t, &idx));
+            let dep = tw.and_then(|t| current::<K>(was, t, &idx));
             let (set, content) = cur.as_ref().map_or((None, None), |c| {
                 let (s, c, _) = K::parts(c);
                 (s.cloned(), c.cloned())
@@ -476,10 +696,10 @@ pub fn edits_section<K: SetKind>(
                 "shared": set.as_deref().map(|s| uuids_of(s, tn)).unwrap_or_default(),
                 // As for a value: with something pending, a revision that
                 // was never deployed differs from it.
-                "pending": match (pending, deployed) {
-                    (Some(p), Some(d)) => differs(p, d, &u),
-                    (Some(_), None) => true,
-                    (None, _) => false,
+                "pending": match (&differs, pending) {
+                    (Some(f), _) => f(&u),
+                    (None, Some(_)) => true,
+                    (None, None) => false,
                 },
             });
             v[K::CONTENT_KEY] = json!(content);
@@ -497,7 +717,7 @@ pub fn edits_section<K: SetKind>(
                 .collect();
             let mut v = json!({ "name": name, "stale": stale });
             v[K::MEMBERS_KEY] = json!(members);
-            v[K::CONTENT_KEY] = json!(K::content_of(lines, doc, lock));
+            v[K::CONTENT_KEY] = json!(K::content_of(lines, &idx));
             v
         })
         .collect();

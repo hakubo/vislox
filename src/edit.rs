@@ -148,6 +148,14 @@ pub enum Op {
         uuid: String,
         value: Option<Vec<String>>,
     },
+    /// Who may open the NFC Code Touch `uuid` (#76): an `access` set and the
+    /// Code Touch's `.access` claim in [`FILE`] ([`crate::access_edit`]).
+    /// `None` drops vislox's claim: the rights stay as last written. Its
+    /// `previous` is the `access` op with what the Code Touch claimed before.
+    Access {
+        uuid: String,
+        value: Option<crate::access_edit::AccessVal>,
+    },
 }
 
 /// Where a `place` puts one block: its top left corner, as `move` takes it.
@@ -171,7 +179,8 @@ impl Op {
             | Op::Move { uuid, .. }
             | Op::Schedule { uuid, .. }
             | Op::Moods { uuid, .. }
-            | Op::Members { uuid, .. } => Some(uuid),
+            | Op::Members { uuid, .. }
+            | Op::Access { uuid, .. } => Some(uuid),
             Op::AddBlock { .. }
             | Op::Relayout { .. }
             | Op::Place { .. }
@@ -203,7 +212,8 @@ impl Op {
             | Op::Unadopt { .. }
             | Op::Schedule { .. }
             | Op::Moods { .. }
-            | Op::Members { .. } => None,
+            | Op::Members { .. }
+            | Op::Access { .. } => None,
         }
     }
 
@@ -228,7 +238,8 @@ impl Op {
             | Op::Unadopt { .. }
             | Op::Schedule { .. }
             | Op::Moods { .. }
-            | Op::Members { .. } => {}
+            | Op::Members { .. }
+            | Op::Access { .. } => {}
         }
         op
     }
@@ -462,6 +473,8 @@ pub struct Claims(
     pub crate::mood_edit::MoodSets,
     /// The members of central blocks it claims (#75).
     pub crate::member_edit::Members,
+    /// Who may open the NFC Code Touches it claims (#76).
+    pub crate::access_edit::AccessSets,
 );
 
 /// A wire vislox draws: `to.port <- from.port`, each end a slug (an
@@ -614,63 +627,21 @@ impl Claims {
                         .attrs
                         .insert(which, plain(&a.value));
                 }
-                Item::Schedule(s) if s.name.starts_with(SLUG_PREFIX) => {
-                    if c.2.sets.contains_key(&s.name) {
-                        return Err(foreign(&format!("a second `schedule {}`", s.name)));
-                    }
-                    c.2.sets
-                        .insert(s.name.clone(), s.lines().cloned().collect());
-                }
-                Item::ScheduleClaim(sc) if sc.slug.starts_with(SLUG_PREFIX) => {
-                    if c.2
-                        .claims
-                        .insert(sc.slug.clone(), sc.schedule.clone())
-                        .is_some()
-                    {
-                        return Err(foreign(&format!("a second `{}.schedule`", sc.slug)));
-                    }
-                }
-                Item::Moods(m) if m.name.starts_with(SLUG_PREFIX) => {
-                    if c.3.sets.contains_key(&m.name) {
-                        return Err(foreign(&format!("a second `moods {}`", m.name)));
-                    }
-                    c.3.sets
-                        .insert(m.name.clone(), m.moods().cloned().collect());
-                }
-                Item::MoodsClaim(mc) if mc.slug.starts_with(SLUG_PREFIX) => {
-                    if c.3
-                        .claims
-                        .insert(mc.slug.clone(), mc.moods.clone())
-                        .is_some()
-                    {
-                        return Err(foreign(&format!("a second `{}.moods`", mc.slug)));
-                    }
-                }
-                Item::MembersClaim(mc) if mc.slug.starts_with(SLUG_PREFIX) => {
-                    if c.4.insert(mc.slug.clone(), mc.members.clone()).is_some() {
-                        return Err(foreign(&format!("a second `{}.members`", mc.slug)));
-                    }
-                }
                 Item::Gap | Item::FragmentEnd | Item::Comment(_) => {}
-                _ => return Err(foreign("a statement")),
+                // Switching times, moods, members, access: each kind reads
+                // its own sets and claims.
+                other => match crate::set_claim::KINDS
+                    .iter()
+                    .find_map(|k| k.read(&mut c, &other))
+                {
+                    Some(r) => r.map_err(|e| foreign(&e))?,
+                    None => return Err(foreign("a statement")),
+                },
             }
         }
-        // A claim names one of the file's sets.
-        for (t, set) in &c.2.claims {
-            if !c.2.sets.contains_key(set) {
-                return Err(foreign(&format!("`{t}.schedule = {set}` without its set")));
-            }
-        }
-        for (t, set) in &c.3.claims {
-            if !c.3.sets.contains_key(set) {
-                return Err(foreign(&format!("`{t}.moods = {set}` without its set")));
-            }
-        }
-        // A member list names vislox's blocks: its externs, or the blocks it added.
-        for (central, m) in crate::member_edit::names(&c.4) {
-            if !m.starts_with(SLUG_PREFIX) {
-                return Err(foreign(&format!("`{central}.members` naming `{m}`")));
-            }
+        // A claim names one of the file's sets, and only vislox's blocks.
+        for k in crate::set_claim::KINDS {
+            k.check_read(&c).map_err(|e| foreign(&e))?;
         }
         // A wire's ends are vislox's: its externs, or the blocks it added.
         for w in &c.1 {
@@ -697,17 +668,15 @@ impl Claims {
     /// Whether a set claim of the file (switching times, moods) or a member
     /// list (as the central block, or a member) names `slug`.
     pub fn set_claimed(&self, slug: &str) -> bool {
-        self.2.claims.contains_key(slug)
-            || self.3.claims.contains_key(slug)
-            || self.member_named(slug).is_some()
+        self.claim_on(slug).is_some()
     }
 
-    /// The central block whose member list names `slug` (as the block
-    /// itself, or one of its members), if one does (#75).
-    pub fn member_named(&self, slug: &str) -> Option<&str> {
-        crate::member_edit::names(&self.4)
-            .find(|(_, m)| m.as_str() == slug)
-            .map(|(c, _)| c.as_str())
+    /// What a set or member claim of the file claims on `slug`, said after
+    /// "vislox's file claims ", and its pronoun.
+    pub fn claim_on(&self, slug: &str) -> Option<(String, &'static str)> {
+        crate::set_claim::KINDS
+            .iter()
+            .find_map(|k| k.on(self, slug))
     }
 
     /// Drop the externs that claim nothing and no wire or set claim names.
@@ -744,9 +713,9 @@ impl Claims {
                 out.push_str(&format!("{s}.{k} = {v}\n"));
             }
         }
-        out.push_str(&self.2.render());
-        out.push_str(&self.3.render());
-        out.push_str(&crate::member_edit::render(&self.4));
+        for k in crate::set_claim::KINDS {
+            out.push_str(&k.render(self));
+        }
         if !self.1.is_empty() {
             out.push_str("\n# Wires drawn in vislox. Deleting a line takes the wire out again.\n");
         }
@@ -778,7 +747,8 @@ impl Claims {
             | Op::Unadopt { .. }
             | Op::Schedule { .. }
             | Op::Moods { .. }
-            | Op::Members { .. } => None,
+            | Op::Members { .. }
+            | Op::Access { .. } => None,
         }
     }
 
@@ -886,6 +856,7 @@ pub fn apply(
                     | Op::Schedule { .. }
                     | Op::Moods { .. }
                     | Op::Members { .. }
+                    | Op::Access { .. }
             )
         })
         .ok_or_else(|| "not a value".to_string())?;
@@ -986,7 +957,8 @@ pub fn apply(
         | Op::Unadopt { .. }
         | Op::Schedule { .. }
         | Op::Moods { .. }
-        | Op::Members { .. } => {
+        | Op::Members { .. }
+        | Op::Access { .. } => {
             unreachable!("not a value")
         }
     };
@@ -1183,31 +1155,16 @@ impl Files {
                 }
             }
         }
-        // A schedule (#73) or moods (#74) claim names an extern of the
-        // claims file or a block of vislox's files.
-        for (t, what) in f
-            .claims
-            .2
-            .claims
-            .keys()
-            .map(|t| (t, "schedule"))
-            .chain(f.claims.3.claims.keys().map(|t| (t, "moods")))
-        {
-            if !f.claims.0.keys().any(|u| slug(u) == *t) && f.block(t).is_none() {
-                return Err(format!(
-                    "{CLAIMS}: `{t}.{what}` names `{t}`, which is neither an extern of this file \
-                     nor a block vislox added; put its line back or delete the claim"
-                ));
-            }
-        }
-        // A members claim (#75) names externs of the file or blocks of
-        // vislox's files, the central block and each member.
-        for (c, m) in crate::member_edit::names(&f.claims.4) {
-            if !f.claims.0.keys().any(|u| slug(u) == *m) && f.block(m).is_none() {
-                return Err(format!(
-                    "{CLAIMS}: `{c}.members` names `{m}`, which is neither an extern of this file \
-                     nor a block vislox added; put its line back or delete the claim"
-                ));
+        // A set claim (#73, #74, #76) or a members claim (#75) names externs
+        // of the claims file or blocks of vislox's files.
+        for k in crate::set_claim::KINDS {
+            for (stmt, t) in k.names(&f.claims) {
+                if !f.claims.0.keys().any(|u| slug(u) == t) && f.block(&t).is_none() {
+                    return Err(format!(
+                        "{CLAIMS}: `{stmt}` names `{t}`, which is neither an extern of this file \
+                         nor a block vislox added; put its line back or delete the claim"
+                    ));
+                }
             }
         }
         // Every end of a wire is an extern of the claims file or a block
@@ -1252,9 +1209,9 @@ impl Files {
         let mut out = BTreeMap::new();
         if !self.claims.0.values().all(Claim::is_empty)
             || !self.claims.1.is_empty()
-            || !self.claims.2.is_empty()
-            || !self.claims.3.is_empty()
-            || !self.claims.4.is_empty()
+            || crate::set_claim::KINDS
+                .iter()
+                .any(|k| !k.is_empty(&self.claims))
             || self.present.contains(CLAIMS)
         {
             out.insert(CLAIMS.to_string(), self.claims.render());
@@ -1446,15 +1403,19 @@ pub struct Ctx<'a> {
     pub adoptions: &'a BTreeMap<String, crate::adopt::Adoption>,
     /// For each `adopt_page`, the blocks it adopts, by page UUID.
     pub page_adoptions: &'a BTreeMap<String, Vec<String>>,
-    /// The timers whose switching times the rest of the module claims
-    /// (#73): UUID (lowercase) → the claim's `file:line`.
-    pub sched_claimed: &'a BTreeMap<String, String>,
-    /// The lighting controllers whose moods the rest of the module claims
-    /// (#74): UUID (lowercase) → the claim's `file:line`.
-    pub moods_claimed: &'a BTreeMap<String, String>,
-    /// The central blocks whose members the rest of the module claims
-    /// (#75): UUID (lowercase) → the claim's `file:line`.
-    pub members_claimed: &'a BTreeMap<String, String>,
+    /// The blocks whose switching times (#73), moods (#74), members (#75)
+    /// or access rights (#76) the rest of the module claims, per kind: a
+    /// block takes one such claim ([`Ctx::claimed`]).
+    pub claimed: &'a crate::set_claim::Claimed,
+}
+
+impl Ctx<'_> {
+    /// The blocks the rest of the module claims `kind` of: UUID (lowercase)
+    /// → the claim's `file:line`.
+    pub fn claimed(&self, kind: &str) -> &BTreeMap<String, String> {
+        static NONE: BTreeMap<String, String> = BTreeMap::new();
+        self.claimed.get(kind).unwrap_or(&NONE)
+    }
 }
 
 /// What [`apply_op`] did: the value or op that undoes it (`previous`),
@@ -1495,6 +1456,7 @@ pub fn apply_op(files: &mut Files, ctx: &Ctx, op: &Op) -> Result<Applied, String
         Op::Schedule { uuid, value } => crate::sched_edit::apply(files, ctx, uuid, value.as_ref()),
         Op::Moods { uuid, value } => crate::mood_edit::apply(files, ctx, uuid, value.as_ref()),
         Op::Members { uuid, value } => crate::member_edit::apply(files, ctx, uuid, value.as_ref()),
+        Op::Access { uuid, value } => crate::access_edit::apply(files, ctx, uuid, value.as_ref()),
         _ => {
             let uuid = op.uuid().unwrap_or_default();
             match ctx.lock.slug_of(uuid) {
@@ -1564,6 +1526,10 @@ pub fn undo_ops(
                 value: serde_json::from_value(prev).map_err(bad)?,
             }),
             Op::Members { uuid, .. } => undo.push(Op::Members {
+                uuid: uuid.clone(),
+                value: serde_json::from_value(prev).map_err(bad)?,
+            }),
+            Op::Access { uuid, .. } => undo.push(Op::Access {
                 uuid: uuid.clone(),
                 value: serde_json::from_value(prev).map_err(bad)?,
             }),
@@ -1756,28 +1722,10 @@ fn remove_block(files: &mut Files, ctx: &Ctx, uuid: &str) -> Result<Applied, Str
         }
         None => return Err(format!("{name}: only a block added here can be taken out")),
     };
-    if files.claims.2.claims.contains_key(&slug) {
+    if let Some((what, them)) = files.claims.claim_on(&slug) {
         return Err(format!(
-            "{name}: vislox's file claims its switching times; take them out first (Revert them, \
-             or undo the edit)"
-        ));
-    }
-    if files.claims.3.claims.contains_key(&slug) {
-        return Err(format!(
-            "{name}: vislox's file claims its moods; take them out first (Revert them, or undo the \
+            "{name}: vislox's file claims {what}; take {them} out first (Revert them, or undo the \
              edit)"
-        ));
-    }
-    if let Some(c) = files.claims.member_named(&slug) {
-        return Err(format!(
-            "{name}: vislox's file claims {} members ({c}.members); take {} out first (Revert \
-             them, or undo the edit)",
-            if c == slug {
-                "its"
-            } else {
-                "it among a central block's"
-            },
-            if c == slug { "them" } else { "it" },
         ));
     }
     if ctx
@@ -1964,30 +1912,11 @@ fn unadopt(files: &mut Files, ctx: &Ctx, uuids: &[String]) -> Result<Applied, St
                 name(u)
             ));
         }
-        if files.claims.2.claims.contains_key(s) {
+        if let Some((what, _)) = files.claims.claim_on(s) {
             return Err(format!(
-                "{}: vislox's file claims its switching times; revert them first, then hand it \
-                 back to Loxone Config",
+                "{}: vislox's file claims {what}; revert them first, then hand it back to Loxone \
+                 Config",
                 name(u)
-            ));
-        }
-        if files.claims.3.claims.contains_key(s) {
-            return Err(format!(
-                "{}: vislox's file claims its moods; revert them first, then hand it back to \
-                 Loxone Config",
-                name(u)
-            ));
-        }
-        if let Some(c) = files.claims.member_named(s) {
-            return Err(format!(
-                "{}: vislox's file claims {} ({c}.members); revert them first, then hand it back \
-                 to Loxone Config",
-                name(u),
-                if c == s {
-                    "its members"
-                } else {
-                    "it among a central block's members"
-                }
             ));
         }
         slugs.insert(s.to_string());
@@ -3142,7 +3071,8 @@ pub fn current(doc: &LoxoneDoc, op: &Op) -> Option<String> {
         | Op::Unadopt { .. }
         | Op::Schedule { .. }
         | Op::Moods { .. }
-        | Op::Members { .. } => None,
+        | Op::Members { .. }
+        | Op::Access { .. } => None,
     }
 }
 
@@ -3628,9 +3558,7 @@ mod tests {
                 drawn: &Default::default(),
                 adoptions: &Default::default(),
                 page_adoptions: &Default::default(),
-                sched_claimed: &Default::default(),
-                moods_claimed: &Default::default(),
-                members_claimed: &Default::default(),
+                claimed: &Default::default(),
             };
             apply_op(&mut files, &ctx, &add(EG, t, None, &[], &[])).unwrap();
             let mut l = Lockfile::default();
@@ -3663,9 +3591,7 @@ mod tests {
             drawn: &Default::default(),
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
-            sched_claimed: &Default::default(),
-            moods_claimed: &Default::default(),
-            members_claimed: &Default::default(),
+            claimed: &Default::default(),
         };
         let a = apply_op(
             &mut files,
@@ -3734,9 +3660,7 @@ mod tests {
             drawn: &Default::default(),
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
-            sched_claimed: &Default::default(),
-            moods_claimed: &Default::default(),
-            members_claimed: &Default::default(),
+            claimed: &Default::default(),
         };
         let title = Op::Title {
             uuid: mono.clone(),
@@ -3799,9 +3723,7 @@ mod tests {
             drawn: &Default::default(),
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
-            sched_claimed: &Default::default(),
-            moods_claimed: &Default::default(),
-            members_claimed: &Default::default(),
+            claimed: &Default::default(),
         };
         let r = apply_op(&mut files, &ctx, &Op::RemoveBlock { uuid: mono.clone() }).unwrap();
         // It names the block it adds again (#62): lox mints new UUIDs for it.
@@ -3828,9 +3750,7 @@ mod tests {
             drawn: &Default::default(),
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
-            sched_claimed: &Default::default(),
-            moods_claimed: &Default::default(),
-            members_claimed: &Default::default(),
+            claimed: &Default::default(),
         };
         let e = apply_op(&mut files, &ctx, &Op::RemoveBlock { uuid: pulse }).unwrap_err();
         assert!(e.contains("is deployed"), "{e}");
@@ -3854,9 +3774,7 @@ mod tests {
             drawn: &Default::default(),
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
-            sched_claimed: &Default::default(),
-            moods_claimed: &Default::default(),
-            members_claimed: &Default::default(),
+            claimed: &Default::default(),
         };
         apply_op(&mut files, &ctx, &add(OG, "And", Some("Licht"), &[], &[])).unwrap();
         let text = files.render()["obergeschoss.loxl"].clone();
@@ -3888,9 +3806,7 @@ mod tests {
             drawn: &Default::default(),
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
-            sched_claimed: &Default::default(),
-            moods_claimed: &Default::default(),
-            members_claimed: &Default::default(),
+            claimed: &Default::default(),
         };
         apply_op(&mut files, &ctx, &add(OG, "Or", None, &[], &[])).unwrap();
         let r = files.render();
@@ -3924,9 +3840,7 @@ mod tests {
             drawn: &Default::default(),
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
-            sched_claimed: &Default::default(),
-            moods_claimed: &Default::default(),
-            members_claimed: &Default::default(),
+            claimed: &Default::default(),
         };
         for s in ["vx_and_1", "vx_or_1"] {
             let uuid = l.objects[s].uuid.clone();
@@ -3952,9 +3866,7 @@ mod tests {
             drawn: &Default::default(),
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
-            sched_claimed: &Default::default(),
-            moods_claimed: &Default::default(),
-            members_claimed: &Default::default(),
+            claimed: &Default::default(),
         };
         let mut files = Files::default();
         let err = |op: Op| apply_op(&mut files.clone(), &ctx, &op).unwrap_err();
@@ -3989,9 +3901,7 @@ mod tests {
             drawn: &Default::default(),
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
-            sched_claimed: &Default::default(),
-            moods_claimed: &Default::default(),
-            members_claimed: &Default::default(),
+            claimed: &Default::default(),
         };
         let e = apply_op(&mut Files::default(), &ctx, &add(OG, "And", None, &[], &[])).unwrap_err();
         assert!(e.contains("2 pages are titled"), "{e}");
@@ -4041,9 +3951,7 @@ mod tests {
             drawn: &Default::default(),
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
-            sched_claimed: &Default::default(),
-            moods_claimed: &Default::default(),
-            members_claimed: &Default::default(),
+            claimed: &Default::default(),
         };
         apply_op(&mut files, &ctx, &add(OG, "And", Some("Licht"), &[], &[])).unwrap();
         // Deployed: the base draws it where lox placed it.
@@ -4061,9 +3969,7 @@ mod tests {
             drawn: &Default::default(),
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
-            sched_claimed: &Default::default(),
-            moods_claimed: &Default::default(),
-            members_claimed: &Default::default(),
+            claimed: &Default::default(),
         };
         // Snapped to the grid, the size kept; `previous` moves it back.
         let mut files = Files::from_texts(&files.render()).unwrap();
@@ -4146,9 +4052,7 @@ mod tests {
             drawn: &Default::default(),
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
-            sched_claimed: &Default::default(),
-            moods_claimed: &Default::default(),
-            members_claimed: &Default::default(),
+            claimed: &Default::default(),
         };
         apply_op(&mut files, &ctx, &add(OG, "And", None, &[], &[])).unwrap();
         apply_op(&mut files, &ctx, &add(OG, "Or", None, &[], &[])).unwrap();
@@ -4163,9 +4067,7 @@ mod tests {
             drawn: &Default::default(),
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
-            sched_claimed: &Default::default(),
-            moods_claimed: &Default::default(),
-            members_claimed: &Default::default(),
+            claimed: &Default::default(),
         };
         let err = |op: Op| apply_op(&mut files.clone(), &ctx, &op).unwrap_err();
         // Drawn in Loxone Config: lox does not move it.
@@ -4272,9 +4174,7 @@ mod tests {
             drawn: &Default::default(),
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
-            sched_claimed: &Default::default(),
-            moods_claimed: &Default::default(),
-            members_claimed: &Default::default(),
+            claimed: &Default::default(),
         };
         apply_op(&mut files, &ctx, &add(OG, "And", None, &[], &[])).unwrap();
         let out = compile_files(&d, &files, &mut l).unwrap();
@@ -4299,9 +4199,7 @@ mod tests {
                 drawn: &Default::default(),
                 adoptions: &Default::default(),
                 page_adoptions: &Default::default(),
-                sched_claimed: &Default::default(),
-                moods_claimed: &Default::default(),
-                members_claimed: &Default::default(),
+                claimed: &Default::default(),
             };
             files.layout = Placement::default();
             apply_op(
@@ -4372,9 +4270,7 @@ mod tests {
             drawn: &Default::default(),
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
-            sched_claimed: &Default::default(),
-            moods_claimed: &Default::default(),
-            members_claimed: &Default::default(),
+            claimed: &Default::default(),
         };
         apply_op(&mut files, &ctx, &add(OG, "And", None, &[], &[])).unwrap();
         apply_op(&mut files, &ctx, &add(EG, "Or", None, &[], &[])).unwrap();
@@ -4428,9 +4324,7 @@ mod tests {
             drawn: &Default::default(),
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
-            sched_claimed: &Default::default(),
-            moods_claimed: &Default::default(),
-            members_claimed: &Default::default(),
+            claimed: &Default::default(),
         };
         apply_op(&mut files, &ctx, &add(OG, "And", None, &[], &[])).unwrap();
         let out = compile_files(&d, &files, &mut l).unwrap();
@@ -4519,9 +4413,7 @@ mod tests {
             drawn: &Default::default(),
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
-            sched_claimed: &Default::default(),
-            moods_claimed: &Default::default(),
-            members_claimed: &Default::default(),
+            claimed: &Default::default(),
         };
         // The Divide block's output onto the upper floor's OR: another page.
         let w = wire_op((DIV, "AQ"), (OR, "I2"));
@@ -4567,9 +4459,7 @@ mod tests {
             drawn: &drawn,
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
-            sched_claimed: &Default::default(),
-            moods_claimed: &Default::default(),
-            members_claimed: &Default::default(),
+            claimed: &Default::default(),
         };
         // One request may take a wire out and draw it again (an undo and a
         // redo, a reconnect to the same port): the ops see each other.
@@ -4607,9 +4497,7 @@ mod tests {
             drawn: &Default::default(),
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
-            sched_claimed: &Default::default(),
-            moods_claimed: &Default::default(),
-            members_claimed: &Default::default(),
+            claimed: &Default::default(),
         };
         let err = |op: Op| apply_op(&mut Files::default(), &ctx, &op).unwrap_err();
         assert!(err(wire_op((DIV, "Input2"), (OR, "I2"))).contains("is an input"));
@@ -4658,9 +4546,7 @@ mod tests {
             drawn: &Default::default(),
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
-            sched_claimed: &Default::default(),
-            moods_claimed: &Default::default(),
-            members_claimed: &Default::default(),
+            claimed: &Default::default(),
         };
         let e = apply_op(
             &mut Files::default(),
@@ -4696,9 +4582,7 @@ mod tests {
             drawn: &Default::default(),
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
-            sched_claimed: &Default::default(),
-            moods_claimed: &Default::default(),
-            members_claimed: &Default::default(),
+            claimed: &Default::default(),
         };
         let e = apply_op(
             &mut Files::default(),
@@ -4737,9 +4621,7 @@ mod tests {
             drawn: &Default::default(),
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
-            sched_claimed: &Default::default(),
-            moods_claimed: &Default::default(),
-            members_claimed: &Default::default(),
+            claimed: &Default::default(),
         };
         apply_op(&mut files, &ctx, &add(OG, "And", None, &[("I2", "1")], &[])).unwrap();
         let out = compile_files(&d, &files, &mut l).unwrap();
@@ -4754,9 +4636,7 @@ mod tests {
             drawn: &Default::default(),
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
-            sched_claimed: &Default::default(),
-            moods_claimed: &Default::default(),
-            members_claimed: &Default::default(),
+            claimed: &Default::default(),
         };
         // Its input with a constant takes no wire; the other does.
         let e = apply_op(&mut files, &ctx, &wire_op((DIV, "AQ"), (&new, "I2"))).unwrap_err();
@@ -4792,9 +4672,7 @@ mod tests {
             drawn: &Default::default(),
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
-            sched_claimed: &Default::default(),
-            moods_claimed: &Default::default(),
-            members_claimed: &Default::default(),
+            claimed: &Default::default(),
         };
         let undo = apply_op(&mut files, &ctx, &Op::RemoveBlock { uuid: new.clone() })
             .unwrap()
@@ -4832,9 +4710,7 @@ mod tests {
             drawn: &Default::default(),
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
-            sched_claimed: &Default::default(),
-            moods_claimed: &Default::default(),
-            members_claimed: &Default::default(),
+            claimed: &Default::default(),
         };
         let a = apply_op(&mut files, &ctx, &undo).unwrap();
         let slug2 = a.added.unwrap();
@@ -4925,9 +4801,7 @@ mod tests {
             drawn: &Default::default(),
             adoptions: &adoptions,
             page_adoptions: &pages,
-            sched_claimed: &Default::default(),
-            moods_claimed: &Default::default(),
-            members_claimed: &Default::default(),
+            claimed: &Default::default(),
         };
         let back = |f: &mut Files, u: &str| {
             apply_op(
@@ -5072,9 +4946,7 @@ mod tests {
             drawn: &Default::default(),
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
-            sched_claimed: &claimed,
-            moods_claimed: &Default::default(),
-            members_claimed: &Default::default(),
+            claimed: &claimed,
         };
         let (mon, sat, hol) = (builtin_uuid(4), builtin_uuid(9), builtin_uuid(1));
         let wk: Vec<(String, Vec<Sp>)> = (4..=8)
@@ -5250,11 +5122,14 @@ mod tests {
             .unwrap_err()
             .contains("only a DayTimer")
         );
-        let elsewhere = BTreeMap::from([(UHR.to_string(), "pages/uhr.loxl:4".to_string())]);
+        let elsewhere = BTreeMap::from([(
+            "schedule",
+            BTreeMap::from([(UHR.to_string(), "pages/uhr.loxl:4".to_string())]),
+        )]);
         let e = apply_op(
             &mut files,
             &Ctx {
-                sched_claimed: &elsewhere,
+                claimed: &elsewhere,
                 ..ctx
             },
             &op,
@@ -5291,9 +5166,7 @@ mod tests {
             drawn: &Default::default(),
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
-            sched_claimed: &Default::default(),
-            moods_claimed: &Default::default(),
-            members_claimed: &Default::default(),
+            claimed: &Default::default(),
         };
         let mon = builtin_uuid(4);
         let mut files = Files::default();
@@ -5399,9 +5272,7 @@ mod tests {
             drawn: &Default::default(),
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
-            sched_claimed: &Default::default(),
-            moods_claimed: &Default::default(),
-            members_claimed: &Default::default(),
+            claimed: &Default::default(),
         };
         let mut files = Files::default();
         let mon = builtin_uuid(4);
@@ -5414,8 +5285,11 @@ mod tests {
             },
         )
         .unwrap();
-        let elsewhere = BTreeMap::from([(UHR.to_string(), "pages/uhr.loxl:4".to_string())]);
-        ctx.sched_claimed = &elsewhere;
+        let elsewhere = BTreeMap::from([(
+            "schedule",
+            BTreeMap::from([(UHR.to_string(), "pages/uhr.loxl:4".to_string())]),
+        )]);
+        ctx.claimed = &elsewhere;
         let e = apply_op(
             &mut files.clone(),
             &ctx,
@@ -5499,7 +5373,7 @@ mod tests {
         d: &'a LoxoneDoc,
         lock: &'a Lock,
         names: &'a BTreeSet<String>,
-        claimed: &'a BTreeMap<String, String>,
+        claimed: &'a crate::set_claim::Claimed,
     ) -> Ctx<'a> {
         Ctx {
             doc: d,
@@ -5510,16 +5384,13 @@ mod tests {
             drawn: &EMPTY_WIRES,
             adoptions: &EMPTY_ADOPT,
             page_adoptions: &EMPTY_PAGES,
-            sched_claimed: &EMPTY_CLAIMS,
-            moods_claimed: claimed,
-            members_claimed: &EMPTY_CLAIMS,
+            claimed,
         }
     }
 
     static EMPTY_WIRES: BTreeSet<Wire> = BTreeSet::new();
     static EMPTY_ADOPT: BTreeMap<String, crate::adopt::Adoption> = BTreeMap::new();
     static EMPTY_PAGES: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    static EMPTY_CLAIMS: BTreeMap<String, String> = BTreeMap::new();
 
     #[test]
     fn moods_are_a_set_lox_writes_onto_the_controller() {
@@ -5661,7 +5532,10 @@ mod tests {
         .unwrap();
         // Not a controller; one the module claims.
         assert!(err(moods_op(DIV, None, &[("A", "")])).contains("only a lighting controller"));
-        let elsewhere = BTreeMap::from([(LICHT.to_string(), "pages/licht.loxl:4".to_string())]);
+        let elsewhere = BTreeMap::from([(
+            "moods",
+            BTreeMap::from([(LICHT.to_string(), "pages/licht.loxl:4".to_string())]),
+        )]);
         let e = apply_op(
             &mut Files::default(),
             &mood_ctx(&d, &lock, &names, &elsewhere),
@@ -5974,7 +5848,6 @@ mod tests {
             &lock,
             Some(&gone),
             None,
-            crate::mood_edit::differs,
         );
         assert_eq!(sets[0]["stale"], serde_json::json!([FLUR]));
         // Dropped, Licht's set is written again.
@@ -6004,5 +5877,300 @@ mod tests {
             .unwrap_err()
             .contains("no object")
         );
+    }
+
+    // ── access rights (#76) ────────────────────────────────────────────
+
+    fn access_op(uuid: &str, set: Option<&str>, grants: &[(&str, &str, &str)]) -> Op {
+        Op::Access {
+            uuid: uuid.into(),
+            value: Some(crate::access_edit::AccessVal {
+                set: set.map(String::from),
+                grants: (set.is_none() || !grants.is_empty()).then(|| {
+                    grants
+                        .iter()
+                        .map(|(k, u, s)| crate::access_edit::Grant {
+                            kind: k.to_string(),
+                            uuid: u.to_string(),
+                            schedule: s.to_string(),
+                        })
+                        .collect()
+                }),
+                restore: BTreeMap::new(),
+            }),
+        }
+    }
+
+    fn access_ctx<'a>(
+        d: &'a LoxoneDoc,
+        lock: &'a Lock,
+        names: &'a BTreeSet<String>,
+        claimed: &'a crate::set_claim::Claimed,
+    ) -> Ctx<'a> {
+        Ctx {
+            doc: d,
+            lock,
+            base: d,
+            deployed: None,
+            names,
+            drawn: &EMPTY_WIRES,
+            adoptions: &EMPTY_ADOPT,
+            page_adoptions: &EMPTY_PAGES,
+            claimed,
+        }
+    }
+
+    /// Who may open `door` in `doc`: (title, schedule title).
+    fn opens(doc: &LoxoneDoc, door: &str) -> Vec<(String, String)> {
+        crate::rights::read(doc)[door]
+            .list
+            .iter()
+            .map(|p| (p.title.clone(), p.schedule.clone().unwrap_or_default()))
+            .collect()
+    }
+
+    #[test]
+    fn access_is_a_set_lox_writes_onto_the_code_touch() {
+        use crate::access_edit::fixture::*;
+        let d = LoxoneDoc::parse(house().as_bytes()).unwrap();
+        let (names, claimed) = (BTreeSet::new(), BTreeMap::new());
+        let mut l = Lockfile::default();
+        let lock = lock_of(&l);
+        let ctx = access_ctx(&d, &lock, &names, &claimed);
+        let mut files = Files::default();
+        // alice is left out; the group may open the door on workdays.
+        let op = access_op(DOOR, None, &[("group", BEWOHNER, WORKDAYS)]);
+        let a = apply_op(&mut files, &ctx, &op).unwrap();
+        assert_eq!(a.previous, serde_json::Value::Null);
+        let text = &files.render()["edits.loxl"];
+        let s = slug(DOOR);
+        for want in [
+            format!("extern {s} = NfcCodeTouch(uuid: \"{DOOR}\")\n"),
+            "access vx_haustuer_access\n\tgroup \"Bewohner\": \"Workdays\"\nend\n".to_string(),
+            format!("{s}.access = vx_haustuer_access\n"),
+        ] {
+            assert!(text.contains(&want), "{want} in\n{text}");
+        }
+        assert_eq!(
+            Files::from_texts(&files.render()).unwrap().claims,
+            files.claims
+        );
+        let out = compile_files(&d, &files, &mut l).unwrap();
+        assert_eq!(
+            opens(&out, DOOR),
+            [("Bewohner".to_string(), "Workdays".to_string())]
+        );
+        // alice's ACT= (operating the block in the app) is no access right: kept.
+        let xml = String::from_utf8(out.to_bytes()).unwrap();
+        assert!(
+            xml.contains(&format!("<PRM REF=\"{DOOR}\" ACT=\"3\"/>")),
+            "{}",
+            &xml[xml.find("Title=\"alice\"").unwrap()..][..400]
+        );
+        // The review, and Apply's confirmation, say who loses and who gains it.
+        let ch =
+            crate::rights::changes(&crate::rights::read(&d), &crate::rights::read(&out), |u| {
+                u.to_string()
+            });
+        let door = ch.iter().find(|c| c.uuid == DOOR).unwrap();
+        assert_eq!(door.lose[0].title, "alice");
+        assert_eq!(door.gain[0].title, "bob");
+        assert!(crate::access_edit::missed(&files, &out, &lock, &[DOOR.into()], &[]).is_empty());
+        assert_eq!(
+            crate::access_edit::missed(&files, &d, &lock, &[DOOR.into()], &[]),
+            ["Haustür"]
+        );
+        assert!(crate::access_edit::differs(&out, &d, DOOR));
+        assert!(!crate::access_edit::differs(&out, &d, GARAGE));
+
+        // Changed again: its own set is rewritten; previous is what it claimed,
+        // by UUID (lowercase), so the undo gives it back exactly.
+        let ctx2 = Ctx { doc: &out, ..ctx };
+        let op2 = access_op(DOOR, None, &[]);
+        let a2 = apply_op(&mut files, &ctx2, &op2).unwrap();
+        let prev: crate::access_edit::AccessVal =
+            serde_json::from_value::<Option<_>>(a2.previous.clone())
+                .unwrap()
+                .unwrap();
+        assert_eq!(prev.set.as_deref(), Some("vx_haustuer_access"));
+        assert_eq!(prev.grants.as_ref().unwrap()[0].uuid, BEWOHNER);
+        // An empty set revokes everyone.
+        let out2 = compile_files(&d, &files, &mut l).unwrap();
+        assert!(opens(&out2, DOOR).is_empty());
+        let undo = undo_ops(std::slice::from_ref(&op2), &[a2.previous], &[]).unwrap();
+        assert_eq!(
+            undo,
+            [Op::Access {
+                uuid: DOOR.into(),
+                value: Some(prev)
+            }]
+        );
+        apply_op(&mut files, &Ctx { doc: &out2, ..ctx2 }, &undo[0]).unwrap();
+        assert_eq!(
+            opens(&compile_files(&d, &files, &mut l).unwrap(), DOOR)[0].0,
+            "Bewohner"
+        );
+        // Dropped: the set and extern go, and the rights stay as last written.
+        apply_op(
+            &mut files,
+            &ctx2,
+            &Op::Access {
+                uuid: DOOR.into(),
+                value: None,
+            },
+        )
+        .unwrap();
+        assert!(files.claims.5.is_empty() && files.claims.0.is_empty());
+    }
+
+    #[test]
+    fn access_lox_would_refuse_is_refused_first() {
+        use crate::access_edit::fixture::*;
+        let d = LoxoneDoc::parse(house().as_bytes()).unwrap();
+        let (names, claimed) = (BTreeSet::new(), BTreeMap::new());
+        let lock = Lock::default();
+        let ctx = access_ctx(&d, &lock, &names, &claimed);
+        let err = |op: Op| apply_op(&mut Files::default(), &ctx, &op).unwrap_err();
+        let e = err(access_op(
+            DOOR,
+            None,
+            &[("user", BOB, ALWAYS), ("user", BOB, WORKDAYS)],
+        ));
+        assert!(
+            e.starts_with("Haustür: ") && e.contains("listed twice"),
+            "{e}"
+        );
+        let e = err(access_op(DOOR, None, &[("user", TWIN2, ALWAYS)]));
+        assert!(e.contains("titled \"chris\""), "{e}");
+        // Not a Code Touch; one the module claims.
+        assert!(
+            err(access_op(DIV, None, &[("user", BOB, ALWAYS)])).contains("only an NFC Code Touch")
+        );
+        let elsewhere = BTreeMap::from([(
+            "access",
+            BTreeMap::from([(DOOR.to_string(), "pages/zugang.loxl:7".to_string())]),
+        )]);
+        let e = apply_op(
+            &mut Files::default(),
+            &access_ctx(&d, &lock, &names, &elsewhere),
+            &access_op(DOOR, None, &[("user", BOB, ALWAYS)]),
+        )
+        .unwrap_err();
+        assert!(
+            e.contains("pages/zugang.loxl:7 claims its access rights"),
+            "{e}"
+        );
+        // Dropping vislox's claim on it is always let through.
+        apply_op(
+            &mut Files::default(),
+            &access_ctx(&d, &lock, &names, &elsewhere),
+            &Op::Access {
+                uuid: DOOR.into(),
+                value: None,
+            },
+        )
+        .unwrap();
+    }
+
+    /// Two doors on one set: rewriting it through one changes the other, the
+    /// review says so for both, and the undo gives the other its rights back.
+    #[test]
+    fn a_shared_access_set_is_undone_whole() {
+        use crate::access_edit::fixture::*;
+        let d = LoxoneDoc::parse(house().as_bytes()).unwrap();
+        let (names, claimed) = (BTreeSet::new(), BTreeMap::new());
+        let mut l = Lockfile::default();
+        let lock = lock_of(&l);
+        let ctx = access_ctx(&d, &lock, &names, &claimed);
+        let mut files = Files::default();
+        apply_op(
+            &mut files,
+            &ctx,
+            &access_op(
+                DOOR,
+                None,
+                &[("user", ALICE, ALWAYS), ("user", BOB, ALWAYS)],
+            ),
+        )
+        .unwrap();
+        // Same rights as Haustür.
+        apply_op(
+            &mut files,
+            &ctx,
+            &access_op(GARAGE, Some("vx_haustuer_access"), &[]),
+        )
+        .unwrap();
+        let before = compile_files(&d, &files, &mut l.clone()).unwrap();
+        assert_eq!(opens(&before, GARAGE).len(), 2);
+        let was = files.clone();
+        // The garage rewrites the shared set: bob loses both doors.
+        let op = access_op(
+            GARAGE,
+            Some("vx_haustuer_access"),
+            &[("user", ALICE, ALWAYS)],
+        );
+        let a = apply_op(&mut files, &ctx, &op).unwrap();
+        let out = compile_files(&d, &files, &mut l).unwrap();
+        let ch = crate::rights::changes(
+            &crate::rights::read(&before),
+            &crate::rights::read(&out),
+            |u| u.to_string(),
+        );
+        for door in [DOOR, GARAGE] {
+            let c = ch.iter().find(|c| c.uuid == door).unwrap();
+            assert_eq!(
+                c.lose.iter().map(|n| n.title.as_str()).collect::<Vec<_>>(),
+                ["bob"]
+            );
+        }
+        let undo = undo_ops(
+            std::slice::from_ref(&op),
+            std::slice::from_ref(&a.previous),
+            &[],
+        )
+        .unwrap();
+        apply_op(&mut files, &ctx, &undo[0]).unwrap();
+        assert_eq!(files.claims, was.claims);
+        // Its own set: the door's stays.
+        apply_op(
+            &mut files,
+            &ctx,
+            &access_op(GARAGE, None, &[("user", ALICE, WORKDAYS)]),
+        )
+        .unwrap();
+        assert_eq!(files.claims.5.claims[&slug(GARAGE)], "vx_garage_access");
+        assert_eq!(files.claims.5.sets.len(), 2);
+        let out = compile_files(&d, &files, &mut l).unwrap();
+        assert_eq!(opens(&out, DOOR).len(), 2);
+        assert_eq!(
+            opens(&out, GARAGE),
+            [("alice".to_string(), "Workdays".to_string())]
+        );
+        // Access sets share the namespace with the other sets.
+        assert!(crate::set_claim::taken(&files, &ctx, "vx_garage_access"));
+    }
+
+    #[test]
+    fn an_access_claim_vislox_did_not_write_is_refused() {
+        use crate::access_edit::fixture::DOOR;
+        let s = slug(DOOR);
+        let ext = format!("extern {s} = NfcCodeTouch(uuid: \"{DOOR}\")\n");
+        let set = "access vx_a\n\tuser \"alice\": \"Always\"\nend\n";
+        let read = |t: String| Files::from_texts(&BTreeMap::from([("edits.loxl".to_string(), t)]));
+        assert!(read(format!("{ext}{set}{s}.access = vx_a\n")).is_ok());
+        assert!(
+            read(format!(
+                "{ext}access bewohner\n\tuser \"alice\": \"Always\"\nend\n{s}.access = bewohner\n"
+            ))
+            .is_err()
+        );
+        assert!(read(format!("{ext}{s}.access = vx_b\n")).is_err());
+        assert!(
+            read(format!("{set}{s}.access = vx_a\n"))
+                .unwrap_err()
+                .contains("neither an extern")
+        );
+        // A recipients set is #77's: not vislox's yet.
+        assert!(read("recipients vx_r\n\tuser \"alice\"\nend\n".to_string()).is_err());
     }
 }

@@ -31,6 +31,28 @@ const lagerUuid = (i) => `2${String(i).padStart(7, "0")}-0000-0001-ffff504f94000
 const lagerAt = (i) => { const px = 960 + 1920 * (i % 15), py = 960 + 960 * Math.floor(i / 15); return { px, py, px2: px + 1344, py2: py + 696 }; };
 // An NFC Code Touch on a page of its own (Zugang), for the users lox logic lint says it opens for none of (#66).
 const ZUGANG = "40000000-0000-0000-ffff504f94000001", TOUCH = "40000001-0000-0000-ffff504f94000001";
+// Users, a group and two access schedules (#76): Anna may open Haustür always (and operates it in the app: ACT=),
+// Ben is in Bewohner; Garage, a second Code Touch, opens for nobody. Anna has an NFC tag and a code, never shown.
+const ANNA = "40000011-0000-0000-ffff504f94000001", BEN = "40000012-0000-0000-ffff504f94000001", BEWOHNER = "40000013-0000-0000-ffff504f94000001";
+const ALWAYS = "40000016-0000-0000-ffff504f94000001", WERKTAGS = "40000017-0000-0000-ffff504f94000001", GARAGE = "40000002-0000-0000-ffff504f94000001";
+const usersXml = `\t\t<C Type="LoxCaption" V="178" U="40000010-0000-0000-ffff504f94000001" Title="Users and Permissions" CaptionType="20" SubType="20">
+\t\t\t<C Type="User" V="178" U="${ANNA}" Title="Anna" UsR="-1" NFCArr="0A1B2C3D4E5F" CodeArr="00112233">
+\t\t\t\t<PH NUM="1">
+\t\t\t\t\t<PRM REF="${TOUCH}" TIM="${ALWAYS}" ACT="3"/>
+\t\t\t\t</PH>
+\t\t\t</C>
+\t\t\t<C Type="User" V="178" U="${BEN}" Title="Ben" UsR="129">
+\t\t\t\t<PH NUM="0">
+\t\t\t\t</PH>
+\t\t\t</C>
+\t\t\t<C Type="UserGroup" V="178" U="${BEWOHNER}" Title="Bewohner" Rights="129" User="${BEN}" UserGroups="">
+\t\t\t\t<PH NUM="0">
+\t\t\t\t</PH>
+\t\t\t</C>
+\t\t\t<C Type="SwitchingTimer" V="178" U="${ALWAYS}" Title="Always" M="3" FIX="1"/>
+\t\t\t<C Type="SwitchingTimer" V="178" U="${WERKTAGS}" Title="Werktags" M="3"/>
+\t\t</C>
+`;
 const KITCHEN = "30000a01-0000-0000-ffff504f94000001", BATH = "30000a02-0000-0000-ffff504f94000001";
 // Two analog Daytimers on the upper floor (#73): Uhr, on Mondays 06:30–08:00 and in the Party mode 18:00–23:00,
 // and Heizung, with no switching times; and Licht, a digital one.
@@ -84,7 +106,7 @@ const base = readFileSync(fixture, "utf8").replace('<Co K="Q" U="10000009-0000-0
     timerXml(HEIZ, "Heizung", 6720, "", []) + timerXml(LICHT, "Licht", 8640, "", [], false) +
     lcXml(LC_W, "Wohnzimmer", 4800, true) + lcXml(LC_F, "Diele", 7680, false) + centralXml + `\t\t\t<C Type="And" V="178" U="${FLUR}"`)
   // Two rooms; the Divide block is shown in the app, in the kitchen.
-  .replace('\t\t<C Type="Page" V="178" U="10000002', `\t\t<C Type="Place" V="178" U="${KITCHEN}" Title="Küche"/>
+  .replace('\t\t<C Type="Page" V="178" U="10000002', `${usersXml}\t\t<C Type="Place" V="178" U="${KITCHEN}" Title="Küche"/>
 \t\t<C Type="Place" V="178" U="${BATH}" Title="Bad"/>
 \t\t<C Type="Page" V="178" U="10000002`)
   .replace('<Co K="Input1" Nc="1" U="10000006', `<IoData Visu="true" Pr="${KITCHEN}"/>\n\t\t\t\t<Co K="Input1" Nc="1" U="10000006`)
@@ -93,6 +115,7 @@ const base = readFileSync(fixture, "utf8").replace('<Co K="Q" U="10000009-0000-0
     "\t\t</C>\n" +
     `\t\t<C Type="Page" V="178" U="${ZUGANG}" Title="Zugang" WF="16384">\n` +
     `\t\t\t<C Type="NfcCodeTouch" V="178" U="${TOUCH}" Title="Haustür" Px="960" Py="960" Px2="2304" Py2="1656" Cl="141,255,112" Nio="0" WF="16384"/>\n` +
+    `\t\t\t<C Type="NfcCodeTouch" V="178" U="${GARAGE}" Title="Garage" Px="960" Py="2880" Px2="2304" Py2="3576" Cl="141,255,112" Nio="0" WF="16384"/>\n` +
     "\t\t</C>\n\t</C>\n</ControlList>");
 assert.ok(base.includes(lagerUuid(LAGER_N - 1)), "the Lager page is in the base");
 writeFileSync(join(dir, "base.Loxone"), base);
@@ -225,7 +248,7 @@ for (const line of src.split("\\n")) {
   if ((m = line.match(/^extern (\\w+) = \\w+\\(uuid: "([^"]+)"\\)/))) { slugs[m[1]] = m[2]; continue; }
   if (!(m = line.match(/^(\\w+)\\.(\\w+) = (.*)$/))) continue;
   if (m[2] === "schedule") { claimed.push([slugs[m[1]], m[3]]); continue; }
-  if (m[2] === "moods" || m[2] === "members") continue; // below (#74, #75)
+  if (m[2] === "moods" || m[2] === "members" || m[2] === "access") continue; // below (#74, #75, #76)
   const uuid = slugs[m[1]], i = out.findIndex((l) => l.includes(\`U="\${uuid}"\`));
   if (m[2] === "title") { out[i] = out[i].replace(/Title="[^"]*"/, \`Title="\${xml(unq(m[3]))}"\`); continue; }
   if (m[2] === "room") {
@@ -405,6 +428,40 @@ for (const [, slug, list] of src.matchAll(/^(\\w+)\\.members = \\(([^)]*)\\)$/gm
   const i = out.findIndex((l) => l.includes(\`U="\${uuidOf(slug)}"\`) && l.includes("<C "));
   out[i] = out[i].replace(/ rec="[^"]*"/, "");
   if (rec) out[i] = out[i].replace(/ SpStates=/, \` rec="\${rec}" SpStates=\`);
+}
+// Access rights (#76): \`x.access = set\` makes the set the Code Touch's rights, as lox writes them: every user's and
+// group's TIM= on it goes (a <PRM> with ACT= keeps that), and each principal the set names by title gets TIM= of the
+// schedule it names by title. A title that names nothing or two objects fails the compile, as with lox.
+{
+  const asets = {};
+  let cur = null;
+  for (const line of src.split("\\n")) {
+    const m = line.match(/^access (\\w+)$/);
+    if (m) cur = asets[m[1]] = [];
+    else if (line === "end") cur = null;
+    else if (cur && line.trim()) { const x = line.trim().match(/^(user|group) "([^"]*)": "([^"]*)"$/); cur.push([x[1], x[2], x[3]]); }
+  }
+  const one = (type, title) => {
+    const hits = out.filter((l) => l.includes(\`<C Type="\${type}"\`) && l.includes(\` Title="\${xml(title)}"\`));
+    if (hits.length !== 1) { console.error(\`error: compile error: \${hits.length} \${type} titled "\${title}"\`); process.exit(1); }
+    return hits[0].match(/ U="([^"]+)"/)[1];
+  };
+  for (const [, slug, set] of src.matchAll(/^(\\w+)\\.access = (\\w+)$/gm)) {
+    const door = slugs[slug];
+    const want = new Map(asets[set].map(([k, p, sch]) => [one(k === "user" ? "User" : "UserGroup", p), one("SwitchingTimer", sch)]));
+    out = out.flatMap((l) => {
+      if (!l.includes(\`<PRM REF="\${door}"\`)) return [l];
+      const kept = l.replace(/ TIM="[^"]*"/, "");
+      return / ACT="/.test(kept) ? [kept] : [];
+    });
+    for (const [who, sch] of want) {
+      const i = out.findIndex((l) => l.includes(\` U="\${who}"\`) && l.includes("<C "));
+      const j = out.findIndex((l, n) => n > i && l.includes("</PH>"));
+      const k = out.findIndex((l, n) => n > i && n < j && l.includes(\`<PRM REF="\${door}"\`));
+      if (k >= 0) out[k] = out[k].replace(\`<PRM REF="\${door}"\`, \`<PRM REF="\${door}" TIM="\${sch}"\`);
+      else out.splice(j, 0, \`\\t\\t\\t\\t\\t<PRM REF="\${door}" TIM="\${sch}"/>\`);
+    }
+  }
 }
 // vislox's wires (to.Port <- from.Port) between the objects its externs pin: an <In> in the sink's
 // connector, from the source's connector, as lox draws it.
@@ -1442,15 +1499,17 @@ try {
     // seAdd finds another free hour when the clicked one is taken, and says so when the day is full.
     assert.equal(await page.evaluate(() => { const c = { spans: [{ from: 0, to: 1440 }] }; return seAdd(c, 600, false); }), null);
     assert.deepEqual(await page.evaluate(() => { const c = { spans: [{ from: 1350, to: 1440 }] }; seAdd(c, 1435, false); return c.spans.map((s) => [s.from, s.to]); }), [[0, 60], [1350, 1440]]);
-    // seRevertValue: the deployed set while only this timer claims it; else the deployed times in a set of its
+    // setRevertValue: the deployed set while only this timer claims it; else the deployed times in a set of its
     // own, never a rewrite of the others'; refused when the deployed times cannot be read.
     const M = { [dayU(4)]: [{ from: 60, to: 120, value: "20" }] };
-    const rv = (e, sets) => page.evaluate(([e, sets, u]) => seRevertValue(e, sets, u), [e, sets, UHR]);
+    const rv = (e, sets) => page.evaluate(([e, sets, u]) => setRevertValue("schedule", e, sets, u), [e, sets, UHR]);
     assert.deepEqual(await rv({ deployed: null }, []), { value: null });
     assert.deepEqual(await rv({ deployed: { set: "vx_a", modes: M } }, [{ name: "vx_a", timers: [UHR] }]), { value: { set: "vx_a", modes: M } });
     assert.deepEqual(await rv({ deployed: { set: "vx_a", modes: M } }, [{ name: "vx_a", timers: [UHR, HEIZ] }]), { value: { modes: M } });
     assert.deepEqual(await rv({ deployed: { set: "vx_a", modes: M } }, [{ name: "vx_a", timers: [HEIZ] }]), { value: { modes: M } });
     assert.match((await rv({ deployed: { set: "vx_a", modes: null } }, [{ name: "vx_a", timers: [HEIZ] }])).why, /Heizung claims that set now/);
+    // Unreadable and nobody else on it: refused too, never the set's name alone (which would change nothing).
+    assert.match((await rv({ deployed: { set: "vx_a", modes: null } }, [{ name: "vx_a", timers: [UHR] }])).why, /deployed switching times \(vx_a\) cannot be read/);
   });
   await step("a lighting controller's moods are shown, edited as a moods set, undone, shared and reverted (#74)", async () => {
     await page.waitForFunction(() => /Nothing pending/.test(document.querySelector("#deploy-pend")?.textContent || ""), null, { timeout: 10000 });
@@ -1549,14 +1608,15 @@ try {
     await page.click(`${sec} [data-mo="revert"]`);
     await page.waitForFunction((u) => S.view.objects[u].moods.moods.length === 4 && !S.edits?.moods?.length, LC_W, { timeout: 15000 });
     await page.waitForFunction(() => /Nothing pending/.test(document.querySelector("#deploy-pend")?.textContent || ""), null, { timeout: 10000 });
-    // moRevertValue: the deployed set while only this controller claims it; else the deployed moods in a set of
+    // setRevertValue: the deployed set while only this controller claims it; else the deployed moods in a set of
     // its own, never a rewrite of the others'.
     const M = [{ name: "Viel Licht", values: "all on" }];
-    const rv = (e, sets) => page.evaluate(([e, sets, u]) => moRevertValue(e, sets, u), [e, sets, LC_W]);
+    const rv = (e, sets) => page.evaluate(([e, sets, u]) => setRevertValue("moods", e, sets, u), [e, sets, LC_W]);
     assert.deepEqual(await rv({ deployed: null }, []), { value: null });
     assert.deepEqual(await rv({ deployed: { set: "vx_a", moods: M } }, [{ name: "vx_a", controllers: [LC_W] }]), { value: { set: "vx_a", moods: M } });
     assert.deepEqual(await rv({ deployed: { set: "vx_a", moods: M } }, [{ name: "vx_a", controllers: [LC_W, LC_F] }]), { value: { moods: M } });
     assert.match((await rv({ deployed: { set: "vx_a", moods: null } }, [{ name: "vx_a", controllers: [LC_F] }])).why, /Diele claims that set now/);
+    assert.match((await rv({ deployed: { set: "vx_a", moods: null } }, [])).why, /deployed moods \(vx_a\) cannot be read/);
     // A claimant the config lost is named, with Drop its claim (the server refuses the set until it goes).
     const stale = await page.evaluate(() => staleRows({ name: "vx_a", stale: ["10000099-0000-0990-ffff504f94000001"] }, "mo", null).join(""));
     assert.match(stale, /vx_a is also claimed for 10000099-0000-0990-ffff504f94000001, which this config does not have/);
@@ -1660,6 +1720,128 @@ try {
     await page.evaluate((u) => { gotoPage(S.objPage.get(u), { focus: u }); select(u); }, ALARM);
     await waitText(sec, /stay with Loxone Config[\s\S]*1\s*Diele/);
     assert.equal(await page.$(`${sec} [data-me="open"]`), null);
+  });
+  await step("an NFC Code Touch's access rights are edited as an access set, warned, undone, shared and reverted (#76)", async () => {
+    await page.waitForFunction(() => /Nothing pending/.test(document.querySelector("#deploy-pend")?.textContent || ""), null, { timeout: 10000 });
+    await page.evaluate(() => editGoNewest());
+    await settled();
+    const sec = '#props [data-body="Access"]';
+    const show = async (u) => {
+      await page.evaluate((x) => { gotoPage(S.objPage.get(x), { focus: x }); select(x); }, u);
+      await page.waitForFunction((x) => S.sel === x && document.querySelector('#props [data-body="Access"] [data-ac="open"]'), u, { timeout: 15000 });
+    };
+    await show(TOUCH);
+    assert.match(await page.textContent(sec), /Anna \(Always\)[\s\S]*Opens for\s*Anna/);
+    // The pickers' lists need the admin token: without it the server refuses them.
+    // They come from the config the draft is made on (its blob), never another: a blob the History does not list is
+    // refused.
+    const url = `http://127.0.0.1:${port}/api/access/choices`;
+    const blob = await page.evaluate(() => editRev().blob);
+    const ask = (token, base) => fetch(url, { method: "POST", headers: { "Content-Type": "application/json", "X-Vislox": "act", ...(token ? { "X-Vislox-Token": token } : {}) }, body: JSON.stringify({ base }) });
+    assert.equal((await ask(null, blob)).status, 401);
+    assert.equal((await ask("wrong", blob)).status, 401);
+    assert.equal((await ask("secret", "0000000000000000000000000000000000000000")).status, 409);
+    const listed = await ask("secret", blob);
+    assert.equal(listed.status, 200);
+    assert.equal(listed.headers.get("cache-control"), "no-store");
+    const listedText = await listed.text();
+    assert.match(listedText, /"Anna"/);
+    assert.doesNotMatch(listedText, /0A1B2C3D4E5F|00112233/);
+    // The draft starts from who holds the right; the pickers list every user, group and access schedule by title.
+    await page.click(`${sec} [data-ac="open"]`);
+    await page.waitForSelector(`${sec} [data-ac-p="0"]`);
+    assert.deepEqual(await page.evaluate(() => AC.rows), [{ kind: "user", uuid: ANNA, schedule: ALWAYS }]);
+    assert.deepEqual(await page.$$eval(`${sec} [data-ac-p="0"] option`, (n) => n.map((x) => x.textContent)), ["Anna", "Ben", "Bewohner"]);
+    assert.deepEqual(await page.$$eval(`${sec} [data-ac-s="0"] option`, (n) => n.map((x) => x.textContent)), ["Always", "Werktags"]);
+    // Bewohner instead of Anna, on workdays: Anna loses access, said before anything is sent.
+    await page.selectOption(`${sec} [data-ac-p="0"]`, `group|${BEWOHNER}`);
+    await page.selectOption(`${sec} [data-ac-s="0"]`, WERKTAGS);
+    const n0 = edits.length;
+    await page.click(`${sec} [data-ac="save"]`);
+    await waitText(sec, /⚠ Anna loses access to Haustür\./);
+    assert.equal(await page.textContent(`${sec} [data-ac="save"]`), "Save anyway");
+    assert.equal(edits.length, n0);
+    await page.click(`${sec} [data-ac="save"]`);
+    await until(() => edits.length > n0 && statuses[n0] !== undefined, "the access request");
+    assert.equal(statuses[n0], 200);
+    assert.deepEqual(edits[n0].ops, [{ op: "access", uuid: TOUCH, value: { grants: [{ kind: "group", uuid: BEWOHNER, schedule: WERKTAGS }] } }]);
+    await settled();
+    const file = () => readFileSync(join(dir, "pages", "vislox", "edits.loxl"), "utf8");
+    assert.match(file(), /^access vx_haustuer_access\n\tgroup "Bewohner": "Werktags"\nend$/m);
+    assert.match(file(), /^vx_40000001_0000_0000_ffff504f94000001\.access = vx_haustuer_access$/m);
+    await page.waitForFunction((u) => S.view.objects[u].rights.list.map((p) => p.title).join() === "Bewohner", TOUCH, { timeout: 10000 });
+    await waitText(sec, /Opens for\s*Ben[\s\S]*edited here[\s\S]*not deployed[\s\S]*Revert/);
+    await waitText("#deploy-pend", /access to 1 NFC Code Touch edited here/);
+    const changes = await page.evaluate(() => S.view.changes.map((c) => c.text));
+    assert.ok(changes.includes("Haustür · access: Anna removed (Always)"), changes.join(" | "));
+    assert.ok(changes.includes("Haustür · access: group Bewohner added (Werktags)"), changes.join(" | "));
+    // Apply's confirmation says it again, with the claim that does it; nothing is deployed here.
+    const confirm = await page.evaluate(async () => rightsApplyText(await pendingHardware(editRev())));
+    assert.match(confirm, /⚠ Anna loses access to Haustür \(pages\/vislox\/edits\.loxl:\d+\)/, confirm);
+    assert.match(confirm, /Ben gains access to Haustür/, confirm);
+    // No credential and no name leaves the review: not in the page title, not in /api/edits.
+    assert.doesNotMatch(await page.title(), /Anna|Ben/);
+    const ed = await page.evaluate(async () => JSON.stringify(await (await fetch("/api/edits")).json()));
+    assert.doesNotMatch(ed, /Anna|Bewohner|Werktags|0A1B2C3D4E5F|00112233/);
+    const pageText = await page.textContent("body");
+    assert.doesNotMatch(pageText, /0A1B2C3D4E5F|00112233/);
+    // Undone and redone through the reply's undo.
+    let ops = await undoKey(false, (u) => S.view.objects[u].rights.list.map((p) => p.title).join() === "Anna" && !S.edits?.access?.length, TOUCH);
+    assert.deepEqual(ops, [{ op: "access", uuid: TOUCH, value: null }]);
+    assert.doesNotMatch(file(), /access/);
+    ops = await undoKey(true, (u) => S.view.objects[u].rights.list.map((p) => p.title).join() === "Bewohner", TOUCH);
+    assert.deepEqual(ops, [{ op: "access", uuid: TOUCH, value: { set: "vx_haustuer_access", grants: [{ kind: "group", uuid: BEWOHNER, schedule: WERKTAGS }] } }]);
+    // Another schedule for Bewohner: Ben keeps the door, but vislox cannot tell the new times cover the old ones, so
+    // it is a loss, warned before anything is sent.
+    await page.waitForSelector(`${sec} [data-ac="open"]`);
+    await page.click(`${sec} [data-ac="open"]`);
+    await page.waitForSelector(`${sec} [data-ac-s="0"]`);
+    await page.selectOption(`${sec} [data-ac-s="0"]`, ALWAYS);
+    const n3 = edits.length;
+    await page.click(`${sec} [data-ac="save"]`);
+    await waitText(sec, /⚠ Ben may open Haustür only at Always, no longer at Werktags\./);
+    assert.equal(await page.textContent(`${sec} [data-ac="save"]`), "Save anyway");
+    assert.equal(edits.length, n3);
+    // Apply's confirmation warns about such a change on its own (#68): fewer opening times are a loss.
+    const narrowed = await page.evaluate((u) => rightsApplyText({ rights: [{ uuid: u, kind: "access", title: "Haustür", lose: [], gain: [], added: [], removed: [], rescheduled: [], narrowed: [{ title: "Ben", uuid: "x", from: ["Werktags"], to: ["Always"] }] }] }), TOUCH);
+    assert.match(narrowed, /^⚠ Ben may open Haustür only at Always, no longer at Werktags/, narrowed);
+    // A Revert whose deployed rights cannot be read is refused with the reason, never sent as the set's name alone.
+    assert.match((await page.evaluate((u) => setRevertValue("access", { deployed: { set: "vx_a", grants: null } }, [], u), TOUCH)).why, /deployed access rights \(vx_a\) cannot be read/);
+    // A draft belongs to its Code Touch and its pending config: another selection drops it.
+    await show(GARAGE);
+    assert.equal(await page.evaluate(() => AC.open), false);
+    assert.match(await page.textContent(sec), /No user or group may open it/);
+    // Same rights as Haustür: nobody loses access to the garage, so it is claimed at once.
+    const n1 = edits.length;
+    await page.selectOption(`${sec} [data-ac="same"]`, "vx_haustuer_access");
+    await until(() => edits.length > n1 && statuses[n1] !== undefined, "the same-rights request");
+    assert.equal(statuses[n1], 200);
+    assert.deepEqual(edits[n1].ops, [{ op: "access", uuid: GARAGE, value: { set: "vx_haustuer_access" } }]);
+    await settled();
+    assert.match(file(), /^vx_40000002_0000_0000_ffff504f94000001\.access = vx_haustuer_access$/m);
+    await page.waitForFunction((u) => S.view.objects[u].rights.users.map((p) => p.title).join() === "Ben", GARAGE, { timeout: 10000 });
+    // Haustür's editor now changes Garage too, and the warning names both doors.
+    await show(TOUCH);
+    await waitText(sec, /shared with Garage/);
+    await page.click(`${sec} [data-ac="open"]`);
+    await page.waitForSelector(`${sec} [data-ac="del"]`);
+    await page.click(`${sec} [data-ac="del"][data-i="0"]`);
+    await waitText(sec, /No user or group: saving revokes everyone's access/);
+    const n2 = edits.length;
+    await page.click(`${sec} [data-ac="save"]`);
+    await waitText(sec, /⚠ Ben loses access to Haustür; Ben loses access to Garage\./);
+    assert.equal(edits.length, n2);
+    await page.click(`${sec} [data-ac="cancel"]`);
+    // Reverted: Haustür's claim goes (Garage keeps the set), then Garage's; nothing pending.
+    await page.waitForSelector(`${sec} [data-ac="revert"]`);
+    await page.click(`${sec} [data-ac="revert"]`);
+    await page.waitForFunction((u) => S.edits?.access?.length === 1 && S.edits.access[0].uuid === u, GARAGE, { timeout: 15000 });
+    await settled();
+    await show(GARAGE);
+    await page.waitForSelector(`${sec} [data-ac="revert"]`);
+    await page.click(`${sec} [data-ac="revert"]`);
+    await page.waitForFunction(() => !S.edits?.access?.length, null, { timeout: 15000 });
+    await page.waitForFunction(() => /Nothing pending/.test(document.querySelector("#deploy-pend")?.textContent || ""), null, { timeout: 10000 });
   });
   await step("nothing was deployed: lox only compiled, checked, linted and tested", async () => {
     const ran = readFileSync(calls, "utf8").trim().split("\n");

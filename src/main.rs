@@ -1,6 +1,7 @@
 //! vislox — a read-only, Loxone-Config-style view of the configs `lox` and
 //! `loxone-config` manage, with live reload, history and change review.
 
+mod access_edit;
 mod actions;
 mod adopt;
 mod appcalendar;
@@ -559,6 +560,10 @@ async fn main() -> Result<()> {
         .route("/api/discard", axum::routing::post(api_discard))
         .route("/api/edit", axum::routing::post(api_edit))
         .route("/api/edits", get(api_edits))
+        .route(
+            "/api/access/choices",
+            axum::routing::post(api_access_choices),
+        )
         .route("/api/check", get(api_check))
         .route("/api/compile", axum::routing::post(api_compile))
         .route("/api/block-types", get(api_block_types))
@@ -1785,6 +1790,72 @@ async fn api_edit(
 async fn api_edits(State(app): State<Arc<App>>) -> Response {
     let (deployed, pending) = edit_revisions(&app).await;
     Json(app.actions.edits(deployed, pending).await).into_response()
+}
+
+/// The users, groups and access schedules an access set may name (#76), by
+/// UUID and title, from the revision whose blob is `base` (the config the
+/// browser's draft is made on: the pending one, or the deployed one when
+/// nothing is pending): the pickers of *Edit access*. A revision the History
+/// no longer lists is refused, never answered from another one. Personal
+/// data, so it needs the admin token, unlike the review (which names only
+/// who holds a right), and it is a POST with the blob in its body, so no
+/// address and no cache keeps it. Never logged.
+async fn api_access_choices(
+    State(app): State<Arc<App>>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<ChoicesBody>,
+) -> Response {
+    if let Some(r) = not_from_vislox(&headers) {
+        return r;
+    }
+    if let Err(r) = app.actions.check(&headers) {
+        return refused(r);
+    }
+    let a = app.clone();
+    let base = body.base.clone();
+    let bytes = tokio::task::spawn_blocking(move || {
+        let mut h = a.history.lock().unwrap();
+        let lists = h.lists();
+        let listed = lists
+            .pending
+            .iter()
+            .chain(lists.history.iter())
+            .any(|r| r.blob == base);
+        if listed { h.content(&base) } else { None }
+    })
+    .await
+    .ok()
+    .flatten();
+    let Some(bytes) = bytes else {
+        return refused((
+            StatusCode::CONFLICT,
+            "that config is no longer in the History: show the newest one and edit again".into(),
+        ));
+    };
+    let v = tokio::task::spawn_blocking(move || {
+        loxone_config::LoxoneDoc::parse(&bytes)
+            .map(|d| access_edit::Directory::read(&d).choices())
+            .map_err(|e| e.to_string())
+    })
+    .await;
+    match v {
+        Ok(Ok(v)) => {
+            let mut r = Json(v).into_response();
+            r.headers_mut().insert(
+                axum::http::header::CACHE_CONTROL,
+                axum::http::HeaderValue::from_static("no-store"),
+            );
+            r
+        }
+        Ok(Err(e)) => refused((StatusCode::CONFLICT, format!("cannot read the config: {e}"))),
+        Err(e) => refused((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct ChoicesBody {
+    /// The blob id of the config the draft is made on.
+    base: String,
 }
 
 /// Whether the project's module compiles (#65): `lox logic check`'s

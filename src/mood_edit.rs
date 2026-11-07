@@ -144,15 +144,15 @@ impl set_claim::SetKind for MoodKind {
          # list (its off mood aside); deleting it leaves the moods as last written.\n";
     const CONTENT_KEY: &'static str = "moods";
     const MEMBERS_KEY: &'static str = "controllers";
+    const ENTRIES_KEY: &'static str = "moods";
+    const SETS_KEY: &'static str = "mood_sets";
+    type Index<'a> = ();
 
     fn store(c: &Claims) -> &MoodSets {
         &c.3
     }
     fn store_mut(c: &mut Claims) -> &mut MoodSets {
         &mut c.3
-    }
-    fn claimed_elsewhere<'a>(ctx: &'a Ctx) -> &'a BTreeMap<String, String> {
-        ctx.moods_claimed
     }
     fn wrong_type(name: &str) -> String {
         format!("{name}: only a lighting controller's moods are written in Lox Logic")
@@ -171,8 +171,40 @@ impl set_claim::SetKind for MoodKind {
             restore,
         }
     }
-    fn content_of(lines: &[MoodLine], _: &LoxoneDoc, _: &Lock) -> Option<Vec<MoodRow>> {
+    fn index<'a>(_: &'a LoxoneDoc, _: &'a Lock) -> Self::Index<'a> {}
+    fn content_of(lines: &[MoodLine], _: &()) -> Option<Vec<MoodRow>> {
         Some(rows_of(lines))
+    }
+    fn read_item(item: &Item) -> Option<set_claim::SetItem<Self::Line>> {
+        let vx = |n: &str| n.starts_with(crate::blocks::SLUG_PREFIX);
+        match item {
+            Item::Moods(m) if vx(&m.name) => Some(set_claim::SetItem::Set(
+                m.name.clone(),
+                m.moods().cloned().collect(),
+            )),
+            Item::MoodsClaim(c) if vx(&c.slug) => {
+                Some(set_claim::SetItem::Claim(c.slug.clone(), c.moods.clone()))
+            }
+            _ => None,
+        }
+    }
+    fn op(op: &crate::edit::Op) -> Option<(&str, Option<&Self::Val>)> {
+        match op {
+            crate::edit::Op::Moods { uuid, value } => Some((uuid, value.as_ref())),
+            _ => None,
+        }
+    }
+    fn missed(
+        files: &Files,
+        out: &LoxoneDoc,
+        lock: &Lock,
+        uuids: &[String],
+        restored: &[String],
+    ) -> Vec<String> {
+        missed(files, out, lock, uuids, restored)
+    }
+    fn differ<'a>(a: &'a LoxoneDoc, b: &'a LoxoneDoc) -> Box<dyn Fn(&str) -> bool + 'a> {
+        Box::new(move |u| differs(a, b, u))
     }
     fn lines_of(
         rows: &Vec<MoodRow>,

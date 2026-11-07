@@ -896,3 +896,8 @@ rect.ghost, line.ghost { fill: #1f6fd10a; stroke: var(--moved); stroke-opacity: 
 .me-list { margin: 2px 10px 4px 30px; padding: 0; font-size: 12px; }
 .me-item { padding: 1px 0; }
 .me-ops { margin-left: 6px; white-space: nowrap; }
+/* Edit access (#76): a row per user or group, its access schedule, ✕. */
+.ac-list { margin: 2px 10px 4px 10px; padding: 0; list-style: none; font-size: 12px; }
+.ac-item { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; padding: 2px 0; }
+.ac-item select { max-width: 13em; padding: 2px 4px; border: 1px solid var(--line); border-radius: var(--radius); font: inherit; }
+.ac-item.bad select { border-color: var(--removed); }
