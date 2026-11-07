@@ -393,6 +393,17 @@ sends to the Miniserver see [miniserver.md](miniserver.md).
   here, each switch or dimmer circuit `AQ1` … `AQ5` can be declared the other kind. How:
   [editing.md](editing.md#lighting-moods-74).
 
+- **Members of a central block** (#75): Properties of a CentralLight or CentralShade has *Members*: the lighting
+  controllers or automatic blinds it drives, in the order the app lists them, each a link to its block (and its
+  page). Compared with another revision, the members added are marked, those removed listed, and a new order
+  shown; the Changes list says it by name (*Alle Lichter · member added: Diele*). *Edit members* (the same project
+  and token) lists them with ↑ ↓ and ✕; *Add member…* (or Ctrl+K while the editor is open) picks one of the blocks
+  the central block takes (LightController2 under a CentralLight, AutoJalousie under a CentralShade) that it does
+  not list yet. *Save* writes a Lox Logic `.members` claim into vislox's file of the module and compiles; an empty
+  list empties it. Saved and not deployed, the section says so, with *Revert*. A central block the module's own
+  file claims is changed there. An alarm's or smoke alarm's members are shown, not edited: they stay with Loxone
+  Config. How: [editing.md](editing.md#members-of-a-central-block-75).
+
 For a `lox.toml` project:
 
 ```bash

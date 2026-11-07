@@ -44,7 +44,8 @@ Then open <http://127.0.0.1:7878>. Started without a path or `--ctx` in a direct
 - The Miniserver log and, opt-in, its Debug-Monitor.
 - For a `lox.toml` project: edit values in Properties, add blocks to a page, adopt the blocks Loxone Config drew into
   the module (`lox logic adopt`, the config unchanged), move the blocks the module manages, draw wires, edit a
-  Daytimer's switching times (a Lox Logic `schedule` set) and a lighting controller's moods (a `moods` set), then
+  Daytimer's switching times (a Lox Logic `schedule` set), a lighting controller's moods (a `moods` set) and the
+  members of a central light or shade block (`.members`), then
   Apply, Sync and Discard from the browser.
 - For a `lox.toml` project: the blocks its Lox Logic module manages marked, each with the `.loxl` file and line that
   makes it.
@@ -134,7 +135,7 @@ Opt-ins:
 | Sync, Discard | `--admin-token-file`, then the token | nothing; they change the project and its git repository |
 | Push to git | `--admin-token-file`, then the token | nothing; it pushes the commits git's remote lacks, after `lox logic scan` finds no personal data in them |
 | Compile (a module changed outside vislox) | `--admin-token-file`, then the token | nothing; it runs `lox logic compile` |
-| Edit values, switching times and moods, add, adopt and move blocks, draw wires | `--admin-token-file`, then the token | nothing; vislox writes its files in the module (and positions and adopted blocks in the lockfile; `lox logic adopt` runs on a copy) and runs `lox logic compile` |
+| Edit values, switching times, moods and members, add, adopt and move blocks, draw wires | `--admin-token-file`, then the token | nothing; vislox writes its files in the module (and positions and adopted blocks in the lockfile; `lox logic adopt` runs on a copy) and runs `lox logic compile` |
 | Operate virtual inputs | `--operate` with `--admin-token-file` | `jdev/sps/io/<uuid>/<cmd>`, only to `VirtualIn` objects, each confirmed |
 | Query blocks on this page | a toggle in the legend, off by default | read-only `jdev/sps/io/<uuid>/all`, at most 20 a second |
 | Debug-Monitor | `--monitor`, then Start | `dev/sps/log/<address>`: the Miniserver sends its debug output to vislox until Stop or the time limit |

@@ -1144,6 +1144,7 @@ function renderProps() {
   }
 }
 function renderPropsBody() {
+  meSync();
   const box = $("props");
   const o = S.sel && S.view?.objects[S.sel];
   if (!o) {
@@ -1165,6 +1166,8 @@ function renderPropsBody() {
   if (se) section("Switching times", se.rows, se.count);
   const mo = moRows(o, row, marks);
   if (mo) section("Moods", mo.rows, mo.count);
+  const me = meRows(o, row, marks);
+  if (me) section("Members", me.rows, me.count);
   const ms = managedSrc(o.uuid);
   // The errors of lox logic check whose line names this block (#65): on the newest config only.
   const ce = S.rev === editRev()?.id ? checkErrors(o.uuid) : [];
@@ -1616,7 +1619,17 @@ $("chg-prev").onclick = () => gotoChange(S.chgIdx < 0 ? -1 : S.chgIdx - 1);
 $("chg-next").onclick = () => gotoChange(S.chgIdx + 1);
 
 // ── command palette ────────────────────────────────────────────────────
-const pal = { items: [], idx: 0 };
+// The palette also picks a block for an editor (`pal.pick`, #75: a central block's new member): only blocks of
+// the types it takes, none it excludes, and choosing one hands it over instead of going there.
+const pal = { items: [], idx: 0, pick: null };
+const PAL_PLACEHOLDER = "Go to a page or block…";
+function openPicker(pick) {
+  if (!S.view) return;
+  pal.pick = pick;
+  $("pal-input").placeholder = pick.placeholder;
+  $("palette").setAttribute("aria-label", pick.title);
+  openPalette("");
+}
 function openPalette(q) {
   if (!S.view) return;
   $("palette").classList.remove("hidden");
@@ -1625,7 +1638,15 @@ function openPalette(q) {
   renderPalette();
   inp.focus();
 }
-function closePalette() { $("palette").classList.add("hidden"); }
+function closePalette() {
+  $("palette").classList.add("hidden");
+  if (!pal.pick) return;
+  const back = pal.pick.back;
+  pal.pick = null;
+  $("pal-input").placeholder = PAL_PLACEHOLDER;
+  $("palette").setAttribute("aria-label", "Go to page or block");
+  back?.();
+}
 /** Subsequence match: every query character in order; earlier and contiguous hits score higher. */
 function fuzzy(q, s) {
   const t = s.toLowerCase();
@@ -1659,6 +1680,28 @@ function renderPalette() {
   }
   // Views match a whole word they start with (“mod”, “calendar”), not any subsequence, and come after
   // pages and blocks, so that a short query still opens the best page or block.
+  if (pal.pick) {
+    const pk = pal.pick, seen = new Set();
+    // The server's rule: a block the module manages is never offered (vislox's files name only their own blocks
+    // and Loxone Config's).
+    const managed = new Set((S.edits?.managed || []).map((u) => u.toLowerCase()));
+    const cands = blocks.filter((b) => {
+      const o = v.objects[b.uuid], u = b.uuid.toLowerCase();
+      if (!o || seen.has(u) || !pk.types.includes(o.ty) || pk.exclude.has(u) || managed.has(u)) return false;
+      seen.add(u);
+      return true;
+    });
+    const scored = q ? cands.map((it) => { const m = fuzzy(q, it.title); return m ? { ...it, score: m.score, hits: m.hits } : null; }).filter(Boolean).sort((a, b) => b.score - a.score)
+      : cands.sort((a, b) => a.title.localeCompare(b.title));
+    pal.items = scored.length ? [{ sec: pk.title }, ...scored] : [];
+    pal.idx = pal.items.findIndex((x) => !x.sec);
+    $("pal-list").innerHTML = pal.items.length ? pal.items.map((it, i) => it.sec
+      ? `<li class="sec" role="presentation">${esc(it.sec)}</li>`
+      : `<li role="option" id="pal-${i}" data-i="${i}" aria-selected="${i === pal.idx}"><span class="pk">add</span><span class="pt">${mark(it.title, it.hits)}</span><span class="pm">${esc(it.meta)}</span></li>`).join("")
+      : `<li class="sec" role="presentation">${esc(pk.none)}</li>`;
+    $("pal-input").setAttribute("aria-activedescendant", pal.idx >= 0 ? `pal-${pal.idx}` : "");
+    return;
+  }
   const views = mdEntries().length || v.modes.length ? [{ kind: "view", title: "Operating modes", meta: "year calendar of the calendar entries", names: ["operating modes", "modes", "calendar"] }] : [];
   let items;
   if (!q) items = [{ sec: "Pages" }, ...pages, ...(views.length ? [{ sec: "Views" }, ...views] : [])];
@@ -1697,6 +1740,13 @@ function palMove(d) {
 function palOpen(i) {
   const it = pal.items[i];
   if (!it || it.sec) return;
+  if (pal.pick) {
+    const take = pal.pick.onPick;
+    pal.pick.back = null;
+    closePalette();
+    take(it.uuid);
+    return;
+  }
   closePalette();
   if (it.kind === "view") { modesOpen(); return; }
   if (it.kind === "page") { gotoPage(it.page); select(null, { noReveal: true }); }
@@ -1750,7 +1800,12 @@ window.addEventListener("keydown", (e) => {
   }
   if (AB.open) { if (e.key === "Escape") abClose(); return; }
   if (e.key === "Escape" && !$("undo-pop").classList.contains("hidden")) { undoListToggle(false); $("btn-undo-list").focus(); return; }
-  if ((e.ctrlKey || e.metaKey) && (e.key === "k" || e.key === "K")) { e.preventDefault(); openPalette(""); return; }
+  if ((e.ctrlKey || e.metaKey) && (e.key === "k" || e.key === "K")) {
+    e.preventDefault();
+    // With a central block's members open in the editor, Ctrl+K picks a member to add (#75).
+    if ($("props").querySelector('[data-me="add"]:not([disabled])')) meAdd(); else openPalette("");
+    return;
+  }
   if ((e.ctrlKey || e.metaKey) && e.key === "f") { e.preventDefault(); $("tree-filter").focus(); $("tree-filter").select(); return; }
   const tag = e.target.tagName;
   if (tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA") { if (e.key === "Escape") e.target.blur(); return; }
@@ -2107,6 +2162,7 @@ function editsHere() {
   if (editsMoved().length) parts.push(`${plural(editsMoved().length, "block")} moved here`);
   if (schedsPending().length) parts.push(`switching times of ${plural(schedsPending().length, "timer")} edited here`);
   if (moodsPending().length) parts.push(`moods of ${plural(moodsPending().length, "lighting controller")} edited here`);
+  if (membersPending().length) parts.push(`members of ${plural(membersPending().length, "central block")} edited here`);
   const drawn = editsWires().filter((w) => w.now).length, out = editsWires().length - drawn;
   if (drawn) parts.push(`${plural(drawn, "wire")} drawn here`);
   if (out) parts.push(`${plural(out, "wire")} taken out here`);
@@ -3953,6 +4009,181 @@ $("props").addEventListener("keydown", (e) => {
   else if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); moClose(); }
 }, true);
 
+// ── members of a central block (#75) ───────────────────────────────────
+// A CentralLight drives a list of lighting controllers, a CentralShade a list of automatic blinds: Lox Logic writes
+// it as `<central>.members = (a, b, …)`, in the order the app lists them. Properties shows the members, each a link
+// to its block; the editor adds one (the Ctrl+K picker, offering only blocks of the type the central block takes),
+// removes and reorders them. Saving sends one `members` op with the whole list: compiled, never deployed, undone
+// through `undo`. An alarm's members (`Objects=`) are shown read-only: they stay with Loxone Config.
+// The draft belongs to one block and one pending config (`blob`): when either changes (another selection, an
+// undo, an edit elsewhere) it is dropped, and a save sends the blob it was made on, which the server checks.
+const ME = { uuid: null, blob: null, open: false, list: [], dropped: 0, busy: false, msg: "", err: "" };
+const ME_WHAT = { LightController2: "lighting controller", AutoJalousie: "automatic blind" };
+/** What `GET /api/edits` says of this central block's members (#75), or null. */
+function membersEdit(uuid) { return (S.edits?.members || []).find((m) => m.uuid === uuid) || null; }
+/** The central blocks whose members were edited here and are not deployed. */
+function membersPending() { return (S.edits?.members || []).filter((m) => m.pending); }
+/** Whether this block's members can be edited here now: `{ ok, rev }`, or null. */
+function meState(o) {
+  if (!o.members?.editable) return null;
+  const st = editState(o);
+  return st?.ok ? st : null;
+}
+/** The module's own claim on this block's members (a file other than vislox's), if any. */
+function meOther(o) { return (S.edits?.members_claims || []).find((c) => c.blocks?.includes(o.uuid) && !c.file.startsWith(`${S.edits?.dir}/`)) || null; }
+/** A block as a member link: from the view's objects (a member the draft adds may be listed nowhere yet). */
+function meTarget(u) {
+  const x = S.view?.objects[u];
+  if (!x) return { uuid: u, missing: true };
+  return { uuid: u, title: x.title, ty: x.ty, page: x.page, page_title: S.pageOf?.get(x.page)?.title, path: x.page ? null : x.path };
+}
+function meLink(t) {
+  return t.missing ? `<span class="mono">${esc(t.uuid)}</span> <span class="mo-tag" title="The list names it, but this config has no such object">not in this config</span>` : linkTarget(t);
+}
+function meWhat(mi) { return mi.takes ? ME_WHAT[mi.takes] || prettyType(mi.takes) : "block"; }
+function meOpen(uuid) {
+  const o = S.view?.objects[uuid];
+  if (!o?.members?.editable) return;
+  const st = meState(o);
+  if (!st) return;
+  // A member the config does not have cannot be saved (the server refuses it): the draft leaves it out, and says so.
+  const missing = o.members.members.filter((m) => m.missing).length;
+  Object.assign(ME, { uuid, blob: st.rev.blob, open: true, list: o.members.members.filter((m) => !m.missing).map((m) => m.uuid), dropped: missing, busy: false, msg: "", err: "" });
+  S.closed.delete("Members");
+  renderProps();
+  $("props").querySelector('[data-me="add"]')?.focus();
+}
+/** Drop a draft made on another block or another pending config than the one shown now. */
+function meSync() {
+  if (!ME.open || ME.busy) return;
+  if (S.sel !== ME.uuid) Object.assign(ME, { open: false, list: [], dropped: 0, msg: "", err: "" });
+  else if (editRev()?.blob !== ME.blob) Object.assign(ME, { open: false, list: [], dropped: 0, err: "", msg: "The pending config changed while editing: the draft was dropped. Edit members again." });
+}
+function meClose() {
+  if (ME.busy) return;
+  Object.assign(ME, { open: false, list: [], dropped: 0, msg: "", err: "" });
+  renderProps();
+  $("props").querySelector('[data-me="open"]')?.focus();
+}
+/** Add a member: the picker offers the blocks of the type the central block takes, not those listed already. */
+function meAdd() {
+  const o = S.view?.objects[ME.uuid];
+  if (!o?.members || !ME.open || ME.busy) return;
+  const what = meWhat(o.members);
+  openPicker({
+    title: `Add a member to ${displayTitle(o)}`,
+    placeholder: `Add a ${what}…`,
+    none: `No other ${what} to add.`,
+    types: [o.members.takes],
+    exclude: new Set([o.uuid, ...ME.list].map((u) => u.toLowerCase())),
+    onPick: (u) => { ME.list.push(u); ME.err = ""; ME.msg = ""; renderProps(); $("props").querySelector('[data-me="add"]')?.focus(); },
+    back: () => $("props").querySelector('[data-me="add"]')?.focus(),
+  });
+}
+/** The rows of the *Members* section. */
+function meRows(o, row, marks) {
+  const mi = o.members;
+  if (!mi) return null;
+  const rows = [], st = meState(o), e = membersEdit(o.uuid), mine = ME.uuid === o.uuid ? ME : null;
+  const other = mi.editable ? meOther(o) : null, dis = mine?.busy ? " disabled" : "";
+  const msg = () => (mine?.msg || mine?.err ? `<span class="ed-msg${mine.err ? " err" : ""}" role="status">${esc(mine.err || mine.msg)}</span>` : "");
+  if (!mi.editable) rows.push(`<div class="ed-note">The members of an alarm (<span class="mono">Objects=</span>) stay with Loxone Config: they name hidden references wired to the alarm, which the list does not own.</div>`);
+  if (other && e?.members) {
+    rows.push(`<div class="sch-note warn">⚠ Claimed twice: ${esc(claimAt(other))} and vislox's ${esc(S.edits?.file || "")} both claim its members, and lox compiles neither until one goes.</div>`,
+      `<div class="ed-bar"><button type="button" class="ed-btn small" data-me="drop"${dis} title="Take vislox's claim out and compile: ${esc(claimAt(other))} keeps the block">Remove vislox's claim</button>${msg()}</div>`);
+  } else if (other) rows.push(`<div class="ed-note">${esc(claimAt(other))} claims its members: change them there.</div>`);
+  else if (e?.members && st) rows.push(`<div class="ed-note">Claimed by vislox in ${esc(S.edits?.file || "")}: the list is the block's whole member list, in order.</div>`);
+  if (e?.stale?.length && st && !other) {
+    rows.push(`<div class="sch-note warn">⚠ vislox's claim lists ${plural(e.stale.length, "member")} this config does not have (deleted in Loxone Config?), so lox cannot compile it. ` +
+      `<button type="button" class="ed-btn small" data-me="dropstale"${dis}>Drop the missing members</button></div>`);
+  }
+  if (e?.pending && st && !other) {
+    const back = e.deployed ? "Back to the members deployed" : "Back to the members as last written: vislox's claim goes";
+    rows.push(row("Members", `<span class="ed-v">edited here</span><span class="ed-tag" title="Saved into the module and compiled, not on the Miniserver yet: Apply deploys it, Discard drops it">not deployed</span>` +
+      `<button type="button" class="ed-btn small" data-me="revert"${dis} title="${esc(back)}">Revert</button>`, "pr-chg"));
+  }
+  if (!mine?.open || !st || other) {
+    // The members as the config shown has them, marked against the compared revision.
+    const old = marks ? o.members_old : null;
+    const inOld = (u) => old?.members.some((m) => m.uuid === u);
+    if (!mi.members.length) rows.push(row(mi.editable ? "Members" : "Objects", `<span class="none-v">none</span>`));
+    mi.members.forEach((m, i) => {
+      const added = old && !inOld(m.uuid);
+      rows.push(row(`${i + 1}`, `${added ? '<span class="new">' : ""}${meLink(m)}${added ? "</span>" : ""}`, added ? "pr-chg" : ""));
+    });
+    for (const m of old?.members || []) if (!mi.members.some((x) => x.uuid === m.uuid)) rows.push(row("—", `<span class="old">${esc(m.title || m.uuid)}</span> <span class="mo-tag">removed</span>`, "pr-chg"));
+    if (old) {
+      const order = (a, b) => a.members.filter((m) => b.members.some((x) => x.uuid === m.uuid)).map((m) => m.title || m.uuid).join(" · ");
+      if (order(old, mi) !== order(mi, old)) rows.push(`<div class="ed-note">Order: <span class="old">${esc(order(old, mi))}</span> <span class="new">${esc(order(mi, old))}</span></div>`);
+    }
+    if (st && !other) rows.push(`<div class="ed-bar"><button type="button" class="ed-btn small" data-me="open">Edit members</button>${msg()}</div>`);
+    return { rows, count: (e?.pending ? 1 : 0) + (e?.stale?.length ? 1 : 0) || undefined };
+  }
+  // The editor: the list in order, each with ↑ ↓ ✕, and *Add member*.
+  const what = meWhat(mi);
+  const items = ME.list.map((u, i) => {
+    const t = meTarget(u), name = t.missing ? u : displayTitle(S.view.objects[u]);
+    return `<li class="me-item">${meLink(t)}<span class="me-ops">` +
+      `<button type="button" class="se-x" data-me="up" data-i="${i}" aria-label="Move ${esc(name)} up"${i ? "" : " disabled"}${dis}>↑</button>` +
+      `<button type="button" class="se-x" data-me="down" data-i="${i}" aria-label="Move ${esc(name)} down"${i < ME.list.length - 1 ? "" : " disabled"}${dis}>↓</button>` +
+      `<button type="button" class="se-x" data-me="del" data-i="${i}" aria-label="Remove ${esc(name)}"${dis}>✕</button></span></li>`;
+  }).join("");
+  if (ME.dropped) rows.push(`<div class="sch-note warn">⚠ ${plural(ME.dropped, "member")} not in this config ${ME.dropped === 1 ? "was" : "were"} dropped from the draft: saving leaves ${ME.dropped === 1 ? "it" : "them"} out.</div>`);
+  rows.push(ME.list.length ? `<ol class="me-list">${items}</ol>` : `<div class="ed-note">No members: saving empties the list.</div>`);
+  rows.push(`<div class="ed-bar"><button type="button" class="ed-btn small" data-me="add"${dis} title="Pick a ${esc(what)} (Ctrl+K)">Add member…</button><span class="none-v">${esc(`${prettyType(mi.takes)} blocks, in the order the app lists them`)}</span></div>`);
+  rows.push(`<div class="ed-bar"><button type="button" class="primary small" data-me="save"${dis}>${mine.busy ? "Compiling…" : "Save"}</button>` +
+    `<button type="button" class="ed-btn small" data-me="cancel"${dis}>Cancel</button>` +
+    `<span class="ed-msg${mine.err ? " err" : ""}" role="status" aria-live="polite">${esc(mine.err || mine.msg || "Saving claims the list in the module and compiles it; nothing is deployed.")}</span></div>`);
+  return { rows, count: e?.pending ? 1 : 0 };
+}
+async function meSend(o, base, op, label) {
+  ME.uuid = o.uuid; ME.busy = true; ME.err = ""; ME.msg = ""; renderProps();
+  try {
+    const res = await editAct(base, [op], label);
+    Object.assign(ME, { open: false, list: [], dropped: 0, busy: false, err: "", msg: res.unchanged ? "Nothing changed." : "Saved and compiled: pending, not deployed. Review it, then Apply or Discard." });
+    await editShowNewest(res.blob);
+  } catch (err) {
+    ME.busy = false; ME.err = err.message;
+  }
+  renderProps();
+}
+function meSave() {
+  const o = S.view?.objects[ME.uuid], st = o && meState(o);
+  if (!st || ME.busy || !ME.open) return;
+  // Never save a draft over a newer list: the draft goes against the config it was made on.
+  if (st.rev.blob !== ME.blob) {
+    Object.assign(ME, { open: false, list: [], dropped: 0, err: "The pending config changed while editing: the draft was dropped. Edit members again.", msg: "" });
+    renderProps();
+    return;
+  }
+  meSend(o, ME.blob, { op: "members", uuid: o.uuid, value: [...ME.list] });
+}
+$("props").addEventListener("click", (e) => {
+  const b = e.target.closest("[data-me]");
+  if (!b) return;
+  e.stopPropagation();
+  const o = S.view?.objects[S.sel], what = b.dataset.me;
+  if (!o) return;
+  if (what === "open") return meOpen(S.sel);
+  if (what === "cancel") return meClose();
+  if (what === "save") return meSave();
+  if (what === "add") return meAdd();
+  const st = meState(o), ed = membersEdit(o.uuid);
+  if (what === "revert") { if (st && ed) meSend(o, st.rev.blob, { op: "members", uuid: o.uuid, value: ed.deployed ?? null }, `Revert the members of ${displayTitle(o)}`); return; }
+  if (what === "drop") { if (st) meSend(o, st.rev.blob, { op: "members", uuid: o.uuid, value: null }, `Remove vislox's claim on the members of ${displayTitle(o)}`); return; }
+  if (what === "dropstale") { if (st && ed?.members) meSend(o, st.rev.blob, { op: "members", uuid: o.uuid, value: ed.members.filter((u) => !ed.stale.includes(u)) }, `Drop the missing members of ${displayTitle(o)}`); return; }
+  if (ME.busy || !ME.open) return;
+  const i = +b.dataset.i;
+  if (what === "del") ME.list.splice(i, 1);
+  else if (what === "up" && i > 0) ME.list.splice(i - 1, 0, ME.list.splice(i, 1)[0]);
+  else if (what === "down" && i < ME.list.length - 1) ME.list.splice(i + 1, 0, ME.list.splice(i, 1)[0]);
+  ME.err = "";
+  renderProps();
+  // Keep the keyboard where it was: on the same button of the row that moved, or the next row's.
+  const j = what === "up" ? i - 1 : what === "down" ? i + 1 : Math.min(i, ME.list.length - 1);
+  ($("props").querySelector(`[data-me="${what}"][data-i="${j}"]:not([disabled])`) || $("props").querySelector(`[data-me="del"][data-i="${j}"]`) || $("props").querySelector('[data-me="add"]'))?.focus();
+}, true);
+
 // ── adopting blocks (#72) ──────────────────────────────────────────────
 // `lox logic adopt` puts a block Loxone Config drew under the module: its declaration goes into vislox's
 // file of the page, it keeps its UUIDs, and the config stays exactly as it is (the server checks). It is
@@ -4123,6 +4354,7 @@ function undoLabel(ops) {
   if (ops.length === 1 && op.op === "adopt") return op.blocks.length === 1 ? `Adopt ${obj(op.blocks[0].uuid)}` : `Adopt ${plural(op.blocks.length, "block")}`;
   if (ops.length === 1 && op.op === "adopt_page") return `Adopt the blocks of ${S.pageOf?.get(op.page)?.title || "the page"}`;
   if (ops.length === 1 && op.op === "unadopt") return op.uuids.length === 1 ? `Hand ${obj(op.uuids[0])} back to Loxone Config` : `Hand ${plural(op.uuids.length, "block")} back to Loxone Config`;
+  if (ops.length === 1 && op.op === "members") return `Members of ${obj(op.uuid)}${op.value == null ? ": as last written" : ""}`;
   if (ops.length === 1 && op.op === "moods") return `Moods of ${obj(op.uuid)}${op.value == null ? ": Loxone Config's" : op.value.moods ? "" : ": shared set"}`;
   if (ops.length === 1 && op.op === "schedule") return `Switching times of ${obj(op.uuid)}${op.value == null ? ": Loxone Config's" : op.value.modes ? "" : ": shared set"}`;
   if (ops.length === 1 && op.op === "wire") return `Wire ${wire(op)}`;

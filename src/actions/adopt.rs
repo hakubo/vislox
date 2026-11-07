@@ -167,8 +167,8 @@ pub(super) fn why_not(
         || files.claims.set_claimed(&s)
     {
         return Some(format!(
-            "{name}: vislox's edits claim values, wires, switching times or moods on it ({}); \
-             revert them first, then adopt it",
+            "{name}: vislox's edits claim values, wires, switching times, moods or members on \
+             it ({}); revert them first, then adopt it",
             edit::FILE
         ));
     }

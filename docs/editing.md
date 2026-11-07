@@ -2,8 +2,8 @@
 
 vislox becomes an editor in steps: edit values (#58), add blocks (#59), move blocks, inputs and outputs (#60),
 make and change connections (#61), undo and redo (#62), adopt the blocks Loxone Config drew (#72), edit a
-Daytimer's switching times (#73) and a lighting controller's moods (#74). This page is the design they share. #58
-to #62, #72 to #74 are built; the rest says where each step plugs in.
+Daytimer's switching times (#73), a lighting controller's moods (#74) and a central block's members (#75). This
+page is the design they share. #58 to #62, #72 to #75 are built; the rest says where each step plugs in.
 
 ## The rules
 
@@ -50,7 +50,8 @@ POST /api/edit
                { "from": 390, "to": 480, "value": "21.5", "activate": true } ] } } },
            { "op": "moods", "uuid": "…", "value": { "moods": [
                { "name": "Viel Licht", "values": "all on" },
-               { "name": "Lesen", "values": "AQ1 on, AQ2 40%" } ] } } ] }
+               { "name": "Lesen", "values": "AQ1 on, AQ2 40%" } ] } },
+           { "op": "members", "uuid": "…", "value": [ "<member uuid>", "<member uuid>" ] } ] }
 ```
 
 `adopt`, `adopt_page` and `unadopt` go in a request of their own (#72).
@@ -69,7 +70,8 @@ POST /api/edit
   the blocks adopted, and for `unadopt` the `adopt` with the same slugs: a block keeps its UUIDs both ways. For
   `schedule` it is the `schedule` of what the timer claimed before: its set and that set's switching times, or
   no claim; when the op rewrote a set other timers still claim, it also carries that set's old switching times
-  (`restore`), so the undo gives them back too. `moods` is the same for a controller's moods (#74).
+  (`restore`), so the undo gives them back too. `moods` is the same for a controller's moods (#74). For
+  `members` it is the list vislox claimed before, or null (#75).
   A reconnected wire is one request, `unwire` then `wire`:
   undone, the reverse list. The ops of one request see each other: `unwire` then `wire` of the same wire is
   accepted (and changes nothing). `remove_block`'s `add_block` carries the wires the removal took out
@@ -615,6 +617,8 @@ one the config lost), claim it, prune, and build `previous` as a whole inverse (
 op rewrote that others still claim). It also builds the section of `GET /api/edits` (`edits_section`: per block
 `set`, its content, `deployed`, `shared`, `pending`; per set its blocks, content and `stale` claimants). The browser's
 Revert sends the deployed set only while no other block claims it, else the deployed content in a set of its own.
+A central block's members (#75) are no such set: each claim holds its own list, and a block is in as many lists
+as name it. `member_edit.rs` takes only `set_claim.rs`'s naming of vislox's blocks (`member_of`, `target_of`).
 
 ## Lighting moods (#74)
 
@@ -714,8 +718,78 @@ when the set is shared, *Revert*, and *Remove vislox's claim* when claimed twice
 controller added or adopted here, a switch-or-dimmer choice per circuit `AQ1` … `AQ5`. The Deploy pane counts the
 controllers whose moods are edited and not deployed.
 
-Later: a controller's motion settings, presence and other behaviour (they are not in the language yet); the
-central lighting block's members are #75.
+Later: a controller's motion settings, presence and other behaviour (they are not in the language yet).
+
+## Members of a central block (#75)
+
+A `CentralLight` drives lighting controllers, a `CentralShade` automatic blinds. Lox Logic writes the list with one
+claim per central block (no named set: each claim holds its own list). vislox writes it into `edits.loxl`, after
+the externs and any sets:
+
+```text
+extern vx_10000050_0000_0500_ffff504f94000001 = CentralLight(uuid: "10000050-0000-0500-ffff504f94000001")
+extern vx_10000041_0000_0410_ffff504f94000001 = LightController2(uuid: "10000041-0000-0410-ffff504f94000001")
+extern vx_10000040_0000_0400_ffff504f94000001 = LightController2(uuid: "10000040-0000-0400-ffff504f94000001")
+
+# Members of central blocks edited in vislox. A claim makes the list the block's whole
+# member list, in order; deleting it leaves the members as last written.
+vx_10000050_0000_0500_ffff504f94000001.members = (vx_10000041_0000_0410_ffff504f94000001, vx_10000040_0000_0400_ffff504f94000001)
+```
+
+- **Shown from the compiled config.** `objects[…].members` (`model.rs`) has the attribute that holds the list
+  (`rec` on a central block, `Objects` on an alarm), whether vislox edits it (`editable`), the type a member is
+  (`takes`), and the members in order, each a link target (title, type, page) or `missing` when the config has no
+  such object. `members_old` is the compared revision's, when the list differs, and the Changes list says it by
+  name in place of the raw `rec=` line: `Alle Lichter · member added: Diele`, `… member removed: …`, and one line
+  for a new order of the members both revisions list.
+- **The op** is `{ "op": "members", "uuid": <central block>, "value": [<member uuid>, …] }`: the whole list, in
+  the order the app lists them; `[]` empties it (lox writes no `rec=` then). `value: null` drops vislox's claim:
+  the members stay as last written (lox keeps no lock state for it), so before Apply that is the base's list.
+  `previous` is the list vislox claimed before (null: none).
+- **Checked before lox sees it**, with lox's rules: a `CentralLight` or `CentralShade` only (an `Alarm`'s or
+  `SmokeAlarm`'s `Objects=` stays with Loxone Config: it names hidden references wired to the alarm, which the list
+  does not own); each member a `LightController2` under a `CentralLight`, an `AutoJalousie` under a
+  `CentralShade`, listed once, never the central block itself; at most 200. A member Loxone Config drew is named by
+  an extern of the file, one added or adopted here by its slug; one the rest of the module manages is refused
+  (vislox's files name only their own blocks and Loxone Config's, and lox refuses an extern of a managed block):
+  list the members in the module's own file instead. One claim per central block: one the rest of the module
+  claims is refused, naming that `file:line` (`managed::members_claims`, sent as `members_claims`), and so is a
+  central block the rest of the module manages; a central block added or adopted here is claimed by its slug.
+- **Claimed twice** (the module's own file claims the members too, which lox refuses) is mended as for switching
+  times: dropping vislox's claim is let through and compiles the module's uncompiled change along. Properties says
+  *Claimed twice* and offers *Remove vislox's claim*. A drop is always let through, also once the module manages
+  the block or Loxone Config deleted it: a claim left behind would break every compile (the same holds for
+  switching times and moods, `set_claim.rs`).
+- **A member added here and not pinned yet** (no UUID in the lock) is carried by its slug in `previous` and in
+  `GET /api/edits`, and the op takes the slug back as it is, so its undo works.
+- **UUIDs compare lowercase** everywhere (a save may write them either way): the same members in another case are
+  no change in Properties, the Changes list or the after-compile check.
+- **A member the config lost** (deleted in Loxone Config) leaves an extern lox cannot resolve. `GET /api/edits`
+  names it (`stale`), and the browser offers *Drop the missing members*: the list without them. A central block
+  the pending config lost can only have its claim dropped (the op with its UUID and no value).
+- **Checked after the compile.** The pending config must list, on each central block the request gave a list,
+  exactly those members in that order; otherwise the edit is refused and the files, lock and out are put back.
+- **Read back.** vislox reads the claims of `edits.loxl` with lox's parser; a claim not on a `vx_…` slug, or naming
+  a slug that is neither an extern of the file nor a block of vislox's files, is refused. Removing a block added
+  here, handing an adopted one back, and adopting a block are refused while a member list names it (as the central
+  block or a member).
+- **Adopting a central block** (#72): `lox logic adopt` lifts its members as a claim. vislox leaves that claim
+  out, so the block keeps the list Loxone Config wrote (a dropped claim leaves the members as last written) and
+  adopting changes nothing; editing the members later claims them by the block's slug.
+- **Not deployed and Revert.** `GET /api/edits` sends `members`: per central block vislox's file claims the
+  members of now or claimed in the deployed revision, `members` (the UUIDs now, null: no claim), `deployed` (the
+  value a Revert sends), `pending` (the pending config lists other members than the deployed one), `stale` and
+  `missing`.
+
+The browser: *Members* in Properties of a central block or an alarm, on any revision, each member a link. On the
+newest config, *Edit members* on a central block lists them with ↑ ↓ and ✕ and *Add member…*, which opens the
+Ctrl+K palette as a picker (Ctrl+K itself while the editor is shown; otherwise Ctrl+K is the usual palette): only
+the blocks of the type the central block takes, not the central block, not one listed already, not one the module
+manages (the server's `managed`). A member the config does not have is left out of the draft, which says so. The
+draft belongs to the block and the pending config it was opened on: selecting another block, or a new pending
+config (an undo, an edit elsewhere), drops it, and *Save* sends that config's blob as `base`, which the server
+checks as for any edit. *Save*, *Cancel*, *Revert*, and *Remove vislox's claim* when claimed twice. The Deploy pane counts the central blocks whose members are edited
+and not deployed.
 
 ## Undo and redo (#62)
 
@@ -773,6 +847,7 @@ cannot express is left out, not worked around.
 | #72 adopt | `lox logic adopt` on a copy; its declaration in `<module>/vislox/<page>.loxl` | The block keeps its UUIDs, the config stays as it is; then edited like a block added here. |
 | #73 switching times | `schedule vx_… end`, `x.schedule = vx_…` in `edits.loxl` | A DayTimer, extern or added/adopted here; several timers may share a set. |
 | #74 moods | `moods vx_… end`, `x.moods = vx_…` in `edits.loxl`; `Circuit<n>:` | A LightController2, extern or added/adopted here; several controllers may share a set. Circuits only on one added/adopted here. |
+| #75 members | `x.members = (a, b)` in `edits.loxl` | A CentralLight or CentralShade, extern or added/adopted here; members externs or blocks added/adopted here. An alarm's `Objects=` stays with Loxone Config. |
 
 Blocks the module already manages (they are in the lockfile) are refused: they are edited in their own `.loxl`.
 The blocks vislox added or adopted (#72) are the exception: their `.loxl` is vislox's.
@@ -803,7 +878,8 @@ The blocks vislox added or adopted (#72) are the exception: their `.loxl` is vis
   - the NFC Code Touch, Intercom and Touch Pure Flex controller blocks, which exist because Loxone Config paired
     the device (lox adopts them, never creates them);
   - blocks lox creates but that do nothing until they are set up in Loxone Config: the burglar and smoke alarms,
-    the room controller, the irrigation, and the central light and shade blocks (their members are #75);
+    the room controller, the irrigation, and the central light and shade blocks (the members of one the config
+    has are edited here, #75);
   - every type outside lox's table (lox refuses it: "Refuse, never guess"), and templates (#83).
 - On a new block: a program's text (`Code:` takes only `file(…)`), a wire when it is added (draw it once it is
   on the page, #61) or an expression on an input (#82),
@@ -824,7 +900,7 @@ Each of these plugs in as new op kinds on `POST /api/edit`, written into `<modul
 | #72 (built) | adopt a block into the module (`lox logic adopt`) |
 | #73 (built) | Daytimer switching times (`schedule`, `.schedule`) |
 | #74 (built) | lighting moods and circuits (`moods`, `.moods`, `Circuit<n>:`) |
-| #75 | members of a central block (`.members`) |
+| #75 (built) | members of a central block (`.members`) |
 | #76 | NFC Code Touch access (`access`, `.access`) |
 | #77 | notification recipients and messages (`recipients`, `OutputRefLM`) |
 | #78 | Touch Pure Flex tiles (`tiles`, `.tiles`) |

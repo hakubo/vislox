@@ -140,6 +140,14 @@ pub enum Op {
         uuid: String,
         value: Option<crate::mood_edit::MoodsVal>,
     },
+    /// The members of the central block `uuid` (#75): a `.members` claim in
+    /// [`FILE`] ([`crate::member_edit`]), the member UUIDs in order (`[]`
+    /// empties the list). `None` drops vislox's claim: the members stay as
+    /// last written. Its `previous` is the list vislox claimed before.
+    Members {
+        uuid: String,
+        value: Option<Vec<String>>,
+    },
 }
 
 /// Where a `place` puts one block: its top left corner, as `move` takes it.
@@ -162,7 +170,8 @@ impl Op {
             | Op::RemoveBlock { uuid }
             | Op::Move { uuid, .. }
             | Op::Schedule { uuid, .. }
-            | Op::Moods { uuid, .. } => Some(uuid),
+            | Op::Moods { uuid, .. }
+            | Op::Members { uuid, .. } => Some(uuid),
             Op::AddBlock { .. }
             | Op::Relayout { .. }
             | Op::Place { .. }
@@ -193,7 +202,8 @@ impl Op {
             | Op::AdoptPage { .. }
             | Op::Unadopt { .. }
             | Op::Schedule { .. }
-            | Op::Moods { .. } => None,
+            | Op::Moods { .. }
+            | Op::Members { .. } => None,
         }
     }
 
@@ -217,7 +227,8 @@ impl Op {
             | Op::AdoptPage { .. }
             | Op::Unadopt { .. }
             | Op::Schedule { .. }
-            | Op::Moods { .. } => {}
+            | Op::Moods { .. }
+            | Op::Members { .. } => {}
         }
         op
     }
@@ -449,6 +460,8 @@ pub struct Claims(
     pub crate::sched_edit::Scheds,
     /// The lighting moods it writes (#74).
     pub crate::mood_edit::MoodSets,
+    /// The members of central blocks it claims (#75).
+    pub crate::member_edit::Members,
 );
 
 /// A wire vislox draws: `to.port <- from.port`, each end a slug (an
@@ -633,6 +646,11 @@ impl Claims {
                         return Err(foreign(&format!("a second `{}.moods`", mc.slug)));
                     }
                 }
+                Item::MembersClaim(mc) if mc.slug.starts_with(SLUG_PREFIX) => {
+                    if c.4.insert(mc.slug.clone(), mc.members.clone()).is_some() {
+                        return Err(foreign(&format!("a second `{}.members`", mc.slug)));
+                    }
+                }
                 Item::Gap | Item::FragmentEnd | Item::Comment(_) => {}
                 _ => return Err(foreign("a statement")),
             }
@@ -646,6 +664,12 @@ impl Claims {
         for (t, set) in &c.3.claims {
             if !c.3.sets.contains_key(set) {
                 return Err(foreign(&format!("`{t}.moods = {set}` without its set")));
+            }
+        }
+        // A member list names vislox's blocks: its externs, or the blocks it added.
+        for (central, m) in crate::member_edit::names(&c.4) {
+            if !m.starts_with(SLUG_PREFIX) {
+                return Err(foreign(&format!("`{central}.members` naming `{m}`")));
             }
         }
         // A wire's ends are vislox's: its externs, or the blocks it added.
@@ -664,15 +688,26 @@ impl Claims {
         self.1.iter().any(|w| w.touches(slug))
     }
 
-    /// Whether a wire ends at `slug`, or a schedule (#73) or moods (#74)
-    /// claim names it.
+    /// Whether a wire ends at `slug`, or a schedule (#73), moods (#74) or
+    /// members (#75) claim names it.
     fn named(&self, slug: &str) -> bool {
-        self.wired(slug) || self.2.claims.contains_key(slug) || self.3.claims.contains_key(slug)
+        self.wired(slug) || self.set_claimed(slug)
     }
 
-    /// Whether a set claim of the file (switching times, moods) names `slug`.
+    /// Whether a set claim of the file (switching times, moods) or a member
+    /// list (as the central block, or a member) names `slug`.
     pub fn set_claimed(&self, slug: &str) -> bool {
-        self.2.claims.contains_key(slug) || self.3.claims.contains_key(slug)
+        self.2.claims.contains_key(slug)
+            || self.3.claims.contains_key(slug)
+            || self.member_named(slug).is_some()
+    }
+
+    /// The central block whose member list names `slug` (as the block
+    /// itself, or one of its members), if one does (#75).
+    pub fn member_named(&self, slug: &str) -> Option<&str> {
+        crate::member_edit::names(&self.4)
+            .find(|(_, m)| m.as_str() == slug)
+            .map(|(c, _)| c.as_str())
     }
 
     /// Drop the externs that claim nothing and no wire or set claim names.
@@ -711,6 +746,7 @@ impl Claims {
         }
         out.push_str(&self.2.render());
         out.push_str(&self.3.render());
+        out.push_str(&crate::member_edit::render(&self.4));
         if !self.1.is_empty() {
             out.push_str("\n# Wires drawn in vislox. Deleting a line takes the wire out again.\n");
         }
@@ -741,7 +777,8 @@ impl Claims {
             | Op::AdoptPage { .. }
             | Op::Unadopt { .. }
             | Op::Schedule { .. }
-            | Op::Moods { .. } => None,
+            | Op::Moods { .. }
+            | Op::Members { .. } => None,
         }
     }
 
@@ -844,7 +881,11 @@ pub fn apply(
         .filter(|_| {
             !matches!(
                 op,
-                Op::RemoveBlock { .. } | Op::Move { .. } | Op::Schedule { .. } | Op::Moods { .. }
+                Op::RemoveBlock { .. }
+                    | Op::Move { .. }
+                    | Op::Schedule { .. }
+                    | Op::Moods { .. }
+                    | Op::Members { .. }
             )
         })
         .ok_or_else(|| "not a value".to_string())?;
@@ -944,7 +985,8 @@ pub fn apply(
         | Op::AdoptPage { .. }
         | Op::Unadopt { .. }
         | Op::Schedule { .. }
-        | Op::Moods { .. } => {
+        | Op::Moods { .. }
+        | Op::Members { .. } => {
             unreachable!("not a value")
         }
     };
@@ -1158,6 +1200,16 @@ impl Files {
                 ));
             }
         }
+        // A members claim (#75) names externs of the file or blocks of
+        // vislox's files, the central block and each member.
+        for (c, m) in crate::member_edit::names(&f.claims.4) {
+            if !f.claims.0.keys().any(|u| slug(u) == *m) && f.block(m).is_none() {
+                return Err(format!(
+                    "{CLAIMS}: `{c}.members` names `{m}`, which is neither an extern of this file \
+                     nor a block vislox added; put its line back or delete the claim"
+                ));
+            }
+        }
         // Every end of a wire is an extern of the claims file or a block
         // vislox added; anything else would break every compile.
         for w in &f.claims.1 {
@@ -1202,6 +1254,7 @@ impl Files {
             || !self.claims.1.is_empty()
             || !self.claims.2.is_empty()
             || !self.claims.3.is_empty()
+            || !self.claims.4.is_empty()
             || self.present.contains(CLAIMS)
         {
             out.insert(CLAIMS.to_string(), self.claims.render());
@@ -1399,6 +1452,9 @@ pub struct Ctx<'a> {
     /// The lighting controllers whose moods the rest of the module claims
     /// (#74): UUID (lowercase) → the claim's `file:line`.
     pub moods_claimed: &'a BTreeMap<String, String>,
+    /// The central blocks whose members the rest of the module claims
+    /// (#75): UUID (lowercase) → the claim's `file:line`.
+    pub members_claimed: &'a BTreeMap<String, String>,
 }
 
 /// What [`apply_op`] did: the value or op that undoes it (`previous`),
@@ -1438,6 +1494,7 @@ pub fn apply_op(files: &mut Files, ctx: &Ctx, op: &Op) -> Result<Applied, String
         Op::Unadopt { uuids } => unadopt(files, ctx, uuids),
         Op::Schedule { uuid, value } => crate::sched_edit::apply(files, ctx, uuid, value.as_ref()),
         Op::Moods { uuid, value } => crate::mood_edit::apply(files, ctx, uuid, value.as_ref()),
+        Op::Members { uuid, value } => crate::member_edit::apply(files, ctx, uuid, value.as_ref()),
         _ => {
             let uuid = op.uuid().unwrap_or_default();
             match ctx.lock.slug_of(uuid) {
@@ -1503,6 +1560,10 @@ pub fn undo_ops(
                 value: serde_json::from_value(prev).map_err(bad)?,
             }),
             Op::Schedule { uuid, .. } => undo.push(Op::Schedule {
+                uuid: uuid.clone(),
+                value: serde_json::from_value(prev).map_err(bad)?,
+            }),
+            Op::Members { uuid, .. } => undo.push(Op::Members {
                 uuid: uuid.clone(),
                 value: serde_json::from_value(prev).map_err(bad)?,
             }),
@@ -1707,6 +1768,18 @@ fn remove_block(files: &mut Files, ctx: &Ctx, uuid: &str) -> Result<Applied, Str
              edit)"
         ));
     }
+    if let Some(c) = files.claims.member_named(&slug) {
+        return Err(format!(
+            "{name}: vislox's file claims {} members ({c}.members); take {} out first (Revert \
+             them, or undo the edit)",
+            if c == slug {
+                "its"
+            } else {
+                "it among a central block's"
+            },
+            if c == slug { "them" } else { "it" },
+        ));
+    }
     if ctx
         .deployed
         .is_some_and(|d| find(&d.xml.root, uuid).is_some())
@@ -1903,6 +1976,18 @@ fn unadopt(files: &mut Files, ctx: &Ctx, uuids: &[String]) -> Result<Applied, St
                 "{}: vislox's file claims its moods; revert them first, then hand it back to \
                  Loxone Config",
                 name(u)
+            ));
+        }
+        if let Some(c) = files.claims.member_named(s) {
+            return Err(format!(
+                "{}: vislox's file claims {} ({c}.members); revert them first, then hand it back \
+                 to Loxone Config",
+                name(u),
+                if c == s {
+                    "its members"
+                } else {
+                    "it among a central block's members"
+                }
             ));
         }
         slugs.insert(s.to_string());
@@ -3056,7 +3141,8 @@ pub fn current(doc: &LoxoneDoc, op: &Op) -> Option<String> {
         | Op::AdoptPage { .. }
         | Op::Unadopt { .. }
         | Op::Schedule { .. }
-        | Op::Moods { .. } => None,
+        | Op::Moods { .. }
+        | Op::Members { .. } => None,
     }
 }
 
@@ -3544,6 +3630,7 @@ mod tests {
                 page_adoptions: &Default::default(),
                 sched_claimed: &Default::default(),
                 moods_claimed: &Default::default(),
+                members_claimed: &Default::default(),
             };
             apply_op(&mut files, &ctx, &add(EG, t, None, &[], &[])).unwrap();
             let mut l = Lockfile::default();
@@ -3578,6 +3665,7 @@ mod tests {
             page_adoptions: &Default::default(),
             sched_claimed: &Default::default(),
             moods_claimed: &Default::default(),
+            members_claimed: &Default::default(),
         };
         let a = apply_op(
             &mut files,
@@ -3648,6 +3736,7 @@ mod tests {
             page_adoptions: &Default::default(),
             sched_claimed: &Default::default(),
             moods_claimed: &Default::default(),
+            members_claimed: &Default::default(),
         };
         let title = Op::Title {
             uuid: mono.clone(),
@@ -3712,6 +3801,7 @@ mod tests {
             page_adoptions: &Default::default(),
             sched_claimed: &Default::default(),
             moods_claimed: &Default::default(),
+            members_claimed: &Default::default(),
         };
         let r = apply_op(&mut files, &ctx, &Op::RemoveBlock { uuid: mono.clone() }).unwrap();
         // It names the block it adds again (#62): lox mints new UUIDs for it.
@@ -3740,6 +3830,7 @@ mod tests {
             page_adoptions: &Default::default(),
             sched_claimed: &Default::default(),
             moods_claimed: &Default::default(),
+            members_claimed: &Default::default(),
         };
         let e = apply_op(&mut files, &ctx, &Op::RemoveBlock { uuid: pulse }).unwrap_err();
         assert!(e.contains("is deployed"), "{e}");
@@ -3765,6 +3856,7 @@ mod tests {
             page_adoptions: &Default::default(),
             sched_claimed: &Default::default(),
             moods_claimed: &Default::default(),
+            members_claimed: &Default::default(),
         };
         apply_op(&mut files, &ctx, &add(OG, "And", Some("Licht"), &[], &[])).unwrap();
         let text = files.render()["obergeschoss.loxl"].clone();
@@ -3798,6 +3890,7 @@ mod tests {
             page_adoptions: &Default::default(),
             sched_claimed: &Default::default(),
             moods_claimed: &Default::default(),
+            members_claimed: &Default::default(),
         };
         apply_op(&mut files, &ctx, &add(OG, "Or", None, &[], &[])).unwrap();
         let r = files.render();
@@ -3833,6 +3926,7 @@ mod tests {
             page_adoptions: &Default::default(),
             sched_claimed: &Default::default(),
             moods_claimed: &Default::default(),
+            members_claimed: &Default::default(),
         };
         for s in ["vx_and_1", "vx_or_1"] {
             let uuid = l.objects[s].uuid.clone();
@@ -3860,6 +3954,7 @@ mod tests {
             page_adoptions: &Default::default(),
             sched_claimed: &Default::default(),
             moods_claimed: &Default::default(),
+            members_claimed: &Default::default(),
         };
         let mut files = Files::default();
         let err = |op: Op| apply_op(&mut files.clone(), &ctx, &op).unwrap_err();
@@ -3896,6 +3991,7 @@ mod tests {
             page_adoptions: &Default::default(),
             sched_claimed: &Default::default(),
             moods_claimed: &Default::default(),
+            members_claimed: &Default::default(),
         };
         let e = apply_op(&mut Files::default(), &ctx, &add(OG, "And", None, &[], &[])).unwrap_err();
         assert!(e.contains("2 pages are titled"), "{e}");
@@ -3947,6 +4043,7 @@ mod tests {
             page_adoptions: &Default::default(),
             sched_claimed: &Default::default(),
             moods_claimed: &Default::default(),
+            members_claimed: &Default::default(),
         };
         apply_op(&mut files, &ctx, &add(OG, "And", Some("Licht"), &[], &[])).unwrap();
         // Deployed: the base draws it where lox placed it.
@@ -3966,6 +4063,7 @@ mod tests {
             page_adoptions: &Default::default(),
             sched_claimed: &Default::default(),
             moods_claimed: &Default::default(),
+            members_claimed: &Default::default(),
         };
         // Snapped to the grid, the size kept; `previous` moves it back.
         let mut files = Files::from_texts(&files.render()).unwrap();
@@ -4050,6 +4148,7 @@ mod tests {
             page_adoptions: &Default::default(),
             sched_claimed: &Default::default(),
             moods_claimed: &Default::default(),
+            members_claimed: &Default::default(),
         };
         apply_op(&mut files, &ctx, &add(OG, "And", None, &[], &[])).unwrap();
         apply_op(&mut files, &ctx, &add(OG, "Or", None, &[], &[])).unwrap();
@@ -4066,6 +4165,7 @@ mod tests {
             page_adoptions: &Default::default(),
             sched_claimed: &Default::default(),
             moods_claimed: &Default::default(),
+            members_claimed: &Default::default(),
         };
         let err = |op: Op| apply_op(&mut files.clone(), &ctx, &op).unwrap_err();
         // Drawn in Loxone Config: lox does not move it.
@@ -4174,6 +4274,7 @@ mod tests {
             page_adoptions: &Default::default(),
             sched_claimed: &Default::default(),
             moods_claimed: &Default::default(),
+            members_claimed: &Default::default(),
         };
         apply_op(&mut files, &ctx, &add(OG, "And", None, &[], &[])).unwrap();
         let out = compile_files(&d, &files, &mut l).unwrap();
@@ -4200,6 +4301,7 @@ mod tests {
                 page_adoptions: &Default::default(),
                 sched_claimed: &Default::default(),
                 moods_claimed: &Default::default(),
+                members_claimed: &Default::default(),
             };
             files.layout = Placement::default();
             apply_op(
@@ -4272,6 +4374,7 @@ mod tests {
             page_adoptions: &Default::default(),
             sched_claimed: &Default::default(),
             moods_claimed: &Default::default(),
+            members_claimed: &Default::default(),
         };
         apply_op(&mut files, &ctx, &add(OG, "And", None, &[], &[])).unwrap();
         apply_op(&mut files, &ctx, &add(EG, "Or", None, &[], &[])).unwrap();
@@ -4327,6 +4430,7 @@ mod tests {
             page_adoptions: &Default::default(),
             sched_claimed: &Default::default(),
             moods_claimed: &Default::default(),
+            members_claimed: &Default::default(),
         };
         apply_op(&mut files, &ctx, &add(OG, "And", None, &[], &[])).unwrap();
         let out = compile_files(&d, &files, &mut l).unwrap();
@@ -4417,6 +4521,7 @@ mod tests {
             page_adoptions: &Default::default(),
             sched_claimed: &Default::default(),
             moods_claimed: &Default::default(),
+            members_claimed: &Default::default(),
         };
         // The Divide block's output onto the upper floor's OR: another page.
         let w = wire_op((DIV, "AQ"), (OR, "I2"));
@@ -4464,6 +4569,7 @@ mod tests {
             page_adoptions: &Default::default(),
             sched_claimed: &Default::default(),
             moods_claimed: &Default::default(),
+            members_claimed: &Default::default(),
         };
         // One request may take a wire out and draw it again (an undo and a
         // redo, a reconnect to the same port): the ops see each other.
@@ -4503,6 +4609,7 @@ mod tests {
             page_adoptions: &Default::default(),
             sched_claimed: &Default::default(),
             moods_claimed: &Default::default(),
+            members_claimed: &Default::default(),
         };
         let err = |op: Op| apply_op(&mut Files::default(), &ctx, &op).unwrap_err();
         assert!(err(wire_op((DIV, "Input2"), (OR, "I2"))).contains("is an input"));
@@ -4553,6 +4660,7 @@ mod tests {
             page_adoptions: &Default::default(),
             sched_claimed: &Default::default(),
             moods_claimed: &Default::default(),
+            members_claimed: &Default::default(),
         };
         let e = apply_op(
             &mut Files::default(),
@@ -4590,6 +4698,7 @@ mod tests {
             page_adoptions: &Default::default(),
             sched_claimed: &Default::default(),
             moods_claimed: &Default::default(),
+            members_claimed: &Default::default(),
         };
         let e = apply_op(
             &mut Files::default(),
@@ -4630,6 +4739,7 @@ mod tests {
             page_adoptions: &Default::default(),
             sched_claimed: &Default::default(),
             moods_claimed: &Default::default(),
+            members_claimed: &Default::default(),
         };
         apply_op(&mut files, &ctx, &add(OG, "And", None, &[("I2", "1")], &[])).unwrap();
         let out = compile_files(&d, &files, &mut l).unwrap();
@@ -4646,6 +4756,7 @@ mod tests {
             page_adoptions: &Default::default(),
             sched_claimed: &Default::default(),
             moods_claimed: &Default::default(),
+            members_claimed: &Default::default(),
         };
         // Its input with a constant takes no wire; the other does.
         let e = apply_op(&mut files, &ctx, &wire_op((DIV, "AQ"), (&new, "I2"))).unwrap_err();
@@ -4683,6 +4794,7 @@ mod tests {
             page_adoptions: &Default::default(),
             sched_claimed: &Default::default(),
             moods_claimed: &Default::default(),
+            members_claimed: &Default::default(),
         };
         let undo = apply_op(&mut files, &ctx, &Op::RemoveBlock { uuid: new.clone() })
             .unwrap()
@@ -4722,6 +4834,7 @@ mod tests {
             page_adoptions: &Default::default(),
             sched_claimed: &Default::default(),
             moods_claimed: &Default::default(),
+            members_claimed: &Default::default(),
         };
         let a = apply_op(&mut files, &ctx, &undo).unwrap();
         let slug2 = a.added.unwrap();
@@ -4814,6 +4927,7 @@ mod tests {
             page_adoptions: &pages,
             sched_claimed: &Default::default(),
             moods_claimed: &Default::default(),
+            members_claimed: &Default::default(),
         };
         let back = |f: &mut Files, u: &str| {
             apply_op(
@@ -4960,6 +5074,7 @@ mod tests {
             page_adoptions: &Default::default(),
             sched_claimed: &claimed,
             moods_claimed: &Default::default(),
+            members_claimed: &Default::default(),
         };
         let (mon, sat, hol) = (builtin_uuid(4), builtin_uuid(9), builtin_uuid(1));
         let wk: Vec<(String, Vec<Sp>)> = (4..=8)
@@ -5178,6 +5293,7 @@ mod tests {
             page_adoptions: &Default::default(),
             sched_claimed: &Default::default(),
             moods_claimed: &Default::default(),
+            members_claimed: &Default::default(),
         };
         let mon = builtin_uuid(4);
         let mut files = Files::default();
@@ -5285,6 +5401,7 @@ mod tests {
             page_adoptions: &Default::default(),
             sched_claimed: &Default::default(),
             moods_claimed: &Default::default(),
+            members_claimed: &Default::default(),
         };
         let mut files = Files::default();
         let mon = builtin_uuid(4);
@@ -5395,6 +5512,7 @@ mod tests {
             page_adoptions: &EMPTY_PAGES,
             sched_claimed: &EMPTY_CLAIMS,
             moods_claimed: claimed,
+            members_claimed: &EMPTY_CLAIMS,
         }
     }
 

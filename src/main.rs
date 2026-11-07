@@ -16,6 +16,7 @@ mod history;
 mod live;
 mod log;
 mod managed;
+mod member_edit;
 mod miniserver;
 mod model;
 mod monframe;

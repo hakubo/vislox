@@ -532,6 +532,12 @@ pub fn extract(
     for i in &new {
         match i {
             Item::Extern(_) => {}
+            // A central block's members (#75): lox lifts them as a claim.
+            // Left out, the block keeps the list Loxone Config wrote (a
+            // claim dropped leaves the members as last written), so adopting
+            // changes nothing; editing them later claims them in vislox's
+            // file of claims, by the block's slug.
+            Item::MembersClaim(_) => {}
             Item::Block(b) => {
                 let slug = rename.get(&b.slug).cloned().ok_or_else(|| {
                     format!(

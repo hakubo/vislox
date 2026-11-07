@@ -547,13 +547,23 @@ pub struct SetClaim {
 /// The claim keywords on a block, and the set kinds they name.
 const SET_CLAIMS: &[&str] = &["access", "recipients", "schedule", "moods"];
 
-/// Every `<slug>.access|recipients|schedule = <set>` at the top level of the
-/// module's files, outside template bodies (what a template claims is made
-/// once per instance), with the block each one is on.
-pub fn set_claims<T: AsRef<str>>(files: &[(String, T)], lock: &crate::edit::Lock) -> Vec<SetClaim> {
+/// The headers of the sets a scan found: (kind, set) → where each is declared.
+type SetHeaders = BTreeMap<(&'static str, String), Vec<(String, usize)>>;
+
+/// The one scanner of the module's claims on a block: every
+/// `<slug>.<keyword> = <rhs>` at the top level of the module's files, outside
+/// template bodies (what a template claims is made once per instance), whose
+/// keyword and right-hand side `claim` takes (it names the kind), with the
+/// block each one is on. With `headers`, also the set headers of those kinds
+/// (`access bewohner`).
+fn scan_claims<T: AsRef<str>>(
+    files: &[(String, T)],
+    lock: &crate::edit::Lock,
+    claim: impl Fn(&str, &str) -> Option<&'static str>,
+    headers: &[&'static str],
+) -> (Vec<SetClaim>, SetHeaders) {
     let decls = Declarations::new(files);
-    // (kind, set) → its declarations.
-    let mut sets: BTreeMap<(&str, String), Vec<(String, usize)>> = BTreeMap::new();
+    let mut sets: SetHeaders = BTreeMap::new();
     let mut claims = Vec::new();
     for (file, text) in files {
         let lines: Vec<&str> = text.as_ref().split('\n').collect();
@@ -565,7 +575,7 @@ pub fn set_claims<T: AsRef<str>>(files: &[(String, T)], lock: &crate::edit::Lock
             let c = code(line).trim();
             // `access bewohner`: a set's header.
             if let Some((kw, name)) = c.split_once(char::is_whitespace)
-                && let Some(kind) = SET_CLAIMS.iter().find(|k| **k == kw)
+                && let Some(kind) = headers.iter().find(|k| **k == kw)
                 && is_name(name.trim())
             {
                 sets.entry((kind, name.trim().to_string()))
@@ -573,24 +583,24 @@ pub fn set_claims<T: AsRef<str>>(files: &[(String, T)], lock: &crate::edit::Lock
                     .push((file.clone(), n + 1));
                 continue;
             }
-            let Some((lhs, set)) = c.split_once('=') else {
+            let Some((lhs, rhs)) = c.split_once('=') else {
                 continue;
             };
-            let (set, lhs) = (set.trim(), lhs.trim());
+            let (rhs, lhs) = (rhs.trim(), lhs.trim());
             let Some((slug, kw)) = lhs.split_once('.') else {
                 continue;
             };
-            let (slug, kw) = (slug.trim(), kw.trim());
-            let Some(kind) = SET_CLAIMS.iter().find(|k| **k == kw) else {
-                continue;
-            };
-            if !is_name(slug) || !is_name(set) || set.starts_with('=') {
+            let slug = slug.trim();
+            if !is_name(slug) || rhs.starts_with('=') {
                 continue;
             }
+            let Some(kind) = claim(kw.trim(), rhs) else {
+                continue;
+            };
             claims.push(SetClaim {
                 kind,
                 slug: slug.to_string(),
-                set: set.to_string(),
+                set: rhs.to_string(),
                 file: file.clone(),
                 line: n + 1,
                 set_file: None,
@@ -600,10 +610,6 @@ pub fn set_claims<T: AsRef<str>>(files: &[(String, T)], lock: &crate::edit::Lock
         }
     }
     for c in &mut claims {
-        if let Some([(f, l)]) = sets.get(&(c.kind, c.set.clone())).map(Vec::as_slice) {
-            c.set_file = Some(f.clone());
-            c.set_line = Some(*l);
-        }
         let (f, l) = decls
             .at(&c.slug, None)
             .map_or((None, None), |(f, l)| (Some(f), Some(l)));
@@ -615,7 +621,50 @@ pub fn set_claims<T: AsRef<str>>(files: &[(String, T)], lock: &crate::edit::Lock
         }
         c.blocks = blocks;
     }
+    (claims, sets)
+}
+
+/// Every `<slug>.access|recipients|schedule|moods = <set>` at the top level
+/// of the module's files, outside template bodies, with the block each one is
+/// on and where its set is declared.
+pub fn set_claims<T: AsRef<str>>(files: &[(String, T)], lock: &crate::edit::Lock) -> Vec<SetClaim> {
+    let (mut claims, sets) = scan_claims(
+        files,
+        lock,
+        |kw, rhs| {
+            SET_CLAIMS
+                .iter()
+                .find(|k| **k == kw)
+                .copied()
+                .filter(|_| is_name(rhs))
+        },
+        SET_CLAIMS,
+    );
+    for c in &mut claims {
+        if let Some([(f, l)]) = sets.get(&(c.kind, c.set.clone())).map(Vec::as_slice) {
+            c.set_file = Some(f.clone());
+            c.set_line = Some(*l);
+        }
+    }
     claims
+}
+
+/// Every `<central>.members = (a, b, …)` at the top level of the module's
+/// files, outside template bodies (#75), as a [`SetClaim`] of kind `members`
+/// whose `set` is the list as written (`(a, b)`) and whose `blocks` is the
+/// central block it is on. A member list is no named set, so it is not in
+/// [`set_claims`] (whose sets Apply's confirmation reviews).
+pub fn members_claims<T: AsRef<str>>(
+    files: &[(String, T)],
+    lock: &crate::edit::Lock,
+) -> Vec<SetClaim> {
+    scan_claims(
+        files,
+        lock,
+        |kw, rhs| (kw == "members" && rhs.starts_with('(')).then_some("members"),
+        &[],
+    )
+    .0
 }
 
 #[cfg(test)]
@@ -872,6 +921,37 @@ mod tests {
         set(now);
         m.refresh(root, &root.join("pages"));
         assert_eq!(&*m.texts()[0].1, "d = Or()\n");
+    }
+
+    #[test]
+    fn member_lists_point_at_their_line_and_their_central_block() {
+        let files = vec![(
+            "pages/licht.loxl".to_string(),
+            "extern zentral = CentralLight(uuid: \"10000050-0000-0500-ffff504f94000001\")\n\
+             l1 = LightController2(\"L1\")\n\
+             zentral.members = (l1)  # die Lichter\n\
+             # zentral.members = ()\n\
+             template T(c: CentralLight, l: LightController2)\n\
+             \tc.members = (l)\n\
+             end\n\
+             l1.moods = abend\n"
+                .to_string(),
+        )];
+        let lock = crate::edit::Lock::default();
+        let c = members_claims(&files, &lock);
+        assert_eq!(c.len(), 1, "{c:?}");
+        assert_eq!(
+            (c[0].kind, c[0].slug.as_str(), c[0].set.as_str()),
+            ("members", "zentral", "(l1)")
+        );
+        assert_eq!((c[0].file.as_str(), c[0].line), ("pages/licht.loxl", 3));
+        assert_eq!(c[0].blocks, ["10000050-0000-0500-ffff504f94000001"]);
+        // Not a set claim: Apply's review of sets leaves it out.
+        assert!(
+            set_claims(&files, &lock)
+                .iter()
+                .all(|c| c.kind != "members")
+        );
     }
 
     #[test]
