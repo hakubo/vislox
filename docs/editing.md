@@ -351,10 +351,15 @@ them, shows what they say, and does not deploy while one fails.
 - **What lox prints.** lox has no JSON for test (yet), so `check::parse_test` reads its text: a line per test
   (`test "name" ... ok`, `FAILED` or `ERROR`), the failed `expect`s under it (`    step 1: expect both.Q == 1 —
   actual 0`; with `--lox`, ` (key)` after the value) or the error, and the count it ends with (`3 tests: 2
-  passed, 1 failed`), or `no tests in pages`. Without either, lox failed (it says why on standard error, after
-  `Error: `), and `test` is `{ available: false, reason }`.
-- **Pinned like errors and findings.** `check::locate_tests` gives each test the line of its `test "…"` (top
-  level, in the module's files), each failed `expect` the line in that test that says it, and both the blocks
+  passed, 1 failed`, read loosely: `1 test: …`, more counts, a time after it), or `no tests in pages`. A test
+  whose line says FAILED or ERROR failed, whatever the count says. Without a count, or with one that does not
+  match the lines read (more tests, or more failed), lox failed or said something else (it says why on standard
+  error, after `Error: `), and `test` is `{ available: false, reason }`.
+- **Pinned like errors and findings.** `check::locate_tests` gives each test the line of its `test "…"` (the
+  name compared unescaped, as lox prints it; its body ends at the `end` indented as that line, so a nested
+  block does not cut it short), each failed `expect` its line in that test by position (among the `expect`s
+  after the step lox names, the first not taken that reads the same tokens, so `1.0` and `1` or spacing do not
+  matter, else the first on the same signal; comments cut as lox reads them), and both the blocks
   their `expect`s read: the slug before the port, resolved like a lint finding's name (the lockfile's managed
   blocks, `vx_<uuid>` externs, an extern's `uuid: "…"`). A test that could not run names the blocks the
   simulator has no model for (``StateV "Status" (<uuid>) is not simulated: no model for `StateV` blocks``):
@@ -367,8 +372,10 @@ them, shows what they say, and does not deploy while one fails.
   else it runs `lox logic test .` itself, shown as it runs, and keeps the result for the browsers when the check
   is of these files. So the tests are always of the config `lox config push` compiles. A test that fails or could
   not run stops Apply there, before anything is sent: 409, with the first five tests, their `file:line` and the
-  `expect`s that did not hold. No tests, or a lox that cannot tell, skip the step. There is no *Deploy anyway*:
-  fix the test, or the module.
+  `expect`s that did not hold. Apply fails closed: only a module without tests, or a lox without `logic test`,
+  skips the step. Tests that could not run at all (a timeout, a lox that did not start, output vislox cannot read)
+  stop it too, with *Tests couldn't run* and lox's reason; a check run like that is never taken, so Apply runs
+  the tests again itself. There is no *Deploy anyway*: fix the test, or the module.
 
 The browser, on the newest config only (as errors and lint): *Tests: N of M passed* above Apply, open while one
 fails, each test with its `file:line`, its failed `expect`s (step, statement, expected and actual, at their own
@@ -378,7 +385,7 @@ its tooltip the test, and the test in Properties' *Lox Logic* section. Apply is 
 run fails (its tooltip says how many); while the tests run again it is on, since the server runs them itself.
 
 Later: the same simulator could drive an offline Liveview (simulated values on the wires without a Miniserver,
-#21). `run_tests` and the parsed `tests` are where a separate issue would start.
+#21). `Actions::run_logic(Second::Test)` and the parsed `tests` are where a separate issue would start.
 
 ## Undo and redo (#62)
 

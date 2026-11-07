@@ -221,8 +221,12 @@ try {
     assert.equal(existsSync(join(loxDir, "pushed")), false);
     assert.equal(applies, 1);
     // The refusal (409) is the only error the browser logs.
-    const i = errors.findIndex((e) => /status of 409/.test(e));
-    assert.ok(i >= 0, errors.join(" | "));
+    // The browser may report it after the message shows: wait for it.
+    let i = -1;
+    for (const end = Date.now() + 10000; (i = errors.findIndex((e) => /status of 409/.test(e))) < 0 && Date.now() < end;) {
+      await new Promise((ok) => setTimeout(ok, 50));
+    }
+    assert.ok(i >= 0, "the 409 was logged: " + errors.join(" | "));
     errors.splice(i, 1);
     unlinkSync(failTest());
     dialogs = 0; applies = 0; asked.length = 0;

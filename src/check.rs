@@ -363,11 +363,14 @@ pub struct Tested {
 /// `lox logic test`'s standard output, read: a line per test
 /// (`test "name" ... ok`, `FAILED` or `ERROR`), each failed `expect` or the
 /// error on the lines under it (indented by four), and the count it ends
-/// with (`3 tests: 2 passed, 1 failed`), or `no tests in …` / `no tests
-/// match …` when there are none. `None` without either: lox failed (the
-/// module does not compile: exit 1, `Error: …` on standard error) or is not
-/// one vislox can read. lox has no JSON for test yet, so this reads the text
-/// it prints.
+/// with (`3 tests: 2 passed, 1 failed`; read loosely: `1 test: …`, more
+/// counts, a time after it), or `no tests in …` / `no tests match …` when
+/// there are none. `None` when vislox cannot vouch for what it read: no
+/// count (lox failed: the module does not compile, exit 1, `Error: …` on
+/// standard error; or it is not one vislox can read), a count of tests other
+/// than the lines read, or more failed than the lines say. A test whose line
+/// says FAILED or ERROR failed, whatever the count says. lox has no JSON for
+/// test yet, so this reads the text it prints.
 pub fn parse_test(stdout: &str) -> Option<Tested> {
     let mut tests: Vec<TestRun> = Vec::new();
     // The lines under a test until `trace:` (lox's `--trace`, never asked).
@@ -376,7 +379,11 @@ pub fn parse_test(stdout: &str) -> Option<Tested> {
         if tests.is_empty() && (l.starts_with("no tests in ") || l.starts_with("no tests match ")) {
             return Some(Tested::default());
         }
-        if test_count(l) {
+        if let Some((total, failed)) = test_count(l) {
+            let bad = tests.iter().filter(|t| t.status != "pass").count();
+            if total != tests.len() || failed.is_some_and(|f| f > bad) {
+                return None;
+            }
             return Some(Tested { tests });
         }
         if let Some((name, verdict)) = test_line(l) {
@@ -423,16 +430,28 @@ pub fn parse_test(stdout: &str) -> Option<Tested> {
     None
 }
 
-/// `3 tests: 2 passed, 1 failed` (`1 tests: …` too).
-fn test_count(l: &str) -> bool {
-    let Some((n, rest)) = l.split_once(" tests: ") else {
-        return false;
-    };
-    let Some((p, f)) = rest.split_once(" passed, ") else {
-        return false;
-    };
-    let num = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
-    num(n) && num(p) && f.strip_suffix(" failed").is_some_and(num)
+/// The count `lox logic test` ends with: `3 tests: 2 passed, 1 failed`,
+/// read loosely (`1 test: …`, `…, 1 skipped`, `… (12 ms)`): how many tests,
+/// and how many failed when it says.
+fn test_count(l: &str) -> Option<(usize, Option<usize>)> {
+    let (n, rest) = l.split_once(": ")?;
+    let n = n
+        .strip_suffix(" tests")
+        .or_else(|| n.strip_suffix(" test"))?;
+    if n.is_empty() || !n.bytes().all(|b| b.is_ascii_digit()) || !rest.contains(" passed") {
+        return None;
+    }
+    let mut failed = None;
+    let words: Vec<&str> = rest
+        .split(|c: char| c.is_whitespace() || c == ',' || c == '(' || c == ')')
+        .filter(|w| !w.is_empty())
+        .collect();
+    for w in words.windows(2) {
+        if w[1] == "failed" {
+            failed = w[0].parse().ok();
+        }
+    }
+    Some((n.parse().ok()?, failed))
 }
 
 /// `test "name" ... ok`: the name and `pass`, `fail` or `error`.
@@ -518,60 +537,101 @@ fn unmodeled(l: &str) -> Vec<Unmodeled> {
     out
 }
 
-/// Pin each test to its `test "…"` line, each failed `expect` to its line
-/// in that test (the first statement lox printed as it is written there),
-/// and both to the blocks their `expect`s read: what the slug before the
-/// port is ([`name_blocks`]). Only top-level `test` blocks (lox allows
-/// them nowhere else).
+/// Pin each test to its `test "…"` line (the name compared unescaped),
+/// each failed `expect` to its line in that test, and both to the blocks
+/// their `expect`s read: what the slug before the port is
+/// ([`name_blocks`]). A failed `expect` is found by position: among the
+/// test's `expect`s after its step's `tick`/`step`, the first not taken
+/// that reads the same tokens (so `1.0` and `1`, or spacing, do not
+/// matter), else the first not taken of that step on the same signal.
+/// A test's body ends at the `end` indented as its `test` line, so a block
+/// nested in it does not cut it short. Comments are cut as lox reads them
+/// (a `#` in a string is none).
 pub fn locate_tests<T: AsRef<str>>(tests: &mut [TestRun], texts: &[(String, T)], lock: &Lock) {
     let decls = crate::managed::Declarations::new(texts);
-    let blocks_of = |signal: &str| -> Vec<String> {
-        let slug = signal.split('.').next().unwrap_or(signal);
-        let (file, line) = decls.at(slug, None).unzip();
-        name_blocks(slug, file.as_deref(), line, texts, lock)
+    let files: Vec<(&str, Vec<&str>)> = texts
+        .iter()
+        .map(|(f, t)| (f.as_str(), t.as_ref().lines().collect()))
+        .collect();
+    // Each test's header, by its unescaped name: file and 0-based line.
+    let mut heads: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+    for (fi, (_, lines)) in files.iter().enumerate() {
+        for (li, l) in lines.iter().enumerate() {
+            if let [Tok::Ident(kw), Tok::Str(name), ..] = tokens(l).as_slice()
+                && kw == "test"
+            {
+                heads.entry(name.clone()).or_insert((fi, li));
+            }
+        }
+    }
+    let mut cache: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut blocks_of = |slug: &str| -> Vec<String> {
+        cache
+            .entry(slug.to_string())
+            .or_insert_with(|| {
+                let (file, line) = decls.at(slug, None).unzip();
+                name_blocks(slug, file.as_deref(), line, texts, lock)
+            })
+            .clone()
     };
     for t in tests {
-        // The test's body: from `test "name"` to its `end`.
-        let head = format!("test \"{}\"", t.name);
-        let body = texts.iter().find_map(|(f, text)| {
-            let lines: Vec<&str> = text.as_ref().lines().collect();
-            let at = lines.iter().position(|l| {
-                l.strip_prefix(head.as_str())
-                    .is_some_and(|r| r.trim().is_empty() || r.trim_start().starts_with('#'))
-            })?;
+        let mut blocks: Vec<String> = Vec::new();
+        if let Some(&(fi, at)) = heads.get(&t.name) {
+            let (file, lines) = &files[fi];
+            t.file = Some(file.to_string());
+            t.line = Some(at + 1);
+            let indent = |l: &str| l.len() - l.trim_start().len();
+            let own = indent(lines[at]);
             let end = lines[at + 1..]
                 .iter()
-                .position(|l| l.trim() == "end")
+                .position(|l| indent(l) == own && tokens(l) == [Tok::Ident("end".into())])
                 .map_or(lines.len(), |e| at + 1 + e);
-            Some((f.clone(), at, lines[at + 1..end].to_vec(), at + 1))
-        });
-        let mut blocks: Vec<String> = Vec::new();
-        if let Some((file, at, body, first)) = &body {
-            t.file = Some(file.clone());
-            t.line = Some(at + 1);
-            for l in body {
-                let tl = l.split('#').next().unwrap_or("").trim();
-                if let Some(rest) = tl.strip_prefix("expect ")
-                    && let Some(signal) = rest.split_whitespace().next()
-                {
-                    blocks.extend(blocks_of(signal));
+            // The test's `expect`s: their line, step, tokens and slug.
+            let mut step = 0;
+            let mut expects: Vec<(usize, usize, Vec<Tok>, Option<String>)> = Vec::new();
+            for (li, l) in lines.iter().enumerate().take(end).skip(at + 1) {
+                let tk = tokens(l);
+                match tk.first() {
+                    Some(Tok::Ident(w)) if w == "tick" || w == "step" => step += 1,
+                    Some(Tok::Ident(w)) if w == "expect" => {
+                        let slug = match tk.get(1) {
+                            Some(Tok::Ident(s)) => Some(s.clone()),
+                            _ => None,
+                        };
+                        if let Some(s) = &slug {
+                            blocks.extend(blocks_of(s));
+                        }
+                        expects.push((li, step, tk, slug));
+                    }
+                    _ => {}
                 }
             }
             let mut used = std::collections::BTreeSet::new();
             for e in &mut t.failures {
-                let found = body.iter().enumerate().find(|(i, l)| {
-                    !used.contains(i)
-                        && squash(l.split('#').next().unwrap_or("")) == squash(&e.expect)
-                });
-                if let Some((i, _)) = found {
-                    used.insert(i);
-                    e.line = Some(first + i + 1);
+                let printed = tokens(&e.expect);
+                let slug = e.signal.as_deref().and_then(|s| s.split('.').next());
+                let of_step = |x: &&(usize, usize, Vec<Tok>, Option<String>)| {
+                    !used.contains(&x.0) && e.step.is_none_or(|s| s == x.1)
+                };
+                let found = expects
+                    .iter()
+                    .filter(of_step)
+                    .find(|x| x.2 == printed)
+                    .or_else(|| {
+                        expects
+                            .iter()
+                            .filter(of_step)
+                            .find(|x| x.3.as_deref() == slug)
+                    });
+                if let Some(x) = found {
+                    used.insert(x.0);
+                    e.line = Some(x.0 + 1);
                 }
             }
         }
         for e in &mut t.failures {
             if let Some(s) = &e.signal {
-                e.blocks = blocks_of(s);
+                e.blocks = blocks_of(s.split('.').next().unwrap_or(s));
             }
         }
         blocks.extend(t.unmodeled.iter().map(|u| u.uuid.clone()));
@@ -579,12 +639,6 @@ pub fn locate_tests<T: AsRef<str>>(tests: &mut [TestRun], texts: &[(String, T)],
         blocks.retain(|u| seen.insert(u.clone()));
         t.blocks = blocks;
     }
-}
-
-/// A statement with its spaces run together, to compare what lox prints
-/// with what is written.
-fn squash(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// The UUIDs a line of Lox Logic names ([`names`]): a name by the
@@ -1137,5 +1191,70 @@ test \"Status\" ... ERROR
             t[2].blocks,
             vec!["00000000-0000-001e-ffff504f94000001".to_string()]
         );
+    }
+
+    #[test]
+    fn the_count_is_read_loosely_and_a_failed_line_fails_whatever_it_says() {
+        let one = "test \"x\" ... ok\n1 test: 1 passed, 0 failed\n";
+        assert_eq!(parse_test(one).unwrap().tests[0].status, "pass");
+        let more = "test \"x\" ... ok\ntest \"y\" ... ok\n2 tests: 2 passed, 0 failed, 1 skipped\n";
+        assert_eq!(parse_test(more).unwrap().tests.len(), 2);
+        let timed = "test \"x\" ... FAILED\n    step 1: expect a.Q == 1 — actual 0\n1 tests: 0 passed, 1 failed (12 ms)\n";
+        assert_eq!(parse_test(timed).unwrap().tests[0].status, "fail");
+        // The count says all passed, the line says FAILED: failed.
+        let lies = "test \"x\" ... FAILED\n    step 1: expect a.Q == 1 — actual 0\n1 tests: 1 passed, 0 failed\n";
+        assert_eq!(parse_test(lies).unwrap().tests[0].status, "fail");
+        // A count vislox cannot square with the lines it read: no answer,
+        // never a pass.
+        assert_eq!(
+            parse_test("test \"x\" ... ok\n2 tests: 2 passed, 0 failed\n"),
+            None
+        );
+        assert_eq!(
+            parse_test("test \"x\" ... ok\n1 tests: 0 passed, 1 failed\n"),
+            None
+        );
+        assert_eq!(parse_test("3 tests: 3 passed, 0 failed\n"), None);
+        // Not a count.
+        assert_eq!(parse_test("test \"x\" ... ok\nsome tests: passed\n"), None);
+    }
+
+    #[test]
+    fn a_test_s_lines_are_found_by_position_unescaped_and_past_nested_blocks() {
+        let main = "both = And(\"B\")\n\
+             test \"Sagt \\\"Hallo\\\"\" # quoted\n\
+             \tboth.In1 = 1\n\
+             \ttick 1s\n\
+             \texpect both.Q == 1.0 # a\n\
+             \texpect  both.Q >= 0.5\n\
+             \tnested\n\
+             \t\tstep 1\n\
+             \tend\n\
+             \ttick 1s\n\
+             \texpect both.AQ ~= 21.5 °C # \"#\"\n\
+             \texpect both.Q == 1\n\
+             end\n";
+        let texts = vec![("pages/main.loxl".to_string(), main.to_string())];
+        let lock = Lock {
+            slugs: [("both".to_string(), FLUR.to_string())].into(),
+            ..Default::default()
+        };
+        let out = "test \"Sagt \"Hallo\"\" ... FAILED\n\
+             \x20   step 1: expect both.Q == 1 — actual 0\n\
+             \x20   step 1: expect both.Q >= 0.5 — actual 0\n\
+             \x20   step 3: expect both.Q == 1 — actual 0\n\
+             \x20   step 3: expect both.AQ ~= 21.5 °C — actual 19\n\
+             1 tests: 0 passed, 1 failed\n";
+        let mut t = parse_test(out).unwrap().tests;
+        assert_eq!(t[0].name, "Sagt \"Hallo\"");
+        locate_tests(&mut t, &texts, &lock);
+        // The escaped name in the source is the printed one.
+        assert_eq!(t[0].line, Some(2));
+        let lines: Vec<Option<usize>> = t[0].failures.iter().map(|f| f.line).collect();
+        // `1.0` printed as `1`; `>=` after two spaces; past the nested
+        // block's `end`, the step after it (its `step 1` counts); `°C` and a
+        // `#` in a string.
+        assert_eq!(lines, vec![Some(5), Some(6), Some(12), Some(11)]);
+        assert_eq!(t[0].blocks, vec![FLUR.to_string()]);
     }
 }
