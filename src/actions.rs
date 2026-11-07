@@ -169,65 +169,14 @@ fn edit_schedules(
     pending: Option<&loxone_config::LoxoneDoc>,
     deployed: Option<&loxone_config::LoxoneDoc>,
 ) -> (Value, Value) {
-    use crate::sched_edit as se;
-    let Some(doc) = pending.or(deployed) else {
-        return (json!([]), json!([]));
-    };
-    let modes = se::Modes::new(doc, lock);
-    // Timer UUID → its slug in vislox's files now, and in the deployed ones.
-    let mut timers: std::collections::BTreeMap<String, (Option<&str>, Option<&str>)> =
-        Default::default();
-    for (files, now_side) in [(now, true), (was, false)] {
-        for t in files.claims.2.claims.keys() {
-            if let Some(u) = se::timer_of(files, lock, t) {
-                let slot = timers.entry(u).or_default();
-                if now_side {
-                    slot.0 = Some(t)
-                } else {
-                    slot.1 = Some(t)
-                }
-            }
-        }
-    }
-    let uuids_of = |set: &str, but: Option<&str>| -> Vec<String> {
-        now.claims
-            .2
-            .claimants(set)
-            .into_iter()
-            .filter(|t| Some(*t) != but)
-            .filter_map(|t| se::timer_of(now, lock, t))
-            .collect()
-    };
-    let schedules: Vec<Value> = timers
-        .into_iter()
-        .map(|(u, (tn, tw))| {
-            let cur = tn.and_then(|t| se::current(now, t, &modes));
-            let dep = tw.and_then(|t| se::current(was, t, &modes));
-            let set = cur.as_ref().and_then(|c| c.set.clone());
-            json!({
-                "uuid": u,
-                "set": set,
-                "modes": cur.and_then(|c| c.modes),
-                "deployed": dep,
-                "shared": set.as_deref().map(|s| uuids_of(s, tn)).unwrap_or_default(),
-                // As for a value: with something pending, a revision that
-                // was never deployed differs from it.
-                "pending": match (pending, deployed) {
-                    (Some(p), Some(d)) => se::differs(p, d, &u),
-                    (Some(_), None) => true,
-                    (None, _) => false,
-                },
-            })
-        })
-        .collect();
-    let sets: Vec<Value> = now
-        .claims
-        .2
-        .sets
-        .keys()
-        .map(|name| json!({ "name": name, "timers": uuids_of(name, None) }))
-        .collect();
-    (json!(schedules), json!(sets))
+    crate::set_claim::edits_section::<crate::sched_edit::SchedKind>(
+        now,
+        was,
+        lock,
+        pending,
+        deployed,
+        crate::sched_edit::differs,
+    )
 }
 
 /// `GET /api/edits`' `moods` and `mood_sets` (#74). Per lighting controller
@@ -235,7 +184,8 @@ fn edit_schedules(
 /// revision: the set and its moods now (`set`, `moods`) and then (`deployed`,
 /// the value a Revert sends), the other controllers sharing its set
 /// (`shared`), and whether the pending config has other moods on it than the
-/// deployed one (`pending`). And vislox's sets, each with its controllers.
+/// deployed one (`pending`). And vislox's sets, each with its controllers,
+/// its moods and the claimants the config shown lost (`stale`).
 fn edit_moods(
     now: &edit::Files,
     was: &edit::Files,
@@ -243,67 +193,14 @@ fn edit_moods(
     pending: Option<&loxone_config::LoxoneDoc>,
     deployed: Option<&loxone_config::LoxoneDoc>,
 ) -> (Value, Value) {
-    use crate::mood_edit as me;
-    use crate::sched_edit::timer_of;
-    if pending.or(deployed).is_none() {
-        return (json!([]), json!([]));
-    }
-    // Controller UUID → its slug in vislox's files now, and in the deployed ones.
-    let mut lcs: std::collections::BTreeMap<String, (Option<&str>, Option<&str>)> =
-        Default::default();
-    for (files, now_side) in [(now, true), (was, false)] {
-        for t in files.claims.3.claims.keys() {
-            if let Some(u) = timer_of(files, lock, t) {
-                let slot = lcs.entry(u).or_default();
-                if now_side {
-                    slot.0 = Some(t)
-                } else {
-                    slot.1 = Some(t)
-                }
-            }
-        }
-    }
-    let uuids_of = |set: &str, but: Option<&str>| -> Vec<String> {
-        now.claims
-            .3
-            .claimants(set)
-            .into_iter()
-            .filter(|t| Some(*t) != but)
-            .filter_map(|t| timer_of(now, lock, t))
-            .collect()
-    };
-    let list: Vec<Value> = lcs
-        .into_iter()
-        .map(|(u, (tn, tw))| {
-            let cur = tn.and_then(|t| me::current(now, t));
-            let dep = tw.and_then(|t| me::current(was, t));
-            let set = cur.as_ref().and_then(|c| c.set.clone());
-            json!({
-                "uuid": u,
-                "set": set,
-                "moods": cur.and_then(|c| c.moods),
-                "deployed": dep,
-                "shared": set.as_deref().map(|s| uuids_of(s, tn)).unwrap_or_default(),
-                // As for a value: with something pending, a revision that
-                // was never deployed differs from it.
-                "pending": match (pending, deployed) {
-                    (Some(p), Some(d)) => me::differs(p, d, &u),
-                    (Some(_), None) => true,
-                    (None, _) => false,
-                },
-            })
-        })
-        .collect();
-    let sets: Vec<Value> = now
-        .claims
-        .3
-        .sets
-        .iter()
-        .map(|(name, lines)| {
-            json!({ "name": name, "controllers": uuids_of(name, None), "moods": me::rows_of(lines) })
-        })
-        .collect();
-    (json!(list), json!(sets))
+    crate::set_claim::edits_section::<crate::mood_edit::MoodKind>(
+        now,
+        was,
+        lock,
+        pending,
+        deployed,
+        crate::mood_edit::differs,
+    )
 }
 
 /// The ops that undo an edit (#62), sent back as an edit of its own, into

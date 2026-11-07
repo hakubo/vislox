@@ -32,7 +32,8 @@
 //! other by its quoted title. Columns with the same intervals share a line,
 //! with `daily`, `weekdays` and `weekend` where they fit.
 
-use crate::edit::{self, Applied, Ctx, Files, Lock};
+use crate::edit::{self, Applied, Claims, Ctx, Files, Lock};
+use crate::set_claim;
 use loxone_config::LoxoneDoc;
 use loxone_config::logic::{Day, Interval, ScheduleLine};
 use loxone_config::xml::Element;
@@ -79,61 +80,6 @@ pub struct Sched {
     /// Set name → its switching times, written back before the rest.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub restore: BTreeMap<String, BTreeMap<String, Vec<Span>>>,
-}
-
-/// The sets and claims of vislox's file of claims.
-#[derive(Default, Clone, PartialEq, Debug)]
-pub struct Scheds {
-    /// Set name → its lines, as lox reads them.
-    pub sets: BTreeMap<String, Vec<ScheduleLine>>,
-    /// The slug of a timer (an extern of the file, or a block of vislox's
-    /// files) → the set it claims.
-    pub claims: BTreeMap<String, String>,
-}
-
-impl Scheds {
-    pub fn is_empty(&self) -> bool {
-        self.sets.is_empty() && self.claims.is_empty()
-    }
-
-    /// The timers that claim `set`.
-    pub fn claimants(&self, set: &str) -> Vec<&str> {
-        self.claims
-            .iter()
-            .filter(|(_, s)| s.as_str() == set)
-            .map(|(t, _)| t.as_str())
-            .collect()
-    }
-
-    /// Drop the sets no timer claims.
-    pub fn prune(&mut self) {
-        let used: BTreeSet<String> = self.claims.values().cloned().collect();
-        self.sets.retain(|s, _| used.contains(s));
-    }
-
-    /// The sets, then the claims, as the file has them.
-    pub fn render(&self) -> String {
-        let mut out = String::new();
-        if self.is_empty() {
-            return out;
-        }
-        out.push_str(
-            "\n# Switching times edited in vislox. A claim replaces the timer's whole schedule;\n\
-             # deleting it leaves the timer as the deployed config has it.\n",
-        );
-        for (name, lines) in &self.sets {
-            out.push_str(&format!("schedule {name}\n"));
-            for l in lines {
-                out.push_str(&format!("\t{l}\n"));
-            }
-            out.push_str("end\n");
-        }
-        out.push('\n');
-        for (t, s) in &self.claims {
-            out.push_str(&format!("{t}.schedule = {s}\n"));
-        }
-        out
-    }
 }
 
 /// The built-in operating modes: their number (the `N` of their fixed UUID)
@@ -458,86 +404,111 @@ pub fn lines_of(
 /// The timer a slug of vislox's files names: an extern of the file of
 /// claims (`vx_<uuid>`), or a block vislox added or adopted.
 pub fn timer_of(files: &Files, lock: &Lock, target: &str) -> Option<String> {
-    files
-        .claims
-        .0
-        .keys()
-        .find(|u| edit::slug(u) == target)
-        .cloned()
-        .or_else(|| lock.uuid_of(target).map(String::from))
+    set_claim::member_of(files, lock, target)
 }
 
-/// What `files` give the timer `target`: its set and the set's switching
-/// times (`modes` none when they cannot be read against `modes`).
-pub fn current(files: &Files, target: &str, modes: &Modes) -> Option<Sched> {
-    let s = &files.claims.2;
-    let set = s.claims.get(target)?;
-    Some(Sched {
-        set: Some(set.clone()),
-        modes: s.sets.get(set).and_then(|l| modes_of(l, modes).ok()),
-        restore: BTreeMap::new(),
-    })
-}
+/// The switching times vislox's file writes: its `schedule` sets and claims.
+pub type Scheds = set_claim::SetStore<SchedKind>;
 
-/// Write `cols` into vislox's set `set`, checked for the timers that claim it
-/// (and `also`, about to claim it): an analog one needs a value on each
-/// interval, a digital one takes none; all of one kind.
-fn write_set(
-    files: &mut Files,
-    ctx: &Ctx,
-    modes: &Modes,
-    set: &str,
-    cols: Option<&BTreeMap<String, Vec<Span>>>,
-    also: Option<(&str, &Element)>,
-) -> Result<(), String> {
-    // The timer about to claim it first: its kind decides, and names errors.
-    let mut timers: Vec<(String, &Element)> =
-        also.map(|(t, e)| (t.to_string(), e)).into_iter().collect();
-    for t in files.claims.2.claimants(set) {
-        if also.is_some_and(|(a, _)| a == t) {
-            continue;
-        }
-        if let Some(u) = timer_of(files, ctx.lock, t)
-            && let Some(e) = edit::find(&ctx.doc.xml.root, &u)
-        {
-            timers.push((t.to_string(), e));
+/// Switching times as a kind of set claim ([`set_claim`]).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SchedKind;
+
+impl set_claim::SetKind for SchedKind {
+    type Line = ScheduleLine;
+    type Content = BTreeMap<String, Vec<Span>>;
+    type Val = Sched;
+    const KEYWORD: &'static str = "schedule";
+    const BLOCK: &'static str = "DayTimer";
+    const WHAT: &'static str = "switching times";
+    const STEM: &'static str = "schedule";
+    const HEADER: &'static str = "# Switching times edited in vislox. A claim replaces the timer's whole schedule;\n\
+         # deleting it leaves the timer as the deployed config has it.\n";
+    const CONTENT_KEY: &'static str = "modes";
+    const MEMBERS_KEY: &'static str = "timers";
+
+    fn store(c: &Claims) -> &Scheds {
+        &c.2
+    }
+    fn store_mut(c: &mut Claims) -> &mut Scheds {
+        &mut c.2
+    }
+    fn claimed_elsewhere<'a>(ctx: &'a Ctx) -> &'a BTreeMap<String, String> {
+        ctx.sched_claimed
+    }
+    fn wrong_type(name: &str) -> String {
+        format!(
+            "{name}: only a DayTimer's switching times are written in Lox Logic; change these in \
+             Loxone Config"
+        )
+    }
+    fn parts(v: &Sched) -> set_claim::Parts<'_, Self> {
+        (v.set.as_ref(), v.modes.as_ref(), &v.restore)
+    }
+    fn make(
+        set: Option<String>,
+        modes: Option<Self::Content>,
+        restore: BTreeMap<String, Self::Content>,
+    ) -> Sched {
+        Sched {
+            set,
+            modes,
+            restore,
         }
     }
-    let title = |e: &Element| e.attr_decoded("Title").unwrap_or_default().into_owned();
-    let analog = |e: &Element| e.attr("Analog") == Some("true");
-    if let Some(cols) = cols {
+    fn content_of(lines: &[ScheduleLine], doc: &LoxoneDoc, lock: &Lock) -> Option<Self::Content> {
+        modes_of(lines, &Modes::new(doc, lock)).ok()
+    }
+    /// The timer about to claim it first: its kind (analog or digital)
+    /// decides, and names the errors.
+    fn lines_of(
+        cols: &Self::Content,
+        ctx: &Ctx,
+        timers: &[(String, &Element)],
+    ) -> Result<Vec<ScheduleLine>, String> {
+        let modes = Modes::new(ctx.doc, ctx.lock);
         let a = timers.first().is_some_and(|(_, e)| analog(e));
         let first = timers.first().map(|(_, e)| title(e)).unwrap_or_default();
-        let cols = checked(cols, a, modes).map_err(|e| format!("{first}: {e}"))?;
-        let lines = lines_of(&cols, modes).map_err(|e| format!("{first}: {e}"))?;
-        files.claims.2.sets.insert(set.to_string(), lines);
+        let cols = checked(cols, a, &modes).map_err(|e| format!("{first}: {e}"))?;
+        lines_of(&cols, &modes).map_err(|e| format!("{first}: {e}"))
     }
-    let lines = files
-        .claims
-        .2
-        .sets
-        .get(set)
-        .ok_or_else(|| format!("vislox has no set `{set}`; give the switching times"))?;
-    let spans: Vec<Span> = modes_of(lines, modes)
-        .map_err(|e| format!("`{set}`: {e}"))?
-        .into_values()
-        .flatten()
-        .collect();
-    for (_, e) in &timers {
-        if analog(e) && spans.iter().any(|s| s.value.is_none()) {
-            return Err(format!(
-                "{} is analog and shares `{set}`, whose intervals have no value",
-                title(e)
-            ));
+    /// An analog timer needs a value on each interval, a digital one takes
+    /// none: every timer on a set is of one kind.
+    fn check(
+        lines: &[ScheduleLine],
+        ctx: &Ctx,
+        set: &str,
+        timers: &[(String, &Element)],
+    ) -> Result<(), String> {
+        let spans: Vec<Span> = modes_of(lines, &Modes::new(ctx.doc, ctx.lock))
+            .map_err(|e| format!("`{set}`: {e}"))?
+            .into_values()
+            .flatten()
+            .collect();
+        for (_, e) in timers {
+            if analog(e) && spans.iter().any(|s| s.value.is_none()) {
+                return Err(format!(
+                    "{} is analog and shares `{set}`, whose intervals have no value",
+                    title(e)
+                ));
+            }
+            if !analog(e) && spans.iter().any(|s| s.value.is_some()) {
+                return Err(format!(
+                    "{} is digital and shares `{set}`, whose intervals have values",
+                    title(e)
+                ));
+            }
         }
-        if !analog(e) && spans.iter().any(|s| s.value.is_some()) {
-            return Err(format!(
-                "{} is digital and shares `{set}`, whose intervals have values",
-                title(e)
-            ));
-        }
+        Ok(())
     }
-    Ok(())
+}
+
+fn title(e: &Element) -> String {
+    e.attr_decoded("Title").unwrap_or_default().into_owned()
+}
+
+fn analog(e: &Element) -> bool {
+    e.attr("Analog") == Some("true")
 }
 
 /// Apply a `schedule` op: give the DayTimer `uuid` the switching times
@@ -550,134 +521,7 @@ pub fn apply(
     uuid: &str,
     value: Option<&Sched>,
 ) -> Result<Applied, String> {
-    let el = edit::find(&ctx.doc.xml.root, uuid)
-        .ok_or_else(|| format!("no object {uuid} in the pending config"))?;
-    let name = el.attr_decoded("Title").unwrap_or_default().into_owned();
-    if el.attr("Type") != Some("DayTimer") {
-        return Err(format!(
-            "{name}: only a DayTimer's switching times are written in Lox Logic; change these in \
-             Loxone Config"
-        ));
-    }
-    let target = match ctx.lock.slug_of(uuid) {
-        Some(s) if files.block(s).is_some() => s.to_string(),
-        Some(_) => {
-            return Err(format!(
-                "{name}: the module manages this block; change its switching times in its .loxl \
-                 file"
-            ));
-        }
-        None => edit::slug(uuid),
-    };
-    let modes = Modes::new(ctx.doc, ctx.lock);
-    let before = files.claims.2.clone();
-    let mut previous = current(files, &target, &modes);
-    // Sets of vislox's written back first (an undo's).
-    if let Some(v) = value {
-        for (set, cols) in &v.restore {
-            if !files.claims.2.sets.contains_key(set) {
-                return Err(format!(
-                    "{name}: vislox's set `{set}` is gone; its switching times cannot be put back"
-                ));
-            }
-            write_set(files, ctx, &modes, set, Some(cols), None)?;
-        }
-    }
-    match value {
-        Some(v) if v.set.is_some() || v.modes.is_some() => {
-            // A timer takes one schedule. Dropping vislox's claim is always
-            // let through: it is how a timer the module claims too is mended.
-            if let Some(at) = ctx.sched_claimed.get(&uuid.to_ascii_lowercase()) {
-                return Err(format!(
-                    "{name}: {at} claims its switching times; change them there (a timer takes \
-                     one schedule)"
-                ));
-            }
-            let s = &files.claims.2;
-            let set = match &v.set {
-                Some(n) => n.trim().to_string(),
-                None => match s.claims.get(&target) {
-                    Some(own) if s.claimants(own) == [target.as_str()] => own.clone(),
-                    _ => {
-                        let stem = format!("{name} schedule");
-                        crate::adopt::default_slug(&stem, "DayTimer", &|x| taken(files, ctx, x))
-                    }
-                },
-            };
-            if !s.sets.contains_key(&set) {
-                crate::adopt::check_slug(&set).map_err(|e| format!("The set's name: {e}"))?;
-                if taken(files, ctx, &set) {
-                    return Err(format!(
-                        "The set's name: `{set}` is taken in the module; pick another"
-                    ));
-                }
-                if v.modes.is_none() {
-                    return Err(format!(
-                        "{name}: vislox has no set `{set}`; give the switching times"
-                    ));
-                }
-            }
-            write_set(
-                files,
-                ctx,
-                &modes,
-                &set,
-                v.modes.as_ref(),
-                Some((&target, el)),
-            )
-            .map_err(|e| {
-                if e.starts_with(&name) {
-                    e
-                } else {
-                    format!("{name}: {e}")
-                }
-            })?;
-            files.claims.2.claims.insert(target.clone(), set.clone());
-            // An extern of the file names a timer Loxone Config drew.
-            if target == edit::slug(uuid) {
-                let c = files.claims.0.entry(uuid.to_string()).or_default();
-                c.ty = "DayTimer".into();
-            }
-        }
-        _ => {
-            files.claims.2.claims.remove(&target);
-        }
-    }
-    files.claims.2.prune();
-    files.claims.prune();
-    // The sets the op rewrote that other timers still claim: their old
-    // switching times go into the undo, unless the undo's own set has them.
-    let mut restore = BTreeMap::new();
-    for (set, lines) in &before.sets {
-        let now = files.claims.2.sets.get(set);
-        let others = files.claims.2.claimants(set).iter().any(|t| *t != target);
-        let own = previous.as_ref().and_then(|p| p.set.as_ref()) == Some(set);
-        if now.is_some_and(|n| n != lines) && others && !own {
-            let cols = modes_of(lines, &modes).map_err(|e| format!("`{set}`: {e}"))?;
-            restore.insert(set.clone(), cols);
-        }
-    }
-    if !restore.is_empty() {
-        previous.get_or_insert_with(Sched::default).restore = restore;
-    }
-    Ok(Applied {
-        previous: serde_json::json!(previous),
-        added: None,
-    })
-}
-
-/// Whether a new set may not be named `s`: a name of the module, of the
-/// lockfile (its tombstones too) or of vislox's files (its mood sets, #74,
-/// among them: the sets share one namespace).
-pub(crate) fn taken(files: &Files, ctx: &Ctx, s: &str) -> bool {
-    ctx.names.contains(s)
-        || ctx.lock.slugs.contains_key(s)
-        || ctx.lock.tombstones.contains(s)
-        || ctx.lock.externals.contains_key(s)
-        || files.names(s)
-        || files.claims.2.sets.contains_key(s)
-        || files.claims.3.sets.contains_key(s)
-        || files.claims.0.keys().any(|u| edit::slug(u) == s)
+    set_claim::apply::<SchedKind>(files, ctx, uuid, value)
 }
 
 /// A schedule as the compiled config has it, comparable with a set's:
@@ -739,17 +583,7 @@ pub fn missed(
 ) -> Vec<String> {
     let modes = Modes::new(out, lock);
     let s = &files.claims.2;
-    let mut sets: BTreeSet<&str> = restored.iter().map(String::as_str).collect();
-    for u in uuids {
-        let target = lock
-            .slug_of(u)
-            .filter(|t| files.block(t).is_some())
-            .map(String::from)
-            .unwrap_or_else(|| edit::slug(u));
-        if let Some(set) = s.claims.get(&target) {
-            sets.insert(set);
-        }
-    }
+    let sets = set_claim::sets_written::<SchedKind>(files, lock, uuids, restored);
     let mut bad = Vec::new();
     for set in sets {
         let Some(cols) = s.sets.get(set).and_then(|l| modes_of(l, &modes).ok()) else {

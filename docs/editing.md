@@ -604,6 +604,18 @@ the set, off gives it a set of its own. *Use the same times as …* claims anoth
 same kind: analog or digital). The Deploy pane counts
 the timers whose switching times are edited and not deployed.
 
+## Shared sets (#73, #74)
+
+Switching times and moods, and the claims #76 (access), #77 (recipients) and #78 (tiles) will add, share one
+shape: a named set, claims on blocks, several blocks per set, one set per block. `set_claim.rs` does what is the
+same for every kind, parameterised by a `SetKind` (its keyword, block type, content as an op carries it, how
+content becomes lines and how lines are checked for each block): resolve the block, choose the set (named, the
+block's own when no other block claims it, else `vx_<name>_<stem>`), write it checked for every claimant (refusing
+one the config lost), claim it, prune, and build `previous` as a whole inverse (`restore` for every other set the
+op rewrote that others still claim). It also builds the section of `GET /api/edits` (`edits_section`: per block
+`set`, its content, `deployed`, `shared`, `pending`; per set its blocks, content and `stale` claimants). The browser's
+Revert sends the deployed set only while no other block claims it, else the deployed content in a set of its own.
+
 ## Lighting moods (#74)
 
 A LightController2's moods are a named `moods` set and the controller's claim. vislox writes both into
@@ -625,10 +637,14 @@ vx_10000040_0000_0400_ffff504f94000001.moods = vx_wohnzimmer_moods
 
 - **Shown from the compiled config.** `objects[…].moods` (`model.rs`, with lox's `moods` codec) has, per
   controller, its circuits (`n`, `kind`, `name`, `used`) and its moods in order (`name`, `sid`, `off`,
-  `required`, each circuit's value and the line's `text`), and `selected`: the scene ids its T5 inputs
-  (`Sel1`…`Sel8`) are wired to select. A circuit's kind is the top four bits of its values, one kind per circuit:
-  `switch` (0: on, off, a percentage), `dimmer` (1: off, a percentage), `rgb` (4), and `colour` or `white` (5, 6:
-  RGB or tunable white; `white` once a mood holds a `temp(…)`); any other is `raw`, kept as stored. `moods_old` is
+  `required` and `role`, each circuit's value and the line's `text`), and `selected`: the scene ids its T5 inputs
+  (`Sel1`…`Sel8`) are wired to select. A circuit's kind is lox's (`Moods::prefixes`: the top four bits of its
+  values, one kind per circuit): `switch` (0: on, off, a percentage), `dimmer` (1: off, a percentage), `rgb` (4),
+  and `colour` or `white` (5, 6: RGB or tunable white; `white` once a mood holds a `temp(…)`); any other is `raw`,
+  kept as stored. A circuit whose moods hold two kinds is `mixed`, and `error` says why: lox refuses to write
+  such moods, so they are not edited here (fix them in Loxone Config). Which moods a set must keep (`required`,
+  `role`: `builtin` or `motion`) is `mood_edit::required`, the one place that rule lives; the browser only shows
+  it. `moods_old` is
   the compared revision's, when the moods differ, and the Changes list has a line per mood in the language's
   terms (`Wohnzimmer · mood "Lesen": AQ1 on, AQ2 80% → AQ1 on, AQ2 40%`, `… added: …`, `… removed (was …)`) and
   one for a new order of the moods both have (the off mood among them). A changed mood list marks its
@@ -658,6 +674,11 @@ vx_10000040_0000_0400_ffff504f94000001.moods = vx_wohnzimmer_moods
   it. The off mood keeps its place: first stays first, last stays last.
 - **Claimed twice** (the module's own file claims the controller too) is mended as for switching times: dropping
   vislox's claim is let through and compiles the module's uncompiled change along.
+- **A claimant the config lost.** When a block that claims a shared set is no longer in the pending config
+  (deleted in Loxone Config), writing the set is refused, naming its UUID, rather than skipping it (lox would
+  fail on the claim later). The op with that UUID and no value drops its stale claim (the one op allowed on a
+  block the config does not have); `GET /api/edits` lists such claimants per set (`stale`), and the browser offers
+  *Drop its claim* beside the set. The same holds for switching times.
 - **Checked after the compile.** The pending config must have, on each controller the request changed and every
   controller sharing its set, exactly the set's moods in order (the off mood aside), each circuit's value as lox
   encodes it; otherwise the edit is refused and the files, lock and out are put back. lox pins the UUIDs of the
@@ -676,7 +697,10 @@ vx_10000040_0000_0400_ffff504f94000001.moods = vx_wohnzimmer_moods
   `name: "Circuit<n>"` (`AQ1` … `AQ5`, lox's `CIRCUIT_PARAMS`; `null` drops it). A circuit whose moods hold colours
   is refused: RGB and tunable-white circuits, and `Circuit6` and above, stay with Loxone Config. lox names the
   circuit after the actuator `AQ<n>` drives and refuses one that drives none; changing the kind clears that
-  circuit's values in every mood, as the editor does.
+  circuit's values in every mood, as the editor does. While vislox claims the controller's moods, the claim
+  writes those values anew on every compile, so the claimed set is checked against the new kind first, for that
+  controller (with no declaration: the kind the base has): `on` on a circuit about to be a dimmer is refused,
+  naming the mood, before lox sees it.
 - **Lint.** `lox logic lint`'s `no-actuator` finding (a percentage on a circuit without an actuator, which the
   Miniserver only switches; lox lints only claimed controllers) names the controller; the browser shows it on the
   circuit its message names.

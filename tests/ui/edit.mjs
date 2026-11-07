@@ -1453,7 +1453,7 @@ try {
     assert.match(body, /AQ3\s*no actuator tunable white/);
     assert.match(body, /Lesen\s*AQ1 on, AQ2 80%\s*T5\/1 selects it/);
     assert.match(body, /Aus\s*every circuit off, always there\s*off mood/);
-    assert.match(body, /Viel Licht\s*all on, AQ2 100%, AQ3 temp\(100%, 2700K\)\s*motion/);
+    assert.match(body, /Viel Licht\s*all on, AQ2 100%, AQ3 temp\(100%, 2700K\)\s*built-in/);
     await page.click(`${sec} [data-mo="open"]`);
     assert.deepEqual(await page.$$eval("[data-mo-name]", (n) => n.map((x) => x.value)), ["Viel Licht", "Lesen", "Kino"]);
     // "Viel Licht" is built in: no Delete, and its name stays.
@@ -1544,6 +1544,10 @@ try {
     assert.deepEqual(await rv({ deployed: { set: "vx_a", moods: M } }, [{ name: "vx_a", controllers: [LC_W] }]), { value: { set: "vx_a", moods: M } });
     assert.deepEqual(await rv({ deployed: { set: "vx_a", moods: M } }, [{ name: "vx_a", controllers: [LC_W, LC_F] }]), { value: { moods: M } });
     assert.match((await rv({ deployed: { set: "vx_a", moods: null } }, [{ name: "vx_a", controllers: [LC_F] }])).why, /Diele claims that set now/);
+    // A claimant the config lost is named, with Drop its claim (the server refuses the set until it goes).
+    const stale = await page.evaluate(() => staleRows({ name: "vx_a", stale: ["10000099-0000-0990-ffff504f94000001"] }, "mo", null).join(""));
+    assert.match(stale, /vx_a is also claimed for 10000099-0000-0990-ffff504f94000001, which this config does not have/);
+    assert.match(stale, /data-mo="dropstale" data-u="10000099-0000-0990-ffff504f94000001"[^>]*>Drop its claim/);
   });
   await step("nothing was deployed: lox only compiled, checked, linted and tested", async () => {
     const ran = readFileSync(calls, "utf8").trim().split("\n");

@@ -100,7 +100,9 @@ published under the same version (see [docker/README.md](docker/README.md)).
   share a set (*Use the same moods as …*, *Change … too*); Undo restores every controller the op changed; Revert
   changes only its own; a controller the module's own file claims is changed there (*Claimed twice*: *Remove
   vislox's claim*). On a controller added or adopted here, a circuit is declared a switch or a dimmer
-  (`Circuit<n>:`). Never deploys.
+  (`Circuit<n>:`), re-checked against the moods vislox claims. A shared set whose other claimant Loxone Config
+  deleted is refused by name, with *Drop its claim* (switching times too). Switching times and moods share one
+  implementation of set claims (`set_claim.rs`), ready for access, recipients and tiles. Never deploys.
 - Fixed: Discard failed when the last commit had no lockfile (the first compile writes one), or one was staged
   but not committed. Discard now reads the last commit, never deletes a lock vislox did not write (one not in git
   goes back to how it was before vislox's first edit), and puts everything back when a step fails.

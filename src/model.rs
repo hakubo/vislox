@@ -290,6 +290,9 @@ pub struct MoodsInfo {
     pub moods: Vec<MoodInfo>,
     /// The scene ids a button selects: `Sel<n>` (T5/n) is wired.
     pub selected: Vec<u32>,
+    /// Why lox cannot write these moods (a circuit with two kinds of
+    /// values, `Moods::prefixes`), so they are not edited here.
+    pub error: Option<String>,
 }
 
 /// One lighting circuit (*Lichtkreis*): the controller's output `AQ<n>`.
@@ -299,8 +302,8 @@ pub struct CircuitInfo {
     /// The values it takes, read off the moods (each circuit stores one kind):
     /// `switch` (on, off, a percentage), `dimmer` (off, a percentage), `rgb`
     /// (off, `rgb(…)`), `colour` (off, `rgb(…)`, `temp(…)`), `white` (the same,
-    /// its moods holding tunable white), or `raw` (a kind Lox Logic does not
-    /// name: kept as stored).
+    /// its moods holding tunable white), `raw` (a kind Lox Logic does not
+    /// name: kept as stored), or `mixed` (its moods disagree: see `error`).
     pub kind: &'static str,
     /// Its name (`NameAI<n-1>=`): the actuator Loxone Config's mood editor
     /// named it after. A circuit without one has no actuator: the Miniserver
@@ -319,8 +322,11 @@ pub struct MoodInfo {
     pub sid: Option<String>,
     /// The off mood ("Aus"): always there, never in a set.
     pub off: bool,
-    /// Why a set must keep it: a built-in mood, or one the motion settings name.
+    /// Why a set must keep it, in words: a built-in mood, or one the motion
+    /// settings name ([`crate::mood_edit::required`]).
     pub required: Option<&'static str>,
+    /// The same as a word: `builtin` or `motion`.
+    pub role: Option<crate::mood_edit::Required>,
     /// Each circuit's value in the language's terms (`on`, `80%`, `rgb(…)`).
     pub values: Vec<String>,
     /// The values as a `moods` line writes them: `all on, AQ2 off`.
@@ -335,11 +341,9 @@ fn moods_info(el: &Element) -> Option<MoodsInfo> {
         return None;
     }
     let m = lm::Moods::read(el)?;
-    let motion: Vec<&str> = el
-        .child_elements()
-        .filter(|c| c.name == "LSConfig")
-        .flat_map(|c| ["OpM", "ScMv"].into_iter().filter_map(|a| c.attr(a)))
-        .collect();
+    // Each circuit's kind as lox reads it: one prefix per circuit across the
+    // moods. A circuit whose moods disagree is one lox refuses to write.
+    let prefixes = m.prefixes();
     let circuits = (0..m.outputs)
         .map(|i| {
             let vals: Vec<MoodValue> = m
@@ -355,18 +359,26 @@ fn moods_info(el: &Element) -> Option<MoodsInfo> {
                 .filter(|x| x.sid.as_deref() != Some("777"))
                 .filter_map(|x| x.qs.get(i))
                 .any(|&q| lm::decode(q) != MoodValue::Off);
-            let prefix = m
-                .moods
-                .first()
-                .and_then(|x| x.qs.get(i))
-                .map_or(0, |q| q >> 28);
+            let prefix = match &prefixes {
+                Ok(p) => p.get(i).copied(),
+                Err(_) => {
+                    let seen: BTreeSet<u32> = m
+                        .moods
+                        .iter()
+                        .filter_map(|x| x.qs.get(i))
+                        .map(|q| q >> 28)
+                        .collect();
+                    (seen.len() <= 1).then(|| seen.into_iter().next().unwrap_or(0))
+                }
+            };
             let kind = match prefix {
-                0 => "switch",
-                1 => "dimmer",
-                4 => "rgb",
-                5 | 6 if vals.iter().any(|v| matches!(v, MoodValue::Temp(..))) => "white",
-                5 | 6 => "colour",
-                _ => "raw",
+                None => "mixed",
+                Some(0) => "switch",
+                Some(1) => "dimmer",
+                Some(4) => "rgb",
+                Some(5 | 6) if vals.iter().any(|v| matches!(v, MoodValue::Temp(..))) => "white",
+                Some(5 | 6) => "colour",
+                Some(_) => "raw",
             };
             CircuitInfo {
                 n: i + 1,
@@ -382,20 +394,13 @@ fn moods_info(el: &Element) -> Option<MoodsInfo> {
         .moods
         .iter()
         .map(|x| {
-            let sid = x.sid.as_deref().unwrap_or("");
+            let req = crate::mood_edit::required(el, x);
             MoodInfo {
                 name: x.name.clone(),
                 sid: x.sid.clone(),
                 off: x.is_off(),
-                required: if x.is_off() {
-                    None
-                } else if ["776", "777"].contains(&sid) {
-                    Some("a built-in mood")
-                } else if motion.contains(&sid) {
-                    Some("named by the motion settings")
-                } else {
-                    None
-                },
+                required: req.map(|r| r.why()),
+                role: req,
                 values: x.qs.iter().map(|&q| lm::decode(q).to_string()).collect(),
                 text: lm::render(&x.qs),
             }
@@ -414,6 +419,7 @@ fn moods_info(el: &Element) -> Option<MoodsInfo> {
         circuits,
         moods,
         selected,
+        error: prefixes.err(),
     })
 }
 
@@ -3631,6 +3637,31 @@ mod tests {
         );
         // Other controllers: unchanged.
         assert_eq!(v.objects[crate::mood_edit::fixture::FLUR].status, "");
+        // The built-in and motion moods, by the one rule the server keeps.
+        let m = v.objects[LICHT].moods.as_ref().unwrap();
+        assert_eq!(m.moods[1].role, Some(crate::mood_edit::Required::Builtin));
+        assert!(m.error.is_none());
+    }
+
+    /// A circuit's kind is lox's (`Moods::prefixes`): one whose moods hold two
+    /// kinds of values is `mixed`, and the controller says why lox cannot
+    /// write its moods; the first mood alone decides nothing (#74).
+    #[test]
+    fn a_circuit_whose_moods_disagree_is_mixed_and_said_so() {
+        use crate::mood_edit::fixture::{LICHT, house};
+        let s = house();
+        // Kino's AQ2 stored as a switch value (prefix 0), the others' as a dimmer's.
+        let kino = s.find("<LightsceneC Name=\"Kino\"").unwrap();
+        let at = kino + s[kino..].find("Q2=\"268435456\"").unwrap();
+        let mut bad = s.clone();
+        bad.replace_range(at..at + "Q2=\"268435456\"".len(), "Q2=\"0\"");
+        let v = build(&doc(&bad), None, "");
+        let m = v.objects[LICHT].moods.as_ref().unwrap();
+        assert_eq!(m.circuits[1].kind, "mixed");
+        assert_eq!(m.circuits[0].kind, "switch");
+        assert_eq!(m.circuits[2].kind, "white");
+        let e = m.error.as_deref().unwrap();
+        assert!(e.contains("AQ2 has two value kinds"), "{e}");
     }
 
     /// The house with users (alice, bob), a group of bob (Bewohner), two

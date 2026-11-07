@@ -3391,6 +3391,7 @@ function seRows(o, row) {
   const title = (u) => { const x = S.view?.objects[u]; return x ? displayTitle(x) : u; };
   if (e?.set) {
     rows.push(`<div class="ed-note">Written by vislox as <span class="mono">${esc(e.set)}</span> in ${esc(S.edits?.file || "")}${e.shared?.length ? `, shared with ${esc(e.shared.map(title).join(", "))}` : ""}.</div>`);
+    rows.push(...staleRows((S.edits?.schedule_sets || []).find((x) => x.name === e.set), "se", mine));
   }
   if (e?.pending) {
     const back = e.deployed ? "Back to the switching times deployed" : "Back to Loxone Config's switching times";
@@ -3551,6 +3552,7 @@ $("props").addEventListener("click", (e) => {
   if (what === "save") return seSave();
   if (what === "revert") return seRevert(S.sel);
   if (what === "drop") return seDrop(S.sel);
+  if (what === "dropstale") { const o = S.view?.objects[S.sel], st = o && seState(o); if (st) seSend(o, st, { op: "schedule", uuid: b.dataset.u, value: null }, "Drop a stale claim on switching times"); return; }
   if (SE.busy || !SE.open) return;
   const c = b.dataset.col ? seCol(b.dataset.col) : seCol(SE.sel);
   if (what === "pick") SE.sel = b.dataset.col;
@@ -3627,6 +3629,12 @@ $("props").addEventListener("pointerdown", (e) => {
   window.addEventListener("pointerup", up);
 });
 
+/** A shared set's claimants the config shown no longer has (deleted in Loxone Config): the server refuses
+ *  to write the set while their claims stand, so each gets *Drop its claim* (`attr`: `se` or `mo`). */
+function staleRows(set, attr, mine) {
+  return (set?.stale || []).map((u) => `<div class="sch-note warn">⚠ ${esc(set.name)} is also claimed for ${esc(u)}, which this config does not have (deleted in Loxone Config?). The set cannot be written until that claim goes. ` +
+    `<button type="button" class="ed-btn small" data-${attr}="dropstale" data-u="${esc(u)}"${mine?.busy ? " disabled" : ""}>Drop its claim</button></div>`);
+}
 // ── lighting moods (#74) ───────────────────────────────────────────────
 // A lighting controller's moods are a Lox Logic `moods` set and the controller's `.moods` claim, written into
 // vislox's file of claims. Properties shows the circuits (AQ1 … AQ18, each of one kind: switch, dimmer, colour or
@@ -3636,8 +3644,10 @@ $("props").addEventListener("pointerdown", (e) => {
 // undone through `undo`.
 const MO = { uuid: null, open: false, rows: [], busy: false, msg: "", err: "", bad: {}, shareAll: true, all: false, extra: new Set(), warned: "" };
 /** What each kind of circuit is called, and the values it takes. */
-const MO_KIND = { switch: "switch", dimmer: "dimmer", rgb: "colour (RGB)", colour: "colour (RGB or tunable white)", white: "tunable white", raw: "a kind Lox Logic does not name" };
-const MO_TAKES = { switch: ["off", "on", "pct"], dimmer: ["off", "pct"], rgb: ["off", "rgb"], colour: ["off", "rgb", "temp"], white: ["off", "temp", "rgb"], raw: ["raw"] };
+const MO_KIND = { switch: "switch", dimmer: "dimmer", rgb: "colour (RGB)", colour: "colour (RGB or tunable white)", white: "tunable white", raw: "a kind Lox Logic does not name", mixed: "two kinds of values" };
+const MO_TAKES = { switch: ["off", "on", "pct"], dimmer: ["off", "pct"], rgb: ["off", "rgb"], colour: ["off", "rgb", "temp"], white: ["off", "temp", "rgb"], raw: ["raw"], mixed: ["raw"] };
+/** The tag of a mood a set must keep, from the server's one rule (`role`). */
+const MO_ROLE = { builtin: "built-in", motion: "motion settings" };
 const MO_T = { off: "off", on: "on", pct: "%", rgb: "rgb", temp: "white", raw: "as stored" };
 const MO_HINT = { pct: "0 to 100", rgb: "red, green, blue: 0 to 100 each", temp: "brightness %, Kelvin", raw: "the stored number" };
 /** What `GET /api/edits` says of this controller's moods (#74), or null. */
@@ -3665,7 +3675,7 @@ function moValue(c) {
 }
 /** Whether this controller's moods can be edited here now: `{ ok, rev }`, or null (nothing to edit). */
 function moState(o) {
-  if (o.ty !== "LightController2" || !o.moods) return null;
+  if (o.ty !== "LightController2" || !o.moods || o.moods.error) return null;
   const st = editState(o);
   return st?.ok ? st : null;
 }
@@ -3708,13 +3718,18 @@ function moRows(o, row, marks) {
     const lint = moLint(o.uuid, c.n);
     // A controller added or adopted here declares its switch and dimmer circuits (Circuit1 … Circuit5); colour
     // circuits and the rest stay with Loxone Config.
+    // With vislox's moods claim, the claim writes the circuit's values anew, so they must fit the new kind.
+    const tip = e?.set
+      ? `Declares Circuit${c.n} in the block's declaration. The moods vislox claims (${e.set}) write this circuit's values on every compile, so they must fit the new kind: change them in Edit moods first`
+      : `Declares Circuit${c.n} in the block's declaration; changing it clears the circuit's values in every mood, as Loxone Config's mood editor does`;
     const decl = managed && c.n <= 5 && (c.kind === "switch" || c.kind === "dimmer")
-      ? ` <select class="mo-decl" data-mo="circuit" data-n="${c.n}" aria-label="AQ${c.n} is a" title="Declares Circuit${c.n} in the block's declaration; changing it clears the circuit's values, as Loxone Config's mood editor does"${S.edit.busy ? " disabled" : ""}>${["switch", "dimmer"].map((k) => `<option${k === c.kind ? " selected" : ""}>${k}</option>`).join("")}</select>`
+      ? ` <select class="mo-decl" data-mo="circuit" data-n="${c.n}" aria-label="AQ${c.n} is a" title="${esc(tip)}"${S.edit.busy ? " disabled" : ""}>${["switch", "dimmer"].map((k) => `<option${k === c.kind ? " selected" : ""}>${k}</option>`).join("")}</select>`
       : "";
     return row(`AQ${c.n}`, `${c.name ? esc(c.name) : '<span class="none-v">no actuator</span>'} <span class="mo-kind">${esc(MO_KIND[c.kind])}</span>${decl}` +
       lint.map((f) => `<div class="ed-note lt-note">⚠ Lint (no-actuator${f.file ? `, ${esc(checkAt(f))}` : ""}): ${esc(f.message)}</div>`).join(""), lint.length ? "pr-chg" : "");
   });
   rows.push(`<div class="mo-sub">Circuits</div>`, ...circ);
+  if (mi.error) rows.push(`<div class="sch-note warn">⚠ lox cannot write these moods: ${esc(mi.error)}</div>`);
   if (circuits.length < mi.circuits.length) rows.push(`<div class="ed-bar"><button type="button" class="ed-btn small" data-mo="all">${MO.all ? "Show the circuits in use" : `Show all ${mi.circuits.length} circuits`}</button></div>`);
   // The claim: vislox's set, or the rest of the module's.
   const other = claimsOf(o.uuid).find((c) => c.kind === "moods" && !c.file.startsWith(`${S.edits?.dir}/`));
@@ -3727,6 +3742,7 @@ function moRows(o, row, marks) {
     } else rows.push(`<div class="ed-note">${esc(at)} claims its moods: change them there.</div>`);
   } else if (e?.set && st) {
     rows.push(`<div class="ed-note">Written by vislox as <span class="mono">${esc(e.set)}</span> in ${esc(S.edits?.file || "")}${e.shared?.length ? `, shared with ${esc(e.shared.map(title).join(", "))}` : ""}.</div>`);
+    rows.push(...staleRows((S.edits?.mood_sets || []).find((x) => x.name === e.set), "mo", mine));
   }
   if (e?.pending && st && !other) {
     const back = e.deployed ? "Back to the moods deployed" : "Back to Loxone Config's moods";
@@ -3740,7 +3756,7 @@ function moRows(o, row, marks) {
     rows.push(`<div class="mo-sub">Moods</div>`);
     for (const m of mi.moods) {
       const was = oldOf(m.name), btn = moButton(mi, m.sid);
-      const tags = [m.off ? "off mood" : "", m.required ? (m.sid === "777" ? "motion" : m.required === "a built-in mood" ? "built-in" : "motion settings") : "", btn ? `${btn} selects it` : ""].filter(Boolean);
+      const tags = [m.off ? "off mood" : "", MO_ROLE[m.role] || "", btn ? `${btn} selects it` : ""].filter(Boolean);
       const v = m.off ? '<span class="none-v">every circuit off, always there</span>' : old && !was ? `<span class="new">${esc(m.text)}</span>` : was && was.text !== m.text ? `<span class="old">${esc(was.text)}</span><span class="new">${esc(m.text)}</span>` : esc(m.text);
       rows.push(row(m.name, `${v}${tags.map((t) => ` <span class="mo-tag">${esc(t)}</span>`).join("")}`, old && (!was || was.text !== m.text) ? "pr-chg" : ""));
     }
@@ -3886,6 +3902,7 @@ $("props").addEventListener("click", (e) => {
   if (what === "save") return moSave();
   if (what === "revert") return moRevert(S.sel);
   if (what === "drop") { const st = moState(o); if (st) moSend(o, st, { op: "moods", uuid: o.uuid, value: null }, `Remove vislox's claim on the moods of ${displayTitle(o)}`); return; }
+  if (what === "dropstale") { const st = moState(o); if (st) moSend(o, st, { op: "moods", uuid: b.dataset.u, value: null }, "Drop a stale claim on moods"); return; }
   if (MO.busy || !MO.open) return;
   const i = +b.dataset.i;
   if (what === "add") {

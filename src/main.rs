@@ -33,6 +33,7 @@ mod running;
 mod sched_edit;
 mod schedule;
 mod session;
+mod set_claim;
 mod source;
 mod structure;
 mod tls;

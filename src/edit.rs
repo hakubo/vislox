@@ -2866,6 +2866,27 @@ fn edit_new_block(
         .ok_or_else(|| format!("no object {uuid} in the pending config"))?;
     let name = el.attr_decoded("Title").unwrap_or_default().into_owned();
     let caps = caps(el).unwrap_or_default();
+    // A circuit of a controller whose moods vislox claims (#74): the claimed
+    // set writes the circuit's values anew, so they must fit its new kind.
+    if let Op::Setting {
+        name: setting,
+        value,
+        ..
+    } = op
+        && let Some(n) = connectors::circuit_param(el.attr("Type").unwrap_or(""), setting)
+        && let Some(set) = files.claims.3.claims.get(slug)
+        && let Some(lines) = files.claims.3.sets.get(set)
+    {
+        crate::mood_edit::circuit_against_set(
+            el,
+            find(&ctx.base.xml.root, uuid),
+            n,
+            value.as_deref().map(str::trim),
+            set,
+            lines,
+        )
+        .map_err(|e| format!("{name}: {e}"))?;
+    }
     let b = files.block_mut(slug).expect("checked");
     match op {
         Op::Title { value, .. } => {
@@ -5613,7 +5634,7 @@ mod tests {
         assert_eq!(files.claims.3.sets.len(), 2);
         assert_eq!(files.claims.3.claims[&slug(FLUR)], "vx_flur_moods");
         // A mood set and a schedule set share one namespace.
-        assert!(crate::sched_edit::taken(&files, &ctx, "vx_flur_moods"));
+        assert!(crate::set_claim::taken(&files, &ctx, "vx_flur_moods"));
     }
 
     #[test]
@@ -5711,5 +5732,159 @@ mod tests {
         )
         .unwrap_err();
         assert!(e.contains("\"switch\" or \"dimmer\""), "{e}");
+    }
+
+    /// Changing a circuit's kind on a controller whose moods vislox claims
+    /// re-checks the claimed set: a value the new kind does not take is
+    /// refused up front, naming the mood, not by lox's compile (#74).
+    #[test]
+    fn a_circuit_kind_the_claimed_moods_do_not_fit_is_refused() {
+        let d = LoxoneDoc::parse(crate::mood_edit::fixture::house().as_bytes()).unwrap();
+        let mut files = Files::default();
+        let mut l = Lockfile::default();
+        let (names, claimed) = (BTreeSet::new(), BTreeMap::new());
+        let lock0 = lock_of(&l);
+        let ctx = mood_ctx(&d, &lock0, &names, &claimed);
+        apply_op(
+            &mut files,
+            &ctx,
+            &add(OG, "LightController2", Some("Neu"), &[], &[]),
+        )
+        .unwrap();
+        let out = compile_files(&d, &files, &mut l).unwrap();
+        let lock = lock_of(&l);
+        let uuid = l
+            .objects
+            .iter()
+            .find(|(s, _)| s.starts_with("vx_lightcontroller2"))
+            .map(|(_, o)| o.uuid.clone())
+            .unwrap();
+        let ctx = Ctx {
+            doc: &out,
+            ..mood_ctx(&d, &lock, &names, &claimed)
+        };
+        // Its moods claimed: AQ1 on (a switch's value), AQ2 40%.
+        apply_op(
+            &mut files,
+            &ctx,
+            &moods_op(&uuid, None, &[("Viel Licht", "AQ1 on, AQ2 40%")]),
+        )
+        .unwrap();
+        let out = compile_files(&d, &files, &mut l).unwrap();
+        let ctx = Ctx {
+            doc: &out,
+            ..mood_ctx(&d, &lock, &names, &claimed)
+        };
+        let set = |n: &str, v: &str| Op::Setting {
+            uuid: uuid.clone(),
+            name: n.into(),
+            value: Some(v.into()),
+        };
+        let e = apply_op(&mut files.clone(), &ctx, &set("Circuit1", "dimmer")).unwrap_err();
+        assert!(
+            e.contains("do not fit AQ1 as a dimmer")
+                && e.contains("mood \"Viel Licht\": AQ1 is `on`")
+                && e.contains("Edit moods"),
+            "{e}"
+        );
+        // A dimmer takes the 40% on AQ2; the claim stays.
+        apply_op(&mut files, &ctx, &set("Circuit2", "dimmer")).unwrap();
+        assert_eq!(files.claims.3.claims.len(), 1);
+        // Not claimed: nothing to re-check.
+        let mut free = files.clone();
+        apply_op(
+            &mut free,
+            &ctx,
+            &Op::Moods {
+                uuid: uuid.clone(),
+                value: None,
+            },
+        )
+        .unwrap();
+        apply_op(&mut free, &ctx, &set("Circuit1", "dimmer")).unwrap();
+    }
+
+    /// A claimant of a shared set that the pending config lost (deleted in
+    /// Loxone Config) is refused by name, not skipped; its stale claim is
+    /// dropped with the op and no value (#74).
+    #[test]
+    fn a_shared_set_whose_claimant_is_gone_is_refused_until_its_claim_is_dropped() {
+        use crate::mood_edit::fixture::{FLUR, LICHT};
+        let full = crate::mood_edit::fixture::house();
+        let d = LoxoneDoc::parse(full.as_bytes()).unwrap();
+        let (names, claimed) = (BTreeSet::new(), BTreeMap::new());
+        let lock = Lock::default();
+        let ctx = mood_ctx(&d, &lock, &names, &claimed);
+        let mut files = Files::default();
+        apply_op(
+            &mut files,
+            &ctx,
+            &moods_op(LICHT, None, &[("Viel Licht", "all on")]),
+        )
+        .unwrap();
+        apply_op(
+            &mut files,
+            &ctx,
+            &moods_op(FLUR, Some("vx_licht_moods"), &[]),
+        )
+        .unwrap();
+        // Flur deleted in Loxone Config.
+        let a = full
+            .find(&format!(
+                "<C Type=\"LightController2\" V=\"178\" U=\"{FLUR}\""
+            ))
+            .unwrap();
+        let b = a + full[a..].find("</C>\n").unwrap() + 5;
+        let gone = LoxoneDoc::parse(format!("{}{}", &full[..a], &full[b..]).as_bytes()).unwrap();
+        let ctx = mood_ctx(&gone, &lock, &names, &claimed);
+        let e = apply_op(
+            &mut files.clone(),
+            &ctx,
+            &moods_op(LICHT, Some("vx_licht_moods"), &[("Viel Licht", "AQ1 on")]),
+        )
+        .unwrap_err();
+        assert!(
+            e.contains(&format!(
+                "also claimed for {FLUR}, which the pending config does not have"
+            )) && e.contains("drop that stale claim"),
+            "{e}"
+        );
+        // The section of GET /api/edits names it.
+        let (_, sets) = crate::set_claim::edits_section::<crate::mood_edit::MoodKind>(
+            &files,
+            &Files::default(),
+            &lock,
+            Some(&gone),
+            None,
+            crate::mood_edit::differs,
+        );
+        assert_eq!(sets[0]["stale"], serde_json::json!([FLUR]));
+        // Dropped, Licht's set is written again.
+        apply_op(
+            &mut files,
+            &ctx,
+            &Op::Moods {
+                uuid: FLUR.into(),
+                value: None,
+            },
+        )
+        .unwrap();
+        apply_op(
+            &mut files,
+            &ctx,
+            &moods_op(LICHT, Some("vx_licht_moods"), &[("Viel Licht", "AQ1 on")]),
+        )
+        .unwrap();
+        assert_eq!(files.claims.3.claimants("vx_licht_moods"), [slug(LICHT)]);
+        // A block the config does not have takes no new claim.
+        assert!(
+            apply_op(
+                &mut files,
+                &ctx,
+                &moods_op(FLUR, None, &[("Viel Licht", "")])
+            )
+            .unwrap_err()
+            .contains("no object")
+        );
     }
 }

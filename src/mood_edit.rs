@@ -33,7 +33,8 @@
 //! An op gives each mood its name and its circuit values in the language's
 //! terms (`AQ1 80%, AQ3 on`), parsed with lox's own parser.
 
-use crate::edit::{self, Applied, Ctx, Files, Lock};
+use crate::edit::{self, Applied, Claims, Ctx, Files, Lock};
+use crate::set_claim;
 use loxone_config::LoxoneDoc;
 use loxone_config::logic::{Item, Module, MoodLine, MoodSetting};
 use loxone_config::moods::{MoodValue, Moods, OFF_SID, encode};
@@ -48,6 +49,47 @@ const MAX_MOODS: usize = 64;
 /// The built-in moods a set must keep: the alarm-clock mood and "Viel
 /// Licht", the motion mood.
 const BUILTIN_SIDS: [&str; 2] = ["776", "777"];
+
+/// Why a controller cannot lose a mood (lox refuses a set without it). The
+/// one place this rule lives: Properties and the browser get it from here.
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Required {
+    /// The alarm-clock mood (776) or "Viel Licht" (777).
+    Builtin,
+    /// The controller's motion settings name it (`<LSConfig OpM= ScMv=>`).
+    Motion,
+}
+
+impl Required {
+    /// The reason, in a sentence: *mood "X" is …*.
+    pub fn why(self) -> &'static str {
+        match self {
+            Required::Builtin => "a built-in mood",
+            Required::Motion => "named by the motion settings",
+        }
+    }
+}
+
+/// Why the controller `el` cannot lose mood `m`, if it cannot. Never the off
+/// mood, which is never in a set at all.
+pub fn required(el: &Element, m: &loxone_config::moods::Mood) -> Option<Required> {
+    let sid = m.sid.as_deref().unwrap_or("");
+    if m.is_off() {
+        None
+    } else if BUILTIN_SIDS.contains(&sid) {
+        Some(Required::Builtin)
+    } else if el
+        .child_elements()
+        .filter(|c| c.name == "LSConfig")
+        .flat_map(|c| ["OpM", "ScMv"].into_iter().filter_map(|a| c.attr(a)))
+        .any(|a| a == sid)
+    {
+        Some(Required::Motion)
+    } else {
+        None
+    }
+}
 
 /// One mood, as an op carries it: its name and its circuit values in the
 /// language's terms (`all on, AQ2 off`, `AQ1 80%, AQ4 rgb(100, 50, 0)`;
@@ -83,58 +125,81 @@ pub struct MoodsVal {
     pub restore: BTreeMap<String, Vec<MoodRow>>,
 }
 
-/// The mood sets and claims of vislox's file of claims.
-#[derive(Default, Clone, PartialEq, Debug)]
-pub struct MoodSets {
-    /// Set name → its moods, as lox reads them.
-    pub sets: BTreeMap<String, Vec<MoodLine>>,
-    /// The slug of a controller (an extern of the file, or a block of
-    /// vislox's files) → the set it claims.
-    pub claims: BTreeMap<String, String>,
-}
+/// The lighting moods vislox's file writes: its `moods` sets and claims.
+pub type MoodSets = set_claim::SetStore<MoodKind>;
 
-impl MoodSets {
-    pub fn is_empty(&self) -> bool {
-        self.sets.is_empty() && self.claims.is_empty()
+/// Lighting moods as a kind of set claim ([`set_claim`]).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MoodKind;
+
+impl set_claim::SetKind for MoodKind {
+    type Line = MoodLine;
+    type Content = Vec<MoodRow>;
+    type Val = MoodsVal;
+    const KEYWORD: &'static str = "moods";
+    const BLOCK: &'static str = "LightController2";
+    const WHAT: &'static str = "moods";
+    const STEM: &'static str = "moods";
+    const HEADER: &'static str = "# Lighting moods edited in vislox. A claim makes the set the controller's whole mood\n\
+         # list (its off mood aside); deleting it leaves the moods as last written.\n";
+    const CONTENT_KEY: &'static str = "moods";
+    const MEMBERS_KEY: &'static str = "controllers";
+
+    fn store(c: &Claims) -> &MoodSets {
+        &c.3
     }
-
-    /// The controllers that claim `set`.
-    pub fn claimants(&self, set: &str) -> Vec<&str> {
-        self.claims
-            .iter()
-            .filter(|(_, s)| s.as_str() == set)
-            .map(|(t, _)| t.as_str())
-            .collect()
+    fn store_mut(c: &mut Claims) -> &mut MoodSets {
+        &mut c.3
     }
-
-    /// Drop the sets no controller claims.
-    pub fn prune(&mut self) {
-        let used: BTreeSet<String> = self.claims.values().cloned().collect();
-        self.sets.retain(|s, _| used.contains(s));
+    fn claimed_elsewhere<'a>(ctx: &'a Ctx) -> &'a BTreeMap<String, String> {
+        ctx.moods_claimed
     }
-
-    /// The sets, then the claims, as the file has them.
-    pub fn render(&self) -> String {
-        let mut out = String::new();
-        if self.is_empty() {
-            return out;
+    fn wrong_type(name: &str) -> String {
+        format!("{name}: only a lighting controller's moods are written in Lox Logic")
+    }
+    fn parts(v: &MoodsVal) -> set_claim::Parts<'_, Self> {
+        (v.set.as_ref(), v.moods.as_ref(), &v.restore)
+    }
+    fn make(
+        set: Option<String>,
+        moods: Option<Vec<MoodRow>>,
+        restore: BTreeMap<String, Vec<MoodRow>>,
+    ) -> MoodsVal {
+        MoodsVal {
+            set,
+            moods,
+            restore,
         }
-        out.push_str(
-            "\n# Lighting moods edited in vislox. A claim makes the set the controller's whole mood\n\
-             # list (its off mood aside); deleting it leaves the moods as last written.\n",
-        );
-        for (name, lines) in &self.sets {
-            out.push_str(&format!("moods {name}\n"));
-            for l in lines {
-                out.push_str(&format!("\t{l}\n"));
-            }
-            out.push_str("end\n");
+    }
+    fn content_of(lines: &[MoodLine], _: &LoxoneDoc, _: &Lock) -> Option<Vec<MoodRow>> {
+        Some(rows_of(lines))
+    }
+    fn lines_of(
+        rows: &Vec<MoodRow>,
+        _: &Ctx,
+        _: &[(String, &Element)],
+    ) -> Result<Vec<MoodLine>, String> {
+        lines_of(rows)
+    }
+    /// Every controller on the set: its off mood never in it, the moods it
+    /// cannot lose kept, each circuit a value it takes.
+    fn check(
+        lines: &[MoodLine],
+        _: &Ctx,
+        set: &str,
+        lcs: &[(String, &Element)],
+    ) -> Result<(), String> {
+        for (_, e) in lcs {
+            let c = Controller::read(e)?;
+            c.check(lines).map_err(|err| {
+                if lcs.len() > 1 {
+                    format!("{} (sharing `{set}`): {err}", c.title)
+                } else {
+                    format!("{}: {err}", c.title)
+                }
+            })?;
         }
-        out.push('\n');
-        for (t, s) in &self.claims {
-            out.push_str(&format!("{t}.moods = {s}\n"));
-        }
-        out
+        Ok(())
     }
 }
 
@@ -218,9 +283,13 @@ pub fn lines_of(rows: &[MoodRow]) -> Result<Vec<MoodLine>, String> {
     Ok(out)
 }
 
-/// lox's parse error without its position prefix.
+/// lox's parse error without its position prefix (`Lox Logic parse error at
+/// line 2: `): the line is vislox's wrapper's, not the user's.
 fn short(e: &str) -> String {
-    e.rsplit_once(": ").map_or(e, |(_, m)| m).to_string()
+    e.strip_prefix("Lox Logic parse error at ")
+        .and_then(|r| r.split_once(": "))
+        .map_or(e, |(_, m)| m)
+        .to_string()
 }
 
 /// A controller's moods as the editor needs them.
@@ -259,21 +328,11 @@ impl Controller {
             ],
         });
         let prefixes = moods.prefixes().map_err(|e| format!("{title}: {e}"))?;
-        let motion: BTreeSet<String> = el
-            .child_elements()
-            .filter(|c| c.name == "LSConfig")
-            .flat_map(|c| ["OpM", "ScMv"].into_iter().filter_map(|a| c.attr(a)))
-            .map(String::from)
+        let required = moods
+            .moods
+            .iter()
+            .filter_map(|m| Some((m.name.clone(), required(el, m)?.why())))
             .collect();
-        let mut required = Vec::new();
-        for m in moods.moods.iter().filter(|m| !m.is_off()) {
-            let sid = m.sid.as_deref().unwrap_or("");
-            if BUILTIN_SIDS.contains(&sid) {
-                required.push((m.name.clone(), "a built-in mood"));
-            } else if motion.contains(sid) {
-                required.push((m.name.clone(), "named by the motion settings"));
-            }
-        }
         let off = moods
             .moods
             .iter()
@@ -351,61 +410,6 @@ impl Controller {
     }
 }
 
-/// What `files` give the controller `target`: its set and the set's moods.
-pub fn current(files: &Files, target: &str) -> Option<MoodsVal> {
-    let s = &files.claims.3;
-    let set = s.claims.get(target)?;
-    Some(MoodsVal {
-        set: Some(set.clone()),
-        moods: s.sets.get(set).map(|l| rows_of(l)),
-        restore: BTreeMap::new(),
-    })
-}
-
-/// Write `rows` into vislox's set `set`, checked for every controller that
-/// claims it (and `also`, about to claim it).
-fn write_set(
-    files: &mut Files,
-    ctx: &Ctx,
-    set: &str,
-    rows: Option<&[MoodRow]>,
-    also: Option<(&str, &Element)>,
-) -> Result<(), String> {
-    let mut lcs: Vec<&Element> = also.map(|(_, e)| e).into_iter().collect();
-    for t in files.claims.3.claimants(set) {
-        if also.is_some_and(|(a, _)| a == t) {
-            continue;
-        }
-        if let Some(u) = crate::sched_edit::timer_of(files, ctx.lock, t)
-            && let Some(e) = edit::find(&ctx.doc.xml.root, &u)
-        {
-            lcs.push(e);
-        }
-    }
-    if let Some(rows) = rows {
-        let lines = lines_of(rows)?;
-        files.claims.3.sets.insert(set.to_string(), lines);
-    }
-    let lines = files
-        .claims
-        .3
-        .sets
-        .get(set)
-        .ok_or_else(|| format!("vislox has no mood set `{set}`; give the moods"))?;
-    let shared = lcs.len() > 1;
-    for e in lcs {
-        let c = Controller::read(e)?;
-        c.check(lines).map_err(|err| {
-            if shared {
-                format!("{} (sharing `{set}`): {err}", c.title)
-            } else {
-                format!("{}: {err}", c.title)
-            }
-        })?;
-    }
-    Ok(())
-}
-
 /// Apply a `moods` op: give the LightController2 `uuid` the moods `value`,
 /// or drop vislox's claim on them (`None`). Its `previous` undoes it whole:
 /// the controller's claim as it was, and the moods of every other
@@ -416,107 +420,7 @@ pub fn apply(
     uuid: &str,
     value: Option<&MoodsVal>,
 ) -> Result<Applied, String> {
-    let el = edit::find(&ctx.doc.xml.root, uuid)
-        .ok_or_else(|| format!("no object {uuid} in the pending config"))?;
-    let name = el.attr_decoded("Title").unwrap_or_default().into_owned();
-    if el.attr("Type") != Some("LightController2") {
-        return Err(format!(
-            "{name}: only a lighting controller's moods are written in Lox Logic"
-        ));
-    }
-    let target = match ctx.lock.slug_of(uuid) {
-        Some(s) if files.block(s).is_some() => s.to_string(),
-        Some(_) => {
-            return Err(format!(
-                "{name}: the module manages this block; change its moods in its .loxl file"
-            ));
-        }
-        None => edit::slug(uuid),
-    };
-    let before = files.claims.3.clone();
-    let mut previous = current(files, &target);
-    if let Some(v) = value {
-        for (set, rows) in &v.restore {
-            if !files.claims.3.sets.contains_key(set) {
-                return Err(format!(
-                    "{name}: vislox's mood set `{set}` is gone; its moods cannot be put back"
-                ));
-            }
-            write_set(files, ctx, set, Some(rows), None)?;
-        }
-    }
-    match value {
-        Some(v) if v.set.is_some() || v.moods.is_some() => {
-            // A controller takes one mood list. Dropping vislox's claim is
-            // always let through: it is how one the module claims too is mended.
-            if let Some(at) = ctx.moods_claimed.get(&uuid.to_ascii_lowercase()) {
-                return Err(format!(
-                    "{name}: {at} claims its moods; change them there (a controller takes one mood \
-                     list)"
-                ));
-            }
-            let s = &files.claims.3;
-            let set = match &v.set {
-                Some(n) => n.trim().to_string(),
-                None => match s.claims.get(&target) {
-                    Some(own) if s.claimants(own) == [target.as_str()] => own.clone(),
-                    _ => crate::adopt::default_slug(
-                        &format!("{name} moods"),
-                        "LightController2",
-                        &|x| crate::sched_edit::taken(files, ctx, x),
-                    ),
-                },
-            };
-            if !s.sets.contains_key(&set) {
-                crate::adopt::check_slug(&set).map_err(|e| format!("The set's name: {e}"))?;
-                if crate::sched_edit::taken(files, ctx, &set) {
-                    return Err(format!(
-                        "The set's name: `{set}` is taken in the module; pick another"
-                    ));
-                }
-                if v.moods.is_none() {
-                    return Err(format!(
-                        "{name}: vislox has no mood set `{set}`; give the moods"
-                    ));
-                }
-            }
-            write_set(files, ctx, &set, v.moods.as_deref(), Some((&target, el))).map_err(|e| {
-                if e.starts_with(&name) {
-                    e
-                } else {
-                    format!("{name}: {e}")
-                }
-            })?;
-            files.claims.3.claims.insert(target.clone(), set.clone());
-            if target == edit::slug(uuid) {
-                let c = files.claims.0.entry(uuid.to_string()).or_default();
-                c.ty = "LightController2".into();
-            }
-        }
-        _ => {
-            files.claims.3.claims.remove(&target);
-        }
-    }
-    files.claims.3.prune();
-    files.claims.prune();
-    // The sets the op rewrote that other controllers still claim: their old
-    // moods go into the undo, unless the undo's own set has them.
-    let mut restore = BTreeMap::new();
-    for (set, lines) in &before.sets {
-        let now = files.claims.3.sets.get(set);
-        let others = files.claims.3.claimants(set).iter().any(|t| *t != target);
-        let own = previous.as_ref().and_then(|p| p.set.as_ref()) == Some(set);
-        if now.is_some_and(|n| n != lines) && others && !own {
-            restore.insert(set.clone(), rows_of(lines));
-        }
-    }
-    if !restore.is_empty() {
-        previous.get_or_insert_with(MoodsVal::default).restore = restore;
-    }
-    Ok(Applied {
-        previous: serde_json::json!(previous),
-        added: None,
-    })
+    set_claim::apply::<MoodKind>(files, ctx, uuid, value)
 }
 
 /// A controller's moods as the compiled config has them, but the off mood:
@@ -543,24 +447,14 @@ pub fn missed(
     restored: &[String],
 ) -> Vec<String> {
     let s = &files.claims.3;
-    let mut sets: BTreeSet<&str> = restored.iter().map(String::as_str).collect();
-    for u in uuids {
-        let target = lock
-            .slug_of(u)
-            .filter(|t| files.block(t).is_some())
-            .map(String::from)
-            .unwrap_or_else(|| edit::slug(u));
-        if let Some(set) = s.claims.get(&target) {
-            sets.insert(set);
-        }
-    }
+    let sets = set_claim::sets_written::<MoodKind>(files, lock, uuids, restored);
     let mut bad = Vec::new();
     for set in sets {
         let Some(lines) = s.sets.get(set) else {
             continue;
         };
         for t in s.claimants(set) {
-            let Some(u) = crate::sched_edit::timer_of(files, lock, t) else {
+            let Some(u) = set_claim::member_of(files, lock, t) else {
                 continue;
             };
             let Some(el) = edit::find(&out.xml.root, &u) else {
@@ -608,6 +502,47 @@ pub fn circuit_setting(el: &Element, setting: &str, value: &str) -> Result<(), S
     Ok(())
 }
 
+/// Whether the moods set `set` (`lines`), which vislox claims for the
+/// controller `el`, still fits circuit `AQ<n>` once `Circuit<n>:` is `value`
+/// (`None`: no declaration, so the kind `base` has, if it has the
+/// controller). The claim writes the circuit's values anew on every compile,
+/// so a value the new kind does not take would make lox refuse the compile.
+pub fn circuit_against_set(
+    el: &Element,
+    base: Option<&Element>,
+    n: usize,
+    value: Option<&str>,
+    set: &str,
+    lines: &[MoodLine],
+) -> Result<(), String> {
+    let mut c = Controller::read(el)?;
+    let prefix = match value {
+        Some(v) => loxone_config::connectors::CIRCUIT_KINDS
+            .iter()
+            .find(|(k, _)| *k == v)
+            .map(|(_, p)| *p),
+        None => base
+            .and_then(|b| Controller::read(b).ok())
+            .and_then(|b| b.prefixes.get(n - 1).copied()),
+    };
+    let (Some(prefix), Some(slot)) = (prefix, c.prefixes.get_mut(n - 1)) else {
+        return Ok(());
+    };
+    *slot = prefix;
+    let kind = if prefix == 1 { "dimmer" } else { "switch" };
+    c.check(lines).map_err(|e| {
+        format!(
+            "the moods vislox claims (`{set}`) do not fit AQ{n} as a {kind}: {e}. Change those \
+             values in Edit moods first (a {kind} takes {}), or Revert the moods",
+            if prefix == 1 {
+                "off or a percentage"
+            } else {
+                "on, off or a percentage"
+            }
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -645,7 +580,13 @@ mod tests {
                 .unwrap_err()
                 .contains("two moods")
         );
-        assert!(lines_of(&[row("A", "AQ1 bright")]).is_err());
+        // lox's message, with the mood it is about and without the wrapper's line.
+        let e = lines_of(&[row("A", "AQ1 bright")]).unwrap_err();
+        assert!(
+            e.starts_with("mood \"A\": `AQ1 bright`: expected a value. A mood is `\"<name>\": all"),
+            "{e}"
+        );
+        assert!(!e.contains("line 2"), "{e}");
         assert!(lines_of(&[row("A", "AQ1 on # x")]).is_err());
         assert!(
             lines_of(&[row("A", "AQ1 on, AQ1 off")])
