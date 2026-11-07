@@ -188,6 +188,19 @@ for (const f of fs.existsSync("pages/vislox") ? fs.readdirSync("pages/vislox") :
 }
 // The blocks the rest of the module manages stay in the lock, with the titles their files give them.
 for (const [s, o] of Object.entries(lock.objects)) if (!s.startsWith("vx_")) objects[s] = o;
+// The module's own files declare \`flur\`. When they no longer do, the compile is refused while the lock manages
+// it (#70), unless removals are allowed: then the lock forgets it, with a tombstone, and the config loses it.
+let removed = lock.removed;
+if (objects.flur && !own().some(([, lines]) => lines.some((l) => /^flur = /.test(l)))) {
+  if (!process.argv.includes("--allow-removals")) {
+    console.error("error: compile error: managed block \`flur\` is in the lockfile but not in the source. To delete it, add \`removed flur\` (or pass --allow-removals); to rename it, add \`moved flur -> <new_slug>\`.");
+    process.exit(1);
+  }
+  removed = { ...removed, [objects.flur.uuid]: { slug: "flur", type: "And" } };
+  const i = out.findIndex((l) => l.includes(\`U="\${objects.flur.uuid}"\`));
+  out.splice(i, out.findIndex((l, n) => n > i && l.trim() === "</C>") - i + 1);
+  delete objects.flur;
+}
 for (const [, lines] of own()) for (const line of lines) {
   const m = line.match(/^(\\w+) = \\w+\\("(.*)"\\)$/), o = m && objects[m[1]];
   const i = o ? out.findIndex((l) => l.includes(\`U="\${o.uuid}"\`)) : -1;
@@ -228,7 +241,7 @@ for (const line of src.split("\\n")) {
   const srcU = out[from].match(/U="([^"]+)"/)[1];
   out[to] = out[to].replace(/\\/>$/, \`><In Input="\${srcU}"/></Co>\`);
 }
-fs.writeFileSync(lockFile, JSON.stringify({ objects }));
+fs.writeFileSync(lockFile, JSON.stringify(removed ? { objects, removed } : { objects }));
 if (lockAt < 0) fs.writeFileSync(mintFile, String(n));
 const to = process.argv.indexOf("--out");
 fs.writeFileSync(to > 0 ? process.argv[to + 1] : "out.Loxone", out.join("\\n"));
@@ -1014,6 +1027,39 @@ try {
     assert.equal(readFileSync(flur, "utf8"), was);
     // No tests: the box goes.
     await page.waitForSelector("#deploy-tests.hidden", { state: "attached", timeout: 15000 });
+  });
+  await step("a block the module lost: the Deploy pane says so, and its removal is reviewed before Apply (#70)", async () => {
+    const flur = join(dir, "pages", "flur.loxl"), was = readFileSync(flur, "utf8");
+    const lockWas = readFileSync(join(dir, "logic.lock.json"), "utf8"), outWas = readFileSync(join(dir, "out.Loxone"), "utf8");
+    writeFileSync(flur, was.replace('flur = And("Flur")\n', ""));
+    await waitText("#deploy-check", /The module no longer has managed blocks: lox deletes them only when you allow it/);
+    assert.match(await page.textContent("#deploy-check"), /flur is in the lockfile but not in the source/);
+    // Apply is on: it asks for exactly these removals first.
+    assert.equal(await page.evaluate(() => document.querySelector("#btn-apply").disabled), false);
+    await page.click("#btn-removals");
+    // What Apply would deploy, compared with what runs, and the block: where it is and what is wired to it.
+    await page.waitForSelector(".hrev.k-removals.sel");
+    await waitText("#deploy-check", /Flur \(And, flur\) on page "Obergeschoss": nothing wired/);
+    await page.waitForFunction(() => S.viewRev === S.rev && S.view?.compared);
+    assert.match(await page.textContent(".changes"), /Flur/);
+    // Its button shows the block, marked as removed in the comparison.
+    await page.click('#deploy-check .rm-list .go:has-text("Flur")');
+    await page.waitForFunction((u) => S.sel === u && S.view.objects[u]?.status === "removed", FLUR);
+    // Cancelled from another tab: the server forgets the plan, and this tab's preview goes with it.
+    const other = await browser.newPage();
+    await other.goto(page.url());
+    const rev = await page.evaluate(() => S.removals.rev);
+    await other.evaluate((r) => fetch("/api/removals/cancel", { method: "POST", headers: { "Content-Type": "application/json", "X-Vislox": "removals" }, body: JSON.stringify({ rev: r }) }), rev);
+    await other.close();
+    await page.waitForFunction(() => !S.removals && !document.querySelector(".hrev.k-removals"), null, { timeout: 10000 });
+    await waitText("#deploy-check", /Review the removals/);
+    // The review changed nothing in the project.
+    assert.equal(readFileSync(join(dir, "logic.lock.json"), "utf8"), lockWas);
+    assert.equal(readFileSync(join(dir, "out.Loxone"), "utf8"), outWas);
+    // Declared again: nothing to remove.
+    writeFileSync(flur, was);
+    await page.waitForSelector("#deploy-check.hidden", { state: "attached", timeout: 15000 });
+    await page.click(".hrev.k-git >> nth=0");
   });
   await step("nothing was deployed: lox only compiled, checked, linted and tested", async () => {
     const ran = readFileSync(calls, "utf8").trim().split("\n");

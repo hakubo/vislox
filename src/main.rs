@@ -534,6 +534,11 @@ async fn main() -> Result<()> {
         .route("/api/backups/read", axum::routing::post(api_backups_read))
         .route("/api/apply", axum::routing::post(api_apply))
         .route("/api/rollback/plan", axum::routing::post(api_rollback_plan))
+        .route("/api/removals/plan", axum::routing::post(api_removals_plan))
+        .route(
+            "/api/removals/cancel",
+            axum::routing::post(api_removals_cancel),
+        )
         .route("/api/rollback", axum::routing::post(api_rollback))
         .route(
             "/api/rollback/cancel",
@@ -656,7 +661,10 @@ fn refresh(app: &App) {
         let mut h = app.history.lock().unwrap();
         let a = h.refresh_git();
         let b = h.poll_files();
-        (a || b).then_some(h.version)
+        // A removal plan (#70) goes once the server no longer keeps it, it is
+        // too old, or another revision runs.
+        let c = h.prune_removals(app.actions.removal_plan_id().as_deref());
+        (a || b || c).then_some(h.version)
     };
     if let Some(v) = version {
         let _ = app.tx.send(v);
@@ -1471,9 +1479,97 @@ async fn api_rollback_plan(
     .into_response()
 }
 
+/// What Apply would deploy with the module's removals allowed (#70): the
+/// blocks it deletes, where they are, what is wired to them and who loses
+/// access or notifications with them, and the program, shown as a revision
+/// (`removals:<blob>`) compared with the deployed commit. Deploys nothing,
+/// and changes nothing in the project.
+async fn api_removals_plan(
+    State(app): State<Arc<App>>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    if let Err(r) = app.actions.check(&headers) {
+        return refused(r);
+    }
+    let plan = match app.actions.removal_plan().await {
+        Ok(p) => p,
+        Err(e) => return refused((StatusCode::CONFLICT, e)),
+    };
+    let a = app.clone();
+    let res = tokio::task::spawn_blocking(move || {
+        let deployed = deployed_revision(a.history.lock().unwrap().list().1)
+            .ok_or("no deployed config to compare with")?;
+        // The blocks as the config they are deleted from has them: what runs.
+        let old = load(&a, &deployed.id)?.1;
+        let xml = source::program_xml(&plan.compiled).map_err(|e| e.to_string())?;
+        let new = LoxoneDoc::parse(&xml).map_err(|e| format!("the plan: {e}"))?;
+        let ids: Vec<String> = plan.blocks.iter().map(|b| b.uuid.clone()).collect();
+        let (shown, rights) = model::removed_blocks(&old, &new, &ids);
+        let mut h = a.history.lock().unwrap();
+        let rev = h.set_removals(
+            Some(deployed.id.clone()),
+            "Removals allowed".into(),
+            format!(
+                "The module compiled with --allow-removals: {} deleted",
+                actions::plural(plan.blocks.len(), "managed block")
+            ),
+            plan.compiled,
+        );
+        // Another tab's preview of an older plan goes.
+        let _ = a.tx.send(h.version);
+        drop(h);
+        Ok::<_, String>(serde_json::json!({
+            "revision": rev,
+            "rev": rev.id,
+            "blob": rev.blob,
+            "base": deployed.id,
+            "blocks": plan.blocks.iter().zip(&shown).map(|(b, s)| serde_json::json!({
+                "slug": b.slug,
+                "uuid": b.uuid,
+                "type": b.ty,
+                "deployed": b.deployed,
+                "found": s.found,
+                "title": s.title,
+                "page": s.page,
+                "page_title": s.page_title,
+                "wires": s.wires,
+                "refs": s.refs,
+            })).collect::<Vec<_>>(),
+            "rights": rights,
+        }))
+    })
+    .await
+    .map_err(|e| e.to_string())
+    .and_then(|r| r);
+    match res {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => refused((StatusCode::UNPROCESSABLE_ENTITY, e)),
+    }
+}
+
 #[derive(Deserialize)]
 struct RollbackCancel {
     rev: String,
+}
+
+/// The user cancelled a removal plan (#70): forgotten, with its bytes.
+async fn api_removals_cancel(
+    State(app): State<Arc<App>>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<RollbackCancel>,
+) -> Response {
+    if let Some(r) = not_from_vislox(&headers) {
+        return r;
+    }
+    app.actions.drop_removal_plan(&body.rev);
+    let v = {
+        let mut h = app.history.lock().unwrap();
+        h.clear_removals(&body.rev);
+        h.version
+    };
+    // Every tab drops its preview of it.
+    let _ = app.tx.send(v);
+    Json(serde_json::json!({ "cleared": true })).into_response()
 }
 
 /// The user cancelled a Roll back: its plan is forgotten.
@@ -1581,11 +1677,7 @@ async fn api_calendar(
 /// Apply or Sync), not an uncommitted edit on disk, which the Miniserver
 /// does not run; without git, the file on disk. Never a pending compile.
 fn deployed_revision(hist: Vec<history::Revision>) -> Option<history::Revision> {
-    let i = hist
-        .iter()
-        .position(|r| r.kind == "git")
-        .or_else(|| hist.iter().position(|r| r.current))?;
-    hist.into_iter().nth(i)
+    history::deployed_of(&hist).cloned()
 }
 
 /// The last read of the Miniserver's calendar entries against the deployed

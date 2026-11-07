@@ -21,7 +21,9 @@
 
 use crate::{check, edit, restart};
 
+mod removals;
 mod rollback;
+pub use removals::{NEEDS_CONSENT, RemovalConsent, plan_id as removal_plan_id, refused_slug};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -93,20 +95,37 @@ pub struct Actions {
     project_cache: Mutex<Option<(Vec<u8>, loxone_config::Project)>>,
     /// The pushes in the project's `backups/`, for Roll back (#69).
     pushes: crate::rollback::Pushes,
+    /// The last removal plan worked out (#70), for Apply's consent to name.
+    removals: Mutex<Option<removals::RemovalPlan>>,
+    /// Tests: what `/prog` says of an upload waiting ([`Actions::upload_waiting`]).
+    #[cfg(test)]
+    waiting: Mutex<Option<Result<Option<String>, String>>>,
+}
+
+/// What the Miniserver runs after a push that failed once lox began its
+/// upload ([`Actions::what_runs`]): Roll back (#69) and Apply with removals
+/// (#70) record it the same way.
+#[derive(Debug, PartialEq)]
+enum Runs {
+    /// The program the push uploaded.
+    Pushed,
+    /// Still the program from before, and no upload is waiting to load.
+    Before,
+    /// Cannot tell: why.
+    Unknown(String),
 }
 
 /// Whether `out` is the module compiled as it is now ([`Actions::freshness`]).
 enum Fresh {
-    Yes,
+    /// `removals`: the blocks the push of that compile deletes (#70).
+    Yes { removals: Vec<removals::Removed> },
     /// It compiles to another config: `out` is from before `changed`.
     Stale {
         changed: Vec<String>,
+        removals: Vec<removals::Removed>,
     },
     /// It does not compile against the base (lox's message).
-    Broken {
-        changed: Vec<String>,
-        error: String,
-    },
+    Broken { changed: Vec<String>, error: String },
 }
 
 /// The module and base as a compile read them, and the config it wrote,
@@ -116,6 +135,9 @@ struct Compiled {
     module: std::collections::BTreeMap<String, String>,
     out: String,
     base: Option<String>,
+    /// The lockfile as the compile left it: one changed since (by hand, or
+    /// git) can make the module compile otherwise, or not at all (#70).
+    lock: Option<String>,
 }
 
 /// A file's blob id, if it can be read.
@@ -509,8 +531,9 @@ struct Step {
 }
 
 /// Apply's steps, in order.
-const APPLY_STEPS: [(&str, &str); 10] = [
+const APPLY_STEPS: [(&str, &str); 11] = [
     ("module", "Module compiles"),
+    ("removals", "Removals you confirmed"),
     ("tests", "Tests pass"),
     ("check", "Download and drift check"),
     ("upload", "Upload"),
@@ -748,6 +771,9 @@ impl Actions {
             disk: Mutex::new((None, None)),
             project_cache: Mutex::new(None),
             pushes: Default::default(),
+            removals: Mutex::new(None),
+            #[cfg(test)]
+            waiting: Mutex::new(None),
         };
         a.edit_state.lock().unwrap().why = a.why_not_edit_now();
         a
@@ -906,6 +932,9 @@ impl Actions {
             "running": st.running,
             "last": st.last,
             "progress": st.progress,
+            // The removal plan the server keeps (#70): a tab's own preview
+            // goes when it is another.
+            "removals": self.removal_plan_id(),
         })
     }
 
@@ -1024,6 +1053,22 @@ impl Actions {
                 }
             },
         }
+        // Blocks the module lost (#70): deleted only as the user confirmed
+        // them, compiled into the project before the tests run on it.
+        self.progress(|p| p.start("removals"));
+        let consent = opts.allow_removals.as_ref();
+        // Puts the lockfile and out back on any failure before the push
+        // went through: the consent never outlives this request.
+        let mut put_back = match self.removals_step(consent).await {
+            Ok((state, detail, guard)) => {
+                self.progress(|p| p.finish("removals", state, Some(detail)));
+                guard
+            }
+            Err(why) => {
+                self.end_with("apply", &Err(why.clone()), None);
+                return Err((StatusCode::CONFLICT, why));
+            }
+        };
         // Then its tests (#67) must pass, on the config Apply deploys: the
         // check's run when it is of the files as they are, else run now.
         self.progress(|p| p.start("tests"));
@@ -1031,11 +1076,31 @@ impl Actions {
         match tests_verdict(&tests) {
             Ok((state, detail)) => self.progress(|p| p.finish("tests", state, Some(detail))),
             Err(why) => {
+                drop(put_back.take());
                 self.end_with("apply", &Err(why.clone()), None);
                 return Err((StatusCode::CONFLICT, why));
             }
         }
-        let res = self.apply_steps(opts).await;
+        // The removals were compiled in: what is pushed must still be that
+        // compile, the module and lockfile untouched since.
+        if put_back.is_some() {
+            let fresh = match self.project() {
+                Ok(p) => matches!(self.freshness(&p).await, Ok(Fresh::Yes { .. })),
+                Err(_) => false,
+            };
+            if !fresh {
+                drop(put_back.take());
+                let why = "The module or its lockfile changed after the removals you confirmed \
+                           were compiled. Nothing was deployed: review the pending config again."
+                    .to_string();
+                self.end_with("apply", &Err(why.clone()), None);
+                return Err((StatusCode::CONFLICT, why));
+            }
+        }
+        let res = self.apply_steps(opts, put_back.as_mut()).await;
+        // Failed before the push went through: put back now, before the end
+        // is reported (the check reads the project then).
+        drop(put_back);
         let (res, deployed) = match res {
             Ok((m, d)) => (Ok(m), d),
             Err(e) => (Err(e), None),
@@ -1044,7 +1109,11 @@ impl Actions {
         res.map_err(|e| (StatusCode::BAD_GATEWAY, e))
     }
 
-    async fn apply_steps(&self, opts: &ApplyOpts) -> Result<(String, Option<Deployed>), String> {
+    async fn apply_steps(
+        &self,
+        opts: &ApplyOpts,
+        put_back: Option<&mut removals::PutBack<'_>>,
+    ) -> Result<(String, Option<Deployed>), String> {
         let dir = self.s.project.as_deref().unwrap();
         let mut args = vec!["config", "push", "--force"];
         push_opts(opts, &mut args)?;
@@ -1066,13 +1135,97 @@ impl Actions {
         let before = std::fs::read(&p.base)
             .ok()
             .map(|b| crate::history::blob_id(&b));
-        let (pushed, ran_before) = self.push_config(&args).await?;
+        let (pushed, ran_before, note) = match self.push_config(&args).await {
+            Ok((pushed, ran_before)) => {
+                // Pushed and verified: lox wrote the lockfile of what runs now.
+                if let Some(g) = put_back {
+                    g.keep();
+                }
+                (pushed, ran_before, None)
+            }
+            // Removals compiled in (#70): what runs decides what is kept.
+            Err(why) => match put_back {
+                None => return Err(why),
+                Some(g) => {
+                    let (pushed, note) = self.removals_pushed(&p, &why, before.as_deref()).await?;
+                    // It runs what was confirmed: the lockfile and out stay.
+                    g.keep();
+                    let ran_before = crate::running::Report::failed("no check before".into());
+                    (pushed, ran_before, Some(note))
+                }
+            },
+        };
         let c = Commit {
             subject: &subject,
             body: None,
             force_add: &[],
         };
-        self.after_push(&p, &pushed, &ran_before, before, &c).await
+        self.after_push(&p, &pushed, &ran_before, before, &c)
+            .await
+            .map(|(m, d)| match note {
+                Some(n) => (format!("{n}\n{m}"), d),
+                None => (m, d),
+            })
+    }
+
+    /// A push of removals the user confirmed (#70) failed: as for a Roll back
+    /// (#69), before lox's upload line nothing changed; after it, what the
+    /// Miniserver runs decides. The program confirmed: recorded as the base,
+    /// not verified, and `Ok` with the push's message and the note. Anything
+    /// else is `Err`, and the caller's guard puts the lockfile and out back.
+    async fn removals_pushed(
+        &self,
+        p: &loxone_config::Project,
+        why: &str,
+        before: Option<&str>,
+    ) -> Result<(String, String), String> {
+        if !self.upload_started() {
+            return Err(format!(
+                "{why}\nlox stopped before the upload: nothing changed on the Miniserver. The \
+                 lockfile and out were put back, so the removals are not kept."
+            ));
+        }
+        let confirmed =
+            std::fs::read(&p.out).map_err(|e| format!("{why}\ncannot read out: {e}"))?;
+        let runs = self
+            .what_runs(
+                &crate::history::blob_id(&confirmed),
+                before.unwrap_or(""),
+                ("the previous", "the one you confirmed"),
+            )
+            .await;
+        match runs {
+            Runs::Before => Err(format!(
+                "{why}\nThe Miniserver still runs the previous config, and no upload is waiting: \
+                 nothing changed. The lockfile and out were put back, so the removals are not kept."
+            )),
+            Runs::Unknown(how) => Err(format!(
+                "{why}\n⚠ lox failed after it started the upload, and vislox cannot tell which config \
+                 the Miniserver runs now ({how}). It may run the previous config or the one you \
+                 confirmed, with the blocks removed. The lockfile and out were put back, so the \
+                 project is at its last commit and what was pending, which may not be what runs: \
+                 check \"Which config the Miniserver runs\" in the History, then Pull or Sync."
+            )),
+            Runs::Pushed => {
+                std::fs::write(&p.base, &confirmed).map_err(|e| {
+                    format!(
+                        "{why}\n⚠ The Miniserver runs the config you confirmed, but vislox could \
+                         not record it ({e}). Pull or Sync."
+                    )
+                })?;
+                Ok((
+                    format!(
+                        "lox config push failed after the upload:\n{}",
+                        last_lines(why, 4)
+                    ),
+                    format!(
+                        "{UNVERIFIED}: lox failed after the upload, but the Miniserver runs the \
+                         program you confirmed, with the blocks removed (vislox downloaded it and \
+                         compared)."
+                    ),
+                ))
+            }
+        }
     }
 
     /// `lox config push` with `args`, followed (see [`Self::push_followed`]),
@@ -1227,6 +1380,86 @@ impl Actions {
             }
         }
         format!("{UNVERIFIED} by load: {}.", why.join("; "))
+    }
+
+    /// The running push got as far as lox's upload line: from then on the
+    /// Miniserver may run what it uploaded.
+    fn upload_started(&self) -> bool {
+        self.st
+            .lock()
+            .unwrap()
+            .progress
+            .as_mut()
+            .is_some_and(|p| p.get("upload").state != "wait")
+    }
+
+    /// Whether an upload waits in `/prog` to load on the next program start
+    /// (its name), from the Miniserver's own listing.
+    async fn upload_waiting(&self) -> Result<Option<String>, String> {
+        #[cfg(test)]
+        if let Some(w) = self.waiting.lock().unwrap().clone() {
+            return w;
+        }
+        if !self.s.running.available() {
+            return Err("whether an upload waits cannot be checked".into());
+        }
+        let r = self.s.running.get(true).await;
+        match (r.error, r.waiting) {
+            (Some(e), _) => Err(format!("/prog cannot be read: {e}")),
+            (None, w) => Ok(w),
+        }
+    }
+
+    /// After a push that failed once lox began the upload: download what the
+    /// Miniserver runs (read-only, `lox config download`) and compare it with
+    /// the program the push uploaded (`pushed`) and the one before
+    /// (`before`), each by blob id. `names`: how the messages call them.
+    async fn what_runs(&self, pushed: &str, before: &str, names: (&str, &str)) -> Runs {
+        let (before_name, pushed_name) = names;
+        let dir = self.s.project.as_deref().unwrap();
+        let scratch = match removals::scratch_dir("vislox-runs") {
+            Ok(d) => d,
+            Err(e) => return Runs::Unknown(e),
+        };
+        let _gone = RemoveDir(scratch.clone());
+        let zip = scratch.join("now.zip");
+        let z = zip.to_string_lossy();
+        if let Err(e) = run(
+            &self.s.lox,
+            &["config", "download", "--save-as", &z],
+            dir,
+            PUSH_TIMEOUT,
+        )
+        .await
+        {
+            return Runs::Unknown(format!("lox config download: {}", last_lines(&e, 1)));
+        }
+        let xml = match std::fs::read(&zip)
+            .map_err(|e| e.to_string())
+            .and_then(|z| {
+                loxone_config::archive::extract_and_decompress(&z).map_err(|e| e.to_string())
+            }) {
+            Ok(x) => x,
+            Err(e) => return Runs::Unknown(format!("its download cannot be read: {e}")),
+        };
+        let blob = crate::history::blob_id(&xml);
+        if blob == pushed {
+            return Runs::Pushed;
+        }
+        if blob != before {
+            return Runs::Unknown(format!(
+                "its newest program ({}) is neither {before_name} nor {pushed_name}",
+                &blob[..10]
+            ));
+        }
+        // The program from before: unless an upload waits to load on the next start.
+        match self.upload_waiting().await {
+            Err(e) => Runs::Unknown(format!("it runs {before_name} program, but {e}")),
+            Ok(Some(w)) => Runs::Unknown(format!(
+                "it runs {before_name} program, but {w} waits to be loaded"
+            )),
+            Ok(None) => Runs::Before,
+        }
     }
 
     /// Make the Miniserver's running config the project's base
@@ -1526,7 +1759,7 @@ impl Actions {
         }
         // An edit compiles the whole module: it must not take along changes
         // someone else made to it and has not compiled.
-        self.uncompiled(&p, dir).await?;
+        self.uncompiled(&p).await?;
         // Discard puts the lock and out back as they were before vislox's
         // first edit, where the last commit does not have them.
         snapshot_before_edit(dir, &p).await;
@@ -1585,6 +1818,7 @@ impl Actions {
             module: module_blobs(&p),
             out: blob.clone(),
             base: file_blob(&p.base),
+            lock: file_blob(&p.lock),
         };
         // The UUIDs lox minted for the new blocks.
         let lock = edit::Lock::read(&p.lock);
@@ -1633,7 +1867,7 @@ impl Actions {
     /// Refuse when the module holds changes that are not compiled into the
     /// pending config: an edit's compile would fold them in. See
     /// [`Self::freshness`].
-    async fn uncompiled(&self, p: &loxone_config::Project, dir: &Path) -> Result<(), Refusal> {
+    async fn uncompiled(&self, p: &loxone_config::Project) -> Result<(), Refusal> {
         use axum::http::StatusCode;
         let refuse = |msg: String| (StatusCode::CONFLICT, msg);
         let files = |changed: &[String]| {
@@ -1643,15 +1877,15 @@ impl Actions {
                 changed.join(", ")
             }
         };
-        match self.freshness(p, dir).await.map_err(refuse)? {
-            Fresh::Yes => Ok(()),
+        match self.freshness(p).await.map_err(refuse)? {
+            Fresh::Yes { .. } => Ok(()),
             Fresh::Broken { changed, error } => Err(refuse(format!(
                 "The module does not compile as it is ({} changed since the last compile). \
                  Fix or discard that, then edit:\n{}",
                 files(&changed),
                 last_lines(&error, 6)
             ))),
-            Fresh::Stale { changed } => Err(refuse(format!(
+            Fresh::Stale { changed, .. } => Err(refuse(format!(
                 "The module has changes that are not compiled yet ({}). An edit compiles the \
                  whole module and would take them along: compile them (lox logic compile) or \
                  discard them first.",
@@ -1666,17 +1900,23 @@ impl Actions {
     /// compiled; anything else is compiled as it is into a scratch copy and
     /// compared with `out`. `Err`: it cannot be told (no config to compare
     /// with, no scratch directory).
-    async fn freshness(&self, p: &loxone_config::Project, dir: &Path) -> Result<Fresh, String> {
+    async fn freshness(&self, p: &loxone_config::Project) -> Result<Fresh, String> {
         let module = module_blobs(p);
         let out_blob = file_blob(&p.out);
         let base_blob = file_blob(&p.base);
+        let lock_blob = file_blob(&p.lock);
         let last = self.compiled.lock().unwrap().clone();
+        let base_bytes = std::fs::read(&p.base).unwrap_or_default();
         if let (Some(last), Some(o)) = (&last, &out_blob)
             && last.module == module
             && &last.out == o
             && last.base == base_blob
+            && last.lock == lock_blob
         {
-            return Ok(Fresh::Yes);
+            let lock = std::fs::read(&p.lock).ok();
+            return Ok(Fresh::Yes {
+                removals: removals::pending(lock.as_deref(), &base_bytes),
+            });
         }
         // The files that changed: since vislox's last compile, else those
         // written no earlier than out (a guess, for the message only).
@@ -1717,23 +1957,14 @@ impl Actions {
         let reference = std::fs::read(&p.out)
             .or_else(|_| std::fs::read(&p.base))
             .map_err(|e| format!("cannot read the pending config: {e}"))?;
-        let scratch = std::env::temp_dir().join(format!(
-            "vislox-check-{}-{}",
-            std::process::id(),
-            now_nanos()
-        ));
-        std::fs::create_dir_all(&scratch)
-            .map_err(|e| format!("cannot create {}: {e}", scratch.display()))?;
-        let _gone = RemoveDir(scratch.clone());
-        let (lock, out) = (scratch.join("lock.json"), scratch.join("out.Loxone"));
-        if p.lock.exists() {
-            std::fs::copy(&p.lock, &lock).map_err(|e| format!("cannot copy the lock: {e}"))?;
-        }
-        let (lock_s, out_s) = (lock.to_string_lossy(), out.to_string_lossy());
-        let args = ["logic", "compile", "--lock", &lock_s, "--out", &out_s];
-        match run(&self.s.lox, &args, dir, COMPILE_TIMEOUT).await {
+        let (scratch, res) = self.scratch_compile(p, &[]).await?;
+        let removals = || {
+            let lock = std::fs::read(&scratch.lock).ok();
+            removals::pending(lock.as_deref(), &base_bytes)
+        };
+        match res {
             Err(error) => Ok(Fresh::Broken { changed, error }),
-            Ok(_) if std::fs::read(&out).ok().as_deref() == Some(reference.as_slice()) => {
+            Ok(_) if std::fs::read(&scratch.out).ok().as_deref() == Some(reference.as_slice()) => {
                 // Compiled as it is: remembered, so the next edit need not
                 // compile it again; unless the module changed meanwhile (an
                 // edit while `GET /api/check` compiled), when what compiled
@@ -1741,16 +1972,23 @@ impl Actions {
                 if let Some(o) = out_blob
                     && module_blobs(p) == module
                     && file_blob(&p.base) == base_blob
+                    && file_blob(&p.lock) == lock_blob
                 {
                     *self.compiled.lock().unwrap() = Some(Compiled {
                         module,
                         out: o,
                         base: base_blob,
+                        lock: lock_blob,
                     });
                 }
-                Ok(Fresh::Yes)
+                Ok(Fresh::Yes {
+                    removals: removals(),
+                })
             }
-            Ok(_) => Ok(Fresh::Stale { changed }),
+            Ok(_) => Ok(Fresh::Stale {
+                changed,
+                removals: removals(),
+            }),
         }
     }
 
@@ -2128,15 +2366,28 @@ impl Actions {
         // Is the pending config the module as it is? Not asked while the
         // module does not compile (it cannot be). Else by content: the
         // record of vislox's last compile, or a scratch compile.
-        let stale = if !checked.errors.is_empty() {
-            Value::Null
+        // And what its push would remove (#70): lox's refusal for a block
+        // the module lost, or the blocks it deletes. Apply asks for them.
+        let removal = |refused: Option<String>, blocks: &[removals::Removed]| {
+            if refused.is_none() && blocks.is_empty() {
+                Value::Null
+            } else {
+                json!({ "refused": refused, "blocks": blocks })
+            }
+        };
+        let (stale, removals) = if !checked.errors.is_empty() {
+            (Value::Null, Value::Null)
         } else {
-            match self.freshness(&p, dir).await {
-                Ok(Fresh::Yes) | Err(_) => Value::Null,
-                Ok(Fresh::Stale { changed }) => json!({ "files": changed }),
-                Ok(Fresh::Broken { changed, error }) => {
-                    json!({ "files": changed, "error": last_lines(&error, 6) })
+            match self.freshness(&p).await {
+                Err(_) => (Value::Null, Value::Null),
+                Ok(Fresh::Yes { removals }) => (Value::Null, removal(None, &removals)),
+                Ok(Fresh::Stale { changed, removals }) => {
+                    (json!({ "files": changed }), removal(None, &removals))
                 }
+                Ok(Fresh::Broken { changed, error }) => (
+                    json!({ "files": changed, "error": last_lines(&error, 6) }),
+                    removal(refused_slug(&error), &[]),
+                ),
             }
         };
         json!({
@@ -2146,6 +2397,7 @@ impl Actions {
             "truncated": checked.truncated,
             "unformatted": unformatted,
             "stale": stale,
+            "removals": removals,
             "lint": Value::Null,
             "test": Value::Null,
         })
@@ -2183,7 +2435,13 @@ impl Actions {
         if let Some(out) = file_blob(&p.out)
             && module_blobs(&p) == module
         {
-            *self.compiled.lock().unwrap() = Some(Compiled { module, out, base });
+            let lock = file_blob(&p.lock);
+            *self.compiled.lock().unwrap() = Some(Compiled {
+                module,
+                out,
+                base,
+                lock,
+            });
         }
         Ok(
             "Compiled the module as it is: the pending revision shows it. Nothing was deployed."
@@ -2559,11 +2817,15 @@ pub struct ApplyOpts {
     /// Delete the custom changes the Miniserver holds (`--discard-custom-changes`).
     #[serde(default)]
     pub discard_custom_changes: bool,
+    /// Delete the managed blocks the module lost (#70): exactly these, of
+    /// the plan reviewed. Never a flag of the push (see `removals`).
+    #[serde(default)]
+    pub allow_removals: Option<RemovalConsent>,
 }
 
 /// What a refused Apply could be retried with, from lox's message: the
-/// Loxone Config release to accept, and the custom changes an upload would
-/// delete.
+/// Loxone Config release to accept, the custom changes an upload would
+/// delete, and a managed block the module lost (#70).
 pub fn apply_hints(msg: &str) -> Value {
     let accept_version = msg.split("--accept-version").nth(1).and_then(|rest| {
         let v: String = rest
@@ -2589,6 +2851,9 @@ pub fn apply_hints(msg: &str) -> Value {
     json!({
         "accept_version": accept_version,
         "custom_changes": (!custom.is_empty() && msg.contains("--discard-custom-changes")).then_some(custom),
+        // A block the module lost (#70): the browser asks for the plan.
+        "removals": refused_slug(msg)
+            .or_else(|| msg.contains(NEEDS_CONSENT).then(|| "pending".to_string())),
     })
 }
 
@@ -2785,10 +3050,7 @@ fn tests_verdict(t: &Value) -> Result<(&'static str, String), String> {
     let bad: Vec<&Value> = tests.iter().filter(|t| t["status"] != "pass").collect();
     if bad.is_empty() {
         let n = tests.len();
-        return Ok((
-            "ok",
-            format!("{n} test{} passed", if n == 1 { "" } else { "s" }),
-        ));
+        return Ok(("ok", format!("{} passed", plural(n, "test"))));
     }
     let mut list = Vec::new();
     for t in bad.iter().take(5) {
@@ -2825,6 +3087,11 @@ fn tests_verdict(t: &Value) -> Result<(&'static str, String), String> {
         list.join("\n"),
         if n > 5 { "\n  …" } else { "" }
     ))
+}
+
+/// `3 blocks`, `1 block`.
+pub(crate) fn plural(n: usize, what: &str) -> String {
+    format!("{n} {what}{}", if n == 1 { "" } else { "s" })
 }
 
 /// Why Apply must not run: the module has errors (#65), the first five of
@@ -4121,8 +4388,10 @@ esac
         assert_eq!(runs(), before, "{}", calls_in(&tmp));
         let steps = a.info()["progress"]["steps"].clone();
         assert_eq!(steps[0]["state"], "ok", "{steps}");
-        assert_eq!(steps[1]["id"], "tests", "{steps}");
-        assert_eq!(steps[1]["state"], "fail", "{steps}");
+        assert_eq!(steps[1]["id"], "removals", "{steps}");
+        assert_eq!(steps[1]["state"], "skip", "{steps}");
+        assert_eq!(steps[2]["id"], "tests", "{steps}");
+        assert_eq!(steps[2]["state"], "fail", "{steps}");
         assert!(!calls_in(&tmp).contains("config push"), "nothing deployed");
         assert!(!calls_in(&tmp).contains("logic diff"), "{}", calls_in(&tmp));
 
@@ -4149,8 +4418,8 @@ esac
         let (code, msg) = a.apply(&ApplyOpts::default()).await.unwrap_err();
         assert_eq!(code, StatusCode::BAD_GATEWAY, "{msg}");
         let steps = a.info()["progress"]["steps"].clone();
-        assert_eq!(steps[1]["state"], "ok", "{steps}");
-        assert_eq!(steps[1]["detail"], "1 test passed", "{steps}");
+        assert_eq!(steps[2]["state"], "ok", "{steps}");
+        assert_eq!(steps[2]["detail"], "1 test passed", "{steps}");
         assert!(calls_in(&tmp).contains("config push"));
     }
 
@@ -4231,7 +4500,7 @@ esac
             "Tests couldn't run (lox logic test), so nothing was deployed: the simulator crashed"
         );
         assert_eq!(runs(), before + 1, "{}", calls_in(&tmp));
-        assert_eq!(a.info()["progress"]["steps"][1]["state"], "fail");
+        assert_eq!(a.info()["progress"]["steps"][2]["state"], "fail");
         assert!(!calls_in(&tmp).contains("config push"));
         // lox answers again (nothing in the project changed, so the check's
         // run stays the one without an answer): Apply's own run passes.
@@ -4240,7 +4509,7 @@ esac
         let (code, msg) = a.apply(&ApplyOpts::default()).await.unwrap_err();
         assert_eq!(code, StatusCode::BAD_GATEWAY, "{msg}");
         let steps = a.info()["progress"]["steps"].clone();
-        assert_eq!(steps[1]["state"], "ok", "{steps}");
+        assert_eq!(steps[2]["state"], "ok", "{steps}");
         assert_eq!(runs(), before + 2, "{}", calls_in(&tmp));
         // And it is kept for the browsers.
         assert_eq!(a.check_result()["test"]["passed"], 1);
@@ -4313,7 +4582,7 @@ esac
         let (_, msg) = a.apply(&ApplyOpts::default()).await.unwrap_err();
         assert!(msg.contains("lox config push failed"), "{msg}");
         let steps = a.info()["progress"]["steps"].clone();
-        assert_eq!(steps[1]["state"], "skip", "{steps}");
+        assert_eq!(steps[2]["state"], "skip", "{steps}");
         let runs = calls_in(&tmp)
             .lines()
             .filter(|l| *l == "logic test .")
@@ -5114,7 +5383,7 @@ esac
         DOC_A.replace("Haus", "Haus B")
     }
 
-    fn zip_of(xml: &[u8]) -> Vec<u8> {
+    pub(super) fn zip_of(xml: &[u8]) -> Vec<u8> {
         use std::io::Write;
         let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
         w.start_file("sps0.LoxCC", zip::write::SimpleFileOptions::default())
@@ -5637,6 +5906,19 @@ esac
             "{e}"
         );
         as_the_apply_left_it(&d, &head);
+        // It runs the Apply's, and nothing waits: nothing changed, put back.
+        *a.waiting.lock().unwrap() = Some(Ok(None));
+        let (_, e) = a
+            .rollback(&head, None, &ApplyOpts::default())
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            e.contains("The Miniserver still runs the Apply's config, and no upload is waiting"),
+            "{e}"
+        );
+        as_the_apply_left_it(&d, &head);
+        *a.waiting.lock().unwrap() = None;
         // It runs the rolled-back program: recorded as deployed, not verified.
         std::fs::write(t.join("runs.zip"), zip_of(DOC_A.as_bytes())).unwrap();
         let msg = a
