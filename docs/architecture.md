@@ -107,6 +107,12 @@ The binary is an `axum` server with the UI embedded (plain JS and SVG, no build 
   claims, its targets externs of vislox's file (`SetKind::lines_with`, `SetKind::named`), checked against the
   device's layout, its API links and the types lox knows (`As`, `Lico`), and after the compile (`missed`).
   `check::pin_tile_findings` pins lint's tile findings to a device named by its title.
+- Block settings (#79) are values of a block of vislox's files (`edit.rs`' `edit_new_block`, `blocks::settings`
+  and `Kind`): a program is `Kind::Program`, a `Value::File` whose text `Files` reads from and writes to
+  `<module>/vislox/<slug>.c` (`edit::ours` says which files of vislox's directory are its). `src/units.rs` shows a
+  constant with the unit Lox Logic writes it with and checks a typed unit against the port (`units::shown`,
+  `units::port_value`). `model.rs`' `settings` (`SettingInfo`, `setting_text`) and `attr_change_text` read a
+  block's settings by their Lox Logic names, for Properties and the Changes list.
 - `src/set_claim.rs`' `KINDS` lists every kind of claim on a block's whole content (switching times, moods,
   access, recipients, tiles, members) as a `ClaimKind`; `edit.rs` and `actions.rs` loop over it instead of naming each kind.
 - `src/blocks.rs` is adding blocks (#59): the types vislox offers (`GET /api/block-types`, from lox's builtin

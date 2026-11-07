@@ -1254,9 +1254,12 @@ function renderPropsBody() {
     if (dv.note) rows.push(`<div class="note-p hw-note">${esc(dv.note)}</div>`);
     section("Device", rows);
   }
+  // A constant with the unit Lox Logic writes it with (#79): `Time 30min`, not 1800.
   const params = o.ports.filter((q) => q.def != null || q.def_changed || q.inv)
-    .map((q) => row(q.name + (q.inv ? " (inverted)" : ""), chg(q.old_def, q.def, q.def_changed), marks && q.def_changed ? "pr-chg" : ""));
+    .map((q) => row(q.name + (q.inv ? " (inverted)" : ""), chg(q.old_def_text ?? q.old_def, q.def_text ?? q.def, q.def_changed), marks && q.def_changed ? "pr-chg" : ""));
   section("Parameters", params, params.length);
+  const sets = settingsRows(o, row, marks, chg);
+  if (sets) section("Settings", sets.rows, sets.count);
 
   const connRows = (dir) => o.ports.filter((q) => q.conns.some((c) => c.dir === dir)).map((q) => {
     const cs = q.conns.filter((c) => c.dir === dir);
@@ -1284,7 +1287,9 @@ function renderPropsBody() {
   details.push(row("UUID", `<span class="mono">${esc(o.uuid)}</span><button type="button" class="copy" data-copy="${esc(o.uuid)}" data-label="Copy">Copy</button>`));
   section("Details", details);
 
-  const raw = o.attrs.filter((a) => !["Title", "Type", "IName", ...(note ? ["Text"] : [])].includes(a.name) || (a.changed && a !== note)).map((a) => {
+  // The block settings (#79) are in Settings, as Lox Logic writes them.
+  const inSettings = new Set((o.settings || []).map((x) => x.attr));
+  const raw = o.attrs.filter((a) => !inSettings.has(a.name) && (!["Title", "Type", "IName", ...(note ? ["Text"] : [])].includes(a.name) || (a.changed && a !== note))).map((a) => {
     let v;
     if (a.name === "Cl" && a.value && /^\d+,\d+,\d+$/.test(a.value) && !(marks && a.changed)) v = `<span class="swatch" style="background:rgb(${esc(a.value)})"></span> ${esc(a.value)}`;
     else if (marks && a.changed) v = chg(a.old, a.value, true);
@@ -1318,7 +1323,8 @@ $("props").addEventListener("keydown", (e) => {
   if (e.target.id === "ad-slug" && e.key === "Enter") { e.preventDefault(); adoptSave(S.sel); return; }
   if (e.target.id === "ad-slug" && e.key === "Escape") { e.preventDefault(); e.stopPropagation(); adoptClose(); return; }
   const f = e.target.closest("[data-ed-field]");
-  if (f && e.key === "Enter") { e.preventDefault(); editSave(); return; }
+  // In a program (#79) Enter is a line break; Ctrl+Enter (⌘ on a Mac) saves.
+  if (f && e.key === "Enter" && (f.tagName !== "TEXTAREA" || e.ctrlKey || e.metaKey)) { e.preventDefault(); editSave(); return; }
   if (f && e.key === "Escape") { e.preventDefault(); e.stopPropagation(); editClose(); return; }
   const i = e.target.closest(".op input");
   if (i && e.key === "Enter") { e.preventDefault(); operate(i.dataset.opUuid, i.value); }
@@ -2989,6 +2995,50 @@ function rightsApplyText(hw) {
   return (lose.length ? `⚠ ${lose.join("\n⚠ ")}\n\n` : "") + (gain.length ? `${gain.join("\n")}\n\n` : "");
 }
 
+// ── block settings (#79) ───────────────────────────────────────────────
+// The settings Loxone Config stores on a block's element, by their Lox Logic name and as Lox Logic writes them
+// (`At: 18:58`, `Pulse: sunset`, `Type: text`, the program of a Code16). They are edited on a block the module
+// manages through vislox (added here or adopted: *Edit values*); on any other block they are read-only, since
+// lox takes them only in a managed block's declaration.
+const SET_LABEL = { Desc: "Desc (name in the app)", Code: "Program" };
+/** Lines of `a` and `b`, the changed middle marked: [kind, line] with kind " ", "-" or "+". */
+function lineDiff(a, b) {
+  const x = (a ?? "").split("\n"), y = (b ?? "").split("\n");
+  let i = 0, j = 0;
+  while (i < x.length && i < y.length && x[i] === y[i]) i++;
+  while (j < x.length - i && j < y.length - i && x[x.length - 1 - j] === y[y.length - 1 - j]) j++;
+  return [...x.slice(0, i).map((l) => [" ", l]), ...x.slice(i, x.length - j).map((l) => ["-", l]),
+    ...y.slice(i, y.length - j).map((l) => ["+", l]), ...x.slice(x.length - j).map((l) => [" ", l])];
+}
+/** A program as Properties shows it: folded, its lines counted; a change as a line diff around what changed. */
+function programHtml(s, marks) {
+  const lines = (v) => (v == null ? 0 : v.split("\n").length - (v.endsWith("\n") ? 1 : 0));
+  if (marks && s.changed) {
+    const d = lineDiff(s.old, s.value);
+    // Three lines of context around each change.
+    const near = (k) => d.slice(Math.max(0, k - 3), k + 4).some(([m]) => m !== " ");
+    const shown = d.map((l, k) => (near(k) ? l : null));
+    const out = [];
+    shown.forEach((l, k) => { if (l) out.push(`<span class="pd${l[0] === "-" ? " old" : l[0] === "+" ? " new" : ""}">${esc(l[0] + " " + l[1])}</span>`); else if (shown[k - 1]) out.push('<span class="pd gap">…</span>'); });
+    return `<pre class="prog prog-diff">${out.join("\n")}</pre>`;
+  }
+  if (s.value == null) return '<span class="none-v">— (Loxone Config\'s program)</span>';
+  return `<details class="prog-d"><summary>${plural(lines(s.value), "line")}</summary><pre class="prog">${esc(s.value)}</pre></details>`;
+}
+function settingsRows(o, row, marks, chg) {
+  const list = (o.settings || []).filter((x) => x.value != null || (marks && x.changed));
+  if (!list.length) return null;
+  const rows = list.map((x) => row(SET_LABEL[x.name] || x.name, x.kind === "program" ? programHtml(x, marks) : chg(x.old, x.value, x.changed),
+    marks && x.changed ? (x.value == null ? "pr-rem" : "pr-chg") : ""));
+  // Who edits them: vislox (added or adopted here), the module's own file, or nobody until it is managed.
+  if (S.hist?.actions?.shown && !editsBlock(o.uuid)) {
+    const m = managedSrc(o.uuid);
+    rows.push(`<div class="ed-note set-note">${m ? `The module manages this block: change its settings in ${esc(srcPath(m) || "its .loxl file")}.`
+      : "Read-only: lox changes these only on a block the module manages. Manage with Lox Logic to edit (in Edit above)."}</div>`);
+  }
+  return { rows, count: marks ? list.filter((x) => x.changed).length || undefined : undefined };
+}
+
 // ── editing values (Properties) ────────────────────────────────────────
 // A block's name, its unwired inputs' constants and the settings of a physical input or output are
 // edited here. The server writes them into vislox's own file of the project's module and runs
@@ -3268,13 +3318,23 @@ function editState(o) {
   return { ok: true, rev: r };
 }
 const EDIT_ATTR = { title: "Name", room: "Room", category: "Category" };
-function editLabel(o, c) { return EDIT_ATTR[c.op] || (c.op === "param" ? portName(o, c.port) : c.name); }
+function editLabel(o, c) { return EDIT_ATTR[c.op] || (c.op === "param" ? portName(o, c.port) : SET_LABEL[c.name] || c.name); }
+/** A claimed value as the Edit section lists it: a program (#79) by its size, the rest as written. */
+function editValue(c) {
+  if (c.value == null) return '<span class="none-v">back to Loxone Config\'s value</span>';
+  if (c.op === "setting" && c.name === "Code") return `<span class="none-v">edited here, ${plural(c.value.split("\n").length - (c.value.endsWith("\n") ? 1 : 0), "line")}</span>`;
+  return esc(c.value);
+}
 /** The config's rooms or categories by title; a title two of them share cannot be picked (lox claims by title). */
 function editPlaces(ty) {
   const n = new Map();
   for (const x of Object.values(S.view?.objects || {})) if (x.ty === ty && x.status !== "removed") n.set(x.title, (n.get(x.title) || 0) + 1);
   return [...n].sort((a, b) => a[0].localeCompare(b[0]));
 }
+/** A constant as the form starts it: with the unit Lox Logic writes it with (`30min`), else as stored. */
+function portNow(o, key) { const q = o.ports.find((x) => x.key === key); return q?.def_text ?? q?.def ?? "0"; }
+/** A constant: a number, or one with a unit (#79); the server checks that the port takes the unit. */
+const EDIT_QUANTITY = /^-?\d+(\.\d+)?(ms|s|min|h|%|K|°)?$/;
 /** The fields of the edit form: [field, label, value now, kind, unit]. */
 function editFields(o) {
   const f = [];
@@ -3289,15 +3349,16 @@ function editFields(o) {
     }
     // A block added here may have nothing `caps()` offers (`o.edit` null): its declaration still takes these.
     f.push(["title", "Name", o.title || "", "text"]);
-    for (const p of o.edit?.params || []) f.push([`p:${p.key}`, portName(o, p.key), o.ports.find((q) => q.key === p.key)?.def ?? "0", "number", p.unit]);
-    for (const st of nb.settings || []) f.push([`s:${st.name}`, st.name, st.value ?? "", st.kind, null, st.choices]);
+    for (const p of o.edit?.params || []) f.push([`p:${p.key}`, portName(o, p.key), portNow(o, p.key), "quantity", p.unit]);
+    // A program (#79) starts from the one the block runs: Loxone Config's until the declaration names a file.
+    for (const st of nb.settings || []) f.push([`s:${st.name}`, SET_LABEL[st.name] || st.name, st.value ?? (st.kind === "program" ? o.settings?.find((x) => x.name === st.name)?.value ?? "" : ""), st.kind, null, st.choices]);
     return f;
   }
   if (!o.edit) return f;
   if (o.edit.title) f.push(["title", "Name", o.title || "", "text"]);
   if (o.edit.room) f.push(["room", "Room", o.room || "", "Place"]);
   if (o.edit.category) f.push(["category", "Category", o.category || "", "Category"]);
-  for (const p of o.edit.params) f.push([`p:${p.key}`, portName(o, p.key), o.ports.find((q) => q.key === p.key)?.def ?? "0", "number", p.unit]);
+  for (const p of o.edit.params) f.push([`p:${p.key}`, portName(o, p.key), portNow(o, p.key), "quantity", p.unit]);
   for (const st of o.edit.settings) f.push([`s:${st.name}`, st.name, st.value ?? "", st.text ? "text" : "number"]);
   return f;
 }
@@ -3315,9 +3376,9 @@ function editRows(o, row) {
   }
   // What was edited here and is not deployed yet, each with a way back.
   for (const c of editsPending(o.uuid)) {
-    const v = c.value == null ? '<span class="none-v">back to Loxone Config\'s value</span>' : esc(c.value);
+    const v = editValue(c);
     rows.push(row(editLabel(o, c), `<span class="ed-v">${v}</span><span class="ed-tag" title="Saved into the module and compiled, not on the Miniserver yet: Apply deploys it, Discard drops it">not deployed</span>` +
-      (st.ok ? `<button type="button" class="ed-btn small" data-ed="revert" data-key="${esc(editKey(c))}" title="${c.deployed == null ? "Hand the value back to Loxone Config" : `Back to ${esc(c.deployed)}, as deployed`}">Revert</button>` : ""), "pr-chg"));
+      (st.ok ? `<button type="button" class="ed-btn small" data-ed="revert" data-key="${esc(editKey(c))}" title="${c.deployed == null ? "Hand the value back to Loxone Config" : c.name === "Code" ? "Back to the program as deployed" : `Back to ${esc(c.deployed)}, as deployed`}">Revert</button>` : ""), "pr-chg"));
   }
   if (!st.ok) {
     rows.push(`<div class="ed-note">${esc(st.why)}${st.newest ? ' <button type="button" class="lnk" data-ed="newest">View it</button>' : ""}</div>`);
@@ -3333,8 +3394,11 @@ function editRows(o, row) {
         ? `<select ${attrs}>${editPlaces(kind).map(([t, n]) => `<option value="${esc(t)}"${t === v ? " selected" : ""}${n > 1 ? ' disabled title="Two of them have this title: rename one in Loxone Config to pick it"' : ""}>${esc(t)}</option>`).join("")}</select>`
         : kind === "choice" || kind === "on_off"
         ? `<select ${attrs}><option value="">as Loxone Config places it</option>${(kind === "on_off" ? ["on", "off"] : choices || []).map((c) => `<option${c === v ? " selected" : ""}>${esc(c)}</option>`).join("")}</select>`
-        : `<input ${attrs} value="${esc(v)}" ${kind === "number" || kind === "time" ? `inputmode="decimal" class="num"${kind === "time" ? ' placeholder="HH:MM"' : ""}` : kind === "duration" ? 'class="num" placeholder="5s"' : ""} autocomplete="off" spellcheck="false">`;
-      rows.push(`<div class="pr ed-row"><label class="k" for="${id}">${esc(label)}</label><div class="v">${input}` +
+        // After a line break: HTML drops the first one after <textarea>, so a program starting with a blank line keeps it.
+        : kind === "program"
+        ? `<textarea ${attrs} class="prog" rows="14" autocomplete="off" spellcheck="false" placeholder="Empty: Loxone Config's program">\n${esc(v)}</textarea>`
+        : `<input ${attrs} value="${esc(v)}" ${kind === "number" || kind === "time" ? `inputmode="decimal" class="num"${kind === "time" ? ' placeholder="HH:MM"' : ""}` : kind === "quantity" ? 'class="num" title="A number, or one with its unit: 30min, 250ms, 70%"' : kind === "duration" ? 'class="num" placeholder="5s"' : ""} autocomplete="off" spellcheck="false">`;
+      rows.push(`<div class="pr ed-row${kind === "program" ? " ed-prog" : ""}"><label class="k" for="${id}">${esc(label)}</label><div class="v">${input}` +
         (unit ? `<span class="ed-unit">${esc(unit)}</span>` : "") + (bad ? `<div class="ed-bad" id="${id}-e">${esc(bad)}</div>` : "") + "</div></div>");
     }
     rows.push(`<div class="ed-bar"><button type="button" class="primary small" data-ed="save"${mine.busy ? " disabled" : ""}>${mine.busy ? "Compiling…" : "Save"}</button>` +
@@ -3363,14 +3427,17 @@ async function editSave() {
   for (const [field, , now, kind] of editFields(o)) {
     const v = S.edit.draft[field];
     if (v == null || v === now) continue;
-    const t = kind === "number" || kind === "time" || kind === "duration" ? v.trim() : v;
+    const t = kind === "number" || kind === "quantity" || kind === "time" || kind === "duration" ? v.trim() : v;
     const [k, key] = field.split(/:(.*)/s);
     // On a block added here an empty setting is dropped: Loxone Config's value again.
     if (added && k === "s" && !t.trim()) { ops.push({ op: "setting", uuid: o.uuid, name: key, value: null }); continue; }
     if (kind === "number" && !EDIT_NUMBER.test(t)) { bad[field] = /,/.test(t) ? "Write a decimal point, not a comma." : "A number, like 12 or -2.5."; continue; }
+    if (kind === "quantity" && !EDIT_QUANTITY.test(t)) { bad[field] = /,/.test(t) ? "Write a decimal point, not a comma." : "A number, like 12 or -2.5, or one with its unit, like 30min."; continue; }
     if (kind === "time" && !AB_TIME.test(t)) { bad[field] = "A time of day, like 19:00."; continue; }
     if (kind === "duration" && !AB_DURATION.test(t.trim())) { bad[field] = "A duration, like 12h, 30min, 5s or 90 (seconds)."; continue; }
     if (field === "title" && !t.trim()) { bad[field] = "The name cannot be empty."; continue; }
+    // A program the block already runs, sent back unchanged but for line endings, changes nothing.
+    if (kind === "program" && t.replace(/\r\n/g, "\n") === (now ?? "").replace(/\r\n/g, "\n")) continue;
     ops.push(EDIT_ATTR[field] ? { op: field, uuid: o.uuid, value: t } : k === "p" ? { op: "param", uuid: o.uuid, port: key, value: t } : { op: "setting", uuid: o.uuid, name: key, value: t });
   }
   S.edit.bad = bad; S.edit.err = ""; S.edit.msg = "";
@@ -5731,8 +5798,8 @@ function abFields(t) {
   if (t.mirrors) return t.settings.map((s) => [`s:${s.name}`, s.name === "mirrors" ? "Notification" : s.name === "MinimumTime" ? "Minimum time" : s.name, s.kind, null, "", "main", s.kind === "notification" ? abNotifications() : s.choices]);
   const f = [["title", "Name", "text", null, "", "main"]];
   for (const s of t.settings) f.push([`s:${s.name}`, s.name, s.kind, null, "", "main", s.choices]);
-  for (const p of t.ports.filter((q) => q.dir === "param")) f.push([`p:${p.key}`, p.label ? `${p.name} (${p.label})` : p.name, "number", p.unit, p.default, "main"]);
-  for (const p of t.ports.filter((q) => q.dir === "input")) f.push([`p:${p.key}`, p.label ? `${p.name} (${p.label})` : p.name, "number", p.unit, p.default, "inputs"]);
+  for (const p of t.ports.filter((q) => q.dir === "param")) f.push([`p:${p.key}`, p.label ? `${p.name} (${p.label})` : p.name, "quantity", p.unit, p.default, "main"]);
+  for (const p of t.ports.filter((q) => q.dir === "input")) f.push([`p:${p.key}`, p.label ? `${p.name} (${p.label})` : p.name, "quantity", p.unit, p.default, "inputs"]);
   return f;
 }
 /** The push notifications of the config shown (Loxone Config's Messages), for a new notification block: [uuid, title]. */
@@ -5753,7 +5820,9 @@ function abForm() {
       ? `<select ${attrs}><option value="">${choices.length ? "Pick a push notification…" : "The config has no push notification: make one in Loxone Config (Messages)"}</option>${choices.map(([u, n]) => `<option value="${esc(u)}"${u === v ? " selected" : ""}>${esc(n)}</option>`).join("")}</select>`
       : kind === "choice" || kind === "on_off"
       ? `<select ${attrs}><option value="">as Loxone Config places it</option>${(kind === "on_off" ? ["on", "off"] : choices).map((c) => `<option${c === v ? " selected" : ""}>${esc(c)}</option>`).join("")}</select>`
-      : `<input ${attrs} value="${esc(v)}"${kind === "number" ? ` inputmode="decimal" class="num" placeholder="${esc(def)}"` : kind === "time" ? ' class="num" placeholder="HH:MM"' : kind === "duration" ? ' class="num" placeholder="5s"' : field === "title" ? ` placeholder="${esc(prettyType(t.type))}"` : ""} autocomplete="off" spellcheck="false">`;
+      : kind === "program"
+      ? `<textarea ${attrs} class="prog" rows="10" autocomplete="off" spellcheck="false" placeholder="Empty: Loxone Config's program">\n${esc(v)}</textarea>`
+      : `<input ${attrs} value="${esc(v)}"${kind === "number" || kind === "quantity" ? ` inputmode="decimal" class="num" placeholder="${esc(def)}"` : kind === "time" ? ' class="num" placeholder="HH:MM"' : kind === "duration" ? ' class="num" placeholder="5s"' : field === "title" ? ` placeholder="${esc(prettyType(t.type))}"` : ""} autocomplete="off" spellcheck="false">`;
     return `<div class="pr ed-row"><label class="k" for="${id}">${esc(label)}</label><div class="v">${input}${unit ? `<span class="ed-unit">${esc(unit)}</span>` : ""}${bad ? `<div class="ed-bad" id="${id}-e">${esc(bad)}</div>` : ""}</div></div>`;
   };
   const fs = abFields(t), main = fs.filter((f) => f[5] === "main"), inputs = fs.filter((f) => f[5] === "inputs");
@@ -5791,9 +5860,11 @@ async function abAdd() {
   if (!st?.ok || !t || AB.busy) return;
   const op = { op: "add_block", page: st.page.uuid, type: t.type, params: {}, settings: {} }, bad = {};
   for (const [field, , kind, , , , choices] of abFields(t)) {
-    const raw = AB.draft[field] ?? "", v = kind === "text" ? raw : raw.trim();
+    const raw = AB.draft[field] ?? "", v = kind === "text" || kind === "program" ? raw : raw.trim();
     if (v === "" && !(kind === "text" && raw !== "")) continue;
+    if (kind === "program" && !v.trim()) continue;
     if (kind === "number" && !EDIT_NUMBER.test(v)) { bad[field] = /,/.test(v) ? "Write a decimal point, not a comma." : "A number, like 12 or -2.5."; continue; }
+    if (kind === "quantity" && !EDIT_QUANTITY.test(v)) { bad[field] = /,/.test(v) ? "Write a decimal point, not a comma." : "A number, like 12 or -2.5, or one with its unit, like 30min."; continue; }
     if (kind === "time" && !AB_TIME.test(v)) { bad[field] = "A time of day, like 19:00."; continue; }
     if (kind === "duration" && !AB_DURATION.test(v)) { bad[field] = "A duration, like 12h, 30min, 5s or 90 (seconds)."; continue; }
     if (kind === "choice" && !choices.includes(v)) continue;

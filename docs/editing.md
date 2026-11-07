@@ -3,9 +3,9 @@
 vislox becomes an editor in steps: edit values (#58), add blocks (#59), move blocks, inputs and outputs (#60),
 make and change connections (#61), undo and redo (#62), adopt the blocks Loxone Config drew (#72), edit a
 Daytimer's switching times (#73), a lighting controller's moods (#74), a central block's members (#75), who may
-open an NFC Code Touch (#76), push notifications: who gets them and what they say (#77), and the tiles of a Touch
-Pure Flex (#78). This page is the design they share. #58 to #62, #72 to #78 are built; the rest says where each step
-plugs in.
+open an NFC Code Touch (#76), push notifications: who gets them and what they say (#77), the tiles of a Touch
+Pure Flex (#78), and a managed block's label and settings, its program among them (#79). This page is the design
+they share. #58 to #62, #72 to #79 are built; the rest says where each step plugs in.
 
 ## The rules
 
@@ -16,7 +16,7 @@ plugs in.
   Miniserver runs.
 - **vislox writes one place: its own files under the module directory**, `<module>/vislox/`: `edits.loxl` for
   the values it claims and the wires it draws, and one file per page for the blocks it adds
-  (`<module>/vislox/obergeschoss.loxl`).
+  (`<module>/vislox/obergeschoss.loxl`), and a file per program a block of them runs (`vx_code16_1.c`, #79).
   The rest of the module is never touched. A module that is one file cannot be edited from vislox.
   The exceptions are the lockfile: a move (#60), since lox keeps a managed block's position there, not in the
   source, so vislox writes it there the way lox's own `--relayout` does (see *Moving blocks*); and an adopted
@@ -216,8 +216,58 @@ unchanged in memory. lox has no structured edit command, so vislox works on what
   pending: Apply has nothing to deploy. The Deploy pane says how many blocks adopted here are not committed yet;
   they go into git with the next Apply. Undo hands them back; Discard (with something pending) drops them too.
 
-Later: #79 edits the settings lox takes only on a managed block, #80 deletes and renames adopted blocks, and
-taking out a wire an adopted declaration brought along is left to a later step.
+Later: #80 deletes and renames adopted blocks, and taking out a wire an adopted declaration brought along is left
+to a later step. Its label and settings are edited as for a block added here (#79, see *Block settings*).
+
+## Block settings (#79)
+
+Loxone Config keeps some of a block's settings on the block element rather than on a connector: a Formula's text,
+a PulseAt's time and pulse, a memory flag's type, a Daytimer's On and Off labels, the name the app shows (`Desc`),
+a meter's units, an automatic blind's *use sunshine*, a program block's program. lox takes them only in the
+declaration of a block the module manages (`lox logic adopt` lifts them; a claim on an extern is refused), so they
+are edited on a block of vislox's files: one added here (#59) or adopted (#72).
+
+```text
+vx_abends = PulseAt("Abends", Desc: "Licht abends", At: 06:58, Pulse: "time")
+vx_merker = Memory("Anrufer", Type: "text")
+vx_hue = Code16("Hue", Code: file("vx_hue.c"))
+vx_nachlauf = Monoflop("Nachlauf", Time: 30min)
+```
+
+- **The ops** are the ones values use: `title` for the label, `setting` (by the Lox Logic name, `At`, not `Sec`)
+  for a setting, `param` for a constant. `previous` is the value the declaration gave before (none: the binding
+  goes, and the block is as the base has it), so undo and Revert work as for any value. The settings each type
+  takes, with how each is written, are lox's table (`connectors::attr_params`, what `loxl types` lists), checked
+  before lox sees them: a time of day (`At: 06:58`), one of a few words (`Pulse:`, `Type:`), `on`/`off` (`Sun:`),
+  text (`Desc:`, `Formula:`, `On:`, `Off:`, the meter units; empty only for `On:`/`Off:`), a number (`MaxLvl:`).
+  An empty field drops the binding: Loxone Config's value again.
+- **The label** follows the rules a save applies: one line, no tab, not empty, and no character a Loxone Config
+  save would rewrite (`{`, `}`; `%`, `<`, `|` and spaces at either end become `_` on most types): the error says
+  what the save would write.
+- **A program** (`Code:` on a `Code16`) is a file of its own next to the block's file, `<module>/vislox/<slug>.c`,
+  named by `Code: file("<slug>.c")` (lox reads `file(…)` relative to the `.loxl` file that names it). The op's
+  value is the program's text, so `previous` and undo carry it; CRLF becomes LF, as lox reads the file. Edited, the
+  block keeps its file; dropped, the binding and the file go, and the block runs the program the base has
+  (Loxone Config's). A program file no block names, or a block whose program file is gone, is refused when vislox
+  reads its files, naming the file. An adopted program block runs Loxone Config's program until its program is
+  edited here: `lox logic adopt` never writes `Code:`.
+- **Units.** A constant is shown and edited as Lox Logic writes it: a port documented in milliseconds, seconds or
+  minutes with the largest of `h`, `min`, `s`, `ms` that gives a whole number and the same digits back (`1800` on
+  a seconds port is `30min`, `0.5` is `500ms`; zero and the other ports stay bare). A typed value may carry a unit
+  (`30min`, `250ms`, `70%`): a time on a time port (exactly, in the port's unit: `10s` on a minutes port is not),
+  `%`, `K` or `°` on a port in that unit, any on an undocumented port. It is written as typed (`Time: 30min`,
+  `x.Time = 1h` on a claim) and lox scales it. The same goes for a constant of a block Loxone Config drew (a claim)
+  and of a new block.
+- **Read-only elsewhere.** Properties has a *Settings* section on every block whose type has such settings, by
+  their Lox Logic names and values (`At 18:58`, `Pulse sunset`, a program folded to its line count), marked against
+  the compared revision (a program as a line diff); the raw attributes they are stored in leave *Advanced*. On a
+  block Loxone Config drew it says *Read-only: … Manage with Lox Logic to edit* (the adopt button of #72); on one
+  the module's own files manage, the file and line to change it in.
+- **The Changes list** reads them the same way: `Abends · At: 18:58 → 06:58`, `Abends · Pulse: time → sunset`,
+  `Hue · program: - … · + …` (the changed lines), `Nachlauf · Time: 30min → 1h`.
+- Not offered: the settings lox refuses by name (an alarm's members, a meter's `Rec=`, `StatsType=`, a room
+  controller's, `Task=`; see lox's `connectors::unclaimed_reason`), and any setting on a block the module does not
+  manage.
 
 ## Moving blocks (#60)
 
@@ -1108,6 +1158,7 @@ cannot express is left out, not worked around.
 | #77 recipients | `recipients vx_… end`, `x.recipients = vx_…` in `edits.loxl` | A Notification (an extern); users and groups by a title that names exactly one; Full access is never listed. |
 | #77 notification on a page | `slug = OutputRefLM(mirrors: vx_…, On: "…", Off: "…", MinimumTime: 12h)` | Mirrors a Notification Loxone Config made; no name, no constant; its `AI` wired with #61. |
 | #78 tiles | `tiles vx_… end`, `x.tiles = vx_…` in `edits.loxl` | A Touch Pure Flex (an extern `TreeDevice` with a tile layout); only the indices the layout has; targets API-linked externs or blocks added/adopted here; several devices may share a set. |
+| #79 block settings | `slug = Type("Label", At: 06:58, Desc: "…", Code: file("slug.c"))` | Only a block added or adopted here; a program in `<module>/vislox/<slug>.c`. Constants take a unit (`Time: 30min`, `x.Time = 1h`). |
 
 Blocks the module already manages (they are in the lockfile) are refused: they are edited in their own `.loxl`.
 The blocks vislox added or adopted (#72) are the exception: their `.loxl` is vislox's.
@@ -1116,8 +1167,8 @@ The blocks vislox added or adopted (#72) are the exception: their `.loxl` is vis
 
 - Parameters stored on the block element of a block the module does not manage: a Formula's text, a Daytimer's
   On/Off labels, a memory flag's type, a virtual input's Analog, MinVal, MaxVal and DefVal, and `Desc` on logic
-  blocks. lox takes them only in the declaration of a block it manages: adopt the block first (#72, built), then
-  edit it as a managed block (#79).
+  blocks. lox takes them only in the declaration of a block it manages: adopt the block first (#72), then edit it
+  as a managed block (#79, see *Block settings*). Properties shows them read-only until then.
 - A room or category on an object that has none.
 - Handing a value back after Apply: deleting a claim makes lox restore the value from before the claim, which
   undoes the applied change. So once applied, the module owns the value, and a later change in Loxone Config is
@@ -1141,10 +1192,10 @@ The blocks vislox added or adopted (#72) are the exception: their `.loxl` is vis
     the room controller, the irrigation, and the central light and shade blocks (the members of one the config
     has are edited here, #75);
   - every type outside lox's table (lox refuses it: "Refuse, never guess"), and templates (#83).
-- On a new block: a program's text (`Code:` takes only `file(…)`), a wire when it is added (draw it once it is
-  on the page, #61) or an expression on an input (#82),
-  a position when it is added (lox places it; it can be moved after), and a room or category (lox has no claim for them on a managed block). Its settings
-  (`Formula:`, `Type:`, `At:`, …) are given when it is added; changing them later is #79.
+- On a new block: a wire when it is added (draw it once it is on the page, #61) or an expression on an input (#82),
+  a position when it is added (lox places it; it can be moved after), and a room or category (lox has no claim for
+  them on a managed block). Its settings (`Formula:`, `Type:`, `At:`, a program, …) are given when it is added and
+  changed later in Properties (#79).
 - A block on a page whose title an earlier page has, and a new page (#88).
 - A push notification itself (lox never writes into *Messages*), and adopting a notification's block Loxone Config
   drew (`lox logic adopt` of an `OutputRefLM` fails in lox 0.83): its message is changed in Loxone Config (#77).
@@ -1170,7 +1221,7 @@ Each of these plugs in as new op kinds on `POST /api/edit`, written into `<modul
 | #76 (built) | NFC Code Touch access (`access`, `.access`) |
 | #77 (built) | notification recipients and messages (`recipients`, `OutputRefLM`) |
 | #78 (built) | Touch Pure Flex tiles (`tiles`, `.tiles`) |
-| #79 | a managed block's label and settings (`Desc:`, `Type:`, `Formula:`, `Code: file(…)`, …) |
+| #79 (built) | a managed block's label and settings (`Desc:`, `Type:`, `Formula:`, `Code: file(…)`, …), constants with units |
 | #80 | delete and rename managed blocks (`removed`, `moved`) |
 | #81 | `let` and `defaults` |
 | #82 | expressions and named signals |

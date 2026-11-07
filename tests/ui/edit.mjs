@@ -39,6 +39,24 @@ const ALWAYS = "40000016-0000-0000-ffff504f94000001", WERKTAGS = "40000017-0000-
 // access, so he gets every notification (inherited). Frostwarnung is drawn on the page Meldungen with its message.
 const FULL = "40000018-0000-0000-ffff504f94000001", FROST = "40000021-0000-0000-ffff504f94000001", REGEN = "40000022-0000-0000-ffff504f94000001";
 const MELDUNGEN = "40000030-0000-0000-ffff504f94000001", WARN = "40000031-0000-0000-ffff504f94000001";
+// Block settings (#79): a page Zeiten that Loxone Config drew, with a PulseAt firing at 18:58, a program block
+// (Code16) and a Monoflop whose Time is 1800 s.
+const ZEITEN = "50000000-0000-0000-ffff504f94000001", PULSE = "50000001-0000-0000-ffff504f94000001";
+const HUE = "50000002-0000-0000-ffff504f94000001", NACH = "50000003-0000-0000-ffff504f94000001";
+const zeitenXml = `\t\t<C Type="Page" V="178" U="${ZEITEN}" Title="Zeiten" WF="16384">
+\t\t\t<C Type="PulseAt" V="178" U="${PULSE}" Title="Abends" Px="960" Py="960" Px2="2304" Py2="1656" Cl="141,255,112" Nio="1" WF="16384" Typ="0" Sec="68280">
+\t\t\t\t<Co K="Q" U="50000001-0000-0001-ffff504f94000001"/>
+\t\t\t</C>
+\t\t\t<C Type="Code16" V="178" U="${HUE}" Title="Hue" Px="960" Py="2880" Px2="2304" Py2="3576" Cl="141,255,112" Nio="1" WF="16384" Code="setoutput(0, 1);" Task="1">
+\t\t\t\t<Co K="AQ1" U="50000002-0000-0001-ffff504f94000001"/>
+\t\t\t</C>
+\t\t\t<C Type="Monoflop" V="178" U="${NACH}" Title="Nachlauf Zeit" Px="960" Py="4800" Px2="2304" Py2="5496" Cl="141,255,112" Nio="4" WF="16384">
+\t\t\t\t<Co K="InputTrigger" U="50000003-0000-0001-ffff504f94000001"/>
+\t\t\t\t<Co K="Time" Def="1800" U="50000003-0000-0002-ffff504f94000001"/>
+\t\t\t\t<Co K="Q" U="50000003-0000-0003-ffff504f94000001"/>
+\t\t\t</C>
+\t\t</C>
+`;
 const usersXml = `\t\t<C Type="LoxCaption" V="178" U="40000010-0000-0000-ffff504f94000001" Title="Users and Permissions" CaptionType="20" SubType="20">
 \t\t\t<C Type="User" V="178" U="${ANNA}" Title="Anna" UsR="-1" NFCArr="0A1B2C3D4E5F" CodeArr="00112233">
 \t\t\t\t<PH NUM="2">
@@ -176,7 +194,7 @@ const base0 = readFileSync(fixture, "utf8").replace('<Co K="Q" U="10000009-0000-
     "\t\t</C>\n" +
     `\t\t<C Type="Page" V="178" U="${MELDUNGEN}" Title="Meldungen" WF="16384">\n` +
     `\t\t\t<C Type="OutputRefLM" V="178" U="${WARN}" Title="Frostwarnung" Px="960" Py="960" Px2="2304" Py2="1656" Cl="0,0,0" Nio="2" Ref="${FROST}"><Co K="AI" U="40000031-0000-0001-ffff504f94000001"/><Co K="AQ" U="40000031-0000-0002-ffff504f94000001"/><LoggerMailer RefNotification="${FROST}" On="Frost im Garten" MinimumTime="43200000" NL="1"/></C>\n` +
-    "\t\t</C>\n\t</C>\n</ControlList>");
+    "\t\t</C>\n" + zeitenXml + "\t</C>\n</ControlList>");
 const base = base0.replace(`\t\t<C Type="Place" V="178" U="${KITCHEN}"`, `${flexXml}\t\t<C Type="Place" V="178" U="${KITCHEN}"`)
   .replace(`\t\t<C Type="Page" V="178" U="${MELDUNGEN}"`, `${beschXml}\t\t<C Type="Page" V="178" U="${MELDUNGEN}"`);
 assert.ok(base.includes(FLEX) && base.includes(OST), "the Touch Pure Flex is in the base");
@@ -310,6 +328,19 @@ const src = fs.existsSync(file) ? fs.readFileSync(file, "utf8") : "";
 const slugs = {};
 const KEYS = { In1: "Input1", In2: "Input2", Trigger: "InputTrigger" };
 const unq = (v) => v.startsWith('"') ? JSON.parse(v) : v;
+// A constant with a unit (#79), in the port's seconds as lox writes it: 30min is 1800.
+const scale = (v) => { const m = v.match(/^(-?[\\d.]+)(ms|s|min|h|%|K|°)$/); return m ? String(+m[1] * ({ ms: 0.001, min: 60, h: 3600 }[m[2]] ?? 1)) : v; };
+// The block settings (#79) of a declaration's arguments, as the attributes lox writes: \`At: 06:58\` is Sec="25080",
+// \`Code: file("x.c")\` the program in pages/vislox/x.c. Only those the declaration binds.
+const settingAttrs = (rest) => {
+  const a = {};
+  const at = rest.match(/\\bAt: (\\d\\d):(\\d\\d)/);
+  if (at) a.Sec = String(+at[1] * 3600 + +at[2] * 60);
+  const code = rest.match(/\\bCode: file\\("([^"]+)"\\)/);
+  if (code) a.Code = fs.readFileSync("pages/vislox/" + code[1], "utf8").replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
+  return a;
+};
+const withAttrs = (line, a) => Object.entries(a).reduce((l, [k, v]) => l.replace(new RegExp(\` \${k}="[^"]*"\`), "").replace(/^(\\s*<C [^>]*?)(\\/?>)/, \`$1 \${k}="\${v}"$2\`), line);
 const xml = (v) => v.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
 const claimed = [];
 for (const line of src.split("\\n")) {
@@ -328,7 +359,7 @@ for (const line of src.split("\\n")) {
   }
   const key = KEYS[m[2]] || m[2];
   const j = out.findIndex((l, n) => n > i && l.includes(\`<Co K="\${key}"\`));
-  out[j] = out[j].replace(/ Def="[^"]*"/, "").replace(\`<Co K="\${key}"\`, \`<Co K="\${key}" Def="\${unq(m[3])}"\`);
+  out[j] = out[j].replace(/ Def="[^"]*"/, "").replace(\`<Co K="\${key}"\`, \`<Co K="\${key}" Def="\${scale(unq(m[3]))}"\`);
 }
 // Switching times (#73): each \`schedule\` set of vislox's file, written onto the timers its claims name as lox
 // writes them: a column per mode the set names and the seven weekdays, in \`Mode=\` order, an <Entry> per interval.
@@ -442,6 +473,7 @@ for (const f of fs.existsSync("pages/vislox") ? fs.readdirSync("pages/vislox") :
       objects[slug] = { ...lock.objects[slug] };
       const t = rest.match(/^"((?:[^"\\\\]|\\\\.)*)"/);
       if (t) out[k] = out[k].replace(/Title="[^"]*"/, \`Title="\${xml(JSON.parse('"' + t[1] + '"'))}"\`);
+      out[k] = withAttrs(out[k], settingAttrs(rest));
       continue;
     }
     const uuid = lock.objects[slug]?.uuid || \`bbbbbb\${String(++n).padStart(2, "0")}-0000-0000-ffff504f94000001\`;
@@ -458,8 +490,8 @@ for (const f of fs.existsSync("pages/vislox") ? fs.readdirSync("pages/vislox") :
       continue;
     }
     const title = rest.match(/^"((?:[^"\\\\]|\\\\.)*)"/);
-    const cos = [...rest.matchAll(/(\\w+): (-?[\\d.]+)/g)].map(([, k, v], i) => \`<Co K="\${KEYS[k] || k}" Def="\${v}" U="\${uuid.slice(0, 9)}0000-00\${i}0-ffff504f94000001"/>\`);
-    out.splice(pageAt + 1, 0, \`\\t\\t\\t<C Type="\${ty}" V="178" U="\${uuid}" Title="\${xml(title ? JSON.parse('"' + title[1] + '"') : slug)}" Px="96" Py="96" Px2="1440" Py2="792" Nio="2">\${cos.join("")}</C>\`);
+    const cos = [...rest.matchAll(/(\\w+): (-?[\\d.]+(?:ms|s|min|h|%|K|°)?)(?=[,)]|$)/g)].map(([, k, v], i) => \`<Co K="\${KEYS[k] || k}" Def="\${scale(v)}" U="\${uuid.slice(0, 9)}0000-00\${i}0-ffff504f94000001"/>\`);
+    out.splice(pageAt + 1, 0, withAttrs(\`\\t\\t\\t<C Type="\${ty}" V="178" U="\${uuid}" Title="\${xml(title ? JSON.parse('"' + title[1] + '"') : slug)}" Px="96" Py="96" Px2="1440" Py2="792" Nio="2">\${cos.join("")}</C>\`, settingAttrs(rest)));
   }
 }
 // The blocks the rest of the module manages stay in the lock, with the titles their files give them.
@@ -2167,6 +2199,135 @@ try {
     assert.deepEqual(ops, [{ op: "tiles", uuid: FLEX, value: null }]);
     assert.doesNotMatch(existsSync(join(dir, "pages", "vislox", "edits.loxl")) ? file() : "", /tiles|70000012/);
     await page.waitForFunction(() => /Nothing pending/.test(document.querySelector("#deploy-pend")?.textContent || ""), null, { timeout: 15000 });
+  });
+  await step("block settings read as Lox Logic writes them; a constant takes its unit (#79)", async () => {
+    await page.waitForFunction(() => /Nothing pending/.test(document.querySelector("#deploy-pend")?.textContent || ""), null, { timeout: 15000 });
+    await page.evaluate(() => editGoNewest());
+    await settled();
+    const sets = '#props [data-body="Settings"]';
+    // Drawn in Loxone Config: shown by their Lox Logic names, read-only until the module manages the block.
+    await pick(PULSE);
+    await waitText(sets, /At\s*18:58[\s\S]*Pulse\s*time[\s\S]*Read-only[\s\S]*Manage with Lox Logic to edit/);
+    assert.doesNotMatch(await page.textContent('#props [data-body="Advanced"]').catch(() => ""), /\bSec\b|\bTyp\b/);
+    await pick(HUE);
+    await waitText(sets, /Program\s*1 line/);
+    // A constant as Lox Logic writes it: 1800 s is 30min, and the form starts from that.
+    await pick(NACH);
+    await waitText('#props [data-body="Parameters"]', /Time\s*30min/);
+    await page.click('#props [data-ed="open"]');
+    assert.equal(await page.inputValue(field("p:Time")), "30min");
+    // A unit the port is not in: the server says so, and nothing changes.
+    await page.fill(field("p:Time"), "70%");
+    await page.press(field("p:Time"), "Enter");
+    await waitText("#props", /Time: `70%`: the port is in seconds/);
+    await page.fill(field("p:Time"), "1h");
+    const n = edits.length;
+    await page.press(field("p:Time"), "Enter");
+    await until(() => edits.length > n && statuses[n] !== undefined, "the param request");
+    assert.equal(statuses[n], 200);
+    assert.deepEqual(edits[n].ops, [{ op: "param", uuid: NACH, port: "Time", value: "1h" }]);
+    await settled();
+    const claims = () => readFileSync(join(dir, "pages", "vislox", "edits.loxl"), "utf8");
+    assert.match(claims(), /^vx_50000003_0000_0000_ffff504f94000001\.Time = 1h$/m);
+    await page.waitForFunction((u) => S.view.objects[u].ports.find((p) => p.key === "Time").def === "3600", NACH, { timeout: 10000 });
+    await waitText('#props [data-body="Parameters"]', /Time\s*30min\s*1h/);
+    await waitText('#props [data-body="Edit"]', /Time\s*1h\s*not deployed/);
+    assert.ok((await page.evaluate(() => S.view.changes.map((c) => c.text))).includes("Nachlauf Zeit · Time: 30min → 1h"));
+    const ops = await undoKey(false, (u) => S.view.objects[u].ports.find((p) => p.key === "Time").def === "1800", NACH);
+    assert.deepEqual(ops, [{ op: "param", uuid: NACH, port: "Time", value: null }]);
+  });
+  await step("a managed block's settings and program are edited, reviewed as Lox Logic writes them, and undone (#79)", async () => {
+    await page.waitForFunction(() => /Nothing pending/.test(document.querySelector("#deploy-pend")?.textContent || ""), null, { timeout: 15000 });
+    const sets = '#props [data-body="Settings"]';
+    const zeiten = () => readFileSync(join(dir, "pages", "vislox", "zeiten.loxl"), "utf8");
+    const adopt = async (u, slug) => {
+      await pick(u);
+      await page.waitForSelector('#props [data-ed="adopt-open"]:not([disabled])');
+      await page.click('#props [data-ed="adopt-open"]');
+      await page.fill("#ad-slug", slug);
+      await page.click('#props [data-ed="adopt"]');
+      await page.waitForFunction((x) => S.edits?.blocks?.some((b) => b.uuid === x && b.adopted), u, { timeout: 20000 });
+      await settled();
+    };
+    // Adopted, the PulseAt's time is edited in its declaration.
+    await adopt(PULSE, "vx_abends");
+    await page.waitForFunction(() => !/Read-only/.test(document.querySelector('#props [data-body="Settings"]')?.textContent || ""), null, { timeout: 10000 });
+    await page.click('#props [data-ed="open"]');
+    const fields = await page.$$eval("#props [data-ed-field]", (x) => x.map((f) => f.dataset.edField));
+    assert.ok(fields.includes("s:At") && fields.includes("s:Pulse") && fields.includes("s:Desc"), fields.join(" "));
+    await page.fill(field("s:At"), "06:58");
+    let n = edits.length;
+    await page.press(field("s:At"), "Enter");
+    await until(() => edits.length > n && statuses[n] !== undefined, "the At request");
+    assert.equal(statuses[n], 200);
+    assert.deepEqual(edits[n].ops, [{ op: "setting", uuid: PULSE, name: "At", value: "06:58" }]);
+    await settled();
+    assert.match(zeiten(), /^vx_abends = PulseAt\("Abends", At: 06:58\)$/m);
+    await waitText(sets, /At\s*18:58\s*06:58/);
+    assert.ok((await page.evaluate(() => S.view.changes.map((c) => c.text))).includes("Abends · At: 18:58 → 06:58"));
+    await undoKey(false, (u) => S.view.objects[u].settings.find((x) => x.name === "At").value === "18:58", PULSE);
+    await undoKey(false, (u) => !S.edits?.blocks?.some((b) => b.uuid === u), PULSE);
+    // Adopted, the program block's program is edited in a file of its own.
+    await adopt(HUE, "vx_hue");
+    await page.click('#props [data-ed="open"]');
+    await page.waitForSelector('#props textarea[data-ed-field="s:Code"]');
+    // It starts from the program the block runs.
+    assert.equal(await page.inputValue(field("s:Code")), "setoutput(0, 1);");
+    // A program Loxone Config wrote with CRLF, saved unchanged (the text area shows LF): nothing is sent, and the
+    // program stays Loxone Config's.
+    const code = await page.evaluate((u) => S.view.objects[u].settings.find((x) => x.name === "Code").value, HUE);
+    await page.evaluate((u) => { S.view.objects[u].settings.find((x) => x.name === "Code").value = "setoutput(0, 1);\r\nsetoutput(2, 0);"; }, HUE);
+    await page.click('#props [data-ed="cancel"]');
+    await page.click('#props [data-ed="open"]');
+    await page.fill(field("s:Code"), "setoutput(0, 1);\nsetoutput(2, 0);");
+    n = edits.length;
+    await page.click('#props [data-ed="save"]');
+    await waitText("#props", /Nothing changed\./);
+    assert.equal(edits.length, n);
+    await page.click('#props [data-ed="cancel"]');
+    await page.evaluate(([u, c]) => { S.view.objects[u].settings.find((x) => x.name === "Code").value = c; }, [HUE, code]);
+    await page.click('#props [data-ed="open"]');
+    assert.equal(await page.inputValue(field("s:Code")), "setoutput(0, 1);");
+    // Enter is a line break in a program; Ctrl+Enter saves.
+    await page.click(field("s:Code"));
+    await page.keyboard.press("End");
+    await page.keyboard.press("Enter");
+    await page.keyboard.type("setoutput(1, 0);");
+    n = edits.length;
+    await page.keyboard.press("Control+Enter");
+    await until(() => edits.length > n && statuses[n] !== undefined, "the program request");
+    assert.equal(statuses[n], 200);
+    assert.deepEqual(edits[n].ops, [{ op: "setting", uuid: HUE, name: "Code", value: "setoutput(0, 1);\nsetoutput(1, 0);" }]);
+    await settled();
+    assert.match(zeiten(), /^vx_hue = Code16\("Hue", Code: file\("vx_hue\.c"\)\)$/m);
+    assert.equal(readFileSync(join(dir, "pages", "vislox", "vx_hue.c"), "utf8"), "setoutput(0, 1);\nsetoutput(1, 0);");
+    // Reviewed as a line diff, in Properties and the change list; the Edit section names it by its size.
+    await page.waitForSelector(`${sets} .prog-diff .pd.new`);
+    assert.match(await page.textContent(`${sets} .prog-diff`), /\+ setoutput\(1, 0\);/);
+    await waitText('#props [data-body="Edit"]', /Program\s*edited here, 2 lines\s*not deployed/);
+    const changes = await page.evaluate(() => S.view.changes.map((c) => c.text));
+    assert.ok(changes.some((c) => /^Hue · program: .*\+ setoutput\(1, 0\);/.test(c)), changes.join(" | "));
+    // A program that starts with a blank line keeps it, saved and shown again in the form.
+    await page.click('#props [data-ed="open"]');
+    assert.equal(await page.inputValue(field("s:Code")), "setoutput(0, 1);\nsetoutput(1, 0);");
+    await page.fill(field("s:Code"), "\nsetoutput(0, 1);\nsetoutput(1, 0);");
+    n = edits.length;
+    await page.click('#props [data-ed="save"]');
+    await until(() => edits.length > n && statuses[n] !== undefined, "the blank-line request");
+    assert.equal(statuses[n], 200);
+    assert.equal(edits[n].ops[0].value, "\nsetoutput(0, 1);\nsetoutput(1, 0);");
+    await settled();
+    assert.equal(readFileSync(join(dir, "pages", "vislox", "vx_hue.c"), "utf8"), "\nsetoutput(0, 1);\nsetoutput(1, 0);");
+    await page.waitForFunction((u) => S.edits?.blocks?.find((b) => b.uuid === u)?.settings?.find((x) => x.name === "Code")?.value?.startsWith("\n"), HUE, { timeout: 10000 });
+    await page.click('#props [data-ed="open"]');
+    assert.equal(await page.inputValue(field("s:Code")), "\nsetoutput(0, 1);\nsetoutput(1, 0);");
+    await page.click('#props [data-ed="cancel"]');
+    await undoKey(false, (u) => S.view.objects[u].settings.find((x) => x.name === "Code").value === "setoutput(0, 1);\nsetoutput(1, 0);", HUE);
+    // Undone: the binding and its file go, and the block runs Loxone Config's program again.
+    const ops = await undoKey(false, (u) => S.view.objects[u].settings.find((x) => x.name === "Code").value === "setoutput(0, 1);", HUE);
+    assert.deepEqual(ops, [{ op: "setting", uuid: HUE, name: "Code", value: null }]);
+    assert.equal(existsSync(join(dir, "pages", "vislox", "vx_hue.c")), false);
+    await undoKey(false, (u) => !S.edits?.blocks?.some((b) => b.uuid === u), HUE);
   });
   await step("nothing was deployed: lox only compiled, checked, linted and tested", async () => {
     const ran = readFileSync(calls, "utf8").trim().split("\n");

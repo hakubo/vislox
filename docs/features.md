@@ -434,6 +434,16 @@ sends to the Miniserver see [miniserver.md](miniserver.md).
   command, text and targets (picked from the linked blocks) and writes a Lox Logic `tiles` set and the device's
   claim. The layout and the API link stay with Loxone Config. How: [editing.md](editing.md#tiles-of-a-touch-pure-flex-78).
 
+- **Block settings** (#79): Properties has *Settings* on a block whose type keeps settings on its element, by their
+  Lox Logic names and as Lox Logic writes them: a PulseAt's *At 18:58* and *Pulse sunset*, a memory flag's *Type*,
+  a Daytimer's *On*/*Off*, the name the app shows (*Desc*), a meter's units, a program block's program (folded to
+  its line count). Compared with another revision they are marked old → new, a program as a line diff; the Changes
+  list says the same (`Abends · At: 18:58 → 06:58`, `Hue · program: + …`). A constant reads with its unit
+  (`Time 30min`, not 1800). On a block the module manages through vislox (added or adopted) *Edit values* edits the
+  label, the settings and the program (a text area; Ctrl+Enter saves), and a constant takes a unit (`1h`); the
+  program goes into a file of its own next to the block's. On a block Loxone Config drew they are read-only: *Manage
+  with Lox Logic* adopts it first. How: [editing.md](editing.md#block-settings-79).
+
 For a `lox.toml` project:
 
 ```bash

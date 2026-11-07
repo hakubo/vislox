@@ -83,8 +83,13 @@ impl ModuleFiles {
     pub fn refresh(&mut self, root: &Path, module: &Path) -> Vec<(String, String)> {
         let mut paths = Vec::new();
         if module.is_dir() {
+            // The `.loxl` files, and the programs of vislox's blocks (#79): a
+            // hand edit of one changes what `/api/edits` says.
+            let dir = module.join(crate::edit::DIR);
             crate::edit::module_files(module, &mut |f, _| {
-                if f.extension().is_some_and(|x| x == "loxl") {
+                let program = f.parent() == Some(dir.as_path())
+                    && f.to_string_lossy().ends_with(crate::edit::PROGRAM_EXT);
+                if f.extension().is_some_and(|x| x == "loxl") || program {
                     paths.push(f.to_path_buf());
                 }
             });
@@ -157,10 +162,13 @@ impl ModuleFiles {
         (!all.is_empty()).then(|| crate::history::blob_id(all.join("\n").as_bytes()))
     }
 
-    /// Each file's shown path and text, as last refreshed.
+    /// Each `.loxl` file's shown path and text, as last refreshed (the
+    /// programs only count towards [`ModuleFiles::key`]).
     pub fn texts(&self) -> Vec<(String, Arc<str>)> {
         self.files
-            .values()
+            .iter()
+            .filter(|(p, _)| p.extension().is_some_and(|x| x == "loxl"))
+            .map(|(_, e)| e)
             .map(|e| (e.rel.clone(), e.text.clone()))
             .collect()
     }
@@ -921,6 +929,29 @@ mod tests {
         set(now);
         m.refresh(root, &root.join("pages"));
         assert_eq!(&*m.texts()[0].1, "d = Or()\n");
+    }
+
+    /// A program of vislox's blocks (#79) counts towards the key, so a hand
+    /// edit of it is seen; it is no `.loxl` text.
+    #[test]
+    fn a_program_of_vislox_changes_the_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let dir = root.join("pages").join(crate::edit::DIR);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("p.loxl"), "page \"P\"\n").unwrap();
+        std::fs::write(dir.join("vx_hue.c"), "int a;\n").unwrap();
+        // Elsewhere in the module, a `.c` is no program of vislox's.
+        std::fs::write(root.join("pages").join("other.c"), "x").unwrap();
+        let lock = root.join("lock.json");
+        let mut m = ModuleFiles::default();
+        let first = m.key(root, &root.join("pages"), &lock);
+        assert_eq!(m.texts().len(), 1);
+        std::fs::write(dir.join("vx_hue.c"), "int b;\n").unwrap();
+        assert_ne!(m.key(root, &root.join("pages"), &lock), first);
+        let second = m.key(root, &root.join("pages"), &lock);
+        std::fs::write(root.join("pages").join("other.c"), "y").unwrap();
+        assert_eq!(m.key(root, &root.join("pages"), &lock), second);
     }
 
     #[test]

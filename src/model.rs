@@ -6,6 +6,7 @@ use crate::calendar::{self, EntryDate};
 use crate::hardware;
 use crate::rights;
 use crate::schedule;
+use loxone_config::connectors;
 use loxone_config::diff::{self, DocDiff};
 use loxone_config::doc::{LoxoneDoc, PortView, WireView, ports};
 use loxone_config::layout::{GRID, GeoObject, Layout, PageGeometry, ROW, Shape, Side};
@@ -233,6 +234,10 @@ pub struct ObjInfo {
     pub app_old: Option<InApp>,
     pub app_changed: bool,
     pub attrs: Vec<AttrInfo>,
+    /// The block settings Lox Logic names (#79): `At:` as a time of day,
+    /// `Pulse:` and `Type:` by their word, a program's text.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub settings: Vec<SettingInfo>,
     pub ports: Vec<PortInfo>,
     /// Ref tags that mirror this object: (page uuid, ref object uuid).
     pub mirrored_by: Vec<[String; 2]>,
@@ -918,12 +923,33 @@ pub struct AttrInfo {
     pub hw: bool,
 }
 
+/// A block setting (#79), as Lox Logic names and writes it.
+#[derive(Serialize, Debug, PartialEq)]
+pub struct SettingInfo {
+    /// Its Lox Logic name (`At`, `Pulse`, `Code`).
+    pub name: String,
+    /// The attribute it is stored in (`Sec`, `Typ`, `Code`).
+    pub attr: String,
+    /// How it is written (`time`, `choice`, `program`, …).
+    pub kind: Option<crate::blocks::Kind>,
+    /// Readable: `19:00`, `sunset`, the program's text. `None`: not set.
+    pub value: Option<String>,
+    pub old: Option<String>,
+    pub changed: bool,
+}
+
 #[derive(Serialize)]
 pub struct PortInfo {
     pub key: String,
     pub uuid: String,
     pub name: String,
     pub def: Option<String>,
+    /// `def` with the unit Lox Logic writes it with (`30min` for 1800 s),
+    /// where it has one (#79).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub def_text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub old_def_text: Option<String>,
     pub old_def: Option<String>,
     pub def_changed: bool,
     pub inv: bool,
@@ -2465,10 +2491,18 @@ fn obj_info(
             }
         }
         let k = (uuid.to_string(), p.key.clone());
+        let old_def: Option<String> = d.params.get(&k).cloned().flatten();
+        let text = |v: &Option<String>| {
+            v.as_deref()
+                .map(|v| crate::units::shown(&ty, &p.key, v))
+                .filter(|t| Some(t.as_str()) != v.as_deref())
+        };
         port_infos.push(PortInfo {
             name: port_names::name_of(&ty, &p.key).to_string(),
             def_changed: d.on && d.params.contains_key(&k),
-            old_def: d.params.get(&k).cloned().flatten(),
+            def_text: text(&p.def),
+            old_def_text: text(&old_def),
+            old_def,
             def: p.def.clone(),
             inv: p.inv,
             uuid: p.uuid.clone(),
@@ -2510,6 +2544,7 @@ fn obj_info(
         app_changed: app_changed && !gone,
         app_old: app_old.filter(|_| app_changed && !gone),
         app,
+        settings: settings_of(&ty, &attrs),
         attrs,
         ports: port_infos,
         mirrored_by: c.mirrors.get(uuid).cloned().unwrap_or_default(),
@@ -2688,8 +2723,12 @@ fn changes(view: &mut View, nc: &Ctx, oc: &Ctx, d: &Delta) {
                     "{} · {}: {} → {}",
                     nc.title(&u),
                     port_names::name_of(&ty, key),
-                    old.as_deref().unwrap_or("—"),
-                    new.as_deref().unwrap_or("—")
+                    old.as_deref()
+                        .map(|v| crate::units::shown(&ty, key, v))
+                        .unwrap_or("—".into()),
+                    new.as_deref()
+                        .map(|v| crate::units::shown(&ty, key, v))
+                        .unwrap_or("—".into())
                 ),
                 page: page_for(&u),
                 obj: Some(u.clone()),
@@ -3133,11 +3172,29 @@ fn attr_change_text(
     old: Option<&str>,
     new: Option<&str>,
 ) -> String {
+    // A block setting (#79) reads as Lox Logic writes it: `At: 18:58 →
+    // 06:58`, `Pulse: time → sunset`, the program as a line diff.
+    if let Some(param) = connectors::attr_param(ty, name) {
+        // An absent attribute reads as absent (`—`), not as its default.
+        let text = |v: Option<&str>| v.and_then(|v| setting_text(ty, param, Some(v)));
+        let (o, n) = (text(old), text(new));
+        let label = if connectors::file_params(ty).contains(&param) {
+            "program"
+        } else {
+            param
+        };
+        return attr_text(title, label, o.as_deref(), n.as_deref());
+    }
     let label = if ty == "Text" && name == "Text" {
         "note"
     } else {
         name
     };
+    attr_text(title, label, old, new)
+}
+
+/// `title · label: old → new`, or the changed lines of a long text.
+fn attr_text(title: &str, label: &str, old: Option<&str>, new: Option<&str>) -> String {
     let long = |v: Option<&str>| v.is_some_and(|v| v.contains('\n') || v.chars().count() > 40);
     if !(long(old) || long(new)) {
         return format!("{title} · {label}: {} → {}", short(old), short(new));
@@ -3154,6 +3211,72 @@ fn attr_change_text(
     } else {
         format!("{title} · {label}: {}", lines.join(" · "))
     }
+}
+
+/// The block settings of a block of type `ty` (#79), from its attributes:
+/// every attribute parameter of lox's table, set or not.
+fn settings_of(ty: &str, attrs: &[AttrInfo]) -> Vec<SettingInfo> {
+    // A push notification's message has a section of its own (#77).
+    if ty == crate::blocks::MESSAGE_REF {
+        return Vec::new();
+    }
+    connectors::attr_params(ty)
+        .into_iter()
+        .map(|param| {
+            let attr = connectors::attr_name(ty, param);
+            let a = attrs.iter().find(|a| a.name == attr);
+            let value = a.and_then(|a| a.value.as_deref());
+            let old = a.filter(|a| a.changed).and_then(|a| a.old.as_deref());
+            SettingInfo {
+                name: param.to_string(),
+                attr: attr.to_string(),
+                kind: crate::blocks::setting_kind(ty, param),
+                value: setting_text(ty, param, value),
+                // An attribute the compared revision did not have reads as
+                // absent (`— → new`), as Advanced shows it, not as its default.
+                old: old
+                    .and_then(|o| setting_text(ty, param, Some(o)))
+                    .filter(|_| a.is_some_and(|a| a.changed)),
+                changed: a.is_some_and(|a| a.changed),
+            }
+        })
+        .collect()
+}
+
+/// A block setting's stored value (`stored`: its attribute, `None` when the
+/// block has none) as Lox Logic writes it: `At:` seconds since midnight as
+/// `19:00`, a choice's code as its word, a text boolean as `on`/`off`. An
+/// attribute a save leaves out reads as what a save means by that.
+pub fn setting_text(ty: &str, param: &str, stored: Option<&str>) -> Option<String> {
+    let attr = connectors::attr_name(ty, param);
+    let v = stored.or_else(|| connectors::attr_save_default(ty, attr));
+    if connectors::bool_params(ty).contains(&param) {
+        return match v {
+            Some("true") => Some("on".into()),
+            Some("false") => Some("off".into()),
+            None if connectors::omitted_when_off(ty, attr) => Some("off".into()),
+            other => other.map(String::from),
+        };
+    }
+    let v = v?;
+    if connectors::clock_params(ty).contains(&param) {
+        return Some(
+            v.trim()
+                .parse::<u32>()
+                .ok()
+                .and_then(loxone_config::logic::clock_text)
+                .unwrap_or_else(|| v.to_string()),
+        );
+    }
+    if let Some(c) = connectors::choice_values(ty, param) {
+        return Some(
+            c.iter()
+                .find(|(_, code)| *code == v)
+                .map(|(w, _)| w.to_string())
+                .unwrap_or_else(|| v.to_string()),
+        );
+    }
+    Some(v.to_string())
 }
 
 fn short(s: Option<&str>) -> String {
@@ -3434,6 +3557,113 @@ mod tests {
 
     fn doc(src: &str) -> LoxoneDoc {
         LoxoneDoc::parse(src.as_bytes()).expect("fixture parses")
+    }
+
+    /// The house with a PulseAt, a program block and a Monoflop, set as given.
+    fn with_settings(sec: &str, typ: &str, code: &str, time: &str) -> String {
+        let blocks = format!(
+            r#"<C Type="PulseAt" V="178" U="30000001-0000-0010-ffff504f94000003" Title="Abends" Px="960" Py="7000" Px2="2000" Py2="7600" Typ="{typ}" Sec="{sec}"><Co K="Q" U="30000001-0000-0011-00ff504f94000003"/></C>
+			<C Type="Code16" V="178" U="30000002-0000-0020-ffff504f94000003" Title="Hue" Px="960" Py="8000" Px2="2000" Py2="8600" Code="{code}" Task="1"><Co K="AQ1" U="30000002-0000-0021-00ff504f94000003"/></C>
+			<C Type="Monoflop" V="178" U="30000003-0000-0030-ffff504f94000003" Title="Nachlauf" Px="960" Py="9000" Px2="2000" Py2="9600"><Co K="Time" Def="{time}" U="30000003-0000-0031-00ff504f94000003"/></C>
+			"#
+        );
+        let at = HOUSE.find("<C Type=\"Text\"").unwrap();
+        format!("{}{blocks}{}", &HOUSE[..at], &HOUSE[at..])
+    }
+
+    /// A block's settings (#79) read as Lox Logic writes them, in Properties
+    /// and in the change list: `At:` as a time of day, `Pulse:` by its word,
+    /// the program as a line diff, a time constant with its unit.
+    #[test]
+    fn block_settings_read_as_lox_logic_writes_them() {
+        const PA: &str = "30000001-0000-0010-ffff504f94000003";
+        const CODE: &str = "30000002-0000-0020-ffff504f94000003";
+        const MF: &str = "30000003-0000-0030-ffff504f94000003";
+        let old = doc(&with_settings("68280", "0", "a\nb\nc", "1800"));
+        let v = build(&old, None, "");
+        let at = |o: &ObjInfo, n: &str| o.settings.iter().find(|s| s.name == n).cloned_info();
+        let pa = &v.objects[PA];
+        assert_eq!(at(pa, "At"), (Some("18:58".into()), None, false));
+        assert_eq!(at(pa, "Pulse"), (Some("time".into()), None, false));
+        // `Desc:` is offered on a PulseAt, not set.
+        assert_eq!(at(pa, "Desc"), (None, None, false));
+        let code = &v.objects[CODE];
+        assert_eq!(at(code, "Code").0.as_deref(), Some("a\nb\nc"));
+        assert_eq!(
+            code.settings
+                .iter()
+                .find(|s| s.name == "Code")
+                .unwrap()
+                .kind,
+            Some(crate::blocks::Kind::Program)
+        );
+        let mf = &v.objects[MF];
+        let time = mf.ports.iter().find(|p| p.key == "Time").unwrap();
+        assert_eq!(time.def_text.as_deref(), Some("30min"));
+        // A plain logic block has no settings.
+        assert!(
+            v.objects["10000006-0000-0060-ffff504f94000001"]
+                .settings
+                .is_empty()
+        );
+
+        let new = doc(&with_settings("25080", "10", "a\nB\nc", "3600"));
+        let v = build(&new, Some(&old), "");
+        let pa = &v.objects[PA];
+        assert_eq!(
+            at(pa, "At"),
+            (Some("06:58".into()), Some("18:58".into()), true)
+        );
+        assert_eq!(
+            at(pa, "Pulse"),
+            (Some("sunset".into()), Some("time".into()), true)
+        );
+        let time = v.objects[MF]
+            .ports
+            .iter()
+            .find(|p| p.key == "Time")
+            .unwrap();
+        assert_eq!(time.old_def_text.as_deref(), Some("30min"));
+        let lines = |u: &str| -> Vec<String> {
+            v.changes
+                .iter()
+                .filter(|c| c.obj.as_deref() == Some(u))
+                .map(|c| c.text.clone())
+                .collect()
+        };
+        let pa_lines = lines(PA);
+        assert!(
+            pa_lines.contains(&"Abends · At: 18:58 → 06:58".to_string()),
+            "{pa_lines:?}"
+        );
+        assert!(
+            pa_lines.contains(&"Abends · Pulse: time → sunset".to_string()),
+            "{pa_lines:?}"
+        );
+        assert_eq!(lines(CODE), ["Hue · program: - b · + B"]);
+        assert_eq!(lines(MF), ["Nachlauf · Time: 30min → 1h"]);
+        // A setting the old revision did not have reads — → new.
+        let bare = doc(&with_settings("68280", "0", "a", "1800").replace(" Typ=\"0\"", ""));
+        let v = build(&new, Some(&bare), "");
+        assert_eq!(
+            at(&v.objects[PA], "Pulse"),
+            (Some("sunset".into()), None, true)
+        );
+        let texts: Vec<&String> = v.changes.iter().map(|c| &c.text).collect();
+        assert!(
+            texts.iter().any(|t| *t == "Abends · Pulse: — → sunset"),
+            "{texts:?}"
+        );
+    }
+
+    trait ClonedInfo {
+        fn cloned_info(self) -> (Option<String>, Option<String>, bool);
+    }
+    impl ClonedInfo for Option<&SettingInfo> {
+        fn cloned_info(self) -> (Option<String>, Option<String>, bool) {
+            let s = self.expect("the setting is listed");
+            (s.value.clone(), s.old.clone(), s.changed)
+        }
     }
 
     #[test]

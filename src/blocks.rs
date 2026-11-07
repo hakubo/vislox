@@ -85,10 +85,13 @@ pub enum Kind {
     /// A duration: a number with `ms`, `s`, `min` or `h`, or seconds as a
     /// plain number (`12h`, `30min`, `90`).
     Duration,
+    /// A program's text (`Code:` on `Code16`, #79): written into a file of
+    /// its own next to the block's, `Code: file("vx_code16_1.c")`.
+    Program,
 }
 
 /// How `param`, a setting of `ty`, is written; `None` for one vislox does
-/// not offer: a program's text, which lox takes only as `file(…)`.
+/// not offer.
 pub fn setting_kind(ty: &str, param: &str) -> Option<Kind> {
     // A push notification's message (#77): its texts, and the least time
     // between two messages.
@@ -100,7 +103,7 @@ pub fn setting_kind(ty: &str, param: &str) -> Option<Kind> {
         });
     }
     if connectors::file_params(ty).contains(&param) {
-        None
+        Some(Kind::Program)
     } else if connectors::clock_params(ty).contains(&param) {
         Some(Kind::Time)
     } else if connectors::choice_values(ty, param).is_some() {
@@ -652,14 +655,14 @@ mod tests {
             .collect();
         assert!(kinds.contains(&("At", "time")), "{kinds:?}");
         assert!(kinds.contains(&("Pulse", "choice")), "{kinds:?}");
-        // A program's text is only taken from a file.
+        // A program's text (#79): written into a file of its own.
         let code = types.iter().find(|t| t["type"] == "Code16").unwrap();
         assert!(
-            !code["settings"]
+            code["settings"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|s| s["name"] == "Code")
+                .any(|s| s["name"] == "Code" && s["kind"] == "program")
         );
         assert_eq!(setting_kind("Formula", "Formula"), Some(Kind::Text));
     }

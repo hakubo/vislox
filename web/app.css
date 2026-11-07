@@ -688,6 +688,16 @@ rect.ghost, line.ghost { fill: #1f6fd10a; stroke: var(--moved); stroke-opacity: 
 .ed-unit { margin-left: 6px; color: var(--muted); }
 .ed-bad { color: var(--removed); font-size: 12px; margin-top: 2px; }
 .ed-tag { margin-left: 6px; padding: 0 6px; border-radius: 8px; font-size: 11px; color: var(--pending); background: var(--changed-bg); white-space: nowrap; }
+/* Block settings (#79): a program, folded; its change as a line diff; edited in a text area. */
+.prog { margin: 4px 0 0; padding: 6px 8px; max-height: 24em; overflow: auto; font: 12px/1.45 var(--mono, ui-monospace, Menlo, monospace); white-space: pre; background: var(--bg-soft, #f6f7f9); border: 1px solid var(--line); border-radius: var(--radius); }
+.prog-d summary { cursor: pointer; color: var(--muted); }
+.prog-diff .pd { display: block; }
+.prog-diff .pd.old { text-decoration: none; margin: 0; background: var(--removed-bg); font-weight: normal; }
+.prog-diff .pd.new { background: var(--added-bg, #e6f4ea); font-weight: normal; }
+.prog-diff .pd.gap { color: var(--muted); }
+.ed-row textarea.prog { width: 100%; box-sizing: border-box; max-height: none; resize: vertical; color: inherit; }
+.ed-row textarea[aria-invalid="true"] { border-color: var(--removed); background: var(--removed-bg); }
+.pr.ed-prog { grid-template-columns: 1fr; gap: 2px; }
 
 /* In the app (LoxAPP3.json) */
 .abadge circle { fill: #2f6fb3; stroke: #fff; stroke-width: 1.5px; vector-effect: non-scaling-stroke; }
