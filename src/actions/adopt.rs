@@ -28,54 +28,82 @@ struct Cand {
     page: Option<String>,
 }
 
-/// Every file under `dir` (not hidden ones, as lox skips them), by its path
-/// relative to `dir`, with `/`.
-fn read_tree(dir: &Path) -> BTreeMap<String, Vec<u8>> {
-    fn walk(root: &Path, d: &Path, out: &mut BTreeMap<String, Vec<u8>>) {
-        let Ok(entries) = std::fs::read_dir(d) else {
-            return;
-        };
-        for e in entries.flatten() {
-            let name = e.file_name().to_string_lossy().into_owned();
-            if name.starts_with('.') {
-                continue;
-            }
-            let p = e.path();
-            if p.is_dir() {
-                walk(root, &p, out);
-            } else if let Ok(b) = std::fs::read(&p) {
-                let rel = p.strip_prefix(root).unwrap_or(&p);
-                out.insert(rel.to_string_lossy().replace('\\', "/"), b);
-            }
-        }
-    }
-    let mut out = BTreeMap::new();
-    walk(dir, dir, &mut out);
-    out
+/// The files of a module directory (not hidden ones, as lox skips them), by
+/// their paths relative to it, with `/`: the `.loxl` texts, and the bytes of
+/// any other file (a program a `Code: file(…)` names).
+#[derive(Clone, Default, PartialEq)]
+struct Tree {
+    loxl: BTreeMap<String, String>,
+    other: BTreeMap<String, Vec<u8>>,
 }
 
-/// Put `dir` back to `tree` (as [`read_tree`] read it).
-fn write_tree(dir: &Path, tree: &BTreeMap<String, Vec<u8>>) -> Result<(), String> {
-    for (rel, now) in read_tree(dir) {
-        if tree.get(&rel) != Some(&now) && !tree.contains_key(&rel) {
-            std::fs::remove_file(dir.join(&rel)).map_err(|e| format!("{rel}: {e}"))?;
+impl Tree {
+    fn read(dir: &Path) -> Tree {
+        fn walk(root: &Path, d: &Path, out: &mut Tree) {
+            let Ok(entries) = std::fs::read_dir(d) else {
+                return;
+            };
+            for e in entries.flatten() {
+                let name = e.file_name().to_string_lossy().into_owned();
+                if name.starts_with('.') {
+                    continue;
+                }
+                let p = e.path();
+                if p.is_dir() {
+                    walk(root, &p, out);
+                    continue;
+                }
+                let rel = p
+                    .strip_prefix(root)
+                    .unwrap_or(&p)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                if rel.ends_with(".loxl") {
+                    if let Ok(t) = std::fs::read_to_string(&p) {
+                        out.loxl.insert(rel, t);
+                    }
+                } else if let Ok(b) = std::fs::read(&p) {
+                    out.other.insert(rel, b);
+                }
+            }
         }
+        let mut out = Tree::default();
+        walk(dir, dir, &mut out);
+        out
     }
-    for (rel, b) in tree {
-        let p = dir.join(rel);
-        if let Some(parent) = p.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| format!("{rel}: {e}"))?;
-        }
-        std::fs::write(&p, b).map_err(|e| format!("{rel}: {e}"))?;
-    }
-    Ok(())
-}
 
-fn loxl_texts(tree: &BTreeMap<String, Vec<u8>>) -> BTreeMap<String, String> {
-    tree.iter()
-        .filter(|(p, _)| p.ends_with(".loxl"))
-        .map(|(p, b)| (p.clone(), String::from_utf8_lossy(b).into_owned()))
-        .collect()
+    /// Make `dir` hold exactly this tree.
+    fn write(&self, dir: &Path) -> Result<(), String> {
+        let now = Tree::read(dir);
+        for rel in now.loxl.keys().chain(now.other.keys()) {
+            if !self.loxl.contains_key(rel) && !self.other.contains_key(rel) {
+                std::fs::remove_file(dir.join(rel)).map_err(|e| format!("{rel}: {e}"))?;
+            }
+        }
+        let files = self
+            .loxl
+            .iter()
+            .map(|(r, t)| (r, t.as_bytes()))
+            .chain(self.other.iter().map(|(r, b)| (r, b.as_slice())));
+        for (rel, b) in files {
+            let p = dir.join(rel);
+            if let Some(parent) = p.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| format!("{rel}: {e}"))?;
+            }
+            std::fs::write(&p, b).map_err(|e| format!("{rel}: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// A file other than a `.loxl` one that is added, changed or gone in
+    /// `after`: lox wrote what vislox does not.
+    fn other_changed(&self, after: &Tree) -> Option<String> {
+        self.other
+            .keys()
+            .chain(after.other.keys())
+            .find(|rel| self.other.get(*rel) != after.other.get(*rel))
+            .cloned()
+    }
 }
 
 /// lox's message, without its `error: ` prefix.
@@ -99,30 +127,26 @@ fn lox_says(stdout: &str, stderr: &str) -> String {
 /// module's own files (lox would rewrite them).
 pub(super) fn why_not(
     u: &str,
-    base: &loxone_config::LoxoneDoc,
-    doc: &loxone_config::LoxoneDoc,
+    base: &adopt::Index,
+    doc: &adopt::Index,
     lock: &edit::Lock,
     files: &edit::Files,
 ) -> Option<String> {
-    let title_of = |u: &str| {
-        edit::find(&doc.xml.root, u)
-            .or_else(|| edit::find(&base.xml.root, u))
-            .and_then(|e| e.attr_decoded("Title").map(|t| t.into_owned()))
-            .filter(|t| !t.trim().is_empty())
-            .unwrap_or_else(|| u.to_string())
+    let name = if doc.get(u).is_some() {
+        doc.name(u)
+    } else {
+        base.name(u)
     };
-    let name = title_of(u);
-    let Some(el) = edit::find(&base.xml.root, u) else {
+    let Some(el) = base.get(u) else {
         return Some(format!(
             "{name} is not in the project's base config, which lox adopts from"
         ));
     };
-    let ty = el.attr("Type").unwrap_or_default();
     if lock.slug_of(u).is_some() {
         return Some(format!("{name} is managed by the module already"));
     }
-    match (adopt::page_of(base, u), adopt::page_of(doc, u)) {
-        (Some((a, _)), Some((b, _))) if a == b => {}
+    match (&el.page, doc.get(u).and_then(|e| e.page.as_ref())) {
+        (Some(a), Some(b)) if a == b => {}
         (Some(_), Some(_)) => {
             return Some(format!(
                 "{name} is on another page in the pending config than in the base"
@@ -134,25 +158,17 @@ pub(super) fn why_not(
             ));
         }
     }
-    if loxone_config::connectors::builtin(ty).is_none() {
-        return Some(format!("lox cannot manage blocks of type {ty}"));
+    if loxone_config::connectors::builtin(&el.ty).is_none() {
+        return Some(format!("lox cannot manage blocks of type {}", el.ty));
     }
+    let s = edit::slug(u);
     if files.claims.0.get(u).is_some_and(|c| c.claims())
-        || files.claims.1.iter().any(|w| {
-            let s = edit::slug(u);
-            w.to.0 == s || w.from.0 == s
-        })
+        || files.claims.1.iter().any(|w| w.to.0 == s || w.from.0 == s)
     {
         return Some(format!(
             "{name}: vislox's edits claim values or wires on it ({}); revert them first, \
-                 then adopt it",
+             then adopt it",
             edit::FILE
-        ));
-    }
-    if files.claims.0.get(u).is_some_and(|c| c.pinned) {
-        return Some(format!(
-            "{name} is wired to a block adopted here: lox would rewrite that block's lines. \
-                 Adopt them together (Manage every block on this page), or hand that block back first"
         ));
     }
     if let Some((x, _)) = lock
@@ -162,8 +178,8 @@ pub(super) fn why_not(
     {
         return Some(format!(
             "{name} is the module's extern `{x}`: lox adopts it only under that name and \
-                 moves the module's own lines into it, and vislox writes only its own files. \
-                 Adopt it with lox (`lox logic adopt … --as {x}`)"
+             moves the module's own lines into it, and vislox writes only its own files. \
+             Adopt it with lox (`lox logic adopt … --as {x}`)"
         ));
     }
     None
@@ -171,36 +187,37 @@ pub(super) fn why_not(
 
 /// `cands` with each block after the blocks among them that feed it (in
 /// the base); a loop keeps the order it had.
-fn order(cands: &mut Vec<Cand>, base: &loxone_config::LoxoneDoc) {
-    let mut owner: BTreeMap<String, usize> = BTreeMap::new();
+fn order(cands: &mut Vec<Cand>, base: &loxone_config::LoxoneDoc, index: &adopt::Index) {
+    let mut owner: BTreeMap<&str, usize> = BTreeMap::new();
     for (i, c) in cands.iter().enumerate() {
-        if let Some(el) = edit::find(&base.xml.root, &c.uuid) {
-            for co in el.child_elements().filter(|x| x.name == "Co") {
-                if let Some(u) = co.attr("U") {
-                    owner.insert(u.to_string(), i);
-                }
-            }
+        for co in index.get(&c.uuid).into_iter().flat_map(|e| &e.ports) {
+            owner.insert(co, i);
         }
     }
     let mut feeds: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); cands.len()];
     for w in base.wires() {
-        if let (Some(&a), Some(&b)) = (owner.get(&w.from_port), owner.get(&w.to_port))
-            && a != b
+        if let (Some(&a), Some(&b)) = (
+            owner.get(w.from_port.as_str()),
+            owner.get(w.to_port.as_str()),
+        ) && a != b
         {
             feeds[b].insert(a);
         }
     }
-    let mut done: Vec<usize> = Vec::new();
+    let mut done: BTreeSet<usize> = BTreeSet::new();
+    let mut order: Vec<usize> = Vec::with_capacity(cands.len());
     let mut left: Vec<usize> = (0..cands.len()).collect();
     while !left.is_empty() {
         let next = left
             .iter()
-            .position(|i| feeds[*i].iter().all(|f| done.contains(f)))
+            .position(|i| feeds[*i].is_subset(&done))
             .unwrap_or(0);
-        done.push(left.remove(next));
+        let i = left.remove(next);
+        done.insert(i);
+        order.push(i);
     }
     let mut taken: Vec<Option<Cand>> = std::mem::take(cands).into_iter().map(Some).collect();
-    *cands = done.into_iter().filter_map(|i| taken[i].take()).collect();
+    *cands = order.into_iter().filter_map(|i| taken[i].take()).collect();
 }
 
 impl Actions {
@@ -221,7 +238,7 @@ impl Actions {
         use axum::http::StatusCode;
         let bad = |e: String| (StatusCode::UNPROCESSABLE_ENTITY, e);
         let fail = |e: String| (StatusCode::INTERNAL_SERVER_ERROR, e);
-        let names = edit::module_names(&p.module);
+        let (names, lets) = edit::module_decls(&p.module);
         let mut chosen: BTreeSet<String> = BTreeSet::new();
         let taken = |s: &str, chosen: &BTreeSet<String>| {
             names.contains(s)
@@ -232,14 +249,15 @@ impl Actions {
                 || files.claims.0.keys().any(|u| edit::slug(u) == s)
                 || chosen.contains(s)
         };
+        let (base_ix, doc_ix) = (adopt::Index::of(base), adopt::Index::of(doc));
         let title_of = |u: &str| {
-            edit::find(&doc.xml.root, u)
-                .or_else(|| edit::find(&base.xml.root, u))
-                .and_then(|e| e.attr_decoded("Title").map(|t| t.into_owned()))
-                .filter(|t| !t.trim().is_empty())
-                .unwrap_or_else(|| u.to_string())
+            if doc_ix.get(u).is_some() {
+                doc_ix.name(u)
+            } else {
+                base_ix.name(u)
+            }
         };
-        let why_not = |u: &str| why_not(u, base, doc, lock, files);
+        let why_not = |u: &str| why_not(u, &base_ix, &doc_ix, lock, files);
         let mut cands: Vec<Cand> = Vec::new();
         let mut pages: BTreeMap<String, Vec<String>> = BTreeMap::new();
         let mut skipped: Vec<Value> = Vec::new();
@@ -253,7 +271,7 @@ impl Actions {
                         if let Some(why) = why_not(&b.uuid) {
                             return Err(bad(why));
                         }
-                        let el = edit::find(&base.xml.root, &b.uuid).expect("checked");
+                        let ty = base_ix.get(&b.uuid).expect("checked").ty.clone();
                         let slug = match &b.slug {
                             Some(s) => {
                                 adopt::check_slug(s).map_err(bad)?;
@@ -264,11 +282,9 @@ impl Actions {
                                 }
                                 s.clone()
                             }
-                            None => adopt::default_slug(
-                                &title_of(&b.uuid),
-                                el.attr("Type").unwrap_or_default(),
-                                &|s| taken(s, &chosen),
-                            ),
+                            None => {
+                                adopt::default_slug(&title_of(&b.uuid), &ty, &|s| taken(s, &chosen))
+                            }
                         };
                         chosen.insert(slug.clone());
                         cands.push(Cand {
@@ -280,9 +296,7 @@ impl Actions {
                     }
                 }
                 edit::Op::AdoptPage { page } => {
-                    if edit::find(&base.xml.root, page)
-                        .is_none_or(|e| e.attr("Type") != Some("Page"))
-                    {
+                    if base_ix.get(page).is_none_or(|e| e.ty != "Page") {
                         return Err(bad(format!("no page {page} in the project's base config")));
                     }
                     pages.entry(page.clone()).or_default();
@@ -310,7 +324,7 @@ impl Actions {
         // Sources before the blocks they feed: lox adopts a block wired into
         // a managed one only when that one's declaration binds the wire, and
         // it binds it when it adopts the sink after the source.
-        order(&mut cands, base);
+        order(&mut cands, base, &base_ix);
         if cands.is_empty() {
             let why: Vec<String> = skipped
                 .iter()
@@ -333,29 +347,32 @@ impl Actions {
         let d = removals::scratch_dir("vislox-adopt").map_err(fail)?;
         let _gone = RemoveDir(d.clone());
         let (module, lock_path) = (d.join("module"), d.join("lock.json"));
-        let original = read_tree(&p.module);
-        write_tree(&module, &original).map_err(|e| fail(format!("cannot copy the module: {e}")))?;
-        std::fs::copy(&p.lock, &lock_path)
+        let original = Tree::read(&p.module);
+        original
+            .write(&module)
+            .map_err(|e| fail(format!("cannot copy the module: {e}")))?;
+        let lock0 =
+            std::fs::read(&p.lock).map_err(|e| fail(format!("cannot read the lock: {e}")))?;
+        std::fs::write(&lock_path, &lock0)
             .map_err(|e| fail(format!("cannot copy the lock: {e}")))?;
-        let lock_json = |path: &Path| -> Result<Value, Refusal> {
-            let b = std::fs::read(path).map_err(|e| fail(format!("cannot read the lock: {e}")))?;
-            serde_json::from_slice(&b).map_err(|e| fail(format!("cannot read the lock: {e}")))
+        let parse = |b: &[u8]| -> Result<Value, Refusal> {
+            serde_json::from_slice(b).map_err(|e| fail(format!("cannot read the lock: {e}")))
         };
-        let l0 = lock_json(&lock_path)?;
+        let l0 = parse(&lock0)?;
         let base_path = p.base.to_string_lossy().into_owned();
         let (m, l) = (
             module.to_string_lossy().into_owned(),
             lock_path.to_string_lossy().into_owned(),
         );
         let mut picked: BTreeMap<String, String> = BTreeMap::new();
+        // The copy before each run: what a refused run puts back.
+        let (mut tree, mut lock_was, mut lock_now) = (original.clone(), lock0, l0.clone());
         for c in &cands {
-            let tree = read_tree(&module);
-            let lock_was = std::fs::read(&lock_path).map_err(|e| fail(e.to_string()))?;
-            // A block an earlier adoption of this request pinned as an extern
-            // is adopted under that name (lox moves the lines naming it into
-            // its declaration); vislox's slug replaces it after.
-            let now = lock_json(&lock_path)?;
-            let as_slug = now["externals"]
+            // A block pinned as an extern (by an earlier adoption of this
+            // request, or vislox's extern of a block adopted before) is
+            // adopted under that name: lox moves the lines on the extern into
+            // its declaration. vislox's slug replaces it after.
+            let as_slug = lock_now["externals"]
                 .as_object()
                 .and_then(|x| {
                     x.iter()
@@ -370,6 +387,7 @@ impl Actions {
             // From the project, as every lox command vislox runs; it writes only
             // the copies its arguments name.
             let res = run_out(&self.s.lox, &args, &p.root, COMPILE_TIMEOUT).await;
+            let after = Tree::read(&module);
             let refused = match &res {
                 Err(e) => Some(e.clone()),
                 Ok((false, o, e)) => Some(lox_says(o, e)),
@@ -378,19 +396,14 @@ impl Actions {
                         .lines()
                         .filter(|l| l.trim_start().starts_with("warning"))
                         .collect();
-                    // Anything but the module's `.loxl` files is not vislox's to write.
-                    let other = read_tree(&module)
-                        .into_iter()
-                        .filter(|(rel, b)| !rel.ends_with(".loxl") && tree.get(rel) != Some(b))
-                        .map(|(rel, _)| rel)
-                        .next();
                     if !warnings.is_empty() {
                         Some(format!(
                             "lox warns, so it stays Loxone Config's:\n{}",
                             warnings.join("\n")
                         ))
                     } else {
-                        other.map(|rel| {
+                        // Anything but the module's `.loxl` files is not vislox's to write.
+                        tree.other_changed(&after).map(|rel| {
                             format!(
                                 "lox writes part of it into a file of its own ({rel}); vislox \
                                  writes only .loxl declarations"
@@ -405,11 +418,16 @@ impl Actions {
                     if let Some(pg) = &c.page {
                         pages.entry(pg.clone()).or_default().push(c.uuid.clone());
                     }
+                    lock_was = std::fs::read(&lock_path).map_err(|e| fail(e.to_string()))?;
+                    lock_now = parse(&lock_was)?;
+                    tree = after;
                 }
                 Some(why) => {
                     // lox writes nothing when it refuses; after a warning
                     // or a file vislox does not write, the copy goes back.
-                    write_tree(&module, &tree).map_err(fail)?;
+                    if after != tree {
+                        tree.write(&module).map_err(fail)?;
+                    }
                     std::fs::write(&lock_path, &lock_was).map_err(|e| fail(e.to_string()))?;
                     match c.page {
                         None => return Err(bad(format!("lox cannot adopt {}: {why}", c.title))),
@@ -431,15 +449,14 @@ impl Actions {
                 why.join("\n")
             )));
         }
-        let l1 = lock_json(&lock_path)?;
         let own = |s: &str| files.block(s).is_some();
         let found = adopt::extract(
-            &loxl_texts(&original),
-            &loxl_texts(&read_tree(&module)),
-            &l0,
-            &l1,
+            &original.loxl,
+            &tree.loxl,
+            (&l0, &lock_now),
             &picked,
             &own,
+            &lets,
             base,
         )
         .map_err(bad)?;

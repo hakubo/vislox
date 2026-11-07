@@ -356,13 +356,14 @@ impl PageFile {
                     let mut wires = Vec::new();
                     for a in &b.args {
                         match a {
-                            // A bare name on an adopted block: the default
-                            // output of the object it names.
+                            // A bare name of vislox's on an adopted block: the
+                            // default output of the object it names. Any other
+                            // bare name is a value: a `let` constant, a day word.
                             ArgItem::Binding(Binding {
                                 port,
                                 kind: BindingKind::Param(Value::Ref(src)),
                                 ..
-                            }) if adopted => wires.push((
+                            }) if adopted && src.starts_with(SLUG_PREFIX) => wires.push((
                                 port.clone(),
                                 PortRef {
                                     slug: src.clone(),

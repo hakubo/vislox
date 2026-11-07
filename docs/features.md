@@ -357,7 +357,7 @@ sends to the Miniserver see [miniserver.md](miniserver.md).
   says why the rest stay Loxone Config's (lox's own reason, or a warning). Nothing is pending afterwards, since
   nothing the Miniserver runs changed: the adoption goes into git with the next Apply, and Undo (or *Hand back*)
   gives the block back to Loxone Config. Properties says why a block cannot be adopted (values or wires edited
-  here, an extern of the module's own files, a block wired to one adopted earlier). How:
+  here, an extern of the module's own files), and *Hand back* why it is off. How:
   [editing.md](editing.md#adopting-blocks-72).
 
 For a `lox.toml` project:

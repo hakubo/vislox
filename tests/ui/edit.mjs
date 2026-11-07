@@ -1031,6 +1031,10 @@ try {
     const lockWas = readFileSync(join(dir, "logic.lock.json"), "utf8");
     await page.waitForSelector("#btn-adopt-page:not([disabled])");
     const n = edits.length;
+    // While an undo compiles it is not sent, and the Deploy pane says why.
+    await page.evaluate(() => { UNDO.busy++; try { adoptPage(); } finally { UNDO.busy--; } });
+    await waitText("#deploy-msg", /^Cannot adopt now: An edit is compiling\.$/);
+    assert.equal(edits.length, n);
     await page.click("#btn-adopt-page");
     // lox adopts each block, then the module compiles (slowly with VISLOX_TEST_LOX_DELAY).
     await until(() => statuses[n] !== undefined, "the adopt_page request");

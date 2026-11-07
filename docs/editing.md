@@ -147,7 +147,8 @@ unchanged in memory. lox has no structured edit command, so vislox works on what
   aside) is moved into vislox's file of the page (`<module>/vislox/<page>.loxl`, the same file blocks added there
   live in), under a `# Adopted from Loxone Config` comment: the declaration, then its wires. Every extern lox
   pinned (by title or iname) becomes vislox's extern of that object, `vx_<uuid>` pinned by UUID in `edits.loxl`,
-  and every reference is renamed to it, so vislox's files never name the module's own slugs; such an extern stays
+  and every reference is renamed to it, so vislox's files never name the module's own slugs (a bare name that is
+  a `let` constant of the module or a day word, `Days: mon`, stays a value: lox reads it so first); such an extern stays
   while an adopted block names it. A neighbour the rest of the module manages is refused (vislox's files would
   name its slug); a neighbour of vislox's files is named by its slug.
 - **The lockfile** gains the block's entry (`objects.<slug>`, as lox wrote it on the copy, keyed by vislox's slug)
@@ -164,15 +165,18 @@ unchanged in memory. lox has no structured edit command, so vislox works on what
   the object tree are #84 and #85), of a type lox has no table for (notes, …), not in the base, on another page
   than in the base, with values or wires vislox's edits claim (revert them first: lox would move those lines into
   the declaration), an extern of the module's own files (lox adopts it only under that name and rewrites those
-  files), or wired to a block adopted earlier (lox would rewrite that block's lines: adopt them together, or hand
-  that one back first). lox's own refusals (a block version or attribute its rebuild does not know, a wire into a
+  files). lox's own refusals (a block version or attribute its rebuild does not know, a wire into a
   managed block its declaration does not bind) come back as lox says them; so does any warning, and the block
   stays Loxone Config's. A block whose program lox would write into a file of its own (`Code: file(…)`) is
   refused too.
 - **`adopt_page`** adopts every block of the page that is offered, in the order that feeds lox the sources before
   the blocks they feed (lox adopts a block wired into a managed one only when that one's declaration binds the
   wire, and binds it when it adopts the sink second; a block an earlier adoption of the request pinned as an
-  extern is adopted under that extern's name, and renamed after). The reply's `skipped` names each block it left
+  extern is adopted under that extern's name, and renamed after). A block that blocks adopted earlier wire to
+  through vislox's extern of it (`vx_<uuid>`) is adopted the same way: lox moves their `<-` lines on the extern
+  into its declaration, and they are the only lines that may leave vislox's files; their bindings naming the
+  extern are renamed to its slug, and the `extern_wires` and `externals` entries lox dropped leave the lock. The
+  reply's `skipped` names each block it left
   to Loxone Config and why; `adopted` names the slugs.
 - **Managed then.** The block is in `blocks` (`adopted: true`, and `committed` once the deployed revision's commit
   has it) and is a block of vislox's files: its name, unwired inputs' constants and settings change its
@@ -180,10 +184,14 @@ unchanged in memory. lox has no structured edit command, so vislox works on what
   input). The wires its declaration brought along are its declaration's now (`adopted_wires`, `wire_why.adopted`):
   vislox does not take them out yet. Remove refuses it (it is deployed); deleting a managed block is #80.
 - **`unadopt`** (the undo, and *Hand back* in Properties) takes the declaration and its wires out of vislox's file,
-  the entry out of the lockfile with every `extern_wires` entry of its ports (without its line lox would take
-  those wires out of the config: they are Loxone Config's again), and drops the externs nothing else names. Only
-  a block whose pending state is the base's (what was changed here is reverted first), that no wire drawn here or
-  other adopted block names. It is checked like an adoption.
+  the entry out of the lockfile with every `extern_wires` entry from its ports (without its line lox would take
+  those wires out of the config: they are Loxone Config's again), and drops the externs nothing else names. The
+  blocks that stay adopted keep every wire between them and it, onto vislox's extern of it: their bindings and
+  `<-` lines name `vx_<uuid>`, and a wire into it that its own declaration bound from one of them becomes that
+  block's `<-` line (from a block added here, a line of `edits.loxl`). Only a block whose pending state is the
+  base's (what was changed here is reverted first), and that no wire drawn here ends at. It is checked like an
+  adoption. `blocks[].hand_back` says why it cannot be handed back now (the same op, tried on a copy), and the
+  button is off with that reason.
 - **Nothing pending.** Adopting changes nothing the Miniserver runs, so `out` stays as it was and nothing is
   pending: Apply has nothing to deploy. The Deploy pane says how many blocks adopted here are not committed yet;
   they go into git with the next Apply. Undo hands them back; Discard (with something pending) drops them too.

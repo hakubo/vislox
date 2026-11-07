@@ -3298,7 +3298,8 @@ function adoptRows(o, row) {
   const msg = mine?.msg || mine?.err ? `<span class="ed-msg${mine.err ? " err" : ""}" role="status">${esc(mine.err || mine.msg)}</span>` : "";
   if (nb?.adopted) {
     return [row("Lox Logic", `<span class="ed-v">adopted here</span><span class="ed-tag" title="Declared in ${esc(nb.file)}: the module manages it now, with the UUIDs Loxone Config gave it">managed</span>` +
-      (st.ok ? '<button type="button" class="ed-btn small" data-ed="unadopt" title="Take its declaration out of vislox\'s file: Loxone Config owns it again, as the base has it">Hand back</button>' : "")),
+      (st.ok ? `<button type="button" class="ed-btn small" data-ed="unadopt"${nb.hand_back ? " disabled" : ""} title="${esc(nb.hand_back || "Take its declaration out of vislox's file: Loxone Config owns it again, as the base has it")}">Hand back</button>` : "")),
+      ...(st.ok && nb.hand_back ? [`<div class="ed-note">Hand back: ${esc(nb.hand_back)}</div>`] : []),
       ...(msg ? [`<div class="ed-bar">${msg}</div>`] : [])];
   }
   const ad = S.edits?.adopt;
@@ -3356,6 +3357,7 @@ async function adoptSave(uuid) {
   renderProps();
 }
 async function adoptHandBack(uuid) {
+  if (editsBlock(uuid)?.hand_back) return;
   const res = await adoptSend(uuid, [{ op: "unadopt", uuids: [uuid] }]);
   if (res) { AD.msg = "Handed back to Loxone Config: the config is unchanged."; renderProps(); }
 }
@@ -3366,10 +3368,13 @@ function adoptOnPage(pg) {
 }
 /** "Adopt all": every block of the page lox can rebuild exactly; the reply names the rest. */
 async function adoptPage() {
-  const st = addState();
-  if (!st?.ok || AD.busy || !adoptOnPage(st.page).length) return;
+  // Not now (an older revision, an edit or undo compiling): say why, rather than send nothing silently.
+  const now = adoptState(), st = addState();
+  const why = !now ? "blocks are adopted on the newest config: show it first." : !now.ok ? now.why : !st?.ok ? st?.why : null;
+  if (why) { deployMsg(`Cannot adopt now: ${why}`, true); return; }
+  if (!adoptOnPage(st.page).length) return;
   const res = await adoptSend(null, [{ op: "adopt_page", page: st.page.uuid }]);
-  if (!res) { deployMsg(AD.err, true); return; }
+  if (!res) { deployMsg(AD.err || "Nothing was adopted.", true); return; }
   const n = res.adopted?.length || 0, sk = res.skipped || [];
   deployMsg(`Adopted ${plural(n, "block")} on ${st.page.title || "this page"}: the config is unchanged.` +
     (sk.length ? ` ${plural(sk.length, "block")} stay${sk.length === 1 ? "s" : ""} Loxone Config's: ${sk.map((x) => `${x.title} (${x.why})`).join("; ")}` : ""), false, !!sk.length);

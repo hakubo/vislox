@@ -1679,11 +1679,29 @@ fn adopt(files: &mut Files, ctx: &Ctx, uuids: &[String]) -> Result<Applied, Stri
             }
             c.pinned = true;
         }
+        // Adopted under vislox's extern of it: the wires blocks adopted earlier
+        // drew onto it are its declaration's now, and they name it by its slug.
+        if a.promoted {
+            let ext = slug(u);
+            for p in files.pages.values_mut() {
+                p.wires.retain(|w| w.to.slug != ext);
+                for b in p.blocks.iter_mut() {
+                    for (_, src) in b.wires.iter_mut() {
+                        if src.slug == ext {
+                            src.slug = a.slug.clone();
+                        }
+                    }
+                }
+            }
+        }
         let le = &mut files.lock_edits;
         le.drop.remove(&a.slug);
         le.add.insert(a.slug.clone(), a.object.clone());
         le.wires.extend(a.extern_wires.iter().cloned());
+        le.unwires.extend(a.unwires.iter().cloned());
+        le.unexternals.extend(a.unexternals.iter().cloned());
     }
+    files.repin();
     Ok(Applied {
         previous: op_value(&Op::Unadopt {
             uuids: uuids.to_vec(),
@@ -1697,12 +1715,7 @@ fn adopt(files: &mut Files, ctx: &Ctx, uuids: &[String]) -> Result<Applied, Stri
 /// leave the lock, and Loxone Config owns them again. Only a block whose
 /// pending state is the base's: what was changed here goes first.
 fn unadopt(files: &mut Files, ctx: &Ctx, uuids: &[String]) -> Result<Applied, String> {
-    let name = |u: &str| {
-        find(&ctx.doc.xml.root, u)
-            .and_then(|e| e.attr_decoded("Title").map(|t| t.into_owned()))
-            .filter(|t| !t.trim().is_empty())
-            .unwrap_or_else(|| u.to_string())
-    };
+    let name = |u: &str| crate::adopt::name_in(ctx.doc, u);
     let mut picks = Vec::new();
     let mut slugs: BTreeSet<String> = BTreeSet::new();
     for u in uuids {
@@ -1739,13 +1752,13 @@ fn unadopt(files: &mut Files, ctx: &Ctx, uuids: &[String]) -> Result<Applied, St
             slug: Some(s.to_string()),
         });
     }
-    // Nothing else of vislox's may name them: its lines would break.
     let by = |s: &str| {
         ctx.lock
             .uuid_of(s)
             .map(name)
             .unwrap_or_else(|| s.to_string())
     };
+    // A wire drawn here (#61) at it would have to change hands too: taken out first.
     if let Some(w) = files
         .claims
         .1
@@ -1763,15 +1776,77 @@ fn unadopt(files: &mut Files, ctx: &Ctx, uuids: &[String]) -> Result<Applied, St
             w.render()
         ));
     }
-    for p in files.pages.values() {
-        for b in p.blocks.iter().filter(|b| !slugs.contains(&b.slug)) {
-            if let Some((_, src)) = b.wires.iter().find(|(_, src)| slugs.contains(&src.slug)) {
-                return Err(format!(
-                    "{}: {} is wired from it in its declaration; hand that one back too",
-                    by(&src.slug),
-                    by(&b.slug)
-                ));
+    // The blocks that stay adopted keep their wires to it: it is an object of
+    // Loxone Config's again, so they name it as vislox's extern (`vx_<uuid>`).
+    // A wire into it its own declaration bound from such a block becomes that
+    // block's wire onto the extern; the rest of its wires are Loxone Config's.
+    let mut moved: Vec<(String, blocks::FileWire)> = Vec::new();
+    let mut claimed: Vec<Wire> = Vec::new();
+    for s in &slugs {
+        let (_, b) = files.block(s).expect("checked");
+        let ext = slug(ctx.lock.uuid_of(s).expect("checked"));
+        for (port, src) in &b.wires {
+            if slugs.contains(&src.slug) {
+                continue;
             }
+            match files.block(&src.slug) {
+                Some((_, from)) if from.adopted => moved.push((
+                    src.slug.clone(),
+                    blocks::FileWire {
+                        to: logic::PortRef {
+                            slug: ext.clone(),
+                            port: port.clone(),
+                        },
+                        from: src.clone(),
+                    },
+                )),
+                Some(_) if src.port.is_empty() => {
+                    return Err(format!(
+                        "{} is fed by {}, a block added here, from its default output: vislox \
+                         cannot write that wire on its own yet, so it keeps managing it",
+                        by(s),
+                        by(&src.slug)
+                    ));
+                }
+                Some(_) => claimed.push(Wire {
+                    to: (ext.clone(), port.clone()),
+                    from: (src.slug.clone(), src.port.clone()),
+                }),
+                None => {}
+            }
+        }
+    }
+    let externs: Vec<(String, String, String)> = slugs
+        .iter()
+        .map(|s| {
+            let u = ctx.lock.uuid_of(s).expect("checked").to_string();
+            (s.clone(), slug(&u), u)
+        })
+        .collect();
+    for (s, ext, _) in &externs {
+        for p in files.pages.values_mut() {
+            for b in p.blocks.iter_mut().filter(|b| !slugs.contains(&b.slug)) {
+                for (_, src) in b.wires.iter_mut() {
+                    if &src.slug == s {
+                        src.slug = ext.clone();
+                    }
+                }
+            }
+            for w in p.wires.iter_mut() {
+                if &w.to.slug == s && !slugs.contains(&w.from.slug) {
+                    w.to.slug = ext.clone();
+                }
+            }
+        }
+    }
+    for (s, _, u) in &externs {
+        let ty = files
+            .block(s)
+            .map(|(_, b)| b.ty.clone())
+            .unwrap_or_default();
+        let c = files.claims.0.entry(u.clone()).or_default();
+        if c.ty.is_empty() {
+            c.ty = ty;
         }
     }
     for s in &slugs {
@@ -1788,6 +1863,16 @@ fn unadopt(files: &mut Files, ctx: &Ctx, uuids: &[String]) -> Result<Applied, St
             le.drop.insert(s.clone());
         }
     }
+    for (from, w) in moved {
+        if let Some(p) = files
+            .pages
+            .values_mut()
+            .find(|p| p.blocks.iter().any(|b| b.slug == from))
+        {
+            p.wires.push(w);
+        }
+    }
+    files.claims.1.extend(claimed);
     files.repin();
     Ok(Applied {
         previous: op_value(&Op::Adopt { blocks: picks }),
@@ -2679,22 +2764,33 @@ fn edit_new_block(
 /// constants), so that a new slug is none of them. Empty when the module
 /// does not read; then the check after writing says why.
 pub fn module_names(module: &Path) -> BTreeSet<String> {
+    module_decls(module).0
+}
+
+/// [`module_names`], and of them the `let` constants (a bare name in an
+/// argument names one of those before an object).
+pub fn module_decls(module: &Path) -> (BTreeSet<String>, BTreeSet<String>) {
     let Some(m) = module
         .to_str()
         .and_then(|p| loxone_config::cli::read_module(p).ok())
     else {
-        return BTreeSet::new();
+        return Default::default();
     };
-    m.items
-        .iter()
-        .filter_map(|i| match i {
-            Item::Block(b) | Item::Instance(b) => Some(b.slug.clone()),
-            Item::Extern(e) => Some(e.slug.clone()),
-            Item::Signal(s) => Some(s.slug.clone()),
-            Item::Let(l) => Some(l.name.clone()),
-            _ => None,
-        })
-        .collect()
+    let mut names = BTreeSet::new();
+    let mut lets = BTreeSet::new();
+    for i in &m.items {
+        match i {
+            Item::Block(b) | Item::Instance(b) => names.insert(b.slug.clone()),
+            Item::Extern(e) => names.insert(e.slug.clone()),
+            Item::Signal(s) => names.insert(s.slug.clone()),
+            Item::Let(l) => {
+                lets.insert(l.name.clone());
+                names.insert(l.name.clone())
+            }
+            _ => false,
+        };
+    }
+    (names, lets)
 }
 
 /// Check the whole module, with vislox's files as written, the way `lox logic
@@ -4423,5 +4519,87 @@ mod tests {
         ))
         .unwrap_err();
         assert!(e.contains("did not write"), "{e}");
+    }
+
+    /// Handing back one of two blocks adopted together (#72): the other keeps
+    /// every wire between them, onto vislox's extern of the one handed back
+    /// (a loop's wire, a binding in either declaration).
+    #[test]
+    fn a_block_handed_back_leaves_its_neighbours_wires_on_an_extern() {
+        const METER: &str = "10000005-0000-0050-ffff504f94000001";
+        let d = doc("house.Loxone");
+        let lock = Lock {
+            slugs: BTreeMap::from([
+                ("vx_a".to_string(), AND.to_string()),
+                ("vx_b".to_string(), METER.to_string()),
+            ]),
+            ..Default::default()
+        };
+        let text = |a: &str, b: &str, wire: &str| {
+            format!(
+                "page \"Erdgeschoss\"\n# Adopted from Loxone Config\nvx_a = And(\"O1001\"{a})\nvx_b = MeterAbsUni(\"Zähler\"{b})\n{wire}"
+            )
+        };
+        let files = |page: String| {
+            let mut f =
+                Files::from_texts(&BTreeMap::from([("eg.loxl".to_string(), page)])).unwrap();
+            f.repin();
+            f
+        };
+        let (adoptions, pages) = (Default::default(), Default::default());
+        let ctx = Ctx {
+            doc: &d,
+            base: &d,
+            lock: &lock,
+            deployed: None,
+            names: &Default::default(),
+            drawn: &Default::default(),
+            adoptions: &adoptions,
+            page_adoptions: &pages,
+        };
+        let back = |f: &mut Files, u: &str| {
+            apply_op(
+                f,
+                &ctx,
+                &Op::Unadopt {
+                    uuids: vec![u.into()],
+                },
+            )
+            .unwrap();
+            f.render()
+        };
+        let ext_a = slug(AND);
+        // A loop's wire, out of the block that stays into the one handed back.
+        let mut f = files(text("", "", "vx_a.In2 <- vx_b\n"));
+        let out = back(&mut f, AND);
+        assert!(
+            out["eg.loxl"].contains(&format!("{ext_a}.In2 <- vx_b\n")),
+            "{out:?}"
+        );
+        assert!(!out["eg.loxl"].contains("vx_a "), "{out:?}");
+        assert!(
+            out[CLAIMS].contains(&format!("extern {ext_a} = And(uuid: \"{AND}\")")),
+            "{out:?}"
+        );
+        assert!(f.lock_edits.drop.contains("vx_a"));
+        // A binding in the other block's declaration names its extern.
+        let mut f = files(text("", ", Power: vx_a", ""));
+        let out = back(&mut f, AND);
+        assert!(
+            out["eg.loxl"].contains(&format!("Power: {ext_a})")),
+            "{out:?}"
+        );
+        // A binding in its own declaration, fed by the block that stays: that
+        // block's wire onto its extern now.
+        let mut f = files(text("", ", Power: vx_a", ""));
+        let out = back(&mut f, METER);
+        let ext_b = slug(METER);
+        assert!(
+            out["eg.loxl"].contains(&format!("{ext_b}.Power <- vx_a\n")),
+            "{out:?}"
+        );
+        assert!(!out["eg.loxl"].contains("vx_b"), "{out:?}");
+        // Everything the files say still reads back.
+        Files::from_texts(&out).unwrap();
     }
 }

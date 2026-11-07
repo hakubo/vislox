@@ -66,6 +66,8 @@ pub struct Actions {
     edit_state: Mutex<EditState>,
     /// `GET /api/edits`, for the [`EditState::key`] it was worked out for.
     edits_cache: Mutex<Option<(String, Value)>>,
+    /// The base parsed and indexed for adopting (#72), by its blob id.
+    adopt_base: Mutex<Option<(String, Arc<crate::adopt::Indexed>)>>,
     /// The module's `.loxl` files as last read (#64): read and hashed again
     /// only when they change, for the key and for `sources`.
     module_files: Arc<Mutex<crate::managed::ModuleFiles>>,
@@ -838,6 +840,7 @@ impl Actions {
             tx,
             edit_state: Mutex::new(EditState::default()),
             edits_cache: Mutex::new(None),
+            adopt_base: Mutex::new(None),
             module_files: Arc::default(),
             compiled: Mutex::new(None),
             check_cache: Mutex::new(None),
@@ -2051,6 +2054,8 @@ impl Actions {
             .iter()
             .any(|o| matches!(o, edit::Op::Adopt { .. } | edit::Op::AdoptPage { .. }))
         {
+            // The cheap check first: lox runs once per block on the copy.
+            self.uncompiled(&p).await?;
             self.adopt_prepare(&p, &files, &lock, &base, &doc, &req.ops)
                 .await?
         } else {
@@ -3002,7 +3007,7 @@ impl Actions {
                 arrange.insert(page.to_string(), json!(why));
             }
         }
-        let blocks: Vec<Value> = now
+        let mut blocks: Vec<Value> = now
             .pages
             .iter()
             .flat_map(|(name, f)| f.blocks.iter().map(move |b| (name, f, b)))
@@ -3065,21 +3070,41 @@ impl Actions {
         // Which blocks Properties offers to adopt (#72), on the config shown:
         // UUID → null, or why not. Only blocks drawn on a page, of a type lox
         // has a table for, that the module does not manage yet.
+        // One walk of each config (an index), and the base parsed once per blob.
         let mut adopt = serde_json::Map::new();
-        let base_doc = std::fs::read(&p.base)
-            .ok()
-            .and_then(|b| edit::parse_doc(&b).ok());
-        if let (Some(doc), Some(base_doc)) = (shown, base_doc.as_ref())
+        if let (Some(doc), Some(base)) = (shown, self.adopt_base(&p))
             && state.why.is_none()
         {
-            for page in crate::adopt::pages(doc) {
-                for (u, ..) in crate::adopt::on_page(doc, &page) {
-                    if lock.slug_of(&u).is_some() {
-                        continue;
-                    }
-                    let why = adopt::why_not(&u, base_doc, doc, &lock, &now);
-                    adopt.insert(u, json!(why));
+            let (base_doc, base_ix) = (&base.0, &base.1);
+            let ix = crate::adopt::Index::of(doc);
+            for (u, _) in ix.page_blocks() {
+                if lock.slug_of(u).is_none() {
+                    adopt.insert(
+                        u.clone(),
+                        json!(adopt::why_not(u, base_ix, &ix, &lock, &now)),
+                    );
                 }
+            }
+            // Whether each block adopted here can be handed back now (or why not):
+            // the same op the button sends, tried on a copy of the files.
+            let (none_a, none_p) = (Default::default(), Default::default());
+            let ctx = edit::Ctx {
+                doc,
+                base: base_doc,
+                lock: &lock,
+                deployed: None,
+                names: &Default::default(),
+                drawn: &Default::default(),
+                adoptions: &none_a,
+                page_adoptions: &none_p,
+            };
+            for b in blocks.iter_mut().filter(|b| b["adopted"] == true) {
+                let Some(u) = b["uuid"].as_str().map(String::from) else {
+                    continue;
+                };
+                let op = edit::Op::Unadopt { uuids: vec![u] };
+                let why = edit::apply_op(&mut now.clone(), &ctx, &op).err();
+                b["hand_back"] = json!(why);
             }
         }
         json!({
@@ -3106,6 +3131,23 @@ impl Actions {
                 "adopted": edit::Owner::Adopted.why(),
             },
         })
+    }
+
+    /// The project's base, parsed and indexed (#72): kept by blob id, so
+    /// `GET /api/edits` parses it once per base, not per refresh.
+    fn adopt_base(&self, p: &loxone_config::Project) -> Option<Arc<crate::adopt::Indexed>> {
+        let bytes = std::fs::read(&p.base).ok()?;
+        let blob = crate::history::blob_id(&bytes);
+        if let Some((b, v)) = &*self.adopt_base.lock().unwrap()
+            && *b == blob
+        {
+            return Some(v.clone());
+        }
+        let doc = edit::parse_doc(&bytes).ok()?;
+        let ix = crate::adopt::Index::of(&doc);
+        let v = Arc::new((doc, ix));
+        *self.adopt_base.lock().unwrap() = Some((blob, v.clone()));
+        Some(v)
     }
 
     /// Put the module, lock and compiled config back to the last commit.
@@ -5365,6 +5407,7 @@ echo "$*" >> ../calls.log
 case "$1 $2" in
 "logic adopt")
   u=$5; s=$7; m=$9; l=${11}
+  [ -f ../delete-other ] && rm "$m/prog.c"
   { [ "$u" = "10000005-0000-0050-ffff504f94000001" ] || [ -f ../refuse-all ]; } && { echo "error: compile error: cannot adopt MeterAbsUni \"Zähler\": its outputs are hidden" >&2; exit 1; }
   printf 'page "Erdgeschoss"\n\nextern temperatur = VirtualIn(iname: "VI1")\n\n%s = Div("O1002", In2: 1000, In1: temperatur)\n' "$s" > "$m/erdgeschoss.loxl"
   printf '{"objects":{"%s":{"uuid":"%s","type":"Div","ports":{"AQ":"10000006-0000-0063-02ff504f94000001"},"page_uuid":"10000002-0000-0020-ffff504f94000001"}},"externals":{"temperatur":{"uuid":"10000001-0000-0010-ffff504f94000001","matched_by":"iname"}},"extern_wires":[]}\n' "$s" "$u" > "$l"
@@ -5395,6 +5438,7 @@ esac
         let d = tmp.path().join("project");
         std::fs::write(d.join("pages/own.loxl"), "page \"Obergeschoss\"\n").unwrap();
         std::fs::write(d.join("logic.lock.json"), "{\"objects\":{}}\n").unwrap();
+        std::fs::write(d.join("pages/prog.c"), "int x;\n").unwrap();
         sh(&d, "git add -A && git commit -qm module");
         let base = std::fs::read(d.join("base.Loxone")).unwrap();
         let adopt = |uuid: &str, slug: Option<&str>| edit::Request {
@@ -5426,6 +5470,12 @@ esac
             .await
             .unwrap_err();
         assert!(e.1.contains("vx_"), "{e:?}");
+        // lox deleting a file that is not a `.loxl` one: not vislox's to write.
+        std::fs::write(tmp.path().join("delete-other"), "").unwrap();
+        let e = a.edit(&adopt(DIV, None), deployed(&d)).await.unwrap_err();
+        assert!(e.1.contains("a file of its own (prog.c)"), "{e:?}");
+        assert!(d.join("pages/prog.c").exists() && !d.join("pages/vislox").exists());
+        std::fs::remove_file(tmp.path().join("delete-other")).unwrap();
         // A compile that changes the config: refused, and everything put back.
         std::fs::write(tmp.path().join("break"), "").unwrap();
         let lock = std::fs::read(d.join("logic.lock.json")).unwrap();
@@ -5489,6 +5539,7 @@ esac
             e["adopt"]
         );
         let b = &e["blocks"][0];
+        assert_eq!(b["hand_back"], Value::Null, "{b}");
         assert_eq!(
             (b["uuid"].as_str(), b["adopted"].as_bool()),
             (Some(DIV), Some(true)),
@@ -5784,6 +5835,57 @@ esac
             file.contains("vx_zaehler = MeterAbsUni(\"Zähler\", Power: vx_o1001)"),
             "{file}"
         );
+        const METER: &str = "10000005-0000-0050-ffff504f94000001";
+        let read = || std::fs::read_to_string(d.join("pages/vislox/erdgeschoss.loxl")).unwrap();
+        let step = |ops: Vec<edit::Op>| {
+            let base = blob(&d, "out.Loxone");
+            let dep = deployed(&d);
+            let a = &a;
+            async move { a.edit(&edit::Request { base, ops }, dep).await }
+        };
+        // The meter handed back alone: the gate's wire into it stays, onto vislox's extern of it.
+        let back = step(vec![edit::Op::Unadopt {
+            uuids: vec![METER.into()],
+        }])
+        .await
+        .unwrap();
+        assert!(
+            read().contains("vx_10000005_0000_0050_ffff504f94000001.Power <- vx_o1001"),
+            "{}",
+            read()
+        );
+        assert!(!read().contains("vx_zaehler"), "{}", read());
+        assert_eq!(std::fs::read(d.join("out.Loxone")).unwrap(), base);
+        // Its undo adopts it again under that extern: the wire goes back into its declaration.
+        let undo: Vec<edit::Op> = serde_json::from_value(back["undo"].clone()).unwrap();
+        step(undo).await.unwrap();
+        assert!(
+            read().contains("vx_zaehler = MeterAbsUni(\"Zähler\", Power: vx_o1001)"),
+            "{}",
+            read()
+        );
+        assert!(!read().contains(".Power <-"), "{}", read());
+        assert_eq!(std::fs::read(d.join("out.Loxone")).unwrap(), base);
+        // The gate handed back alone: the meter's declaration names it as vislox's extern.
+        let back = step(vec![edit::Op::Unadopt {
+            uuids: vec![GATE.into()],
+        }])
+        .await
+        .unwrap();
+        assert!(
+            read().contains("Power: vx_10000004_0000_0040_ffff504f94000001)"),
+            "{}",
+            read()
+        );
+        assert_eq!(std::fs::read(d.join("out.Loxone")).unwrap(), base);
+        let undo: Vec<edit::Op> = serde_json::from_value(back["undo"].clone()).unwrap();
+        step(undo).await.unwrap();
+        assert!(
+            read().contains("vx_zaehler = MeterAbsUni(\"Zähler\", Power: vx_o1001)"),
+            "{}",
+            read()
+        );
+        assert_eq!(std::fs::read(d.join("out.Loxone")).unwrap(), base);
         assert_eq!(std::fs::read(d.join("out.Loxone")).unwrap(), base);
         let undo: Vec<edit::Op> = serde_json::from_value(page["undo"].clone()).unwrap();
         a.edit(
