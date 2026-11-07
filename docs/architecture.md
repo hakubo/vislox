@@ -124,6 +124,13 @@ The binary is an `axum` server with the UI embedded (plain JS and SVG, no build 
   from one (#81), with lox's parser and `defaults_taken`, for `GET /api/edits`' `constants`. vislox's own constants
   are `Claims`' ninth field in `edit.rs` (`let vx_… = …` in `edits.loxl`); the `let` op is `set_constant`, and a
   `param` op whose value names a constant (`Ctx::lets`, the module's) binds the port to it (`constant_ref`).
+- `src/expressions.rs` reads the module's expressions and named signals (#82) with lox's parser: what each feeds,
+  its text as lox prints it, its file and line, and its blocks (the lockfile's expression-owned entries under its
+  prefix, `<sink>_<port key>__` or `<signal>__`, its top block named by lox's post-order count), and what the
+  deployed config had (the block feeding the sink, or the signal's by UUID, and its label), for `GET /api/edits`'
+  `expressions`. `src/expr_edit.rs` is editing them in vislox's files: the `expr` op (an expression or a port of
+  vislox's into one input: `Claim::exprs` in `edits.loxl`, `NewBlock::exprs` in a declaration, or a wire) and the
+  `signal` op (`PageFile::signals`, with `.title`), operands checked against vislox's names.
 - `src/set_claim.rs`' `KINDS` lists every kind of claim on a block's whole content (switching times, moods,
   access, recipients, tiles, members) as a `ClaimKind`; `edit.rs` and `actions.rs` loop over it instead of naming each kind.
 - `src/blocks.rs` is adding blocks (#59): the types vislox offers (`GET /api/block-types`, from lox's builtin

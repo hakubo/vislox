@@ -161,7 +161,13 @@ fn file_blob(path: &Path) -> Option<String> {
 /// every kind that makes sets), must not be one of them.
 fn needs_module_names(ops: &[edit::Op]) -> bool {
     ops.iter().any(|o| {
-        matches!(o, edit::Op::AddBlock { .. } | edit::Op::Let { .. })
+        matches!(
+            o,
+            edit::Op::AddBlock { .. }
+                | edit::Op::Let { .. }
+                | edit::Op::Expr { value: Some(_), .. }
+                | edit::Op::Signal { .. }
+        )
             // A value that may name a constant (#81); a number needs none.
             || matches!(o, edit::Op::Param { value: Some(v), .. } if edit::bare_name(v)) || crate::set_claim::kind_of(o).is_some_and(|k| k.makes_sets())
     })
@@ -2023,10 +2029,12 @@ impl Actions {
         // The deployed revision: a block added here and in it is deployed.
         let deployed = match deployed {
             Some(b)
-                if req
-                    .ops
-                    .iter()
-                    .any(|o| matches!(o, edit::Op::RemoveBlock { .. })) =>
+                if req.ops.iter().any(|o| {
+                    matches!(
+                        o,
+                        edit::Op::RemoveBlock { .. } | edit::Op::Signal { value: None, .. }
+                    )
+                }) =>
             {
                 Some(
                     edit::parse_doc(&b)
@@ -3112,7 +3120,7 @@ impl Actions {
         pending: Option<Arc<Vec<u8>>>,
     ) -> Value {
         let off = || {
-            let mut v = json!({ "available": false, "reason": state.why, "claims": [], "managed": [], "sources": {}, "set_claims": [], "members_claims": [], "constants": { "lets": [], "defaults": [], "uses": {} }, "set_kinds": {} });
+            let mut v = json!({ "available": false, "reason": state.why, "claims": [], "managed": [], "sources": {}, "set_claims": [], "members_claims": [], "constants": { "lets": [], "defaults": [], "uses": {} }, "expressions": [], "set_kinds": {} });
             for k in crate::set_claim::KINDS {
                 for (key, _) in k.edits_section(
                     &Default::default(),
@@ -3215,7 +3223,9 @@ impl Actions {
                 // deployed while vislox's files give it another value than the
                 // deployed revision's did. Its revert target is that value.
                 let changed = match op {
-                    edit::Op::Let { .. } => now != was,
+                    // An expression (#82) is compared as written: the config
+                    // has blocks, not its text.
+                    edit::Op::Let { .. } | edit::Op::Expr { .. } => now != was,
                     _ => pending_value != deployed_value,
                 };
                 let mut v = serde_json::to_value(&op).unwrap_or_default();
@@ -3250,6 +3260,36 @@ impl Actions {
         // their values from one (#81).
         let mine = format!("{rel_dir}/");
         let constants = crate::constants::constants(&texts, &lock, |f| f.starts_with(&mine));
+        // The module's expressions and named signals, their blocks and what the
+        // deployed revision had (#82). A signal of vislox's carries the op that
+        // reverts it to the deployed revision's files.
+        let mut expressions =
+            crate::expressions::expressions(&texts, &lock, |f| f.starts_with(&mine));
+        crate::expressions::compare(
+            &mut expressions,
+            deployed_doc.as_ref(),
+            pending_doc.as_ref(),
+        );
+        let expressions: Vec<Value> = expressions
+            .into_iter()
+            .map(|e| {
+                let mut v = serde_json::to_value(&e).unwrap_or_default();
+                if e.ours && e.kind == "signal" {
+                    let page = now
+                        .signal(&e.sink)
+                        .and_then(|(f, _)| now.pages[f].uuid.clone());
+                    let was_sig = was.signal(&e.sink).map(|(_, x)| x.clone());
+                    v["revert"] = json!(edit::Op::Signal {
+                        slug: e.sink.clone(),
+                        page: page.unwrap_or_default(),
+                        value: was_sig.as_ref().map(|x| x.expr.clone()),
+                        title: was_sig.and_then(|x| x.title),
+                    });
+                    v["committed"] = json!(was.signal(&e.sink).is_some());
+                }
+                v
+            })
+            .collect();
         // What vislox's file claims on a block's whole content now or
         // claimed in the deployed revision: per kind (switching times #73,
         // moods #74, members #75, access #76) its entries and sets, and the
@@ -3448,6 +3488,7 @@ impl Actions {
             "set_claims": set_claims,
             "members_claims": members_claims,
             "constants": constants,
+            "expressions": expressions,
             "set_kinds": set_kinds,
             "movable": movable,
             "moves": moves,
@@ -5698,6 +5739,42 @@ esac
         let c = check_of(&a, &d).await;
         assert_eq!(c["available"], false, "{c}");
         assert!(a.module_errors().await.is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_expressions_are_listed_with_their_blocks() {
+        const AND: &str = "10000004-0000-0040-ffff504f94000001";
+        let (tmp, a) = project_for_edits();
+        let d = tmp.path().join("project");
+        std::fs::write(
+            d.join("pages/main.loxl"),
+            format!(
+                "extern gate = And(uuid: \"{AND}\")\n\ngate.I2 <- a.Q and b.AQ >= 28\nwarm = b.AQ >= 30\nwarm.title = \"Warm\"\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            d.join("logic.lock.json"),
+            r#"{"objects":{"gate_i2__ge1":{"uuid":"u-ge","type":"GreaterEqual","expr_owned":true},
+                "gate_i2__and1":{"uuid":"u-and","type":"And","expr_owned":true},
+                "warm":{"uuid":"u-warm","type":"GreaterEqual"}}}"#,
+        )
+        .unwrap();
+        let e = edits_of(&a, &d).await;
+        let x = &e["expressions"];
+        assert_eq!(x.as_array().map(Vec::len), Some(2), "{e}");
+        assert_eq!(x[0]["kind"], "wire");
+        assert_eq!(x[0]["sink"], "gate.I2");
+        assert_eq!(x[0]["to"], json!([AND, "I2"]));
+        assert_eq!(x[0]["text"], "a.Q and b.AQ >= 28");
+        assert_eq!(x[0]["line"], 3);
+        assert_eq!(x[0]["blocks"], json!(["u-and", "u-ge"]));
+        assert_eq!(x[0]["ours"], false);
+        assert_eq!(x[1]["kind"], "signal");
+        assert_eq!(x[1]["title"], "Warm");
+        assert_eq!(x[1]["top"], "u-warm");
+        assert!(x[1].get("revert").is_none(), "{e}");
     }
 
     #[cfg(unix)]

@@ -94,6 +94,20 @@ const usersXml = `\t\t<C Type="LoxCaption" V="178" U="40000010-0000-0000-ffff504
 \t\t\t<C Type="Notification" V="178" U="${REGEN}" Title="Regen" WF="16384" Entries="10"/>
 \t\t</C>
 `;
+// Expressions (#82): a page Ausdruck, where the module's own file feeds Markise's I2 from the expression
+// `licht.Q and teiler.AQ >= 28`: lox made an And (EXA) and a GreaterEqual (EXG) for it, expression-owned in the lock.
+// Pumpe's inputs are free: vislox gives one an expression of its own.
+const AUSDRUCK = "80000000-0000-0000-ffff504f94000001", MARK = "80000001-0000-0000-ffff504f94000001";
+const EXA = "80000002-0000-0000-ffff504f94000001", EXG = "80000003-0000-0000-ffff504f94000001", PUMPE = "80000004-0000-0000-ffff504f94000001";
+const gateXml = (ty, u, title, y, ins) => `\t\t\t<C Type="${ty}" V="178" U="${u}" Title="${title}" Px="960" Py="${y}" Px2="2304" Py2="${y + 696}" Cl="141,255,112" Nio="3" WF="16384">
+\t\t\t\t<Co K="I1" U="${u.slice(0, 14)}0001-${u.slice(19)}"/>
+\t\t\t\t<Co K="I2" U="${u.slice(0, 14)}0002-${u.slice(19)}"${ins ? `>\n\t\t\t\t\t<In Input="${ins}"/>\n\t\t\t\t</Co>` : "/>"}
+\t\t\t\t<Co K="Q" U="${u.slice(0, 14)}0003-${u.slice(19)}"/>
+\t\t\t</C>
+`;
+const ausdruckXml = `\t\t<C Type="Page" V="178" U="${AUSDRUCK}" Title="Ausdruck" WF="16384">
+${gateXml("GreaterEqual", EXG, "teiler.AQ &gt;= 28", 960, null)}${gateXml("And", EXA, "licht.Q and teiler.AQ &gt;= 28", 2880, `${EXG.slice(0, 14)}0003-${EXG.slice(19)}`)}${gateXml("And", MARK, "Markise", 4800, `${EXA.slice(0, 14)}0003-${EXA.slice(19)}`)}${gateXml("And", PUMPE, "Pumpe", 6720, null)}\t\t</C>
+`;
 const KITCHEN = "30000a01-0000-0000-ffff504f94000001", BATH = "30000a02-0000-0000-ffff504f94000001";
 // Two analog Daytimers on the upper floor (#73): Uhr, on Mondays 06:30–08:00 and in the Party mode 18:00–23:00,
 // and Heizung, with no switching times; and Licht, a digital one.
@@ -207,7 +221,7 @@ const base0 = readFileSync(fixture, "utf8").replace('<Co K="Q" U="10000009-0000-
     "\t\t</C>\n" +
     `\t\t<C Type="Page" V="178" U="${MELDUNGEN}" Title="Meldungen" WF="16384">\n` +
     `\t\t\t<C Type="OutputRefLM" V="178" U="${WARN}" Title="Frostwarnung" Px="960" Py="960" Px2="2304" Py2="1656" Cl="0,0,0" Nio="2" Ref="${FROST}"><Co K="AI" U="40000031-0000-0001-ffff504f94000001"/><Co K="AQ" U="40000031-0000-0002-ffff504f94000001"/><LoggerMailer RefNotification="${FROST}" On="Frost im Garten" MinimumTime="43200000" NL="1"/></C>\n` +
-    "\t\t</C>\n" + zeitenXml + konstXml + "\t</C>\n</ControlList>");
+    "\t\t</C>\n" + zeitenXml + konstXml + ausdruckXml + "\t</C>\n</ControlList>");
 const base = base0.replace(`\t\t<C Type="Place" V="178" U="${KITCHEN}"`, `${flexXml}\t\t<C Type="Place" V="178" U="${KITCHEN}"`)
   .replace(`\t\t<C Type="Page" V="178" U="${MELDUNGEN}"`, `${beschXml}\t\t<C Type="Page" V="178" U="${MELDUNGEN}"`);
 assert.ok(base.includes(FLEX) && base.includes(OST), "the Touch Pure Flex is in the base");
@@ -220,9 +234,13 @@ writeFileSync(join(dir, "pages", "README"), "the module\n");
 writeFileSync(join(dir, "pages", "flur.loxl"), '# The module\'s own source.\npage "Obergeschoss"\nflur = And("Flur")\n');
 // The module's own constant (#81), and K1's Time bound to it on line 3.
 writeFileSync(join(dir, "pages", "konst.loxl"), `let nachlauf = 30min\nextern k1 = Monoflop(uuid: "${K1}")\nk1.Time = nachlauf\n`);
+// The module's own expression (#82), on line 5.
+writeFileSync(join(dir, "pages", "ausdruck.loxl"), `extern markise = And(uuid: "${MARK}")\nextern licht = Or(uuid: "10000009-0000-0090-ffff504f94000001")\nextern teiler = Div(uuid: "${DIV}")\n\nmarkise.In2 <- licht.Q and teiler.AQ >= 28\n`);
 const FLUR_AT = { px: 7104, py: 2880, px2: 8448, py2: 3576 };
 const lockObjects = { flur: { uuid: FLUR, type: "And", page_uuid: OG, layout: FLUR_AT } };
 for (let i = 0; i < LAGER_N; i++) lockObjects[`lager_${i}`] = { uuid: lagerUuid(i), type: "And", page_uuid: LAGER, layout: lagerAt(i) };
+lockObjects.markise_i2__ge1 = { uuid: EXG, type: "GreaterEqual", page_uuid: AUSDRUCK, layout: { px: 960, py: 960, px2: 2304, py2: 1656 }, expr_owned: true };
+lockObjects.markise_i2__and1 = { uuid: EXA, type: "And", page_uuid: AUSDRUCK, layout: { px: 960, py: 2880, px2: 2304, py2: 3576 }, expr_owned: true };
 writeFileSync(join(dir, "logic.lock.json"), JSON.stringify({ objects: lockObjects }));
 // Compiled after the module's files: nothing is uncompiled.
 writeFileSync(join(dir, "out.Loxone"), base);
@@ -484,12 +502,34 @@ for (const line of mine) {
 // Like lox, a block added again gets a UUID it never had: the count of UUIDs minted is kept.
 const mintFile = ${JSON.stringify(join(loxDir, "minted"))};
 let n = fs.existsSync(mintFile) ? +fs.readFileSync(mintFile, "utf8") : 0;
+// An expression's top block (#82), as lox makes it, drawn on the page at out[pageAt]: one block of the type of the
+// expression's top operator, labelled with it (\`<=\` as ≤, \`<\` as ＜), its UUID kept by slug; an expression's is
+// expression-owned in the lock. Returns its output connector's UUID.
+const exprBlock = (slug, text, pageAt, owned, title) => {
+  const [ty, q] = / or /.test(text) ? ["Or", "Q"] : / and /.test(text) ? ["And", "Q"] : /^not /.test(text) ? ["Not", "Q"]
+    : />=/.test(text) ? ["GreaterEqual", "Q"] : /<=/.test(text) ? ["LessEqual", "Q"] : />/.test(text) ? ["Greater", "Q"]
+    : /</.test(text) ? ["Less", "Q"] : /==/.test(text) ? ["Equal", "Q"] : /!=/.test(text) ? ["NotEqual", "Q"] : ["Formula", "AQ"];
+  const uuid = lock.objects[slug]?.uuid || \`eeeeee\${String(++n).padStart(2, "0")}-0000-0000-ffff504f94000001\`;
+  const page_uuid = out[pageAt].match(/U="([^"]+)"/)[1];
+  const layout = lock.objects[slug]?.layout || { px: 9600, py: 960, px2: 10944, py2: 1656 };
+  objects[slug] = { uuid, type: ty, page_uuid, layout, ...(owned ? { expr_owned: true } : {}) };
+  const label = title ?? text.replace(/<=/g, "≤").replace(/</g, "＜").replace(/%/g, "％");
+  const co = (k, i) => \`\\t\\t\\t\\t<Co K="\${k}" U="\${uuid.slice(0, 9)}0000-00\${i}0-ffff504f94000001"/>\`;
+  out.splice(pageAt + 1, 0, \`\\t\\t\\t<C Type="\${ty}" V="178" U="\${uuid}" Title="\${xml(label)}" Px="96" Py="96" Px2="1440" Py2="792" Nio="3">\`, co("I1", 1), co("I2", 2), co(q, 3), "\\t\\t\\t</C>");
+  return \`\${uuid.slice(0, 9)}0000-0030-ffff504f94000001\`;
+};
 for (const f of fs.existsSync("pages/vislox") ? fs.readdirSync("pages/vislox") : []) {
   if (f === "edits.loxl" || !f.endsWith(".loxl")) continue;
   let pageAt = -1;
   for (const line of fs.readFileSync("pages/vislox/" + f, "utf8").split("\\n")) {
     let m;
     if ((m = line.match(/^page "(.*)"$/))) { pageAt = out.findIndex((l) => l.includes('Type="Page"') && l.includes(\`Title="\${m[1]}"\`)); continue; }
+    // A named signal (#82): its top block, labelled with its .title or its expression.
+    if ((m = line.match(/^(vx_\\w+) = (.+)$/)) && !/^\\w+\\(/.test(m[2])) {
+      const t = fs.readFileSync("pages/vislox/" + f, "utf8").match(new RegExp(\`^\${m[1]}\\\\.title = "((?:[^"\\\\\\\\]|\\\\\\\\.)*)"$\`, "m"));
+      exprBlock(m[1], m[2], pageAt, false, t ? JSON.parse('"' + t[1] + '"') : null);
+      continue;
+    }
     if (!(m = line.match(/^(vx_\\w+) = (\\w+)\\((.*)\\)$/))) continue;
     const [, slug, ty, rest] = m;
     // A block adopted here (#72) is drawn in the base already: it keeps it, with the name its declaration gives.
@@ -518,6 +558,22 @@ for (const f of fs.existsSync("pages/vislox") ? fs.readdirSync("pages/vislox") :
     const cos = [...rest.matchAll(/(\\w+): (-?[\\d.]+(?:ms|s|min|h|%|K|°)?)(?=[,)]|$)/g)].map(([, k, v], i) => \`<Co K="\${KEYS[k] || k}" Def="\${scale(v)}" U="\${uuid.slice(0, 9)}0000-00\${i}0-ffff504f94000001"/>\`);
     out.splice(pageAt + 1, 0, withAttrs(\`\\t\\t\\t<C Type="\${ty}" V="178" U="\${uuid}" Title="\${xml(title ? JSON.parse('"' + title[1] + '"') : slug)}" Px="96" Py="96" Px2="1440" Py2="792" Nio="2">\${cos.join("")}</C>\`, settingAttrs(rest)));
   }
+}
+// vislox's expressions onto inputs (#82): \`x.Port <- <expression>\` in edits.loxl, a block named after the sink's
+// connector key, on the sink's page, wired into it.
+for (const line of src.split("\\n")) {
+  const m = line.match(/^(\\w+)\\.(\\w+) <- (.+)$/);
+  if (!m || /^\\w+(\\.\\w+)?$/.test(m[3])) continue;
+  const sink = slugs[m[1]] || objects[m[1]]?.uuid;
+  let i = out.findIndex((l) => l.includes(\`U="\${sink}"\`) && l.includes("<C "));
+  let pageAt = i;
+  while (pageAt >= 0 && !out[pageAt].includes('Type="Page"')) pageAt--;
+  const key = out[out.findIndex((l, x) => x > i && l.includes(\`<Co K="\${m[2].replace(/^In(\\d)$/, "I$1")}"\`))].match(/K="([^"]+)"/)[1];
+  const top = / or /.test(m[3]) ? "or" : / and /.test(m[3]) ? "and" : /^not /.test(m[3]) ? "not" : />=/.test(m[3]) ? "ge" : /<=/.test(m[3]) ? "le" : />/.test(m[3]) ? "gt" : /</.test(m[3]) ? "lt" : /==/.test(m[3]) ? "eq" : /!=/.test(m[3]) ? "ne" : "f";
+  const q = exprBlock(\`\${m[1]}_\${key.toLowerCase()}__\${top}1\`, m[3], pageAt, true, null);
+  i = out.findIndex((l) => l.includes(\`U="\${sink}"\`) && l.includes("<C "));
+  const to = out.findIndex((l, x) => x > i && l.includes(\`<Co K="\${key}"\`));
+  out[to] = out[to].replace(/\\/>$/, \`><In Input="\${q}"/></Co>\`);
 }
 // The blocks the rest of the module manages stay in the lock, with the titles their files give them.
 for (const [s, o] of Object.entries(lock.objects)) if (!s.startsWith("vx_")) objects[s] = o;
@@ -700,7 +756,7 @@ const coOf = (uuid, name) => {
 for (const line of src.split("\\n")) {
   const m = line.match(/^(\\w+)\\.(\\w+) <- (\\w+)\\.(\\w+)$/);
   if (!m) continue;
-  const to = coOf(slugs[m[1]], m[2]), from = coOf(slugs[m[3]], m[4]);
+  const to = coOf(slugs[m[1]] || objects[m[1]]?.uuid, m[2]), from = coOf(slugs[m[3]] || objects[m[3]]?.uuid, m[4]);
   const srcU = out[from].match(/U="([^"]+)"/)[1];
   out[to] = out[to].replace(/\\/>$/, \`><In Input="\${srcU}"/></Co>\`);
 }
@@ -2538,6 +2594,93 @@ try {
     assert.deepEqual(ops, [{ op: "let", name: "vx_time", value: "30min" }]);
     await page.waitForFunction(() => /Nothing pending/.test(document.querySelector("#deploy-pend")?.textContent || ""), null, { timeout: 15000 });
     assert.match(claims(), /^let vx_time = 30min$/m);
+  });
+  await step("expressions are drawn as one block, shown with their source, edited, named and undone (#82)", async () => {
+    await settled();
+    const ex = '#props [data-body="Expression"]';
+    const claims = () => readFileSync(join(dir, "pages", "vislox", "edits.loxl"), "utf8");
+    const send = async (act, what) => {
+      const n = edits.length;
+      await act();
+      await until(() => edits.length > n && statuses[n] !== undefined, what);
+      assert.equal(statuses[n], 200, what);
+      await settled();
+      return edits[n].ops;
+    };
+    const go = async (u) => {
+      await page.evaluate((x) => { gotoPage(S.objPage.get(x), { focus: x }); select(x); }, u);
+      await page.waitForFunction((x) => S.sel === x, u);
+    };
+    // The module's own expression: its two blocks folded into one, titled with the expression.
+    await page.evaluate((p) => gotoPage(p), AUSDRUCK);
+    await page.waitForSelector('.expr-fold[data-expr="markise_i2__"]', { timeout: 10000 });
+    assert.equal(await page.getAttribute('.expr-fold[data-expr="markise_i2__"]', "aria-label"), "markise.In2 ← licht.Q and teiler.AQ >= 28");
+    for (const u of [EXA, EXG]) assert.ok(await page.$eval(`.blk[data-uuid="${u}"]`, (n) => n.classList.contains("expr-hidden")));
+    // A click opens it and selects its top block: the expression, what it feeds and its line, read-only.
+    await page.click('.expr-fold[data-expr="markise_i2__"]');
+    await page.waitForFunction((u) => S.sel === u && document.querySelector('.expr-grp[data-expr="markise_i2__"]'), EXA);
+    assert.ok(!(await page.$eval(`.blk[data-uuid="${EXG}"]`, (n) => n.classList.contains("expr-hidden"))));
+    await waitText(ex, /Expression\s*licht\.Q and teiler\.AQ >= 28/);
+    await waitText(ex, /Feeds\s*Markise\.In2/);
+    await waitText(ex, /pages\/ausdruck\.loxl:5/);
+    await waitText(ex, /Written in the module's own file: change it there/);
+    assert.equal(await page.$(`${ex} [data-ex="save"]`), null);
+    // Its title folds it again.
+    await page.click('text.expr-t[data-expr="markise_i2__"]');
+    await page.waitForSelector('.expr-fold[data-expr="markise_i2__"]');
+    // An expression of vislox's on Pumpe's free input: `vx_<pumpe>.In1 <- …` in vislox's file.
+    const div = `vx_${DIV.replace(/-/g, "_")}`, pumpe = `vx_${PUMPE.replace(/-/g, "_")}`;
+    await go(PUMPE);
+    await page.click(`${ex} .ex-new summary`);
+    await page.waitForSelector(`${ex} [data-ex="add"]`);
+    await page.selectOption(`${ex} [data-ex-field="new:port"]`, "I1");
+    await page.fill(`${ex} [data-ex-field="new:text"]`, `${div}.AQ >= 30`);
+    let ops = await send(() => page.click(`${ex} [data-ex="add"]`), "add an expression");
+    assert.deepEqual(ops, [{ op: "expr", uuid: PUMPE, port: "I1", value: `${div}.AQ >= 30` }]);
+    assert.ok(claims().includes(`${pumpe}.In1 <- ${div}.AQ >= 30\n`), claims());
+    const id = `${pumpe}_i1__`;
+    await page.waitForFunction((i) => S.edits?.expressions?.some((e) => e.id === i && e.ours && e.pending), id, { timeout: 10000 });
+    // Its top block is selected, and the expression is edited there.
+    await page.waitForFunction((i) => S.edits.expressions.find((e) => e.id === i).blocks[0] === S.sel, id, { timeout: 10000 });
+    await waitText(ex, /Not deployed: new since the deployed config/);
+    await page.fill(`${ex} [data-ex-field="${id}:text"]`, `${div}.AQ >= 30 and ${div}.AQ < 40`);
+    ops = await send(() => page.press(`${ex} [data-ex-field="${id}:text"]`, "Enter"), "change the expression");
+    assert.deepEqual(ops, [{ op: "expr", uuid: PUMPE, port: "I1", value: `${div}.AQ >= 30 and ${div}.AQ < 40` }]);
+    await page.waitForFunction((i) => S.edits?.expressions?.find((e) => e.id === i)?.top_type === "And", id, { timeout: 10000 });
+    // The Changes list reads it as the expression, not as blocks added and removed.
+    await waitText("#changes", new RegExp(`expression on ${pumpe}\\.In1: ${div}\\.AQ >= 30 and ${div}\\.AQ < 40 \\(new\\)`));
+    // Name this expression: a signal of the page, and the input fed from it, in one request.
+    await page.waitForFunction((i) => S.edits.expressions.find((e) => e.id === i).blocks[0] === S.sel, id, { timeout: 10000 });
+    await page.fill(`${ex} [data-ex-field="${id}:name"]`, "vx_pumpe_an");
+    ops = await send(() => page.click(`${ex} [data-ex="name"]`), "name the expression");
+    assert.deepEqual(ops, [
+      { op: "signal", slug: "vx_pumpe_an", page: AUSDRUCK, value: `${div}.AQ >= 30 and ${div}.AQ < 40` },
+      { op: "expr", uuid: PUMPE, port: "I1", value: "vx_pumpe_an" },
+    ]);
+    assert.ok(claims().includes(`${pumpe}.In1 <- vx_pumpe_an.Q\n`), claims());
+    assert.match(readFileSync(join(dir, "pages", "vislox", "ausdruck.loxl"), "utf8"), /^vx_pumpe_an = vx_\w+\.AQ >= 30 and vx_\w+\.AQ < 40$/m);
+    await page.waitForFunction(() => S.edits?.expressions?.some((e) => e.kind === "signal" && e.sink === "vx_pumpe_an" && e.ours) &&
+      !S.edits.expressions.some((e) => e.id.startsWith("vx_80000004")), null, { timeout: 10000 });
+    // The signal's label.
+    await page.waitForFunction(() => S.sel === S.edits.expressions.find((e) => e.sink === "vx_pumpe_an").blocks[0], null, { timeout: 10000 });
+    await waitText(ex, /Signal\s*vx_\w+\.AQ >= 30/);
+    await page.fill(`${ex} [data-ex-field="vx_pumpe_an__:title"]`, "Pumpe an");
+    ops = await send(() => page.click(`${ex} [data-ex="save"]`), "label the signal");
+    assert.deepEqual(ops, [{ op: "signal", slug: "vx_pumpe_an", page: AUSDRUCK, value: `${div}.AQ >= 30 and ${div}.AQ < 40`, title: "Pumpe an" }]);
+    await page.waitForFunction(() => S.edits?.expressions?.find((e) => e.sink === "vx_pumpe_an")?.title === "Pumpe an", null, { timeout: 10000 });
+    // Undone: the label, then the naming (the expression back on the input, the signal dropped).
+    ops = await undoKey(false, () => S.edits?.expressions?.find((e) => e.sink === "vx_pumpe_an")?.title === undefined);
+    assert.deepEqual(ops, [{ op: "signal", slug: "vx_pumpe_an", page: AUSDRUCK, value: `${div}.AQ >= 30 and ${div}.AQ < 40` }]);
+    ops = await undoKey(false, (i) => S.edits?.expressions?.some((e) => e.id === i) && !S.edits.expressions.some((e) => e.sink === "vx_pumpe_an"), id);
+    assert.deepEqual(ops, [
+      { op: "expr", uuid: PUMPE, port: "I1", value: `${div}.AQ >= 30 and ${div}.AQ < 40` },
+      { op: "signal", slug: "vx_pumpe_an", page: AUSDRUCK, value: null },
+    ]);
+    assert.ok(claims().includes(`${pumpe}.In1 <- ${div}.AQ >= 30 and ${div}.AQ < 40\n`), claims());
+    // Undone to the start: nothing of vislox's feeds Pumpe.
+    await undoKey(false, (i) => S.edits?.expressions?.find((e) => e.id === i)?.top_type === "GreaterEqual", id);
+    await undoKey(false, (i) => !S.edits?.expressions?.some((e) => e.id === i), id);
+    assert.ok(!claims().includes(pumpe), claims());
   });
   await step("nothing was deployed: lox only compiled, checked, linted and tested", async () => {
     const ran = readFileSync(calls, "utf8").trim().split("\n");

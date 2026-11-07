@@ -632,6 +632,7 @@ function renderPage() {
       el("line", { class: "ghost-line ghost", x1: x + w / 2, y1: y + h / 2, x2: o.rect[0] + o.rect[2] / 2, y2: o.rect[1] + o.rect[3] / 2 }, L.ghost);
     }
   }
+  drawExprs(p);
   wrDraw(p);
   L.live = liveBuild(p);
   liveApply(null);
@@ -1094,6 +1095,9 @@ window.addEventListener("mouseup", () => (mmDrag = false));
 
 // ── selection, focus mode & properties ────────────────────────────────
 function select(uuid, opts) {
+  // A block of an expression drawn folded (#82): open it, so the block shows.
+  const fx = uuid && exprOf(uuid);
+  if (fx && !S.exOpen.has(fx.id) && curPage()?.objects.some((o) => o.uuid === uuid)) { S.exOpen.add(fx.id); S.sel = uuid; renderPage(); }
   S.sel = uuid || null;
   vpG.querySelectorAll(".sel").forEach((n) => n.classList.remove("sel"));
   if (uuid) vpG.querySelectorAll(`[data-uuid="${CSS.escape(uuid)}"]`).forEach((n) => n.classList.add("sel"));
@@ -1134,8 +1138,8 @@ function calTip(cal) {
 const propRow = (k, v, cls, tip) => `<div class="pr ${cls || ""}"><div class="k${tip ? " hinted" : ""}"${tip ? ` title="${esc(tip)}"` : ""}>${esc(k)}</div><div class="v">${v}</div></div>`;
 function renderProps() {
   // Live values re-render Properties often: keep the edit field being typed in.
-  const f = document.activeElement?.closest?.("#props [data-ed-field], #props [data-sch-field], #props [data-mo-field], #props [data-mo-name]");
-  const attr = ["data-ed-field", "data-sch-field", "data-mo-field", "data-mo-name"].find((a) => f?.hasAttribute(a));
+  const f = document.activeElement?.closest?.("#props [data-ed-field], #props [data-sch-field], #props [data-mo-field], #props [data-mo-name], #props [data-ex-field]");
+  const attr = ["data-ed-field", "data-sch-field", "data-mo-field", "data-mo-name", "data-ex-field"].find((a) => f?.hasAttribute(a));
   const keep = f && { field: f.getAttribute(attr), a: f.selectionStart, b: f.selectionEnd };
   renderPropsBody();
   if (keep) {
@@ -1174,6 +1178,8 @@ function renderPropsBody() {
   if (ti) section("Tiles", ti.rows, ti.count);
   const tl = tiLinkedRows(o, row);
   if (tl) section("Touch Pure Flex", tl);
+  const ex = exRows(o, row, marks);
+  if (ex) section("Expression", ex.rows, ex.count);
   const ms = managedSrc(o.uuid);
   // The errors of lox logic check whose line names this block (#65): on the newest config only.
   const ce = S.rev === editRev()?.id ? checkErrors(o.uuid) : [];
@@ -1328,6 +1334,8 @@ $("props").addEventListener("keydown", (e) => {
   if (e.target.id === "rn-slug" && e.key === "Escape") { e.preventDefault(); e.stopPropagation(); renameClose(); return; }
   if (e.target.id === "ed-mk" && e.key === "Enter") { e.preventDefault(); constMake(); return; }
   if (e.target.id === "ed-mk" && e.key === "Escape") { e.preventDefault(); e.stopPropagation(); constMkClose(); return; }
+  const xf = e.target.closest("[data-ex-field]");
+  if (xf && e.key === "Enter") { e.preventDefault(); exAct(xf.dataset.exEnter, xf.dataset.id); return; }
   const f = e.target.closest("[data-ed-field]");
   // In a program (#79) Enter is a line break; Ctrl+Enter (⌘ on a Mac) saves.
   if (f && e.key === "Enter" && (f.tagName !== "TEXTAREA" || e.ctrlKey || e.metaKey)) { e.preventDefault(); editSave(); return; }
@@ -1335,7 +1343,9 @@ $("props").addEventListener("keydown", (e) => {
   const i = e.target.closest(".op input");
   if (i && e.key === "Enter") { e.preventDefault(); operate(i.dataset.opUuid, i.value); }
 });
+$("props").addEventListener("toggle", (e) => { if (e.target.classList?.contains("ex-new")) { exSync(); S.ex.draft["new:open"] = e.target.open; } }, true);
 $("props").addEventListener("input", (e) => {
+  if (e.target.dataset.exField) { exSync(); S.ex.draft[e.target.dataset.exField] = e.target.value; return; }
   if (e.target.id === "ad-slug") { AD.slug = e.target.value; return; }
   if (e.target.id === "rn-slug") { RN.slug = e.target.value; return; }
   if (e.target.dataset.edScope && S.edit.uuid === S.sel) { (S.edit.scope ||= {})[e.target.dataset.edScope] = e.target.value; return; }
@@ -1345,6 +1355,8 @@ $("props").addEventListener("input", (e) => {
   delete S.edit.bad[f.dataset.edField];
 });
 $("props").addEventListener("click", (e) => {
+  const xb = e.target.closest("[data-ex]");
+  if (xb) { exAct(xb.dataset.ex, xb.dataset.id); return; }
   const eb = e.target.closest("[data-ed]");
   if (eb) {
     const what = eb.dataset.ed;
@@ -1572,22 +1584,46 @@ function chgConst(c) {
   const u = constUse(c.obj, c.port), l = constLet(u);
   return u ? (l ? `let ${l}` : `defaults ${u.name}`) : null;
 }
-/** The changes listed: those the filters let through, and the parameter changes one `let` or `defaults` causes
- *  (two or more) together, where the first of them is. Next and previous go in this order. */
+/** The expression a change is to (#82), on the newest config: `expr <id>`, for a block of its chain now or in the
+ *  deployed revision, and for the wire into its sink. */
+function chgExpr(c) {
+  if (!c.obj) return null;
+  const e = exprList().find((x) => x.blocks.some((b) => ciEq(b, c.obj)) || x.deployed?.blocks.some((b) => ciEq(b, c.obj)));
+  return e ? `expr ${e.id}` : null;
+}
+/** What groups a change: an expression (even one change: it reads as the expression), else a `let` or `defaults`. */
+function chgKey(c) { return chgExpr(c) || chgConst(c); }
+/** Whether the changes of key `k` (`n` of them) go under a heading. */
+function chgGrouped(k, n) { return !!k && (n > 1 || k.startsWith("expr ")); }
+/** The changes listed: those the filters let through, and the changes one expression causes, and the parameter
+ *  changes one `let` or `defaults` causes (two or more), together where the first of them is. Next and previous go
+ *  in this order. */
 function shownChanges() {
   const list = (S.view?.changes || []).filter((c) => !S.chgOff.has(c.kind) && (!S.chgHw || c.hw));
   const key = new Map(), n = new Map();
-  for (const c of list) { const k = chgConst(c); if (k) { key.set(c, k); n.set(k, (n.get(k) || 0) + 1); } }
-  if (![...n.values()].some((x) => x > 1)) return list;
+  for (const c of list) { const k = chgKey(c); if (k) { key.set(c, k); n.set(k, (n.get(k) || 0) + 1); } }
+  if (![...n].some(([k, x]) => chgGrouped(k, x))) return list;
   const by = new Map();
-  for (const c of list) { const k = key.get(c); if (k && n.get(k) > 1) (by.get(k) || by.set(k, []).get(k)).push(c); }
+  for (const c of list) { const k = key.get(c); if (chgGrouped(k, n.get(k))) (by.get(k) || by.set(k, []).get(k)).push(c); }
   const out = [], done = new Set();
   for (const c of list) {
     const k = key.get(c);
-    if (!k || n.get(k) < 2) out.push(c);
+    if (!chgGrouped(k, n.get(k))) out.push(c);
     else if (!done.has(k)) { done.add(k); out.push(...by.get(k)); }
   }
   return out;
+}
+/** The heading over the changes one expression causes: what it feeds, and its text before → now. Before is the
+ *  deployed revision's, shown when that is what is compared. */
+function chgExprHead(k, count) {
+  const e = exprList().find((x) => `expr ${x.id}` === k);
+  if (!e) return "";
+  const vsDeployed = S.base && S.base === deployedRev()?.id;
+  const old = vsDeployed && e.deployed && e.deployed.text !== e.text ? e.deployed.text : null;
+  const what = e.kind === "signal" ? `signal ${e.sink}` : `expression on ${e.sink}`;
+  const text = old ? `<span class="old">${esc(old)}</span> → <span class="new">${esc(e.text)}</span>` : vsDeployed && !e.deployed ? `<span class="new">${esc(e.text)}</span> (new)` : esc(e.text);
+  const at = e.file ? constAt(e.file, e.line) : "";
+  return `<div class="chg-grp chg-expr" role="listitem" data-expr="${esc(e.id)}"><span class="mono">${esc(what)}: ${text}</span> · ${plural(count, "change")}${at ? `<span class="p">${esc(at)}</span>` : ""}</div>`;
 }
 /** The heading over the changes one `let` or `defaults` causes. */
 function chgConstHead(k, count) {
@@ -1644,11 +1680,11 @@ function renderChanges() {
   if (!v.changes.length) { box.innerHTML = '<div class="empty">No differences between these revisions.</div>'; return; }
   const list = shownChanges().slice(0, 2000);
   const groups = new Map();
-  for (const c of list) { const k = chgConst(c); if (k) groups.set(k, (groups.get(k) || 0) + 1); }
+  for (const c of list) { const k = chgKey(c); if (k) groups.set(k, (groups.get(k) || 0) + 1); }
   let inGroup = null;
   list.forEach((c, i) => {
-    const k = chgConst(c), grouped = k && groups.get(k) > 1;
-    if (grouped && k !== inGroup) box.insertAdjacentHTML("beforeend", chgConstHead(k, groups.get(k)));
+    const k = chgKey(c), grouped = chgGrouped(k, groups.get(k));
+    if (grouped && k !== inGroup) box.insertAdjacentHTML("beforeend", k.startsWith("expr ") ? chgExprHead(k, groups.get(k)) : chgConstHead(k, groups.get(k)));
     inGroup = grouped ? k : null;
     const d = document.createElement("button");
     d.type = "button";
@@ -3124,13 +3160,15 @@ S.edits = null; // GET /api/edits: what vislox's file claims, and which of it is
 S.edit = { uuid: null, open: false, draft: {}, bad: {}, busy: false, msg: "", err: "" };
 S.editsKey = null; // the server's key of what /api/edits says (vislox's file, deployed and pending config)
 async function loadEdits() {
-  const was = managedSet(), consts = JSON.stringify(S.edits?.constants || null);
+  const was = managedSet(), consts = JSON.stringify(S.edits?.constants || null), exprs = JSON.stringify(S.edits?.expressions || null);
   if (!S.hist?.actions?.shown) { S.edits = null; managedRefresh(was); return; }
   try { S.edits = await api("/api/edits"); } catch { S.edits = null; S.editsKey = null; }
-  // The managed blocks' badges and the legend follow the lockfile and the module (#64).
+  // The managed blocks' badges and the legend follow the lockfile and the module (#64); the expressions'
+  // groups follow the module too (#82).
+  if (S.view && managedSet() === was && JSON.stringify(S.edits?.expressions || null) !== exprs) renderPage();
   managedRefresh(was);
   // The claims' λ file:line in Rights and schedules too (#68); the changes a constant causes, grouped (#81).
-  if (S.view) S.view.compared && JSON.stringify(S.edits?.constants || null) !== consts ? renderChanges() : renderRights();
+  if (S.view) S.view.compared && (JSON.stringify(S.edits?.constants || null) !== consts || JSON.stringify(S.edits?.expressions || null) !== exprs) ? renderChanges() : renderRights();
   renderActions();
   if (S.sel && S.view) renderProps();
 }
@@ -3414,6 +3452,173 @@ function editPlaces(ty) {
 }
 /** A constant as the form starts it: with the unit Lox Logic writes it with (`30min`), else as stored. */
 function portNow(o, key) { const q = o.ports.find((x) => x.key === key); return q?.def_text ?? q?.def ?? "0"; }
+// ── expressions and named signals (#82) ───────────────────────────────
+// lox desugars an expression (`x.Port <- a.Q and b.AQ >= 28`, `Port: …` in a declaration, or a named signal
+// `warm = …`) into And, Or, Not, comparator and Formula blocks, which it re-derives on every compile, so they are
+// never edited as blocks. GET /api/edits' `expressions` names each one's blocks (the top one first), where it is
+// written and what the deployed revision had. The canvas draws a chain as one group titled with its expression,
+// folded into one block until it is opened; Properties shows the expression, and edits those of vislox's own files
+// (the `expr` and `signal` ops); the Changes list puts an expression's changes under its old → new text.
+S.exOpen = new Set(); // the expressions (by id) drawn open
+S.ex = { key: null, draft: {}, err: "" }; // the Expression section's draft, for one block of one pending config
+function exprList() { return managedShown() ? S.edits.expressions || [] : []; }
+function ciEq(a, b) { return !!a && !!b && a.toLowerCase() === b.toLowerCase(); }
+/** The expression whose blocks `uuid` is one of. */
+function exprOf(uuid) { return uuid ? exprList().find((e) => e.blocks.some((b) => ciEq(b, uuid))) || null : null; }
+/** The expressions that feed an input of `uuid`. */
+function exprsInto(uuid) { return exprList().filter((e) => e.to && ciEq(e.to[0], uuid)); }
+/** What an expression feeds, said after its text: `jal.AutoShade`, or a signal's output. */
+function exprWhat(e) { return e.kind === "signal" ? `${e.sink} =` : `${e.sink} ←`; }
+/** Each expression with a block on page `p`: a dashed frame titled with it when open, else one block showing it
+ *  in place of its blocks and the wires between them. */
+function drawExprs(p) {
+  const list = exprList();
+  if (!list.length) return;
+  const objs = new Map(p.objects.filter((o) => o.shape !== "tag" && !o.moved_to).map((o) => [o.uuid.toLowerCase(), o]));
+  for (const e of list) {
+    const here = e.blocks.map((b) => objs.get(b.toLowerCase())).filter(Boolean);
+    if (!here.length) continue;
+    const pad = 120;
+    const x1 = Math.min(...here.map((o) => o.rect[0])) - pad, y1 = Math.min(...here.map((o) => o.rect[1])) - pad;
+    const x2 = Math.max(...here.map((o) => o.rect[0] + o.rect[2])) + pad, y2 = Math.max(...here.map((o) => o.rect[1] + o.rect[3])) + pad;
+    const w = x2 - x1, h = y2 - y1;
+    const top = here.find((o) => ciEq(o.uuid, e.blocks[0])) || here[0];
+    const title = `${exprWhat(e)} ${e.text}`;
+    const tip = () => `<b>${esc(e.kind === "signal" ? `Signal ${e.sink}${e.title ? ` (${e.title})` : ""}` : `Expression on ${e.sink}`)}</b><br><span class="mono">${esc(e.text)}</span><br><span class="tm">${plural(e.blocks.length, "block")} lox made for it${e.file ? ` · ${esc(constAt(e.file, e.line))}` : ""}</span>`;
+    if (S.exOpen.has(e.id)) {
+      const g = el("g", { class: "expr-grp" + (e.pending ? " pending" : ""), "data-expr": e.id }, L.ghost);
+      el("rect", { class: "expr-frame", x: x1, y: y1, width: w, height: h, rx: 90 }, g);
+      const t = el("text", { class: "expr-t", x: x1 + 40, y: y1 - 60 }, L.badges, clip(`▾ ${title}`, Math.max(12, Math.floor(w / 62))));
+      t.setAttribute("data-expr", e.id);
+      t.setAttribute("role", "button");
+      hoverTip(t, () => `${tip()}<br><span class="tm">Click to fold it into one block.</span>`);
+      t.addEventListener("click", (ev) => { ev.stopPropagation(); S.exOpen.delete(e.id); renderPage(); applyFocus(); });
+      continue;
+    }
+    const inside = new Set(here.map((o) => o.uuid));
+    for (const u of inside) vpG.querySelectorAll(`.blk[data-uuid="${CSS.escape(u)}"]`).forEach((n) => n.classList.add("expr-hidden"));
+    L.wires.querySelectorAll(".wire").forEach((n) => {
+      if (inside.has(n.dataset.f) && inside.has(n.dataset.t)) { n.classList.add("expr-hidden"); n.nextElementSibling?.classList.add("expr-hidden"); }
+    });
+    const g = el("g", { class: "expr-fold" + (e.pending ? " pending" : "") + (inside.has(S.sel) ? " sel" : ""), "data-expr": e.id, "data-top": top.uuid, role: "button", "aria-label": title }, L.objs);
+    el("rect", { class: "expr-body", x: x1, y: y1, width: w, height: h, rx: 90 }, g);
+    el("text", { class: "expr-h", x: x1 + 90, y: y1 + 190 }, g, clip(e.kind === "signal" ? `Signal ${e.title || e.sink}` : `Expression ▸ ${e.sink}`, Math.floor((w - 180) / 66)));
+    // The text, wrapped at its spaces.
+    const per = Math.max(8, Math.floor((w - 180) / 62)), words = e.text.split(" "), lines = [];
+    for (const wd of words) { const last = lines[lines.length - 1]; if (last != null && (last + " " + wd).length <= per) lines[lines.length - 1] = last + " " + wd; else lines.push(wd); }
+    const room = Math.max(1, Math.floor((h - 300) / 150));
+    lines.slice(0, room).forEach((l, i) => el("text", { class: "expr-x", x: x1 + 90, y: y1 + 400 + i * 150 }, g, i === room - 1 && lines.length > room ? clip(l + " …", per) : clip(l, per)));
+    hoverTip(g, () => `${tip()}<br><span class="tm">Click to open it.</span>`);
+    g.addEventListener("click", (ev) => { ev.stopPropagation(); if (drag?.moved) return; select(top.uuid); });
+  }
+}
+/** The Expression section's draft follows the selected block and the pending config: a new one starts afresh. */
+function exSync() {
+  const key = `${S.sel}|${editRev()?.blob || ""}`;
+  if (S.ex.key !== key) S.ex = { key, draft: {}, err: S.ex.key == null ? "" : "" };
+}
+/** Whether vislox can edit expressions now: the newest config shown, editing on, nothing compiling. */
+function exState() {
+  const a = S.hist?.actions;
+  if (!a?.shown) return null;
+  if (!a.edit?.available) return { why: `Editing is off: ${a.edit?.reason || "unknown"}.` };
+  const r = editRev();
+  if (!r || S.rev !== r.id) return null;
+  if (a.running) return { why: `${a.running} is running.` };
+  if (UNDO.busy || S.edit.busy) return { why: "An edit is compiling." };
+  return { ok: true, rev: r };
+}
+/** The pending claim of the `expr` op on an input (`claims`), for its Revert. */
+function exClaim(e) { return e.to ? (S.edits?.claims || []).find((c) => c.op === "expr" && ciEq(c.uuid, e.to[0]) && c.port === e.to[1]) || null : null; }
+function exRows(o, row, marks) {
+  exSync();
+  const mine = exprOf(o.uuid);
+  const list = [mine, ...exprsInto(o.uuid).filter((e) => e !== mine)].filter(Boolean);
+  const st = exState();
+  const d = S.ex.draft;
+  const rows = [];
+  let count = 0;
+  for (const e of list) {
+    const id = esc(e.id);
+    const old = e.pending && e.deployed && e.deployed.text !== e.text ? e.deployed.text : null;
+    const sink = e.to && S.view.objects[e.to[0]];
+    rows.push(row(e.kind === "signal" ? "Signal" : "Expression", `<span class="mono ex-text">${marks && old ? `<span class="old">${esc(old)}</span><span class="new">${esc(e.text)}</span>` : esc(e.text)}</span>`, old ? "pr-chg" : ""));
+    if (e.kind === "signal") {
+      rows.push(row("Output", `<span class="mono">${esc(e.sink)}.${e.top_type === "Formula" ? "AQ" : "Q"}</span>`));
+      rows.push(row("Label", e.title ? esc(e.title) : '<span class="none-v">— (its expression)</span>'));
+    } else rows.push(row("Feeds", sink ? `<button type="button" class="lnk" data-go="${esc(sink.uuid)}" data-page="${esc(sink.page || "")}">${esc(displayTitle(sink))}.${esc(portName(sink, e.to[1]))}</button>` : `<span class="mono">${esc(e.sink)}</span>`));
+    rows.push(row("Blocks", `${plural(e.blocks.length, "block")} lox made for it`, "", "lox makes these blocks from the expression on every compile: they are changed through the expression, never one by one."));
+    const path = constAt(e.file, e.line);
+    if (path) rows.push(row("Source", `<span class="mono src-path">${esc(path)}</span><button type="button" class="copy" data-copy="${esc(path)}" data-label="Copy path" title="Copy the file and line">Copy path</button>`));
+    if (e.pending) { count++; rows.push(`<div class="ed-note ex-pending">${e.deployed ? `Not deployed: the deployed config has <span class="mono">${esc(e.deployed.text)}</span>.` : "Not deployed: new since the deployed config."}</div>`); }
+    if (!e.ours) {
+      rows.push(`<div class="ed-note">Written in the module's own file: change it there (vislox writes only its own files).</div>`);
+      continue;
+    }
+    if (!st) continue;
+    if (!st.ok) { rows.push(`<div class="ed-note">${esc(st.why)}</div>`); continue; }
+    const tv = d[`${e.id}:text`] ?? e.text;
+    rows.push(`<div class="ex-form"><label class="ed-l">Expression <input type="text" class="ed-in mono" data-ex-field="${id}:text" data-ex-enter="save" data-id="${id}" value="${esc(tv)}" spellcheck="false" aria-label="Expression"></label>` +
+      (e.kind === "signal" ? `<label class="ed-l">Label <input type="text" class="ed-in" data-ex-field="${id}:title" data-ex-enter="save" data-id="${id}" value="${esc(d[`${e.id}:title`] ?? e.title ?? "")}" placeholder="its expression" aria-label="Label"></label>` : "") +
+      `<div class="ed-bar"><button type="button" class="ed-btn" data-ex="save" data-id="${id}">Save</button>` +
+      (e.pending && (e.kind === "signal" ? e.revert : exClaim(e)?.pending) ? `<button type="button" class="ed-btn" data-ex="revert" data-id="${id}" title="Back to what the deployed revision has">Revert</button>` : "") + `</div>` +
+      (e.kind !== "signal" ? `<label class="ed-l">Name this expression <input type="text" class="ed-in mono" data-ex-field="${id}:name" data-ex-enter="name" data-id="${id}" value="${esc(d[`${e.id}:name`] ?? "")}" placeholder="vx_name" spellcheck="false" aria-label="Signal name"></label><div class="ed-bar"><button type="button" class="ed-btn" data-ex="name" data-id="${id}" title="Turn it into a named signal of this page, and feed the input from it">Name it</button></div>` : "") +
+      `</div>`);
+  }
+  // A new expression on an unwired input of a block vislox edits.
+  const fresh = st?.ok && !mine && (o.edit?.params || []).filter((q) => !exprsInto(o.uuid).some((e) => e.to[1] === q.key));
+  if (fresh?.length && !S.edits?.managed?.includes(o.uuid)) {
+    const port = d["new:port"] ?? fresh[0].key;
+    rows.push(`<details class="ex-new"${d["new:open"] ? " open" : ""}><summary>Feed an input from an expression…</summary><div class="ex-form"><label class="ed-l">Input <select class="ed-in" data-ex-field="new:port" aria-label="Input">${fresh.map((q) => `<option value="${esc(q.key)}"${q.key === port ? " selected" : ""}>${esc(portName(o, q.key))}</option>`).join("")}</select></label>` +
+      `<label class="ed-l">Expression <input type="text" class="ed-in mono" data-ex-field="new:text" data-ex-enter="add" data-id="new" value="${esc(d["new:text"] ?? "")}" placeholder="vx_….Q and vx_….AQ >= 28" spellcheck="false" aria-label="New expression"></label>` +
+      `<div class="ed-bar"><button type="button" class="ed-btn" data-ex="add" data-id="new">Add expression</button></div>` +
+      `<div class="ed-note">Names: a block of vislox's by its slug, one Loxone Config drew as vx_ and its UUID (- as _), a constant. lox makes the blocks; the compile says what it refuses.</div></div></details>`);
+  }
+  if (S.ex.err) rows.push(`<div class="ed-msg err ex-err" role="alert">${esc(S.ex.err)}</div>`);
+  return rows.length ? { rows, count: count || undefined } : null;
+}
+/** A button of the Expression section: `save`, `revert`, `name` (Name this expression) or `add`. */
+async function exAct(what, id) {
+  exSync();
+  const st = exState();
+  if (!st?.ok) return;
+  const d = S.ex.draft, uuid = S.sel;
+  const e = exprList().find((x) => x.id === id);
+  let ops;
+  if (what === "add") {
+    const o = S.view.objects[uuid];
+    const port = d["new:port"] ?? (o?.edit?.params || [])[0]?.key, text = (d["new:text"] || "").trim();
+    if (!port || !text) { S.ex.err = "Type the expression first."; renderProps(); return; }
+    ops = [{ op: "expr", uuid, port, value: text }];
+  } else if (!e) return;
+  else if (what === "save") {
+    const text = (d[`${id}:text`] ?? e.text).trim();
+    if (!text) { S.ex.err = "An expression cannot be empty."; renderProps(); return; }
+    ops = e.kind === "signal"
+      ? [{ op: "signal", slug: e.sink, page: S.page, value: text, title: ((d[`${id}:title`] ?? e.title ?? "").trim()) || null }]
+      : [{ op: "expr", uuid: e.to[0], port: e.to[1], value: text }];
+  } else if (what === "revert") {
+    if (e.kind === "signal") ops = [e.revert];
+    else { const c = exClaim(e); if (!c) return; ops = [{ op: "expr", uuid: c.uuid, port: c.port, value: c.deployed }]; }
+  } else if (what === "name") {
+    const name = (d[`${id}:name`] || "").trim();
+    if (!/^vx_[a-z0-9_]+$/.test(name)) { S.ex.err = "A signal of vislox's is named vx_ and then lowercase letters, digits and _."; renderProps(); return; }
+    ops = [{ op: "signal", slug: name, page: S.page, value: e.text }, { op: "expr", uuid: e.to[0], port: e.to[1], value: name }];
+  } else return;
+  S.ex.err = "";
+  const r = await editSend(uuid, st.rev, ops);
+  if (r === "failed") { S.ex.err = S.edit.err; S.edit.err = ""; renderProps(); return; }
+  // The expression's blocks may be new ones: select its top block once /api/edits names it.
+  if (e || what === "add") {
+    await loadEdits();
+    const want = what === "name" ? exprList().find((x) => x.kind === "signal" && x.sink === (d[`${id}:name`] || "").trim())
+      : e ? exprList().find((x) => x.id === e.id) : exprsInto(uuid).find((x) => x.to[1] === ops[0].port);
+    const top = want?.blocks[0];
+    if (top && S.view?.objects[top]) select(top, { noReveal: true });
+    else if (top) { const t = Object.keys(S.view?.objects || {}).find((u) => ciEq(u, top)); if (t) select(t, { noReveal: true }); }
+  }
+}
+
 // ── let constants and defaults (#81) ──────────────────────────────────
 // lox writes a `let` constant's value, and a type's `defaults`, into each port that takes it, so the config keeps
 // no trace of either. GET /api/edits says which port of which block takes its value from one (`constants.uses`,
@@ -5265,6 +5470,11 @@ function undoLabel(ops) {
     return `Bring back ${S.view?.objects[op.uuid] ? obj(op.uuid) : m?.[2] || m?.[1] || "a block"}`;
   }
   if (ops.length === 1 && op.op === "rename") return `Rename ${obj(op.uuid)} to ${op.slug}`;
+  // Expressions and named signals (#82).
+  if (ops.length === 1 && op.op === "expr") return op.value == null ? `Drop the expression on ${end([op.uuid, op.port])}` : `${end([op.uuid, op.port])} ← ${op.value}`;
+  if (ops.length === 1 && op.op === "signal") return op.value == null ? `Drop the signal ${op.slug}` : `Signal ${op.slug} = ${op.value}${op.title ? ` (${op.title})` : ""}`;
+  if (ops.length === 2 && op.op === "signal" && ops[1].op === "expr" && op.value != null) return `Name the expression ${op.slug}`;
+  if (ops.length === 2 && op.op === "expr" && ops[1].op === "signal" && ops[1].value == null) return `Inline the signal ${ops[1].slug}`;
   if (ops.length === 1 && op.op === "tidy") return "Drop lines lox needs no more";
   if (kinds.size === 1 && op.op === "move") return ops.length === 1 ? `Move ${obj(op.uuid)}` : `Move ${plural(ops.length, "block")}`;
   if (ops.length === 1 && op.op === "relayout") return `Arrange ${S.pageOf?.get(op.page)?.title || "the page"}`;
