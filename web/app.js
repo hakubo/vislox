@@ -14,7 +14,7 @@ const S = {
   follow: true, marks: true, vp: {}, open: new Set(["__pages"]), chgOff: new Set(), chgHw: false,
   objPage: new Map(), pageOf: new Map(), loadSeq: 0, onlyChanged: false, chgIdx: -1,
   closed: new Set(["Advanced"]), dim: true, onlyManaged: false, treeFocus: null, hash: null, applyingHash: false,
-  app: null, appBusy: false, appErr: "", applyReads: 0, deployed: null,
+  app: null, appBusy: false, appErr: "", applyReads: 0, deployed: null, rollbackRev: null, rollbackAt: 0,
   live: { on: pref("live", false), dim: pref("liveDim", true), query: pref("liveQuery", false), qes: null, qkey: "", qstat: null, es: null, status: null, values: new Map(), controls: {}, globals: {}, periods: null },
 };
 function pref(k, d) { try { const v = localStorage.getItem("vislox." + k); return v === null ? d : v === "1"; } catch { return d; } }
@@ -71,7 +71,7 @@ function setStatus(text, cls) {
   $("status").className = "status " + (cls || "");
   $("status").title = text;
 }
-function allRevs() { return S.hist ? [...S.hist.pending, ...S.hist.history, ...(S.hist.backups || [])] : []; }
+function allRevs() { return S.hist ? [...(rollbackPreview() ? [S.rollbackRev] : []), ...S.hist.pending, ...S.hist.history, ...(S.hist.backups || [])] : []; }
 function revById(id) { return allRevs().find((r) => r.id === id); }
 function lightColor(rgb) {
   const m = /^(\d+),(\d+),(\d+)$/.exec(rgb || "");
@@ -92,6 +92,7 @@ function revInfo(r) {
   let title = r.label;
   const m = /Config backup .*?\(v(\d+)\)/i.exec(r.label);
   if (r.kind === "pending") title = r.current ? "Compiled, not deployed" : "Earlier compile";
+  else if (r.kind === "rollback") title = r.label;
   else if (r.kind === "live") title = r.label.replace(/ \(same as an older commit\)/, "");
   else if (r.kind === "backup") title = r.label;
   else if (m) title = `Backup v${m[1]}`;
@@ -185,6 +186,7 @@ function revButton(r, newest) {
     `\n\nClick: show it\nShift+click: compare what you see with it${r.id === S.base ? " (again: stop comparing)" : ""}`;
   const pills = [];
   if (r.kind === "pending" && r.current) pills.push('<span class="pill pend">would be deployed</span>');
+  if (r.kind === "rollback") pills.push('<span class="pill pend">would be deployed by Roll back</span>');
   if (deployed) pills.push('<span class="pill cur">on Miniserver</span>');
   if (r.kind === "live") pills.push('<span class="pill new">not in git</span>');
   if (r.kind === "backup") pills.push('<span class="pill ms">not pulled</span>');
@@ -215,9 +217,14 @@ function renderHistory() {
       h.textContent = title;
       box.appendChild(h);
     }
-    for (const r of list) box.appendChild(revButton(r, list[0].id));
+    for (const r of list) {
+      box.appendChild(revButton(r, list[0].id));
+      const rb = S.hist.rollbacks?.[r.id];
+      if (rb) box.appendChild(rollbackRow(r, rb));
+    }
   };
   renderOpLog(box);
+  if (rollbackPreview()) sec("Roll back, not deployed", [S.rollbackRev]);
   if (S.hist.pending.length) { sec("Pending deployment", S.hist.pending); sec("Deployed history", S.hist.history); }
   else sec(null, S.hist.history);
   if (!S.hist.history.length) box.insertAdjacentHTML("beforeend", '<div class="empty">No revisions yet.</div>');
@@ -2107,6 +2114,7 @@ function renderActions() {
   renderCheck();
   $("deploy-pend").classList.toggle("idle", !pend && !a.running);
   $("deploy-pend").textContent = a.running === "Apply" ? "Deploying to the Miniserver… (download, check, upload, restart, verify)"
+    : a.running === "Roll back" ? "Rolling back on the Miniserver… (backup, tests, download, check, upload, restart, verify)"
     : a.running === "Edit" ? "Compiling the edit… (lox logic compile; nothing is deployed)"
     : a.running === "Compile" ? "Compiling the module… (lox logic compile; nothing is deployed)"
     : a.running ? `${a.running}…` : pend ? `Compiled changes are pending (${fmtWhen(pend.time)}), not deployed.` +
@@ -2131,10 +2139,11 @@ function renderActions() {
   const last = a.last;
   if (last && last.at !== renderActions.shownAt) {
     renderActions.shownAt = last.at;
-    const head = { apply: [last.warn ? "Applied, but not verified.\n" : "Applied.\n", "Apply failed.\n"], sync: ["", "Sync failed.\n"], discard: ["", "Discard failed.\n"], compile: ["", "Compile failed.\n"] }[last.kind] || ["", ""];
+    const head = { apply: [last.warn ? "Applied, but not verified.\n" : "Applied.\n", "Apply failed.\n"],
+      rollback: [last.warn ? "Rolled back, but not verified.\n" : "Rolled back.\n", "Roll back failed.\n"], sync: ["", "Sync failed.\n"], discard: ["", "Discard failed.\n"], compile: ["", "Compile failed.\n"] }[last.kind] || ["", ""];
     deployMsg(head[last.ok ? 0 : 1] + last.message, !last.ok, last.ok && last.warn);
     // What the new program logged as it started.
-    if (last.kind === "apply") logStale();
+    if (last.kind === "apply" || last.kind === "rollback") logStale();
     if (last.kind !== "discard" && S.hist?.running) loadRunning(true);
   }
 }
@@ -2151,7 +2160,7 @@ function renderSteps(a) {
     `<span class="ic" aria-label="${esc(s.state)}">${icon[s.state] || "·"}</span><span class="l">${esc(s.label)}</span><span class="t">${esc(secs(s))}</span>` +
     (s.detail ? `<span class="d">${esc(s.detail)}</span>` : "") + "</li>").join("");
   // The running step's clock.
-  if (a.running === "Apply") renderSteps.tick = setTimeout(() => renderSteps(S.hist?.actions || a), 1000);
+  if (a.running === "Apply" || a.running === "Roll back") renderSteps.tick = setTimeout(() => renderSteps(S.hist?.actions || a), 1000);
 }
 /** After an Apply: view the deployed revision compared with the one it replaced, with live values,
  *  and list what changed with each block's first value. */
@@ -2179,7 +2188,7 @@ async function showDeployed() {
     objs[c.obj] = v.objects[c.obj];
   }
   // Removed devices are gone from the bus on purpose.
-  S.deployed = { rows, objs, hw: (v?.compared ? v.hardware || [] : []).filter((x) => x.how !== "removed") };
+  S.deployed = { rows, objs, hw: (v?.compared ? v.hardware || [] : []).filter((x) => x.how !== "removed"), kind: S.hist.actions?.last?.kind };
   renderDeployed();
   watchBus(S.deployed);
 }
@@ -2216,8 +2225,8 @@ function deployedRev() { return S.hist?.history.find((r) => r.current) || null; 
 const HW_WAIT = 6000;
 /** The devices the pending change reconfigures, and, for new serials, whether they are on the bus; and what
  *  it does to access rights and notification recipients (#68): one request (`/api/apply/changes`). */
-async function pendingHardware(pend) {
-  const base = deployedRev()?.id || pend.base || "";
+async function pendingHardware(pend, against) {
+  const base = against || deployedRev()?.id || pend.base || "";
   const until = Date.now() + HW_WAIT;
   let devs, rights;
   try {
@@ -2307,7 +2316,7 @@ function renderDeployed() {
     return `<div class="pr"><span class="k ${esc(c.kind)}">${esc(KIND[c.kind]?.[1] || c.kind)}</span>` +
       `<button type="button" class="go" data-go="${esc(c.obj)}" title="${esc(o.path || "")}">${esc(name)}</button>${q ? lvSpan(q.uuid) : ""}</div>`;
   }).join("");
-  box.innerHTML = `<div class="h">Changed by this Apply<button type="button" class="x" aria-label="Close">×</button></div>${shown}` +
+  box.innerHTML = `<div class="h">Changed by this ${S.deployed.kind === "rollback" ? "Roll back" : "Apply"}<button type="button" class="x" aria-label="Close">×</button></div>${shown}` +
     (rows.length > 12 ? `<div class="note">and ${rows.length - 12} more in Changes</div>` : "") +
     (rows.length ? '<div class="note">Values fill in as the Miniserver sends them; the canvas marks every change.</div>' : "") + hw + check;
 }
@@ -2464,32 +2473,109 @@ async function apply() {
     calApplyWarning(calNow) + hwApplyText(hw) +
     "Deploy the pending changes to the Miniserver?\n\nFirst the module must compile and its tests pass (lox logic test). Then lox config push uploads the config and restarts the Miniserver's program (a few seconds), " +
     "checks that it runs exactly the compiled config, then vislox commits and pushes to git.")) return;
+  await deploy("/api/apply", {}, "applying");
+}
+/** Apply's and Roll back's request (#69): lox refuses some pushes until the user allows them; ask, then retry
+ *  with that allowed. Afterwards, the deployed revision compared with the one it replaced. */
+async function deploy(path, body, doing) {
   deployMsg("");
   $("deploy-new").classList.add("hidden");
   S.deployed = null;
   // The structure file the server reads after this is the new config's.
   try { S.applyReads = (await api("/api/app")).reads ?? 0; } catch { S.applyReads = S.app?.reads ?? 0; }
-  // lox refuses some pushes until the user allows them; ask, then retry with that allowed.
-  const opts = {};
+  const opts = { ...body };
   for (let tries = 0; tries < 3; tries++) {
-    try { await act("/api/apply", opts); await showDeployed(); return; } catch (err) {
+    try { await act(path, opts); await showDeployed(); return; } catch (err) {
       const h = err.data?.hints || {};
       if (h.accept_version && !opts.accept_version && window.confirm(
         `This config was saved by a newer Loxone Config (version ${h.accept_version}) than the project last compiled with.\n\n` +
-        "Accept that version and apply? Nothing else changes; the project's lockfile records the new version.")) {
+        `Accept that version and go on ${doing}? Nothing else changes; the project's lockfile records the new version.`)) {
         opts.accept_version = h.accept_version; continue;
       }
       if (h.custom_changes && !opts.discard_custom_changes && window.confirm(
         `The Miniserver holds ${h.custom_changes.length} change(s) that are not in its program file ` +
         "(made in the app, the web UI or by Loxone Config without saving):\n\n  " + h.custom_changes.join("\n  ") +
-        "\n\nApplying DELETES them. To keep them instead, load the project from the Miniserver in Loxone Config and save it, then apply again." +
-        "\n\nDelete them and apply?")) {
+        `\n\nThe upload DELETES them. To keep them instead, load the project from the Miniserver in Loxone Config and save it, then try again.` +
+        `\n\nDelete them and go on ${doing}?`)) {
         opts.discard_custom_changes = true; continue;
       }
       deployMsg(err.message, true);
       return;
     }
   }
+}
+// ── roll back (#69) ────────────────────────────────────────────────────
+// lox config push keeps what the Miniserver ran before each push (backups/<stamp>-pre-push.zip). A Roll back
+// deploys that again the way Apply deploys: the server works out what will run (the module from before the Apply,
+// compiled onto that download) and shows it as a revision compared with what runs now; the same confirmation as
+// Apply's; then the same steps (tests, lox config push with its drift check, restart, verify), a commit and git push.
+let rollbackAsking = false;
+/** Under an Apply in the History: "Roll back to before this", when its download from before is kept. */
+function rollbackRow(r, rb) {
+  const d = document.createElement("div");
+  d.className = "rb-row";
+  const a = S.hist?.actions;
+  const why = !a?.apply?.available ? `Cannot roll back: ${a?.apply?.reason || ""}`
+    : !rb.available ? rb.reason
+    : a.running ? `${a.running} is running`
+    : pendingChange() ? "Apply or discard the pending changes first: a Roll back puts the module back to before this Apply"
+    : "";
+  const tip = why || `Deploy again what the Miniserver ran before this (${rb.backup}), the way Apply deploys, and put the module back to before it`;
+  d.innerHTML = `<button type="button" class="rb-btn"${why || rollbackAsking || applyAsking ? " disabled" : ""} title="${esc(tip)}">↶ Roll back to before this</button>`;
+  d.querySelector("button").onclick = () => rollBack(r);
+  return d;
+}
+async function rollBack(r) {
+  if (rollbackAsking || applyAsking) return;
+  rollbackAsking = true; renderHistory();
+  try { await rollBackAsk(r); } finally { rollbackAsking = false; renderHistory(); renderActions(); }
+}
+/** The Roll back's plan this tab asked for (#69), shown only here, while it is about the deployed commit and
+ *  younger than the server keeps it. */
+const ROLLBACK_TTL = 15 * 60 * 1000;
+function rollbackPreview() {
+  const r = S.rollbackRev;
+  if (!r) return null;
+  const deployed = S.hist?.history.find((x) => x.kind === "git");
+  if (deployed?.id !== r.base || Date.now() - S.rollbackAt > ROLLBACK_TTL) { S.rollbackRev = null; return null; }
+  return r;
+}
+/** Forget the plan, here and on the server; show what runs again if the plan was shown. */
+async function dropRollback(back) {
+  const r = S.rollbackRev;
+  if (!r) return;
+  S.rollbackRev = null;
+  try { await fetch("/api/rollback/cancel", { method: "POST", headers: { "Content-Type": "application/json", "X-Vislox": "rollback" }, body: JSON.stringify({ rev: r.id }) }); } catch { /* the server forgets it anyway */ }
+  if (back && S.rev === r.id) { S.rev = r.base; S.base = null; renderHistory(); renderSelects(); await loadView(); writeHash(true); }
+  else renderHistory();
+}
+async function rollBackAsk(r) {
+  deployMsg("");
+  let plan;
+  try { plan = await act("/api/rollback/plan", { commit: r.id }); } catch (err) { deployMsg(`Cannot roll back: ${err.message}`, true); return; }
+  // What it deploys, compared with what runs now, behind the confirmation: in this tab only.
+  S.rollbackRev = plan.revision; S.rollbackAt = Date.now();
+  const target = plan.revision;
+  S.rev = plan.rev; S.base = plan.base; S.follow = false; $("chk-follow").checked = false;
+  renderHistory(); renderSelects(); await loadView(); writeHash(true);
+  const [, calNow, hw] = await Promise.all([loadMs(true), loadCal(true), pendingHardware(target, plan.base)]);
+  const stale = staleText();
+  const sched = await pendingScheduleText(target);
+  const n = S.viewRev === plan.rev && S.view?.compared ? S.view.changes.length : null;
+  if (!window.confirm((stale ? `⚠ ${stale} Rolling back overwrites what changed there since.\n\n` : "") + rightsApplyText(hw) + sched +
+    calApplyWarning(calNow) + hwApplyText(hw) +
+    `Roll back "${plan.subject}"?\n\nThe Miniserver then runs what it ran before it (${plan.backup})` +
+    (plan.same_bytes ? "" : ", compiled again from the module of then") +
+    (n == null ? "" : `: ${plural(n, "change")} from what it runs now, as the view shows`) +
+    ". The module and lockfile go back to before it, so nothing is pending afterwards.\n\n" +
+    "Whatever changed on the Miniserver since is lost: a save from Loxone Config stops the Roll back, and custom changes made in the app are deleted only if you allow it.\n\n" +
+    "As Apply: the tests run (lox logic test), lox config push checks that the Miniserver still runs this config and stages exactly what you reviewed, uploads, restarts the program and verifies, then vislox commits and pushes to git.")) {
+    await dropRollback(true);
+    return;
+  }
+  // The server works the plan out again, and deploys only what was reviewed.
+  await deploy("/api/rollback", { commit: plan.commit, reviewed: plan.blob }, "rolling back");
+  await dropRollback(false);
 }
 $("btn-sync").onclick = async () => {
   deployMsg("");

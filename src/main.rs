@@ -25,6 +25,7 @@ mod query;
 mod reason;
 mod restart;
 mod rights;
+mod rollback;
 mod route;
 mod running;
 mod schedule;
@@ -532,6 +533,12 @@ async fn main() -> Result<()> {
         .route("/api/running", get(api_running))
         .route("/api/backups/read", axum::routing::post(api_backups_read))
         .route("/api/apply", axum::routing::post(api_apply))
+        .route("/api/rollback/plan", axum::routing::post(api_rollback_plan))
+        .route("/api/rollback", axum::routing::post(api_rollback))
+        .route(
+            "/api/rollback/cancel",
+            axum::routing::post(api_rollback_cancel),
+        )
         .route("/api/discard", axum::routing::post(api_discard))
         .route("/api/edit", axum::routing::post(api_edit))
         .route("/api/edits", get(api_edits))
@@ -740,17 +747,28 @@ fn spawn_watcher(app: Arc<App>) -> Result<()> {
 }
 
 async fn api_history(State(app): State<Arc<App>>) -> impl IntoResponse {
-    let h = app.history.lock().unwrap();
-    let l = h.lists();
+    let (l, version, error) = {
+        let h = app.history.lock().unwrap();
+        (h.lists(), h.version, h.last_error.clone())
+    };
+    // Which commits can be rolled back: off the history lock and the async
+    // workers (it reads backups/, and hashes downloads it has not seen).
+    let rollbacks = {
+        let (a, l) = (app.clone(), l.clone());
+        tokio::task::spawn_blocking(move || a.actions.rollbacks(&l.history))
+            .await
+            .unwrap_or_else(|_| serde_json::json!({}))
+    };
     Json(serde_json::json!({
         "label": app.label,
         "vislox": { "version": env!("CARGO_PKG_VERSION"), "commit": option_env!("VISLOX_COMMIT") },
-        "version": h.version,
+        "version": version,
         "pending": l.pending,
         "history": l.history,
         "backups": l.backups,
+        "rollbacks": rollbacks,
         "ms_backups": app.backups.info(),
-        "error": h.last_error,
+        "error": error,
         "live": app.live.info(),
         "pull": app.pull.info(),
         "running": app.running.available(),
@@ -1394,6 +1412,110 @@ async fn api_apply(
     match res {
         Ok(m) => Json(serde_json::json!({ "message": m })).into_response(),
         // What the user could allow to retry (a newer Loxone Config, custom changes).
+        Err((status, msg)) => (
+            status,
+            Json(serde_json::json!({
+                "error": reason::explain(&msg),
+                "hints": actions::apply_hints(&msg),
+            })),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct RollbackBody {
+    /// The commit to roll back (`git:<hash>` or the hash).
+    commit: String,
+    /// The blob id of the program the user reviewed (the plan's revision):
+    /// the deploy refuses unless it works out the same.
+    #[serde(default)]
+    reviewed: Option<String>,
+    #[serde(flatten)]
+    opts: actions::ApplyOpts,
+}
+
+/// What a Roll back of a commit would deploy (#69), shown as a revision
+/// (`rollback:<hash>`) compared with that commit, for the review and the
+/// confirmation. Deploys nothing, and changes nothing in the project.
+async fn api_rollback_plan(
+    State(app): State<Arc<App>>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<RollbackBody>,
+) -> Response {
+    if let Err(r) = app.actions.check(&headers) {
+        return refused(r);
+    }
+    let plan = match app.actions.rollback_plan(&body.commit).await {
+        Ok(p) => p,
+        Err(e) => return refused((StatusCode::CONFLICT, e)),
+    };
+    let short = plan.commit[..10.min(plan.commit.len())].to_string();
+    // Only this browser shows it: no event to the others.
+    let rev = app.history.lock().unwrap().set_rollback(
+        &format!("git:{}", plan.commit),
+        format!("Roll back: {}", plan.subject),
+        format!("{} · what ran before {short}", plan.backup),
+        plan.compiled.clone(),
+    );
+    Json(serde_json::json!({
+        "revision": rev,
+        "rev": rev.id,
+        "blob": rev.blob,
+        "base": format!("git:{}", plan.commit),
+        "commit": plan.commit,
+        "subject": plan.subject,
+        "backup": plan.backup,
+        "same_bytes": plan.same_bytes,
+    }))
+    .into_response()
+}
+
+#[derive(Deserialize)]
+struct RollbackCancel {
+    rev: String,
+}
+
+/// The user cancelled a Roll back: its plan is forgotten.
+async fn api_rollback_cancel(
+    State(app): State<Arc<App>>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<RollbackCancel>,
+) -> Response {
+    if let Some(r) = not_from_vislox(&headers) {
+        return r;
+    }
+    app.history.lock().unwrap().clear_rollback(&body.rev);
+    Json(serde_json::json!({ "cleared": true })).into_response()
+}
+
+/// Roll back a commit (#69): Apply's path, with the same preflight, onto the
+/// Miniserver's download from before it.
+async fn api_rollback(
+    State(app): State<Arc<App>>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<RollbackBody>,
+) -> Response {
+    if let Err(r) = app.actions.check(&headers) {
+        return refused(r);
+    }
+    if app.actions.wants_miniserver()
+        && let Some(r) = preflight(&app, miniserver::Action::Apply).await
+    {
+        return r;
+    }
+    let res = app
+        .actions
+        .rollback(&body.commit, body.reviewed.as_deref(), &body.opts)
+        .await;
+    let plan_id = format!("rollback:{}", body.commit.trim_start_matches("git:"));
+    app.history.lock().unwrap().clear_rollback(&plan_id);
+    let a = app.clone();
+    let _ = tokio::task::spawn_blocking(move || refresh(&a)).await;
+    app.ms.forget();
+    reread_calendar(&app);
+    match res {
+        Ok(m) => Json(serde_json::json!({ "message": m })).into_response(),
         Err((status, msg)) => (
             status,
             Json(serde_json::json!({

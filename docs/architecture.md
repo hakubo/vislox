@@ -26,6 +26,13 @@ The binary is an `axum` server with the UI embedded (plain JS and SVG, no build 
 - `src/actions.rs` runs Apply (`lox config push --force`, `git commit`, `git push`), Sync (`lox config merge`,
   `git commit`, `git push`) and Discard (`git checkout` of the module, lock and out). Apply's steps follow lox's
   progress lines as they come.
+- `src/rollback.rs` finds the downloads `lox config push` leaves in a project's `backups/` (`<stamp>-pre-push` and
+  `-post-push`) for Roll back (#69): a commit whose base is a post-push program is a push, and its pre-push
+  program is what ran before. It reads and checks them; `actions/rollback.rs` plans the Roll back (`POST
+  /api/rollback/plan`, a scratch compile of the module from before, under the compile lock) and runs it through
+  Apply's steps (`POST /api/rollback`), checking that the in-place compile, lox's staged upload and its verified
+  download are the reviewed program, and working out what runs when a push fails after its upload. `history.rs`
+  keeps the plan as the `rollback:<commit>` revision, found by id only (the asking tab shows it).
 - `src/running.rs` reads `/prog` and `def.log` for the config the Miniserver runs (`GET /api/running`), and
   checks after an Apply that the upload loaded.
 - `src/edit.rs` is editing from Properties ([editing.md](editing.md)): the edit operations, what each object

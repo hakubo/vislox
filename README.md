@@ -50,6 +50,8 @@ Then open <http://127.0.0.1:7878>. Started without a path or `--ctx` in a direct
   (Apply is off until it does), and *Compile* when the pending config is from before the module's latest change.
 - For a `lox.toml` project: `lox logic lint` findings (unused names, blocks whose outputs feed nothing, users whose
   tag opens no Code Touch, …) as a warning badge on each block and a *Lint* list in the Deploy pane. Hints only.
+- For a `lox.toml` project: *Roll back* an Apply from the History, onto the download `lox config push` kept from
+  before it, through Apply's own steps and checks.
 - For a `lox.toml` project: the module's `lox logic test` scenarios run in lox's simulator, each with pass, fail or
   couldn't run, the failing `expect` with expected and actual values, and the blocks it checks. Apply stops while
   a test fails.
@@ -121,6 +123,7 @@ Opt-ins:
 | What | Turned on by | Sends to the Miniserver |
 |---|---|---|
 | Apply | `--admin-token-file`, then the token in the browser | `lox config push --force`: upload and program restart |
+| Roll back | `--admin-token-file`, then the token | `lox config push --force --patched-from …`: upload and program restart, as Apply |
 | Sync, Discard | `--admin-token-file`, then the token | nothing; they change the project and its git repository |
 | Compile (a module changed outside vislox) | `--admin-token-file`, then the token | nothing; it runs `lox logic compile` |
 | Edit values, add and move blocks, draw wires | `--admin-token-file`, then the token | nothing; vislox writes its files in the module (and positions in the lockfile) and runs `lox logic compile` |
@@ -128,9 +131,9 @@ Opt-ins:
 | Query blocks on this page | a toggle in the legend, off by default | read-only `jdev/sps/io/<uuid>/all`, at most 20 a second |
 | Debug-Monitor | `--monitor`, then Start | `dev/sps/log/<address>`: the Miniserver sends its debug output to vislox until Stop or the time limit |
 
-Only Apply and operate commands change the Miniserver's program or its state.
+Only Apply (and Roll back, which is an Apply) and operate commands change the Miniserver's program or its state.
 
-Before Pull, Apply, Sync and each operate command, vislox checks that the Miniserver at lox's address has the
+Before Pull, Apply, Roll back, Sync and each operate command, vislox checks that the Miniserver at lox's address has the
 config's serial, and refuses otherwise. Every request is described in [docs/miniserver.md](docs/miniserver.md).
 
 ## Documentation
@@ -154,6 +157,7 @@ cd tests/ui && npm ci && npx playwright install chromium && cd ../..
 VISLOX_BIN=target/release/vislox node tests/ui/smoke.mjs   # drives the UI in headless Chromium
 VISLOX_BIN=target/release/vislox node tests/ui/apply.mjs   # Apply's steps, with a stand-in lox
 VISLOX_BIN=target/release/vislox node tests/ui/edit.mjs    # editing values, adding and moving blocks, with a stand-in lox
+VISLOX_BIN=target/release/vislox node tests/ui/rollback.mjs  # rolling back an Apply, with a stand-in lox
 ```
 
 CI (`.github/workflows/ci.yml`) runs all of these on every push to `main` and every pull request.
