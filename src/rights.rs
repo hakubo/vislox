@@ -53,9 +53,10 @@ pub struct Principal {
     /// The access schedule's title (access only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub schedule: Option<String>,
-    /// The access schedule's UUID: two schedules may share a title.
-    #[serde(skip)]
-    schedule_uuid: Option<String>,
+    /// The access schedule's UUID: what identifies the right (two schedules
+    /// may share a title).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schedule_uuid: Option<String>,
     /// A group's direct members, by title: its users, then its groups.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub members: Vec<String>,
@@ -74,7 +75,9 @@ pub struct Rights {
     /// [`ACCESS`] or [`RECIPIENTS`].
     pub kind: &'static str,
     /// Who holds it directly: users first, then groups, each in document
-    /// order.
+    /// order. An access right is one entry per user or group and schedule:
+    /// a principal with two `<PRM>`s on one block (two schedules) is there
+    /// twice.
     pub list: Vec<Principal>,
     /// The users who hold it in effect: directly, through a group (nested
     /// groups too), or, for a notification, as members of *Full access*.
@@ -152,7 +155,12 @@ pub fn read(doc: &LoxoneDoc) -> BTreeMap<String, Rights> {
                 _ if p.ui.is_none() => continue,
                 _ => None,
             };
-            if r.list.iter().any(|x| x.uuid == *uuid) {
+            // Every right, once: a principal and a schedule (a recipient has
+            // none, so another `ACT=` value is the same recipient).
+            if r.list
+                .iter()
+                .any(|x| x.uuid == *uuid && x.schedule_uuid == schedule_uuid)
+            {
                 continue;
             }
             r.list.push(Principal {
@@ -165,18 +173,26 @@ pub fn read(doc: &LoxoneDoc) -> BTreeMap<String, Rights> {
             });
         }
     }
+    // Each user's groups, nested ones too: once, not once per block.
+    let groups_of: Vec<Vec<&loxone_config::access::Group>> = m
+        .users
+        .iter()
+        .map(|u| m.groups_of_transitive(&u.uuid))
+        .collect();
     for r in out.values_mut() {
         let holds: BTreeSet<&str> = r.list.iter().map(|p| p.uuid.as_str()).collect();
         let mut users: Vec<Named> = m
             .users
             .iter()
-            .filter(|u| {
+            .zip(&groups_of)
+            .filter(|(u, groups)| {
                 holds.contains(u.uuid.as_str())
-                    || m.groups_of_transitive(&u.uuid).iter().any(|g| {
+                    || groups.iter().any(|g| {
                         holds.contains(g.uuid.as_str())
                             || r.kind == RECIPIENTS && g.kind.as_deref() == Some(FULL_ACCESS)
                     })
             })
+            .map(|(u, _)| u)
             .map(|u| Named {
                 title: title(&u.uuid, &u.title),
                 uuid: u.uuid.clone(),
@@ -195,6 +211,8 @@ pub struct Rescheduled {
     pub principal: Principal,
     /// The schedule's title before.
     pub from: Option<String>,
+    /// …and its UUID.
+    pub from_uuid: Option<String>,
 }
 
 /// How one block's right, or a Daytimer's switching times, differ between
@@ -207,6 +225,8 @@ pub struct Change {
     pub title: String,
     /// The block is new: nothing to compare its rights with.
     pub new_block: bool,
+    /// The block is gone: everyone who held the right loses it.
+    pub removed_block: bool,
     pub added: Vec<Principal>,
     pub removed: Vec<Principal>,
     pub rescheduled: Vec<Rescheduled>,
@@ -225,6 +245,7 @@ impl Change {
             kind: SCHEDULE,
             title,
             new_block: false,
+            removed_block: false,
             added: Vec::new(),
             removed: Vec::new(),
             rescheduled: Vec::new(),
@@ -235,7 +256,14 @@ impl Change {
 
     /// The change in lines, for the change list: `Haustür · access: alice
     /// removed (Always)`.
+    #[cfg(test)]
     pub fn lines(&self) -> Vec<String> {
+        self.lines_how().into_iter().map(|(_, l)| l).collect()
+    }
+
+    /// The lines, each with what it does: `added`, `removed` or `changed`
+    /// (the change list colours them so).
+    pub fn lines_how(&self) -> Vec<(&'static str, String)> {
         let t = &self.title;
         let k = self.kind;
         let who = |p: &Principal| match p.kind {
@@ -244,81 +272,146 @@ impl Change {
         };
         let when = |s: &Option<String>| s.as_ref().map(|s| format!(" ({s})")).unwrap_or_default();
         let mut out = Vec::new();
+        if self.removed_block {
+            let names: Vec<&str> = self.lose.iter().map(|n| n.title.as_str()).collect();
+            let what = match (k, names.len()) {
+                (_, 0) => "nobody held a right on it".to_string(),
+                (ACCESS, 1) => format!("{} loses access", names[0]),
+                (ACCESS, _) => format!("{} lose access", names.join(", ")),
+                (_, 1) => format!("{} stops getting it", names[0]),
+                _ => format!("{} stop getting it", names.join(", ")),
+            };
+            out.push(("removed", format!("{t} removed: {what}")));
+            return out;
+        }
         for p in &self.removed {
-            out.push(format!(
-                "{t} · {k}: {} removed{}",
-                who(p),
-                when(&p.schedule)
+            out.push((
+                "removed",
+                format!("{t} · {k}: {} removed{}", who(p), when(&p.schedule)),
             ));
         }
         for p in &self.added {
-            out.push(format!("{t} · {k}: {} added{}", who(p), when(&p.schedule)));
+            out.push((
+                "added",
+                format!("{t} · {k}: {} added{}", who(p), when(&p.schedule)),
+            ));
         }
         for r in &self.rescheduled {
-            out.push(format!(
-                "{t} · {k}: {}, {} → {}",
-                who(&r.principal),
-                r.from.as_deref().unwrap_or("—"),
-                r.principal.schedule.as_deref().unwrap_or("—")
+            out.push((
+                "changed",
+                format!(
+                    "{t} · {k}: {}, {} → {}",
+                    who(&r.principal),
+                    r.from.as_deref().unwrap_or("—"),
+                    r.principal.schedule.as_deref().unwrap_or("—")
+                ),
             ));
         }
         out
     }
 }
 
-/// How the rights of the blocks of `new` differ from `old`'s ([`read`] of
-/// each), by the block's UUID. A block only `old` has is left out: its
-/// removal is in the change list.
+/// How the rights of the blocks differ between `old` and `new` ([`read`]
+/// of each), by the block's UUID. A block only `old` has is there too
+/// (`removed_block`): whoever held its right loses it. `title` names a block
+/// in whichever config has it.
+///
+/// A right is a principal with a schedule (an access right) or a principal
+/// (a recipient). A principal with one right on the block before and one
+/// after, under another schedule, is `rescheduled`; any other difference is
+/// rights `added` and `removed`.
 pub fn changes(
     old: &BTreeMap<String, Rights>,
     new: &BTreeMap<String, Rights>,
     title: impl Fn(&str) -> String,
 ) -> Vec<Change> {
+    let empty = Rights {
+        kind: ACCESS,
+        list: Vec::new(),
+        users: Vec::new(),
+    };
+    let mut uuids: Vec<&String> = new.keys().collect();
+    uuids.extend(old.keys().filter(|u| !new.contains_key(*u)));
     let mut out = Vec::new();
-    for (uuid, now) in new {
-        let was = old.get(uuid);
-        if was.is_some_and(|w| w == now) {
+    for uuid in uuids {
+        let (was, now) = (old.get(uuid), new.get(uuid));
+        if was == now {
             continue;
         }
-        let was_list: &[Principal] = was.map(|w| w.list.as_slice()).unwrap_or_default();
-        let was_users: &[Named] = was.map(|w| w.users.as_slice()).unwrap_or_default();
-        let by = |l: &[Principal], u: &str| l.iter().find(|p| p.uuid == u).cloned();
-        let added: Vec<Principal> = now
+        let kind = now.or(was).map_or(ACCESS, |r| r.kind);
+        let (w, n) = (was.unwrap_or(&empty), now.unwrap_or(&empty));
+        let key = |p: &Principal| (p.uuid.clone(), p.schedule_uuid.clone());
+        let wk: BTreeSet<_> = w.list.iter().map(key).collect();
+        let nk: BTreeSet<_> = n.list.iter().map(key).collect();
+        let mut added: Vec<Principal> = n
             .list
             .iter()
-            .filter(|p| by(was_list, &p.uuid).is_none())
+            .filter(|p| !wk.contains(&key(p)))
             .cloned()
             .collect();
-        let removed: Vec<Principal> = was_list
-            .iter()
-            .filter(|p| by(&now.list, &p.uuid).is_none())
-            .cloned()
-            .collect();
-        let rescheduled: Vec<Rescheduled> = now
+        let mut removed: Vec<Principal> = w
             .list
             .iter()
-            .filter_map(|p| {
-                let o = by(was_list, &p.uuid)?;
-                (o.schedule_uuid != p.schedule_uuid).then(|| Rescheduled {
-                    principal: p.clone(),
-                    from: o.schedule,
+            .filter(|p| !nk.contains(&key(p)))
+            .cloned()
+            .collect();
+        // One right of a principal for another of the same: a new schedule.
+        let mut rescheduled = Vec::new();
+        if now.is_some() && was.is_some() {
+            let once = |l: &[Principal], u: &str| l.iter().filter(|p| p.uuid == u).count() == 1;
+            let pairs: Vec<(usize, usize)> = added
+                .iter()
+                .enumerate()
+                .filter_map(|(i, a)| {
+                    let j = removed.iter().position(|r| r.uuid == a.uuid)?;
+                    (once(&added, &a.uuid)
+                        && once(&removed, &a.uuid)
+                        && once(&n.list, &a.uuid)
+                        && once(&w.list, &a.uuid))
+                    .then_some((i, j))
                 })
-            })
-            .collect();
+                .collect();
+            for &(i, j) in &pairs {
+                rescheduled.push(Rescheduled {
+                    principal: added[i].clone(),
+                    from: removed[j].schedule.clone(),
+                    from_uuid: removed[j].schedule_uuid.clone(),
+                });
+            }
+            let (ai, ri): (BTreeSet<usize>, BTreeSet<usize>) = pairs.into_iter().unzip();
+            added = added
+                .into_iter()
+                .enumerate()
+                .filter(|(i, _)| !ai.contains(i))
+                .map(|(_, p)| p)
+                .collect();
+            removed = removed
+                .into_iter()
+                .enumerate()
+                .filter(|(i, _)| !ri.contains(i))
+                .map(|(_, p)| p)
+                .collect();
+        }
         let ids = |l: &[Named]| l.iter().map(|n| n.uuid.clone()).collect::<BTreeSet<_>>();
-        let (a, b) = (ids(was_users), ids(&now.users));
-        let lose: Vec<Named> = was_users
-            .iter()
-            .filter(|n| !b.contains(&n.uuid))
-            .cloned()
-            .collect();
-        let gain: Vec<Named> = now
+        let (a, b) = (ids(&w.users), ids(&n.users));
+        let lose: Vec<Named> = w
             .users
             .iter()
-            .filter(|n| !a.contains(&n.uuid))
+            .filter(|x| !b.contains(&x.uuid))
             .cloned()
             .collect();
-        if added.is_empty()
+        let gain: Vec<Named> = n
+            .users
+            .iter()
+            .filter(|x| !a.contains(&x.uuid))
+            .cloned()
+            .collect();
+        if now.is_none() && w.list.is_empty() && lose.is_empty() {
+            // A block nobody held a right on: its removal is in the change list.
+            continue;
+        }
+        if now.is_some()
+            && added.is_empty()
             && removed.is_empty()
             && rescheduled.is_empty()
             && lose.is_empty()
@@ -329,9 +422,10 @@ pub fn changes(
         }
         out.push(Change {
             uuid: uuid.clone(),
-            kind: now.kind,
+            kind,
             title: title(uuid),
             new_block: was.is_none(),
+            removed_block: now.is_none(),
             added,
             removed,
             rescheduled,
@@ -491,5 +585,84 @@ mod tests {
         // Another ACT= value is the same recipient.
         let again = read(&doc("", &prm(FROST, None, Some("3")), ""));
         assert!(changes(&old, &again, |_| String::new()).is_empty());
+    }
+
+    #[test]
+    fn a_second_right_of_one_principal_is_kept_and_compared() {
+        // alice may open the door always and on workdays: two `<PRM>`s.
+        let two = prm(DOOR, Some(ALWAYS), None) + &prm(DOOR, Some(WORKDAYS), None);
+        let old = read(&doc(&two, "", ""));
+        let door = &old[DOOR];
+        let got: Vec<_> = door
+            .list
+            .iter()
+            .map(|p| (p.title.as_str(), p.schedule_uuid.as_deref()))
+            .collect();
+        assert_eq!(got, [("alice", Some(ALWAYS)), ("alice", Some(WORKDAYS))]);
+        // The workdays right goes: a removal, not a reschedule, and she
+        // still opens the door.
+        let new = read(&doc(&prm(DOOR, Some(ALWAYS), None), "", ""));
+        let c = changes(&old, &new, |_| "Haustür".into());
+        assert_eq!(c.len(), 1, "{c:?}");
+        assert!(c[0].rescheduled.is_empty() && c[0].added.is_empty());
+        assert_eq!(c[0].removed.len(), 1);
+        assert_eq!(c[0].removed[0].schedule_uuid.as_deref(), Some(WORKDAYS));
+        assert!(c[0].lose.is_empty());
+        assert_eq!(c[0].lines(), ["Haustür · access: alice removed (Workdays)"]);
+        // One right for another of the same principal is a reschedule, by
+        // the schedule's UUID.
+        let moved = read(&doc(&prm(DOOR, Some(WORKDAYS), None), "", ""));
+        let c = changes(&new, &moved, |_| "Haustür".into());
+        assert_eq!(c[0].rescheduled.len(), 1, "{c:?}");
+        assert_eq!(c[0].rescheduled[0].from_uuid.as_deref(), Some(ALWAYS));
+        assert_eq!(
+            c[0].rescheduled[0].principal.schedule_uuid.as_deref(),
+            Some(WORKDAYS)
+        );
+    }
+
+    #[test]
+    fn a_removed_block_takes_its_rights_with_it() {
+        let old = read(&doc(
+            &prm(DOOR, Some(ALWAYS), None),
+            &prm(FROST, None, Some("3")),
+            &prm(DOOR, Some(WORKDAYS), None),
+        ));
+        let mut new = old.clone();
+        new.remove(DOOR);
+        new.remove(FROST);
+        let c = changes(&old, &new, |u| {
+            if u == DOOR {
+                "Haustür".into()
+            } else {
+                "Frost".into()
+            }
+        });
+        let got: Vec<_> = c
+            .iter()
+            .map(|c| (c.kind, c.removed_block, c.lines()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (
+                    ACCESS,
+                    true,
+                    vec!["Haustür removed: alice, bob, carol lose access".to_string()]
+                ),
+                (
+                    RECIPIENTS,
+                    true,
+                    vec!["Frost removed: bob, carol stop getting it".to_string()]
+                ),
+            ]
+        );
+        assert_eq!(titles(&c[0].lose), ["alice", "bob", "carol"]);
+        assert_eq!(c[0].removed.len(), 2);
+        // A block nobody held a right on goes unnoticed here.
+        let none = read(&doc("", "", ""));
+        let mut gone = none.clone();
+        gone.remove(DOOR);
+        assert!(changes(&none, &gone, |_| String::new()).is_empty());
     }
 }

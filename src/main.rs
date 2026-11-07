@@ -520,8 +520,7 @@ async fn main() -> Result<()> {
         .route("/api/miniserver", get(api_miniserver))
         .route("/api/log", get(api_log))
         .route("/api/hardware", get(api_hardware))
-        .route("/api/hardware/changes", get(api_hardware_changes))
-        .route("/api/rights/changes", get(api_rights_changes))
+        .route("/api/apply/changes", get(api_apply_changes))
         .route("/api/app", get(api_app))
         .route("/api/app/load", axum::routing::post(api_app_load))
         .route("/api/app/icon", get(api_app_icon))
@@ -814,48 +813,28 @@ async fn api_schedules(State(app): State<Arc<App>>, Query(q): Query<RevQuery>) -
     }
 }
 
-/// What `rev` does to access rights and push notification recipients
-/// compared with `base` (#68): Apply's confirmation warns about who loses
-/// them. Served like the view: titles of users and groups are part of the
-/// review, and nothing of it is logged.
-async fn api_rights_changes(State(app): State<Arc<App>>, Query(q): Query<ViewQuery>) -> Response {
+/// What Apply's confirmation lists of `rev` compared with `base`, each config
+/// loaded and parsed once: the devices it reconfigures (`view.hardware`), and
+/// what it does to access rights and push notification recipients
+/// (`view.rights` without the schedules, #68). Served like the view: titles of
+/// users and groups are part of the review, and nothing of it is logged.
+async fn api_apply_changes(State(app): State<Arc<App>>, Query(q): Query<ViewQuery>) -> Response {
     let res = tokio::task::spawn_blocking(move || {
         let base = q.base.as_deref().filter(|b| !b.is_empty());
         let (_, new) = load(&app, &q.rev)?;
         match base {
-            Some(b) => Ok(model::rights_changes(&new, &load(&app, b)?.1)),
-            None => Ok(Vec::new()),
+            Some(b) => Ok(Some(model::apply_changes(&new, &load(&app, b)?.1))),
+            None => Ok(None),
         }
     })
     .await
     .map_err(|e| e.to_string())
     .and_then(|r: Result<_, String>| r);
     match res {
-        Ok(changes) => Json(serde_json::json!({ "changes": changes })).into_response(),
-        Err(e) => (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(serde_json::json!({ "error": e })),
-        )
-            .into_response(),
-    }
-}
-
-/// The devices `rev` reconfigures compared with `base` (`view.hardware`),
-/// without the rest of the view: what Apply's confirmation lists.
-async fn api_hardware_changes(State(app): State<Arc<App>>, Query(q): Query<ViewQuery>) -> Response {
-    let res = tokio::task::spawn_blocking(move || {
-        let base = q.base.as_deref().filter(|b| !b.is_empty());
-        let (_, new) = load(&app, &q.rev)?;
-        match base {
-            Some(b) => Ok(model::hardware(&new, &load(&app, b)?.1)),
-            None => Ok(Vec::new()),
+        Ok(c) => {
+            let (devices, rights) = c.map(|c| (c.devices, c.rights)).unwrap_or_default();
+            Json(serde_json::json!({ "devices": devices, "rights": rights })).into_response()
         }
-    })
-    .await
-    .map_err(|e| e.to_string())
-    .and_then(|r: Result<_, String>| r);
-    match res {
-        Ok(devices) => Json(serde_json::json!({ "devices": devices })).into_response(),
         Err(e) => (
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(serde_json::json!({ "error": e })),

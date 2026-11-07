@@ -397,15 +397,19 @@ next push, so the review shows them on their own. vislox reviews them; it does n
 - **From the compiled config, not the source.** `rights.rs` reads, with lox's own `AccessModel`, the `<PRM>`
   lists of every user and group: a `TIM=` on an `NfcCodeTouch` is an access right under that access schedule,
   an `ACT=` on a `Notification` makes it a recipient. Per block: who holds the right directly (users, then
-  groups, a group with its direct members) and who holds it in effect: directly, through a group (nested groups
+  groups, a group with its direct members; an access right is a principal *and* a schedule, so one with two
+  `<PRM>`s on a door, under two schedules, holds two rights) and who holds it in effect: directly, through a group (nested groups
   too), or, for a notification, as a member of *Full access*, who always get it. Comparing two configs gives, per
-  block, the users and groups added, removed and given another schedule, and the users who gain or lose the
-  right in effect. So a change made in Loxone Config shows the same way as one a claim makes, and removing
+  block, the rights added and removed, and the users who gain or lose the right in effect. Rights compare by
+  the schedule's UUID (two schedules may share a title); a principal with one right before and one after,
+  under another schedule, is *rescheduled*. A Code Touch or notification the change deletes is there too
+  (`removed_block`): everyone who held its right loses it (*Haustür removed: alice, bob lose access*). So a change made in Loxone Config shows the same way as one a claim makes, and removing
   someone from a set while their group still opens the door is not a loss.
 - `view.rights` lists the blocks whose rights changed, and the Daytimers whose switching times changed (from the
   schedule comparison of #15), in document order: `{ uuid, kind, title, new_block, added, removed, rescheduled,
-  lose, gain }`, `kind` being `access`, `recipients` or `schedule`. Such a block is marked changed, and the change
-  list has a line per entry (`Haustür · access: alice removed (Always)`) under its own filter, *rights*.
+  lose, gain, removed_block }`, `kind` being `access`, `recipients` or `schedule`. Such a block is marked
+  changed, and the change list has a line per entry (`Haustür · access: alice removed (Always)`) under its own
+  filter, *rights*, coloured by what it does (`how`: added green, removed red, changed amber).
   `objects[…].rights` is each Code Touch's and notification's right, and `rights_old` the compared revision's,
   when it differs.
 - **The claims.** `GET /api/edits` sends `set_claims`: each `<slug>.access|recipients|schedule = <set>` at the top
@@ -414,12 +418,14 @@ next push, so the review shows them on their own. vislox reviews them; it does n
   name (the lockfile's managed blocks, `vx_<uuid>` names, an extern's `uuid: "…"`), or else the object the
   lockfile's `externals` resolved an extern by title to. Like `sources`, it is today's module, shown on the
   newest config only.
-- **Apply's confirmation** asks `GET /api/rights/changes?rev=<pending>&base=<deployed>` (the same comparison,
-  without the view) and warns first: *⚠ alice loses access to Haustür (pages/access.loxl:12)*, *⚠ alice stops
+- **Apply's confirmation** asks `GET /api/apply/changes?rev=<pending>&base=<deployed>`, which loads both
+  configs once and returns the devices the change reconfigures and this comparison (`{ devices, rights }`,
+  without the view), within the same 6 s as the devices. It warns first: *⚠ alice loses access to Haustür (pages/access.loxl:12)*, *⚠ alice stops
   getting Frostwarnung*, then who gains a right. A schedule the Miniserver runs differently (live values, as
   before) names the claim that replaces it: *Uhr: Feiertag (claimed by pages/access.loxl:14)*. The Miniserver
-  does not say when its switching times were changed in the app, so the warning has no date. Neither refuses
-  Apply.
+  does not say when its switching times were changed in the app, so the warning has no date. When the request
+  fails or does not answer in time, the confirmation says *⚠ Couldn't check access changes: …* rather than
+  nothing. Neither refuses Apply.
 - **Who may see it.** Names of users and groups are served with the rest of the review (the view and its
   endpoints) and nowhere else: not in a URL (the address names a block by its UUID), not in the page title,
   and never in vislox's log. Credentials (tags, codes, passwords, even hashed) never leave `rights.rs`, and no

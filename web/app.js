@@ -1562,7 +1562,7 @@ function renderChanges() {
     d.className = "chg" + (i === S.chgIdx ? " cur" : "");
     d.setAttribute("role", "listitem");
     const where = c.page ? S.pageOf.get(c.page)?.title : c.obj ? v.objects[c.obj]?.path : "";
-    d.innerHTML = `<span class="k ${esc(c.kind)}" aria-label="${esc(KIND[c.kind]?.[1] || c.kind)}">${KIND[c.kind]?.[0] || "~"}</span><span class="x"><span class="t">${esc(c.text)}</span>${where ? `<span class="p">${esc(where)}</span>` : ""}</span>${c.hw ? '<span class="hw-tag" title="Reconfigures a device">hardware</span>' : ""}`;
+    d.innerHTML = `<span class="k ${esc(c.kind)}${c.how ? " " + esc(c.how) : ""}" aria-label="${esc(KIND[c.kind]?.[1] || c.kind)}">${c.how === "added" ? "+" : c.how === "removed" ? "−" : KIND[c.kind]?.[0] || "~"}</span><span class="x"><span class="t">${esc(c.text)}</span>${where ? `<span class="p">${esc(where)}</span>` : ""}</span>${c.hw ? '<span class="hw-tag" title="Reconfigures a device">hardware</span>' : ""}`;
     d.onclick = () => gotoChange(i);
     box.appendChild(d);
   });
@@ -2214,26 +2214,28 @@ function deployedRev() { return S.hist?.history.find((r) => r.current) || null; 
 /** How long Apply's confirmation waits for the device list and the bus, together, before it asks anyway
  *  (and says the bus check did not finish). */
 const HW_WAIT = 6000;
-/** The devices the pending change reconfigures, and, for new serials, whether they are on the bus. */
+/** The devices the pending change reconfigures, and, for new serials, whether they are on the bus; and what
+ *  it does to access rights and notification recipients (#68): one request (`/api/apply/changes`). */
 async function pendingHardware(pend) {
   const base = deployedRev()?.id || pend.base || "";
   const until = Date.now() + HW_WAIT;
-  let devs;
+  let devs, rights;
   try {
     const ctl = new AbortController(), t = setTimeout(() => ctl.abort(), HW_WAIT);
     try {
-      const r = await fetch(`/api/hardware/changes?rev=${encodeURIComponent(pend.id)}&base=${encodeURIComponent(base)}`, { signal: ctl.signal });
+      const r = await fetch(`/api/apply/changes?rev=${encodeURIComponent(pend.id)}&base=${encodeURIComponent(base)}`, { signal: ctl.signal });
       const j = await r.json();
       if (!r.ok) throw new Error(j.error || r.statusText);
       devs = j.devices || [];
+      rights = j.rights || [];
     } finally { clearTimeout(t); }
-  } catch (e) { return { error: e.name === "AbortError" ? `no answer within ${HW_WAIT / 1000} s` : e.message, devs: [] }; }
+  } catch (e) { return { error: e.name === "AbortError" ? `no answer within ${HW_WAIT / 1000} s` : e.message, devs: [], rights: null }; }
   const fresh = devs.filter((d) => (d.how === "added" || d.how === "replaced" || d.how === "paired") && d.check);
-  if (!fresh.length || !hwInfo().available) return { devs, fresh: [] };
+  if (!fresh.length || !hwInfo().available) return { devs, rights, fresh: [] };
   try {
     const bus = await loadBus(Math.max(1000, until - Date.now()));
-    return { devs, fresh, missing: fresh.filter((d) => !onBus(d, bus)) };
-  } catch (e) { return { devs, fresh, busError: e.message }; }
+    return { devs, rights, fresh, missing: fresh.filter((d) => !onBus(d, bus)) };
+  } catch (e) { return { devs, rights, fresh, busError: e.message }; }
 }
 function hwLine(d) {
   const what = d.how === "replaced" || d.how === "unpaired" ? `${d.how}, serial ${d.old_serial || "—"} → ${d.serial || "—"}`
@@ -2453,7 +2455,8 @@ async function apply() {
   // calendar entries edited in the app.
   const [, calNow, hw] = await Promise.all([loadMs(true), loadCal(true), pendingHardware(pend)]);
   const stale = staleText();
-  const [sched, rights] = await Promise.all([pendingScheduleText(pend), pendingRightsText(pend)]);
+  const sched = await pendingScheduleText(pend);
+  const rights = rightsApplyText(hw);
   const src = S.check?.available && S.check.ok && S.check.stale;
   const srcText = src ? `⚠ The pending revision is from before the latest edit to ${src.files?.length ? src.files.join(", ") : "the module"}. ` +
     "lox config push compiles the module as it is, so Apply deploys changes this review does not show. Compile first to review them.\n\n" : "";
@@ -2510,11 +2513,16 @@ function setClaims(uuid) { return managedShown() ? claimsOf(uuid) : []; }
 /** The same, whatever revision is shown: for Apply's confirmation, which is about the newest config. */
 function claimsOf(uuid) { return (S.edits?.set_claims || []).filter((c) => c.blocks?.includes(uuid)); }
 function claimAt(c) { return `${c.file}:${c.line}`; }
-function claimNote(c) {
-  const what = c.kind === "schedule" ? "The push replaces these switching times, edits made in the app among them"
+function claimWhat(c) {
+  return c.kind === "schedule" ? "The push replaces these switching times, edits made in the app among them"
     : c.kind === "access" ? "Whoever the set leaves out loses access on the next push"
     : "Whoever the set leaves out stops getting it on the next push";
-  return `<div class="ed-note rt-claim">Managed by <span class="mono">${esc(claimAt(c))}</span> <span class="none-v">(${esc(c.kind)} ${esc(c.set)}${c.set_line ? `, ${esc(`${c.set_file}:${c.set_line}`)}` : ""})</span>. ${what}.</div>`;
+}
+function claimSet(c) { return `${c.kind} ${c.set}${c.set_line ? `, ${c.set_file}:${c.set_line}` : ""}`; }
+/** The claim in plain text, for a tooltip. */
+function claimTip(c) { return `Managed by ${claimAt(c)} (${claimSet(c)}). ${claimWhat(c)}.`; }
+function claimNote(c) {
+  return `<div class="ed-note rt-claim">Managed by <span class="mono">${esc(claimAt(c))}</span> <span class="none-v">(${esc(claimSet(c))})</span>. ${esc(claimWhat(c))}.</div>`;
 }
 const RIGHT_KIND = { access: "access", recipients: "recipients", schedule: "switching times" };
 function whoText(p) { return `${p.kind === "group" ? "group " : ""}${p.title}`; }
@@ -2552,7 +2560,7 @@ function renderRights() {
     const o = v.objects[c.uuid];
     const claims = setClaims(c.uuid);
     const head = `<div class="rt-head"><button type="button" class="lnk" data-go="${esc(c.uuid)}">${esc(c.title)}</button> <span class="rt-kind">${esc(RIGHT_KIND[c.kind] || c.kind)}</span>` +
-      claims.map((x) => ` <span class="rt-src" title="${esc(claimNote(x).replace(/<[^>]+>/g, ""))}">λ <span class="mono">${esc(claimAt(x))}</span></span>`).join("") + "</div>";
+      claims.map((x) => ` <span class="rt-src" title="${esc(claimTip(x))}">λ <span class="mono">${esc(claimAt(x))}</span></span>`).join("") + "</div>";
     if (c.kind === "schedule") return `<li class="rt-item">${head}${scheduleSideBySide(o)}</li>`;
     const lines = [
       ...(c.lose?.length ? [`<li class="rt-lose">⚠ ${esc(lossText(c, c.lose))}</li>`] : []),
@@ -2561,25 +2569,43 @@ function renderRights() {
       ...c.rescheduled.map((r) => holderLi(r.principal, "rt-chg", "~", ` <span class="none-v">was ${esc(r.from || "—")}</span>`)),
       ...(c.gain?.length ? [`<li class="rt-gain">${esc(gainText(c, c.gain))}</li>`] : []),
     ];
-    return `<li class="rt-item">${head}${c.new_block ? '<div class="none-v">A new block.</div>' : ""}<ul class="rt-lines">${lines.join("")}</ul></li>`;
+    return `<li class="rt-item">${head}${c.new_block ? '<div class="none-v">A new block.</div>' : ""}${c.removed_block ? '<div class="rt-lose">Removed, with its rights.</div>' : ""}<ul class="rt-lines">${lines.join("")}</ul></li>`;
   });
   box.innerHTML = `<details${open ? " open" : ""}><summary><span class="rt-h">Rights and schedules</span> ${list.length}${lost ? ` <span class="rt-lose">· ${plural(lost, "user")} lose${lost === 1 ? "s" : ""} a right</span>` : ""}</summary><ul class="rt-list">${items.join("")}</ul></details>`;
 }
 $("rights-box").addEventListener("click", goClicked);
+/** How two lists of rights differ, as the server compares them (rights.rs): a right is a principal and a
+ *  schedule, both by UUID. A principal with one right before and one after, under another schedule, is
+ *  rescheduled (new entry → old entry); anything else is added or removed. */
+function rightsDiff(was, now) {
+  const key = (p) => `${p.uuid}|${p.schedule_uuid || ""}`;
+  const wk = new Set(was.map(key)), nk = new Set(now.map(key));
+  let added = now.filter((p) => !wk.has(key(p))), removed = was.filter((p) => !nk.has(key(p)));
+  const once = (l, u) => l.filter((p) => p.uuid === u).length === 1;
+  const rescheduled = new Map();
+  for (const a of added) {
+    const r = removed.find((x) => x.uuid === a.uuid);
+    if (r && once(added, a.uuid) && once(removed, a.uuid) && once(now, a.uuid) && once(was, a.uuid)) rescheduled.set(a, r);
+  }
+  added = added.filter((p) => !rescheduled.has(p));
+  const gone = new Set(rescheduled.values());
+  removed = removed.filter((p) => !gone.has(p));
+  return { added, removed, rescheduled };
+}
 /** Properties of an NFC Code Touch or a push notification: who holds the right, marked against the compared
  *  revision, who holds it in effect, and the module's claim on it. */
 function rightsRows(o, marks) {
   const r = o.rights;
   const old = marks ? o.rights_old : null;
   const rows = setClaims(o.uuid).map(claimNote);
-  const by = (l, u) => l?.find((p) => p.uuid === u);
+  const d = old ? rightsDiff(old.list, r.list) : null;
   const items = r.list.map((p) => {
-    const was = old && by(old.list, p.uuid);
-    if (old && !was) return holderLi(p, "rt-add", "+");
-    if (was && was.schedule !== p.schedule) return holderLi(p, "rt-chg", "~", ` <span class="none-v">was ${esc(was.schedule || "—")}</span>`);
-    return holderLi(p, "", "");
+    if (!d) return holderLi(p, "", "");
+    const was = d.rescheduled.get(p);
+    if (was) return holderLi(p, "rt-chg", "~", ` <span class="none-v">was ${esc(was.schedule || "—")}</span>`);
+    return d.added.includes(p) ? holderLi(p, "rt-add", "+") : holderLi(p, "", "");
   });
-  if (old) for (const p of old.list) if (!by(r.list, p.uuid)) items.push(holderLi(p, "rt-rem", "−"));
+  if (d) for (const p of d.removed) items.push(holderLi(p, "rt-rem", "−"));
   rows.push(items.length ? `<ul class="rt-lines rt-props">${items.join("")}</ul>`
     : `<div class="empty">${r.kind === "access" ? "No user or group may open it." : "No user or group is a recipient."}</div>`);
   const users = r.users.map((u) => u.title);
@@ -2595,18 +2621,17 @@ function rightsRows(o, marks) {
   }
   return { rows, count: r.list.length };
 }
-/** For Apply's confirmation: who loses or gains a right the pending config changes, against the deployed one. */
-async function pendingRightsText(pend) {
-  const base = deployedRev()?.id || pend.base || "";
-  let ch;
-  try { ch = (await api(`/api/rights/changes?rev=${encodeURIComponent(pend.id)}&base=${encodeURIComponent(base)}`)).changes || []; } catch (e) {
-    return `⚠ Could not check whose access rights or notifications this changes (${e.message}).\n\n`;
-  }
+/** For Apply's confirmation: who loses or gains a right the pending config changes, against the deployed one
+ *  (`rights` of `/api/apply/changes`, fetched with the devices). Never silently empty: when that request failed,
+ *  it says so. */
+function rightsApplyText(hw) {
+  if (!hw || !hw.rights) return `⚠ Couldn't check access changes: ${hw?.error || "no answer"}. Applying may take away someone's access to a door or a notification.\n\n`;
   const lose = [], gain = [];
-  for (const c of ch) {
+  for (const c of hw.rights) {
     const by = claimsOf(c.uuid).map(claimAt);
     const src = by.length ? ` (${by.join(", ")})` : "";
-    for (const u of c.lose || []) lose.push(c.kind === "access" ? `${u.title} loses access to ${c.title}${src}` : `${u.title} stops getting ${c.title}${src}`);
+    const gone = c.removed_block ? ", which this removes" : "";
+    for (const u of c.lose || []) lose.push(c.kind === "access" ? `${u.title} loses access to ${c.title}${gone}${src}` : `${u.title} stops getting ${c.title}${gone}${src}`);
     for (const u of c.gain || []) gain.push(c.kind === "access" ? `${u.title} gains access to ${c.title}` : `${u.title} starts getting ${c.title}`);
   }
   return (lose.length ? `⚠ ${lose.join("\n⚠ ")}\n\n` : "") + (gain.length ? `${gain.join("\n")}\n\n` : "");
@@ -2626,6 +2651,8 @@ async function loadEdits() {
   try { S.edits = await api("/api/edits"); } catch { S.edits = null; S.editsKey = null; }
   // The managed blocks' badges and the legend follow the lockfile and the module (#64).
   managedRefresh(was);
+  // The claims' λ file:line in Rights and schedules too (#68).
+  if (S.view) renderRights();
   renderActions();
   if (S.sel && S.view) renderProps();
 }

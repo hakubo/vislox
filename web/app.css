@@ -394,7 +394,9 @@ rect.ghost, line.ghost { fill: #1f6fd10a; stroke: var(--moved); stroke-opacity: 
 .changes .chg .k.removed, .changes .chg .k.wire- { background: var(--removed); }
 .changes .chg .k.renamed, .changes .chg .k.param, .changes .chg .k.attr { background: var(--changed-dot); color: #2b1d00; }
 .changes .chg .k.moved { background: var(--moved); }
-.changes .chg .k.rights { background: var(--removed); }
+.changes .chg .k.rights { background: var(--changed-dot); color: #2b1d00; }
+.changes .chg .k.rights.added { background: var(--added); color: #fff; }
+.changes .chg .k.rights.removed { background: var(--removed); color: #fff; }
 /* Rights and schedules (#68): access, recipients and switching times the compared change sets */
 .rights-box { flex: none; max-height: 40%; overflow: auto; padding: 6px 10px; border-bottom: 1px solid var(--line-2); font-size: 12px; }
 .rights-box summary { cursor: pointer; }
