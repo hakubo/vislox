@@ -241,6 +241,12 @@ pub struct ObjInfo {
     pub calendar: Option<CalInfo>,
     /// The switching times of a Daytimer, or of a block that holds one.
     pub schedule: Option<SchedInfo>,
+    /// A lighting controller's moods and circuits (#74).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub moods: Option<MoodsInfo>,
+    /// The compared revision's, when they differ.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub moods_old: Option<MoodsInfo>,
     /// Who may open an NFC Code Touch, or who gets a push notification (#68).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rights: Option<rights::Rights>,
@@ -270,6 +276,193 @@ pub struct DeviceInfo {
     /// How the compared change reconfigures the device, if it does
     /// ([`HwDevice::how`]).
     pub how: Option<&'static str>,
+}
+
+/// A lighting controller's moods (#74), as the viewed config stores them
+/// (`<LightscenesC>`, read with lox's `moods` model).
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct MoodsInfo {
+    /// The circuit count (`AQ1` … `AQ<outputs>`).
+    pub outputs: usize,
+    /// Every circuit, in order.
+    pub circuits: Vec<CircuitInfo>,
+    /// The moods in the app's order, the off mood among them.
+    pub moods: Vec<MoodInfo>,
+    /// The scene ids a button selects: `Sel<n>` (T5/n) is wired.
+    pub selected: Vec<u32>,
+    /// Why lox cannot write these moods (a circuit with two kinds of
+    /// values, `Moods::prefixes`), so they are not edited here.
+    pub error: Option<String>,
+}
+
+/// One lighting circuit (*Lichtkreis*): the controller's output `AQ<n>`.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct CircuitInfo {
+    pub n: usize,
+    /// The values it takes, read off the moods (each circuit stores one kind):
+    /// `switch` (on, off, a percentage), `dimmer` (off, a percentage), `rgb`
+    /// (off, `rgb(…)`), `colour` (off, `rgb(…)`, `temp(…)`), `white` (the same,
+    /// its moods holding tunable white), `raw` (a kind Lox Logic does not
+    /// name: kept as stored), or `mixed` (its moods disagree: see `error`).
+    pub kind: &'static str,
+    /// Its name (`NameAI<n-1>=`): the actuator Loxone Config's mood editor
+    /// named it after. A circuit without one has no actuator: the Miniserver
+    /// only switches it.
+    pub name: Option<String>,
+    /// A mood other than "Viel Licht" (which switches every circuit on)
+    /// gives it a value other than off.
+    pub used: bool,
+}
+
+/// One mood (*Stimmung*).
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct MoodInfo {
+    pub name: String,
+    /// Its scene id: what `Sel<n>` and the app select it by.
+    pub sid: Option<String>,
+    /// The off mood ("Aus"): always there, never in a set.
+    pub off: bool,
+    /// Why a set must keep it, in words: a built-in mood, or one the motion
+    /// settings name ([`crate::mood_edit::required`]).
+    pub required: Option<&'static str>,
+    /// The same as a word: `builtin` or `motion`.
+    pub role: Option<crate::mood_edit::Required>,
+    /// Each circuit's value in the language's terms (`on`, `80%`, `rgb(…)`).
+    pub values: Vec<String>,
+    /// The values as a `moods` line writes them: `all on, AQ2 off`.
+    pub text: String,
+}
+
+/// The moods of a LightController2 element; `None` for any other block, or
+/// one without moods (minted from source, never saved by Loxone Config).
+fn moods_info(el: &Element) -> Option<MoodsInfo> {
+    use loxone_config::moods::{self as lm, MoodValue};
+    if el.attr("Type") != Some("LightController2") {
+        return None;
+    }
+    let m = lm::Moods::read(el)?;
+    // Each circuit's kind as lox reads it: one prefix per circuit across the
+    // moods. A circuit whose moods disagree is one lox refuses to write.
+    let prefixes = m.prefixes();
+    let circuits = (0..m.outputs)
+        .map(|i| {
+            let vals: Vec<MoodValue> = m
+                .moods
+                .iter()
+                .filter_map(|x| x.qs.get(i).map(|&q| lm::decode(q)))
+                .collect();
+            // "Viel Licht" switches every circuit on, wired or not: only the
+            // other moods tell which circuits are in use.
+            let used = m
+                .moods
+                .iter()
+                .filter(|x| x.sid.as_deref() != Some("777"))
+                .filter_map(|x| x.qs.get(i))
+                .any(|&q| lm::decode(q) != MoodValue::Off);
+            let prefix = match &prefixes {
+                Ok(p) => p.get(i).copied(),
+                Err(_) => {
+                    let seen: BTreeSet<u32> = m
+                        .moods
+                        .iter()
+                        .filter_map(|x| x.qs.get(i))
+                        .map(|q| q >> 28)
+                        .collect();
+                    (seen.len() <= 1).then(|| seen.into_iter().next().unwrap_or(0))
+                }
+            };
+            let kind = match prefix {
+                None => "mixed",
+                Some(0) => "switch",
+                Some(1) => "dimmer",
+                Some(4) => "rgb",
+                Some(5 | 6) if vals.iter().any(|v| matches!(v, MoodValue::Temp(..))) => "white",
+                Some(5 | 6) => "colour",
+                Some(_) => "raw",
+            };
+            CircuitInfo {
+                n: i + 1,
+                kind,
+                name: el
+                    .attr_decoded(&format!("NameAI{i}"))
+                    .map(|n| n.into_owned()),
+                used,
+            }
+        })
+        .collect();
+    let moods = m
+        .moods
+        .iter()
+        .map(|x| {
+            let req = crate::mood_edit::required(el, x);
+            MoodInfo {
+                name: x.name.clone(),
+                sid: x.sid.clone(),
+                off: x.is_off(),
+                required: req.map(|r| r.why()),
+                role: req,
+                values: x.qs.iter().map(|&q| lm::decode(q).to_string()).collect(),
+                text: lm::render(&x.qs),
+            }
+        })
+        .collect();
+    let selected = el
+        .child_elements()
+        .filter(|c| c.name == "Co")
+        .filter_map(|c| {
+            let n: u32 = c.attr("K")?.strip_prefix("Sel")?.parse().ok()?;
+            c.child_elements().any(|i| i.name == "In").then_some(n)
+        })
+        .collect();
+    Some(MoodsInfo {
+        outputs: m.outputs,
+        circuits,
+        moods,
+        selected,
+        error: prefixes.err(),
+    })
+}
+
+/// The moods of a controller that changed, as the change list reads them:
+/// *Licht · mood "Lesen": all on → AQ1 80%*, a mood added or removed, and a
+/// new order of the moods both revisions have.
+fn moods_changes(title: &str, old: &MoodsInfo, new: &MoodsInfo) -> Vec<String> {
+    let mut out = Vec::new();
+    let find =
+        |m: &MoodsInfo, n: &str| m.moods.iter().find(|x| x.name == n).map(|x| x.text.clone());
+    for x in &new.moods {
+        match find(old, &x.name) {
+            Some(t) if t != x.text => {
+                out.push(format!("{title} · mood \"{}\": {t} → {}", x.name, x.text))
+            }
+            Some(_) => {}
+            None => out.push(format!("{title} · mood \"{}\" added: {}", x.name, x.text)),
+        }
+    }
+    for x in &old.moods {
+        if find(new, &x.name).is_none() {
+            out.push(format!(
+                "{title} · mood \"{}\" removed (was {})",
+                x.name, x.text
+            ));
+        }
+    }
+    let both = |a: &MoodsInfo, b: &MoodsInfo| -> Vec<String> {
+        a.moods
+            .iter()
+            .filter(|x| b.moods.iter().any(|y| y.name == x.name))
+            .map(|x| format!("\"{}\"", x.name))
+            .collect()
+    };
+    let (o, n) = (both(old, new), both(new, old));
+    if o != n {
+        out.push(format!(
+            "{title} · moods order: {} → {}",
+            o.join(", "),
+            n.join(", ")
+        ));
+    }
+    out
 }
 
 /// A schedule, as the viewed config stores it (see `schedule.rs`).
@@ -963,6 +1156,8 @@ struct Delta {
     calendar: HashSet<String>,
     /// Blocks whose switching times changed.
     schedule: HashSet<String>,
+    /// Lighting controllers whose moods changed (#74).
+    moods: HashSet<String>,
     /// NFC Code Touches and push notifications whose access rights or
     /// recipients changed (#68).
     rights: HashSet<String>,
@@ -987,6 +1182,7 @@ impl Delta {
             || self.placements.contains(uuid)
             || self.calendar.contains(uuid)
             || self.schedule.contains(uuid)
+            || self.moods.contains(uuid)
             || self.rights.contains(uuid)
             || self.in_app.contains(uuid)
             || self.params.keys().any(|(o, _)| o == uuid)
@@ -1160,6 +1356,30 @@ pub fn build(new: &LoxoneDoc, old: Option<&LoxoneDoc>, title: &str) -> View {
         }
     }
 
+    // Lighting moods (#74): changed ones mark their controller changed.
+    let mut moods: HashMap<String, (MoodsInfo, Option<MoodsInfo>)> = HashMap::new();
+    for u in &nc.order {
+        if let Some(mi) = nc.el(u).and_then(moods_info) {
+            let old = oc
+                .as_ref()
+                .filter(|_| d.on)
+                .and_then(|o| o.el(u))
+                .and_then(moods_info)
+                .filter(|o| o.moods != mi.moods);
+            if old.is_some() {
+                d.moods.insert(u.clone());
+            }
+            moods.insert(u.clone(), (mi, old));
+        }
+    }
+    if let Some(oc) = &oc {
+        for u in oc.order.iter().filter(|u| !nc.els.contains_key(*u)) {
+            if let Some(mi) = oc.el(u).and_then(moods_info) {
+                moods.insert(u.clone(), (mi, None));
+            }
+        }
+    }
+
     // Access rights and recipients (#68): a changed one marks its block
     // changed.
     let mut new_rights = rights::read(new);
@@ -1222,6 +1442,10 @@ pub fn build(new: &LoxoneDoc, old: Option<&LoxoneDoc>, title: &str) -> View {
         let ci = cals.remove(u);
         let mut o = obj_info(&nc, oc.as_ref(), u, &d, false, ci);
         o.schedule = scheds.remove(u);
+        if let Some((m, old)) = moods.remove(u) {
+            o.moods = Some(m);
+            o.moods_old = old;
+        }
         o.rights = new_rights.remove(u);
         if d.rights.contains(u) {
             o.rights_old = old_rights.remove(u);
@@ -1234,6 +1458,7 @@ pub fn build(new: &LoxoneDoc, old: Option<&LoxoneDoc>, title: &str) -> View {
                 let ci = cals.remove(u);
                 let mut o = obj_info(oc, None, u, &d, true, ci);
                 o.schedule = scheds.remove(u);
+                o.moods = moods.remove(u).map(|(m, _)| m);
                 o.rights = old_rights.remove(u);
                 view.objects.insert(u.clone(), o);
             }
@@ -1790,6 +2015,8 @@ fn obj_info(
     ObjInfo {
         calendar,
         schedule: None,
+        moods: None,
+        moods_old: None,
         rights: None,
         rights_old: None,
         device,
@@ -2017,6 +2244,20 @@ fn changes(view: &mut View, nc: &Ctx, oc: &Ctx, d: &Delta) {
                     obj: Some(u.clone()),
                     hw: None,
                     how: Some(how),
+                });
+            }
+        }
+        if let Some(o) = view.objects.get(&u)
+            && let (Some(new), Some(old)) = (&o.moods, &o.moods_old)
+        {
+            for text in moods_changes(&nc.title(&u), old, new) {
+                v.push(Change {
+                    kind: "attr",
+                    text,
+                    page: page_for(&u),
+                    obj: Some(u.clone()),
+                    hw: None,
+                    how: None,
                 });
             }
         }
@@ -3328,6 +3569,99 @@ mod tests {
             .map(|c| (c.kind, c.uuid.as_str(), c.title.as_str()))
             .collect();
         assert_eq!(r, [("schedule", TIMER, "Uhr")]);
+    }
+
+    /// A lighting controller shows its circuits and moods, and a changed
+    /// mood list is one change line per mood and its order (#74).
+    #[test]
+    fn a_lighting_controller_shows_its_moods_and_their_changes() {
+        use crate::mood_edit::fixture::{LICHT, house};
+        let base_s = house();
+        let base = doc(&base_s);
+        let v = build(&base, None, "");
+        let m = v.objects[LICHT].moods.as_ref().expect("moods");
+        assert_eq!(m.outputs, 18);
+        let kinds: Vec<&str> = m.circuits.iter().take(4).map(|c| c.kind).collect();
+        assert_eq!(kinds, ["switch", "dimmer", "white", "switch"]);
+        assert_eq!(m.circuits[0].name.as_deref(), Some("Deckenlicht"));
+        assert!(m.circuits[1].name.is_none() && m.circuits[1].used);
+        assert!(!m.circuits[4].used);
+        let names: Vec<(&str, bool, Option<&str>)> = m
+            .moods
+            .iter()
+            .map(|x| (x.name.as_str(), x.off, x.required))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ("Viel Licht", false, Some("a built-in mood")),
+                ("Lesen", false, None),
+                ("Kino", false, None),
+                ("Aus", true, None)
+            ]
+        );
+        assert_eq!(m.moods[1].values[1], "80%");
+        assert_eq!(m.moods[2].values[2], "temp(20%, 2700K)");
+        assert_eq!(m.selected, [1]);
+        assert!(v.objects[AND].moods.is_none());
+
+        // Lesen dimmed, Kino gone, Neu added, Lesen before Viel Licht.
+        let viel = base_s.find("<LightsceneC Name=\"Viel Licht\"").unwrap();
+        let viel_end = viel + base_s[viel..].find("/>").unwrap() + 2;
+        let viel_el = base_s[viel..viel_end].to_string();
+        let lesen_at = base_s.find("<LightsceneC Name=\"Lesen\"").unwrap();
+        let lesen_end = lesen_at + base_s[lesen_at..].find("/>").unwrap() + 2;
+        let lesen_el = base_s[lesen_at..lesen_end].replace("Q2=\"268435536\"", "Q2=\"268435506\"");
+        let kino = base_s.find("<LightsceneC Name=\"Kino\"").unwrap();
+        let kino_end = kino + base_s[kino..].find("/>").unwrap() + 2;
+        let neu = base_s[kino..kino_end]
+            .replace("Name=\"Kino\"", "Name=\"Neu\"")
+            .replace("SID=\"2\"", "SID=\"3\"");
+        let mut new_s = base_s.clone();
+        new_s.replace_range(viel..kino_end, &format!("{lesen_el}{viel_el}{neu}"));
+        let new = doc(&new_s);
+        let v = build(&new, Some(&base), "");
+        let o = &v.objects[LICHT];
+        assert_eq!(o.status, "changed");
+        assert!(o.moods_old.is_some());
+        let texts: Vec<&str> = v.changes.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            [
+                "Licht · mood \"Lesen\": AQ1 on, AQ2 80% → AQ1 on, AQ2 50%",
+                "Licht · mood \"Neu\" added: AQ3 temp(20%, 2700K)",
+                "Licht · mood \"Kino\" removed (was AQ3 temp(20%, 2700K))",
+                "Licht · moods order: \"Viel Licht\", \"Lesen\", \"Aus\" → \"Lesen\", \"Viel Licht\", \"Aus\"",
+            ],
+            "{texts:?}"
+        );
+        // Other controllers: unchanged.
+        assert_eq!(v.objects[crate::mood_edit::fixture::FLUR].status, "");
+        // The built-in and motion moods, by the one rule the server keeps.
+        let m = v.objects[LICHT].moods.as_ref().unwrap();
+        assert_eq!(m.moods[1].role, Some(crate::mood_edit::Required::Builtin));
+        assert!(m.error.is_none());
+    }
+
+    /// A circuit's kind is lox's (`Moods::prefixes`): one whose moods hold two
+    /// kinds of values is `mixed`, and the controller says why lox cannot
+    /// write its moods; the first mood alone decides nothing (#74).
+    #[test]
+    fn a_circuit_whose_moods_disagree_is_mixed_and_said_so() {
+        use crate::mood_edit::fixture::{LICHT, house};
+        let s = house();
+        // Kino's AQ2 stored as a switch value (prefix 0), the others' as a dimmer's.
+        let kino = s.find("<LightsceneC Name=\"Kino\"").unwrap();
+        let at = kino + s[kino..].find("Q2=\"268435456\"").unwrap();
+        let mut bad = s.clone();
+        bad.replace_range(at..at + "Q2=\"268435456\"".len(), "Q2=\"0\"");
+        let v = build(&doc(&bad), None, "");
+        let m = v.objects[LICHT].moods.as_ref().unwrap();
+        assert_eq!(m.circuits[1].kind, "mixed");
+        assert_eq!(m.circuits[0].kind, "switch");
+        assert_eq!(m.circuits[2].kind, "white");
+        let e = m.error.as_deref().unwrap();
+        assert!(e.contains("AQ2 has two value kinds"), "{e}");
     }
 
     /// The house with users (alice, bob), a group of bob (Bewohner), two

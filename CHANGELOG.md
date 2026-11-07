@@ -86,6 +86,23 @@ published under the same version (see [docker/README.md](docker/README.md)).
   overlap, no wrap past midnight, a value on each interval of an analog timer and none on a digital one, one
   schedule per timer (a claim of the module's own file is named instead). A Miniserver that runs other switching
   times (changed in the app) is named in the editor: the save, once applied, replaces them. Never deploys.
+- Show, review and edit a lighting controller's moods (#74): Properties of a LightController2 has *Moods*: its
+  circuits (`AQ1` … `AQ18`), each a switch, dimmer, colour or tunable-white circuit and named after its actuator
+  or marked *no actuator* (with `lox logic lint`'s `no-actuator` finding on the circuit), and its moods in order
+  with their values in Lox Logic's terms (`AQ1 on, AQ2 80%`), the off mood, the built-in and motion moods and the
+  T5 input that selects each marked. The Changes list has a line per changed, added or removed mood
+  (*Wohnzimmer · mood "Lesen": AQ1 on, AQ2 80% → AQ1 on, AQ2 40%*) and a new order. *Edit moods* adds, renames,
+  reorders and deletes moods and sets each circuit's value, offering only the values its kind takes; *Save* sends
+  the new op `moods`, which writes a Lox Logic `moods vx_… end` set and the controller's `.moods` claim into
+  `<module>/vislox/edits.loxl` and compiles; the compile must write exactly those moods. Checked before lox sees
+  it: names (one each, never the off mood), values each circuit takes, "Viel Licht" and the moods the motion
+  settings name kept. Deleting or renaming a mood a button selects is warned about first. Several controllers
+  share a set (*Use the same moods as …*, *Change … too*); Undo restores every controller the op changed; Revert
+  changes only its own; a controller the module's own file claims is changed there (*Claimed twice*: *Remove
+  vislox's claim*). On a controller added or adopted here, a circuit is declared a switch or a dimmer
+  (`Circuit<n>:`), re-checked against the moods vislox claims. A shared set whose other claimant Loxone Config
+  deleted is refused by name, with *Drop its claim* (switching times too). Switching times and moods share one
+  implementation of set claims (`set_claim.rs`), ready for access, recipients and tiles. Never deploys.
 - Fixed: Discard failed when the last commit had no lockfile (the first compile writes one), or one was staged
   but not committed. Discard now reads the last commit, never deletes a lock vislox did not write (one not in git
   goes back to how it was before vislox's first edit), and puts everything back when a step fails.
