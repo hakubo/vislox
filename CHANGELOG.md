@@ -54,6 +54,15 @@ published under the same version (see [docker/README.md](docker/README.md)).
   any failure before the push goes through, and pushes without `--allow-removals`. A push that fails after its
   upload is judged by what the Miniserver runs, as for a Roll back (kept as deployed, put back, or unknown). Without consent Apply refuses,
   also for a tombstone already in the lockfile. A retry asks again; a Roll back takes no consent.
+- No personal data in git (#71): before every git push vislox makes (Apply, Roll back, Sync), the new step *No
+  personal data in git* runs `lox logic scan` on each config file version in the commits the push remote lacks
+  (`.Loxone`, `.LoxCC`, a backup `.zip`'s program; the whole repository). A finding stops the push: the commit
+  stays local (an Apply has deployed, and says *Applied, but not pushed to git*), and the Deploy pane's *Not pushed
+  to git* lists each finding by file, line, kind and element, never the value, with what to do (take the file out
+  of git) and **Push to git**, which scans again and pushes (`POST /api/push`). It fails closed: a file lox cannot
+  read, a lox without `logic scan`, or an answer vislox cannot read push nothing. A failed `git push` offers *Push
+  to git* too, and so do commits not pushed when vislox starts. A project that tracks a real base config is
+  blocked until the base is git-ignored.
 - Fixed: Discard failed when the last commit had no lockfile (the first compile writes one), or one was staged
   but not committed. Discard now reads the last commit, never deletes a lock vislox did not write (one not in git
   goes back to how it was before vislox's first edit), and puts everything back when a step fails.

@@ -2140,17 +2140,51 @@ function renderActions() {
     : testsFailing() ? `Cannot apply: ${testsFailing()} (see Tests above)`
     : "Deploy to the Miniserver with lox config push, then commit and push to git" + msWarn("apply");
   renderSteps(a);
+  renderPush(a);
   const last = a.last;
   if (last && last.at !== renderActions.shownAt) {
     renderActions.shownAt = last.at;
-    const head = { apply: [last.warn ? "Applied, but not verified.\n" : "Applied.\n", "Apply failed.\n"],
-      rollback: [last.warn ? "Rolled back, but not verified.\n" : "Rolled back.\n", "Roll back failed.\n"], sync: ["", "Sync failed.\n"], discard: ["", "Discard failed.\n"], compile: ["", "Compile failed.\n"] }[last.kind] || ["", ""];
-    deployMsg(head[last.ok ? 0 : 1] + last.message, !last.ok, last.ok && last.warn);
+    const done = (verb) => verb + (last.warn && last.unpushed ? ", but not verified and not pushed to git" : last.warn ? ", but not verified"
+      : last.unpushed ? ", but not pushed to git" : "") + ".\n";
+    const head = { apply: [done("Applied"), "Apply failed.\n"],
+      rollback: [done("Rolled back"), "Roll back failed.\n"], sync: ["", "Sync failed.\n"], discard: ["", "Discard failed.\n"], compile: ["", "Compile failed.\n"],
+      push: ["", "Not pushed to git.\n"] }[last.kind] || ["", ""];
+    deployMsg(head[last.ok ? 0 : 1] + last.message, !last.ok, last.ok && (last.warn || last.unpushed));
     // What the new program logged as it started.
     if (last.kind === "apply" || last.kind === "rollback") logStale();
     if (last.kind !== "discard" && S.hist?.running) loadRunning(true);
   }
 }
+// ── personal data before a git push (#71) ─────────────────────────────
+// Every git push vislox makes (Apply, Roll back, Sync) first asks lox logic scan about what it would send: each
+// config file in the commits the remote does not have. lox names where personal data is (element and attribute,
+// the value's length), never the value. On a finding, a file lox cannot read, or no answer, nothing is pushed: the
+// commit stays local (an Apply has deployed it), and this box lists the findings and what to do. Push to git scans
+// again, then pushes.
+/** The commits the git remote does not have, and why. */
+function renderPush(a) {
+  const box = $("deploy-push"), p = a.push;
+  box.classList.toggle("hidden", !p);
+  if (!p) { box.innerHTML = ""; return; }
+  box.classList.toggle("error", p.state !== "behind");
+  box.classList.toggle("hint", p.state === "behind");
+  const head = { found: "Not pushed to git: personal data", unscanned: "Not pushed to git: couldn't check for personal data",
+    failed: "Not pushed to git: git push failed", behind: "Not pushed to git yet" }[p.state] || "Not pushed to git";
+  const ran = a.last?.ok && ["apply", "rollback"].includes(a.last.kind) && a.last.at >= p.at - 1
+    ? "The Miniserver runs the deployed config and the commit records it: only the git remote is behind. " : "";
+  const items = (p.findings || []).map((f) => `<li><span class="ck-at">${esc(f.file + (f.entry ? ` › ${f.entry}` : "") + (f.line ? `:${f.line}` : ""))}</span>` +
+    `${esc(f.kind)} — ${esc(f.what)}${f.len != null ? ` (${plural(f.len, "char")})` : ""}${f.now ? "" : ` · only in commit ${esc(f.commit)}, deleted since`}</li>`);
+  const why = !a.apply?.available ? `Cannot push: ${a.apply?.reason || ""}` : a.running ? `${a.running} is running` : "";
+  box.innerHTML = `<div class="ck-h">${esc(head)}</div><div class="ck-sub">${esc(ran + p.message)}.</div>` +
+    (items.length ? `<ul class="ps-list">${items.join("")}</ul>` : "") + (p.advice ? `<pre>${esc(p.advice)}</pre>` : "") +
+    `<div class="ck-row"><button type="button" id="btn-push" class="ghost small"${why ? " disabled" : ""}
+      title="${esc(why || "Check the commits not pushed yet for personal data again (lox logic scan), then git push")}">${a.running === "Push" ? "Pushing…" : "Push to git"}</button></div>`;
+}
+$("deploy-push").addEventListener("click", async (e) => {
+  if (!e.target.closest("#btn-push")) return;
+  deployMsg("");
+  try { const j = await act("/api/push"); deployMsg(j.message); } catch (err) { deployMsg(err.message, true); }
+});
 /** Apply's steps as they happen: lox's progress, and what vislox sees of the program restart. */
 function renderSteps(a) {
   const box = $("deploy-steps"), p = a.progress;

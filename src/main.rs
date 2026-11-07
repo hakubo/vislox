@@ -477,6 +477,11 @@ async fn main() -> Result<()> {
         let app = app.clone();
         tokio::spawn(async move { app.actions.check_worker().await });
     }
+    // Commits a push blocked or failed before a restart: Push to git (#71).
+    {
+        let app = app.clone();
+        tokio::spawn(async move { app.actions.find_unpushed().await });
+    }
     // Fallback poll, and the only way to notice new git commits.
     {
         let app = app.clone();
@@ -551,6 +556,7 @@ async fn main() -> Result<()> {
         .route("/api/compile", axum::routing::post(api_compile))
         .route("/api/block-types", get(api_block_types))
         .route("/api/sync", axum::routing::post(api_sync))
+        .route("/api/push", axum::routing::post(api_push))
         .route("/api/operate", axum::routing::post(api_operate))
         .with_state(app)
         .layer(tower_http::compression::CompressionLayer::new());
@@ -1866,6 +1872,22 @@ async fn api_sync(State(app): State<Arc<App>>, headers: axum::http::HeaderMap) -
     match res {
         Ok(m) => Json(serde_json::json!({ "message": m })).into_response(),
         Err((status, msg)) => refused((status, reason::explain(&msg))),
+    }
+}
+
+/// *Push to git* (#71): push the commits the remote does not have, after
+/// `lox logic scan` found no personal data in them. Talks to the git remote
+/// only, never to the Miniserver.
+async fn api_push(State(app): State<Arc<App>>, headers: axum::http::HeaderMap) -> Response {
+    if let Err(r) = app.actions.check(&headers) {
+        return refused(r);
+    }
+    let res = app.actions.push().await;
+    let a = app.clone();
+    let _ = tokio::task::spawn_blocking(move || refresh(&a)).await;
+    match res {
+        Ok(m) => Json(serde_json::json!({ "message": m })).into_response(),
+        Err(r) => refused(r),
     }
 }
 

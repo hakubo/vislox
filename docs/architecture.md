@@ -44,6 +44,12 @@ The binary is an `axum` server with the UI embedded (plain JS and SVG, no build 
   reported as unknown.
   `history.rs` keeps the newest plan as the `removals:<blob>` revision, compared with the deployed revision,
   found by id only, and drops it with its bytes when it is cancelled, replaced, too old or another revision runs.
+- `actions/scan.rs` checks what a git push would send for personal data (#71): each config file version in the
+  commits the push remote does not have (`.Loxone`, `.LoxCC`, a backup `.zip`'s program), copied into a private
+  scratch directory and read by `lox logic scan --json`, each finding given the line of the element lox names.
+  `Actions::push_git` (in `actions.rs`) is the only place vislox runs `git push`: Apply, Roll back and Sync go
+  through it, as Apply's *No personal data in git* step, and *Push to git* (`POST /api/push`) retries it. A finding,
+  a file lox cannot read or no answer blocks the push and is kept as `actions.push` for the Deploy pane.
 - `src/running.rs` reads `/prog` and `def.log` for the config the Miniserver runs (`GET /api/running`), and
   checks after an Apply that the upload loaded.
 - `src/edit.rs` is editing from Properties ([editing.md](editing.md)): the edit operations, what each object
