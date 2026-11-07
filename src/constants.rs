@@ -23,7 +23,7 @@ use loxone_config::logic::{
 };
 use loxone_config::port_names;
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// A `let` constant of the module.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -88,18 +88,33 @@ pub struct Constants {
     pub uses: BTreeMap<String, BTreeMap<String, Use>>,
 }
 
+impl Constants {
+    /// Where the module's own files bind port `key` of `uuid` to a constant
+    /// (`x.Port = name` on an extern): its `file:line`. vislox does not claim
+    /// such a port too.
+    pub fn module_binding(&self, uuid: &str, key: &str) -> Option<String> {
+        let u = self.uses.get(&uuid.to_ascii_lowercase())?.get(key)?;
+        (u.kind == "let" && !u.at_ours).then(|| match u.at_line {
+            Some(l) => format!("{}:{l}", u.at_file),
+            None => u.at_file.clone(),
+        })
+    }
+}
+
 /// One file parsed, with its lines.
 struct Parsed<'a> {
     file: &'a str,
     lines: Vec<&'a str>,
+    /// The lines inside a template's body: none of its statements is the
+    /// module's own.
+    body: BTreeSet<usize>,
     items: Vec<Item>,
 }
 
 /// The line (1-based) of `slug.port = …` at the top level of `p`.
 fn set_line(p: &Parsed, slug: &str, port: &str) -> Option<usize> {
-    let body = template_bodies(&p.lines);
     p.lines.iter().enumerate().find_map(|(n, l)| {
-        if body.contains(&n) {
+        if p.body.contains(&n) {
             return None;
         }
         let (lhs, rhs) = code(l).split_once('=')?;
@@ -110,11 +125,10 @@ fn set_line(p: &Parsed, slug: &str, port: &str) -> Option<usize> {
 
 /// The line (1-based) of `defaults <ty>` at the top level of `p`.
 fn defaults_line(p: &Parsed, ty: &str) -> Option<usize> {
-    let body = template_bodies(&p.lines);
     p.lines.iter().enumerate().find_map(|(n, l)| {
         let c = code(l).trim_start();
         let rest = c.strip_prefix("defaults")?;
-        if !rest.starts_with(char::is_whitespace) || body.contains(&n) {
+        if !rest.starts_with(char::is_whitespace) || p.body.contains(&n) {
             return None;
         }
         let name = rest
@@ -138,9 +152,11 @@ pub fn constants<T: AsRef<str>>(
         .iter()
         .filter_map(|(f, t)| {
             let t = t.as_ref();
+            let lines: Vec<&str> = t.split('\n').collect();
             Some(Parsed {
                 file: f.as_str(),
-                lines: t.split('\n').collect(),
+                body: template_bodies(&lines),
+                lines,
                 items: Module::parse_fragment(t).ok()?.items,
             })
         })
@@ -262,11 +278,18 @@ pub fn constants<T: AsRef<str>>(
                 }
                 Item::Extern(e) => {
                     let uuid = externs.get(&e.slug).and_then(|x| x.1.clone());
-                    let line = decls.at(&e.slug, Some(p.file)).map(|(_, l)| l);
+                    // Each argument at its own line, as on a block.
+                    let lines: BTreeMap<String, usize> = decls
+                        .at(&e.slug, Some(p.file))
+                        .map(|(_, l)| bindings(&p.lines, l - 1))
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|(k, n)| (k, n + 1))
+                        .collect();
                     for a in &e.args {
                         if let ArgItem::Binding(x) = a
                             && let BindingKind::Param(Value::Ref(n)) = &x.kind
-                            && let Some(u) = let_use(n, p.file, line)
+                            && let Some(u) = let_use(n, p.file, lines.get(&x.port).copied())
                         {
                             uses.push((uuid.clone(), key(&e.block_type, &x.port), u));
                         }
@@ -423,6 +446,18 @@ mod tests {
         assert_eq!(c.uses[AND].len(), 1, "{:?}", c.uses[AND]);
         assert_eq!((a.name.as_str(), a.ours, a.at_ours), ("vx_a", true, true));
         assert_eq!(a.at_line, Some(4));
+    }
+
+    #[test]
+    fn an_extern_s_argument_is_found_on_its_own_line() {
+        let files = vec![(
+            "m.loxl".to_string(),
+            format!("let t = 3\nextern teiler = Div(\n\tuuid: \"{DIV}\",\n\tIn2: t,\n)\n"),
+        )];
+        let c = constants(&files, &lock(), |_| false);
+        let u = &c.uses[&DIV.to_ascii_lowercase()]["Input2"];
+        assert_eq!((u.at_line, u.line), (Some(4), Some(1)));
+        assert_eq!(c.module_binding(DIV, "Input2").as_deref(), Some("m.loxl:4"));
     }
 
     #[test]

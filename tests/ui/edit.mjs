@@ -2493,6 +2493,13 @@ try {
     ops = await send(() => page.press(field("p:Time"), "Enter"), "bind K3");
     assert.deepEqual(ops, [{ op: "param", uuid: K3, port: "Time", value: "vx_time" }]);
     await page.waitForFunction(`${time(K3)} === "1800"`, null, { timeout: 10000 });
+    // Applied (as Apply leaves it: the base is the compile, committed), so the constant has a deployed value.
+    writeFileSync(join(dir, "base.Loxone"), readFileSync(join(dir, "out.Loxone")));
+    git("add", "-A");
+    git("commit", "-q", "-m", "Applied the constant");
+    await page.waitForFunction(() => /Nothing pending/.test(document.querySelector("#deploy-pend")?.textContent || "") &&
+      (S.edits?.claims || []).some((c) => c.op === "let" && c.deployed === "30min" && !c.pending), null, { timeout: 20000 });
+    await settled();
     // Changed on K2, it asks: the constant (2 uses) or only this block. The constant changes both ports.
     await pick(K2);
     await page.waitForFunction(() => S.edits?.constants?.lets?.find((l) => l.name === "vx_time")?.uses === 2, null, { timeout: 10000 });
@@ -2508,6 +2515,12 @@ try {
     const at = list.findIndex(([c]) => c === "chg-grp");
     assert.match(list[at][1], /pages\/vislox\/edits\.loxl:\d+/);
     assert.deepEqual(list.slice(at + 1, at + 3).map(([c, t]) => [c.includes("in-grp"), /Keller|Garten/.test(t)]), [[true, true], [true, true]]);
+    // The constant is a claim not deployed: Revert puts back its deployed value, in both ports.
+    await waitText(edit, /Constant vx_time\s*45min\s*not deployed\s*Revert/);
+    ops = await send(() => page.click(`#props [data-ed="revert"][data-key="let||vx_time"]`), "revert the constant");
+    assert.deepEqual(ops, [{ op: "let", name: "vx_time", value: "30min" }]);
+    await page.waitForFunction(`${time(K2)} === "1800" && ${time(K3)} === "1800"`, null, { timeout: 10000 });
+    assert.match(claims(), /^let vx_time = 30min$/m);
     // Only this block: K3's own value; the constant stays.
     await pick(K3);
     await page.click('#props [data-ed="open"]');
@@ -2515,17 +2528,16 @@ try {
     await page.fill(field("p:Time"), "20min");
     ops = await send(() => page.click('#props [data-ed="save"]'), "only this block");
     assert.deepEqual(ops, [{ op: "param", uuid: K3, port: "Time", value: "20min" }]);
-    await page.waitForFunction(`${time(K3)} === "1200" && ${time(K2)} === "2700"`, null, { timeout: 10000 });
-    // Undone step by step, back to where it started: no constant, no binding.
-    ops = await undoKey(false, `${time(K3)} === "2700"`);
+    await page.waitForFunction(`${time(K3)} === "1200" && ${time(K2)} === "1800"`, null, { timeout: 10000 });
+    // Undone step by step, back to what is deployed.
+    ops = await undoKey(false, `${time(K3)} === "1800"`);
     assert.deepEqual(ops, [{ op: "param", uuid: K3, port: "Time", value: "vx_time" }]);
+    ops = await undoKey(false, `${time(K2)} === "2700" && ${time(K3)} === "2700"`);
+    assert.deepEqual(ops, [{ op: "let", name: "vx_time", value: "45min" }]);
     ops = await undoKey(false, `${time(K2)} === "1800" && ${time(K3)} === "1800"`);
     assert.deepEqual(ops, [{ op: "let", name: "vx_time", value: "30min" }]);
-    ops = await undoKey(false, `${time(K3)} === "60"`);
-    assert.deepEqual(ops, [{ op: "param", uuid: K3, port: "Time", value: null }]);
-    ops = await undoKey(false, () => !S.edits?.constants?.lets?.some((l) => l.name === "vx_time"));
-    assert.deepEqual(ops, [{ op: "param", uuid: K2, port: "Time", value: null }, { op: "let", name: "vx_time", value: null }]);
-    assert.doesNotMatch(claims(), /vx_time/);
+    await page.waitForFunction(() => /Nothing pending/.test(document.querySelector("#deploy-pend")?.textContent || ""), null, { timeout: 15000 });
+    assert.match(claims(), /^let vx_time = 30min$/m);
   });
   await step("nothing was deployed: lox only compiled, checked, linted and tested", async () => {
     const ran = readFileSync(calls, "utf8").trim().split("\n");

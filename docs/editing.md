@@ -373,21 +373,33 @@ vx_60000002_0000_0000_ffff504f94000001.Time = vx_nachlauf
   module or its lockfile. The value is what a port takes: a number, one with its unit (`30min`, `70%`; lox scales a
   time into each port's unit), a time of day (`19:00`) or `on`/`off` (lox checks it against every port bound to
   it). A text constant is not made here. `value: null` drops it, refused while a port of vislox's files is bound to
-  it. `previous` is the value before, or null when the op made it, so undo drops a constant it made.
+  it. `previous` is the value before, or null when the op made it, so undo drops a constant it made. The names it
+  is checked against are the module's own files' (vislox's directory left out) and vislox's files as the request
+  has changed them so far, so a request may drop a constant and make it again.
+- **Not deployed.** `GET /api/edits`' `claims` lists each of vislox's constants as a `let` op, `deployed` the value
+  the deployed revision's file gave it, and `pending` while the two differ (a constant leaves no trace in the
+  config to compare). Properties of a block that takes it shows *Constant vx_… 45min not deployed* with *Revert*,
+  which sends `let` with the deployed value; one made here has none, and goes once the ports bound to it are
+  reverted.
 - **Binding a port** is the `param` op with the constant's name as the value (`"value": "vx_nachlauf"`): on a claim
   it is written `x.Time = vx_nachlauf`, on a block of vislox's files `Time: vx_nachlauf`. The name may be vislox's
-  constant or one the module declares. Any other value binds the port to a value of its own, as before. A bare
-  name of vislox's constant on an adopted block (#72) reads as the value, never as a wire from an object.
+  constant or one the module declares. Any other value binds the port to a value of its own, as before. Only a
+  request with such a bare name reads the module's own files for their constants; when they do not read, it is
+  refused with lox's error rather than "not a number". A bare name of vislox's constant on an adopted block (#72)
+  reads as the value, never as a wire from an object (`PageFile::parse_with` knows vislox's constants). Adopting
+  keeps the module's constants and aliases (`let x = y.Q`) as bare names.
 - **Make a constant** (Properties, *Edit values*, under an unbound constant field) names the field's value: one
   request of `let` and `param`, undone together. Another block takes it by its name, typed into its field (the
   field offers the constants).
 - **Changing a value a constant gives** asks first: *Change the constant (N uses)*, which sends `let` and changes
-  every port bound to it, or *Only this block*, which sends `param` and binds this port to a value of its own.
+  every port bound to it, or *Only this block*, which sends `param` and binds this port to a value of its own. Two
+  fields of one constant given different values are refused in the form, naming the other field.
 - **Not offered, a product decision:** changing a `let` or a `defaults` line of the module's own files. vislox
   writes only its own files (see *The rules*), so a value from such a constant or default is changed only on the
   block: *Only this block*, on a block of vislox's files or a claim. Where the module's own file binds the port (`x.Port
-  = name` on an extern), the field is read-only and names that line: a claim of vislox's on the same port would
-  claim it twice. The `let` op on a constant of the module's own files is refused, naming why. vislox never writes
+  = name` on an extern), the field is read-only and names that line, and the server refuses a `param` claim on it
+  (`… is bound in pages/x.loxl:3, the module's own file`): a claim of vislox's on the same port would claim it
+  twice. Dropping vislox's claim is let through. The `let` op on a constant of the module's own files is refused, naming why. vislox never writes
   a `defaults` statement: it changes every managed block of the type, the module's own among them.
 
 ## Moving blocks (#60)

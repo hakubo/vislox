@@ -992,6 +992,44 @@ mod tests {
     }
 
     #[test]
+    fn an_alias_of_the_module_stays_a_bare_name_on_an_adopted_block() {
+        // `let dauer = licht.Q` names a port: lox reads `In2: dauer` as it, so
+        // adopting keeps the bare name rather than pinning an object (#81).
+        let tmp = tempfile::tempdir().unwrap();
+        let module = tmp.path().join("pages");
+        std::fs::create_dir_all(module.join(crate::edit::DIR)).unwrap();
+        std::fs::write(
+            module.join("main.loxl"),
+            "licht = Monoflop(\"Licht\")\nlet dauer = licht.Q\n",
+        )
+        .unwrap();
+        let decls = crate::edit::module_decls(&module).unwrap();
+        assert!(decls.aliases.contains("dauer") && !decls.lets.contains("dauer"));
+        let (mut after, l0, l1) = lox_wrote();
+        after.insert(
+            "erdgeschoss.loxl".into(),
+            "page \"Erdgeschoss\"\n\ngate = And(\"O1001\", In2: dauer)\n".into(),
+        );
+        let mut l1 = l1;
+        l1["extern_wires"] = json!([]);
+        let picked = BTreeMap::from([(GATE.to_string(), "vx_gate".to_string())]);
+        let a = extract(
+            &BTreeMap::new(),
+            &after,
+            (&l0, &l1),
+            &picked,
+            &|_| false,
+            &decls.bare(),
+            &base(),
+        )
+        .unwrap();
+        assert_eq!(
+            a[0].block.args,
+            vec![("In2".to_string(), Value::Ref("dauer".into()))]
+        );
+    }
+
+    #[test]
     fn a_block_lox_pinned_under_another_name_gets_vislox_s() {
         let (after, l0, l1) = lox_wrote();
         let picked = BTreeMap::from([(GATE.to_string(), "vx_tor".to_string())]);

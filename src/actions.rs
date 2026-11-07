@@ -161,10 +161,9 @@ fn file_blob(path: &Path) -> Option<String> {
 /// every kind that makes sets), must not be one of them.
 fn needs_module_names(ops: &[edit::Op]) -> bool {
     ops.iter().any(|o| {
-        matches!(
-            o,
-            edit::Op::AddBlock { .. } | edit::Op::Let { .. } | edit::Op::Param { .. }
-        ) || crate::set_claim::kind_of(o).is_some_and(|k| k.makes_sets())
+        matches!(o, edit::Op::AddBlock { .. } | edit::Op::Let { .. })
+            // A value that may name a constant (#81); a number needs none.
+            || matches!(o, edit::Op::Param { value: Some(v), .. } if edit::bare_name(v)) || crate::set_claim::kind_of(o).is_some_and(|k| k.makes_sets())
     })
 }
 
@@ -2043,13 +2042,70 @@ impl Actions {
             .copied()
             .filter(|k| req.ops.iter().any(|o| k.op(o).is_some()))
             .collect();
-        // The module's names, and of them its `let` constants (#81), which a
-        // port's value may name.
+        // The names of the module's own files, and of them its `let` constants
+        // (#81), which a port's value may name. vislox's own are in `files`.
         let (names, lets) = if needs_module_names(&req.ops) {
-            edit::module_decls(&p.module)
+            match edit::module_decls(&p.module) {
+                Ok(d) => (d.names, d.lets),
+                // A value that would name a constant cannot be told from a typo:
+                // say why. A new name is checked again once written.
+                Err(e) => {
+                    if let Some(v) = req.ops.iter().find_map(|o| match o {
+                        edit::Op::Param { value: Some(v), .. }
+                            if edit::bare_name(v)
+                                && !files.claims.8.contains_key(v.trim())
+                                && !req.ops.iter().any(
+                                    |l| matches!(l, edit::Op::Let { name, .. } if name == v.trim()),
+                                ) =>
+                        {
+                            Some(v.trim())
+                        }
+                        _ => None,
+                    }) {
+                        return Err(bad(format!(
+                            "`{v}` may name a constant of the module, but the module does not \
+                             read: {e}"
+                        )));
+                    }
+                    Default::default()
+                }
+            }
         } else {
             Default::default()
         };
+        // A port the module's own files bind (`x.Port = name`, #81) is changed
+        // there: a claim of vislox's on it too would claim it twice.
+        if req
+            .ops
+            .iter()
+            .any(|o| matches!(o, edit::Op::Param { value: Some(_), .. }))
+        {
+            let texts = {
+                let mut m = self.module_files.lock().unwrap();
+                m.refresh(&p.root, &p.module);
+                m.texts()
+            };
+            let mine = format!("{shown}/");
+            let c = crate::constants::constants(&texts, &lock, |f| f.starts_with(&mine));
+            for op in &req.ops {
+                let edit::Op::Param {
+                    uuid,
+                    port,
+                    value: Some(_),
+                } = op
+                else {
+                    continue;
+                };
+                if lock.slug_of(uuid).is_some_and(|s| files.block(s).is_some()) {
+                    continue;
+                }
+                if let Some(at) = c.module_binding(uuid, port) {
+                    return Err(bad(format!(
+                        "{port} is bound in {at}, the module's own file: change it there"
+                    )));
+                }
+            }
+        }
         // The blocks the rest of the module claims, per kind: a block takes
         // one claim of each kind.
         let mut claimed = crate::set_claim::Claimed::new();
@@ -3155,10 +3211,17 @@ impl Actions {
                 } else {
                     deployed_value.clone()
                 };
+                // A constant (#81) leaves no trace in the config: it is not
+                // deployed while vislox's files give it another value than the
+                // deployed revision's did. Its revert target is that value.
+                let changed = match op {
+                    edit::Op::Let { .. } => now != was,
+                    _ => pending_value != deployed_value,
+                };
                 let mut v = serde_json::to_value(&op).unwrap_or_default();
                 v["value"] = json!(now);
                 v["deployed"] = json!(was);
-                v["pending"] = json!(pending_value != deployed_value);
+                v["pending"] = json!(changed);
                 v
             })
             .collect();
@@ -4214,6 +4277,72 @@ if [ -f pages/foo.loxl ]; then echo "<!-- foo -->" >> "$out"; fi
             bytes,
         };
         a.edits(Some(deployed), pending).await
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_constant_made_here_is_a_claim_until_deployed_and_a_module_binding_is_not_claimed_twice()
+     {
+        use axum::http::StatusCode;
+        let (tmp, a) = project_for_edits();
+        let d = tmp.path().join("project");
+        let req = |ops: Vec<edit::Op>| edit::Request {
+            base: blob(&d, "out.Loxone"),
+            ops,
+        };
+        // Made here: listed with the claims, not deployed, no deployed value.
+        let r = a
+            .edit(
+                &req(vec![edit::Op::Let {
+                    name: "vx_a".into(),
+                    value: Some("5".into()),
+                }]),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(r["previous"], json!([null]));
+        let e = edits_of(&a, &d).await;
+        let c: Vec<&Value> = e["claims"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|c| c["op"] == "let")
+            .collect();
+        assert_eq!(
+            c,
+            vec![
+                &json!({ "op": "let", "name": "vx_a", "value": "5", "deployed": null, "pending": true })
+            ],
+            "{e}"
+        );
+        // The module's own file binds the Divide block's divisor: a claim of
+        // vislox's on it is refused, naming the line; dropping one is not.
+        std::fs::write(
+            d.join("pages/main.loxl"),
+            format!("extern teiler = Div(uuid: \"{DIV}\")\nlet t = 4\nteiler.In2 = t\n"),
+        )
+        .unwrap();
+        let param = |v: Option<&str>| edit::Op::Param {
+            uuid: DIV.into(),
+            port: "Input2".into(),
+            value: v.map(Into::into),
+        };
+        let (code, msg) = a
+            .edit(&req(vec![param(Some("8"))]), None)
+            .await
+            .unwrap_err();
+        assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "{msg}");
+        assert!(msg.contains("bound in pages/main.loxl:3"), "{msg}");
+        // A module that does not read: a bare name may be its constant, so the
+        // edit says why rather than "not a number".
+        std::fs::write(d.join("pages/main.loxl"), "let = (\n").unwrap();
+        let (code, msg) = a
+            .edit(&req(vec![param(Some("schwelle"))]), None)
+            .await
+            .unwrap_err();
+        assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "{msg}");
+        assert!(msg.contains("the module does not read: main.loxl"), "{msg}");
     }
 
     #[cfg(unix)]

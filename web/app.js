@@ -3379,7 +3379,12 @@ function adoptedUncommitted() { return (S.edits?.blocks || []).filter((b) => b.a
 /** The blocks added here (#59) that are not deployed yet, or the one with UUID `uuid`. */
 function editsAdded(uuid) { return (S.edits?.blocks || []).filter((b) => b.uuid && !b.deployed && (!uuid || b.uuid === uuid)); }
 /** The values vislox edited and has not deployed yet, of one object or of all; not those of a new block, which is new as a whole. */
-function editsPending(uuid) { return (S.edits?.claims || []).filter((c) => c.pending && (!uuid || c.uuid === uuid) && !editsAdded(c.uuid).length); }
+function editsPending(uuid) { return (S.edits?.claims || []).filter((c) => c.pending && (c.op === "let" ? !uuid : (!uuid || c.uuid === uuid) && !editsAdded(c.uuid).length)); }
+/** vislox's constants (#81) whose value is not deployed, that a port of `o` takes. */
+function constsPending(o) {
+  const names = new Set(o.ports.map((q) => constUse(o.uuid, q.key)).filter((u) => u?.ours).map(constLet).filter(Boolean));
+  return (S.edits?.claims || []).filter((c) => c.op === "let" && c.pending && names.has(c.name));
+}
 /** Whether `o` can be edited now: `{ ok }`, or `{ why }` and maybe `{ newest }` to go to. */
 function editState(o) {
   const a = S.hist?.actions;
@@ -3514,6 +3519,13 @@ function editRows(o, row) {
     rows.push(row(editLabel(o, c), `<span class="ed-v">${v}</span><span class="ed-tag" title="Saved into the module and compiled, not on the Miniserver yet: Apply deploys it, Discard drops it">not deployed</span>` +
       (st.ok ? `<button type="button" class="ed-btn small" data-ed="revert" data-key="${esc(editKey(c))}" title="${c.deployed == null ? "Hand the value back to Loxone Config" : c.name === "Code" ? "Back to the program as deployed" : `Back to ${esc(c.deployed)}, as deployed`}">Revert</button>` : ""), "pr-chg"));
   }
+  // A constant of vislox's this block takes, changed and not deployed (#81): Revert puts back the deployed value;
+  // one made here is dropped by reverting the ports bound to it.
+  for (const c of constsPending(o)) {
+    const back = c.deployed != null && st.ok
+      ? `<button type="button" class="ed-btn small" data-ed="revert" data-key="${esc(editKey(c))}" title="Back to ${esc(c.deployed)}, as deployed, in every port bound to it">Revert</button>` : "";
+    rows.push(row(`Constant ${c.name}`, `<span class="ed-v">${esc(c.value)}</span><span class="ed-tag" title="${c.deployed == null ? "Made here, not deployed: revert the ports bound to it to drop it" : `Deployed as ${esc(c.deployed)}`}">not deployed</span>${back}`, "pr-chg"));
+  }
   if (!st.ok) {
     rows.push(`<div class="ed-note">${esc(st.why)}${st.newest ? ' <button type="button" class="lnk" data-ed="newest">View it</button>' : ""}</div>`);
   } else if (!mine?.open) {
@@ -3543,7 +3555,7 @@ function editRows(o, row) {
       `<button type="button" class="ed-btn small" data-ed="cancel"${mine.busy ? " disabled" : ""}>Cancel</button>` +
       `<span class="ed-msg${mine.err ? " err" : ""}" role="status" aria-live="polite">${esc(mine.err || mine.msg || "Saving compiles the module; nothing is deployed.")}</span></div>`);
   }
-  return { rows, count: editsPending(o.uuid).length + editsAdded(o.uuid).length + mv.count };
+  return { rows, count: editsPending(o.uuid).length + constsPending(o).length + editsAdded(o.uuid).length + mv.count };
 }
 function editOpen(uuid) {
   S.edit = { uuid, open: true, draft: {}, bad: {}, busy: false, msg: "", err: "" };
@@ -3561,7 +3573,7 @@ const EDIT_NUMBER = /^-?\d+(\.\d+)?$/;
 async function editSave() {
   const o = S.view?.objects[S.edit.uuid], st = o && editState(o);
   if (!st?.ok || S.edit.busy || !S.edit.open) return;
-  const ops = [], bad = {}, added = !!editsBlock(o.uuid), lets = new Set(constLets().map((l) => l.name)), changed = new Set();
+  const ops = [], bad = {}, added = !!editsBlock(o.uuid), lets = new Set(constLets().map((l) => l.name)), changed = new Map();
   for (const [field, , now, kind] of editFields(o)) {
     const v = S.edit.draft[field];
     if (v == null || v === now || constLocked(o, field)) continue;
@@ -3573,8 +3585,11 @@ async function editSave() {
     const u = k === "p" ? constUse(o.uuid, key) : null;
     if (u?.kind === "let" && u.ours && (S.edit.scope?.[field] || "constant") === "constant") {
       if (!EDIT_QUANTITY.test(t) && !AB_TIME.test(t) && !/^(on|off)$/.test(t)) { bad[field] = "A number, one with its unit (30min, 70%), a time of day (19:00), or on or off."; continue; }
-      if (!changed.has(u.name)) ops.push({ op: "let", name: u.name, value: t });
-      changed.add(u.name);
+      // Two fields of one constant: one value, or say which differ.
+      const was = changed.get(u.name);
+      if (was && was.value !== t) { bad[field] = `${u.name} is ${was.value} in ${was.label}: give both the same value, or change one for this block only.`; continue; }
+      if (!was) ops.push({ op: "let", name: u.name, value: t });
+      changed.set(u.name, { value: t, label: portName(o, key) });
       continue;
     }
     // On a block added here an empty setting is dropped: Loxone Config's value again.
@@ -3650,8 +3665,11 @@ async function constMake() {
 }
 /** Back to the deployed value: claim what the deployed revision claimed, or nothing. */
 async function editRevert(key) {
-  const c = (S.edits?.claims || []).find((x) => editKey(x) === key && x.pending), o = c && S.view?.objects[c.uuid], st = o && editState(o);
+  const c = (S.edits?.claims || []).find((x) => editKey(x) === key && x.pending);
+  // A constant (#81) is reverted from a block that takes it: the one selected.
+  const o = c && S.view?.objects[c.op === "let" ? S.sel : c.uuid], st = o && editState(o);
   if (!st?.ok) return;
+  if (c.op === "let") { await editSend(o.uuid, st.rev, [{ op: "let", name: c.name, value: c.deployed }], `Revert the constant ${c.name}`); return; }
   const op = EDIT_ATTR[c.op] ? { op: c.op, uuid: c.uuid } : c.op === "param" ? { op: "param", uuid: c.uuid, port: c.port } : { op: "setting", uuid: c.uuid, name: c.name };
   await editSend(c.uuid, st.rev, [{ ...op, value: c.deployed }], `Revert ${editLabel(o, c)} of ${displayTitle(o)}`);
 }

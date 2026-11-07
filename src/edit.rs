@@ -924,6 +924,13 @@ impl Claims {
                 }
             }
         }
+        // The constants made here (#81), by name.
+        for (n, val) in &self.8 {
+            v.push(Op::Let {
+                name: n.clone(),
+                value: Some(val.to_string()),
+            });
+        }
         v
     }
 }
@@ -989,6 +996,14 @@ fn text(s: &str, what: &str, empty_ok: bool) -> Result<String, String> {
 }
 
 // ── constants (#81) ─────────────────────────────────────────────────────
+
+/// Whether a typed value is a bare name (`vx_nachlauf`, `temp_schwelle`): it
+/// may name a constant (#81); a number never does.
+pub fn bare_name(v: &str) -> bool {
+    let v = v.trim();
+    v.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+        && v.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
 
 /// Whether `name` may be one of vislox's constants: `vx_` and a name of its
 /// own, not one vislox names an object of Loxone Config's by.
@@ -1455,29 +1470,20 @@ impl Files {
             ..Files::default()
         };
         let mut programs = BTreeMap::new();
+        // The claims first: a page file's bare name of one of its constants
+        // (#81) is a value.
+        if let Some(text) = texts.get(CLAIMS) {
+            f.claims = Claims::parse(text).map_err(|e| format!("{CLAIMS}: {e}"))?;
+        }
+        let consts: BTreeSet<String> = f.claims.8.keys().cloned().collect();
         for (name, text) in texts {
             if name.ends_with(PROGRAM_EXT) {
                 programs.insert(name.clone(), text.replace("\r\n", "\n"));
-            } else if name == CLAIMS {
-                f.claims = Claims::parse(text).map_err(|e| format!("{name}: {e}"))?;
-            } else {
+            } else if name != CLAIMS {
                 f.pages.insert(
                     name.clone(),
-                    PageFile::parse(text).map_err(|e| format!("{name}: {e}"))?,
+                    PageFile::parse_with(text, &consts).map_err(|e| format!("{name}: {e}"))?,
                 );
-            }
-        }
-        // A bare name on an adopted block reads as a wire from the object it
-        // names, but one of vislox's constants (#81) is a value.
-        for p in f.pages.values_mut() {
-            for b in &mut p.blocks {
-                let (consts, wires): (Vec<_>, Vec<_>) = std::mem::take(&mut b.wires)
-                    .into_iter()
-                    .partition(|(_, r)| r.port.is_empty() && f.claims.8.contains_key(&r.slug));
-                b.wires = wires;
-                for (port, r) in consts {
-                    b.args.push((port, Value::Ref(r.slug)));
-                }
             }
         }
         // A program (#79) is in a file of vislox's directory that its block
@@ -1712,9 +1718,13 @@ impl Files {
             .find_map(|p| p.blocks.iter_mut().find(|b| b.slug == slug))
     }
 
-    /// Whether a block, removal or rename of vislox's files is named `slug`.
+    /// Whether a block, removal, rename, set or constant (#81) of vislox's files is
+    /// named `slug`.
     pub fn names(&self, slug: &str) -> bool {
         self.claims.8.contains_key(slug)
+            || crate::set_claim::KINDS
+                .iter()
+                .any(|k| k.set_names(&self.claims).contains(&slug))
             || self.pages.values().any(|p| {
                 p.removed.contains(slug)
                     || p.moved.iter().any(|(f, t)| f == slug || t == slug)
@@ -2748,7 +2758,8 @@ fn restore_block(files: &mut Files, ctx: &Ctx, op: &Op) -> Result<Applied, Strin
             String::new()
         }
     );
-    let pf = PageFile::parse(&text).map_err(|e| format!("its declaration: {e}"))?;
+    let consts: BTreeSet<String> = files.claims.8.keys().cloned().collect();
+    let pf = PageFile::parse_with(&text, &consts).map_err(|e| format!("its declaration: {e}"))?;
     let [b] = pf.blocks.as_slice() else {
         return Err("its declaration is one block".into());
     };
@@ -4174,41 +4185,75 @@ fn edit_new_block(
     }
 }
 
-/// The names the module declares (blocks, externs, signals, instances,
-/// constants), so that a new slug is none of them, and of them the `let`
-/// constants (a bare name in an argument names one of those before an
-/// object). Empty when the module does not read; then the check after
-/// writing says why.
-pub fn module_decls(module: &Path) -> (BTreeSet<String>, BTreeSet<String>) {
-    let Some(m) = module
-        .to_str()
-        .and_then(|p| loxone_config::cli::read_module(p).ok())
-    else {
-        return Default::default();
-    };
-    let mut names = BTreeSet::new();
-    let mut lets = BTreeSet::new();
-    for i in &m.items {
-        match i {
-            Item::Block(b) | Item::Instance(b) => names.insert(b.slug.clone()),
-            Item::Extern(e) => names.insert(e.slug.clone()),
-            Item::Signal(s) => names.insert(s.slug.clone()),
-            // The sets share the namespace (#73 picks a set's name).
-            Item::Schedule(s) => names.insert(s.name.clone()),
-            Item::Tiles(s) => names.insert(s.name.clone()),
-            Item::Moods(s) => names.insert(s.name.clone()),
-            Item::Access(s) => names.insert(s.name.clone()),
-            // An alias (`let x = y.Q`) names a port: no value to bind.
-            Item::Let(l) => {
-                if !matches!(l.value, Value::Port(_)) {
-                    lets.insert(l.name.clone());
-                }
-                names.insert(l.name.clone())
-            }
-            _ => false,
-        };
+/// What the module's own files declare (vislox's directory, [`DIR`], left
+/// out: what vislox's files declare is read from [`Files`] as the request
+/// changes it, #81).
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Decls {
+    /// Every name (blocks, externs, signals, instances, sets, constants), so
+    /// that a new name is none of them.
+    pub names: BTreeSet<String>,
+    /// Of them, the `let` constants of a value, which a port may be bound to.
+    pub lets: BTreeSet<String>,
+    /// And the aliases (`let x = y.Q`), which name a port, not a value.
+    pub aliases: BTreeSet<String>,
+}
+
+impl Decls {
+    /// The bare names lox reads as themselves before an object: the
+    /// constants and the aliases (an adopted block keeps them, #72).
+    pub fn bare(&self) -> BTreeSet<String> {
+        self.lets.union(&self.aliases).cloned().collect()
     }
-    (names, lets)
+}
+
+/// [`Decls`] of the module's own `.loxl` files. A file that does not read is
+/// an error naming it (shown relative to the module).
+pub fn module_decls(module: &Path) -> Result<Decls, String> {
+    let mut paths = Vec::new();
+    if module.is_file() {
+        paths.push(module.to_path_buf());
+    } else {
+        let ours = module.join(DIR);
+        module_files(module, &mut |f, _| {
+            if f.extension().is_some_and(|x| x == "loxl") && !f.starts_with(&ours) {
+                paths.push(f.to_path_buf());
+            }
+        });
+    }
+    paths.sort();
+    let mut d = Decls::default();
+    for f in paths {
+        let shown = f
+            .strip_prefix(module)
+            .unwrap_or(&f)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let text = std::fs::read_to_string(&f).map_err(|e| format!("{shown}: {e}"))?;
+        let m = Module::parse_fragment(&text).map_err(|e| format!("{shown}: {e}"))?;
+        for i in &m.items {
+            match i {
+                Item::Block(b) | Item::Instance(b) => d.names.insert(b.slug.clone()),
+                Item::Extern(e) => d.names.insert(e.slug.clone()),
+                Item::Signal(s) => d.names.insert(s.slug.clone()),
+                // The sets share the namespace (#73 picks a set's name).
+                Item::Schedule(s) => d.names.insert(s.name.clone()),
+                Item::Tiles(s) => d.names.insert(s.name.clone()),
+                Item::Moods(s) => d.names.insert(s.name.clone()),
+                Item::Access(s) => d.names.insert(s.name.clone()),
+                Item::Let(l) => {
+                    if matches!(l.value, Value::Port(_)) {
+                        d.aliases.insert(l.name.clone());
+                    } else {
+                        d.lets.insert(l.name.clone());
+                    }
+                    d.names.insert(l.name.clone())
+                }
+                _ => false,
+            };
+        }
+    }
+    Ok(d)
 }
 
 /// Check the whole module, with vislox's files as written, the way `lox logic
@@ -9184,5 +9229,55 @@ mod tests {
         assert!(b.wires.is_empty(), "{b:?}");
         assert_eq!(b.get("Time"), Some(&Value::Ref("vx_zeit".into())));
         assert_eq!(constant_uses(&f, "vx_zeit"), 1);
+    }
+
+    #[test]
+    fn a_constant_dropped_and_made_again_in_one_request_is_vislox_s_to_name() {
+        let d = doc("house.Loxone");
+        let names = BTreeSet::new();
+        let lock = Lock::default();
+        let ctx = ctx_of(&d, &d, &lock, None, &names);
+        let mut files = Files::default();
+        apply_op(&mut files, &ctx, &let_op("vx_a", Some("1"))).unwrap();
+        // The module's names leave vislox's own files out: what vislox's files
+        // name is the request's, as it goes.
+        let mut again = files.clone();
+        for op in [let_op("vx_a", None), let_op("vx_a", Some("2"))] {
+            apply_op(&mut again, &ctx, &op).unwrap();
+        }
+        assert_eq!(again.claims.8["vx_a"], Value::Number("2".into()));
+        // Dropped earlier in the request, it names nothing.
+        let mut gone = files.clone();
+        apply_op(&mut gone, &ctx, &let_op("vx_a", None)).unwrap();
+        let e = apply_op(&mut gone, &ctx, &param(DIV, "Input2", Some("vx_a"))).unwrap_err();
+        assert!(e.contains("not a number"), "{e}");
+        // vislox's own names count its constants.
+        assert!(files.names("vx_a"));
+    }
+
+    #[test]
+    fn the_module_s_names_leave_vislox_s_files_out_and_say_what_does_not_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let module = tmp.path().join("pages");
+        std::fs::create_dir_all(module.join(DIR)).unwrap();
+        std::fs::write(
+            module.join("main.loxl"),
+            "let t = 4\nlet aussen = licht.Q\nlicht = Monoflop(\"Licht\")\n",
+        )
+        .unwrap();
+        std::fs::write(module.join(DIR).join("edits.loxl"), "let vx_a = 1\n").unwrap();
+        let d = module_decls(&module).unwrap();
+        assert_eq!(
+            d.names,
+            ["aussen", "licht", "t"]
+                .map(String::from)
+                .into_iter()
+                .collect()
+        );
+        assert_eq!(d.lets, ["t".to_string()].into());
+        assert_eq!(d.aliases, ["aussen".to_string()].into());
+        std::fs::write(module.join("kaputt.loxl"), "let = (\n").unwrap();
+        let e = module_decls(&module).unwrap_err();
+        assert!(e.starts_with("kaputt.loxl: "), "{e}");
     }
 }
