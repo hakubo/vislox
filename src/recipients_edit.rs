@@ -43,8 +43,7 @@ use loxone_config::xml::Element;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
-/// The block type that takes a `recipients` claim.
-pub const NOTIFICATION: &str = loxone_config::connectors::MESSAGE_REF_TARGET;
+use crate::blocks::NOTIFICATION;
 
 /// The most recipients one set takes (only bounds a request).
 const MAX_RECIPIENTS: usize = 500;
@@ -103,13 +102,13 @@ impl Directory {
         })
     }
 
-    /// An op's recipients as lines: each user or group once, each title
-    /// naming exactly its object.
+    /// An op's recipients as lines, each title naming exactly its object.
+    /// That each is in the set once is [`set_claim::SetKind::check`]'s, which
+    /// every set written goes through.
     pub fn recipient_lines(&self, list: &[Recipient]) -> Result<Vec<AccessGrant>, String> {
         if list.len() > MAX_RECIPIENTS {
             return Err(format!("at most {MAX_RECIPIENTS} recipients"));
         }
-        let mut seen = BTreeSet::new();
         let mut out = Vec::new();
         for r in list {
             let kind = match r.kind.as_str() {
@@ -118,12 +117,6 @@ impl Directory {
                 k => return Err(format!("`{k}`: a recipient is a user or a group")),
             };
             let principal = Self::title_of(kind.as_str(), &r.uuid, &self.principals(kind))?;
-            if !seen.insert(r.uuid.to_ascii_lowercase()) {
-                return Err(format!(
-                    "{} \"{principal}\" is listed twice; each user or group is in a set once",
-                    kind.as_str()
-                ));
-            }
             out.push(AccessGrant {
                 kind,
                 principal: principal.to_string(),
@@ -217,24 +210,26 @@ impl set_claim::SetKind for RecipientsKind {
     }
     fn lines_of(
         list: &Vec<Recipient>,
-        ctx: &Ctx,
+        _: &Ctx,
+        dir: &Directory,
         _: &[(String, &Element)],
     ) -> Result<Vec<AccessGrant>, String> {
-        Directory::read(ctx.doc).recipient_lines(list)
+        dir.recipient_lines(list)
     }
     /// Every title names exactly one user or group in the pending config,
-    /// none has a schedule, and each is in the set once.
+    /// none has a schedule, and each user or group (by UUID) is in the set
+    /// once: the one rule for duplicates.
     fn check(
         lines: &[AccessGrant],
-        ctx: &Ctx,
+        _: &Ctx,
+        m: &Directory,
         set: &str,
         _: &[(String, &Element)],
     ) -> Result<(), String> {
-        let m = Directory::read(ctx.doc);
         let mut seen = BTreeSet::new();
         for l in lines {
-            m.recipient_of(l).map_err(|e| format!("`{set}`: {e}"))?;
-            if !seen.insert((l.kind, l.principal.clone())) {
+            let r = m.recipient_of(l).map_err(|e| format!("`{set}`: {e}"))?;
+            if !seen.insert(r.uuid) {
                 return Err(format!(
                     "`{set}`: {} \"{}\" is listed twice; each user or group is in a set once",
                     l.kind.as_str(),
@@ -353,10 +348,7 @@ mod tests {
         );
         let back: Vec<Recipient> = lines.iter().map(|l| m.recipient_of(l).unwrap()).collect();
         assert_eq!(back, [r("user", ALICE), r("group", FAMILIE)]);
-        let e = m
-            .recipient_lines(&[r("user", ALICE), r("user", ALICE)])
-            .unwrap_err();
-        assert!(e.contains("listed twice"), "{e}");
+        // Twice in a set is the check's, by UUID (`edit.rs` tests it through the op).
         let e = m.recipient_lines(&[r("user", TWIN1)]).unwrap_err();
         assert!(e.contains("2 users are titled \"chris\""), "{e}");
         let e = m.recipient_lines(&[r("user", FAMILIE)]).unwrap_err();

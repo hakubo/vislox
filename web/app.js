@@ -3280,11 +3280,13 @@ function editFields(o) {
       for (const st of nb.settings || []) f.push([`s:${st.name}`, st.name === "MinimumTime" ? "Minimum time" : st.name, st.value ?? "", st.kind]);
       return f;
     }
+    // A block added here may have nothing `caps()` offers (`o.edit` null): its declaration still takes these.
     f.push(["title", "Name", o.title || "", "text"]);
-    for (const p of o.edit.params) f.push([`p:${p.key}`, portName(o, p.key), o.ports.find((q) => q.key === p.key)?.def ?? "0", "number", p.unit]);
+    for (const p of o.edit?.params || []) f.push([`p:${p.key}`, portName(o, p.key), o.ports.find((q) => q.key === p.key)?.def ?? "0", "number", p.unit]);
     for (const st of nb.settings || []) f.push([`s:${st.name}`, st.name, st.value ?? "", st.kind, null, st.choices]);
     return f;
   }
+  if (!o.edit) return f;
   if (o.edit.title) f.push(["title", "Name", o.title || "", "text"]);
   if (o.edit.room) f.push(["room", "Room", o.room || "", "Place"]);
   if (o.edit.category) f.push(["category", "Category", o.category || "", "Category"]);

@@ -169,20 +169,21 @@ impl set_claim::SetKind for AccessKind {
     }
     fn lines_of(
         grants: &Vec<Grant>,
-        ctx: &Ctx,
+        _: &Ctx,
+        dir: &Directory,
         _: &[(String, &Element)],
     ) -> Result<Vec<AccessGrant>, String> {
-        Directory::read(ctx.doc).lines_of(grants)
+        dir.lines_of(grants)
     }
     /// Every title names exactly one object of its kind in the pending
     /// config, and each principal is in the set once.
     fn check(
         lines: &[AccessGrant],
-        ctx: &Ctx,
+        _: &Ctx,
+        m: &Directory,
         set: &str,
         _: &[(String, &Element)],
     ) -> Result<(), String> {
-        let m = Directory::read(ctx.doc);
         let mut seen = BTreeSet::new();
         for l in lines {
             m.grant_of(l).map_err(|e| format!("`{set}`: {e}"))?;

@@ -208,21 +208,19 @@ pub fn read(doc: &LoxoneDoc) -> BTreeMap<String, Rights> {
                     .iter()
                     .any(|g| g.kind.as_deref() == Some(FULL_ACCESS))
         };
-        let mut users: Vec<Named> = m
-            .users
-            .iter()
-            .zip(&groups_of)
-            .filter(|(u, groups)| direct(u, groups) || full(groups))
-            .map(|(u, _)| named(u))
-            .collect();
+        // One pass: who gets it in effect, and of them who only through Full access.
+        let (mut users, mut inherited) = (Vec::new(), Vec::new());
+        for (u, groups) in m.users.iter().zip(&groups_of) {
+            match (direct(u, groups), full(groups)) {
+                (true, _) => users.push(named(u)),
+                (false, true) => {
+                    users.push(named(u));
+                    inherited.push(named(u));
+                }
+                (false, false) => {}
+            }
+        }
         users.sort();
-        let mut inherited: Vec<Named> = m
-            .users
-            .iter()
-            .zip(&groups_of)
-            .filter(|(u, groups)| !direct(u, groups) && full(groups))
-            .map(|(u, _)| named(u))
-            .collect();
         inherited.sort();
         r.inherited = inherited;
         if r.kind == ACCESS {

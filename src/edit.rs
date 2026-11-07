@@ -1647,14 +1647,16 @@ fn setting_value(ty: &str, name: &str, kind: blocks::Kind, v: &str) -> Result<Va
 }
 
 /// A duration as Lox Logic writes one: `12h`, `30min`, `5s`, `500ms`, or
-/// seconds as a plain number. Read with lox's own parser, so it is spelled
-/// the way lox keeps it.
+/// seconds as a plain number (lox reads `MinimumTime: 90` as 90 s, its
+/// `output_ref_lm_defaults_follow_loxone_config`). Read with lox's own
+/// parser, so it is spelled the way lox keeps it. Never negative.
 fn duration(v: &str) -> Option<Value> {
     let at = v
         .find(|c: char| !c.is_ascii_digit() && c != '.')
         .unwrap_or(v.len());
     let (n, u) = v.split_at(at);
-    if n.starts_with('-') || number(n).is_err() || !["", "ms", "s", "min", "h"].contains(&u) {
+    // `at` stops at a sign, so `-5s` leaves `n` empty and is refused here.
+    if number(n).is_err() || !["", "ms", "s", "min", "h"].contains(&u) {
         return None;
     }
     if u.is_empty() {
@@ -1713,7 +1715,8 @@ fn add_block(files: &mut Files, ctx: &Ctx, op: &Op) -> Result<Applied, String> {
     let mirrors = if message_ref {
         if title.is_some() {
             return Err(
-                "a push notification's block takes the notification's name; rename the                  notification in Loxone Config"
+                "a push notification's block takes the notification's name; rename the \
+                 notification in Loxone Config"
                     .into(),
             );
         }
@@ -1730,10 +1733,30 @@ fn add_block(files: &mut Files, ctx: &Ctx, op: &Op) -> Result<Applied, String> {
             .filter(|e| e.attr("Type") == Some(blocks::NOTIFICATION))
             .ok_or_else(|| {
                 format!(
-                    "no push notification {u} in the pending config; make it in Loxone Config                      (Messages) first"
+                    "no push notification {u} in the pending config; make it in Loxone Config \
+                     (Messages) first"
                 )
             })?;
-        Some(el.attr("U").unwrap_or(u.trim()).to_string())
+        let u = el.attr("U").unwrap_or(u.trim());
+        // vislox's extern of it, keyed as the other claims key it (case aside:
+        // two keys of one UUID would be two `extern vx_…` lines).
+        let key = files
+            .claims
+            .0
+            .keys()
+            .find(|k| k.eq_ignore_ascii_case(u))
+            .cloned()
+            .unwrap_or_else(|| u.to_ascii_lowercase());
+        if let Some(c) = files.claims.0.get(&key)
+            && !c.ty.is_empty()
+            && c.ty != blocks::NOTIFICATION
+        {
+            return Err(format!(
+                "vislox's file names {u} as a {}, not a push notification",
+                c.ty
+            ));
+        }
+        Some(key)
     } else {
         None
     };
@@ -1753,10 +1776,6 @@ fn add_block(files: &mut Files, ctx: &Ctx, op: &Op) -> Result<Applied, String> {
     let mut args = Vec::new();
     if let Some(u) = &mirrors {
         args.push((blocks::MIRRORS.to_string(), Value::Ref(slug(u))));
-        // vislox's extern of the notification, kept while the block names it.
-        let c = files.claims.0.entry(u.clone()).or_default();
-        c.ty = blocks::NOTIFICATION.into();
-        c.pinned = true;
     }
     for spec in blocks::valued_ports(ty) {
         if let Some(v) = params.get(spec.key) {
@@ -1779,6 +1798,15 @@ fn add_block(files: &mut Files, ctx: &Ctx, op: &Op) -> Result<Applied, String> {
             || files.names(s)
     };
     let slug = blocks::new_slug(ty, &taken);
+    // Everything is checked: from here on `files` changes.
+    if let Some(u) = &mirrors {
+        // vislox's extern of the notification, kept while the block names it.
+        let c = files.claims.0.entry(u.clone()).or_default();
+        if c.ty.is_empty() {
+            c.ty = blocks::NOTIFICATION.into();
+        }
+        c.pinned = true;
+    }
     // The page's file: by its UUID (it may have been renamed), else a new one.
     let file = match files
         .pages
@@ -6608,6 +6636,51 @@ mod tests {
         assert_eq!(settings["Off"], "Trocken");
         // The extern of the notification went with it.
         assert!(files.claims.0.is_empty(), "{:?}", files.claims.0);
+        // A refused add changes nothing: no orphan extern of the notification.
+        let mut f = Files::default();
+        let before = f.clone();
+        assert!(
+            apply_op(
+                &mut f,
+                &ctx,
+                &add(&[("mirrors", REGEN), ("MinimumTime", "bald")], None)
+            )
+            .unwrap_err()
+            .contains("a duration")
+        );
+        assert_eq!(f, before);
+        for bad in ["-5", "-5s", "5 s", "5d", ""] {
+            assert!(duration(bad).is_none(), "{bad}");
+        }
+        assert_eq!(duration("90"), Some(Value::Number("90".into())));
+        // An extern of the notification already there, in another case: one key.
+        let mut f = Files::default();
+        f.claims.0.insert(
+            REGEN.to_ascii_uppercase(),
+            Claim {
+                ty: "Notification".into(),
+                ..Default::default()
+            },
+        );
+        apply_op(&mut f, &ctx, &add(&[("mirrors", REGEN)], None)).unwrap();
+        assert_eq!(f.claims.0.len(), 1);
+        assert_eq!(f.render()["edits.loxl"].matches("extern ").count(), 1);
+        // One of another type is refused, not overwritten.
+        let mut f = Files::default();
+        f.claims.0.insert(
+            REGEN.into(),
+            Claim {
+                ty: "DayTimer".into(),
+                ..Default::default()
+            },
+        );
+        let was = f.clone();
+        assert!(
+            apply_op(&mut f, &ctx, &add(&[("mirrors", REGEN)], None))
+                .unwrap_err()
+                .contains("not a push notification")
+        );
+        assert_eq!(f, was);
         // Refused: no notification, a name, another object, a constant.
         let err = |op: Op| apply_op(&mut Files::default(), &ctx, &op).unwrap_err();
         assert!(err(add(&[], None)).contains("which push notification"));

@@ -541,9 +541,6 @@ fn moods_info(el: &Element) -> Option<MoodsInfo> {
     })
 }
 
-/// The moods of a controller that changed, as the change list reads them:
-/// *Licht · mood "Lesen": all on → AQ1 80%*, a mood added or removed, and a
-/// new order of the moods both revisions have.
 /// What a push notification drawn on a page says, and when (#77): the
 /// `<LoggerMailer>` child of an `OutputRefLM` (lox's `loxone-format.md`,
 /// *Push notifications*). The texts can hold names, phone numbers or mail
@@ -631,6 +628,9 @@ fn message_changes(title: &str, old: &MessageInfo, new: &MessageInfo) -> Vec<Str
     out
 }
 
+/// The moods of a controller that changed, as the change list reads them:
+/// *Licht · mood "Lesen": all on → AQ1 80%*, a mood added or removed, and a
+/// new order of the moods both revisions have.
 fn moods_changes(title: &str, old: &MoodsInfo, new: &MoodsInfo) -> Vec<String> {
     let mut out = Vec::new();
     let find =

@@ -1978,6 +1978,8 @@ try {
     assert.match(pf, /^vx_outputreflm_1 = OutputRefLM\(mirrors: vx_40000022_0000_0000_ffff504f94000001, On: "Es regnet", MinimumTime: 30min\)$/m);
     assert.match(file(), /^extern vx_40000022_0000_0000_ffff504f94000001 = Notification\(uuid: "40000022-0000-0000-ffff504f94000001"\)$/m);
     const added = await page.evaluate(() => S.sel);
+    // A block added here with nothing caps() offers (no `o.edit`) still gets its form, never a TypeError.
+    assert.deepEqual(await page.evaluate((u) => editFields({ ...S.view.objects[u], ty: "And", edit: null }).map((f) => f[0]), added), ["title", "s:On", "s:Off", "s:MinimumTime"]);
     await waitText(msg, /Notification\s*Regen[\s\S]*On\s*Es regnet[\s\S]*Minimum time\s*30min/);
     // Its message is edited in its declaration: no name field, the texts and the minimum time.
     await page.click('#props [data-body="Edit"] [data-ed="open"]');
