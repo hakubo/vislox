@@ -936,3 +936,26 @@ rect.ghost, line.ghost { fill: #1f6fd10a; stroke: var(--moved); stroke-opacity: 
 .changes .chg-grp { padding: 6px 10px 3px; font-size: 12px; font-weight: 600; border-bottom: 1px solid var(--line-2); background: #f7f9f6; display: flex; flex-wrap: wrap; gap: 0 6px; align-items: baseline; }
 .changes .chg-grp .p { color: var(--muted); font-weight: 400; }
 .changes .chg.in-grp { padding-left: 22px; }
+
+/* Expressions and named signals (#82): a chain lox made for one expression, as one group. */
+.expr-hidden { display: none; }
+.expr-frame { fill: rgba(31, 111, 209, .04); stroke: var(--sel); stroke-width: 14px; stroke-dasharray: 60 40; }
+.expr-grp.pending .expr-frame, .expr-fold.pending .expr-body { stroke: var(--pending); }
+.expr-t { fill: var(--sel); font-size: 110px; font-weight: 600; font-family: ui-monospace, "DejaVu Sans Mono", monospace; cursor: pointer; }
+.expr-fold { cursor: pointer; }
+.expr-body { fill: #f4f8fd; stroke: var(--sel); stroke-width: 16px; }
+.expr-fold.sel .expr-body { stroke-width: 40px; }
+.expr-h { fill: var(--muted); font-size: 110px; font-weight: 700; }
+.expr-x { fill: #161a16; font-size: 118px; font-family: ui-monospace, "DejaVu Sans Mono", monospace; }
+.lod-far .expr-x, .lod-far .expr-t { display: none; }
+.ex-form { padding: 4px 12px 8px; }
+.ex-form .ed-l { display: block; font-size: 12px; color: var(--muted); margin: 4px 0; }
+.ex-form .ed-in { display: block; width: 100%; box-sizing: border-box; padding: 3px 6px; border: 1px solid var(--line); border-radius: var(--radius); font: inherit; color: var(--text); }
+.ex-form .ed-in.mono { font-family: ui-monospace, "DejaVu Sans Mono", monospace; }
+.ex-form .ed-bar { padding: 4px 0; }
+.ex-text { overflow-wrap: anywhere; }
+.ex-new { padding: 2px 12px 6px; font-size: 12px; }
+.ex-new summary { cursor: pointer; color: var(--sel); }
+.ex-new .ex-form { padding: 4px 0 0; }
+.chg-expr .old { text-decoration: line-through; color: var(--removed); }
+.chg-expr .new { color: var(--added); }

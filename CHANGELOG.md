@@ -172,6 +172,14 @@ published under the same version (see [docker/README.md](docker/README.md)).
   the port to it; another block takes it by its name. Changing it asks: the constant (every port bound to it) or
   only this block. The module's own `let` and `defaults` lines are shown, not changed: vislox writes only its own
   files. Never deploys.
+- Expressions and named signals (#82): the `And`, `Or`, `Not`, comparator and `Formula` blocks lox made for one
+  expression are drawn as one block showing the expression (click to open the group, its title folds it again),
+  Properties of any of them shows the expression, what it feeds or the signal's name, and its file and line, and the
+  Changes list puts an expression's changes under its old → new text. An expression of vislox's own files is edited
+  there: *Feed an input from an expression* (`vx_….Port <- …` in `edits.loxl`, `Port: …` on a block of vislox's),
+  its text, *Name this expression* (a named signal of the page, `vx_warm = …`, feeding the input), a signal's label
+  (`.title`), Revert and Undo. lox's rules hold: a signal keeps its top block's type (`and` → `or` is refused), and a
+  deployed signal is not deleted yet. The module's own expressions are shown, not changed. Never deploys.
 
 ## 0.2.0
 

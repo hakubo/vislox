@@ -49,9 +49,11 @@ Then open <http://127.0.0.1:7878>. Started without a path or `--ctx` in a direct
   gets a push notification (a `recipients` set) and what a Touch Pure Flex's tiles do (a `tiles` set), a managed
   block's label and settings (a PulseAt's time, a Formula, a program block's program, constants with units), rename
   and delete a managed block (`moved`, keeping its UUIDs; `removed`), make `let` constants and bind ports to them,
+  feed an input from an expression and name it as a signal (`x.Port <- a.Q and b.AQ >= 28`, `vx_warm = …`),
   then Apply, Sync and Discard from the browser.
 - For a `lox.toml` project: the blocks its Lox Logic module manages marked, each with the `.loxl` file and line that
-  makes it, and each parameter a `let` constant or a `defaults` statement gives named after it.
+  makes it, each parameter a `let` constant or a `defaults` statement gives named after it, and the blocks lox made
+  for an expression drawn as one block showing the expression.
 - For a `lox.toml` project: `lox logic check` errors listed by file, line and block when the module doesn't compile
   (Apply is off until it does), and *Compile* when the pending config is from before the module's latest change.
 - For a `lox.toml` project: `lox logic lint` findings (unused names, blocks whose outputs feed nothing, users whose

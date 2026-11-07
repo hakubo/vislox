@@ -90,7 +90,10 @@ sends to the Miniserver see [miniserver.md](miniserver.md).
   since Loxone Config owns it. Its Properties have a *Lox Logic* section: the slug, the `.loxl` file and line
   that make it (`pages/beschattung.loxl:12`) and *Copy path*, for pasting into an editor or an agent's prompt. A
   block lox made for an expression (`temp_hoch and sonne` becomes an `And`) points at the line of the expression;
-  one a template instance made, at the instance. The legend's *Show managed blocks only* fades the rest, and
+  one a template instance made, at the instance. The blocks of one expression are drawn as one block showing the
+  expression (`markise.In2 ← licht.Q and teiler.AQ >= 28`); a click opens the group (a dashed frame titled with the
+  expression, whose title folds it again), and Properties of any of its blocks has an *Expression* section: the
+  expression, what it feeds (or the named signal and its label), and its file and line (#82). The legend's *Show managed blocks only* fades the rest, and
   Ctrl+K finds a block by its slug as well as its name. The lines follow the module's files as they are on disk,
   compiled or not, and are shown on the newest config only (the lockfile is today's). See [editing.md](editing.md#blocks-the-module-manages-64).
 - **Navigation**: Ctrl+K finds any page or block (a managed one by its slug too). There is a minimap, a "Changed pages only" filter, and links
@@ -349,6 +352,14 @@ sends to the Miniserver see [miniserver.md](miniserver.md).
   bound to it); another block takes it by its name, typed into its field. Changing a value one of vislox's constants
   gives asks: *Change the constant (N uses)* or *Only this block*. The module's own `let` and `defaults` lines are
   changed in its files; vislox binds only the block. How: [editing.md](editing.md#constants-and-defaults-81).
+
+- **Expressions and named signals** (the same project and token, #82): an expression of vislox's own files is
+  edited in Properties' *Expression* section: its text, and *Name this expression*, which makes it a named signal of
+  the page (`vx_warm = …`) and feeds the input from it; a signal's label too. *Feed an input from an expression*
+  gives an unwired input of a block vislox edits an expression of its own. lox makes the blocks and the compile says
+  what it refuses. The Changes list reads an edited expression as its old → new text, not as blocks added and
+  removed. The module's own expressions are changed in its files. How:
+  [editing.md](editing.md#expressions-and-named-signals-82).
 
 - **Delete and rename managed blocks** (the same project and token, #80): Properties of a block added or adopted
   here shows its slug with *Rename* and, once deployed or adopted, *Delete*. *Rename* rewrites the slug in vislox's

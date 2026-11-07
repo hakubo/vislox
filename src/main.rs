@@ -13,6 +13,8 @@ mod configdate;
 mod constants;
 mod discover;
 mod edit;
+mod expr_edit;
+mod expressions;
 mod hardware;
 mod history;
 mod live;

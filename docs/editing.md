@@ -5,8 +5,9 @@ make and change connections (#61), undo and redo (#62), adopt the blocks Loxone 
 Daytimer's switching times (#73), a lighting controller's moods (#74), a central block's members (#75), who may
 open an NFC Code Touch (#76), push notifications: who gets them and what they say (#77), the tiles of a Touch
 Pure Flex (#78), a managed block's label and settings, its program among them (#79), deleting and renaming a
-managed block (#80), and `let` constants and `defaults` (#81). This page is the design they share. #58 to #62, #72
-to #81 are built (#81 in part: see *Constants and defaults*); the rest says where each step plugs in.
+managed block (#80), `let` constants and `defaults` (#81), and expressions and named signals (#82). This page is the
+design they share. #58 to #62, #72 to #82 are built (#81 and #82 in part: see their sections); the rest says where
+each step plugs in.
 
 ## The rules
 
@@ -64,7 +65,10 @@ POST /api/edit
            { "op": "add_block", "page": "<page uuid>", "type": "OutputRefLM",
              "settings": { "mirrors": "<notification uuid>", "On": "Frost", "MinimumTime": "12h" } },
            { "op": "let", "name": "vx_nachlauf", "value": "30min" },
-           { "op": "param", "uuid": "…", "port": "Time", "value": "vx_nachlauf" } ] }
+           { "op": "param", "uuid": "…", "port": "Time", "value": "vx_nachlauf" },
+           { "op": "expr", "uuid": "…", "port": "I2", "value": "vx_….Q and vx_….AQ >= 28" },
+           { "op": "signal", "slug": "vx_warm", "page": "<page uuid>", "value": "vx_….AQ >= 28",
+             "title": "Warm" } ] }
 ```
 
 `adopt`, `adopt_page` and `unadopt` go in a request of their own (#72), and so does `rename` (#80). `restore_block`
@@ -89,7 +93,9 @@ is what undoes a `remove_block` of a deployed block (#80); vislox makes it, see 
   (`restore`), so the undo gives them back too. `moods` is the same for a controller's moods (#74). For
   `members` it is the list vislox claimed before, or null (#75). `access` is as `moods`, for a Code Touch's
   rights (#76), `recipients` for a notification's recipients (#77), and `tiles` for a Touch Pure Flex's tiles (#78).
-  `let` is a value op (#81): its `previous` is the constant's value before, or null when the op made it.
+  `let` is a value op (#81): its `previous` is the constant's value before, or null when the op made it. `expr`
+  is a value op too (#82): what vislox's files fed the input before, or null; `signal`'s `previous` is the `signal`
+  op that puts back what was (null `value`: the op made the signal).
   A reconnected wire is one request, `unwire` then `wire`:
   undone, the reverse list. The ops of one request see each other: `unwire` then `wire` of the same wire is
   accepted (and changes nothing). `remove_block`'s `add_block` carries the wires the removal took out
@@ -401,6 +407,66 @@ vx_60000002_0000_0000_ffff504f94000001.Time = vx_nachlauf
   (`… is bound in pages/x.loxl:3, the module's own file`): a claim of vislox's on the same port would claim it
   twice. Dropping vislox's claim is let through. The `let` op on a constant of the module's own files is refused, naming why. vislox never writes
   a `defaults` statement: it changes every managed block of the type, the module's own among them.
+
+## Expressions and named signals (#82)
+
+Lox Logic writes logic as expressions: `jal.AutoShade <- sonne.Q and temp.AQ >= 28` on an extern, `In1: …` in a
+managed block's declaration, or a named signal `beschatten = sonne.Q and temp.AQ >= 28`. lox desugars each into
+`And`, `Or`, `Not`, comparator and `Formula` blocks labelled with their sub-expressions (`<=` as `≤`, `<` as `＜`,
+`%` as `％`), expression-owned in the lockfile and named `<sink>_<port key>__<op><n>`, or `<signal>__<op><n>` with
+the signal's top block `<signal>` itself (hand-owned). lox re-derives them on every compile, so they are never
+edited as blocks: the expression is.
+
+- **Read.** `GET /api/edits` sends `expressions`, read with lox's parser at the top level of each file (a template's
+  body is #83's): `id` (the blocks' prefix; a second expression on one prefix is `<prefix>#2`), `kind` (`wire`, `argument` or `signal`), `sink` (`jal.AutoShade`, or the
+  signal's slug), `to` (`[object UUID, connector key]` of the input it feeds), `text` (as lox prints it), a signal's
+  `title`, `file`, `line`, `ours` (in vislox's files), `top` and `top_type` (its top block: the signal's, or the last
+  one lox's post-order count names), `blocks` (the blocks lox names for this expression, by the same count shared
+  by the expressions of one prefix, so each block is exactly one expression's; the top one first), `deployed` (the block that feeds the sink in the deployed config, or the signal's by UUID, when lox makes
+  that type: its `label`, read back as `text`, and the chain's `blocks` then: those wired into it that are this
+  expression's now or gone from the pending config), `now` (the pending config's top label read back the same way)
+  and `pending` (the chain as compiled differs: each block's type, label and attributes and what feeds each
+  connector, so a labelled signal whose expression changed is pending too). A signal of vislox's carries `revert`,
+  the ops that put the deployed revision's files back: each input it feeds that they did not feed from it gets back
+  what they fed it (`expr`), then the `signal` op; and `committed`. Like `sources`, they are the module as it is now: newest config only.
+- **The canvas** draws an expression's blocks as one block over the area they take, showing what it feeds and the
+  expression; its blocks and the wires between them are hidden, and other blocks in that area stay on top of it,
+  taking their own clicks. A click opens it (and selects its top block): the
+  blocks show inside a dashed frame titled with the expression, whose title folds it again. Selecting a block of a
+  folded expression (the tree, Ctrl+K, the Changes list) opens it.
+- **Properties** of any block of an expression, and of the block it feeds, has an *Expression* section: the
+  expression, what it feeds (or the signal's output and label), how many blocks lox made, the file and line, and
+  *Not deployed* with what the deployed config has. One of the module's own files is read-only: *change it there*.
+- **The Changes list** puts every change to an expression's blocks, now or deployed, under one heading: `expression
+  on jal.AutoShade: <deployed> → <now>` when the deployed revision is compared and the two top labels, read back
+  alike, differ (`(new)` for an expression it does not have, `(changed)` when only the blocks below a label did),
+  with its `file:line`. Unchanged expressions show no old text. Next and previous go in that order.
+- **`expr`** (a value op) sets what vislox's files feed into one input: an expression, written `vx_<uuid>.Port <- …`
+  in `edits.loxl` for a block Loxone Config drew and `Port: …` in the declaration of a block of vislox's files, or a
+  port of vislox's (`vx_warm.Q`; a bare signal name takes its output), written as a wire and checked as the `wire`
+  op checks one (an output into an input, of matching kinds); a signal the request just made is not compiled yet,
+  so its output is taken by its expression. `null` drops it, always
+  (also when the block is gone or the module manages it now). Refused: an output, an input Loxone Config inverted or
+  wired (take that wire out first), one with a constant edited here, a text input, a block the module manages (its
+  file), and an operand vislox's files do not name: a block of theirs is named by its slug, one Loxone Config drew by
+  `vx_` and its UUID (an extern of `edits.loxl`, added with the expression and dropped with the last name of it), a
+  constant by its name; the module's own slugs are not named. lox checks the rest (two-input gates, comparisons do
+  not chain, at most four ports in a `Formula`, no units or strings in arithmetic) when the module is checked before
+  the compile and when it compiles: what it refuses changes nothing, and its words come back.
+- **`signal`** makes, changes or drops a named signal of vislox's file of `page`: `vx_warm = <expression>`, with its
+  label as `vx_warm.title = "…"` (none: the expression). The name is `vx_` and lowercase letters, digits and `_`,
+  without `__`, not `vx_<uuid>`, and not taken. Changing the top operator (`and` → `or`) is refused: lox keeps a
+  pinned block's type; make a new signal and drop this one. Dropping is refused while vislox's files read it (a wire
+  or an expression) and once it is deployed (deleting a deployed signal is a later step); a compiled one leaves
+  `removed <slug>` for lox, under the comment `# Signals dropped here`, which goes when it is made again or lox
+  forgets it. Only such a line is taken back: any other `removed` line (a deleted block) keeps its name taken.
+- **Name this expression** sends `signal` (the expression, on the page shown) and `expr` (the input fed from the
+  signal) in one request; undone, the expression is back on the input and the signal dropped.
+- **Feed an input from an expression** (Properties of a block vislox edits, folded) picks an unwired input and
+  types the expression: `expr`. lox mints the blocks and places them on the sink's page.
+- **Deleting** a block of vislox's files that an expression of theirs reads is refused (#80's `delete_refusal`).
+- Not offered: editing an expression of the module's own files (vislox writes only its own, as for `let`, #81),
+  deleting a deployed signal, and an expression on a new block's input in *Add block* (add it, then feed the input).
 
 ## Moving blocks (#60)
 
@@ -1328,7 +1394,8 @@ The blocks vislox added or adopted (#72) are the exception: their `.loxl` is vis
     the room controller, the irrigation, and the central light and shade blocks (the members of one the config
     has are edited here, #75);
   - every type outside lox's table (lox refuses it: "Refuse, never guess"), and templates (#83).
-- On a new block: a wire when it is added (draw it once it is on the page, #61) or an expression on an input (#82),
+- On a new block: a wire when it is added (draw it once it is on the page, #61) or an expression on an input (feed
+  it once the block is on the page, #82),
   a position when it is added (lox places it; it can be moved after), and a room or category (lox has no claim for
   them on a managed block). Its settings (`Formula:`, `Type:`, `At:`, a program, …) are given when it is added and
   changed later in Properties (#79).
@@ -1360,7 +1427,7 @@ Each of these plugs in as new op kinds on `POST /api/edit`, written into `<modul
 | #79 (built) | a managed block's label and settings (`Desc:`, `Type:`, `Formula:`, `Code: file(…)`, …), constants with units |
 | #80 (built) | delete and rename managed blocks (`removed`, `moved`) |
 | #81 (built in part) | `let` constants made and changed in vislox's file, ports bound to them; the module's `let` and `defaults` shown |
-| #82 | expressions and named signals |
+| #82 (built in part) | expressions (`<-`, `Port: …`) and named signals (`slug = …`, `.title`) of vislox's files; the module's shown |
 | #83 | `template` instances |
 | #84 | virtual inputs, virtual and Modbus devices |
 | #85 | Tree and Air hardware (`Statistics:`, new Tree devices) |
@@ -1409,7 +1476,7 @@ lost is deleted only with consent to exactly that list, see [features.md](featur
 - `GET /api/edits` lists what vislox's files claim now and in the deployed revision, which of it is not
   deployed, the blocks vislox added (`blocks`: slug, UUID, type, page, file, and whether the deployed config has
   it), the other blocks the module manages (`managed`), where the module makes each managed block (`sources`,
-  #64), the module's `let` constants and `defaults` and the ports that take a value from one (`constants`, #81), the blocks lox can move (`movable`: managed and drawn on a page) and
+  #64), the module's `let` constants and `defaults` and the ports that take a value from one (`constants`, #81), its expressions and named signals with their blocks (`expressions`, #82), the blocks lox can move (`movable`: managed and drawn on a page) and
   those the pending config draws elsewhere than the deployed one (`moves`: UUID, position, deployed position),
   for each page with such a block whether *Arrange* can lay it out (`arrange`: page UUID → null, or why not), and
   the wires vislox's files draw now or drew in the deployed revision (`wires`: `from`, `to`, `now`, `deployed`), the

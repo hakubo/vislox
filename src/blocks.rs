@@ -21,7 +21,7 @@
 
 use loxone_config::connectors::{self, PortDir};
 use loxone_config::logic::{
-    ArgItem, Binding, BindingKind, Item, Module, PageDecl, PortRef, Value, WireDecl,
+    ArgItem, Attr, Binding, BindingKind, Item, Module, PageDecl, PortRef, Value, WireDecl,
 };
 use loxone_config::port_names;
 use serde::Serialize;
@@ -280,6 +280,35 @@ pub struct NewBlock {
     /// adopted block has them; a block added here is wired by `<-` in
     /// `edits.loxl` (#61).
     pub wires: Vec<(String, PortRef)>,
+    /// The expressions into its inputs (#82): port (by its source name) →
+    /// the expression as lox prints it (`vx_a.Q and vx_b.AQ >= 28`). lox
+    /// makes their blocks, named `<slug>_<port>__<op><n>`.
+    pub exprs: Vec<(String, crate::expr_edit::ExprSrc)>,
+}
+
+/// A named signal of a page file (#82): `vx_warm = vx_a.AQ >= 28`, the
+/// expression as lox prints it, and its label (`vx_warm.title = "…"`), none
+/// showing the expression. Its top block is `slug` itself (hand-owned), the
+/// rest `<slug>__<op><n>` (expression-owned).
+#[derive(Clone, Debug, PartialEq)]
+pub struct SignalDef {
+    pub slug: String,
+    pub expr: crate::expr_edit::ExprSrc,
+    pub title: Option<String>,
+}
+
+impl SignalDef {
+    pub fn render(&self) -> String {
+        let mut out = format!("{} = {}", self.slug, self.expr);
+        if let Some(t) = &self.title {
+            out.push_str(&format!(
+                "\n{}.title = {}",
+                self.slug,
+                Value::Str(t.clone())
+            ));
+        }
+        out
+    }
 }
 
 impl NewBlock {
@@ -306,6 +335,9 @@ impl NewBlock {
         }
         for (k, src) in &self.wires {
             parts.push(format!("{k}: {src}"));
+        }
+        for (k, e) in &self.exprs {
+            parts.push(format!("{k}: {e}"));
         }
         format!("{} = {}({})", self.slug, self.ty, parts.join(", "))
     }
@@ -334,6 +366,11 @@ pub struct PageFile {
     /// `lox logic adopt` writes them. lox tracks them in the lockfile
     /// (`extern_wires`).
     pub wires: Vec<FileWire>,
+    /// The named signals written here (#82).
+    pub signals: Vec<SignalDef>,
+    /// Of `removed`, the signals dropped here (#82): only making one again
+    /// takes its line back. Written under a comment of their own.
+    pub dropped: BTreeSet<String>,
 }
 
 /// `to <- from`: a wire of a page file, out of a block adopted there.
@@ -356,6 +393,9 @@ const UUID_LINE: &str = "page uuid:";
 /// blocks after it are adopted, not added.
 pub const ADOPTED_LINE: &str = "Adopted from Loxone Config";
 
+/// The comment above the `removed` lines of signals dropped here (#82).
+pub const DROPPED_LINE: &str = "Signals dropped here";
+
 fn foreign(what: &str) -> String {
     format!("it holds {what}, which vislox did not write; move it to another file of the module")
 }
@@ -371,11 +411,16 @@ impl PageFile {
             removed: BTreeSet::new(),
             moved: BTreeMap::new(),
             wires: Vec::new(),
+            signals: Vec::new(),
+            dropped: BTreeSet::new(),
         }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.blocks.is_empty() && self.removed.is_empty() && self.moved.is_empty()
+        self.blocks.is_empty()
+            && self.removed.is_empty()
+            && self.moved.is_empty()
+            && self.signals.is_empty()
     }
 
     /// Read a file vislox wrote. Only what vislox writes is accepted, so
@@ -393,6 +438,8 @@ impl PageFile {
         let mut file: Option<PageFile> = None;
         let mut uuid = None;
         let mut adopted = false;
+        // Under the comment of the signals dropped here (#82).
+        let mut dropping = false;
         for item in m.items {
             match item {
                 Item::Comment(c) if file.is_none() && c.trim().starts_with(UUID_LINE) => {
@@ -400,6 +447,10 @@ impl PageFile {
                 }
                 Item::Comment(c) if file.is_some() && c.trim().starts_with(ADOPTED_LINE) => {
                     adopted = true;
+                    dropping = false;
+                }
+                Item::Comment(c) if file.is_some() => {
+                    dropping = c.trim().starts_with(DROPPED_LINE);
                 }
                 Item::Page(p) if file.is_none() => {
                     file = Some(PageFile {
@@ -418,6 +469,7 @@ impl PageFile {
                     }
                     let mut args = Vec::new();
                     let mut wires = Vec::new();
+                    let mut exprs = Vec::new();
                     for a in &b.args {
                         match a {
                             // `mirrors:` names the object a ref is (a push
@@ -458,6 +510,12 @@ impl PageFile {
                                 kind: BindingKind::Wire(src),
                                 ..
                             }) if adopted => wires.push((port.clone(), src.clone())),
+                            // An expression into an input (#82).
+                            ArgItem::Binding(Binding {
+                                port,
+                                kind: BindingKind::Expr(e),
+                                ..
+                            }) => exprs.push((port.clone(), crate::expr_edit::ExprSrc::of(e))),
                             ArgItem::Binding(_) => {
                                 return Err(foreign(&format!("a wire onto `{}`", b.slug)));
                             }
@@ -471,7 +529,36 @@ impl PageFile {
                         args,
                         adopted,
                         wires,
+                        exprs,
                     });
+                }
+                // A named signal (#82), and its label.
+                Item::Signal(x) if x.slug.starts_with(SLUG_PREFIX) => {
+                    file.as_mut()
+                        .ok_or_else(|| foreign(&format!("`{}` before its page line", x.slug)))?
+                        .signals
+                        .push(SignalDef {
+                            slug: x.slug,
+                            expr: crate::expr_edit::ExprSrc::of(&x.expr),
+                            title: None,
+                        });
+                }
+                Item::Attr(a)
+                    if a.attr == Attr::Title
+                        && matches!(a.value, Value::Str(_))
+                        && file.as_ref().is_some_and(|f| {
+                            f.signals
+                                .iter()
+                                .any(|x| x.slug == a.slug && x.title.is_none())
+                        }) =>
+                {
+                    let Value::Str(t) = a.value else {
+                        unreachable!("matched")
+                    };
+                    let f = file.as_mut().expect("checked");
+                    if let Some(x) = f.signals.iter_mut().find(|x| x.slug == a.slug) {
+                        x.title = Some(t);
+                    }
                 }
                 // A wire out of a block adopted here (#72).
                 Item::Wire(WireDecl { to, from, .. })
@@ -487,10 +574,13 @@ impl PageFile {
                         .push(FileWire { to, from });
                 }
                 Item::Removed(r) if r.slug.starts_with(SLUG_PREFIX) => {
-                    file.as_mut()
-                        .ok_or_else(|| foreign("`removed` before the page line"))?
-                        .removed
-                        .insert(r.slug);
+                    let f = file
+                        .as_mut()
+                        .ok_or_else(|| foreign("`removed` before the page line"))?;
+                    if dropping {
+                        f.dropped.insert(r.slug.clone());
+                    }
+                    f.removed.insert(r.slug);
                 }
                 Item::Moved(m)
                     if m.from.starts_with(SLUG_PREFIX) && m.to.starts_with(SLUG_PREFIX) =>
@@ -545,10 +635,29 @@ impl PageFile {
                 out.push('\n');
             }
         }
-        if !self.removed.is_empty() {
+        if !self.signals.is_empty() {
+            out.push_str(
+                "\n# Named signals written in vislox: each names an expression's result.\n",
+            );
+        }
+        for x in &self.signals {
+            out.push_str(&x.render());
+            out.push('\n');
+        }
+        let (signals, deleted): (Vec<&String>, Vec<&String>) =
+            self.removed.iter().partition(|s| self.dropped.contains(*s));
+        if !deleted.is_empty() {
             out.push_str("\n# Deleted here: lox takes them out of the config.\n");
         }
-        for s in &self.removed {
+        for s in deleted {
+            out.push_str(&format!("removed {s}\n"));
+        }
+        if !signals.is_empty() {
+            out.push_str(&format!(
+                "\n# {DROPPED_LINE}: lox takes them out of the config.\n"
+            ));
+        }
+        for s in signals {
             out.push_str(&format!("removed {s}\n"));
         }
         if !self.moved.is_empty() {
@@ -773,6 +882,7 @@ mod tests {
                     ext("vx_10000006_0000_0060_ffff504f94000001", "AQ"),
                 ),
             ],
+            exprs: vec![],
         });
         f.wires.push(FileWire {
             to: ext("vx_10000005_0000_0050_ffff504f94000001", "Power"),
