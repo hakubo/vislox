@@ -48,6 +48,8 @@ Then open <http://127.0.0.1:7878>. Started without a path or `--ctx` in a direct
   makes it.
 - For a `lox.toml` project: `lox logic check` errors listed by file, line and block when the module doesn't compile
   (Apply is off until it does), and *Compile* when the pending config is from before the module's latest change.
+- For a `lox.toml` project: `lox logic lint` findings (unused names, blocks whose outputs feed nothing, users whose
+  tag opens no Code Touch, …) as a warning badge on each block and a *Lint* list in the Deploy pane. Hints only.
 - Ctrl+K to find any page or block (by name, or by its Lox Logic slug), links that reopen a page, block and revision, and full keyboard use (`?`).
 
 Details: [docs/features.md](docs/features.md).

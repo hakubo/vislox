@@ -546,6 +546,11 @@ rect.ghost, line.ghost { fill: #1f6fd10a; stroke: var(--moved); stroke-opacity: 
 .deploy-check pre { margin: 4px 0 0; white-space: pre-wrap; font-size: 11px; }
 .deploy-check .ck-fmt { margin-top: 4px; color: var(--muted); font-weight: 400; }
 .ck-err { color: var(--removed); }
+.deploy-lint summary { cursor: pointer; }
+.deploy-lint.quiet { background: none; padding: 2px 0; font-size: 11px; }
+.deploy-lint .lt-kind > ul { margin-top: 2px; padding-left: 10px; }
+.deploy-lint .lt-k { font-family: ui-monospace, "DejaVu Sans Mono", monospace; font-weight: 600; }
+.lt-note { color: var(--changed); }
 .deploy-new { margin: 8px 10px 0; padding: 6px 8px; border: 1px solid var(--line-2); border-radius: 4px; background: var(--panel-2); font-size: 12px; }
 .deploy-new .h { display: flex; align-items: center; gap: 6px; font-weight: 600; margin-bottom: 4px; }
 .deploy-new .h .x { margin-left: auto; border: none; background: none; color: var(--muted); font-size: 14px; line-height: 1; padding: 0 2px; }
@@ -647,6 +652,8 @@ rect.ghost, line.ghost { fill: #1f6fd10a; stroke: var(--moved); stroke-opacity: 
 /* Managed by the project's Lox Logic module (#64) */
 .mbadge rect { fill: #6b4fa8; stroke: #fff; stroke-width: 1.5px; vector-effect: non-scaling-stroke; }
 .mbadge text { fill: #fff; font-size: 130px; font-weight: 700; }
+.lbadge path { fill: #e0a100; stroke: #fff; stroke-width: 1.5px; vector-effect: non-scaling-stroke; stroke-linejoin: round; }
+.lbadge text { fill: #2b1d00; font-size: 130px; font-weight: 800; }
 .legend:not(.managed) .managed-only { display: none; }
 .lg.managed-k::before { border-color: #6b4fa8; background: #6b4fa8; border-radius: 4px; }
 .only-managed .blk:not(.managed):not(.lit), .only-managed .tag:not(.lit), .only-managed .xref:not(.lit) { opacity: .25; }

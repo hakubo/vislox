@@ -173,6 +173,15 @@ sends to the Miniserver see [miniserver.md](miniserver.md).
   the admin token; nothing is deployed). Files `lox logic fmt --check` would format are a hint, never a blocker.
   How: [editing.md](editing.md#when-the-module-does-not-compile-65).
 
+- **Lint** (a `lox.toml` project): with the same check, while the module compiles, vislox runs `lox logic lint` on
+  the project: unused externs, constants and templates, managed blocks whose outputs feed nothing, Touch Pure Flex
+  commands that reach several blocks or none, values outside a port's range, bare times that read better with a
+  unit, and the rest of lox's kinds. Each block a finding is about gets an amber warning badge on the canvas (its
+  tooltip says why) and the finding in Properties' *Lox Logic* section. The Deploy pane's *Lint: N findings* lists
+  them all by kind, each with its file and line and a button per block that shows it on its page. An NFC Code
+  Touch's Properties list the users whose NFC tag or code opens no Code Touch. Findings never stop Apply. How:
+  [editing.md](editing.md#lint-findings-66).
+
 - **Edit values** (for a `lox.toml` project, with the admin token): Properties' *Edit values* changes a block's
   name, its room and category, the constant of an unwired input (lox checks it against the documented range) and the settings of a
   physical input or output or a device. *Save* writes them into vislox's own file of the module and runs

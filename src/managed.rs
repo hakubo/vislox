@@ -50,6 +50,20 @@ pub struct Source {
 #[derive(Default)]
 pub struct ModuleFiles {
     files: BTreeMap<PathBuf, Entry>,
+    /// The lockfile, by the same rule: its path, stamp and blob id.
+    lock: Option<(PathBuf, (SystemTime, u64), String)>,
+}
+
+/// A file's modification time and size, and whether that time is too
+/// recent to trust ([`RACY`]).
+fn stamp_of(f: &Path, now: SystemTime) -> Option<((SystemTime, u64), bool)> {
+    let meta = std::fs::metadata(f).ok()?;
+    let stamp = (
+        meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+        meta.len(),
+    );
+    let racy = now.duration_since(stamp.0).map_or(true, |d| d < RACY);
+    Some((stamp, racy))
 }
 
 struct Entry {
@@ -81,14 +95,9 @@ impl ModuleFiles {
         let now = SystemTime::now();
         let mut kept = BTreeMap::new();
         for f in paths {
-            let Ok(meta) = std::fs::metadata(&f) else {
+            let Some((stamp, racy)) = stamp_of(&f, now) else {
                 continue;
             };
-            let stamp = (
-                meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
-                meta.len(),
-            );
-            let racy = now.duration_since(stamp.0).map_or(true, |d| d < RACY);
             if let Some(e) = self.files.remove(&f)
                 && e.stamp == stamp
                 && !racy
@@ -112,6 +121,40 @@ impl ModuleFiles {
             .values()
             .map(|e| (e.rel.clone(), e.blob.clone()))
             .collect()
+    }
+
+    /// The lockfile's blob id, read and hashed again only when it changed
+    /// (by the same rule as the module's files); `None` without one.
+    pub fn lock_blob(&mut self, path: &Path) -> Option<String> {
+        let now = SystemTime::now();
+        let Some((stamp, racy)) = stamp_of(path, now) else {
+            self.lock = None;
+            return None;
+        };
+        if let Some((p, s, blob)) = &self.lock
+            && p == path
+            && *s == stamp
+            && !racy
+        {
+            return Some(blob.clone());
+        }
+        let blob = crate::history::blob_id(&std::fs::read(path).ok()?);
+        self.lock = Some((path.to_path_buf(), stamp, blob.clone()));
+        Some(blob)
+    }
+
+    /// The module's files and the lockfile as one blob id: the files part
+    /// of the edit and check keys. `None` when there is neither.
+    pub fn key(&mut self, root: &Path, module: &Path, lock: &Path) -> Option<String> {
+        let mut all: Vec<String> = self
+            .refresh(root, module)
+            .into_iter()
+            .map(|(n, b)| format!("{n}={b}"))
+            .collect();
+        if let Some(b) = self.lock_blob(lock) {
+            all.push(format!("lock={b}"));
+        }
+        (!all.is_empty()).then(|| crate::history::blob_id(all.join("\n").as_bytes()))
     }
 
     /// Each file's shown path and text, as last refreshed.
@@ -172,6 +215,30 @@ pub fn sources<T: AsRef<str>>(
             )
         })
         .collect()
+}
+
+/// Where the module declares each top-level name (any kind: a block, an
+/// extern, a `let`, a template, …), for what lox names by it (#66).
+pub struct Declarations<'a>(Index<'a>);
+
+impl<'a> Declarations<'a> {
+    pub fn new<T: AsRef<str>>(files: &'a [(String, T)]) -> Self {
+        Declarations(Index::new(files))
+    }
+
+    /// `name`'s one top-level declaration (in `file`, when given): its file
+    /// and 1-based line. `None` when there is none, or more than one.
+    pub fn at(&self, name: &str, file: Option<&str>) -> Option<(String, usize)> {
+        let d = self.0.decls.get(name)?;
+        let at: Vec<&At> =
+            d.at.iter()
+                .filter(|(f, _)| file.is_none_or(|x| x == *f))
+                .collect();
+        match at.as_slice() {
+            [(f, l)] => Some((f.to_string(), *l)),
+            _ => None,
+        }
+    }
 }
 
 type At<'a> = (&'a str, usize);

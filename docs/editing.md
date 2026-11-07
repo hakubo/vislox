@@ -244,6 +244,12 @@ and the review would show an older change than the one in the source. So vislox 
   writer to finish; so does the end of any action. `GET /api/check` only reads the last check it kept (`current`:
   nothing changed since); a request never runs lox. `actions.edit.check` counts the checks kept, and the browser
   fetches again when it moves.
+- **Kept under the files lox read.** The key's module and lock part is taken when the watcher or the poll looks.
+  A file changed since (and maybe changed back before the next look) would keep what lox said of the change under
+  the key of the files after it. So the worker looks at the module and lock itself before and after lox runs, and
+  keeps the check only when both looks are the key's. When the key lags the files, the worker brings its module
+  and lock part up to date itself and checks again, rather than waiting for the next look. Its own look rereads
+  and rehashes only a file (or the lock) whose size or time changed, off the async worker.
 - The worker never checks while an action (an edit, Compile, Apply, Sync, Discard) runs: that check would be of a
   project half written. It keeps nothing then, and the action's end wakes it, so a check skipped during an Apply
   that failed and changed no file comes back as it was.
@@ -284,8 +290,49 @@ message and a button per block its line names (on the newest config); *Pending i
 `pages/x.loxl`* (or, with nothing pending, *The module changed … and is not compiled yet*) with *Compile*; and the
 formatting hint. Properties shows a block's errors in its *Lox Logic* section.
 
-`lox logic lint` findings (#66) and `lox logic test` results (#67) are meant to join this: more fields of
-`GET /api/check`, worked out on the same key, shown in the same box and on the blocks `check::locate` finds.
+`lox logic test` results (#67) are meant to join this, as lint did (below): more fields of `GET /api/check`,
+worked out on the same key, shown in the same pane and on the blocks `check::locate` finds.
+
+## Lint findings (#66)
+
+`lox logic lint` reports what compiles but is likely a mistake: unused externs, constants and templates, managed
+blocks whose outputs feed nothing in the compiled config, Touch Pure Flex commands that reach several blocks or
+none, users whose NFC tag or code opens no Code Touch, values outside a port's range, bare times that read better
+with a unit, and more. vislox shows them; it never runs `--fix`.
+
+- **Same check, same key, second step.** The check worker runs `lox logic lint .` in the project on the same key
+  (module files, lock, base, out), so a request never runs it; but only after `check` and `fmt --check` came back
+  without errors, and after that check is kept and told to the browsers. So errors never wait for lint (which
+  compiles, and may take long). While the module does not compile, lint does not run (`lint: null`).
+- **Lint gives way.** Lint compiles the module in memory for its dead-output analysis and writes nothing, so it
+  does not hold the compile lock: an edit, Compile or Apply never waits for it. An action that starts while it
+  runs stops it (the process is killed); the action's end wakes the worker, which lints the files as they are
+  then. A lint whose files changed while it ran is not kept. Until lint is done, `lint` is `{ available: true,
+  running: true, findings }` with the last lint's findings, so badges don't flicker on every change.
+- **A lox without lint** (usage error: exit 2, `unknown command`) is found out once, by the lox binary's path,
+  time and size: `lint` is `{ available: false, unsupported: true, reason }`, the browser says so in one quiet
+  line, and lint is not asked again until that binary changes.
+- **What lox prints.** lox has no JSON for lint (yet), so `check::parse_lint` reads its text: a header per kind
+  (`dead-outputs (2)`), a line per finding (two spaces, then `` pages/a.loxl: `slug` — detail ``; the file only in a
+  directory module), and the count it ends with (`lint: 3 findings`, or `lint: clean`). Any other line after a
+  finding goes on with its detail, up to the next kind's header. Without that count the run failed
+  (lox exits 1 for findings and for errors alike), and `lint` is `{ available: false, reason }` with lox's last
+  lines.
+- **Pinned like errors.** `check::locate_findings` gives each finding the line of its name's one top-level
+  declaration (with #64's declaration index, in the file lox named) and its `blocks`: the managed block or device
+  the lockfile pins by that name, or the object an extern of that name pins. Not the blocks the declaration only
+  refers to: `x = And(In1: m.Q)` unused is about `x`, not `m`.
+- `GET /api/check`'s `lint`: `{ available: true, findings: [{ kind, name, message, file, line, blocks }] }`.
+  `name` is what lox names: a slug, a constant, a template, a block type (`unused-default`) or a user
+  (`no-access-right`).
+- **Never a blocker.** Apply's first step asks `lox logic check` only; findings do not refuse or warn on Apply.
+  A finding meant to stay is silenced in the module, as lox says: `# lint: allow <kind>` above the declaration.
+
+The browser, on the newest config only (as errors): an amber warning badge at the upper right of each block a
+finding names, its tooltip the findings; the findings in Properties' *Lox Logic* section; on an NFC Code Touch,
+the `no-access-right` findings (lox names the user, not a Code Touch); and *Lint: N findings* below Apply, folded,
+by kind, each with `file:line`, the name, lox's message and a button per block that shows it on its page. The
+list, too, shows only while the newest config is shown. When lint didn't run, that box says why.
 
 ## Undo and redo (#62)
 
@@ -406,7 +453,7 @@ Each of these plugs in as new op kinds on `POST /api/edit`, written into `<modul
 | #87 | Automatic Designer rules (`rule`) |
 | #88 | new pages (`page "…" (room: …)`) |
 
-Around the module: #64 (mark managed blocks, built), #65 (`lox logic check` errors, built), #66 (lint), #67 (`lox logic test`),
+Around the module: #64 (mark managed blocks, built), #65 (`lox logic check` errors, built), #66 (lint, built), #67 (`lox logic test`),
 #68 (review claimed access, recipients and schedules), #70 (removals on Apply).
 
 ## The browser
