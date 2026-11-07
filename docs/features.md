@@ -373,6 +373,15 @@ sends to the Miniserver see [miniserver.md](miniserver.md).
   instances changed`), and those of one call under its instance (`sued: Fassade (call changed)`). The module's own
   instances and templates are changed in its files. How: [editing.md](editing.md#template-instances-83).
 
+- **Virtual inputs and devices** (the same project and token, #84): *Add* on the *Virtual Inputs*, *Virtual
+  Outputs* and *Netzwerkperipherie* folders of the project tree, and on a virtual or Modbus device, adds a virtual
+  input, a virtual HTTP, UDP or text input, a virtual output, a Modbus server, a command, a Modbus device or its
+  sensor or actuator: a form per type with its settings, the ones lox needs first. vislox writes it into
+  `<module>/vislox/_periphery.loxl` (`device:` names where an I/O hangs); lox mints its designation (`VI4`, `VHI1`).
+  Properties edits its name and settings; Rename, Delete and Undo work as for a block. The Changes list shows it added
+  (with each command of a device added with it) and a changed setting old → new. Nothing is sent to the device.
+  Adopting one Loxone Config made is not offered yet. How: [editing.md](editing.md#virtual-inputs-virtual-and-modbus-devices-84).
+
 - **Delete and rename managed blocks** (the same project and token, #80): Properties of a block added or adopted
   here shows its slug with *Rename* and, once deployed or adopted, *Delete*. *Rename* rewrites the slug in vislox's
   files with lox's own rename and adds `moved <old> -> <new>`: the block keeps its UUIDs and the config does not

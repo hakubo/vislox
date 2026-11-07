@@ -1584,6 +1584,12 @@ impl Files {
                 // its file: a page file has a page line, the templates file none.
                 f.templates = crate::template_edit::parse_templates(text)
                     .map_err(|e| format!("{name}: {e}"))?;
+            } else if name == crate::periphery::FILE {
+                // The objects of the object tree (#84): no page line.
+                f.pages.insert(
+                    name.clone(),
+                    PageFile::parse_periphery(text, &consts).map_err(|e| format!("{name}: {e}"))?,
+                );
             } else if name != CLAIMS {
                 f.pages.insert(
                     name.clone(),
@@ -1758,7 +1764,7 @@ impl Files {
     /// Loxone Config renamed: `page "…"` names the page by its title. A file
     /// written before it had a UUID takes the first page with its title.
     pub fn follow_pages(&mut self, base: &LoxoneDoc) {
-        for p in self.pages.values_mut() {
+        for p in self.pages.values_mut().filter(|p| !p.periphery) {
             match &p.uuid {
                 Some(u) => {
                     if let Some(t) = find(&base.xml.root, u)
@@ -1796,10 +1802,13 @@ impl Files {
                 }
             }
             // The notification a push notification's block mirrors (#77),
-            // on a block added here too.
+            // on a block added here too, and the device an I/O hangs below
+            // (#84).
             for b in &p.blocks {
-                if let Some(Value::Ref(n)) = b.get(blocks::MIRRORS) {
-                    out.push((n.clone(), name.clone()));
+                for k in [blocks::MIRRORS, crate::periphery::DEVICE] {
+                    if let Some(Value::Ref(n)) = b.get(k) {
+                        out.push((n.clone(), name.clone()));
+                    }
                 }
             }
             for w in &p.wires {
@@ -1968,6 +1977,11 @@ impl Files {
 pub fn split_args(b: &NewBlock) -> (BTreeMap<String, String>, BTreeMap<String, String>) {
     let (mut params, mut settings) = (BTreeMap::new(), BTreeMap::new());
     for (k, v) in &b.args {
+        // The device an I/O hangs below (#84): where it is, which `add_block`
+        // takes as its `page`, never a value.
+        if k == crate::periphery::DEVICE {
+            continue;
+        }
         let key = blocks::port_key(&b.ty, k);
         // The notification a push notification's block mirrors (#77): by
         // UUID, as `add_block` takes it.
@@ -1998,6 +2012,12 @@ pub fn new_block_settings(b: &NewBlock) -> serde_json::Value {
                 "choices": connectors::choice_values(&b.ty, name)
                     .map(|c| c.iter().map(|(w, _)| *w).collect::<Vec<_>>()),
                 "value": b.get(name).map(plain),
+                // An object of the object tree (#84): the unit lox documents
+                // a number in, and whether it cannot go.
+                "unit": crate::periphery::of(&b.ty)
+                    .and_then(|_| connectors::port_unit(&b.ty, name))
+                    .map(unit_suffix),
+                "required": crate::periphery::of(&b.ty).is_some_and(|t| t.required.contains(&name)),
             })
         })
         .collect()
@@ -2233,6 +2253,17 @@ pub(crate) fn block_title(ty: &str, t: &str) -> Result<String, String> {
 /// A setting's value as lox takes it.
 fn setting_value(ty: &str, name: &str, kind: blocks::Kind, v: &str) -> Result<Value, String> {
     use blocks::Kind;
+    // An object of the object tree (#84): a long command or pattern is one
+    // setting, and a number may carry the unit lox documents (`Poll: 1min`).
+    if crate::periphery::of(ty).is_some() {
+        match kind {
+            Kind::Text => return Ok(Value::Str(crate::periphery::text_value(name, v)?)),
+            Kind::Number => {
+                return crate::periphery::number_value(ty, name, v);
+            }
+            _ => {}
+        }
+    }
     Ok(match kind {
         Kind::Text => Value::Str(text(v, name, connectors::empty_ok(ty, name))?),
         Kind::Choice => {
@@ -2333,6 +2364,10 @@ fn add_block(files: &mut Files, ctx: &Ctx, op: &Op) -> Result<Applied, String> {
     else {
         unreachable!()
     };
+    // An object of the object tree (#84): `page` is its folder or device.
+    if let Some(t) = crate::periphery::of(ty) {
+        return add_object(files, ctx, op, t);
+    }
     let pg = find(&ctx.base.xml.root, page)
         .filter(|e| e.attr("Type") == Some("Page"))
         .ok_or_else(|| format!("no page {page} in the project's base config"))?;
@@ -2492,8 +2527,113 @@ fn add_block(files: &mut Files, ctx: &Ctx, op: &Op) -> Result<Applied, String> {
     })
 }
 
+/// Add an object of the object tree (#84): a virtual input, a virtual or
+/// Modbus device or one of their I/Os, declared in vislox's periphery file
+/// ([`crate::periphery::FILE`]). `page` is the folder it goes into or the
+/// device it hangs below; lox mints its UUIDs and `IName=` and puts it there.
+fn add_object(
+    files: &mut Files,
+    ctx: &Ctx,
+    op: &Op,
+    t: &crate::periphery::Type,
+) -> Result<Applied, String> {
+    let Op::AddBlock {
+        page: parent,
+        ty,
+        title,
+        params,
+        settings,
+        wires,
+        ..
+    } = op
+    else {
+        unreachable!()
+    };
+    let at = crate::periphery::parent(files, ctx, t, parent)?;
+    if !params.is_empty() {
+        return Err(format!(
+            "a {ty} takes no constants here: wire its input once it is in the config"
+        ));
+    }
+    if !wires.is_empty() {
+        return Err(format!(
+            "a {ty} is added without wires: draw them once it is in the config"
+        ));
+    }
+    let title = title.as_deref().map(|t| block_title(ty, t)).transpose()?;
+    let offered = blocks::settings(ty);
+    if let Some(name) = settings
+        .keys()
+        .find(|n| !offered.iter().any(|(o, _)| o == n))
+    {
+        return Err(format!("{ty}: {name} cannot be set here"));
+    }
+    let mut args = Vec::new();
+    if let Some(d) = at.name() {
+        args.push((crate::periphery::DEVICE.to_string(), Value::Ref(d)));
+    }
+    for (name, kind) in offered {
+        if let Some(v) = settings.get(name) {
+            args.push((name.to_string(), setting_value(ty, name, kind, v)?));
+        }
+    }
+    let missing = crate::periphery::missing(ty, &args);
+    if !missing.is_empty() {
+        return Err(format!(
+            "a new {ty} needs {}: lox makes none without",
+            missing.join(" and ")
+        ));
+    }
+    if let Some(e) = crate::periphery::rewritten(ty, &args) {
+        return Err(e);
+    }
+    let taken = |s: &str| {
+        ctx.names.contains(s)
+            || ctx.lock.slugs.contains_key(s)
+            || ctx.lock.tombstoned(s)
+            || files.names(s)
+    };
+    let slug = blocks::new_slug(ty, &taken);
+    // Everything is checked: from here on `files` changes.
+    if let crate::periphery::Parent::Theirs(key, pty) = &at {
+        // vislox's extern of the device, kept while an I/O names it.
+        let c = files.claims.0.entry(key.clone()).or_default();
+        if c.ty.is_empty() {
+            c.ty = pty.clone();
+        }
+        c.pinned = true;
+    }
+    let f = files
+        .pages
+        .entry(crate::periphery::FILE.to_string())
+        .or_insert_with(PageFile::periphery);
+    f.blocks.push(NewBlock {
+        slug: slug.clone(),
+        ty: ty.clone(),
+        title,
+        args,
+        ..Default::default()
+    });
+    Ok(Applied {
+        previous: serde_json::Value::Null,
+        added: Some(slug),
+        warnings: Vec::new(),
+    })
+}
+
+/// The `page` of the block `b` of vislox's file `file`, as `add_block` and
+/// `restore_block` take it: its page, or for an object of the object tree
+/// (#84) its folder or device.
+fn block_page(files: &Files, ctx: &Ctx, file: &str, b: &NewBlock) -> String {
+    if files.pages[file].periphery {
+        crate::periphery::parent_uuid(files, ctx, b)
+    } else {
+        file_page(files, ctx, file)
+    }
+}
+
 fn remove_block(files: &mut Files, ctx: &Ctx, uuid: &str) -> Result<Applied, String> {
-    let r = removal(files, ctx, uuid)?;
+    let r = removal(files, ctx, uuid, &crate::periphery::below(files))?;
     if r.delete {
         return delete_block(files, ctx, &r.slug, r.wires);
     }
@@ -2502,7 +2642,7 @@ fn remove_block(files: &mut Files, ctx: &Ctx, uuid: &str) -> Result<Applied, Str
     let (file, b) = (file.to_string(), b.clone());
     let (params, settings) = split_args(&b);
     let again = Op::AddBlock {
-        page: file_page(files, ctx, &file),
+        page: block_page(files, ctx, &file, &b),
         ty: b.ty.clone(),
         title: b.title.clone(),
         params,
@@ -2539,12 +2679,29 @@ struct Removal {
 }
 
 /// Whether `remove_block` of `uuid` is refused now, and why (`None`: it is
-/// not). Changes nothing: `GET /api/edits` asks it for every block.
+/// not). Changes nothing: `GET /api/edits` asks it for every block
+/// ([`delete_refusals`]).
+#[cfg(test)]
 pub fn delete_refusal(files: &Files, ctx: &Ctx, uuid: &str) -> Option<String> {
-    removal(files, ctx, uuid).err()
+    removal(files, ctx, uuid, &crate::periphery::below(files)).err()
 }
 
-fn removal(files: &Files, ctx: &Ctx, uuid: &str) -> Result<Removal, String> {
+/// [`delete_refusal`] of each of `uuids`, with what hangs below each device
+/// (#84) worked out once.
+pub fn delete_refusals(files: &Files, ctx: &Ctx, uuids: &[String]) -> Vec<Option<String>> {
+    let below = crate::periphery::below(files);
+    uuids
+        .iter()
+        .map(|u| removal(files, ctx, u, &below).err())
+        .collect()
+}
+
+fn removal(
+    files: &Files,
+    ctx: &Ctx,
+    uuid: &str,
+    below: &crate::periphery::Below,
+) -> Result<Removal, String> {
     let el = find_ci(&ctx.doc.xml.root, uuid)
         .ok_or_else(|| format!("no object {uuid} in the pending config"))?;
     let name = el.attr_decoded("Title").unwrap_or_default().into_owned();
@@ -2569,6 +2726,30 @@ fn removal(files: &Files, ctx: &Ctx, uuid: &str) -> Result<Removal, String> {
         return Err(format!(
             "{name}: vislox's file claims {what}; take {them} out first (Revert them, or undo the \
              edit)"
+        ));
+    }
+    // A device the objects of vislox's files hang below (#84): lox would
+    // find no device for them.
+    if let Some(o) = below.get(&slug).and_then(|v| v.first()) {
+        let other = ctx
+            .lock
+            .uuid_of(o)
+            .and_then(|u| find_ci(&ctx.doc.xml.root, u))
+            .and_then(|e| e.attr_decoded("Title").map(|t| t.into_owned()))
+            .filter(|t| !t.trim().is_empty())
+            .unwrap_or_else(|| o.to_string());
+        return Err(format!("{name}: {other} hangs below it; delete that first"));
+    }
+    // Objects Loxone Config made below a device of vislox's would go with
+    // it, and whatever reads them: refused, naming them.
+    let others = crate::periphery::others_below(files, ctx, uuid);
+    if !others.is_empty() {
+        return Err(format!(
+            "{name}: {} below it {} made in Loxone Config, and would be deleted with it; delete \
+             or move {} there first",
+            others.join(", "),
+            if others.len() == 1 { "was" } else { "were" },
+            if others.len() == 1 { "it" } else { "them" },
         ));
     }
     let (_, b) = files.block(&slug).expect("checked");
@@ -2714,8 +2895,10 @@ fn delete_block(
     // vislox's externs its source names: brought back with it.
     let mut named: Vec<String> = b.wires.iter().map(|(_, src)| src.slug.clone()).collect();
     named.extend(out_wires.iter().map(|w| w.to.slug.clone()));
-    if let Some(Value::Ref(n)) = b.get(blocks::MIRRORS) {
-        named.push(n.clone());
+    for k in [blocks::MIRRORS, crate::periphery::DEVICE] {
+        if let Some(Value::Ref(n)) = b.get(k) {
+            named.push(n.clone());
+        }
     }
     let externs: BTreeMap<String, String> = files
         .claims
@@ -2726,7 +2909,7 @@ fn delete_block(
         .collect();
     let again = Op::RestoreBlock {
         uuid: ctx.lock.uuid_of(slug).unwrap_or_default().to_string(),
-        page: file_page(files, ctx, &file),
+        page: block_page(files, ctx, &file, &b),
         adopted: b.adopted,
         source,
         program,
@@ -2824,6 +3007,10 @@ fn check_entry(
     }
     for f in ["layout", "superseded_layout"] {
         let Some(l) = o.get(f) else { continue };
+        // An object of the object tree (#84) has no position.
+        if l.is_null() && connectors::object_tree(ty) {
+            continue;
+        }
         let n = |k: &str| l.get(k).and_then(|v| v.as_i64());
         let ok = match (n("px"), n("py"), n("px2"), n("py2")) {
             (Some(x), Some(y), Some(x2), Some(y2)) => {
@@ -2918,31 +3105,51 @@ fn restore_block(files: &mut Files, ctx: &Ctx, op: &Op) -> Result<Applied, Strin
             "the project's base has no object {uuid} any more: it cannot come back with its UUIDs"
         ));
     }
-    let pg = find(&ctx.base.xml.root, page)
-        .filter(|e| e.attr("Type") == Some("Page"))
-        .ok_or_else(|| format!("no page {page} in the project's base config"))?;
-    let page_title = pg.attr_decoded("Title").unwrap_or_default().into_owned();
-    let mut same = Vec::new();
-    pages_titled(&ctx.base.xml.root, &page_title, &mut same);
-    if page_title.trim().is_empty() || same.first().and_then(|e| e.attr("U")) != Some(page.as_str())
-    {
-        return Err(format!(
-            "lox puts a block on the first page titled \"{page_title}\", and that is not its page \
-             any more"
-        ));
-    }
-    // Read as vislox reads its files: only what it writes.
-    let text = format!(
-        "{}\n{}{source}\n",
-        blocks::render_page_line(&page_title),
-        if *adopted {
-            format!("# {}\n", blocks::ADOPTED_LINE)
-        } else {
-            String::new()
-        }
-    );
     let consts: BTreeSet<String> = files.claims.8.keys().cloned().collect();
-    let pf = PageFile::parse_with(&text, &consts).map_err(|e| format!("its declaration: {e}"))?;
+    // An object of the object tree (#84) is in vislox's periphery file, which
+    // has no page: `page` is its folder or device.
+    let adopted_line = if *adopted {
+        format!("# {}\n", blocks::ADOPTED_LINE)
+    } else {
+        String::new()
+    };
+    // Read once as the periphery file reads it, when it may be one.
+    let periph = (crate::periphery::of(&ty).is_some() || ty.is_empty())
+        .then(|| PageFile::parse_periphery(&format!("{adopted_line}{source}\n"), &consts));
+    let object = crate::periphery::of(&ty).is_some()
+        || (ty.is_empty() && periph.as_ref().is_some_and(Result::is_ok));
+    let page_title = if object {
+        String::new()
+    } else {
+        let pg = find(&ctx.base.xml.root, page)
+            .filter(|e| e.attr("Type") == Some("Page"))
+            .ok_or_else(|| format!("no page {page} in the project's base config"))?;
+        let page_title = pg.attr_decoded("Title").unwrap_or_default().into_owned();
+        let mut same = Vec::new();
+        pages_titled(&ctx.base.xml.root, &page_title, &mut same);
+        if page_title.trim().is_empty()
+            || same.first().and_then(|e| e.attr("U")) != Some(page.as_str())
+        {
+            return Err(format!(
+                "lox puts a block on the first page titled \"{page_title}\", and that is not its \
+                 page any more"
+            ));
+        }
+        page_title
+    };
+    // Read as vislox reads its files: only what it writes.
+    let pf = if let (true, Some(p)) = (object, periph) {
+        p
+    } else {
+        PageFile::parse_with(
+            &format!(
+                "{}\n{adopted_line}{source}\n",
+                blocks::render_page_line(&page_title)
+            ),
+            &consts,
+        )
+    }
+    .map_err(|e| format!("its declaration: {e}"))?;
     let [b] = pf.blocks.as_slice() else {
         return Err("its declaration is one block".into());
     };
@@ -2974,8 +3181,10 @@ fn restore_block(files: &mut Files, ctx: &Ctx, op: &Op) -> Result<Applied, Strin
     // claims file, or a block of vislox's files.
     let mut named: Vec<&str> = b.wires.iter().map(|(_, src)| src.slug.as_str()).collect();
     named.extend(pf.wires.iter().map(|w| w.to.slug.as_str()));
-    if let Some(Value::Ref(n)) = b.get(blocks::MIRRORS) {
-        named.push(n);
+    for k in [blocks::MIRRORS, crate::periphery::DEVICE] {
+        if let Some(Value::Ref(n)) = b.get(k) {
+            named.push(n);
+        }
     }
     for n in named {
         let ext = externs
@@ -2986,6 +3195,20 @@ fn restore_block(files: &mut Files, ctx: &Ctx, op: &Op) -> Result<Applied, Strin
             return Err(format!(
                 "its declaration names `{n}`, which is neither an extern of vislox's files nor \
                  a block of them"
+            ));
+        }
+    }
+    // Where an object of the object tree goes is what its declaration says.
+    if object {
+        let now = crate::periphery::parent_uuid(files, ctx, b);
+        let ext = |n: &str| externs.keys().find(|u| self::slug(u) == n).cloned();
+        let now = match (now.is_empty(), b.get(crate::periphery::DEVICE)) {
+            (true, Some(Value::Ref(n))) => ext(n).unwrap_or_default(),
+            _ => now,
+        };
+        if now.is_empty() || !now.eq_ignore_ascii_case(page) {
+            return Err(format!(
+                "its declaration puts it elsewhere than {page}, or there is no such folder or device"
             ));
         }
     }
@@ -3009,22 +3232,34 @@ fn restore_block(files: &mut Files, ctx: &Ctx, op: &Op) -> Result<Applied, Strin
             c.ty = t.clone();
         }
     }
-    let file = match files
-        .pages
-        .iter()
-        .find(|(_, p)| p.uuid.as_deref() == Some(page.as_str()))
-    {
-        Some((n, _)) => n.clone(),
-        None => blocks::file_name(&page_title, &|n| n == CLAIMS || files.pages.contains_key(n)),
+    let file = if object {
+        crate::periphery::FILE.to_string()
+    } else {
+        match files
+            .pages
+            .iter()
+            .find(|(_, p)| p.uuid.as_deref() == Some(page.as_str()))
+        {
+            Some((n, _)) => n.clone(),
+            None => blocks::file_name(&page_title, &|n| n == CLAIMS || files.pages.contains_key(n)),
+        }
     };
     for p in files.pages.values_mut() {
         p.removed.remove(&slug);
     }
-    let f = files.pages.entry(file).or_insert_with(|| PageFile {
-        uuid: Some(page.clone()),
-        ..PageFile::new(&page_title)
+    let f = files.pages.entry(file).or_insert_with(|| {
+        if object {
+            PageFile::periphery()
+        } else {
+            PageFile {
+                uuid: Some(page.clone()),
+                ..PageFile::new(&page_title)
+            }
+        }
     });
-    f.page = page_title;
+    if !object {
+        f.page = page_title;
+    }
     f.blocks.push(b.clone());
     f.wires.extend(pf.wires.iter().cloned());
     // Each wire on a copy: one whose other end is gone is left out, said,
@@ -4367,6 +4602,21 @@ fn edit_new_block(
                     _ => program_file(slug),
                 };
             }
+            // An object of the object tree (#84) keeps the settings lox
+            // makes it with, and none a Loxone Config save would rewrite.
+            if crate::periphery::of(&b.ty).is_some() {
+                let mut t = b.clone();
+                t.set(setting, v.clone());
+                if crate::periphery::missing(&t.ty, &t.args).contains(&setting.as_str()) {
+                    return Err(format!(
+                        "{name}: a {} needs {setting}; change it, it cannot go",
+                        t.ty
+                    ));
+                }
+                if let Some(e) = crate::periphery::rewritten(&t.ty, &t.args) {
+                    return Err(format!("{name}: {e}"));
+                }
+            }
             b.set(setting, v);
             Ok(previous)
         }
@@ -5558,7 +5808,8 @@ mod tests {
         let mut files = Files::default();
         let err = |op: Op| apply_op(&mut files.clone(), &ctx, &op).unwrap_err();
         assert!(err(add(DIV, "And", None, &[], &[])).contains("no page"));
-        assert!(err(add(EG, "VirtualIn", None, &[], &[])).contains("does not add"));
+        // A virtual input goes into its folder (#84), never onto a page.
+        assert!(err(add(EG, "VirtualIn", None, &[], &[])).contains("goes into the folder"));
         assert!(err(add(EG, "And", Some("a|b"), &[], &[])).contains("\"a_b\""));
         assert!(err(add(EG, "And", Some(" "), &[], &[])).contains("cannot be empty"));
         assert!(err(add(EG, "And", None, &[("Q", "1")], &[])).contains("no input Q"));
@@ -10351,5 +10602,587 @@ mod tests {
         assert!(e.pending, "{e:?}");
         crate::expressions::compare(&mut exprs, Some(&pending), Some(&pending));
         assert!(!exprs[0].pending);
+    }
+
+    // ── objects of the object tree (#84) ────────────────────────────────
+
+    const VI_FOLDER: &str = "10000000-0000-0002-ffff504f94000001";
+    const VO_FOLDER: &str = "10000000-0000-0003-ffff504f94000001";
+    const NET_FOLDER: &str = "10000000-0000-0004-ffff504f94000001";
+    /// A Modbus server Loxone Config made, in Netzwerkperipherie.
+    const WP: &str = "10000000-0000-0005-ffff504f94000001";
+
+    /// The house with a Virtual Outputs folder and a Netzwerkperipherie
+    /// folder holding a Modbus server (made-up address).
+    fn periphery_house() -> LoxoneDoc {
+        let p = format!("{}/tests/fixtures/house.Loxone", env!("CARGO_MANIFEST_DIR"));
+        let s = std::fs::read_to_string(p).unwrap();
+        let add = format!(
+            "\t\t<C Type=\"VirtualOutCaption\" V=\"178\" U=\"{VO_FOLDER}\" Title=\"Virtuelle Ausgänge\">\n\t\t</C>\n\
+             \t\t<C Type=\"WeatherCaption\" V=\"178\" U=\"{NET_FOLDER}\" Title=\"Netzwerkperipherie\">\n\
+             \t\t\t<C Type=\"ModbusServer\" V=\"178\" U=\"{WP}\" Title=\"WP\" Cl=\"0,0,0\" WF=\"16384\" Address=\"192.0.2.12:502\" Timeout=\"2000\">\n\
+             \t\t\t</C>\n\t\t</C>\n"
+        );
+        let i = s.find("\t\t<C Type=\"ModeCaption\"").unwrap();
+        let s = format!("{}{add}{}", &s[..i], &s[i..]);
+        LoxoneDoc::parse(s.as_bytes()).unwrap()
+    }
+
+    /// The element `uuid`'s parent's UUID.
+    fn parent_of(doc: &LoxoneDoc, uuid: &str) -> Option<String> {
+        fn walk(el: &Element, uuid: &str) -> Option<String> {
+            for c in el.child_elements() {
+                if c.attr("U").is_some_and(|u| u.eq_ignore_ascii_case(uuid)) {
+                    return el.attr("U").map(String::from);
+                }
+                if let Some(r) = walk(c, uuid) {
+                    return Some(r);
+                }
+            }
+            None
+        }
+        walk(&doc.xml.root, uuid)
+    }
+
+    #[test]
+    fn objects_of_the_object_tree_are_added_into_their_folder_or_device() {
+        let d = periphery_house();
+        let names = BTreeSet::new();
+        let mut files = Files::default();
+        let mut l = Lockfile::default();
+        let lock = lock_of(&l);
+        let ctx = ctx_of(&d, &d, &lock, None, &names);
+        for op in [
+            add(
+                VI_FOLDER,
+                "VirtualIn",
+                Some("Sollwert"),
+                &[],
+                &[
+                    ("Analog", "on"),
+                    ("MinVal", "5"),
+                    ("MaxVal", "30"),
+                    ("DefVal", "21"),
+                ],
+            ),
+            add(
+                VI_FOLDER,
+                "VirtualHttpIn",
+                Some("Zähler"),
+                &[],
+                &[("Address", "http://192.0.2.10/status"), ("Poll", "1min")],
+            ),
+            add(
+                NET_FOLDER,
+                "ModbusServer",
+                Some("Lüftung"),
+                &[],
+                &[("Address", "192.0.2.13:502")],
+            ),
+            add(WP, "ModbusDev", Some("Regler"), &[], &[]),
+        ] {
+            apply_op(&mut files, &ctx, &op).unwrap();
+        }
+        let r = files.render();
+        let text = &r[crate::periphery::FILE];
+        assert!(!text.contains("page "), "{text}");
+        assert!(
+            text.contains(
+                "vx_virtualhttpin_1 = VirtualHttpIn(\"Zähler\", Address: \"http://192.0.2.10/status\", Poll: 1min)\n"
+            ),
+            "{text}"
+        );
+        let wp = slug(WP);
+        assert!(
+            text.contains(&format!(
+                "vx_modbusdev_1 = ModbusDev(\"Regler\", device: {wp})\n"
+            )),
+            "{text}"
+        );
+        assert!(
+            r[CLAIMS].contains(&format!(
+                "extern {wp} = ModbusServer(uuid: \"{}\")",
+                WP.to_lowercase()
+            )),
+            "{r:?}"
+        );
+        // Read back as written.
+        assert_eq!(Files::from_texts(&r).unwrap().pages, files.pages);
+        let out = compile_files(&d, &files, &mut l).unwrap();
+        let u = |l: &Lockfile, s: &str| l.objects[s].uuid.clone();
+        assert_eq!(
+            parent_of(&out, &u(&l, "vx_virtualin_1")).as_deref(),
+            Some(VI_FOLDER)
+        );
+        assert_eq!(
+            parent_of(&out, &u(&l, "vx_virtualhttpin_1")).as_deref(),
+            Some(VI_FOLDER)
+        );
+        assert_eq!(
+            parent_of(&out, &u(&l, "vx_modbusserver_1")).as_deref(),
+            Some(NET_FOLDER)
+        );
+        assert_eq!(
+            parent_of(&out, &u(&l, "vx_modbusdev_1")).as_deref(),
+            Some(WP)
+        );
+        let http = find(&out.xml.root, &u(&l, "vx_virtualhttpin_1")).unwrap();
+        assert_eq!(http.attr("Poll"), Some("60"));
+        assert_eq!(http.attr("IName"), Some("VHI1"));
+        assert!(lock_of(&l).placed.is_empty(), "no position");
+
+        // Its I/O: below the device just made, and below the one made here.
+        let lock = lock_of(&l);
+        let ctx = ctx_of(&out, &d, &lock, None, &names);
+        let http_u = u(&l, "vx_virtualhttpin_1");
+        let dev_u = u(&l, "vx_modbusdev_1");
+        for op in [
+            add(
+                &http_u,
+                "VirtualHttpInCmd",
+                Some("Leistung"),
+                &[],
+                &[("Check", "\"power\":\\v")],
+            ),
+            add(
+                &dev_u,
+                "ModbusASensor",
+                Some("Vorlauf"),
+                &[],
+                &[("ModbusAddress", "1"), ("MaxTime", "46s")],
+            ),
+        ] {
+            apply_op(&mut files, &ctx, &op).unwrap();
+        }
+        let text = &files.render()[crate::periphery::FILE];
+        assert!(
+            text.contains(
+                "vx_virtualhttpincmd_1 = VirtualHttpInCmd(\"Leistung\", device: vx_virtualhttpin_1, Check: \"\\\"power\\\":\\\\v\")\n"
+            ),
+            "{text}"
+        );
+        let out = compile_files(&d, &files, &mut l).unwrap();
+        let cmd = find(&out.xml.root, &u(&l, "vx_virtualhttpincmd_1")).unwrap();
+        assert_eq!(cmd.attr_decoded("Check").as_deref(), Some("\"power\":\\v"));
+        assert_eq!(
+            parent_of(&out, &u(&l, "vx_virtualhttpincmd_1")),
+            Some(http_u.clone())
+        );
+        let sensor = find(&out.xml.root, &u(&l, "vx_modbusasensor_1")).unwrap();
+        assert_eq!(sensor.attr("MaxTime"), Some("46000"));
+        assert_eq!(
+            parent_of(&out, &u(&l, "vx_modbusasensor_1")),
+            Some(dev_u.clone())
+        );
+        // What vislox's files set, listed and revertable; never where it is.
+        let ops = files.ops(&lock_of(&l));
+        assert!(
+            ops.contains(&Op::Setting {
+                uuid: http_u.clone(),
+                name: "Poll".into(),
+                value: Some("1min".into())
+            }),
+            "{ops:?}"
+        );
+        assert!(
+            !ops.iter()
+                .any(|o| matches!(o, Op::Setting { name, .. } if name == "device")),
+            "{ops:?}"
+        );
+    }
+
+    #[test]
+    fn an_object_is_refused_without_what_lox_needs_and_nothing_changes() {
+        let d = periphery_house();
+        let names = BTreeSet::new();
+        let files = Files::default();
+        let lock = Lock::default();
+        let ctx = ctx_of(&d, &d, &lock, None, &names);
+        for (op, why) in [
+            (
+                add(
+                    VI_FOLDER,
+                    "VirtualHttpIn",
+                    None,
+                    &[],
+                    &[("Address", "http://x")],
+                ),
+                "needs Poll",
+            ),
+            (
+                add(
+                    VI_FOLDER,
+                    "VirtualHttpIn",
+                    None,
+                    &[],
+                    &[("Address", "http://x"), ("Poll", "5")],
+                ),
+                "from 10 to 604800",
+            ),
+            (
+                add(
+                    VI_FOLDER,
+                    "VirtualHttpIn",
+                    None,
+                    &[],
+                    &[("Address", " "), ("Poll", "60")],
+                ),
+                "cannot be empty",
+            ),
+            (
+                add(VI_FOLDER, "VirtualIn", None, &[], &[("MaxVal", "30")]),
+                "would write 1",
+            ),
+            (
+                add(VI_FOLDER, "VirtualIn", None, &[], &[("IName", "VI9")]),
+                "IName cannot be set",
+            ),
+            (
+                add(VI_FOLDER, "VirtualHttpInCmd", None, &[], &[("Check", "x")]),
+                "hangs below a VirtualHttpIn",
+            ),
+            (
+                add(VO_FOLDER, "VirtualIn", None, &[], &[]),
+                "goes into the folder Virtual Inputs",
+            ),
+            (
+                add(WP, "ModbusASensor", None, &[], &[("ModbusAddress", "1")]),
+                "hangs below a ModbusDev",
+            ),
+            (
+                add(
+                    VO_FOLDER,
+                    "VirtualOut",
+                    None,
+                    &[("I", "1")],
+                    &[("Address", "x")],
+                ),
+                "takes no constants",
+            ),
+            (add(EG, "VirtualIn", None, &[], &[]), "goes into the folder"),
+            (
+                add(
+                    "deadbeef-0000-0000-ffff504f94000001",
+                    "ModbusDev",
+                    None,
+                    &[],
+                    &[],
+                ),
+                "no object",
+            ),
+            // A unit only where lox documents one, and checked in it.
+            (
+                add(VI_FOLDER, "VirtualUdpIn", None, &[], &[("Port", "30min")]),
+                "plain number",
+            ),
+            (
+                add(
+                    VI_FOLDER,
+                    "VirtualHttpIn",
+                    None,
+                    &[],
+                    &[("Address", "x"), ("Poll", "5s")],
+                ),
+                "write 10 s",
+            ),
+            (
+                add(
+                    VI_FOLDER,
+                    "VirtualHttpIn",
+                    None,
+                    &[],
+                    &[("Address", "x"), ("Poll", "200h")],
+                ),
+                "write 604800 s",
+            ),
+            (
+                add(WP, "ModbusDev", None, &[], &[("Channel", "70%")]),
+                "plain number",
+            ),
+            // Text by type: a virtual output's command separator is text, its
+            // CloseAfterSend on or off.
+            (
+                add(
+                    VO_FOLDER,
+                    "VirtualOut",
+                    None,
+                    &[],
+                    &[("Address", "x"), ("CloseAfterSend", "maybe")],
+                ),
+                "on or off",
+            ),
+        ] {
+            let mut f = files.clone();
+            let e = apply_op(&mut f, &ctx, &op).unwrap_err();
+            assert!(e.contains(why), "{why}: {e}");
+            assert_eq!(f, files);
+        }
+        // An object of the object tree is not a page block, nor a page block one.
+        let e = Files::from_texts(&BTreeMap::from([(
+            "erdgeschoss.loxl".to_string(),
+            "page \"Erdgeschoss\"\nvx_virtualin_1 = VirtualIn()\n".to_string(),
+        )]))
+        .unwrap_err();
+        assert!(e.contains("vislox did not write"), "{e}");
+        let e = Files::from_texts(&BTreeMap::from([(
+            crate::periphery::FILE.to_string(),
+            "vx_and_1 = And()\n".to_string(),
+        )]))
+        .unwrap_err();
+        assert!(e.contains("vislox did not write"), "{e}");
+    }
+
+    #[test]
+    fn an_objects_settings_are_edited_and_it_is_taken_out_and_deleted_like_a_block() {
+        let d = periphery_house();
+        let names = BTreeSet::new();
+        let mut files = Files::default();
+        let mut l = Lockfile::default();
+        let lock = lock_of(&l);
+        let ctx = ctx_of(&d, &d, &lock, None, &names);
+        apply_op(
+            &mut files,
+            &ctx,
+            &add(
+                VI_FOLDER,
+                "VirtualUdpIn",
+                Some("UDP"),
+                &[],
+                &[("Port", "7000")],
+            ),
+        )
+        .unwrap();
+        let out = compile_files(&d, &files, &mut l).unwrap();
+        let udp = l.objects["vx_virtualudpin_1"].uuid.clone();
+        let lock = lock_of(&l);
+        let ctx = ctx_of(&out, &d, &lock, None, &names);
+        apply_op(
+            &mut files,
+            &ctx,
+            &add(
+                &udp,
+                "VirtualUdpInCmd",
+                Some("T"),
+                &[],
+                &[("Check", "t=\\v")],
+            ),
+        )
+        .unwrap();
+        let out = compile_files(&d, &files, &mut l).unwrap();
+        let cmd = l.objects["vx_virtualudpincmd_1"].uuid.clone();
+        let lock = lock_of(&l);
+        let ctx = ctx_of(&out, &d, &lock, None, &names);
+        let set = |name: &str, v: Option<&str>| Op::Setting {
+            uuid: cmd.clone(),
+            name: name.into(),
+            value: v.map(Into::into),
+        };
+        // Its settings: changed, their undo the value before; a required one
+        // stays; one a save rewrites is refused.
+        let r = apply_op(&mut files, &ctx, &set("MaxTime", Some("30s"))).unwrap();
+        assert_eq!(r.previous, serde_json::Value::Null);
+        let r = apply_op(&mut files, &ctx, &set("Check", Some("v=\\v"))).unwrap();
+        assert_eq!(r.previous, serde_json::json!("t=\\v"));
+        let e = apply_op(&mut files.clone(), &ctx, &set("Check", None)).unwrap_err();
+        assert!(e.contains("needs Check"), "{e}");
+        let e = apply_op(&mut files.clone(), &ctx, &set("ValOT", Some("1.5"))).unwrap_err();
+        assert!(e.contains("would write 1"), "{e}");
+        apply_op(
+            &mut files,
+            &ctx,
+            &Op::Title {
+                uuid: cmd.clone(),
+                value: Some("Temp".into()),
+            },
+        )
+        .unwrap();
+        let out = compile_files(&d, &files, &mut l).unwrap();
+        let el = find(&out.xml.root, &cmd).unwrap();
+        assert_eq!(
+            (el.attr("MaxTime"), el.attr("Title")),
+            (Some("30000"), Some("Temp"))
+        );
+
+        // The device is not taken out while its command hangs below it.
+        let lock = lock_of(&l);
+        let ctx = ctx_of(&out, &d, &lock, None, &names);
+        let e = delete_refusal(&files, &ctx, &udp).unwrap();
+        assert!(e.contains("Temp hangs below it"), "{e}");
+        // The command, not deployed, is taken out; its undo adds it again below its device.
+        let r = apply_op(&mut files, &ctx, &Op::RemoveBlock { uuid: cmd.clone() }).unwrap();
+        let again: Op = serde_json::from_value(r.previous).unwrap();
+        let Op::AddBlock {
+            ref page,
+            ref settings,
+            ..
+        } = again
+        else {
+            panic!("{again:?}")
+        };
+        assert_eq!(page, &udp);
+        assert_eq!(settings.get("Check").map(String::as_str), Some("v=\\v"));
+        assert!(!settings.contains_key("device"));
+        apply_op(&mut files, &ctx, &again).unwrap();
+
+        // Deployed: deleted from the config, and back with its UUIDs.
+        let deployed = compile_files(&d, &files, &mut l).unwrap();
+        let base = deployed.clone();
+        let cmd = l.objects["vx_virtualudpincmd_2"].uuid.clone();
+        let was = identity(&deployed, &cmd);
+        let lock = lock_of(&l);
+        let ctx = ctx_of(&deployed, &base, &lock, Some(&deployed), &names);
+        let r = apply_op(&mut files, &ctx, &Op::RemoveBlock { uuid: cmd.clone() }).unwrap();
+        let again: Op = serde_json::from_value(r.previous).unwrap();
+        let Op::RestoreBlock {
+            ref page, ref lock, ..
+        } = again
+        else {
+            panic!("{again:?}")
+        };
+        assert_eq!(page, &udp);
+        assert!(lock["layout"].is_null());
+        let gone = compile_files(&base, &files, &mut l).unwrap();
+        assert!(find(&gone.xml.root, &cmd).is_none());
+        let lock = lock_of(&l);
+        files.tidy(&lock);
+        let ctx = ctx_of(&gone, &base, &lock, Some(&deployed), &names);
+        // Put elsewhere than its declaration says: refused.
+        let mut moved = again.clone();
+        if let Op::RestoreBlock { page, .. } = &mut moved {
+            *page = VI_FOLDER.into();
+        }
+        let e = apply_op(&mut files.clone(), &ctx, &moved).unwrap_err();
+        assert!(e.contains("elsewhere"), "{e}");
+        apply_op(&mut files, &ctx, &again).unwrap();
+        l = edit_lock(&l, &files.lock_edits);
+        files.lock_edits = Default::default();
+        let back = compile_files(&base, &files, &mut l).unwrap();
+        assert_eq!(identity(&back, &cmd), was);
+        assert!(loxone_config::diff::diff(&deployed, &back).logic_is_empty());
+
+        // Renamed: what hangs below it follows.
+        let lock = lock_of(&l);
+        let ctx = ctx_of(&back, &base, &lock, Some(&deployed), &names);
+        apply_op(
+            &mut files,
+            &ctx,
+            &Op::Rename {
+                uuid: udp.clone(),
+                slug: "vx_udp".into(),
+            },
+        )
+        .unwrap();
+        let text = &files.render()[crate::periphery::FILE];
+        assert!(text.contains("device: vx_udp,"), "{text}");
+        assert!(text.contains("moved vx_virtualudpin_1 -> vx_udp"), "{text}");
+        let renamed = compile_files(&base, &files, &mut l).unwrap();
+        assert!(loxone_config::diff::diff(&back, &renamed).logic_is_empty());
+    }
+
+    #[test]
+    fn a_device_is_not_deleted_with_what_loxone_config_hung_below_it() {
+        let d = periphery_house();
+        let names = BTreeSet::new();
+        let mut files = Files::default();
+        let mut l = Lockfile::default();
+        let lock = lock_of(&l);
+        let ctx = ctx_of(&d, &d, &lock, None, &names);
+        apply_op(
+            &mut files,
+            &ctx,
+            &add(
+                VO_FOLDER,
+                "VirtualOut",
+                Some("Out"),
+                &[],
+                &[("Address", "http://192.0.2.20"), ("CmdSep", ";")],
+            ),
+        )
+        .unwrap();
+        let out = compile_files(&d, &files, &mut l).unwrap();
+        let vo = l.objects["vx_virtualout_1"].uuid.clone();
+        // Deployed, then Loxone Config hung a command below it.
+        let text = String::from_utf8(out.to_bytes()).unwrap();
+        let at = text.find(&format!("U=\"{vo}\"")).unwrap();
+        let end = at + text[at..].find('>').unwrap() + 1;
+        let with = format!(
+            "{}\n<C Type=\"VirtualOutCmd\" V=\"178\" U=\"a0000003-0000-0000-ffff504f94000001\" Title=\"Licht an\" CmdOn=\"/on\"><Co K=\"I\" U=\"a0000003-0000-0001-ffff504f94000001\"/></C>{}",
+            &text[..end],
+            &text[end..]
+        );
+        let base = LoxoneDoc::parse(with.as_bytes()).unwrap();
+        let lock = lock_of(&l);
+        let ctx = ctx_of(&base, &base, &lock, Some(&base), &names);
+        let e = delete_refusal(&files, &ctx, &vo).unwrap();
+        assert!(
+            e.contains("Licht an below it was made in Loxone Config"),
+            "{e}"
+        );
+        let mut f = files.clone();
+        let e = apply_op(&mut f, &ctx, &Op::RemoveBlock { uuid: vo.clone() }).unwrap_err();
+        assert!(e.contains("Licht an"), "{e}");
+        assert_eq!(f, files);
+        // Only in the base (the pending config lost it): refused all the same.
+        let ctx = ctx_of(&out, &base, &lock, Some(&base), &names);
+        assert!(
+            delete_refusal(&files, &ctx, &vo)
+                .unwrap()
+                .contains("Licht an")
+        );
+        // A command of vislox's own below it is named as such.
+        let ctx = ctx_of(&base, &base, &lock, Some(&base), &names);
+        apply_op(
+            &mut files,
+            &ctx,
+            &add(
+                &vo,
+                "VirtualOutCmd",
+                Some("Aus"),
+                &[],
+                &[("CmdOff", "/off")],
+            ),
+        )
+        .unwrap();
+        assert!(
+            delete_refusal(&files, &ctx, &vo)
+                .unwrap()
+                .contains("hangs below it")
+        );
+    }
+
+    #[test]
+    fn where_an_object_can_be_added_is_served_with_the_reason() {
+        let d = periphery_house();
+        let names = BTreeSet::new();
+        let lock = Lock::default();
+        let ctx = ctx_of(&d, &d, &lock, None, &names);
+        let m = crate::periphery::add_refusals(&Files::default(), &ctx);
+        assert_eq!(m[VI_FOLDER], serde_json::Value::Null);
+        assert_eq!(m[WP], serde_json::Value::Null);
+        assert!(!m.contains_key(EG), "a page takes none");
+        // Two Virtual Outputs folders: lox adds to the one there is, so neither takes one.
+        let text = String::from_utf8(d.to_bytes()).unwrap().replacen(
+            "<C Type=\"VirtualOutCaption\"",
+            "<C Type=\"VirtualOutCaption\" V=\"178\" U=\"a0000009-0000-0000-ffff504f94000001\" Title=\"Zwei\"></C>\n<C Type=\"VirtualOutCaption\"",
+            1,
+        );
+        let two = LoxoneDoc::parse(text.as_bytes()).unwrap();
+        let ctx = ctx_of(&two, &two, &lock, None, &names);
+        let m = crate::periphery::add_refusals(&Files::default(), &ctx);
+        assert!(
+            m[VO_FOLDER].as_str().unwrap().contains("2 folders"),
+            "{m:?}"
+        );
+        // A device not in the base: lox resolves an extern there.
+        let plain = doc("house.Loxone");
+        let ctx = ctx_of(&d, &plain, &lock, None, &names);
+        let m = crate::periphery::add_refusals(&Files::default(), &ctx);
+        assert!(
+            m[WP]
+                .as_str()
+                .unwrap()
+                .contains("not in the project's base"),
+            "{m:?}"
+        );
     }
 }

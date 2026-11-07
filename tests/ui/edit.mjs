@@ -114,6 +114,12 @@ ${gateXml("GreaterEqual", NORD_G, "Nord", 960, null)}\t\t</C>
 const ausdruckXml = `\t\t<C Type="Page" V="178" U="${AUSDRUCK}" Title="Ausdruck" WF="16384">
 ${gateXml("GreaterEqual", EXG, "teiler.AQ &gt;= 28", 960, null)}${gateXml("And", EXA, "licht.Q and teiler.AQ &gt;= 28", 2880, `${EXG.slice(0, 14)}0003-${EXG.slice(19)}`)}${gateXml("And", MARK, "Markise", 4800, `${EXA.slice(0, 14)}0003-${EXA.slice(19)}`)}${gateXml("And", PUMPE, "Pumpe", 6720, null)}\t\t</C>
 `;
+// Objects of the object tree (#84): the house's Virtual Inputs folder (VI_F), a Virtual Outputs folder and a
+// Netzwerkperipherie folder with a Modbus server Loxone Config made (WP, a made-up address).
+const VI_F = "10000000-0000-0002-ffff504f94000001", NET_F = "7e000001-0000-0000-ffff504f94000001", WP = "7e000002-0000-0000-ffff504f94000001";
+const periphXml = `\t\t<C Type="VirtualOutCaption" V="178" U="7e000000-0000-0000-ffff504f94000001" Title="Virtuelle Ausgänge">\n\t\t</C>\n` +
+  `\t\t<C Type="WeatherCaption" V="178" U="${NET_F}" Title="Netzwerkperipherie">\n` +
+  `\t\t\t<C Type="ModbusServer" V="178" U="${WP}" Title="Wärmepumpe" Cl="0,0,0" WF="16384" Address="192.0.2.12:502" Timeout="2000">\n\t\t\t</C>\n\t\t</C>\n`;
 const KITCHEN = "30000a01-0000-0000-ffff504f94000001", BATH = "30000a02-0000-0000-ffff504f94000001";
 // Two analog Daytimers on the upper floor (#73): Uhr, on Mondays 06:30–08:00 and in the Party mode 18:00–23:00,
 // and Heizung, with no switching times; and Licht, a digital one.
@@ -229,7 +235,9 @@ const base0 = readFileSync(fixture, "utf8").replace('<Co K="Q" U="10000009-0000-
     `\t\t\t<C Type="OutputRefLM" V="178" U="${WARN}" Title="Frostwarnung" Px="960" Py="960" Px2="2304" Py2="1656" Cl="0,0,0" Nio="2" Ref="${FROST}"><Co K="AI" U="40000031-0000-0001-ffff504f94000001"/><Co K="AQ" U="40000031-0000-0002-ffff504f94000001"/><LoggerMailer RefNotification="${FROST}" On="Frost im Garten" MinimumTime="43200000" NL="1"/></C>\n` +
     "\t\t</C>\n" + zeitenXml + konstXml + ausdruckXml + vorlagenXml + "\t</C>\n</ControlList>");
 const base = base0.replace(`\t\t<C Type="Place" V="178" U="${KITCHEN}"`, `${flexXml}\t\t<C Type="Place" V="178" U="${KITCHEN}"`)
-  .replace(`\t\t<C Type="Page" V="178" U="${MELDUNGEN}"`, `${beschXml}\t\t<C Type="Page" V="178" U="${MELDUNGEN}"`);
+  .replace(`\t\t<C Type="Page" V="178" U="${MELDUNGEN}"`, `${beschXml}\t\t<C Type="Page" V="178" U="${MELDUNGEN}"`)
+  .replace('\t\t<C Type="ModeCaption"', `${periphXml}\t\t<C Type="ModeCaption"`);
+assert.ok(base.includes(WP), "the Modbus server is in the base");
 assert.ok(base.includes(FLEX) && base.includes(OST), "the Touch Pure Flex is in the base");
 assert.ok(base.includes(lagerUuid(LAGER_N - 1)), "the Lager page is in the base");
 writeFileSync(join(dir, "base.Loxone"), base);
@@ -558,8 +566,28 @@ const instance = (slug, tname, rest, pageAt) => {
     out.splice(pageAt + 1, 0, \`\\t\\t\\t<C Type="\${b.ty}" V="178" U="\${uuid}" Title="\${xml(title)}" Px="96" Py="96" Px2="1440" Py2="792" Nio="2"><Co K="Q" U="\${uuid.slice(0, 9)}0000-0030-ffff504f94000001"/></C>\`);
   }
 };
+// Objects of the object tree (#84): vislox's _periphery.loxl, with no page. A device goes into its folder, an I/O
+// below the device its \`device:\` names (an extern of edits.loxl, or a device declared above it), each with the
+// settings its declaration binds as attributes.
+const FOLDER = { VirtualIn: "VirtualInCaption", VirtualHttpIn: "VirtualInCaption", VirtualUdpIn: "VirtualInCaption", VirtualTextIn: "VirtualInCaption", VirtualOut: "VirtualOutCaption", ModbusServer: "WeatherCaption" };
+if (fs.existsSync("pages/vislox/_periphery.loxl")) {
+  for (const line of fs.readFileSync("pages/vislox/_periphery.loxl", "utf8").split("\\n")) {
+    const m = line.match(/^(vx_\\w+) = (\\w+)\\((.*)\\)$/);
+    if (!m) continue;
+    const [, slug, ty, rest] = m;
+    const uuid = lock.objects[slug]?.uuid || \`dddddd\${String(++n).padStart(2, "0")}-0000-0000-ffff504f94000001\`;
+    objects[slug] = { uuid, type: ty, ports: {}, layout: null };
+    const dev = rest.match(/device: (\\w+)/), at = dev ? (slugs[dev[1]] || objects[dev[1]]?.uuid) : null;
+    const i = out.findIndex((l) => l.includes("<C ") && (at ? l.includes(\`U="\${at}"\`) : l.includes(\`Type="\${FOLDER[ty]}"\`)));
+    if (i < 0) { console.error(\`error: compile error: \\\`\${slug}\\\`: no \${at ? "device " + at : FOLDER[ty]} in the base\`); process.exit(1); }
+    const title = rest.match(/^"((?:[^"\\\\]|\\\\.)*)"/);
+    const attrs = [...rest.matchAll(/(\\w+): ("(?:[^"\\\\]|\\\\.)*"|[^,]+)/g)].filter(([, k]) => k !== "device")
+      .map(([, k, v]) => \` \${k}="\${xml(v.startsWith('"') ? JSON.parse(v) : v === "on" ? "true" : v === "off" ? "false" : scale(v))}"\`).join("");
+    out.splice(i + 1, 0, \`\\t\\t\\t<C Type="\${ty}" V="178" U="\${uuid}" Title="\${xml(title ? JSON.parse('"' + title[1] + '"') : slug)}"\${attrs}>\`, "\\t\\t\\t</C>");
+  }
+}
 for (const f of fs.existsSync("pages/vislox") ? fs.readdirSync("pages/vislox") : []) {
-  if (f === "edits.loxl" || f === "templates.loxl" || !f.endsWith(".loxl")) continue;
+  if (f === "edits.loxl" || f === "templates.loxl" || f === "_periphery.loxl" || !f.endsWith(".loxl")) continue;
   let pageAt = -1, instancing = false;
   for (const line of fs.readFileSync("pages/vislox/" + f, "utf8").split("\\n")) {
     let m;
@@ -2814,6 +2842,104 @@ try {
     await undoKey(false, () => S.edits && !S.edits.templates.instances.some((i) => i.path === "vx_treppenlicht_1"));
     assert.equal(vfile("templates.loxl"), "");
   });
+  await step("virtual inputs and Modbus devices are added from the project tree, edited and taken out (#84)", async () => {
+    await settled();
+    const send = async (act, what) => {
+      const n = edits.length;
+      await act();
+      await until(() => edits.length > n && statuses[n] !== undefined, what);
+      assert.equal(statuses[n], 200, what);
+      await settled();
+      return edits[n].ops;
+    };
+    const pfile = () => { const p = join(dir, "pages", "vislox", "_periphery.loxl"); return existsSync(p) ? readFileSync(p, "utf8") : ""; };
+    const claims = () => readFileSync(join(dir, "pages", "vislox", "edits.loxl"), "utf8");
+    const row = (u) => `#tree .tn-row[data-uuid="${u}"]`;
+    // The Virtual Inputs folder offers Add; a page does not.
+    await page.evaluate((u) => revealInTree(u), VI_F);
+    await page.waitForSelector(`${row(VI_F)} [data-add-under]:not([disabled])`);
+    assert.equal(await page.$(`${row(OG)} [data-add-under]`), null);
+    await page.click(`${row(VI_F)} [data-add-under]`);
+    await page.waitForSelector("#ab-q");
+    assert.equal(await page.textContent("#ab-h"), "Add an object");
+    assert.deepEqual(await page.$$eval("#ab-list [role=option] .ac", (n) => n.map((x) => x.textContent).sort()), ["VirtualHttpIn", "VirtualIn", "VirtualTextIn", "VirtualUdpIn"]);
+    await page.fill("#ab-q", "VirtualHttpIn");
+    await page.press("#ab-q", "Enter");
+    await page.waitForSelector('#ab-body [data-ab-field="s:Address"]');
+    // Address and Poll come first: lox makes none without them, and the browser says so before it sends anything.
+    assert.deepEqual((await page.$$eval("#ab-body [data-ab-field]", (n) => n.map((x) => x.dataset.abField))).slice(0, 3), ["title", "s:Address", "s:Poll"]);
+    await page.fill('#ab-body [data-ab-field="title"]', "Zähler");
+    await page.fill('#ab-body [data-ab-field="s:Address"]', "http://192.0.2.10/status");
+    const n0 = edits.length;
+    await page.click('#ab-body [data-ab="add"]');
+    await page.waitForSelector('#ab-body [data-ab-field="s:Poll"][aria-invalid="true"]');
+    assert.equal(edits.length, n0, "nothing sent without Poll");
+    await page.fill('#ab-body [data-ab-field="s:Poll"]', "1min");
+    let ops = await send(() => page.click('#ab-body [data-ab="add"]'), "add a virtual HTTP input");
+    assert.deepEqual(ops, [{ op: "add_block", page: VI_F, type: "VirtualHttpIn", title: "Zähler", params: {}, settings: { Address: "http://192.0.2.10/status", Poll: "1min" } }]);
+    assert.match(pfile(), /^vx_virtualhttpin_1 = VirtualHttpIn\("Zähler", Address: "http:\/\/192\.0\.2\.10\/status", Poll: 1min\)$/m);
+    assert.doesNotMatch(pfile(), /^page /m);
+    // It is selected, in the tree below the folder, added here and not deployed.
+    const http = await (await page.waitForFunction(() => S.edits?.blocks?.find((b) => b.slug === "vx_virtualhttpin_1")?.uuid, null, { timeout: 20000 })).jsonValue();
+    await page.waitForFunction((u) => ciEq(S.sel, u), http);
+    await page.waitForSelector(`${row(http)}`);
+    await waitText('[data-body="Edit"]', /added here[\s\S]*not deployed/);
+    // Its command: the device offers only what hangs below it.
+    await page.click(`${row(http)} [data-add-under]`);
+    await page.waitForSelector("#ab-q");
+    assert.deepEqual(await page.$$eval("#ab-list [role=option] .ac", (n) => n.map((x) => x.textContent)), ["VirtualHttpInCmd"]);
+    await page.press("#ab-q", "Enter");
+    await page.fill('#ab-body [data-ab-field="title"]', "Leistung");
+    await page.fill('#ab-body [data-ab-field="s:Check"]', '"power":\\v');
+    ops = await send(() => page.click('#ab-body [data-ab="add"]'), "add its command");
+    assert.deepEqual(ops, [{ op: "add_block", page: http, type: "VirtualHttpInCmd", title: "Leistung", params: {}, settings: { Check: '"power":\\v' } }]);
+    assert.match(pfile(), /^vx_virtualhttpincmd_1 = VirtualHttpInCmd\("Leistung", device: vx_virtualhttpin_1, Check: "\\"power\\":\\\\v"\)$/m);
+    // A device of Loxone Config's: the Modbus server takes a Modbus device, through vislox's extern of it.
+    await page.evaluate((u) => revealInTree(u), WP);
+    await page.waitForSelector(`${row(WP)} [data-add-under]:not([disabled])`);
+    await page.click(`${row(WP)} [data-add-under]`);
+    await page.waitForSelector("#ab-q");
+    await page.press("#ab-q", "Enter");
+    await page.fill('#ab-body [data-ab-field="title"]', "Regler");
+    ops = await send(() => page.press('#ab-body [data-ab-field="title"]', "Enter"), "add a Modbus device");
+    assert.deepEqual(ops, [{ op: "add_block", page: WP, type: "ModbusDev", title: "Regler", params: {}, settings: {} }]);
+    const wp = `vx_${WP.replace(/-/g, "_")}`;
+    assert.match(pfile(), new RegExp(`^vx_modbusdev_1 = ModbusDev\\("Regler", device: ${wp}\\)$`, "m"));
+    assert.ok(claims().includes(`extern ${wp} = ModbusServer(uuid: "${WP}")`), claims());
+    // The Changes list names what was added.
+    await waitText("#changes", /Zähler/);
+    await waitText("#changes", /Leistung/);
+    // A setting changed in Properties; a required one cannot go, and the server says so.
+    await page.evaluate((u) => { select(u); revealInTree(u); }, http);
+    await page.waitForFunction((u) => ciEq(S.sel, u) && document.querySelector('#props [data-ed="open"]'), http);
+    await page.click('#props [data-ed="open"]');
+    assert.equal(await page.inputValue(field("s:Poll")), "1min");
+    await page.fill(field("s:Poll"), "120");
+    ops = await send(() => page.click('#props [data-ed="save"]'), "change the polling cycle");
+    assert.deepEqual(ops, [{ op: "setting", uuid: http, name: "Poll", value: "120" }]);
+    assert.match(pfile(), /Poll: 120\)$/m);
+    await page.waitForFunction(() => document.querySelector('#props [data-ed="open"]'));
+    await page.click('#props [data-ed="open"]');
+    await page.fill(field("s:Address"), "");
+    const n1 = edits.length;
+    await page.click('#props [data-ed="save"]');
+    await until(() => statuses[n1] !== undefined, "the refused setting");
+    assert.equal(statuses[n1], 422);
+    await waitText("#props", /needs Address/);
+    assert.match(pfile(), /Address: "http:\/\/192\.0\.2\.10\/status"/);
+    await page.click('#props [data-ed="cancel"]');
+    // The device cannot go while its command hangs below it: Remove is off, with the reason.
+    await page.waitForSelector('#props [data-ed="remove"][disabled]');
+    assert.match(await page.getAttribute('#props [data-ed="remove"]', "title"), /Leistung hangs below it/);
+    // Undone in turn: the setting, the Modbus device (and the extern with it), the command, the input.
+    await undoKey(false, () => S.edits?.blocks.find((b) => b.slug === "vx_virtualhttpin_1")?.settings.find((x) => x.name === "Poll")?.value === "1min");
+    assert.match(pfile(), /Poll: 1min\)$/m);
+    await undoKey(false, () => !S.edits?.blocks.some((b) => b.slug === "vx_modbusdev_1"));
+    assert.ok(!claims().includes(wp), claims());
+    await undoKey(false, () => !S.edits?.blocks.some((b) => b.slug === "vx_virtualhttpincmd_1"));
+    await undoKey(false, () => !S.edits?.blocks.some((b) => b.slug === "vx_virtualhttpin_1"));
+    assert.doesNotMatch(pfile(), /= Virtual/);
+  });
   await step("nothing was deployed: lox only compiled, checked, linted and tested", async () => {
     const ran = readFileSync(calls, "utf8").trim().split("\n");
     assert.ok(ran.length >= 2, ran.join(" | "));
@@ -2832,6 +2958,7 @@ try {
   if (page) console.error("check:", await page.evaluate(() => JSON.stringify(S.check)).catch(() => "?"));
   if (page) console.error("server check:", await page.evaluate(async () => JSON.stringify([S.checkKey, S.hist?.actions?.edit, await (await fetch("/api/check")).json()])).catch(() => "?"));
   if (page) console.error("add block:", await page.textContent("#ab-body").catch(() => "?"));
+  if (page) console.error("changes:", await page.textContent("#changes").catch(() => "?"));
   if (page) console.error("wire card:", await page.textContent("#wcard").catch(() => "?"), "| deploy:", await page.textContent("#deploy-msg").catch(() => "?"));
   console.error(log);
 } finally {

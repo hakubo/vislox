@@ -969,3 +969,6 @@ rect.ghost, line.ghost { fill: #1f6fd10a; stroke: var(--moved); stroke-opacity: 
 .lod-far .tpl-a { display: none; }
 .chg-tpl .mono { color: #5b3f96; }
 .tp-form .tm { font-size: 11px; }
+/* Add on a folder or device of the object tree (#84). */
+.tn-add + .badge, .tn-add + .tn-n { margin-left: 6px; }
+.tn-add:disabled { opacity: .5; cursor: default; }

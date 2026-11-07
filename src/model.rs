@@ -2666,8 +2666,15 @@ fn changes(view: &mut View, nc: &Ctx, oc: &Ctx, d: &Delta) {
         x
     };
     // Leave out ports' owners' children noise: only report top objects whose parent is not also added.
+    // An I/O of a virtual or Modbus device (#84) is listed all the same: each is a value read or a
+    // command sent, and its settings are its own.
+    let io = |ctx: &Ctx, u: &str| {
+        let ty = ctx.ty(u);
+        loxone_config::connectors::object_tree(&ty)
+            && loxone_config::connectors::container_type(&ty).is_none()
+    };
     for u in sorted(&d.added, nc) {
-        if nc.parent.get(&u).is_some_and(|p| d.added.contains(p)) {
+        if nc.parent.get(&u).is_some_and(|p| d.added.contains(p)) && !io(nc, &u) {
             continue;
         }
         view.stats.added += 1;
@@ -2682,7 +2689,7 @@ fn changes(view: &mut View, nc: &Ctx, oc: &Ctx, d: &Delta) {
         });
     }
     for u in sorted(&d.removed, oc) {
-        if oc.parent.get(&u).is_some_and(|p| d.removed.contains(p)) {
+        if oc.parent.get(&u).is_some_and(|p| d.removed.contains(p)) && !io(oc, &u) {
             continue;
         }
         view.stats.removed += 1;
@@ -4910,6 +4917,34 @@ mod tests {
         assert!(hint(MS_IN, "MinChange").is_none());
         assert!(hint(TOUCH_TEMP, "MinChange").is_none());
         assert!(v.hardware.is_empty() && v.stats.devices == 0);
+    }
+
+    /// Objects of the object tree (#84): an added device lists its I/O too,
+    /// and a changed setting reads old → new.
+    #[test]
+    fn a_virtual_device_and_its_commands_are_reviewed() {
+        let base = HOUSE.to_string();
+        let folder = "<C Type=\"VirtualInCaption\" V=\"178\" U=\"10000000-0000-0002-ffff504f94000001\" Title=\"Virtuelle Eingänge\">";
+        assert!(base.contains(folder));
+        let with = |poll: &str| {
+            base.replace(
+                folder,
+                &format!(
+                    "{folder}\n<C Type=\"VirtualHttpIn\" V=\"178\" U=\"a0000001-0000-0000-ffff504f94000001\" Title=\"Zähler\" Address=\"http://192.0.2.10/\" Poll=\"{poll}\">\n\
+                     <C Type=\"VirtualHttpInCmd\" V=\"178\" U=\"a0000002-0000-0000-ffff504f94000001\" Title=\"Leistung\" Check=\"\\v\"><Co K=\"AQ\" U=\"a0000002-0000-0001-ffff504f94000001\"/></C>\n</C>"
+                ),
+            )
+        };
+        let v = build(&doc(&with("60")), Some(&doc(&base)), "t");
+        let texts: Vec<&str> = v.changes.iter().map(|c| c.text.as_str()).collect();
+        assert!(texts.contains(&"Zähler (VirtualHttpIn)"), "{texts:?}");
+        assert!(texts.contains(&"Leistung (VirtualHttpInCmd)"), "{texts:?}");
+        let v = build(&doc(&with("120")), Some(&doc(&with("60"))), "t");
+        assert!(
+            v.changes.iter().any(|c| c.text.contains("Poll: 60 → 120")),
+            "{:?}",
+            v.changes.iter().map(|c| &c.text).collect::<Vec<_>>()
+        );
     }
 
     #[test]

@@ -1466,9 +1466,12 @@ function renderTree() {
     const ty = extra ?? (!kids && name !== prettyType(n.ty) ? prettyType(n.ty) : "");
     const tipText = calTip(S.view.objects[n.uuid]?.calendar);
     const year = MODES_FOLDERS.has(n.ty) ? '<button type="button" class="tn-year" data-modes tabindex="-1" title="Operating modes: a year calendar of when each mode is on">Year</button>' : "";
+    // A folder or device of the object tree takes new virtual inputs, outputs and Modbus devices (#84).
+    const pst = n.synthetic ? null : periphAddState(n);
+    const add = pst ? `<button type="button" class="tn-year tn-add" data-add-under tabindex="-1"${pst.ok ? "" : " disabled"} title="${esc(pst.ok ? `Add to ${name} (it is compiled, not deployed)` : pst.why)}">Add</button>` : "";
     const num = n.ty === "Page" || n.ty === "Refs" ? `<span class="tn-n">${n.ty === "Page" ? treeChildren(n).reduce((a, c) => a + (c.synthetic ? 0 : 1), 0) : n.children.length}</span>` : "";
     return `<div class="tn-row ${marks ? n.status : ""}${n.uuid === S.sel ? " sel" : ""}${n.uuid === S.treeFocus ? " kfocus" : ""}" role="treeitem" aria-level="${depth + 1}"${kids ? ` aria-expanded="${open}"` : ""} aria-selected="${n.uuid === S.sel}" data-uuid="${esc(n.uuid)}"${tipText ? ` title="${esc(tipText)}"` : ""} style="padding-left:${4 + depth * 14}px">` +
-      `<span class="tn-tw${open ? " open" : ""}" aria-hidden="true">${kids ? "▶" : ""}</span>${icon(n)}<span class="tn-t">${esc(name)}</span>${ty ? `<span class="tn-ty">${esc(ty)}</span>` : ""}${year}${badge}${num}</div>`;
+      `<span class="tn-tw${open ? " open" : ""}" aria-hidden="true">${kids ? "▶" : ""}</span>${icon(n)}<span class="tn-t">${esc(name)}</span>${ty ? `<span class="tn-ty">${esc(ty)}</span>` : ""}${year}${add}${badge}${num}</div>`;
   };
   if (q) {
     const out = [];
@@ -1537,11 +1540,12 @@ $("tree").addEventListener("click", (e) => {
   const uuid = row.dataset.uuid;
   S.treeFocus = uuid;
   if (e.target.closest("[data-modes]")) { modesOpen(); return; }
+  if (e.target.closest("[data-add-under]")) { abOpenUnder(uuid); return; }
   if (e.target.closest(".tn-tw") && row.hasAttribute("aria-expanded")) { toggleNode(uuid); return; }
   activateNode(uuid);
 });
 $("tree").addEventListener("dblclick", (e) => {
-  if (e.target.closest("[data-modes]")) return;
+  if (e.target.closest("[data-modes], [data-add-under]")) return;
   const row = e.target.closest(".tn-row");
   if (row && row.hasAttribute("aria-expanded")) toggleNode(row.dataset.uuid);
 });
@@ -3166,7 +3170,7 @@ S.edits = null; // GET /api/edits: what vislox's file claims, and which of it is
 S.edit = { uuid: null, open: false, draft: {}, bad: {}, busy: false, msg: "", err: "" };
 S.editsKey = null; // the server's key of what /api/edits says (vislox's file, deployed and pending config)
 async function loadEdits() {
-  const was = managedSet(), consts = JSON.stringify(S.edits?.constants || null), exprs = JSON.stringify([S.edits?.expressions || null, S.edits?.templates?.instances || null, S.edits?.templates?.templates || null]);
+  const was = managedSet(), under = JSON.stringify(S.edits?.add_under || null), consts = JSON.stringify(S.edits?.constants || null), exprs = JSON.stringify([S.edits?.expressions || null, S.edits?.templates?.instances || null, S.edits?.templates?.templates || null]);
   if (!S.hist?.actions?.shown) { S.edits = null; managedRefresh(was); return; }
   try { S.edits = await api("/api/edits"); } catch { S.edits = null; S.editsKey = null; }
   // The managed blocks' badges and the legend follow the lockfile and the module (#64); the expressions'
@@ -3177,6 +3181,8 @@ async function loadEdits() {
   // The claims' λ file:line in Rights and schedules too (#68); the changes a constant causes, grouped (#81).
   if (S.view) S.view.compared && (JSON.stringify(S.edits?.constants || null) !== consts || exprsNow !== exprs) ? renderChanges() : renderRights();
   renderActions();
+  // Where the tree offers Add (#84) follows the server's `add_under`.
+  if (S.view && JSON.stringify(S.edits?.add_under || null) !== under) renderTree();
   if (S.sel && S.view) renderProps();
 }
 /** Fetch the edits again only when the server says they may have changed. */
@@ -3948,6 +3954,13 @@ function editFields(o) {
       for (const st of nb.settings || []) f.push([`s:${st.name}`, st.name === "MinimumTime" ? "Minimum time" : st.name, st.value ?? "", st.kind]);
       return f;
     }
+    // An object of the object tree (#84): its name and settings; a number may carry its unit, and a setting lox
+    // needs stays (the server refuses an empty one).
+    if (nb.periphery) {
+      f.push(["title", "Name", o.title || "", "text"]);
+      for (const st of nb.settings || []) f.push([`s:${st.name}`, st.required ? `${st.name} (required)` : st.name, st.value ?? "", st.kind === "number" ? "quantity" : st.kind, st.unit, st.choices]);
+      return f;
+    }
     // A block added here may have nothing `caps()` offers (`o.edit` null): its declaration still takes these.
     f.push(["title", "Name", o.title || "", "text"]);
     for (const p of o.edit?.params || []) f.push([`p:${p.key}`, portName(o, p.key), portNow(o, p.key), "quantity", p.unit]);
@@ -3974,7 +3987,7 @@ function editRows(o, row) {
   // A block added here and not deployed: Remove takes it out again.
   for (const b of editsAdded(o.uuid)) {
     rows.push(row("Block", `<span class="ed-v">added here</span><span class="ed-tag" title="Declared in ${esc(b.file)} and compiled, not on the Miniserver yet: Apply deploys it, Discard drops it">not deployed</span>` +
-      (st.ok ? '<button type="button" class="ed-btn small" data-ed="remove" title="Take the block out again">Remove</button>' : ""), "pr-chg"));
+      (st.ok ? `<button type="button" class="ed-btn small" data-ed="remove"${b.delete ? ` disabled title="${esc(b.delete)}"` : ' title="Take the block out again"'}>Remove</button>` : ""), "pr-chg"));
   }
   // What was edited here and is not deployed yet, each with a way back.
   for (const c of editsPending(o.uuid)) {
@@ -6431,7 +6444,46 @@ wcard.addEventListener("mousedown", (e) => e.stopPropagation());
 // lox logic compile, which mints the block and places it on the page: it shows as the pending revision,
 // and its Properties offer Remove until it is deployed. Adding never deploys: only Apply does.
 S.types = null;
-const AB = { open: false, ty: null, items: [], idx: 0, draft: {}, bad: {}, busy: false, err: "" };
+const AB = { open: false, ty: null, items: [], idx: 0, draft: {}, bad: {}, busy: false, err: "", parent: null };
+// Objects of the object tree (#84) are added from the project tree: a folder (Virtual Inputs, Virtual Outputs,
+// Netzwerkperipherie) or a device takes them. GET /api/edits' `add_under` names each folder and device of the config
+// shown that takes new objects, with why `add_block` there would be refused (null: it would not); the palette's
+// `periphery` says which types go where.
+S.periph = null;
+/** Whether an object can be added under the tree node `n`: `{ ok, rev }`, or `{ why }`; null: not offered at all. */
+function periphAddState(n) {
+  const a = S.hist?.actions, under = S.edits?.add_under;
+  if (!a?.shown || !a.edit?.available || MD.open || !under || !(n.uuid in under)) return null;
+  const r = editRev();
+  if (!r) return { why: "The config on disk is not in the History yet." };
+  if (S.rev !== r.id) return { why: `Objects are added on the newest config (${r.kind === "pending" ? "Pending" : "deployed"}).` };
+  if (n.status === "removed") return { why: "This is not in the config any more." };
+  if (under[n.uuid]) return { why: under[n.uuid] };
+  if (a.running) return { why: `${a.running} is running.` };
+  if (UNDO.busy) return { why: "Undo or redo is compiling." };
+  return { ok: true, rev: r };
+}
+/** The palette's types that go under an object of type `ty`. */
+function periphUnder(ty) { return (S.periph || []).filter((t) => t.folder === ty || t.devices?.includes(ty)); }
+async function abLoadTypes() {
+  if (S.types) return true;
+  $("ab-body").innerHTML = '<div class="ab-sum">Loading the block types…</div>';
+  let j;
+  try { j = await api("/api/block-types"); } catch (err) { if (AB.open) $("ab-body").innerHTML = `<div class="ab-sum">${esc(err.message)}</div>`; return false; }
+  S.types = j.types; S.periph = j.periphery || [];
+  return true;
+}
+/** “Add” on a folder or device of the project tree: the dialog, for the types that go there. */
+async function abOpenUnder(uuid) {
+  const n = nodeById(uuid), st = n && periphAddState(n);
+  if (!st?.ok) return;
+  Object.assign(AB, { open: true, ty: null, draft: {}, bad: {}, busy: false, err: "", parent: { uuid, ty: n.ty, title: autoTitle(n.title) ? prettyType(n.ty) : n.title } });
+  $("addblk").classList.remove("hidden");
+  $("ab-h").textContent = "Add an object";
+  $("ab-page").textContent = `in ${AB.parent.title}`;
+  if (!(await abLoadTypes()) || !AB.open) return;
+  abPick("");
+}
 /** Whether a block can be added to the page shown: `{ ok, rev, page }`, or `{ why }`; null: not offered at all. */
 function addState() {
   const a = S.hist?.actions, pg = S.view && curPage();
@@ -6469,31 +6521,27 @@ function renderAddHud() {
 async function abOpen() {
   const st = addState();
   if (!st?.ok) return;
-  Object.assign(AB, { open: true, ty: null, draft: {}, bad: {}, busy: false, err: "" });
+  Object.assign(AB, { open: true, ty: null, draft: {}, bad: {}, busy: false, err: "", parent: null });
   $("addblk").classList.remove("hidden");
+  $("ab-h").textContent = "Add a block";
   $("ab-page").textContent = `on ${st.page.title || "this page"}`;
-  if (!S.types) {
-    $("ab-body").innerHTML = '<div class="ab-sum">Loading the block types…</div>';
-    let types;
-    try { types = (await api("/api/block-types")).types; } catch (err) { if (AB.open) $("ab-body").innerHTML = `<div class="ab-sum">${esc(err.message)}</div>`; return; }
-    S.types = types;
-    // Closed while the types loaded: leave the focus where it is.
-    if (!AB.open) return;
-  }
+  // Closed while the types loaded: leave the focus where it is.
+  if (!(await abLoadTypes()) || !AB.open) return;
   abPick("");
 }
 function abClose() {
   if (AB.busy) return;
   AB.open = false;
   $("addblk").classList.add("hidden");
-  $("btn-add-block").focus();
+  if (AB.parent) $("tree").focus();
+  else $("btn-add-block").focus();
 }
 /** Step one: the types, searched by name, type and purpose. */
 function abPick(q) {
   AB.ty = null;
   $("ab-body").innerHTML = `<input id="ab-q" type="text" placeholder="Search block types… (And, Monoflop, timer)" autocomplete="off" spellcheck="false" role="combobox" aria-expanded="true" aria-controls="ab-list" aria-autocomplete="list" aria-label="Block type">
     <ul id="ab-list" role="listbox" aria-label="Block types"></ul>
-    <div class="pal-foot"><kbd>↑</kbd><kbd>↓</kbd> choose · <kbd>Enter</kbd> pick · <kbd>Esc</kbd> close · only the types lox can create on a page</div>`;
+    <div class="pal-foot"><kbd>↑</kbd><kbd>↓</kbd> choose · <kbd>Enter</kbd> pick · <kbd>Esc</kbd> close · ${AB.parent ? `only the types that go in ${esc(AB.parent.title)}` : "only the types lox can create on a page"}</div>`;
   const inp = $("ab-q");
   inp.value = q;
   inp.addEventListener("input", abList);
@@ -6509,8 +6557,8 @@ function abPick(q) {
 function abList() {
   const q = $("ab-q").value.trim().toLowerCase();
   // The module's templates and lox's library's (#83): an instance of one.
-  const tpls = tplOffered().map((x) => ({ t: { type: x.name, summary: `Template · ${x.description || x.from}`, template: x }, name: x.name }));
-  const all = [...S.types.map((t) => ({ t, name: prettyType(t.type) })), ...tpls];
+  const tpls = AB.parent ? [] : tplOffered().map((x) => ({ t: { type: x.name, summary: `Template · ${x.description || x.from}`, template: x }, name: x.name }));
+  const all = AB.parent ? periphUnder(AB.parent.ty).map((t) => ({ t, name: prettyType(t.type) })) : [...S.types.map((t) => ({ t, name: prettyType(t.type) })), ...tpls];
   AB.items = !q ? all.sort((a, b) => a.name.localeCompare(b.name)) : all.map((it) => {
     const m = fuzzy(q, it.name) || fuzzy(q, it.t.type);
     const inSum = (it.t.summary || "").toLowerCase().includes(q);
@@ -6519,7 +6567,7 @@ function abList() {
   AB.idx = AB.items.length ? 0 : -1;
   $("ab-list").innerHTML = AB.items.length ? AB.items.map((it, i) => `<li role="option" id="ab-o${i}" data-i="${i}" aria-selected="${i === AB.idx}"><span class="at">${mark(it.name, it.hits)}</span>` +
     (it.name !== it.t.type ? `<span class="ac">${esc(it.t.type)}</span>` : "") + `<span class="as">${esc(it.t.summary || "")}</span></li>`).join("")
-    : '<li class="sec" role="presentation">No block type matches. Virtual inputs and devices are not added on a page.</li>';
+    : `<li class="sec" role="presentation">${AB.parent ? `Nothing that goes in ${esc(AB.parent.title)} matches.` : "No block type matches. Virtual inputs and devices are added in their folder of the project tree."}</li>`;
   $("ab-q").setAttribute("aria-activedescendant", AB.idx >= 0 ? "ab-o0" : "");
 }
 function abMove(d) {
@@ -6540,6 +6588,12 @@ function abChoose(i) {
 function abFields(t) {
   // A push notification (#77) takes the notification's name, and its input is wired once it is on the page.
   if (t.mirrors) return t.settings.map((s) => [`s:${s.name}`, s.name === "mirrors" ? "Notification" : s.name === "MinimumTime" ? "Minimum time" : s.name, s.kind, null, "", "main", s.kind === "notification" ? abNotifications() : s.choices]);
+  // An object of the object tree (#84): its name and settings, the ones lox needs first; a number may carry its unit.
+  if (t.folder || t.devices) {
+    const req = t.settings.filter((s) => s.required), rest = t.settings.filter((s) => !s.required);
+    return [["title", "Name", "text", null, "", "main"],
+      ...[...req, ...rest].map((s) => [`s:${s.name}`, s.name, s.kind === "number" ? "quantity" : s.kind, s.unit, s.required ? "required" : "", s.required ? "main" : "inputs", s.choices, s.required])];
+  }
   const f = [["title", "Name", "text", null, "", "main"]];
   for (const s of t.settings) f.push([`s:${s.name}`, s.name, s.kind, null, "", "main", s.choices]);
   for (const p of t.ports.filter((q) => q.dir === "param")) f.push([`p:${p.key}`, p.label ? `${p.name} (${p.label})` : p.name, "quantity", p.unit, p.default, "main"]);
@@ -6567,7 +6621,7 @@ function abForm() {
       ? `<select ${attrs}><option value="">as Loxone Config places it</option>${(kind === "on_off" ? ["on", "off"] : choices).map((c) => `<option${c === v ? " selected" : ""}>${esc(c)}</option>`).join("")}</select>`
       : kind === "program"
       ? `<textarea ${attrs} class="prog" rows="10" autocomplete="off" spellcheck="false" placeholder="Empty: Loxone Config's program">\n${esc(v)}</textarea>`
-      : `<input ${attrs} value="${esc(v)}"${kind === "number" || kind === "quantity" ? ` inputmode="decimal" class="num" placeholder="${esc(def)}"` : kind === "time" ? ' class="num" placeholder="HH:MM"' : kind === "duration" ? ' class="num" placeholder="5s"' : field === "title" ? ` placeholder="${esc(prettyType(t.type))}"` : ""} autocomplete="off" spellcheck="false">`;
+      : `<input ${attrs} value="${esc(v)}"${kind === "number" || kind === "quantity" ? ` inputmode="decimal" class="num" placeholder="${esc(def)}"` : kind === "time" ? ' class="num" placeholder="HH:MM"' : kind === "duration" ? ' class="num" placeholder="5s"' : field === "title" ? ` placeholder="${esc(prettyType(t.type))}"` : def ? ` placeholder="${esc(def)}"` : ""} autocomplete="off" spellcheck="false">`;
     return `<div class="pr ed-row"><label class="k" for="${id}">${esc(label)}</label><div class="v">${input}${unit ? `<span class="ed-unit">${esc(unit)}</span>` : ""}${bad ? `<div class="ed-bad" id="${id}-e">${esc(bad)}</div>` : ""}</div></div>`;
   };
   const fs = abFields(t), main = fs.filter((f) => f[5] === "main"), inputs = fs.filter((f) => f[5] === "inputs");
@@ -6575,10 +6629,10 @@ function abForm() {
   $("ab-body").innerHTML = `<div class="ab-form">
     <div class="ab-sum"><b>${esc(prettyType(t.type))}</b> <span class="mono">${esc(t.type)}</span>${t.summary ? ` · ${esc(t.summary)}` : ""}${t.docs ? `<a href="${esc(t.docs)}" target="_blank" rel="noopener">Loxone documentation</a>` : ""}</div>
     ${main.map(field).join("")}
-    ${inputs.length ? `<details${inputsOpen ? " open" : ""}><summary>Constants of the inputs (${inputs.length}): used until something is wired</summary>${inputs.map(field).join("")}</details>` : ""}
+    ${inputs.length ? `<details${inputsOpen ? " open" : ""}><summary>${t.folder || t.devices ? `More settings (${inputs.length}): Loxone Config's defaults until set` : `Constants of the inputs (${inputs.length}): used until something is wired`}</summary>${inputs.map(field).join("")}</details>` : ""}
     <div class="ed-bar"><button type="button" class="primary small" data-ab="add"${AB.busy ? " disabled" : ""}>${AB.busy ? "Compiling…" : "Add"}</button>
       <button type="button" class="ed-btn small" data-ab="back"${AB.busy ? " disabled" : ""}>Other type</button>
-      <span class="ed-msg${AB.err ? " err" : ""}" role="status" aria-live="polite">${esc(AB.err || (t.mirrors ? "No text means no message. Wire its input from a block once it is on the page. Adding compiles the module; nothing is deployed." : "Empty values get what Loxone Config places the block with. Adding compiles the module; nothing is deployed."))}</span></div>
+      <span class="ed-msg${AB.err ? " err" : ""}" role="status" aria-live="polite">${esc(AB.err || (t.mirrors ? "No text means no message. Wire its input from a block once it is on the page. Adding compiles the module; nothing is deployed." : t.folder || t.devices ? "lox gives it its designation (VI, VHI, …). Empty settings get Loxone Config's defaults. Adding compiles the module; nothing is deployed, and nothing is sent to the device." : "Empty values get what Loxone Config places the block with. Adding compiles the module; nothing is deployed."))}</span></div>
   </div>`;
 }
 $("ab-body").addEventListener("input", (e) => {
@@ -6601,12 +6655,14 @@ $("addblk").addEventListener("mousedown", (e) => { if (e.target.id === "addblk")
 $("btn-add-block").onclick = abOpen;
 const AB_TIME = /^\d{1,2}:\d{2}(:\d{2})?$/;
 async function abAdd() {
-  const st = addState(), t = AB.ty;
+  const pn = AB.parent && nodeById(AB.parent.uuid);
+  const st = AB.parent ? pn && periphAddState(pn) : addState(), t = AB.ty;
   if (!st?.ok || !t || AB.busy) return;
   if (t.template) { tplAbAdd(st, t.template); return; }
-  const op = { op: "add_block", page: st.page.uuid, type: t.type, params: {}, settings: {} }, bad = {};
-  for (const [field, , kind, , , , choices] of abFields(t)) {
+  const op = { op: "add_block", page: AB.parent ? AB.parent.uuid : st.page.uuid, type: t.type, params: {}, settings: {} }, bad = {};
+  for (const [field, , kind, , , , choices, req] of abFields(t)) {
     const raw = AB.draft[field] ?? "", v = kind === "text" || kind === "program" ? raw : raw.trim();
+    if (req && !v.trim()) { bad[field] = "lox makes none without it."; continue; }
     if (v === "" && !(kind === "text" && raw !== "")) continue;
     if (kind === "program" && !v.trim()) continue;
     if (kind === "number" && !EDIT_NUMBER.test(v)) { bad[field] = /,/.test(v) ? "Write a decimal point, not a comma." : "A number, like 12 or -2.5."; continue; }
@@ -6628,10 +6684,12 @@ async function abAdd() {
     abClose();
     await editShowNewest(res.blob);
     const uuid = res.added?.[0]?.uuid;
-    if (uuid && S.view?.objects[uuid]) {
-      S.edit = { uuid, open: false, draft: {}, bad: {}, busy: false, msg: "Added and compiled: pending, not deployed. Review it, then Apply or Discard.", err: "" };
-      gotoPage(st.page.uuid, { focus: uuid });
-      select(uuid);
+    const u = uuid && Object.keys(S.view?.objects || {}).find((k) => ciEq(k, uuid));
+    if (u) {
+      S.edit = { uuid: u, open: false, draft: {}, bad: {}, busy: false, msg: "Added and compiled: pending, not deployed. Review it, then Apply or Discard.", err: "" };
+      if (!AB.parent) gotoPage(st.page.uuid, { focus: u });
+      select(u);
+      if (AB.parent) revealInTree(u);
     }
   } catch (err) {
     AB.busy = false; AB.err = err.message;

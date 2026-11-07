@@ -176,6 +176,28 @@ pub fn port_value(ty: &str, key: &str, v: &str) -> Result<Value, String> {
     lox_value(&format!("{n}{suffix}")).ok_or_else(|| format!("`{v}` is not a number with a unit"))
 }
 
+/// A number of port or setting `key` of `ty` in its own documented unit:
+/// a plain number as it is, a time with a suffix scaled into it (`5s` on a
+/// seconds setting is `5`, `46s` on a milliseconds one `46000`). `None`
+/// when it is not one exactly (no time unit documented, another kind of
+/// unit, not a whole number of it).
+pub fn in_own_unit(ty: &str, key: &str, v: &Value) -> Option<String> {
+    match v {
+        Value::Number(n) => Some(n.clone()),
+        Value::Unit { number, unit } if unit.is_time() => {
+            let per = per_ms(connectors::port_unit(ty, key)?)?;
+            let size = SUFFIXES
+                .iter()
+                .find(|(s, _)| *s == unit.suffix())
+                .and_then(|(_, z)| *z)?;
+            let (neg, m, frac) = decimal(number)?;
+            let den = 10u128.checked_pow(frac)?.checked_mul(per)?;
+            render(neg, m.checked_mul(size)?, den)
+        }
+        _ => None,
+    }
+}
+
 /// `text` as lox's parser reads it in an argument (`30min` → a unit value),
 /// `None` when it is not one value.
 pub fn lox_value(text: &str) -> Option<Value> {
