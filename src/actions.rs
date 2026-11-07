@@ -3016,7 +3016,10 @@ impl Actions {
             )
             .await
         {
-            let paths: Vec<&str> = list.lines().filter(|l| l.ends_with(".loxl")).collect();
+            let paths: Vec<&str> = list
+                .lines()
+                .filter(|l| edit::ours(l.rsplit('/').next().unwrap_or(l)))
+                .collect();
             let specs: Vec<String> = paths.iter().map(|p| format!("{commit}:{p}")).collect();
             let mut texts = std::collections::BTreeMap::new();
             for (path, bytes) in paths

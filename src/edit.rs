@@ -583,6 +583,8 @@ pub fn plain(v: &Value) -> String {
     match v {
         Value::Number(n) => n.clone(),
         Value::Str(s) => s.clone(),
+        // A program (#79): its text, as Properties edits it.
+        Value::File { text: Some(t), .. } => t.clone(),
         other => other.to_string(),
     }
 }
@@ -969,9 +971,9 @@ pub fn apply(
         Op::Param { port, value, .. } => {
             let pname = port_names::name_of(&ty, port).to_string();
             let v = match value {
-                Some(v) if caps.params.iter().any(|p| &p.key == port) => Some(Value::Number(
-                    number(v).map_err(|e| format!("{pname}: {e}"))?,
-                )),
+                Some(v) if caps.params.iter().any(|p| &p.key == port) => Some(
+                    crate::units::port_value(&ty, port, v).map_err(|e| format!("{pname}: {e}"))?,
+                ),
                 Some(_) => {
                     return Err(format!(
                         "{name}: {pname} cannot be edited here (it is wired, or not an input)"
@@ -1189,8 +1191,11 @@ impl Files {
             present: texts.keys().cloned().collect(),
             ..Files::default()
         };
+        let mut programs = BTreeMap::new();
         for (name, text) in texts {
-            if name == CLAIMS {
+            if name.ends_with(PROGRAM_EXT) {
+                programs.insert(name.clone(), text.replace("\r\n", "\n"));
+            } else if name == CLAIMS {
                 f.claims = Claims::parse(text).map_err(|e| format!("{name}: {e}"))?;
             } else {
                 f.pages.insert(
@@ -1198,6 +1203,30 @@ impl Files {
                     PageFile::parse(text).map_err(|e| format!("{name}: {e}"))?,
                 );
             }
+        }
+        // A program (#79) is in a file of vislox's directory that its block
+        // names, `Code: file("vx_code16_1.c")`; each file is one block's.
+        for (name, p) in f.pages.iter_mut() {
+            for b in &mut p.blocks {
+                for (k, v) in &mut b.args {
+                    if let Value::File { path, text } = v {
+                        let t = programs.remove(path.as_str()).ok_or_else(|| {
+                            format!(
+                                "{name}: `{}`'s {k} names file(\"{path}\"), which is not a program \
+                                 in vislox's directory; put it back or delete the setting",
+                                b.slug
+                            )
+                        })?;
+                        *text = Some(t);
+                    }
+                }
+            }
+        }
+        if let Some(name) = programs.keys().next() {
+            return Err(format!(
+                "{name}: no block of vislox's files names this program; delete it, or put back \
+                 the block's `Code: file(\"{name}\")`"
+            ));
         }
         // A block adopted here names externs of the claims file, or blocks of
         // vislox's files; those externs stay while it does.
@@ -1244,7 +1273,7 @@ impl Files {
         Ok(f)
     }
 
-    /// The `.loxl` files of `dir`, by name.
+    /// The `.loxl` files of `dir` and the programs there (#79), by name.
     pub fn texts(dir: &Path) -> BTreeMap<String, String> {
         let mut out = BTreeMap::new();
         let Ok(entries) = std::fs::read_dir(dir) else {
@@ -1252,7 +1281,7 @@ impl Files {
         };
         for e in entries.flatten() {
             let name = e.file_name().to_string_lossy().into_owned();
-            if name.starts_with('.') || !name.ends_with(".loxl") || !e.path().is_file() {
+            if !ours(&name) || !e.path().is_file() {
                 continue;
             }
             if let Ok(t) = std::fs::read_to_string(e.path()) {
@@ -1279,6 +1308,18 @@ impl Files {
         for (name, p) in &self.pages {
             if !p.is_empty() {
                 out.insert(name.clone(), p.render());
+            }
+            // Each program (#79) in the file its block names.
+            for b in &p.blocks {
+                for (_, v) in &b.args {
+                    if let Value::File {
+                        path,
+                        text: Some(t),
+                    } = v
+                    {
+                        out.insert(path.clone(), t.clone());
+                    }
+                }
             }
         }
         out
@@ -1682,7 +1723,50 @@ fn setting_value(ty: &str, name: &str, kind: blocks::Kind, v: &str) -> Result<Va
         Kind::Number => Value::Number(number(v).map_err(|e| format!("{name}: {e}"))?),
         Kind::Duration => duration(v.trim())
             .ok_or_else(|| format!("{name}: a duration, like 12h, 30min, 5s or 90 (seconds)"))?,
+        // Its file is named once the block's slug is known.
+        Kind::Program => Value::File {
+            path: String::new(),
+            text: Some(program_text(v).map_err(|e| format!("{name}: {e}"))?),
+        },
     })
+}
+
+/// The most text a program (#79) may hold.
+const MAX_PROGRAM: usize = 256 * 1024;
+
+/// The extension of the files vislox keeps a program in (#79).
+pub const PROGRAM_EXT: &str = ".c";
+
+/// The file of the program of block `slug`, next to the block's file.
+fn program_file(slug: &str) -> String {
+    format!("{slug}{PROGRAM_EXT}")
+}
+
+/// Whether `name` is a file of vislox's directory: a `.loxl` file, or a
+/// program a block of it names (#79).
+pub fn ours(name: &str) -> bool {
+    !name.starts_with('.') && (name.ends_with(".loxl") || name.ends_with(PROGRAM_EXT))
+}
+
+/// A program's text as lox reads it from its file: LF line breaks (lox
+/// turns CRLF into LF), no NUL, not empty, not too long.
+fn program_text(v: &str) -> Result<String, String> {
+    let t = v.replace("\r\n", "\n");
+    if t.trim().is_empty() {
+        return Err(
+            "the program is empty; clear the field to hand it back to Loxone Config".into(),
+        );
+    }
+    if t.contains('\0') || t.contains('\r') {
+        return Err("the program holds a character a text file cannot (NUL or a lone CR)".into());
+    }
+    if t.len() > MAX_PROGRAM {
+        return Err(format!(
+            "the program is longer than {} KB",
+            MAX_PROGRAM / 1024
+        ));
+    }
+    Ok(t)
 }
 
 /// A duration as Lox Logic writes one: `12h`, `30min`, `5s`, `500ms`, or
@@ -1813,7 +1897,7 @@ fn add_block(files: &mut Files, ctx: &Ctx, op: &Op) -> Result<Applied, String> {
             let n = spec.name;
             args.push((
                 n.to_string(),
-                Value::Number(number(v).map_err(|e| format!("{n}: {e}"))?),
+                crate::units::port_value(ty, spec.key, v).map_err(|e| format!("{n}: {e}"))?,
             ));
         }
     }
@@ -1829,6 +1913,12 @@ fn add_block(files: &mut Files, ctx: &Ctx, op: &Op) -> Result<Applied, String> {
             || files.names(s)
     };
     let slug = blocks::new_slug(ty, &taken);
+    // A program (#79) goes into a file named after the block.
+    for (_, v) in &mut args {
+        if let Value::File { path, .. } = v {
+            *path = program_file(&slug);
+        }
+    }
     // Everything is checked: from here on `files` changes.
     if let Some(u) = &mirrors {
         // vislox's extern of the notification, kept while the block names it.
@@ -3093,9 +3183,10 @@ fn edit_new_block(
                 .ok_or_else(|| format!("{name}: {port} cannot be edited here"))?;
             let previous = b.get(pname).map(plain);
             let v = match value {
-                Some(v) if caps.params.iter().any(|p| &p.key == port) => Some(Value::Number(
-                    number(v).map_err(|e| format!("{pname}: {e}"))?,
-                )),
+                Some(v) if caps.params.iter().any(|p| &p.key == port) => Some(
+                    crate::units::port_value(&b.ty, port, v)
+                        .map_err(|e| format!("{pname}: {e}"))?,
+                ),
                 Some(_) => {
                     return Err(format!(
                         "{name}: {pname} cannot be edited here (it is wired, or not an input)"
@@ -3132,10 +3223,18 @@ fn edit_new_block(
                 .map(|(_, k)| k)
                 .ok_or_else(|| format!("{name}: {setting} cannot be edited here"))?;
             let previous = b.get(setting).map(plain);
-            let v = value
+            let mut v = value
                 .as_deref()
                 .map(|v| setting_value(&b.ty, setting, kind, v))
                 .transpose()?;
+            // A program (#79) keeps the file it is in, else gets one named
+            // after the block.
+            if let Some(Value::File { path, .. }) = &mut v {
+                *path = match b.get(setting) {
+                    Some(Value::File { path: p, .. }) => p.clone(),
+                    _ => program_file(slug),
+                };
+            }
             b.set(setting, v);
             Ok(previous)
         }
@@ -3580,12 +3679,22 @@ mod tests {
         files: &Files,
         lock: &mut Lockfile,
     ) -> Result<LoxoneDoc, String> {
-        let frags: Vec<Module> = files
-            .render()
-            .values()
-            .map(|t| Module::parse_fragment(t).map_err(|e| e.to_string()))
-            .collect::<Result<_, _>>()?;
-        let m = Module::from_fragments(frags);
+        // Written out and read back as lox reads a module: a program
+        // (#79) comes from its file.
+        let tmp = tempfile::tempdir().map_err(|e| e.to_string())?;
+        // Not under the temporary directory's own hidden name: lox skips those.
+        let module = tmp.path().join("module");
+        let dir = module.join(DIR);
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let mut texts = files.render();
+        if texts.is_empty() {
+            texts.extend([Files::placeholder()]);
+        }
+        for (name, t) in texts {
+            std::fs::write(dir.join(name), t).map_err(|e| e.to_string())?;
+        }
+        let m =
+            loxone_config::cli::read_module(module.to_str().unwrap()).map_err(|e| e.to_string())?;
         logic::validate_ports(&m).map_err(|e| e.to_string())?;
         let opts = CompileOptions {
             machine: [0x50, 0x4f, 0x94, 0, 0, 1],
@@ -4031,6 +4140,152 @@ mod tests {
         assert!(files.render().is_empty(), "{:?}", files.render());
     }
 
+    /// A program (#79) is a file of its own next to its block's file, named
+    /// by `Code: file(…)`; edited, it keeps the file, and dropped, the file
+    /// goes. lox compiles it into the block's `Code=`.
+    #[test]
+    fn a_program_is_a_file_of_its_own() {
+        let d = doc("house.Loxone");
+        let names = BTreeSet::new();
+        let mut l = Lockfile::default();
+        let lock = lock_of(&l);
+        let ctx = Ctx {
+            doc: &d,
+            lock: &lock,
+            base: &d,
+            deployed: None,
+            names: &names,
+            drawn: &Default::default(),
+            adoptions: &Default::default(),
+            page_adoptions: &Default::default(),
+            claimed: &Default::default(),
+        };
+        let mut files = Files::default();
+        let prog = "int main() {\r\n  setoutput(0, 1);\r\n}\r\n";
+        apply_op(
+            &mut files,
+            &ctx,
+            &add(EG, "Code16", Some("Hue"), &[], &[("Code", prog)]),
+        )
+        .unwrap();
+        let texts = files.render();
+        assert!(
+            texts["erdgeschoss.loxl"]
+                .contains(r#"vx_code16_1 = Code16("Hue", Code: file("vx_code16_1.c"))"#),
+            "{texts:?}"
+        );
+        assert_eq!(
+            texts["vx_code16_1.c"],
+            "int main() {\n  setoutput(0, 1);\n}\n"
+        );
+        // Read back, the block holds the program's text.
+        let back = Files::from_texts(&texts).unwrap();
+        assert_eq!(back.pages, files.pages);
+        let out = compile_files(&d, &files, &mut l).unwrap();
+        let uuid = l.objects["vx_code16_1"].uuid.clone();
+        let el = find(&out.xml.root, &uuid).unwrap();
+        assert_eq!(
+            el.attr_decoded("Code").unwrap(),
+            "int main() {\n  setoutput(0, 1);\n}\n"
+        );
+        // Edited: the same file, and `previous` is the old text.
+        let lock = lock_of(&l);
+        let ctx = Ctx {
+            doc: &out,
+            base: &out,
+            lock: &lock,
+            ..ctx
+        };
+        let setting = |v: Option<&str>| Op::Setting {
+            uuid: uuid.clone(),
+            name: "Code".into(),
+            value: v.map(Into::into),
+        };
+        let a = apply_op(&mut files, &ctx, &setting(Some("int main() {}\n"))).unwrap();
+        assert_eq!(
+            a.previous,
+            serde_json::json!("int main() {\n  setoutput(0, 1);\n}\n")
+        );
+        assert_eq!(files.render()["vx_code16_1.c"], "int main() {}\n");
+        // The op carries the text, so undo puts it back.
+        assert!(files.ops(&lock).contains(&setting(Some("int main() {}\n"))));
+        // Dropped: the binding and the file go; Loxone Config's program again.
+        let a = apply_op(&mut files, &ctx, &setting(None)).unwrap();
+        assert_eq!(a.previous, serde_json::json!("int main() {}\n"));
+        let texts = files.render();
+        assert!(!texts.contains_key("vx_code16_1.c"));
+        assert!(texts["erdgeschoss.loxl"].contains(r#"vx_code16_1 = Code16("Hue")"#));
+        // A program no block names, or a block whose program is gone, is
+        // refused when the files are read.
+        let mut orphan = texts.clone();
+        orphan.insert("stray.c".into(), "x".into());
+        assert!(Files::from_texts(&orphan).unwrap_err().contains("stray.c"));
+        let mut lost = texts.clone();
+        lost.insert(
+            "erdgeschoss.loxl".into(),
+            texts["erdgeschoss.loxl"]
+                .replace(r#"Code16("Hue")"#, r#"Code16("Hue", Code: file("gone.c"))"#),
+        );
+        assert!(Files::from_texts(&lost).unwrap_err().contains("gone.c"));
+    }
+
+    /// A constant takes a unit the port is documented in (#79), on a block
+    /// added here and on a claim, and lox scales it into the port's unit.
+    #[test]
+    fn a_constant_takes_its_unit() {
+        let d = doc("house.Loxone");
+        let names = BTreeSet::new();
+        let mut l = Lockfile::default();
+        let lock = lock_of(&l);
+        let ctx = Ctx {
+            doc: &d,
+            lock: &lock,
+            base: &d,
+            deployed: None,
+            names: &names,
+            drawn: &Default::default(),
+            adoptions: &Default::default(),
+            page_adoptions: &Default::default(),
+            claimed: &Default::default(),
+        };
+        let mut files = Files::default();
+        apply_op(
+            &mut files,
+            &ctx,
+            &add(EG, "Monoflop", None, &[("Time", "30min")], &[]),
+        )
+        .unwrap();
+        assert!(files.render()["erdgeschoss.loxl"].contains("Monoflop(Time: 30min)"));
+        let out = compile_files(&d, &files, &mut l).unwrap();
+        let uuid = l.objects["vx_monoflop_1"].uuid.clone();
+        let el = find(&out.xml.root, &uuid).unwrap();
+        let def = |el: &Element| {
+            el.child_elements()
+                .find(|c| c.name == "Co" && c.attr("K") == Some("Time"))
+                .and_then(|c| c.attr("Def"))
+                .map(String::from)
+        };
+        assert_eq!(def(el).as_deref(), Some("1800"));
+        assert_eq!(crate::units::shown("Monoflop", "Time", "1800"), "30min");
+        // Edited on the block: `previous` is the value as written.
+        let lock = lock_of(&l);
+        let ctx = Ctx {
+            doc: &out,
+            base: &out,
+            lock: &lock,
+            ..ctx
+        };
+        let a = apply_op(&mut files, &ctx, &param(&uuid, "Time", Some("2h"))).unwrap();
+        assert_eq!(a.previous, serde_json::json!("30min"));
+        let e = apply_op(
+            &mut files.clone(),
+            &ctx,
+            &param(&uuid, "Time", Some("2parsec")),
+        )
+        .unwrap_err();
+        assert!(e.contains("unit"), "{e}");
+    }
+
     #[test]
     fn a_new_block_is_checked_before_lox_sees_it() {
         let d = doc("house.Loxone");
@@ -4057,7 +4312,8 @@ mod tests {
         assert!(err(add(EG, "And", None, &[("I1", "1,5")], &[])).contains("decimal point"));
         assert!(err(add(EG, "Memory", None, &[], &[("Type", "big")])).contains("\"digital\""));
         assert!(err(add(EG, "PulseAt", None, &[], &[("At", "25:00")])).contains("time of day"));
-        assert!(err(add(EG, "Code16", None, &[], &[("Code", "x")])).contains("cannot be set"));
+        assert!(err(add(EG, "Code16", None, &[], &[("Code", " \n")])).contains("empty"));
+        assert!(err(add(EG, "Monoflop", None, &[("Time", "5%")], &[])).contains("seconds"));
         // A slug the module has is not picked again; a port by its key.
         let a = apply_op(&mut files, &ctx, &add(EG, "And", None, &[("I2", "1")], &[])).unwrap();
         assert_eq!(a.added.as_deref(), Some("vx_and_2"));

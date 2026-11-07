@@ -154,6 +154,13 @@ published under the same version (see [docker/README.md](docker/README.md)).
   but not committed. Discard now reads the last commit, never deletes a lock vislox did not write (one not in git
   goes back to how it was before vislox's first edit), and puts everything back when a step fails.
 - Fixed: Discard and the operate buttons ignored mouse clicks.
+- Block settings (#79): Properties shows the settings a block keeps on its element (a PulseAt's time and pulse, a
+  memory flag's type, a Formula, the name the app shows, a meter's units, a program block's program) by their Lox
+  Logic names and as Lox Logic writes them, marked against the compared revision; the Changes list reads them the
+  same way (`At: 18:58 → 06:58`, a program as a line diff). Constants read with their unit (`Time 30min`). On a block
+  added or adopted here they are edited in *Edit values*: a program in a text area, written into a file of its own
+  (`<module>/vislox/<slug>.c`, `Code: file(…)`); constants take a unit (`1h`, `250ms`). On a block Loxone Config
+  drew they are read-only until it is adopted. Never deploys.
 
 ## 0.2.0
 
