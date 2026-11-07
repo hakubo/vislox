@@ -59,6 +59,10 @@ const lcXml = (u, title, y, button) => {
     mood("Aus", 778, 11, ' ReadOnly="true"', [0, 2 ** 28, 6 * 2 ** 28], 0) +
     `\t\t\t\t</LightscenesC>\n\t\t\t\t<LSConfig OpM="778" ScMv="777" ScAc="1"/>\n\t\t\t</C>\n`;
 };
+// A CentralLight on the upper floor (#75), driving Wohnzimmer; and an alarm whose members stay with Loxone Config.
+const CENTRAL = "10000050-0000-0500-ffff504f94000001", ALARM = "10000053-0000-0530-ffff504f94000001";
+const centralXml = `\t\t\t<C Type="CentralLight" V="178" U="${CENTRAL}" Title="Alle Lichter" Px="17280" Py="4800" Px2="18624" Py2="5760" Nio="0" rec="${LC_W}" SpStates="0"/>\n` +
+  `\t\t\t<C Type="Alarm" V="178" U="${ALARM}" Title="Alarmanlage" Px="17280" Py="7680" Px2="18624" Py2="8640" Nio="0" Entries="40" CentralOut="1" Objects="${LC_F}"/>\n`;
 const root = mkdtempSync(join(tmpdir(), "vislox-edit-"));
 const dir = join(root, "project");
 mkdirSync(join(dir, "pages"), { recursive: true });
@@ -78,7 +82,7 @@ const base = readFileSync(fixture, "utf8").replace('<Co K="Q" U="10000009-0000-0
 \t\t\t</C>`)
   .replace(`\t\t\t<C Type="And" V="178" U="${FLUR}"`, timerXml(UHR, "Uhr", 4800, `${MON},${PARTY}`, ['<Entry From="390" To="480" V="21"/>', '<Entry From="1080" To="1380" Ix="1" V="22.5"/>']) +
     timerXml(HEIZ, "Heizung", 6720, "", []) + timerXml(LICHT, "Licht", 8640, "", [], false) +
-    lcXml(LC_W, "Wohnzimmer", 4800, true) + lcXml(LC_F, "Diele", 7680, false) + `\t\t\t<C Type="And" V="178" U="${FLUR}"`)
+    lcXml(LC_W, "Wohnzimmer", 4800, true) + lcXml(LC_F, "Diele", 7680, false) + centralXml + `\t\t\t<C Type="And" V="178" U="${FLUR}"`)
   // Two rooms; the Divide block is shown in the app, in the kitchen.
   .replace('\t\t<C Type="Page" V="178" U="10000002', `\t\t<C Type="Place" V="178" U="${KITCHEN}" Title="Küche"/>
 \t\t<C Type="Place" V="178" U="${BATH}" Title="Bad"/>
@@ -221,7 +225,7 @@ for (const line of src.split("\\n")) {
   if ((m = line.match(/^extern (\\w+) = \\w+\\(uuid: "([^"]+)"\\)/))) { slugs[m[1]] = m[2]; continue; }
   if (!(m = line.match(/^(\\w+)\\.(\\w+) = (.*)$/))) continue;
   if (m[2] === "schedule") { claimed.push([slugs[m[1]], m[3]]); continue; }
-  if (m[2] === "moods") continue; // below (#74)
+  if (m[2] === "moods" || m[2] === "members") continue; // below (#74, #75)
   const uuid = slugs[m[1]], i = out.findIndex((l) => l.includes(\`U="\${uuid}"\`));
   if (m[2] === "title") { out[i] = out[i].replace(/Title="[^"]*"/, \`Title="\${xml(unq(m[3]))}"\`); continue; }
   if (m[2] === "room") {
@@ -392,6 +396,15 @@ for (const o of Object.values(objects)) {
   const i = out.findIndex((l) => l.includes(\`U="\${o.uuid}"\`));
   const L = o.layout;
   if (i >= 0 && L) out[i] = out[i].replace(/Px="-?\\d+" Py="-?\\d+" Px2="-?\\d+" Py2="-?\\d+"/, \`Px="\${L.px}" Py="\${L.py}" Px2="\${L.px2}" Py2="\${L.py2}"\`);
+}
+// Members of central blocks (#75): \`x.members = (a, b)\` makes rec= the members' UUIDs in that order (right before
+// SpStates=, as lox writes it); \`()\` takes rec= out.
+for (const [, slug, list] of src.matchAll(/^(\\w+)\\.members = \\(([^)]*)\\)$/gm)) {
+  const uuidOf = (s) => slugs[s] || objects[s]?.uuid;
+  const rec = list.split(",").map((x) => x.trim()).filter(Boolean).map(uuidOf).join(",");
+  const i = out.findIndex((l) => l.includes(\`U="\${uuidOf(slug)}"\`) && l.includes("<C "));
+  out[i] = out[i].replace(/ rec="[^"]*"/, "");
+  if (rec) out[i] = out[i].replace(/ SpStates=/, \` rec="\${rec}" SpStates=\`);
 }
 // vislox's wires (to.Port <- from.Port) between the objects its externs pin: an <In> in the sink's
 // connector, from the source's connector, as lox draws it.
@@ -1548,6 +1561,73 @@ try {
     const stale = await page.evaluate(() => staleRows({ name: "vx_a", stale: ["10000099-0000-0990-ffff504f94000001"] }, "mo", null).join(""));
     assert.match(stale, /vx_a is also claimed for 10000099-0000-0990-ffff504f94000001, which this config does not have/);
     assert.match(stale, /data-mo="dropstale" data-u="10000099-0000-0990-ffff504f94000001"[^>]*>Drop its claim/);
+  });
+  await step("a central block's members are shown, edited in order with the Ctrl+K picker, emptied, undone and reverted (#75)", async () => {
+    await page.waitForFunction(() => /Nothing pending/.test(document.querySelector("#deploy-pend")?.textContent || ""), null, { timeout: 10000 });
+    await page.evaluate(() => editGoNewest());
+    await settled();
+    await page.evaluate((u) => { gotoPage(S.objPage.get(u), { focus: u }); select(u); }, CENTRAL);
+    const sec = '#props [data-body="Members"]';
+    await page.waitForSelector(`${sec} [data-me="open"]`);
+    // The member, a link to its block.
+    assert.match(await page.textContent(sec), /1\s*Wohnzimmer/);
+    assert.equal(await page.getAttribute(`${sec} .lnk`, "data-go"), LC_W);
+    await page.click(`${sec} [data-me="open"]`);
+    // Ctrl+K picks a member: only the lighting controllers not listed yet.
+    await page.keyboard.press("Control+k");
+    await page.waitForSelector("#palette:not(.hidden)");
+    assert.equal(await page.getAttribute("#pal-input", "placeholder"), "Add a lighting controller…");
+    assert.deepEqual(await page.$$eval("#pal-list [role=option] .pt", (n) => n.map((x) => x.textContent)), ["Diele"]);
+    await page.keyboard.press("Enter");
+    await page.waitForSelector("#palette.hidden", { state: "attached" });
+    assert.equal(await page.getAttribute("#pal-input", "placeholder"), "Go to a page or block…");
+    // Diele first: the order the app lists them in.
+    await page.click(`${sec} [data-me="up"][data-i="1"]`);
+    assert.match(await page.textContent(`${sec} .me-list`), /^Diele.*Wohnzimmer/);
+    const n0 = edits.length;
+    await page.click(`${sec} [data-me="save"]`);
+    await until(() => edits.length > n0 && statuses[n0] !== undefined, "the members request");
+    assert.equal(statuses[n0], 200);
+    assert.deepEqual(edits[n0].ops, [{ op: "members", uuid: CENTRAL, value: [LC_F, LC_W] }]);
+    await settled();
+    const file = () => readFileSync(join(dir, "pages", "vislox", "edits.loxl"), "utf8");
+    assert.match(file(), /^vx_10000050_0000_0500_ffff504f94000001\.members = \(vx_10000041_0000_0410_ffff504f94000001, vx_10000040_0000_0400_ffff504f94000001\)$/m);
+    assert.match(file(), /^extern vx_10000050_0000_0500_ffff504f94000001 = CentralLight\(uuid: "10000050-0000-0500-ffff504f94000001"\)$/m);
+    await page.waitForFunction(([u, want]) => S.view.objects[u].members.members.map((m) => m.uuid).join() === want, [CENTRAL, `${LC_F},${LC_W}`], { timeout: 10000 });
+    await waitText(sec, /edited here[\s\S]*not deployed[\s\S]*Revert/);
+    await waitText("#deploy-pend", /members of 1 central block edited here/);
+    const changes = await page.evaluate(() => S.view.changes.map((c) => c.text));
+    assert.ok(changes.includes("Alle Lichter · member added: Diele"), changes.join(" | "));
+    assert.ok(!changes.some((c) => / rec[: ]/.test(c)), changes.join(" | "));
+    // Undone and redone through the reply's undo.
+    let ops = await undoKey(false, (u) => S.view.objects[u].members.members.length === 1 && !S.edits?.members?.length, CENTRAL);
+    assert.deepEqual(ops, [{ op: "members", uuid: CENTRAL, value: null }]);
+    assert.doesNotMatch(file(), /members/);
+    ops = await undoKey(true, (u) => S.view.objects[u].members.members.length === 2, CENTRAL);
+    assert.deepEqual(ops, [{ op: "members", uuid: CENTRAL, value: [LC_F, LC_W] }]);
+    // Emptied: `()`, and no rec= in the pending config.
+    await page.waitForSelector(`${sec} [data-me="open"]`);
+    await page.click(`${sec} [data-me="open"]`);
+    await page.click(`${sec} [data-me="del"][data-i="1"]`);
+    await page.click(`${sec} [data-me="del"][data-i="0"]`);
+    await waitText(sec, /No members: saving empties the list/);
+    const n1 = edits.length;
+    await page.click(`${sec} [data-me="save"]`);
+    await until(() => edits.length > n1 && statuses[n1] !== undefined, "the empty members request");
+    assert.equal(statuses[n1], 200);
+    assert.deepEqual(edits[n1].ops[0].value, []);
+    await page.waitForFunction((u) => S.view.objects[u].members.members.length === 0, CENTRAL, { timeout: 10000 });
+    await settled();
+    assert.match(file(), /^vx_10000050_0000_0500_ffff504f94000001\.members = \(\)$/m);
+    // Reverted: vislox's claim goes, the base's list is back, nothing pending.
+    await page.waitForSelector(`${sec} [data-me="revert"]`);
+    await page.click(`${sec} [data-me="revert"]`);
+    await page.waitForFunction((u) => S.view.objects[u].members.members.length === 1 && !S.edits?.members?.length, CENTRAL, { timeout: 15000 });
+    await page.waitForFunction(() => /Nothing pending/.test(document.querySelector("#deploy-pend")?.textContent || ""), null, { timeout: 10000 });
+    // An alarm's members are shown, never edited.
+    await page.evaluate((u) => { gotoPage(S.objPage.get(u), { focus: u }); select(u); }, ALARM);
+    await waitText(sec, /stay with Loxone Config[\s\S]*1\s*Diele/);
+    assert.equal(await page.$(`${sec} [data-me="open"]`), null);
   });
   await step("nothing was deployed: lox only compiled, checked, linted and tested", async () => {
     const ran = readFileSync(calls, "utf8").trim().split("\n");

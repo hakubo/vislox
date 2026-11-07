@@ -201,7 +201,7 @@ pub struct PLabel {
     pub src: String,
 }
 
-#[derive(Serialize, Clone, Default)]
+#[derive(Serialize, Clone, Default, Debug, PartialEq)]
 pub struct Target {
     pub uuid: String,
     pub title: String,
@@ -247,6 +247,12 @@ pub struct ObjInfo {
     /// The compared revision's, when they differ.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub moods_old: Option<MoodsInfo>,
+    /// A central block's members, or an alarm's (#75).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub members: Option<MembersInfo>,
+    /// The compared revision's, when they differ.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub members_old: Option<MembersInfo>,
     /// Who may open an NFC Code Touch, or who gets a push notification (#68).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rights: Option<rights::Rights>,
@@ -276,6 +282,93 @@ pub struct DeviceInfo {
     /// How the compared change reconfigures the device, if it does
     /// ([`HwDevice::how`]).
     pub how: Option<&'static str>,
+}
+
+/// The members of a central block (`rec=`, edited here) or an alarm
+/// (`Objects=`, which stay with Loxone Config), in the app's order (#75).
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct MembersInfo {
+    /// The attribute that lists them: `rec` or `Objects`.
+    pub attr: &'static str,
+    /// Whether vislox edits them: a central block's, not an alarm's.
+    pub editable: bool,
+    /// The type of block a member is (`LightController2` under a
+    /// `CentralLight`, `AutoJalousie` under a `CentralShade`).
+    pub takes: Option<&'static str>,
+    pub members: Vec<MemberInfo>,
+}
+
+/// One member: the block, as a link, or its UUID when the config has no
+/// such object (`missing`).
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct MemberInfo {
+    #[serde(flatten)]
+    pub target: Target,
+    pub missing: bool,
+}
+
+/// The members `uuid` lists, if it is a block that lists any.
+fn members_info(c: &Ctx, uuid: &str) -> Option<MembersInfo> {
+    let el = c.el(uuid)?;
+    let ty = el.attr("Type")?;
+    let (attr, editable) = crate::member_edit::list_attr(ty)?;
+    let members = crate::member_edit::of(el)
+        .into_iter()
+        .map(|m| match c.el(&m) {
+            Some(_) => MemberInfo {
+                target: c.target(&m, None),
+                missing: false,
+            },
+            None => MemberInfo {
+                target: Target {
+                    title: m.clone(),
+                    uuid: m,
+                    ..Target::default()
+                },
+                missing: true,
+            },
+        })
+        .collect();
+    Some(MembersInfo {
+        attr,
+        editable,
+        takes: crate::member_edit::member_type(ty),
+        members,
+    })
+}
+
+/// A member list that changed, as the change list reads it: *Alle Lichter ·
+/// member added: Küche*, *· member removed: Bad*, and a new order of the
+/// members both revisions list.
+fn members_changes(title: &str, old: &MembersInfo, new: &MembersInfo) -> Vec<String> {
+    let has = |m: &MembersInfo, u: &str| m.members.iter().any(|x| x.target.uuid == u);
+    let mut out = Vec::new();
+    for x in &new.members {
+        if !has(old, &x.target.uuid) {
+            out.push(format!("{title} · member added: {}", x.target.title));
+        }
+    }
+    for x in &old.members {
+        if !has(new, &x.target.uuid) {
+            out.push(format!("{title} · member removed: {}", x.target.title));
+        }
+    }
+    let both = |a: &MembersInfo, b: &MembersInfo| -> Vec<String> {
+        a.members
+            .iter()
+            .filter(|x| has(b, &x.target.uuid))
+            .map(|x| x.target.title.clone())
+            .collect()
+    };
+    let (o, n) = (both(old, new), both(new, old));
+    if o != n {
+        out.push(format!(
+            "{title} · members order: {} → {}",
+            o.join(", "),
+            n.join(", ")
+        ));
+    }
+    out
 }
 
 /// A lighting controller's moods (#74), as the viewed config stores them
@@ -1380,6 +1473,34 @@ pub fn build(new: &LoxoneDoc, old: Option<&LoxoneDoc>, title: &str) -> View {
         }
     }
 
+    // Member lists (#75): a changed one marks its block changed (its `rec=`
+    // or `Objects=` does already); the change list reads it by name.
+    let mut members: HashMap<String, (MembersInfo, Option<MembersInfo>)> = HashMap::new();
+    for u in &nc.order {
+        if let Some(mi) = members_info(&nc, u) {
+            let old = oc
+                .as_ref()
+                .filter(|_| d.on)
+                .and_then(|o| members_info(o, u))
+                .filter(|o| {
+                    o.members.iter().map(|m| &m.target.uuid).collect::<Vec<_>>()
+                        != mi
+                            .members
+                            .iter()
+                            .map(|m| &m.target.uuid)
+                            .collect::<Vec<_>>()
+                });
+            members.insert(u.clone(), (mi, old));
+        }
+    }
+    if let Some(oc) = &oc {
+        for u in oc.order.iter().filter(|u| !nc.els.contains_key(*u)) {
+            if let Some(mi) = members_info(oc, u) {
+                members.insert(u.clone(), (mi, None));
+            }
+        }
+    }
+
     // Access rights and recipients (#68): a changed one marks its block
     // changed.
     let mut new_rights = rights::read(new);
@@ -1446,6 +1567,10 @@ pub fn build(new: &LoxoneDoc, old: Option<&LoxoneDoc>, title: &str) -> View {
             o.moods = Some(m);
             o.moods_old = old;
         }
+        if let Some((m, old)) = members.remove(u) {
+            o.members = Some(m);
+            o.members_old = old;
+        }
         o.rights = new_rights.remove(u);
         if d.rights.contains(u) {
             o.rights_old = old_rights.remove(u);
@@ -1459,6 +1584,7 @@ pub fn build(new: &LoxoneDoc, old: Option<&LoxoneDoc>, title: &str) -> View {
                 let mut o = obj_info(oc, None, u, &d, true, ci);
                 o.schedule = scheds.remove(u);
                 o.moods = moods.remove(u).map(|(m, _)| m);
+                o.members = members.remove(u).map(|(m, _)| m);
                 o.rights = old_rights.remove(u);
                 view.objects.insert(u.clone(), o);
             }
@@ -2017,6 +2143,8 @@ fn obj_info(
         schedule: None,
         moods: None,
         moods_old: None,
+        members: None,
+        members_old: None,
         rights: None,
         rights_old: None,
         device,
@@ -2219,12 +2347,19 @@ fn changes(view: &mut View, nc: &Ctx, oc: &Ctx, d: &Delta) {
                 how: None,
             });
         }
-        let (lines, covered) = view
+        let (mut lines, mut covered) = view
             .objects
             .get(&u)
             .and_then(|o| o.calendar.as_ref())
             .map(|ci| calendar_changes(&nc.title(&u), ci))
             .unwrap_or_default();
+        // A member list (#75) reads by name, in place of its raw attribute.
+        if let Some(o) = view.objects.get(&u)
+            && let (Some(new), Some(old)) = (&o.members, &o.members_old)
+        {
+            lines.extend(members_changes(&nc.title(&u), old, new));
+            covered.push(new.attr);
+        }
         for text in lines {
             v.push(Change {
                 kind: "attr",
@@ -3641,6 +3776,78 @@ mod tests {
         let m = v.objects[LICHT].moods.as_ref().unwrap();
         assert_eq!(m.moods[1].role, Some(crate::mood_edit::Required::Builtin));
         assert!(m.error.is_none());
+    }
+
+    /// A central block lists its members in order, each a link; a changed
+    /// list is a line per member added or removed and one for the order, in
+    /// place of the raw `rec=` line; an alarm's are shown read-only (#75).
+    #[test]
+    fn a_central_block_shows_its_members_and_their_changes() {
+        use crate::member_edit::fixture::{ALARM, ALLE, BAD, FLUR, LICHT, ROLLOS, house};
+        let base_s = house();
+        let base = doc(&base_s);
+        let v = build(&base, None, "");
+        let m = v.objects[ALLE].members.as_ref().expect("members");
+        assert_eq!(
+            (m.attr, m.editable, m.takes),
+            ("rec", true, Some("LightController2"))
+        );
+        let t: Vec<(&str, &str, bool)> = m
+            .members
+            .iter()
+            .map(|x| (x.target.title.as_str(), x.target.ty.as_str(), x.missing))
+            .collect();
+        assert_eq!(
+            t,
+            [
+                ("Licht", "LightController2", false),
+                ("Flur", "LightController2", false)
+            ]
+        );
+        assert_eq!(
+            m.members[0].target.page_title.as_deref(),
+            Some("Obergeschoss")
+        );
+        let r = v.objects[ROLLOS].members.as_ref().unwrap();
+        assert_eq!(r.takes, Some("AutoJalousie"));
+        assert!(r.members.is_empty());
+        let a = v.objects[ALARM].members.as_ref().unwrap();
+        assert_eq!((a.attr, a.editable, a.members.len()), ("Objects", false, 1));
+        assert!(v.objects[LICHT].members.is_none());
+
+        // Flur first, Licht removed, Bad and a UUID the config lacks added.
+        let gone = "10000099-0000-0990-ffff504f94000001";
+        let new_s = base_s.replace(
+            &format!("rec=\"{LICHT},{FLUR}\""),
+            &format!("rec=\"{FLUR},{BAD},{gone}\""),
+        );
+        let v = build(&doc(&new_s), Some(&base), "");
+        let o = &v.objects[ALLE];
+        assert_eq!(o.status, "changed");
+        assert!(o.members.as_ref().unwrap().members[2].missing);
+        let texts: Vec<&str> = v.changes.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            [
+                "Alle Lichter · member added: Bad",
+                &format!("Alle Lichter · member added: {gone}"),
+                "Alle Lichter · member removed: Licht",
+            ],
+            "{texts:?}"
+        );
+        // Only the order: one line.
+        let swapped = base_s.replace(
+            &format!("rec=\"{LICHT},{FLUR}\""),
+            &format!("rec=\"{FLUR},{LICHT}\""),
+        );
+        let v = build(&doc(&swapped), Some(&base), "");
+        let texts: Vec<&str> = v.changes.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            ["Alle Lichter · members order: Licht, Flur → Flur, Licht"]
+        );
+        assert!(v.objects[ALLE].members_old.is_some());
+        assert!(v.objects[ROLLOS].members_old.is_none());
     }
 
     /// A circuit's kind is lox's (`Moods::prefixes`): one whose moods hold two

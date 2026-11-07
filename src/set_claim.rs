@@ -167,7 +167,7 @@ pub fn member_of(files: &Files, lock: &Lock, slug: &str) -> Option<String> {
 }
 
 /// The slug vislox's files name the block `uuid` by.
-fn target_of(files: &Files, lock: &Lock, uuid: &str) -> String {
+pub fn target_of(files: &Files, lock: &Lock, uuid: &str) -> String {
     lock.slug_of(uuid)
         .filter(|t| files.block(t).is_some())
         .map(String::from)

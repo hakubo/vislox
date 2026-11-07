@@ -2076,6 +2076,10 @@ impl Actions {
             .iter()
             .any(|o| matches!(o, edit::Op::Schedule { .. }));
         let mooding = req.ops.iter().any(|o| matches!(o, edit::Op::Moods { .. }));
+        let membering = req
+            .ops
+            .iter()
+            .any(|o| matches!(o, edit::Op::Members { .. }));
         let names = if scheduling
             || mooding
             || req
@@ -2092,17 +2096,23 @@ impl Actions {
         let mut sched_claimed = std::collections::BTreeMap::new();
         // And the lighting controllers whose moods it claims (#74).
         let mut moods_claimed = std::collections::BTreeMap::new();
-        if scheduling || mooding {
+        // And the central blocks whose members it claims (#75).
+        let mut members_claimed = std::collections::BTreeMap::new();
+        if scheduling || mooding || membering {
             let texts = {
                 let mut m = self.module_files.lock().unwrap();
                 m.refresh(&p.root, &p.module);
                 m.texts()
             };
             let mine = format!("{shown}/");
-            for c in crate::managed::set_claims(&texts, &lock) {
+            let claims = crate::managed::set_claims(&texts, &lock)
+                .into_iter()
+                .chain(crate::managed::members_claims(&texts, &lock));
+            for c in claims {
                 let into = match c.kind {
                     "schedule" => &mut sched_claimed,
                     "moods" => &mut moods_claimed,
+                    "members" => &mut members_claimed,
                     _ => continue,
                 };
                 if !c.file.starts_with(&mine) {
@@ -2151,6 +2161,7 @@ impl Actions {
             page_adoptions: &prepared.pages,
             sched_claimed: &sched_claimed,
             moods_claimed: &moods_claimed,
+            members_claimed: &members_claimed,
         };
         // `removed` lines lox needs no more go first: their slugs are free.
         files.tidy(&lock);
@@ -2192,6 +2203,9 @@ impl Actions {
             }
             edit::Op::Moods { uuid, value: None } => {
                 moods_claimed.contains_key(&uuid.to_ascii_lowercase())
+            }
+            edit::Op::Members { uuid, value: None } => {
+                members_claimed.contains_key(&uuid.to_ascii_lowercase())
             }
             _ => false,
         });
@@ -2276,6 +2290,8 @@ impl Actions {
         // The same for moods (#74): the controllers, the sets written back.
         let mut lit: Vec<String> = Vec::new();
         let mut lit_restored: Vec<String> = Vec::new();
+        // And the central blocks whose members it writes (#75).
+        let mut centrals: Vec<String> = Vec::new();
         for o in &req.ops {
             match o {
                 edit::Op::Schedule {
@@ -2292,11 +2308,19 @@ impl Actions {
                     lit.push(uuid.clone());
                     lit_restored.extend(v.restore.keys().cloned());
                 }
+                edit::Op::Members {
+                    uuid,
+                    value: Some(_),
+                } => centrals.push(uuid.clone()),
                 _ => {}
             }
         }
         // The compiled config, read once for the checks below.
-        let out_doc = if !place.moves.is_empty() || !timed.is_empty() || !lit.is_empty() || adopting
+        let out_doc = if !place.moves.is_empty()
+            || !timed.is_empty()
+            || !lit.is_empty()
+            || !centrals.is_empty()
+            || adopting
         {
             Some(
                 std::fs::read(&p.out)
@@ -2334,6 +2358,16 @@ impl Actions {
             if !missed.is_empty() {
                 return Err(fail(format!(
                     "lox logic compile did not write the moods of {}",
+                    missed.join(", ")
+                )));
+            }
+        }
+        // Nor a members claim lox did not write onto its central block (#75).
+        if let (false, Some(out)) = (centrals.is_empty(), &out_doc) {
+            let missed = crate::member_edit::missed(&files, out, &lock, &centrals);
+            if !missed.is_empty() {
+                return Err(fail(format!(
+                    "lox logic compile did not write the members of {}",
                     missed.join(", ")
                 )));
             }
@@ -3008,7 +3042,7 @@ impl Actions {
         deployed: Option<DeployedRev>,
         pending: Option<Arc<Vec<u8>>>,
     ) -> Value {
-        let off = || json!({ "available": false, "reason": state.why, "claims": [], "managed": [], "sources": {}, "set_claims": [], "schedules": [], "schedule_sets": [], "moods": [], "mood_sets": [] });
+        let off = || json!({ "available": false, "reason": state.why, "claims": [], "managed": [], "sources": {}, "set_claims": [], "members_claims": [], "schedules": [], "schedule_sets": [], "moods": [], "mood_sets": [], "members": [] });
         let Some(dir) = self.s.project.as_deref() else {
             return off();
         };
@@ -3117,6 +3151,17 @@ impl Actions {
         // The module's claims on a block's access rights, recipients or
         // switching times (#68), and the block each is on.
         let set_claims = crate::managed::set_claims(&texts, &lock);
+        // And on a central block's members (#75).
+        let members_claims = crate::managed::members_claims(&texts, &lock);
+        // The members vislox's file claims now or claimed in the deployed
+        // revision, per central block.
+        let members = crate::member_edit::edits_section(
+            &now,
+            &was,
+            &lock,
+            pending_doc.as_ref(),
+            deployed_doc.as_ref(),
+        );
         // The switching times vislox's file claims now or claimed in the
         // deployed revision (#73), per timer, and its sets.
         let (schedules, schedule_sets) = edit_schedules(
@@ -3263,6 +3308,7 @@ impl Actions {
                 page_adoptions: &none_p,
                 sched_claimed: &Default::default(),
                 moods_claimed: &Default::default(),
+                members_claimed: &Default::default(),
             };
             for b in blocks.iter_mut().filter(|b| b["adopted"] == true) {
                 let Some(u) = b["uuid"].as_str().map(String::from) else {
@@ -3284,6 +3330,8 @@ impl Actions {
             "managed": managed,
             "sources": sources,
             "set_claims": set_claims,
+            "members_claims": members_claims,
+            "members": members,
             "schedules": schedules,
             "schedule_sets": schedule_sets,
             "moods": moods,
@@ -7884,5 +7932,160 @@ esac
             .unwrap_err();
         assert_eq!(code, axum::http::StatusCode::UNPROCESSABLE_ENTITY, "{msg}");
         assert!(msg.contains("pages/own.loxl:8 claims its moods"), "{msg}");
+    }
+
+    // ── members of a central block (#75) ───────────────────────────────
+
+    fn members_op(uuid: &str, list: Option<&[&str]>) -> edit::Op {
+        edit::Op::Members {
+            uuid: uuid.into(),
+            value: list.map(|l| l.iter().map(|s| s.to_string()).collect()),
+        }
+    }
+
+    /// A compile that does not write the claim onto its central block is
+    /// refused, and the module, lock and out are put back; nothing is deployed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn members_lox_did_not_write_are_refused_and_put_back() {
+        use crate::member_edit::fixture::{ALLE, FLUR, LICHT, house};
+        let (tmp, a) = project_for_edits();
+        let d = tmp.path().join("project");
+        std::fs::write(d.join("base.Loxone"), house()).unwrap();
+        std::fs::write(d.join("out.Loxone"), house()).unwrap();
+        sh(&d, "git add -A && git commit -qm centrals");
+        std::fs::write(
+            tmp.path().join("lox"),
+            "#!/bin/sh\necho \"$*\" >> ../calls.log\n[ \"$1 $2\" = \"logic compile\" ] || exit 2\n\
+             out=out.Loxone; prev=\nfor a in \"$@\"; do [ \"$prev\" = --out ] && out=$a; prev=$a; done\n\
+             cp base.Loxone \"$out\"\n",
+        )
+        .unwrap();
+        let req = edit::Request {
+            base: blob(&d, "out.Loxone"),
+            ops: vec![members_op(ALLE, Some(&[FLUR, LICHT]))],
+        };
+        let out_was = std::fs::read(d.join("out.Loxone")).unwrap();
+        let (code, msg) = a.edit(&req, None).await.unwrap_err();
+        assert_eq!(code, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            msg.contains("did not write the members of Alle Lichter"),
+            "{msg}"
+        );
+        assert!(!d.join("pages/vislox/edits.loxl").exists());
+        assert_eq!(std::fs::read(d.join("out.Loxone")).unwrap(), out_was);
+        let calls = std::fs::read_to_string(tmp.path().join("calls.log")).unwrap();
+        assert!(
+            calls.lines().all(|l| l.starts_with("logic compile")),
+            "{calls}"
+        );
+    }
+
+    /// Members with the real lox (#75): set `VISLOX_TEST_LOX` to a lox binary
+    /// (v0.83.0) to run it; it never talks to a Miniserver. The claim is
+    /// compiled onto the central block in the order given, `GET /api/edits`
+    /// lists it as not deployed, the reply's undo puts the base's list back,
+    /// and a central block the module's own file claims is refused, its drop
+    /// let through.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn members_are_compiled_by_lox_and_undone() {
+        use crate::member_edit::fixture::{ALLE, BAD, FLUR, LICHT, house};
+        let Some(lox) = std::env::var_os("VISLOX_TEST_LOX") else {
+            eprintln!("VISLOX_TEST_LOX is not set: skipped");
+            return;
+        };
+        let (tmp, a) = project_with_lox_base(Path::new(&lox), house().as_bytes());
+        let d = tmp.path().join("project");
+        let rec = |p: &str| {
+            let doc = edit::parse_doc(&std::fs::read(d.join(p)).unwrap()).unwrap();
+            crate::member_edit::of(edit::find(&doc.xml.root, ALLE).unwrap())
+        };
+        assert_eq!(rec("out.Loxone"), [LICHT, FLUR]);
+        let r = a
+            .edit(
+                &edit::Request {
+                    base: blob(&d, "out.Loxone"),
+                    ops: vec![members_op(ALLE, Some(&[BAD, FLUR]))],
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(r["undo"][0]["op"], "members");
+        assert_eq!(r["undo"][0]["value"], Value::Null);
+        let file = std::fs::read_to_string(d.join("pages").join(edit::FILE)).unwrap();
+        assert!(
+            file.contains(&format!(
+                "{}.members = ({}, {})\n",
+                edit::slug(ALLE),
+                edit::slug(BAD),
+                edit::slug(FLUR)
+            )),
+            "{file}"
+        );
+        assert_eq!(rec("out.Loxone"), [BAD, FLUR]);
+        let e = edits_of(&a, &d).await;
+        assert_eq!(e["members"][0]["uuid"], ALLE);
+        assert_eq!(e["members"][0]["pending"], true);
+        assert_eq!(e["members"][0]["members"], json!([BAD, FLUR]));
+        // `()` empties the list: no `rec=` at all.
+        a.edit(
+            &edit::Request {
+                base: blob(&d, "out.Loxone"),
+                ops: vec![members_op(ALLE, Some(&[]))],
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(rec("out.Loxone").is_empty());
+        // Back to the first edit's list, then undone: the base's list again.
+        a.edit(
+            &edit::Request {
+                base: blob(&d, "out.Loxone"),
+                ops: vec![members_op(ALLE, Some(&[BAD, FLUR]))],
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        let undo: Vec<edit::Op> = serde_json::from_value(r["undo"].clone()).unwrap();
+        a.edit(
+            &edit::Request {
+                base: blob(&d, "out.Loxone"),
+                ops: undo,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(rec("out.Loxone"), [LICHT, FLUR]);
+        // The module's own file claims it: refused, naming that line.
+        std::fs::write(
+            d.join("pages/own.loxl"),
+            format!(
+                "# The module's own.\npage \"Obergeschoss\"\nextern alle = CentralLight(uuid: \"{ALLE}\")\n\
+                 extern licht = LightController2(uuid: \"{LICHT}\")\nalle.members = (licht)\n"
+            ),
+        )
+        .unwrap();
+        sh(
+            &d,
+            &format!("{} logic compile >/dev/null", Path::new(&lox).display()),
+        );
+        assert_eq!(rec("out.Loxone"), [LICHT]);
+        let (code, msg) = a
+            .edit(
+                &edit::Request {
+                    base: blob(&d, "out.Loxone"),
+                    ops: vec![members_op(ALLE, Some(&[FLUR]))],
+                },
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(code, axum::http::StatusCode::UNPROCESSABLE_ENTITY, "{msg}");
+        assert!(msg.contains("pages/own.loxl:5 claims its members"), "{msg}");
     }
 }

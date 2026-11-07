@@ -103,6 +103,19 @@ published under the same version (see [docker/README.md](docker/README.md)).
   (`Circuit<n>:`), re-checked against the moods vislox claims. A shared set whose other claimant Loxone Config
   deleted is refused by name, with *Drop its claim* (switching times too). Switching times and moods share one
   implementation of set claims (`set_claim.rs`), ready for access, recipients and tiles. Never deploys.
+- Show, review and edit the members of a central block (#75): Properties of a CentralLight or CentralShade has
+  *Members*: the lighting controllers or automatic blinds it drives, in the order the app lists them, each a link
+  to its block (one the config lacks is named by its UUID). An alarm's members (`Objects=`) are shown read-only:
+  they stay with Loxone Config. The Changes list reads a changed list by name (*Alle Lichter · member added:
+  Diele*, *… member removed: …*, *… members order: …*) instead of the raw `rec=` line. *Edit members* adds one
+  with the Ctrl+K picker (only blocks of the type the central block takes, none listed already), removes and
+  reorders them; *Save* sends the new op `members` (the whole list, in order; `[]` empties it), which writes a Lox
+  Logic `<central>.members = (…)` claim into `<module>/vislox/edits.loxl` and compiles; the compile must write
+  exactly that list. Checked before lox sees it: the right type, each listed once, never the central block itself,
+  no block the module manages, one claim per central block (one the module's own file makes is named, *Claimed
+  twice*: *Remove vislox's claim*). Undo, Revert and the Deploy pane count it like the other edits; a member
+  Loxone Config deleted is named, with *Drop the missing members*. Adopting a central block leaves its list as
+  Loxone Config wrote it. Never deploys.
 - Fixed: Discard failed when the last commit had no lockfile (the first compile writes one), or one was staged
   but not committed. Discard now reads the last commit, never deletes a lock vislox did not write (one not in git
   goes back to how it was before vislox's first edit), and puts everything back when a step fails.

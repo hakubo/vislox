@@ -618,6 +618,60 @@ pub fn set_claims<T: AsRef<str>>(files: &[(String, T)], lock: &crate::edit::Lock
     claims
 }
 
+/// Every `<central>.members = (a, b, …)` at the top level of the module's
+/// files, outside template bodies (#75), as a [`SetClaim`] of kind `members`
+/// whose `set` is the list as written (`(a, b)`) and whose `blocks` is the
+/// central block it is on. A member list is no named set, so it is not in
+/// [`set_claims`] (whose sets Apply's confirmation reviews).
+pub fn members_claims<T: AsRef<str>>(
+    files: &[(String, T)],
+    lock: &crate::edit::Lock,
+) -> Vec<SetClaim> {
+    let decls = Declarations::new(files);
+    let mut claims = Vec::new();
+    for (file, text) in files {
+        let lines: Vec<&str> = text.as_ref().split('\n').collect();
+        let body = template_bodies(&lines);
+        for (n, line) in lines.iter().enumerate() {
+            if body.contains(&n) {
+                continue;
+            }
+            let c = code(line).trim();
+            let Some((lhs, list)) = c.split_once('=') else {
+                continue;
+            };
+            let (lhs, list) = (lhs.trim(), list.trim());
+            let Some((slug, kw)) = lhs.split_once('.') else {
+                continue;
+            };
+            let slug = slug.trim();
+            if kw.trim() != "members" || !is_name(slug) || !list.starts_with('(') {
+                continue;
+            }
+            let (f, l) = decls
+                .at(slug, None)
+                .map_or((None, None), |(f, l)| (Some(f), Some(l)));
+            let mut blocks = crate::check::name_blocks(slug, f.as_deref(), l, files, lock);
+            if blocks.is_empty()
+                && let Some(u) = lock.externals.get(slug)
+            {
+                blocks.push(u.to_ascii_lowercase());
+            }
+            claims.push(SetClaim {
+                kind: "members",
+                slug: slug.to_string(),
+                set: list.to_string(),
+                file: file.clone(),
+                line: n + 1,
+                set_file: None,
+                set_line: None,
+                blocks,
+            });
+        }
+    }
+    claims
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -872,6 +926,37 @@ mod tests {
         set(now);
         m.refresh(root, &root.join("pages"));
         assert_eq!(&*m.texts()[0].1, "d = Or()\n");
+    }
+
+    #[test]
+    fn member_lists_point_at_their_line_and_their_central_block() {
+        let files = vec![(
+            "pages/licht.loxl".to_string(),
+            "extern zentral = CentralLight(uuid: \"10000050-0000-0500-ffff504f94000001\")\n\
+             l1 = LightController2(\"L1\")\n\
+             zentral.members = (l1)  # die Lichter\n\
+             # zentral.members = ()\n\
+             template T(c: CentralLight, l: LightController2)\n\
+             \tc.members = (l)\n\
+             end\n\
+             l1.moods = abend\n"
+                .to_string(),
+        )];
+        let lock = crate::edit::Lock::default();
+        let c = members_claims(&files, &lock);
+        assert_eq!(c.len(), 1, "{c:?}");
+        assert_eq!(
+            (c[0].kind, c[0].slug.as_str(), c[0].set.as_str()),
+            ("members", "zentral", "(l1)")
+        );
+        assert_eq!((c[0].file.as_str(), c[0].line), ("pages/licht.loxl", 3));
+        assert_eq!(c[0].blocks, ["10000050-0000-0500-ffff504f94000001"]);
+        // Not a set claim: Apply's review of sets leaves it out.
+        assert!(
+            set_claims(&files, &lock)
+                .iter()
+                .all(|c| c.kind != "members")
+        );
     }
 
     #[test]

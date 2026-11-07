@@ -76,6 +76,13 @@ The binary is an `axum` server with the UI embedded (plain JS and SVG, no build 
   (`missed`); also the `Circuit<n>:` setting of a controller added or adopted here. `model.rs` reads a controller's
   circuits and moods for Properties (`moods`, `moods_old`) and the Changes list; `GET /api/edits` sends `moods` and
   `mood_sets`.
+- `src/member_edit.rs` is editing a central block's members (#75): the `members` op (the member UUIDs in order),
+  checked as lox would (the type a CentralLight or CentralShade takes, each once, never itself; an alarm's
+  `Objects=` read-only), written as `.members` claims in `edits.loxl` (externs for Loxone Config's blocks, the slugs
+  of vislox's own), checked after the compile (`missed`), and `GET /api/edits`' `members`. A member list is no
+  shared set, so it is not a `SetKind`; it takes `set_claim.rs`'s naming of vislox's blocks. `model.rs` reads the
+  members for Properties (`members`, `members_old`) and the Changes list; `managed.rs` finds the module's own
+  `.members` claims (`members_claims`).
 - `src/blocks.rs` is adding blocks (#59): the types vislox offers (`GET /api/block-types`, from lox's builtin
   table and its language server's descriptions), and vislox's file of new blocks per page
   (`<module>/vislox/<page>.loxl`). `edit.rs` applies `add_block` and `remove_block` to it.
