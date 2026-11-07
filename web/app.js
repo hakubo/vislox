@@ -2760,7 +2760,9 @@ function undoWhy(queue) {
   const r = editRev();
   if (!r) return "The config on disk is not in the History yet.";
   if (S.rev !== r.id) return `Undo and redo change the newest config (${r.kind === "pending" ? "Pending" : "deployed"}): show it first.`;
-  if (a.running) return `${a.running} is running.`;
+  // An edit compiling (this tab's own save, or the step before) is waited for, not refused: the server
+  // reports it running before the page's own request comes back.
+  if (a.running && !(queue && a.running === "Edit")) return `${a.running} is running.`;
   if (queue) return null;
   if (UNDO.busy || UNDO.inflight || S.mvBusy || S.wrBusy || AB.busy || S.edit.busy || MV) return "An edit is compiling.";
   return null;
@@ -2773,8 +2775,12 @@ function undoStep(redo) {
   if (UNDO.busy >= UNDO_QUEUE) return;
   UNDO.busy++;
   renderAddHud();
-  // Done: the page drew blocks as not movable while it ran.
-  UNDO.chain = UNDO.chain.then(() => undoRun(redo)).catch(() => {}).finally(() => { UNDO.busy--; renderAddHud(); if (!UNDO.busy && S.view) renderPage(); });
+  // Done: the page drew blocks as not movable, and Properties said it was compiling, while it ran.
+  UNDO.chain = UNDO.chain.then(() => undoRun(redo)).catch(() => {}).finally(() => {
+    UNDO.busy--;
+    renderAddHud();
+    if (!UNDO.busy && S.view) { renderPage(); if (S.sel) renderProps(); }
+  });
 }
 /** Resolves once `ok()` holds, or after `ms`. */
 async function until(ok, ms) {
@@ -2786,6 +2792,8 @@ async function undoRun(redo) {
   if (UNDO.sending) await UNDO.sending.catch(() => {});
   await until(() => !S.mvBusy && !S.wrBusy && !AB.busy && !S.edit.busy && !MV, 10000);
   if (UNDO.blob && editRev()?.blob !== UNDO.blob) await editShowNewest(UNDO.blob).catch(() => {});
+  // The server done with it too: the History says so a moment after the reply.
+  await until(() => S.hist?.actions?.running !== "Edit", 30000);
   undoSync();
   const e = (redo ? UNDO.undone : UNDO.done).at(-1);
   if (!e) return;
