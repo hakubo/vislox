@@ -271,6 +271,31 @@ pub fn locate_findings<T: AsRef<str>>(
     }
 }
 
+/// Pin the tile findings (`tile-broadcast`, `tile-dead-command`, #78) that
+/// name a Touch Pure Flex by its title (one no extern pins) to the devices of
+/// `compiled` with that title: lint checks every device, claimed or not.
+pub fn pin_tile_findings(findings: &mut [Finding], compiled: &loxone_config::LoxoneDoc) {
+    fn walk<'a>(el: &'a loxone_config::xml::Element, title: &str, out: &mut Vec<&'a str>) {
+        if crate::tiles::is_flex(el)
+            && el.attr_decoded("Title").is_some_and(|t| t == title)
+            && let Some(u) = el.attr("U")
+        {
+            out.push(u);
+        }
+        for c in el.child_elements() {
+            walk(c, title, out);
+        }
+    }
+    for f in findings
+        .iter_mut()
+        .filter(|f| f.kind.starts_with("tile-") && f.blocks.is_empty())
+    {
+        let mut found = Vec::new();
+        walk(&compiled.xml.root, &f.name, &mut found);
+        f.blocks = found.into_iter().map(String::from).collect();
+    }
+}
+
 /// The blocks `name` is: the managed block or device the lockfile pins by
 /// it, the UUID vislox names an extern after, or the object an extern of
 /// that name pins on its declaration's line (`file`:`line`).
@@ -1256,5 +1281,18 @@ test \"Status\" ... ERROR
         // `#` in a string.
         assert_eq!(lines, vec![Some(5), Some(6), Some(12), Some(11)]);
         assert_eq!(t[0].blocks, vec![FLUR.to_string()]);
+    }
+
+    #[test]
+    fn tile_findings_are_pinned_to_the_device_by_its_title() {
+        let d = loxone_config::LoxoneDoc::parse(crate::tiles::fixture::house().as_bytes()).unwrap();
+        let out = "tile-dead-command (1)\n  `Flex Küche` — tile 5 click: `SET(Lico;M+;pulse)&WAIT(500)` addresses Lico, but no LightController2 is API-linked to the device, so the command reaches nothing\n\
+                   unused-let (1)\n  `Flex Küche` — x\n\
+                   lint: 2 findings\n";
+        let mut f = parse_lint(out, str::to_string).unwrap();
+        pin_tile_findings(&mut f, &d);
+        assert_eq!(f[0].blocks, [crate::tiles::fixture::FLEX]);
+        // Only tile findings: another kind that happens to name a title is not.
+        assert!(f[1].blocks.is_empty());
     }
 }

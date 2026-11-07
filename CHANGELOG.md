@@ -138,6 +138,15 @@ published under the same version (see [docker/README.md](docker/README.md)).
   *Add block* offers *Push notification*: an `OutputRefLM` that `mirrors:` a notification Loxone Config made, with
   its message (`add_block` with `settings.mirrors`); its input is wired by dragging (#61). Its message is edited in
   Properties (*Edit values*: On, Off, Minimum time as a duration). Never deploys.
+- Touch Pure Flex tiles (#78): Properties of a Touch Pure Flex has *Tiles*: the blocks linked to its API connector
+  (directly or through an OutputRef) and each tile by index with its click, arrow up and arrow down (command, status
+  text, targets as links), marked against the compared revision; a changed function reads old → new in the Changes
+  list (`Flex Küche · tile 3 click: "…" → "…"`, `… click targets: Nord → Süd`). lox logic lint's `tile-broadcast`
+  and `tile-dead-command` show on the tile (pinned to a device lint names by title). *Edit tiles*: the new op `tiles`
+  writes a `tiles vx_… end` set (in lox's own format) and the device's `.tiles` claim into `edits.loxl`, its targets
+  picked from the linked blocks as externs; checked as lox would (indices the layout has, API-linked targets, `As`
+  and `Lico` types) and after the compile. A `SetKind` (shared sets, undo, Revert, the Deploy pane); the module's
+  own `.tiles` claims are listed in `set_claims`. Never deploys.
 - Fixed: Revert of switching times, moods or access whose deployed content could not be read sent the set's name
   alone, which claimed the set as it was and changed nothing; it is now refused with the reason. One Revert
   serves every set kind, from the keys the server sends (`set_kinds`).

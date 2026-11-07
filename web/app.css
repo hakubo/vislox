@@ -901,3 +901,15 @@ rect.ghost, line.ghost { fill: #1f6fd10a; stroke: var(--moved); stroke-opacity: 
 .ac-item { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; padding: 2px 0; }
 .ac-item select { max-width: 13em; padding: 2px 4px; border: 1px solid var(--line); border-radius: var(--radius); font: inherit; }
 .ac-item.bad select { border-color: var(--removed); }
+
+/* Touch Pure Flex tiles (#78): per tile, a row per function; the editor's command, text and targets. */
+.ti-h { display: flex; align-items: center; gap: 6px; }
+.ti-text { color: var(--muted); }
+.ti-to { margin-top: 2px; font-size: 12px; }
+.ti-to .arr { margin-right: 4px; color: var(--muted); }
+.ti-fn { display: grid; grid-template-columns: 6.5em 1fr; gap: 3px 6px; align-items: center; padding: 3px 12px; font-size: 12px; }
+.ti-fn .ti-k { grid-row: span 3; align-self: start; padding-top: 3px; color: var(--muted); }
+.ti-fn input { min-width: 0; padding: 2px 4px; border: 1px solid var(--line); border-radius: var(--radius); font: inherit; }
+.ti-picks { display: flex; flex-wrap: wrap; gap: 2px 10px; }
+.ti-pick { display: inline-flex; align-items: center; gap: 3px; white-space: nowrap; }
+.ti-pick.bad { color: var(--removed); }

@@ -524,7 +524,7 @@ fn bindings(lines: &[&str], start: usize) -> Vec<(String, usize)> {
 /// Daytimer's switching times, edits made in the app among them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SetClaim {
-    /// `access`, `recipients`, `schedule` or `moods` (#74).
+    /// `access`, `recipients`, `schedule`, `moods` (#74) or `tiles` (#78).
     pub kind: &'static str,
     /// The block, as the module names it.
     pub slug: String,
@@ -545,7 +545,7 @@ pub struct SetClaim {
 }
 
 /// The claim keywords on a block, and the set kinds they name.
-const SET_CLAIMS: &[&str] = &["access", "recipients", "schedule", "moods"];
+const SET_CLAIMS: &[&str] = &["access", "recipients", "schedule", "moods", "tiles"];
 
 /// The headers of the sets a scan found: (kind, set) → where each is declared.
 type SetHeaders = BTreeMap<(&'static str, String), Vec<(String, usize)>>;
@@ -624,7 +624,7 @@ fn scan_claims<T: AsRef<str>>(
     (claims, sets)
 }
 
-/// Every `<slug>.access|recipients|schedule|moods = <set>` at the top level
+/// Every `<slug>.access|recipients|schedule|moods|tiles = <set>` at the top level
 /// of the module's files, outside template bodies, with the block each one is
 /// on and where its set is declared.
 pub fn set_claims<T: AsRef<str>>(files: &[(String, T)], lock: &crate::edit::Lock) -> Vec<SetClaim> {
@@ -984,6 +984,13 @@ mod tests {
                  vx_10000030_0000_0300_ffff504f94000001.schedule = abend\n"
                     .to_string(),
             ),
+            (
+                "pages/flex.loxl".to_string(),
+                "extern flex = TreeDevice(uuid: \"20000007-0000-0070-ffff504f94000002\")\n\
+                 tiles kueche\n\ttile 2()\nend\n\
+                 flex.tiles = kueche\n"
+                    .to_string(),
+            ),
         ];
         let lock = crate::edit::Lock {
             slugs: [(
@@ -1046,6 +1053,14 @@ mod tests {
                     "pages/zeit.loxl:6".to_string(),
                     Some(1),
                     "10000030-0000-0300-ffff504f94000001".to_string()
+                ),
+                (
+                    "tiles",
+                    "flex",
+                    "kueche",
+                    "pages/flex.loxl:5".to_string(),
+                    Some(2),
+                    "20000007-0000-0070-ffff504f94000002".to_string()
                 ),
             ]
         );

@@ -426,6 +426,14 @@ sends to the Miniserver see [miniserver.md](miniserver.md).
   itself, and the message of a block Loxone Config drew, stay with Loxone Config. How:
   [editing.md](editing.md#push-notifications-77).
 
+- **Touch Pure Flex tiles** (#78): select the device in the tree. *Tiles* lists the blocks linked to its API
+  connector (the only blocks a tile's command reaches) and each tile by index: what its click and its arrows up and
+  down do, the status text and the blocks each command addresses, marked against the compared revision; the Changes
+  list says a changed function as old → new (`Flex Küche · tile 3 click: "…" → "…"`, `… click targets: Nord → Süd`).
+  lox logic lint's `tile-broadcast` and `tile-dead-command` show on the tile. *Edit tiles* edits each function's
+  command, text and targets (picked from the linked blocks) and writes a Lox Logic `tiles` set and the device's
+  claim. The layout and the API link stay with Loxone Config. How: [editing.md](editing.md#tiles-of-a-touch-pure-flex-78).
+
 For a `lox.toml` project:
 
 ```bash
