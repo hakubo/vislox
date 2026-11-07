@@ -6,8 +6,9 @@ Daytimer's switching times (#73), a lighting controller's moods (#74), a central
 open an NFC Code Touch (#76), push notifications: who gets them and what they say (#77), the tiles of a Touch
 Pure Flex (#78), a managed block's label and settings, its program among them (#79), deleting and renaming a
 managed block (#80), `let` constants and `defaults` (#81), expressions and named signals (#82), template
-instances (#83), and virtual inputs, virtual and Modbus devices (#84). This page is the design they share. #58 to #62,
-#72 to #84 are built (#81 to #84 in part: see their sections); the rest says where each step plugs in.
+instances (#83), virtual inputs, virtual and Modbus devices (#84), and Tree and Air hardware: statistics and new
+Tree devices (#85). This page is the design they share. #58 to #62, #72 to #85 are built (#81 to #84 in part: see
+their sections); the rest says where each step plugs in.
 
 ## The rules
 
@@ -18,8 +19,9 @@ instances (#83), and virtual inputs, virtual and Modbus devices (#84). This page
   Miniserver runs.
 - **vislox writes one place: its own files under the module directory**, `<module>/vislox/`: `edits.loxl` for
   the values it claims, the wires it draws and the constants it makes (#81), and one file per page for the blocks it adds
-  (`<module>/vislox/obergeschoss.loxl`), `_periphery.loxl` for the virtual inputs and devices it adds (#84), and a
-  file per program a block of them runs (`vx_code16_1.c`, #79).
+  (`<module>/vislox/obergeschoss.loxl`), `_periphery.loxl` for the virtual inputs and devices it adds (#84),
+  `_hardware.loxl` for the Tree and Air hardware it declares (#85), and a file per program a block of them runs
+  (`vx_code16_1.c`, #79).
   The rest of the module is never touched. A module that is one file cannot be edited from vislox.
   The exceptions are the lockfile: a move (#60), since lox keeps a managed block's position there, not in the
   source, so vislox writes it there the way lox's own `--relayout` does (see *Moving blocks*); and an adopted
@@ -73,7 +75,10 @@ POST /api/edit
            { "op": "instance", "slug": "vx_ost", "page": "<page uuid>",
              "value": { "template": "Treppenlicht", "args": { "taster": "vx_…", "dauer": "5min" } } },
            { "op": "add_block", "page": "<folder or device uuid>", "type": "VirtualHttpIn", "title": "Zähler",
-             "settings": { "Address": "http://192.0.2.10/status", "Poll": "1min" } } ] }
+             "settings": { "Address": "http://192.0.2.10/status", "Poll": "1min" } },
+           { "op": "statistics", "uuid": "<Tree or Air I/O uuid>", "value": "on" },
+           { "op": "add_block", "page": "<Tree extension uuid>", "type": "TreeDevice", "title": "Melder Flur",
+             "settings": { "kind": "PresenceSensorTree", "branch": "left" } } ] }
 ```
 
 `adopt`, `adopt_page` and `unadopt` go in a request of their own (#72), and so does `rename` (#80). `restore_block`
@@ -101,7 +106,9 @@ is what undoes a `remove_block` of a deployed block (#80); vislox makes it, see 
   `let` is a value op (#81): its `previous` is the constant's value before, or null when the op made it. `expr`
   is a value op too (#82): what vislox's files fed the input before, or null; `signal`'s `previous` is the `signal`
   op that puts back what was (null `value`: the op made the signal). `instance` is as `signal`, for a template
-  instance (#83).
+  instance (#83). `statistics` is a value op (#85): what vislox's file claimed before, or null. A Tree device created
+  here is added and removed as a block: `remove_block`'s `previous` is the `add_block` that creates it again (a new
+  UUID) or, once deployed, the `restore_block` that brings it back with its UUID.
   A reconnected wire is one request, `unwire` then `wire`:
   undone, the reverse list. The ops of one request see each other: `unwire` then `wire` of the same wire is
   accepted (and changes nothing). `remove_block`'s `add_block` carries the wires the removal took out
@@ -616,6 +623,68 @@ vx_modbusdev_1 = ModbusDev("Regler", device: vx_7e000002_0000_0000_ffff504f94000
   its I/O, under slugs lox picks, `<device slug>_<title>`, into a file per folder; vislox's adoption (#72) moves
   only page blocks into its page files). Until then its settings are Loxone Config's (Properties shows them
   read-only). Operating modes and calendar entries, of the same lox table, are #86's.
+
+## Tree and Air hardware (#85)
+
+Lox Logic does two things with hardware beyond the settings of #58: it switches statistics on or off for a Tree or
+Air input or output, and it creates a Tree device that is not paired yet. Both are hardware declarations, which take
+over a device or an I/O ([lox's language](https://github.com/discostu105/lox/blob/main/crates/loxone-config/docs/language.md#hardware--tree-and-air-devices-and-what-hangs-below-them)).
+vislox writes them into a file of its own (`src/hw_edit.rs`), with no `page` line:
+
+```text
+# Tree and Air hardware vislox declares: …                                              # <module>/vislox/_hardware.loxl
+
+extern vx_hw_20000002_0000_0020_ffff504f94000002 = LoxTree(uuid: "20000002-0000-0020-ffff504f94000002")
+
+vx_presencesensortree_1 = TreeDevice("Melder Flur", kind: "PresenceSensorTree", tree: vx_hw_20000002_0000_0020_ffff504f94000002, branch: "left")
+vx_hw_20000003_0000_0030_ffff504f94000002 = TreeDevice(uuid: "20000003-0000-0030-ffff504f94000002")
+
+vx_presencesensortree_1_i1 = TreeSensor(device: vx_presencesensortree_1, iname: "I1", Statistics: on)
+vx_hw_20000003_0000_0031_ffff504f94000002 = TreeAsensor(device: vx_hw_20000003_0000_0030_ffff504f94000002, uuid: "20000003-0000-0031-ffff504f94000002", Statistics: on)
+```
+
+- **Statistics** (`{ "op": "statistics", "uuid": …, "value": "on" | "off" | null }`): `on` writes the `StatsType=` the
+  type records with (7 on a digital input or output, 11 on an analog sensor), `off` removes it. lox takes it on
+  `TreeSensor`, `TreeAsensor`, `TreeActor`, `LoxAIRsensor`, `LoxAIRAsensor` and `LoxAIRactor` only (not on an analog
+  output); `x.Statistics = on` on an extern is refused, so the I/O is declared, and with it its device. A device
+  Loxone Config paired is declared by `uuid:` and states nothing else, so vislox owns no title, room or setting of
+  it; an I/O below it by `uuid:` (lox matches `iname:` only inside a device matched by `serial:`). An I/O below a
+  device created here is declared by `iname:`, since lox mints its UUIDs anew on every compile until the device is
+  deployed. A value op: Revert and Undo as for any value; `null` drops the declaration (and the device's, when no
+  other I/O names it), and the I/O records as the base has it. Refused, changing nothing: another type, a word but
+  `on`/`off`, an I/O or device the module's own files declare (the refusal names the slug), an I/O not in the base.
+  Dropping vislox's claim is always allowed, also when the object is gone since.
+- **Shown read-only everywhere**: Properties' *Device* section of a Tree or Air I/O has *Statistics*: `on`, `off`, or
+  the other kind Loxone Config set (`StatsType 3`), old → new when comparing. A changed `StatsType=` is reviewed as
+  a change of the I/O.
+- **A new Tree device**: *Add* on a Tree extension (`LoxTree`) of the project tree is `add_block` with the extension
+  as `page`, type `TreeDevice`, a name and the settings `kind` (`TouchTree`, `PresenceSensorTree`,
+  `CorridorLightTree`, `ValveTree`: the kinds lox's `tree_kinds` creates) and `branch` (`left`, `right`). It becomes
+  `vx_<kind>_<n> = TreeDevice("…", kind: "…", tree: <extern of the extension>, branch: "…")`; lox adds it to the
+  extension unpaired (`Serial="00000000"`) with the kind's inputs and outputs (titles in English), keeps its UUID in the
+  lockfile (`externals`, `matched_by: created`, and `hardware`), and prints a note on every compile and push. The
+  reply's `added` names it with that UUID. The extension must be in the base (lox resolves the extern there):
+  `add_under` says so otherwise. Its I/O's statistics are set from Properties of each I/O (by `iname:`); its name
+  from its Properties (the declaration's label). Its other values, and those of its I/O (names, rooms,
+  settings), wait for Apply: an extern by UUID of an object the base does not have would name nothing, so they are
+  refused until then.
+- **Marked unpaired**: the project tree tags it *unpaired* (`GET /api/edits`' `blocks[]` entry: `hardware`, `kind`,
+  `branch`, `paired` from the config shown), Properties' *Device* section says *Created here, not paired: pair it with
+  a Tree search in Loxone Config*, and Apply's confirmation lists it as *added, not paired* (`GET
+  /api/apply/changes`' `devices[].unpaired`, for any Tree device added with no serial). Pairing, search and firmware
+  stay in Loxone Config.
+- **Taken out or deleted** with *Remove*/*Delete* (`remove_block`): its declaration and its I/O's go, with `removed
+  <slug>` (lox keeps a created device from its first compile on and refuses to let its declaration go without it).
+  Not deployed: its `previous` is the `add_block` with its kind, branch, name and its I/O's statistics
+  (`<iname>.Statistics`); lox creates it under a new UUID. Deployed: Apply deletes it, and its `previous` is the
+  `restore_block` (its declaration as the `source`, the extension as `page`), which brings it back with its UUID while
+  lox keeps the tombstone; vislox rebuilds its lockfile entries from the deployed config, checks the tombstone, the
+  slug, the kind and the extension, and never takes them from the request. Refused while a wire (drawn in Loxone
+  Config or anywhere) leaves one of its objects (lox does not delete a device that feeds a wire), and while vislox's
+  file claims a value of one of them. Not offered: renaming it (`blocks[].renames: false`).
+- **Not built**: naming a created device's I/O when it is added (lox's English titles until the device is deployed,
+  then #58's title claim), adopting a device Loxone Config paired with all its I/O (lox's `adopt --uuid <device>`;
+  vislox declares a paired device only by `uuid:`, for its I/O's statistics), and declaring hardware by `serial:`.
 
 ## Moving blocks (#60)
 
@@ -1510,6 +1579,8 @@ cannot express is left out, not worked around.
 | #80 rename a managed block | `moved old -> new`, lox's rename over vislox's files | A block added or adopted here; the config does not change. |
 | #79 block settings | `slug = Type("Label", At: 06:58, Desc: "…", Code: file("slug.c"))` | Only a block added or adopted here; a program in `<module>/vislox/<slug>.c`. Constants take a unit (`Time: 30min`, `x.Time = 1h`). |
 | #81 constants | `let vx_… = 30min` in `edits.loxl`; `x.Time = vx_…`, `Time: vx_…` | Made, changed and dropped in vislox's file; a port bound to it, or to a constant of the module. The module's own `let` and `defaults` lines are shown, not changed. |
+| #85 statistics | `vx_hw_… = TreeSensor(device: …, uuid: "…", Statistics: on)` in `_hardware.loxl` | A Tree or Air input, digital output or analog sensor; its device declared by `uuid:` alone. Not on one the module declares. |
+| #85 new Tree device | `vx_<kind>_<n> = TreeDevice("…", kind: "…", tree: …, branch: "…")`, `removed vx_…` | The four kinds lox creates, on a Tree extension of the base; unpaired until a Tree search in Loxone Config. |
 
 Blocks the module already manages (they are in the lockfile) are refused: they are edited in their own `.loxl`.
 The blocks vislox added or adopted (#72) are the exception: their `.loxl` is vislox's.
@@ -1581,7 +1652,7 @@ Each of these plugs in as new op kinds on `POST /api/edit`, written into `<modul
 | #82 (built in part) | expressions (`<-`, `Port: …`) and named signals (`slug = …`, `.title`) of vislox's files; the module's shown |
 | #83 (built in part) | `template` instances of vislox's files (the `instance` op, lox's library copied in); the module's shown, grouped and reviewed |
 | #84 (built in part) | virtual inputs, virtual and Modbus devices added and edited in `_periphery.loxl` (`device:`); adopting Loxone Config's is left |
-| #85 | Tree and Air hardware (`Statistics:`, new Tree devices) |
+| #85 (built) | Tree and Air hardware: `Statistics:` on an I/O, new Tree devices (`kind:`, `removed`) in `_hardware.loxl` |
 | #86 | operating modes and calendar entries |
 | #87 | Automatic Designer rules (`rule`) |
 | #88 | new pages (`page "…" (room: …)`) |
@@ -1600,6 +1671,9 @@ lost is deleted only with consent to exactly that list, see [features.md](featur
   first; it is off, with the reason, where an edit would be refused (`GET /api/edits`' `add_under`: each folder and
   device that takes new objects, null or why `add_block` there would be refused) (#84). A number takes a unit only
   where lox documents one (`Poll: 1min`, not `Port: 30min`), and is range-checked in that unit. The new object is selected in the tree.
+  A Tree extension takes a new Tree device the same way, its kind and branch picked from lists (#85).
+- *Edit values* on a Tree or Air input or output has *Statistics* (on or off) where lox switches them; below a Tree
+  device created here and not deployed it is the only field (#85).
 - *Add block* (top left of the page, on the newest revision) lists the types vislox offers (`GET /api/block-types`:
   each type's purpose and link to Loxone's documentation, its ports with their units, canvas labels and the value
   Loxone Config places them with, and its settings), searched by name, type and purpose. The form asks for the

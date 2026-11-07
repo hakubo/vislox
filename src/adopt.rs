@@ -89,6 +89,10 @@ pub struct LockEdits {
     /// Removal tombstones to take out, by object UUID: a deleted block
     /// restored (#80) is the lock's again, with its UUIDs.
     pub untomb: BTreeSet<String>,
+    /// Tree devices created here and restored (#85): slug → (UUID, title).
+    /// Each gets its `externals` entry (`matched_by: created`) and its
+    /// `hardware` entry back, as lox wrote them.
+    pub created: BTreeMap<String, (String, Option<String>)>,
 }
 
 impl LockEdits {
@@ -99,6 +103,7 @@ impl LockEdits {
             && self.unwires.is_empty()
             && self.unexternals.is_empty()
             && self.untomb.is_empty()
+            && self.created.is_empty()
     }
 }
 
@@ -142,6 +147,24 @@ pub fn write_lock(lock: &[u8], edits: &LockEdits) -> Result<Vec<u8>, String> {
         for s in &edits.unexternals {
             x.remove(s);
         }
+    }
+    for (slug, (uuid, title)) in &edits.created {
+        let x = root
+            .entry("externals")
+            .or_insert_with(|| Json::Object(Default::default()))
+            .as_object_mut()
+            .ok_or_else(|| "the lock's externals are not a JSON object".to_string())?;
+        x.insert(
+            slug.clone(),
+            serde_json::json!({ "uuid": uuid, "matched_by": "created", "title_at_match": title,
+                "iname_at_match": null, "owned": true }),
+        );
+        let h = root
+            .entry("hardware")
+            .or_insert_with(|| Json::Object(Default::default()))
+            .as_object_mut()
+            .ok_or_else(|| "the lock's hardware is not a JSON object".to_string())?;
+        h.insert(slug.clone(), Json::String(uuid.clone()));
     }
     let wires = root
         .entry("extern_wires")

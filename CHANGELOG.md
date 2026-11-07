@@ -188,6 +188,10 @@ published under the same version (see [docker/README.md](docker/README.md)).
   an instance calls it); an instance of vislox's files is edited in Properties (arguments checked as lox checks a
   call), reverted, and removed while never committed. The module's own instances are shown, not changed. Never
   deploys.
+- Tree and Air hardware (#85): *Statistics* on or off for a Tree or Air input, digital output or analog sensor
+  (Properties, shown read-only everywhere), and *Add* on a Tree extension creates an unpaired Tree device of the kinds
+  lox creates, tagged *unpaired* in the tree and in Apply's confirmation; Remove/Delete and Undo as for a block. Written
+  into `<module>/vislox/_hardware.loxl` as hardware declarations. Never deploys, never pairs.
 
 ## 0.2.0
 

@@ -145,6 +145,11 @@ The binary is an `axum` server with the UI embedded (plain JS and SVG, no build 
   one goes (`parent`: its folder, or a device of vislox's or Loxone Config's), and the palette's `periphery`. They are
   declared in `<module>/vislox/_periphery.loxl`, a `PageFile` with `periphery` set and no page line; `edit.rs`'
   `add_block` hands them to `add_object`, and `remove_block`, `restore_block` and `edit_new_block` take them as blocks.
+- `src/hw_edit.rs` is Tree and Air hardware (#85): `<module>/vislox/_hardware.loxl` (`Files::hardware`, an
+  `HwFile`: the Tree extensions it names, devices by `uuid:` or created with `kind:`, I/O by `uuid:` or `iname:`
+  with `Statistics:`, `removed` lines), the `statistics` op, `add_block` of a `TreeDevice` (`add_device`), and
+  `remove_block`/`restore_block` of a created device, whose lockfile entries (`externals`, `hardware`) `adopt.rs`'
+  `LockEdits::created` writes back. `edit::check_module` validates the expanded module, where a declaration is an extern.
 - `src/set_claim.rs`' `KINDS` lists every kind of claim on a block's whole content (switching times, moods,
   access, recipients, tiles, members) as a `ClaimKind`; `edit.rs` and `actions.rs` loop over it instead of naming each kind.
 - `src/blocks.rs` is adding blocks (#59): the types vislox offers (`GET /api/block-types`, from lox's builtin

@@ -2514,9 +2514,14 @@ impl Actions {
                 }
             }
         }
+        // A Tree device created here (#85) is an extern of the lockfile.
+        let uuid_of = |s: &str| {
+            lock.uuid_of(s)
+                .or_else(|| lock.externals.get(s).map(String::as_str))
+        };
         let minted: Vec<Option<String>> = slugs
             .iter()
-            .map(|s| s.as_deref().and_then(|s| lock.uuid_of(s)).map(String::from))
+            .map(|s| s.as_deref().and_then(uuid_of).map(String::from))
             .collect();
         let added: Vec<Value> = req
             .ops
@@ -2524,7 +2529,7 @@ impl Actions {
             .zip(&slugs)
             .filter_map(|(op, s)| {
                 let s = s.as_deref()?;
-                let mut a = json!({ "slug": s, "uuid": lock.uuid_of(s) });
+                let mut a = json!({ "slug": s, "uuid": uuid_of(s) });
                 if let edit::Op::AddBlock {
                     restores: Some(was),
                     ..
@@ -3499,6 +3504,15 @@ impl Actions {
                 })
             })
             .collect();
+        // The Tree devices vislox created (#85), listed as its blocks are.
+        blocks.extend(crate::hw_edit::listed(
+            &now,
+            &lock,
+            &rel_dir,
+            deployed_doc.as_ref(),
+            pending_doc.as_ref().or(deployed_doc.as_ref()),
+            &was,
+        ));
         // The wires vislox's files draw now and in the deployed revision (#61),
         // by their ends as the page names them.
         let mut wires: std::collections::BTreeMap<(String, String, String, String), (bool, bool)> =
@@ -3583,6 +3597,8 @@ impl Actions {
             // Each folder and device that takes new objects of the object tree
             // (#84): null, or why `add_block` there would be refused.
             add_under = crate::periphery::add_refusals(&now, &ctx);
+            // And each Tree extension, for a new Tree device (#85).
+            add_under.extend(crate::hw_edit::add_refusals(&ctx));
         }
         // Whether each block of vislox's files can be deleted now (#80), or why
         // not: the checks `remove_block` makes first, which change nothing.

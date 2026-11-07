@@ -194,7 +194,8 @@ Weather Station, Motion Sensor). The NAT table's `0x801A` is named *Presence Sen
 
 The devices on the bus come from `lox extensions -o json` (name, serial, online), run like `lox log` with
 lox's configuration and context (`GET /api/hardware`, which needs an `X-Vislox` header since lox logs in; one read
-at a time). It only reads. Apply's confirmation lists the devices from `GET /api/apply/changes?rev=&base=` (`devices`)
+at a time). It only reads. Apply's confirmation lists the devices from `GET /api/apply/changes?rev=&base=` (`devices`; a Tree
+device added with no serial, as one the module created (#85), is `unpaired` and listed as *added, not paired*)
 (the pending compile compared with what is deployed, as the list after Apply is), and reads the bus only when
 the change adds, pairs or replaces a device. It waits at most 6 s for both, then asks anyway and says the bus
 was not checked. After Apply, the bus is read every 15 s for 3 minutes, only when the Apply reconfigured a

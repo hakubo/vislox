@@ -17,6 +17,7 @@ mod expr_edit;
 mod expressions;
 mod hardware;
 mod history;
+mod hw_edit;
 mod live;
 mod log;
 mod managed;

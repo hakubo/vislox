@@ -66,6 +66,11 @@ pub struct HwDevice {
     /// Whether `serial` can be looked for on the bus (`lox extensions`): a
     /// real serial, not an Air device's MAC-derived address.
     pub check: bool,
+    /// A Tree device added with no serial (one the module created, #85, or
+    /// one Loxone Config added offline): no device gets its configuration
+    /// until a Tree search in Loxone Config pairs it.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub unpaired: bool,
 }
 
 /// An operating mode (`Mode`), by the number calendar entries name it with.
@@ -239,6 +244,13 @@ pub struct ObjInfo {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub settings: Vec<SettingInfo>,
     pub ports: Vec<PortInfo>,
+    /// Whether a Tree or Air input or output records statistics (#85):
+    /// `on`, `off`, or the other kind Loxone Config set (`StatsType 3`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub statistics: Option<String>,
+    /// The compared revision's, when it differs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub statistics_old: Option<String>,
     /// Ref tags that mirror this object: (page uuid, ref object uuid).
     pub mirrored_by: Vec<[String; 2]>,
     pub target: Option<Target>,
@@ -2146,6 +2158,9 @@ fn hw_devices(nc: &Ctx, oc: &Ctx, d: &Delta) -> Vec<HwDevice> {
                 let norm = |s: Option<String>| s.map(|s| crate::discover::norm_serial(&s));
                 let serial = norm(c.serial(u));
                 let dev = HwDevice {
+                    unpaired: *how == "added"
+                        && c.ty(u) == "TreeDevice"
+                        && hardware::unpaired(serial.as_deref()),
                     check: c.ty(u) != hardware::AIR && !hardware::unpaired(serial.as_deref()),
                     uuid: u.clone(),
                     title: c.title(u),
@@ -2537,6 +2552,12 @@ fn obj_info(
         api_linked: Vec::new(),
         device,
         edit: if gone { None } else { crate::edit::caps(el) },
+        statistics_old: old
+            .filter(|_| d.on)
+            .and_then(|o| o.el(uuid))
+            .and_then(crate::hw_edit::stats_state)
+            .filter(|o| crate::hw_edit::stats_state(el).as_ref() != Some(o)),
+        statistics: crate::hw_edit::stats_state(el),
         uuid: uuid.to_string(),
         title: c.title(uuid),
         old_title: d.renamed.get(uuid).cloned().flatten(),
@@ -5121,6 +5142,48 @@ mod tests {
         assert_eq!(
             v.objects[COMFORT].device.as_ref().unwrap().kind,
             "Room Comfort Sensor Tree"
+        );
+    }
+
+    #[test]
+    fn a_tree_device_added_with_no_serial_is_to_pair_and_its_statistics_show() {
+        // A Presence Sensor Tree the module created (#85): Serial 00000000;
+        // and the Touch's temperature recording statistics.
+        let new = hw_edited(&[
+            (
+                "\t\t\t\t\t<C Type=\"TreeDevice\" TId=\"RoomsensorTree\"",
+                "\t\t\t\t\t<C Type=\"TreeDevice\" TId=\"PresenceSensorTree\" V=\"178\" U=\"20000008-0000-0080-ffff504f94000002\" Title=\"Melder Flur\" WF=\"16384\" Serial=\"00000000\" SubType=\"32794\" TreeType=\"32794\"/>\n\t\t\t\t\t<C Type=\"TreeDevice\" TId=\"RoomsensorTree\"",
+            ),
+            ("Idx=\"1\">", "Idx=\"1\" StatsType=\"11\">"),
+        ]);
+        let v = build(&doc(&new), Some(&doc(HW)), "t");
+        let d = v
+            .hardware
+            .iter()
+            .find(|d| d.title == "Melder Flur")
+            .unwrap();
+        assert_eq!((d.how, d.unpaired, d.check), ("added", true, false));
+        assert!(
+            v.hardware
+                .iter()
+                .filter(|d| d.title != "Melder Flur")
+                .all(|d| !d.unpaired)
+        );
+        let temp = &v.objects["20000003-0000-0031-ffff504f94000002"];
+        assert_eq!(temp.statistics.as_deref(), Some("on"));
+        assert_eq!(temp.statistics_old.as_deref(), Some("off"));
+        assert_eq!(
+            temp.edit.as_ref().unwrap().statistics.as_deref(),
+            Some("on")
+        );
+        // Not on a device, nor on an I/O lox records no statistics on.
+        assert_eq!(
+            v.objects["20000003-0000-0030-ffff504f94000002"].statistics,
+            None
+        );
+        assert_eq!(
+            v.objects["20000005-0000-0051-ffff504f94000002"].statistics,
+            None
         );
     }
 

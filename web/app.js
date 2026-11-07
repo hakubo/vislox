@@ -1256,6 +1256,14 @@ function renderPropsBody() {
     if (!dv.own) rows.push(row("Device", `<button type="button" class="lnk" data-go="${esc(dv.uuid)}">${esc(dv.title)}</button>`));
     else if (!o.attrs.some((a) => a.hint && /^(Serial|IP)$/.test(a.name))) rows.push(row("Serial", val(dv.serial)));
     if (marks && dv.how) rows.push(row("This change", `<span class="hw-how">${esc(HW_HOW[dv.how] || dv.how)}</span>`, "pr-chg"));
+    // Whether a Tree or Air input or output records statistics (#85), as the config has it.
+    if (o.statistics) {
+      const was = marks ? o.statistics_old : null;
+      rows.push(row("Statistics", was ? chg(was, o.statistics, true) : esc(o.statistics), was ? "pr-chg" : "", STATS_TIP));
+    }
+    // A Tree device created here (#85): not paired until a Tree search in Loxone Config finds it.
+    const made = hwCreated(o.uuid);
+    if (made && !made.paired) rows.push(row("Pairing", `<span class="hw-how">${esc(HW_UNPAIRED)}</span>`, "pr-chg"));
     // The settings matched to the device's own configuration, with what they do there.
     for (const a of o.attrs.filter((x) => x.hint)) {
       rows.push(row(HW_LABEL[a.name] || a.name, marks && a.changed ? chg(a.old, a.value, true) : val(a.value), marks && a.changed ? (a.hw ? "pr-chg pr-hw" : "pr-chg") : "", a.hint));
@@ -1413,6 +1421,17 @@ const HW_HOW = {
   unpaired: "Unpaired: the config no longer names a serial, so no physical device gets this configuration",
   changed: "Reconfigures the device: the Miniserver sends it a new configuration, which the device stores",
 };
+/** Statistics on a Tree or Air input or output (#85). */
+const STATS_TIP = "Statistics: the Miniserver records the value (StatsType=). on is the kind Lox Logic writes for this type; another kind (StatsType n) is one Loxone Config set.";
+/** A Tree device created here and not paired yet (#85). */
+const HW_UNPAIRED = "Created here, not paired: pair it with a Tree search in Loxone Config. Until then no device gets its configuration.";
+/** The Tree device created here (#85) with UUID `uuid`, from GET /api/edits' blocks. */
+function hwCreated(uuid) { return (S.edits?.blocks || []).find((b) => b.hardware && b.uuid && ciEq(b.uuid, uuid)) || null; }
+/** Whether `uuid` hangs below a Tree device created here and not deployed: lox mints its UUIDs anew on every compile. */
+function hwBelowNew(uuid) {
+  const path = findPath(uuid);
+  return (S.edits?.blocks || []).some((b) => b.hardware && b.uuid && !b.deployed && path.some((p) => ciEq(p, b.uuid)));
+}
 const HW_LABEL = { AC: "Audible acknowledgement", SSC: "Send interval", MinChange: "Threshold", MinTime: "Minimal time between sends", AverageTime: "Mean value time", TreeType: "Device type", SubType: "Device subtype", HwVersion: "Hardware version" };
 
 // ── tree ───────────────────────────────────────────────────────────────
@@ -1469,9 +1488,12 @@ function renderTree() {
     // A folder or device of the object tree takes new virtual inputs, outputs and Modbus devices (#84).
     const pst = n.synthetic ? null : periphAddState(n);
     const add = pst ? `<button type="button" class="tn-year tn-add" data-add-under tabindex="-1"${pst.ok ? "" : " disabled"} title="${esc(pst.ok ? `Add to ${name} (it is compiled, not deployed)` : pst.why)}">Add</button>` : "";
+    // A Tree device created here and not paired yet (#85).
+    const hwNew = !n.synthetic && hwCreated(n.uuid);
+    const unpaired = hwNew && !hwNew.paired ? `<span class="tn-tag" title="${esc(HW_UNPAIRED)}">unpaired</span>` : "";
     const num = n.ty === "Page" || n.ty === "Refs" ? `<span class="tn-n">${n.ty === "Page" ? treeChildren(n).reduce((a, c) => a + (c.synthetic ? 0 : 1), 0) : n.children.length}</span>` : "";
     return `<div class="tn-row ${marks ? n.status : ""}${n.uuid === S.sel ? " sel" : ""}${n.uuid === S.treeFocus ? " kfocus" : ""}" role="treeitem" aria-level="${depth + 1}"${kids ? ` aria-expanded="${open}"` : ""} aria-selected="${n.uuid === S.sel}" data-uuid="${esc(n.uuid)}"${tipText ? ` title="${esc(tipText)}"` : ""} style="padding-left:${4 + depth * 14}px">` +
-      `<span class="tn-tw${open ? " open" : ""}" aria-hidden="true">${kids ? "▶" : ""}</span>${icon(n)}<span class="tn-t">${esc(name)}</span>${ty ? `<span class="tn-ty">${esc(ty)}</span>` : ""}${year}${add}${badge}${num}</div>`;
+      `<span class="tn-tw${open ? " open" : ""}" aria-hidden="true">${kids ? "▶" : ""}</span>${icon(n)}<span class="tn-t">${esc(name)}</span>${ty ? `<span class="tn-ty">${esc(ty)}</span>` : ""}${year}${add}${unpaired}${badge}${num}</div>`;
   };
   if (q) {
     const out = [];
@@ -2499,7 +2521,9 @@ async function pendingHardware(pend, against) {
 }
 function hwLine(d) {
   const what = d.how === "replaced" || d.how === "unpaired" ? `${d.how}, serial ${d.old_serial || "—"} → ${d.serial || "—"}`
-    : d.how === "paired" ? `paired, serial ${d.serial || "—"}` : d.how === "changed" ? "settings" : d.how;
+    : d.how === "paired" ? `paired, serial ${d.serial || "—"}` : d.how === "changed" ? "settings"
+    // A Tree device with no serial (created by the module, #85): lox config push says so too.
+    : d.how === "added" && d.unpaired ? "added, not paired: pair it with a Tree search in Loxone Config" : d.how;
   return `  ${d.title} (${d.kind}): ${what}`;
 }
 /** Apply's confirmation: "This reconfigures 3 devices", and new serials that are not on the bus. */
@@ -3170,6 +3194,7 @@ S.edits = null; // GET /api/edits: what vislox's file claims, and which of it is
 S.edit = { uuid: null, open: false, draft: {}, bad: {}, busy: false, msg: "", err: "" };
 S.editsKey = null; // the server's key of what /api/edits says (vislox's file, deployed and pending config)
 async function loadEdits() {
+  const hwWas = JSON.stringify((S.edits?.blocks || []).filter((b) => b.hardware).map((b) => [b.uuid, b.paired]));
   const was = managedSet(), under = JSON.stringify(S.edits?.add_under || null), consts = JSON.stringify(S.edits?.constants || null), exprs = JSON.stringify([S.edits?.expressions || null, S.edits?.templates?.instances || null, S.edits?.templates?.templates || null]);
   if (!S.hist?.actions?.shown) { S.edits = null; managedRefresh(was); return; }
   try { S.edits = await api("/api/edits"); } catch { S.edits = null; S.editsKey = null; }
@@ -3182,7 +3207,8 @@ async function loadEdits() {
   if (S.view) S.view.compared && (JSON.stringify(S.edits?.constants || null) !== consts || exprsNow !== exprs) ? renderChanges() : renderRights();
   renderActions();
   // Where the tree offers Add (#84) follows the server's `add_under`.
-  if (S.view && JSON.stringify(S.edits?.add_under || null) !== under) renderTree();
+  if (S.view && (JSON.stringify(S.edits?.add_under || null) !== under ||
+    JSON.stringify((S.edits?.blocks || []).filter((b) => b.hardware).map((b) => [b.uuid, b.paired])) !== hwWas)) renderTree();
   if (S.sel && S.view) renderProps();
 }
 /** Fetch the edits again only when the server says they may have changed. */
@@ -3449,7 +3475,7 @@ function editState(o) {
   if (UNDO.busy) return { why: "Undo or redo is compiling." };
   return { ok: true, rev: r };
 }
-const EDIT_ATTR = { title: "Name", room: "Room", category: "Category" };
+const EDIT_ATTR = { title: "Name", room: "Room", category: "Category", statistics: "Statistics" };
 function editLabel(o, c) { return EDIT_ATTR[c.op] || (c.op === "param" ? portName(o, c.port) : SET_LABEL[c.name] || c.name); }
 /** A claimed value as the Edit section lists it: a program (#79) by its size, the rest as written. */
 function editValue(c) {
@@ -3969,11 +3995,16 @@ function editFields(o) {
     return f;
   }
   if (!o.edit) return f;
+  // Statistics on a Tree or Air input or output (#85): on or off; another kind Loxone Config set shows as it is.
+  const stats = o.edit.statistics ? ["statistics", "Statistics", o.edit.statistics, "stats"] : null;
+  // Below a Tree device created here and not deployed, only the statistics: lox mints the UUIDs anew on every compile.
+  if (hwBelowNew(o.uuid)) return stats ? [stats] : f;
   if (o.edit.title) f.push(["title", "Name", o.title || "", "text"]);
   if (o.edit.room) f.push(["room", "Room", o.room || "", "Place"]);
   if (o.edit.category) f.push(["category", "Category", o.category || "", "Category"]);
   for (const p of o.edit.params) f.push([`p:${p.key}`, portName(o, p.key), portNow(o, p.key), "quantity", p.unit]);
   for (const st of o.edit.settings) f.push([`s:${st.name}`, st.name, st.value ?? "", st.text ? "text" : "number"]);
+  if (stats) f.push(stats);
   return f;
 }
 function editRows(o, row) {
@@ -4018,6 +4049,8 @@ function editRows(o, row) {
         ? `<select ${attrs}>${editPlaces(kind).map(([t, n]) => `<option value="${esc(t)}"${t === v ? " selected" : ""}${n > 1 ? ' disabled title="Two of them have this title: rename one in Loxone Config to pick it"' : ""}>${esc(t)}</option>`).join("")}</select>`
         : kind === "choice" || kind === "on_off"
         ? `<select ${attrs}><option value="">as Loxone Config places it</option>${(kind === "on_off" ? ["on", "off"] : choices || []).map((c) => `<option${c === v ? " selected" : ""}>${esc(c)}</option>`).join("")}</select>`
+        : kind === "stats"
+        ? `<select ${attrs} title="${esc(STATS_TIP)}">${v === "on" || v === "off" ? "" : `<option value="${esc(v)}" selected disabled>${esc(v)}, as Loxone Config set it</option>`}${["on", "off"].map((c) => `<option${c === v ? " selected" : ""}>${c}</option>`).join("")}</select>`
         // After a line break: HTML drops the first one after <textarea>, so a program starting with a blank line keeps it.
         : kind === "program"
         ? `<textarea ${attrs} class="prog" rows="14" autocomplete="off" spellcheck="false" placeholder="Empty: Loxone Config's program">\n${esc(v)}</textarea>`
@@ -4075,6 +4108,7 @@ async function editSave() {
     if (kind === "time" && !AB_TIME.test(t)) { bad[field] = "A time of day, like 19:00."; continue; }
     if (kind === "duration" && !AB_DURATION.test(t.trim())) { bad[field] = "A duration, like 12h, 30min, 5s or 90 (seconds)."; continue; }
     if (field === "title" && !t.trim()) { bad[field] = "The name cannot be empty."; continue; }
+    if (kind === "stats" && t !== "on" && t !== "off") continue;
     // A program the block already runs, sent back unchanged but for line endings, changes nothing.
     if (kind === "program" && t.replace(/\r\n/g, "\n") === (now ?? "").replace(/\r\n/g, "\n")) continue;
     ops.push(EDIT_ATTR[field] ? { op: field, uuid: o.uuid, value: t } : k === "p" ? { op: "param", uuid: o.uuid, port: key, value: t } : { op: "setting", uuid: o.uuid, name: key, value: t });
@@ -5633,7 +5667,8 @@ function lifecycleRows(o, row, st) {
   const del = deletes && st.ok
     ? `<button type="button" class="ed-btn small" data-ed="delete"${nb.delete ? " disabled" : ""} title="${esc(nb.delete || "Delete it from the config (removed): Apply deletes it on the Miniserver, Undo brings it back with its UUIDs")}">Delete</button>` : "";
   return [row("Slug", `<span class="ed-v mono">${esc(nb.slug)}</span>` +
-      (st.ok ? `<button type="button" class="ed-btn small" data-ed="rename-open" title="Rename its slug in vislox's files; lox keeps its UUIDs">Rename</button>` : "") + del),
+      // The server says which can be renamed: not a Tree device created here (#85).
+      (st.ok && nb.renames !== false ? `<button type="button" class="ed-btn small" data-ed="rename-open" title="Rename its slug in vislox's files; lox keeps its UUIDs">Rename</button>` : "") + del),
     ...(deletes && st.ok && nb.delete ? [`<div class="ed-note">Delete: ${esc(nb.delete)}</div>`] : [])];
 }
 function renameOpen(uuid) {
@@ -6632,7 +6667,7 @@ function abForm() {
     ${inputs.length ? `<details${inputsOpen ? " open" : ""}><summary>${t.folder || t.devices ? `More settings (${inputs.length}): Loxone Config's defaults until set` : `Constants of the inputs (${inputs.length}): used until something is wired`}</summary>${inputs.map(field).join("")}</details>` : ""}
     <div class="ed-bar"><button type="button" class="primary small" data-ab="add"${AB.busy ? " disabled" : ""}>${AB.busy ? "Compiling…" : "Add"}</button>
       <button type="button" class="ed-btn small" data-ab="back"${AB.busy ? " disabled" : ""}>Other type</button>
-      <span class="ed-msg${AB.err ? " err" : ""}" role="status" aria-live="polite">${esc(AB.err || (t.mirrors ? "No text means no message. Wire its input from a block once it is on the page. Adding compiles the module; nothing is deployed." : t.folder || t.devices ? "lox gives it its designation (VI, VHI, …). Empty settings get Loxone Config's defaults. Adding compiles the module; nothing is deployed, and nothing is sent to the device." : "Empty values get what Loxone Config places the block with. Adding compiles the module; nothing is deployed."))}</span></div>
+      <span class="ed-msg${AB.err ? " err" : ""}" role="status" aria-live="polite">${esc(AB.err || (t.mirrors ? "No text means no message. Wire its input from a block once it is on the page. Adding compiles the module; nothing is deployed." : t.hardware ? "lox creates it unpaired, with the kind's inputs and outputs: pair it with a Tree search in Loxone Config. Adding compiles the module; nothing is deployed." : t.folder || t.devices ? "lox gives it its designation (VI, VHI, …). Empty settings get Loxone Config's defaults. Adding compiles the module; nothing is deployed, and nothing is sent to the device." : "Empty values get what Loxone Config places the block with. Adding compiles the module; nothing is deployed."))}</span></div>
   </div>`;
 }
 $("ab-body").addEventListener("input", (e) => {
