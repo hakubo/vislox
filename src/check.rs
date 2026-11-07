@@ -274,7 +274,7 @@ pub fn locate_findings<T: AsRef<str>>(
 /// The blocks `name` is: the managed block or device the lockfile pins by
 /// it, the UUID vislox names an extern after, or the object an extern of
 /// that name pins on its declaration's line (`file`:`line`).
-fn name_blocks<T: AsRef<str>>(
+pub(crate) fn name_blocks<T: AsRef<str>>(
     name: &str,
     file: Option<&str>,
     line: Option<usize>,

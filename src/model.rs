@@ -4,6 +4,7 @@
 
 use crate::calendar::{self, EntryDate};
 use crate::hardware;
+use crate::rights;
 use crate::schedule;
 use loxone_config::diff::{self, DocDiff};
 use loxone_config::doc::{LoxoneDoc, PortView, WireView, ports};
@@ -38,6 +39,10 @@ pub struct View {
     /// The devices the compared change reconfigures: added, removed,
     /// replaced (another serial) or with settings that reach the device.
     pub hardware: Vec<HwDevice>,
+    /// What the compared change does to who may open an NFC Code Touch, who
+    /// gets a push notification, and to a Daytimer's switching times (#68),
+    /// in document order.
+    pub rights: Vec<rights::Change>,
 }
 
 /// A device a change reconfigures (see [`crate::hardware`]).
@@ -236,6 +241,12 @@ pub struct ObjInfo {
     pub calendar: Option<CalInfo>,
     /// The switching times of a Daytimer, or of a block that holds one.
     pub schedule: Option<SchedInfo>,
+    /// Who may open an NFC Code Touch, or who gets a push notification (#68).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rights: Option<rights::Rights>,
+    /// The compared revision's, when it differs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rights_old: Option<rights::Rights>,
     /// The device this object is, or belongs to (an input or output).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub device: Option<DeviceInfo>,
@@ -405,6 +416,9 @@ pub struct Change {
     /// The device this change reconfigures (the "hardware" filter).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hw: Option<String>,
+    /// For a `rights` change: `added`, `removed` or `changed`, to colour it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub how: Option<&'static str>,
 }
 
 fn rect(l: &Layout) -> [i64; 4] {
@@ -949,6 +963,9 @@ struct Delta {
     calendar: HashSet<String>,
     /// Blocks whose switching times changed.
     schedule: HashSet<String>,
+    /// NFC Code Touches and push notifications whose access rights or
+    /// recipients changed (#68).
+    rights: HashSet<String>,
     /// Objects whose app settings changed: shown or not, room, category.
     in_app: HashSet<String>,
     /// Devices the change reconfigures → how ([`HwDevice::how`]).
@@ -970,6 +987,7 @@ impl Delta {
             || self.placements.contains(uuid)
             || self.calendar.contains(uuid)
             || self.schedule.contains(uuid)
+            || self.rights.contains(uuid)
             || self.in_app.contains(uuid)
             || self.params.keys().any(|(o, _)| o == uuid)
         {
@@ -1142,11 +1160,42 @@ pub fn build(new: &LoxoneDoc, old: Option<&LoxoneDoc>, title: &str) -> View {
         }
     }
 
+    // Access rights and recipients (#68): a changed one marks its block
+    // changed.
+    let mut new_rights = rights::read(new);
+    let mut old_rights = old.filter(|_| d.on).map(rights::read).unwrap_or_default();
+    let rights_changed = match &oc {
+        Some(oc) if d.on => rights_of(&nc, oc, &old_rights, &new_rights),
+        _ => Vec::new(),
+    };
+    d.rights = rights_changed.iter().map(|c| c.uuid.clone()).collect();
+
     let mut view = View {
         title: title.to_string(),
         compared: d.on,
         ..View::default()
     };
+    if d.on {
+        // In document order, the Daytimers whose switching times changed
+        // among them.
+        let mut by: HashMap<String, rights::Change> = rights_changed
+            .into_iter()
+            .map(|c| (c.uuid.clone(), c))
+            .collect();
+        for u in &nc.order {
+            if let Some(c) = by.remove(u) {
+                view.rights.push(c);
+            } else if d.schedule.contains(u) {
+                view.rights.push(rights::Change::schedule(u, nc.title(u)));
+            }
+        }
+        // Then the blocks removed, and their rights with them.
+        for u in oc.iter().flat_map(|oc| &oc.order) {
+            if let Some(c) = by.remove(u) {
+                view.rights.push(c);
+            }
+        }
+    }
 
     // Pages: the new document's, then removed ones.
     let mut page_ids: Vec<(String, bool)> = nc.pages.iter().map(|p| (p.clone(), false)).collect();
@@ -1173,6 +1222,10 @@ pub fn build(new: &LoxoneDoc, old: Option<&LoxoneDoc>, title: &str) -> View {
         let ci = cals.remove(u);
         let mut o = obj_info(&nc, oc.as_ref(), u, &d, false, ci);
         o.schedule = scheds.remove(u);
+        o.rights = new_rights.remove(u);
+        if d.rights.contains(u) {
+            o.rights_old = old_rights.remove(u);
+        }
         view.objects.insert(u.clone(), o);
     }
     if let Some(oc) = &oc {
@@ -1181,6 +1234,7 @@ pub fn build(new: &LoxoneDoc, old: Option<&LoxoneDoc>, title: &str) -> View {
                 let ci = cals.remove(u);
                 let mut o = obj_info(oc, None, u, &d, true, ci);
                 o.schedule = scheds.remove(u);
+                o.rights = old_rights.remove(u);
                 view.objects.insert(u.clone(), o);
             }
         }
@@ -1198,13 +1252,40 @@ pub fn build(new: &LoxoneDoc, old: Option<&LoxoneDoc>, title: &str) -> View {
     view
 }
 
-/// The devices `new` reconfigures compared with `old` (`view.hardware`),
-/// without building the rest of the view: for Apply's confirmation.
-pub fn hardware(new: &LoxoneDoc, old: &LoxoneDoc) -> Vec<HwDevice> {
+/// How access rights and recipients differ (#68), each block named as the
+/// view names it, in whichever config has it.
+fn rights_of(
+    nc: &Ctx,
+    oc: &Ctx,
+    old: &BTreeMap<String, rights::Rights>,
+    new: &BTreeMap<String, rights::Rights>,
+) -> Vec<rights::Change> {
+    rights::changes(old, new, |u| {
+        if nc.els.contains_key(u) {
+            nc.title(u)
+        } else {
+            oc.title(u)
+        }
+    })
+}
+
+/// What Apply's confirmation lists of a change, without building the rest of
+/// the view: the devices `new` reconfigures compared with `old`
+/// (`view.hardware`), and what it does to access rights and push
+/// notification recipients (`view.rights`, without the schedules, #68).
+pub struct ApplyChanges {
+    pub devices: Vec<HwDevice>,
+    pub rights: Vec<rights::Change>,
+}
+
+pub fn apply_changes(new: &LoxoneDoc, old: &LoxoneDoc) -> ApplyChanges {
     let (nc, oc) = (Ctx::new(new), Ctx::new(old));
     let mut d = delta(&nc, &oc, &diff::diff(old, new));
     hw_delta(&nc, &oc, &mut d);
-    hw_devices(&nc, &oc, &d)
+    ApplyChanges {
+        devices: hw_devices(&nc, &oc, &d),
+        rights: rights_of(&nc, &oc, &rights::read(old), &rights::read(new)),
+    }
 }
 
 /// Which devices the change reconfigures, and with which attributes.
@@ -1628,6 +1709,8 @@ fn obj_info(
     ObjInfo {
         calendar,
         schedule: None,
+        rights: None,
+        rights_old: None,
         device,
         edit: if gone { None } else { crate::edit::caps(el) },
         uuid: uuid.to_string(),
@@ -1769,6 +1852,7 @@ fn changes(view: &mut View, nc: &Ctx, oc: &Ctx, d: &Delta) {
             page: page_for(&u),
             hw: d.hw.contains_key(&u).then(|| u.clone()),
             obj: Some(u),
+            how: None,
         });
     }
     for u in sorted(&d.removed, oc) {
@@ -1782,6 +1866,7 @@ fn changes(view: &mut View, nc: &Ctx, oc: &Ctx, d: &Delta) {
             page: page_for(&u),
             hw: d.hw.contains_key(&u).then(|| u.clone()),
             obj: Some(u),
+            how: None,
         });
     }
     let mut changed: Vec<String> = nc
@@ -1800,6 +1885,7 @@ fn changes(view: &mut View, nc: &Ctx, oc: &Ctx, d: &Delta) {
                 page: page_for(&u),
                 obj: Some(u.clone()),
                 hw: None,
+                how: None,
             });
         }
         let ty = nc.ty(&u);
@@ -1822,6 +1908,7 @@ fn changes(view: &mut View, nc: &Ctx, oc: &Ctx, d: &Delta) {
                 page: page_for(&u),
                 obj: Some(u.clone()),
                 hw: None,
+                how: None,
             });
         }
         let (lines, covered) = view
@@ -1837,7 +1924,20 @@ fn changes(view: &mut View, nc: &Ctx, oc: &Ctx, d: &Delta) {
                 page: page_for(&u),
                 obj: Some(u.clone()),
                 hw: None,
+                how: None,
             });
+        }
+        if let Some(rc) = view.rights.iter().find(|c| c.uuid == u) {
+            for (how, text) in rc.lines_how() {
+                v.push(Change {
+                    kind: "rights",
+                    text,
+                    page: page_for(&u),
+                    obj: Some(u.clone()),
+                    hw: None,
+                    how: Some(how),
+                });
+            }
         }
         if let Some(si) = view.objects.get(&u).and_then(|o| o.schedule.as_ref()) {
             for text in schedule_changes(&nc.title(&u), si) {
@@ -1847,6 +1947,7 @@ fn changes(view: &mut View, nc: &Ctx, oc: &Ctx, d: &Delta) {
                     page: page_for(&u),
                     obj: Some(u.clone()),
                     hw: None,
+                    how: None,
                 });
             }
         }
@@ -1880,6 +1981,7 @@ fn changes(view: &mut View, nc: &Ctx, oc: &Ctx, d: &Delta) {
                     page: page_for(&u),
                     obj: Some(u.clone()),
                     hw,
+                    how: None,
                 });
             }
         }
@@ -1920,6 +2022,7 @@ fn changes(view: &mut View, nc: &Ctx, oc: &Ctx, d: &Delta) {
                 page: page_for(&u),
                 obj: Some(u.clone()),
                 hw: None,
+                how: None,
             });
         }
         // Said above, with the names, for what has an `<IoData>`.
@@ -1930,6 +2033,7 @@ fn changes(view: &mut View, nc: &Ctx, oc: &Ctx, d: &Delta) {
                 page: page_for(&u),
                 obj: Some(u.clone()),
                 hw: None,
+                how: None,
             });
         }
     }
@@ -1960,6 +2064,7 @@ fn changes(view: &mut View, nc: &Ctx, oc: &Ctx, d: &Delta) {
             page: wire_page(nc, w),
             obj: wire_obj(nc, w),
             hw: None,
+            how: None,
         });
     }
     let mut wr: Vec<_> = d.wires_removed.iter().collect();
@@ -1972,6 +2077,7 @@ fn changes(view: &mut View, nc: &Ctx, oc: &Ctx, d: &Delta) {
             page: wire_page(oc, w),
             obj: wire_obj(oc, w),
             hw: None,
+            how: None,
         });
     }
     let mut moved: Vec<_> = d
@@ -1996,7 +2102,22 @@ fn changes(view: &mut View, nc: &Ctx, oc: &Ctx, d: &Delta) {
             page: page_for(&u),
             obj: Some(u),
             hw: None,
+            how: None,
         });
+    }
+    // A removed Code Touch or notification takes its rights with it (#68),
+    // also when its page went with it.
+    for rc in view.rights.iter().filter(|c| c.removed_block) {
+        for (how, text) in rc.lines_how() {
+            v.push(Change {
+                kind: "rights",
+                text,
+                page: page_for(&rc.uuid),
+                obj: Some(rc.uuid.clone()),
+                hw: None,
+                how: Some(how),
+            });
+        }
     }
     view.changes = v;
 }
@@ -3086,6 +3207,149 @@ mod tests {
             ["Uhr · schedule, Party: 18:00–23:00 22.5 → 17:00–23:00 22.5"],
             "{texts:?}"
         );
+        // The review's Rights and schedules lists it (#68).
+        let r: Vec<_> = v
+            .rights
+            .iter()
+            .map(|c| (c.kind, c.uuid.as_str(), c.title.as_str()))
+            .collect();
+        assert_eq!(r, [("schedule", TIMER, "Uhr")]);
+    }
+
+    /// The house with users (alice, bob), a group of bob (Bewohner), two
+    /// access schedules, a push notification and an NFC Code Touch on a page
+    /// of its own; alice may open the door always, and gets the
+    /// notification.
+    fn with_users() -> String {
+        let users = format!(
+            r#"		<C Type="LoxCaption" V="178" U="50000000-0000-0001-ffff504f94000001" Title="Users and Permissions" CaptionType="20" SubType="20">
+			<C Type="User" V="178" U="{ALICE}" Title="alice" UsR="-1" NFCArr="0A1B2C3D4E5F" NFCNArr="Schlüssel" CodeArr="00112233">
+				<PH NUM="2">
+					<PRM REF="{DOOR}" TIM="{ALWAYS}"/>
+					<PRM REF="{FROST}" ACT="3"/>
+				</PH>
+			</C>
+			<C Type="User" V="178" U="{BOB}" Title="bob" UsR="129"/>
+			<C Type="UserGroup" V="178" U="{BEWOHNER}" Title="Bewohner" Rights="129" User="{BOB}" UserGroups=""/>
+			<C Type="SwitchingTimer" V="178" U="{ALWAYS}" Title="Always" M="3" FIX="1"/>
+			<C Type="SwitchingTimer" V="178" U="{WORKDAYS}" Title="Workdays" M="3"/>
+			<C Type="Notification" V="178" U="{FROST}" Title="Frost" WF="16384" Entries="10"/>
+		</C>
+		<C Type="Page" V="178" U="50000008-0000-0080-ffff504f94000001" Title="Zugang" WF="16384">
+			<C Type="NfcCodeTouch" V="178" U="{DOOR}" Title="Haustür" Px="960" Py="960" Px2="2304" Py2="1656" Nio="0" WF="16384"/>
+		</C>
+"#
+        );
+        let anchor = "\t\t<C Type=\"Page\" V=\"178\" U=\"10000002";
+        assert!(HOUSE.contains(anchor));
+        HOUSE.replacen(anchor, &format!("{users}{anchor}"), 1)
+    }
+    const ALICE: &str = "50000001-0000-0010-ffff504f94000001";
+    const BOB: &str = "50000002-0000-0020-ffff504f94000001";
+    const BEWOHNER: &str = "50000003-0000-0030-ffff504f94000001";
+    const ALWAYS: &str = "50000006-0000-0060-ffff504f94000001";
+    const WORKDAYS: &str = "50000007-0000-0070-ffff504f94000001";
+    const DOOR: &str = "50000009-0000-0090-ffff504f94000001";
+    const FROST: &str = "5000000a-0000-00a0-ffff504f94000001";
+
+    #[test]
+    fn a_claimed_access_set_and_recipients_show_who_gains_and_loses_the_right() {
+        use loxone_config::{Lockfile, logic};
+        let base = doc(&with_users());
+        // As lox compiles the claims: the set leaves alice out of the door and
+        // the notification, and lets the group in on workdays.
+        let m = logic::Module::parse(&format!(
+            "extern haustuer = NfcCodeTouch(uuid: \"{DOOR}\")\n\
+             extern frost = Notification(uuid: \"{FROST}\")\n\
+             access bewohner\n\tgroup \"Bewohner\": \"Workdays\"\nend\n\
+             recipients familie\n\tuser \"bob\"\nend\n\
+             haustuer.access = bewohner\n\
+             frost.recipients = familie\n"
+        ))
+        .expect("module parses");
+        let opts = logic::CompileOptions {
+            machine: [0x50, 0x4f, 0x94, 0, 0, 1],
+            mint_time_unix: 0,
+            page_title: None,
+            allow_removals: false,
+            accept_version: None,
+            relayout: vec![],
+        };
+        let out = logic::compile(&base, &m, &mut Lockfile::default(), &opts).expect("compiles");
+        let new = LoxoneDoc::parse(&out.to_bytes()).unwrap();
+        let v = build(&new, Some(&base), "");
+
+        let r: Vec<_> = v
+            .rights
+            .iter()
+            .map(|c| (c.kind, c.title.as_str()))
+            .collect();
+        assert_eq!(r, [("recipients", "Frost"), ("access", "Haustür")], "{r:?}");
+        let door = &v.rights[1];
+        let names = |l: &[rights::Named]| l.iter().map(|n| n.title.clone()).collect::<Vec<_>>();
+        assert_eq!(names(&door.lose), ["alice"]);
+        assert_eq!(names(&door.gain), ["bob"]);
+        // The Code Touch is changed, and says what it had.
+        let o = &v.objects[DOOR];
+        assert_eq!(o.status, "changed");
+        let now = o.rights.as_ref().expect("its rights");
+        assert_eq!(now.list[0].title, "Bewohner");
+        assert_eq!(now.list[0].members, ["bob"]);
+        assert_eq!(
+            o.rights_old.as_ref().expect("the old rights").list[0].title,
+            "alice"
+        );
+        let texts: Vec<&str> = v
+            .changes
+            .iter()
+            .filter(|c| c.kind == "rights")
+            .map(|c| c.text.as_str())
+            .collect();
+        assert_eq!(
+            texts,
+            [
+                "Frost · recipients: alice removed",
+                "Frost · recipients: bob added",
+                "Haustür · access: alice removed (Always)",
+                "Haustür · access: group Bewohner added (Workdays)",
+            ]
+        );
+        // Apply's confirmation asks for the same, without the view.
+        assert_eq!(apply_changes(&new, &base).rights, {
+            let mut x = v.rights.clone();
+            x.sort_by(|a, b| a.uuid.cmp(&b.uuid));
+            x
+        });
+        // No credential is in the view.
+        let json = serde_json::to_string(&v.rights).unwrap();
+        assert!(!json.contains("0A1B2C3D4E5F") && !json.contains("00112233"));
+        // The Code Touch deleted with its page: alice loses access, in the
+        // review, the change list and Apply's confirmation alike.
+        let src = with_users();
+        let at = src
+            .find("\t\t<C Type=\"Page\" V=\"178\" U=\"50000008")
+            .unwrap();
+        let end = at + src[at..].find("\n\t\t</C>\n").unwrap() + "\n\t\t</C>\n".len();
+        let gone = doc(&format!("{}{}", &src[..at], &src[end..]));
+        let v = build(&gone, Some(&base), "");
+        let r: Vec<_> = v
+            .rights
+            .iter()
+            .map(|c| (c.kind, c.title.as_str(), c.removed_block))
+            .collect();
+        assert_eq!(r, [("access", "Haustür", true)], "{r:?}");
+        assert!(
+            v.changes.iter().any(|c| c.kind == "rights"
+                && c.text == "Haustür removed: alice loses access"
+                && c.how == Some("removed")),
+            "{:?}",
+            v.changes.iter().map(|c| &c.text).collect::<Vec<_>>()
+        );
+        assert_eq!(apply_changes(&gone, &base).rights, v.rights);
+        // Unchanged, nothing is listed.
+        let same = build(&base, Some(&base), "");
+        assert!(same.rights.is_empty());
+        assert!(same.objects[DOOR].rights_old.is_none());
     }
 
     #[test]

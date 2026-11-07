@@ -10,6 +10,11 @@ The binary is an `axum` server with the UI embedded (plain JS and SVG, no build 
   positions and wires.
 - `src/schedule.rs` reads a Daytimer's (or a room controller's) switching times from the `.Loxone` file, in the
   terms of the Miniserver's Daytimer event table, for Properties, the change list and the live comparison.
+- `src/rights.rs` reads who may open each NFC Code Touch and who gets each push notification from the users
+  and groups of a `.Loxone` file (lox's `AccessModel`), directly and in effect (through groups), and compares two
+  configs block by block for the review's *Rights and schedules* and Apply's confirmation (#68). Only titles leave
+  it. `managed.rs` finds the module's `access`, `recipients` and `schedule` claims and their lines
+  (`set_claims` of `GET /api/edits`).
 - `src/calendar.rs` decodes a calendar entry's date from the `.Loxone` file's attributes (as lox's
   `loxone-format.md` documents them: `Mode=` the kind, `From`/`To` days since 2009-01-01, `CalType=` the mode's
   number) and words it. The view carries the decoded date by kind (`calendar.date`), and the config's modes by

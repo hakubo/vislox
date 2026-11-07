@@ -40,6 +40,28 @@ const hardware = `\t\t<C Type="LoxLIVE" V="178" U="20000001-0000-0010-ffff504f94
 \t\t</C>
 \t</C>
 </ControlList>`;
+// Users and an NFC Code Touch (#68): alice may open the front door always and gets the frost warning, bob on
+// workdays; the group Bewohner (bob) has no right. The pending compile claims both: Bewohner opens it on
+// workdays, alice does not, bob under another schedule of the same title, and bob gets the warning instead
+// of her.
+const ALICE = "50000001-0000-0010-ffff504f94000001", BOB = "50000002-0000-0020-ffff504f94000001";
+const BEWOHNER = "50000003-0000-0030-ffff504f94000001", ALWAYS = "50000006-0000-0060-ffff504f94000001";
+const WORKDAYS = "50000007-0000-0070-ffff504f94000001", DOOR = "50000009-0000-0090-ffff504f94000001";
+const FROST = "5000000a-0000-00a0-ffff504f94000001", WORKDAYS2 = "50000008-0000-0080-ffff504f94000001";
+const prm = (ref, tim, act) => `<PRM REF="${ref}"${tim ? ` TIM="${tim}"` : ""}${act ? ` ACT="${act}"` : ""}/>`;
+const users = (alice, bewohner = "", bob = "") => `\t\t<C Type="LoxCaption" V="178" U="50000000-0000-0001-ffff504f94000001" Title="Users and Permissions" CaptionType="20" SubType="20">
+\t\t\t<C Type="User" V="178" U="${ALICE}" Title="alice" UsR="-1" NFCArr="0A1B2C3D4E5F" NFCNArr="Schlüssel" CodeArr="00112233"><PH>${alice}</PH></C>
+\t\t\t<C Type="User" V="178" U="${BOB}" Title="bob" UsR="129"><PH>${bob}</PH></C>
+\t\t\t<C Type="UserGroup" V="178" U="${BEWOHNER}" Title="Bewohner" Rights="129" User="${BOB}" UserGroups=""><PH>${bewohner}</PH></C>
+\t\t\t<C Type="SwitchingTimer" V="178" U="${ALWAYS}" Title="Always" M="3" FIX="1"/>
+\t\t\t<C Type="SwitchingTimer" V="178" U="${WORKDAYS}" Title="Workdays" M="3"/>
+\t\t\t<C Type="SwitchingTimer" V="178" U="${WORKDAYS2}" Title="Workdays" M="3"/>
+\t\t\t<C Type="Notification" V="178" U="${FROST}" Title="Frostwarnung" WF="16384" Entries="10"/>
+\t\t</C>
+\t\t<C Type="Page" V="178" U="50000008-0000-0080-ffff504f94000001" Title="Zugang" WF="16384">
+\t\t\t<C Type="NfcCodeTouch" V="178" U="${DOOR}" Title="Haustür" Px="960" Py="960" Px2="2304" Py2="1656" Nio="0" WF="16384"/>
+\t\t</C>
+`;
 // …and holds a Daytimer, whose Feiertag column the Miniserver runs from 07:00 (edited in the app).
 const TIMER = "10000030-0000-0300-ffff504f94000001";
 const base = readFileSync(fixture, "utf8").replace('<Co K="Input1" Nc="1"', '<IoData Visu="true"/><Co K="Input1" Nc="1"')
@@ -47,7 +69,8 @@ const base = readFileSync(fixture, "utf8").replace('<Co K="Input1" Nc="1"', '<Io
 \t\t\t<C Type="DayTimer" V="178" U="${TIMER}" Title="Uhr" Px="960" Py="2880" Px2="3648" Py2="3768" Nio="2" WF="16384" Analog="true" Modes="00000000-0000-0001-1500000000000000">
 \t\t\t\t<Co K="AQ" U="10000030-0000-0302-01ff504f94000001"/><Entry From="390" To="480" V="21"/>
 \t\t\t</C>`)
-  .replace("\t</C>\n</ControlList>", hardware);
+  .replace("\t</C>\n</ControlList>", hardware)
+  .replace('\t\t<C Type="Page" V="178" U="10000002', () => users(prm(DOOR, ALWAYS) + prm(FROST, null, "3"), "", prm(DOOR, WORKDAYS)) + '\t\t<C Type="Page" V="178" U="10000002');
 writeFileSync(join(dir, "base.Loxone"), base);
 // The pending compile: a rename, the renamed block shown in the app, the Divide block removed, and the
 // Touch replaced by another one (another serial), with its audible acknowledgement off.
@@ -55,9 +78,28 @@ const divBlock = base.match(/\t*<C Type="Div"[\s\S]*?<\/C>\n/)[0];
 writeFileSync(join(dir, "out.Loxone"), base.replace('Title="Licht OG"', 'Title="Licht oben"')
   .replace('<Co K="I1" Nc="1" U="10000009', '<IoData Visu="true"/><Co K="I1" Nc="1" U="10000009')
   .replace(divBlock, "")
-  .replace('Serial="B03B368A" SubType="32771" TreeType="32771" AC="1"', 'Serial="B03B9999" SubType="32771" TreeType="32771" AC="0"'));
+  .replace('Serial="B03B368A" SubType="32771" TreeType="32771" AC="1"', 'Serial="B03B9999" SubType="32771" TreeType="32771" AC="0"')
+  // The claims (#68): the rights as above, and the Daytimer's Feiertag from 06:00.
+  .replace(users(prm(DOOR, ALWAYS) + prm(FROST, null, "3"), "", prm(DOOR, WORKDAYS)), users("", prm(DOOR, WORKDAYS), prm(FROST, null, "3") + prm(DOOR, WORKDAYS2)))
+  .replace('<Entry From="390" To="480" V="21"/>', '<Entry From="360" To="480" V="21"/>'));
 writeFileSync(join(dir, "lox.toml"), 'base = "base.Loxone"\nmodule = "pages"\nout = "out.Loxone"\n');
 writeFileSync(join(dir, "pages", "main.lox"), "# module\n");
+// The module's claims on the Code Touch, the notification and the Daytimer (#68): lines 12, 13 and 14.
+writeFileSync(join(dir, "pages", "access.loxl"), `extern haustuer = NfcCodeTouch(uuid: "${DOOR}")
+extern frost = Notification(uuid: "${FROST}")
+extern uhr = DayTimer(uuid: "${TIMER}")
+access bewohner
+\tgroup "Bewohner": "Workdays"
+end
+recipients familie
+\tuser "bob"
+end
+schedule feiertag
+end
+haustuer.access = bewohner
+frost.recipients = familie
+uhr.schedule = feiertag
+`);
 // The module's test fails at first (#67).
 const failTest = () => join(loxDir, "failtest");
 execFileSync("git", ["init", "-q", "--bare", join(root, "remote.git")]);
@@ -171,7 +213,8 @@ try {
   page.on("console", (m) => { if (m.type() === "error") errors.push(m.text()); });
   let dialogs = 0, applies = 0;
   const asked = [];
-  page.on("dialog", (d) => { dialogs++; asked.push(d.message()); d.accept(); });
+  let dismissNext = false;
+  page.on("dialog", (d) => { dialogs++; asked.push(d.message()); if (dismissNext) { dismissNext = false; d.dismiss(); } else d.accept(); });
   page.on("request", (r) => { if (r.method() === "POST" && new URL(r.url()).pathname === "/api/apply") applies++; });
   await page.addInitScript(() => localStorage.setItem("vislox.token", "secret"));
   await page.goto(`http://127.0.0.1:${port}/`);
@@ -209,6 +252,67 @@ try {
     assert.deepEqual(shown.sort(), ["Touch Küche · AC: 1 → 0", "Touch Küche · device replaced: 0x8003 Touch Tree, serial B03B368A → B03B9999"]);
     await page.click(".chg-filter .pill.hw");
     await page.click('.hrev >> nth=0');
+  });
+  await step("the review lists the rights and switching times the compile claims, and who loses a right (#68)", async () => {
+    await page.click('.hrev.k-pending');
+    await page.click("#cmp-prev");
+    await page.waitForSelector(".hrev.k-pending.sel");
+    // The module's claims come with GET /api/edits.
+    await page.waitForFunction(() => /λ pages\/access\.loxl:12/.test(document.querySelector("#rights-box")?.textContent || ""));
+    const text = await page.textContent("#rights-box");
+    assert.match(text, /Rights and schedules 3 · 1 user loses a right/, text);
+    assert.match(text, /Frostwarnung recipients λ pages\/access\.loxl:13⚠ alice stops getting it−alice\+bobbob now gets it/, text);
+    // bob's schedule is another one of the same title: rescheduled, by its UUID.
+    assert.match(text, /Haustür access λ pages\/access\.loxl:12⚠ alice loses access−alice \(Always\)\+group Bewohner \(Workdays\)~bob \(Workdays\) was WorkdaysUhr/, text);
+    // The λ tooltip is plain text.
+    assert.equal(await page.getAttribute('#rights-box .rt-src >> nth=1', "title"),
+      "Managed by pages/access.loxl:12 (access bewohner, pages/access.loxl:4). Whoever the set leaves out loses access on the next push.");
+    assert.match(text, /Uhr switching times λ pages\/access\.loxl:14/, text);
+    // The Daytimer's changed mode: the week before next to the week after.
+    assert.equal(await page.$$eval("#rights-box .rt-sch-r", (n) => n.length), 1);
+    assert.equal(await page.getAttribute("#rights-box .rt-sch-r > div:nth-child(2)", "title"), "06:30–08:00 21");
+    assert.equal(await page.getAttribute("#rights-box .rt-sch-r > div:nth-child(3)", "title"), "06:00–08:00 21");
+    // A group's members show on hover.
+    assert.equal(await page.getAttribute("#rights-box .rt-add[title]", "title"), "Members: bob");
+    // The change list has them too, under their own filter.
+    const rights = await page.$$eval(".changes .chg", (n) => n.filter((x) => x.querySelector(".k.rights")).map((x) => x.querySelector(".t").textContent));
+    assert.deepEqual(rights, ["Frostwarnung · recipients: alice removed", "Frostwarnung · recipients: bob added",
+      "Haustür · access: alice removed (Always)", "Haustür · access: group Bewohner added (Workdays)", "Haustür · access: bob, Workdays → Workdays"]);
+    // Coloured by what they do: removed red, added green, changed amber.
+    const how = await page.$$eval(".changes .chg .k.rights", (n) => n.map((x) => x.className.replace("k rights", "").trim() || "changed"));
+    assert.deepEqual(how, ["removed", "added", "removed", "added", "changed"]);
+    // The Code Touch opens in Properties, with its claim and who it opens for.
+    await page.click('#rights-box .lnk:has-text("Haustür")');
+    await page.waitForFunction(() => document.querySelector(".ph-t")?.textContent === "Haustür");
+    const props = await page.textContent("#props");
+    assert.match(props, /Access2/, props);
+    assert.match(props, /Managed by pages\/access\.loxl:12 \(access bewohner, pages\/access\.loxl:4\)\. Whoever the set leaves out loses access on the next push\./, props);
+    // Marked as the server compares: bob's schedule by UUID, though its title is the same.
+    assert.match(props, /~bob \(Workdays\) was Workdays\+group Bewohner \(Workdays\)−alice \(Always\)/, props);
+    assert.match(props, /Opens forbob/, props);
+    assert.match(props, /⚠ alice loses access here\./, props);
+    if (process.env.SHOT) await page.screenshot({ path: process.env.SHOT + "-rights.png" });
+    // The Daytimer's Schedule section names its claim.
+    await page.click('#rights-box .lnk:has-text("Uhr")');
+    await page.waitForFunction(() => document.querySelector(".ph-t")?.textContent === "Uhr");
+    assert.match(await page.textContent("#props"), /Managed by pages\/access\.loxl:14 \(schedule feiertag, pages\/access\.loxl:10\)\. The push replaces these switching times/);
+    // Names stay on the page: not in the address or the title, and never in vislox's log.
+    assert.ok(!/alice|bob|Bewohner/.test(page.url() + (await page.title())), page.url());
+    await page.click('.hrev >> nth=0');
+  });
+  await step("when the access changes can't be read, Apply's confirmation says so (#68)", async () => {
+    await page.route("**/api/apply/changes*", (r) => r.abort());
+    dismissNext = true;
+    await page.click("#btn-apply");
+    for (const end = Date.now() + 20000; !asked.length && Date.now() < end;) await new Promise((ok) => setTimeout(ok, 50));
+    assert.match(asked[0] || "", /⚠ Couldn't check access changes: .+\. Applying may take away someone's access/, asked[0]);
+    await page.unroute("**/api/apply/changes*");
+    // Dismissed: nothing was sent.
+    assert.equal(applies, 0);
+    await page.waitForSelector("#btn-apply:not([disabled])");
+    // The aborted request is the only error the browser logs.
+    for (let i; (i = errors.findIndex((e) => /ERR_FAILED|Failed to load resource/.test(e))) >= 0;) errors.splice(i, 1);
+    dialogs = 0; asked.length = 0;
   });
   await step("a failing test stops Apply at its Tests step, before anything is sent (#67)", async () => {
     // This stand-in has no lox logic check, so the browser knows of no test: the server's preflight refuses.
@@ -248,7 +352,9 @@ try {
   await step("every step ends done", async () => {
     await page.waitForFunction(() => /^Applied/.test(document.querySelector("#deploy-msg")?.textContent || ""), null, { timeout: 20000 });
     assert.equal(dialogs, 1, "one confirmation");
-    assert.match(asked[0], /The Miniserver runs other switching times than this config for:\n  Uhr: Feiertag\n/, asked[0]);
+    assert.match(asked[0], /The Miniserver runs other switching times than this config for:\n  Uhr: Feiertag \(claimed by pages\/access\.loxl:14\)\n/, asked[0]);
+    // …and who loses a right, with the claim that takes it away (#68).
+    assert.match(asked[0], /⚠ alice loses access to Haustür \(pages\/access\.loxl:12\)\n⚠ alice stops getting Frostwarnung \(pages\/access\.loxl:13\)\n\nbob starts getting Frostwarnung\n\n/, asked[0]);
     // The confirmation says which devices this reconfigures, and that the new serial is not on the bus.
     assert.match(asked[0], /⚠ Not on the bus \(lox extensions does not list it\): Touch Küche \(Touch Tree\), serial B03B9999/);
     assert.match(asked[0], /This reconfigures 1 device: it stores the new configuration/);
@@ -331,6 +437,9 @@ try {
   });
   await step("no errors in the browser", async () => {
     assert.deepEqual(errors, []);
+  });
+  await step("no user's name in vislox's log (#68)", async () => {
+    assert.ok(!/alice|Bewohner/.test(log), log);
   });
 } catch (e) {
   failed = true;
