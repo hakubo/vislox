@@ -80,7 +80,9 @@ published under the same version (see [docker/README.md](docker/README.md)).
   Logic `schedule vx_… end` set and the timer's `.schedule` claim into `<module>/vislox/edits.loxl`, grouped into
   `daily`, `weekdays` and `weekend` lines, and compiles; the compile must write exactly those switching times onto
   the timer. Several timers share a set (*Use the same times as …*, and *Change … too* when editing one of them);
-  Revert, Undo and Discard drop the claim. Checked before lox sees it: whole minutes, `24:00` ends a day, no
+  Undo restores every timer the op changed (a rewritten shared set too); Revert changes only its own timer;
+  Discard drops it all. A timer the module's own file claims too is marked *Claimed twice*, with *Remove
+  vislox's claim*. Checked before lox sees it: whole minutes, `24:00` ends a day, no
   overlap, no wrap past midnight, a value on each interval of an analog timer and none on a digital one, one
   schedule per timer (a claim of the module's own file is named instead). A Miniserver that runs other switching
   times (changed in the app) is named in the editor: the save, once applied, replaces them. Never deploys.

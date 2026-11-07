@@ -65,7 +65,8 @@ POST /api/edit
   `unwire` of the same ends, and for `unwire` the `wire`. For `adopt` and `adopt_page` it is the `unadopt` of
   the blocks adopted, and for `unadopt` the `adopt` with the same slugs: a block keeps its UUIDs both ways. For
   `schedule` it is the `schedule` of what the timer claimed before: its set and that set's switching times, or
-  `value: null` (no claim).
+  no claim; when the op rewrote a set other timers still claim, it also carries that set's old switching times
+  (`restore`), so the undo gives them back too.
   A reconnected wire is one request, `unwire` then `wire`:
   undone, the reverse list. The ops of one request see each other: `unwire` then `wire` of the same wire is
   accepted (and changes nothing). `remove_block`'s `add_block` carries the wires the removal took out
@@ -552,14 +553,19 @@ vx_10000020_0000_0200_ffff504f94000001.schedule = vx_uhr_schedule
   `{ from, to, value?, activate? }` in minutes of the day. `value.set` names the set: vislox's set of that name is
   rewritten (for every timer that claims it) and claimed, or with no `modes` claimed as it is (*Use the same times
   as …*). Without `set`, the times go into the set the timer claims when no other timer claims it, else into a new
-  one (`vx_<name>_schedule`, a name the module, the lockfile and vislox's files do not have). `value: null` drops
-  the claim; a set no claim names goes, and so does an extern nothing else needs.
+  one (`vx_<name>_schedule`, a name the module, the lockfile and vislox's files do not have). `value: null` (or
+  neither `set` nor `modes`) drops the claim; a set no claim names goes, and so does an extern nothing else needs.
+  `value.restore` (set → columns) writes vislox's sets back first: what `previous` carries.
 - **Checked before lox sees it**, with lox's rules: a DayTimer only (lox writes switching times onto nothing
   else); whole minutes up to `24:00`, the start before the end (an interval across midnight is two), no overlap in
   a column; a value (a decimal number) on every interval of an analog timer, none on a digital one (`1` is taken as
   on); every timer sharing the set the same kind; at most 48 intervals a column. One schedule per timer: a timer
   whose schedule the rest of the module claims is refused, naming that `file:line` (`set_claims`), and so is a
   block the rest of the module manages. A Daytimer added or adopted here is claimed by its slug.
+- **Claimed twice.** When the module's own file claims a timer vislox claims too, lox compiles neither. Dropping
+  vislox's claim is always let through, and a request of only such drops is the one edit that compiles the
+  module's uncompiled changes along (they are what the drop is for). Properties says *Claimed twice* and offers
+  *Remove vislox's claim*.
 - **Written as lox takes it.** Every column is spelled the one way lox accepts: a built-in mode by its day word, a
   mode the module declares or externs by its slug (the lockfile's), any other by its quoted title (which must be
   unique). All seven weekdays are written, `off` where the timer is off (the claim leaves a weekday it does not
@@ -576,7 +582,9 @@ vx_10000020_0000_0200_ffff504f94000001.schedule = vx_uhr_schedule
 - **Not deployed and Revert.** `GET /api/edits` sends `schedules`: per timer vislox's files claim now or claimed in
   the deployed revision, `set`, its switching times (`modes`), the other timers on the set (`shared`), what the
   deployed revision claimed (`deployed`: the value a Revert sends) and `pending` (the pending config switches it
-  otherwise than the deployed one); and `schedule_sets`, each set with its timers. Dropping a claim after Apply
+  otherwise than the deployed one; with something pending and no deployed revision, it does, as for a value); and
+  `schedule_sets`, each set with its timers. Revert changes only its timer: when other timers claim the deployed
+  set now, the timer gets the deployed switching times in a set of its own instead of a rewrite of theirs. Dropping a claim after Apply
   leaves the timer as deployed (lox keeps no lock state for it); before Apply, as Loxone Config had it.
 - **What the app changed.** The Miniserver sends a Daytimer's schedule with the live values (#15). While they come
   in and differ from the config shown, the editor names the modes that differ: an edit made in the app is replaced
@@ -589,7 +597,8 @@ interval moves it and an end resizes it, snapped to 15 minutes (Alt: one), never
 The selected column's intervals below take exact times, a value, *activate* and *Delete*; *Copy to* the weekdays,
 the weekend or every day; *Start from the times of* another timer of the same kind. Times are checked in the
 browser first (nothing is sent while one is marked). When the timer shares its set, *Change … too* (on) rewrites
-the set, off gives it a set of its own. *Use the same times as …* claims another timer's set. The Deploy pane counts
+the set, off gives it a set of its own. *Use the same times as …* claims another timer's set (of a timer of the
+same kind: analog or digital). The Deploy pane counts
 the timers whose switching times are edited and not deployed.
 
 ## Undo and redo (#62)

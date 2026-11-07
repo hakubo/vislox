@@ -8,7 +8,7 @@
 // Nothing here talks to a Miniserver: vislox runs with --no-live.
 import { chromium } from "playwright";
 import { spawn, execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, chmodSync, existsSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, chmodSync, existsSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -33,11 +33,11 @@ const lagerAt = (i) => { const px = 960 + 1920 * (i % 15), py = 960 + 960 * Math
 const ZUGANG = "40000000-0000-0000-ffff504f94000001", TOUCH = "40000001-0000-0000-ffff504f94000001";
 const KITCHEN = "30000a01-0000-0000-ffff504f94000001", BATH = "30000a02-0000-0000-ffff504f94000001";
 // Two analog Daytimers on the upper floor (#73): Uhr, on Mondays 06:30–08:00 and in the Party mode 18:00–23:00,
-// and Heizung, with no switching times.
-const UHR = "10000020-0000-0200-ffff504f94000001", HEIZ = "10000021-0000-0210-ffff504f94000001";
+// and Heizung, with no switching times; and Licht, a digital one.
+const UHR = "10000020-0000-0200-ffff504f94000001", HEIZ = "10000021-0000-0210-ffff504f94000001", LICHT = "10000022-0000-0220-ffff504f94000001";
 const PARTY = "10000011-0000-0110-ffff504f94000001", MON = "00000000-0000-0004-1500000000000000";
 const dayU = (n) => `00000000-0000-${n.toString(16).padStart(4, "0")}-1500000000000000`;
-const timerXml = (u, title, y, modes, entries) => `\t\t\t<C Type="DayTimer" V="178" U="${u}" Title="${title}" Px="960" Py="${y}" Px2="3648" Py2="${y + 888}" Nio="2" WF="16384" Analog="true" DefValue="18"${modes ? ` Modes="${modes}"` : ""}>
+const timerXml = (u, title, y, modes, entries, analog = true) => `\t\t\t<C Type="DayTimer" V="178" U="${u}" Title="${title}" Px="960" Py="${y}" Px2="3648" Py2="${y + 888}" Nio="2" WF="16384"${analog ? ' Analog="true" DefValue="18"' : ""}${modes ? ` Modes="${modes}"` : ""}>
 \t\t\t\t<Co K="Mode" U="${u.slice(0, 19)}1-00ff504f94000001"/>
 \t\t\t\t<Co K="AQ" U="${u.slice(0, 19)}2-01ff504f94000001"/>
 ${entries.map((e) => `\t\t\t\t${e}\n`).join("")}\t\t\t</C>
@@ -60,7 +60,7 @@ const base = readFileSync(fixture, "utf8").replace('<Co K="Q" U="10000009-0000-0
 \t\t\t\t<Co K="Q" U="1000000b-0000-00b3-02ff504f94000001"/>
 \t\t\t</C>`)
   .replace(`\t\t\t<C Type="And" V="178" U="${FLUR}"`, timerXml(UHR, "Uhr", 4800, `${MON},${PARTY}`, ['<Entry From="390" To="480" V="21"/>', '<Entry From="1080" To="1380" Ix="1" V="22.5"/>']) +
-    timerXml(HEIZ, "Heizung", 6720, "", []) + `\t\t\t<C Type="And" V="178" U="${FLUR}"`)
+    timerXml(HEIZ, "Heizung", 6720, "", []) + timerXml(LICHT, "Licht", 8640, "", [], false) + `\t\t\t<C Type="And" V="178" U="${FLUR}"`)
   // Two rooms; the Divide block is shown in the app, in the kitchen.
   .replace('\t\t<C Type="Page" V="178" U="10000002', `\t\t<C Type="Place" V="178" U="${KITCHEN}" Title="Küche"/>
 \t\t<C Type="Place" V="178" U="${BATH}" Title="Bad"/>
@@ -1308,14 +1308,55 @@ try {
     await page.waitForFunction((u) => S.view.objects[u].schedule.entries.length === 11, HEIZ);
     assert.match(readFileSync(join(dir, "pages", "vislox", "edits.loxl"), "utf8"), /^vx_10000021_0000_0210_ffff504f94000001\.schedule = vx_uhr_schedule$/m);
     await waitText('[data-body="Switching times"]', /shared with Uhr/);
+    // A digital timer is not offered the analog set: the server would refuse it.
+    await page.evaluate((u) => { gotoPage(S.objPage.get(u), { focus: u }); select(u); }, LICHT);
+    await page.waitForSelector('#props [data-body="Switching times"] [data-se="open"]');
+    assert.equal(await page.$('#props [data-se="same"]'), null);
+    await page.evaluate((u) => { gotoPage(S.objPage.get(u), { focus: u }); select(u); }, HEIZ);
+    await page.waitForSelector('#props [data-se="revert"]');
     // Reverted: back to Loxone Config's (no claim); the set stays for Uhr.
     await page.click('#props [data-se="revert"]');
     await page.waitForFunction((u) => S.view.objects[u].schedule.entries.length === 0 && !S.edits?.schedules?.some((s) => s.uuid === u), HEIZ, { timeout: 15000 });
     await settled();
     assert.doesNotMatch(readFileSync(join(dir, "pages", "vislox", "edits.loxl"), "utf8"), /0210_ffff504f94000001\.schedule/);
-    // Discarded: nothing pending again.
-    await page.click("#btn-discard");
+    // Claimed twice: the module's own file claims Uhr too. vislox's claim is removed with one click, and the
+    // module's file keeps the timer.
+    const own = join(dir, "pages", "uhr.loxl");
+    writeFileSync(own, `# The module's own.\nextern uhr = DayTimer(uuid: "${UHR}")\nschedule abend\n\tmon 17:00-22:00 = 20\nend\nuhr.schedule = abend\n`);
+    await page.evaluate((u) => { gotoPage(S.objPage.get(u), { focus: u }); select(u); }, UHR);
+    await waitText('[data-body="Switching times"]', /Claimed twice: pages\/uhr\.loxl:6 and vislox's/);
+    const k = edits.length;
+    await page.click('#props [data-se="drop"]');
+    await until(() => edits.length > k && statuses[k] !== undefined, "the drop request");
+    assert.equal(statuses[k], 200);
+    assert.deepEqual(edits[k].ops, [{ op: "schedule", uuid: UHR, value: null }]);
+    await settled();
+    assert.doesNotMatch(readFileSync(join(dir, "pages", "vislox", "edits.loxl"), "utf8"), /\.schedule = /);
+    await waitText('[data-body="Switching times"]', /pages\/uhr\.loxl:6 claims its switching times: change them there/);
+    rmSync(own);
+    // Both timers are as deployed again: nothing pending.
     await page.waitForFunction(() => /Nothing pending/.test(document.querySelector("#deploy-pend")?.textContent || ""), null, { timeout: 10000 });
+    await page.waitForFunction(() => /Nothing pending/.test(document.querySelector("#deploy-pend")?.textContent || ""), null, { timeout: 10000 });
+  });
+  await step("a new interval never overlaps, and Revert changes no other timer (#73)", async () => {
+    // seFree: an hour from the start, no later than 23:00; none inside an interval or without a free minute.
+    const free = (spans, at) => page.evaluate(([sp, a]) => seFree({ spans: sp }, a), [spans, at]);
+    assert.equal(await free([{ from: 1350, to: 1420 }], 1435), null);
+    assert.deepEqual(await free([{ from: 1410, to: 1440 }], 1435), { from: 1380, to: 1410 });
+    assert.deepEqual(await free([{ from: 400, to: 500 }], 360), { from: 360, to: 400 });
+    assert.equal(await free([{ from: 0, to: 1440 }], 600), null);
+    // seAdd finds another free hour when the clicked one is taken, and says so when the day is full.
+    assert.equal(await page.evaluate(() => { const c = { spans: [{ from: 0, to: 1440 }] }; return seAdd(c, 600, false); }), null);
+    assert.deepEqual(await page.evaluate(() => { const c = { spans: [{ from: 1350, to: 1440 }] }; seAdd(c, 1435, false); return c.spans.map((s) => [s.from, s.to]); }), [[0, 60], [1350, 1440]]);
+    // seRevertValue: the deployed set while only this timer claims it; else the deployed times in a set of its
+    // own, never a rewrite of the others'; refused when the deployed times cannot be read.
+    const M = { [dayU(4)]: [{ from: 60, to: 120, value: "20" }] };
+    const rv = (e, sets) => page.evaluate(([e, sets, u]) => seRevertValue(e, sets, u), [e, sets, UHR]);
+    assert.deepEqual(await rv({ deployed: null }, []), { value: null });
+    assert.deepEqual(await rv({ deployed: { set: "vx_a", modes: M } }, [{ name: "vx_a", timers: [UHR] }]), { value: { set: "vx_a", modes: M } });
+    assert.deepEqual(await rv({ deployed: { set: "vx_a", modes: M } }, [{ name: "vx_a", timers: [UHR, HEIZ] }]), { value: { modes: M } });
+    assert.deepEqual(await rv({ deployed: { set: "vx_a", modes: M } }, [{ name: "vx_a", timers: [HEIZ] }]), { value: { modes: M } });
+    assert.match((await rv({ deployed: { set: "vx_a", modes: null } }, [{ name: "vx_a", timers: [HEIZ] }])).why, /Heizung claims that set now/);
   });
   await step("nothing was deployed: lox only compiled, checked, linted and tested", async () => {
     const ran = readFileSync(calls, "utf8").trim().split("\n");

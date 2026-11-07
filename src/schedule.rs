@@ -140,6 +140,16 @@ pub fn of_col(entries: &[Entry], col: &str) -> Vec<Entry> {
     v
 }
 
+/// Column `col`'s entries as they are compared: from, to, the value (an
+/// analog timer's only; a digital timer's is always on) and activation, in
+/// time order.
+pub fn col_key(entries: &[Entry], col: &str, analog: bool) -> Vec<(u32, u32, Option<u64>, bool)> {
+    of_col(entries, col)
+        .iter()
+        .map(|e| (e.from, e.to, analog.then(|| e.value.to_bits()), e.activate))
+        .collect()
+}
+
 /// The columns, in first-seen order, whose entries differ between `a` and
 /// `b` (order within a column does not count; a digital timer's values do
 /// not either, as [`line`] does not show them).
@@ -150,14 +160,8 @@ pub fn changed_cols(a: &[Entry], b: &[Entry], analog: bool) -> Vec<String> {
             cols.push(&e.col);
         }
     }
-    let key = |es: &[Entry], c: &str| -> Vec<(u32, u32, Option<u64>, bool)> {
-        of_col(es, c)
-            .iter()
-            .map(|e| (e.from, e.to, analog.then(|| e.value.to_bits()), e.activate))
-            .collect()
-    };
     cols.into_iter()
-        .filter(|c| key(a, c) != key(b, c))
+        .filter(|c| col_key(a, c, analog) != col_key(b, c, analog))
         .map(String::from)
         .collect()
 }

@@ -3375,7 +3375,14 @@ function seRows(o, row) {
   if (!st) return null;
   // The rest of the module claims them: changed there (a timer takes one schedule).
   const other = claimsOf(o.uuid).find((c) => c.kind === "schedule" && !c.file.startsWith(`${S.edits?.dir}/`));
-  if (other) return { rows: [`<div class="ed-note">${esc(`${other.file}:${other.line}`)} claims its switching times: change them there.</div>`] };
+  if (other) {
+    const at = `${other.file}:${other.line}`, mine = schedEdit(o.uuid)?.set ? SE.uuid === o.uuid ? SE : {} : null;
+    if (!mine) return { rows: [`<div class="ed-note">${esc(at)} claims its switching times: change them there.</div>`] };
+    // Claimed twice: lox compiles neither until one claim goes. vislox's goes with one click.
+    return { rows: [`<div class="sch-note warn">⚠ Claimed twice: ${esc(at)} and vislox's ${esc(S.edits?.file || "")} both claim its switching times, and lox compiles neither until one goes.</div>`,
+      `<div class="ed-bar"><button type="button" class="ed-btn small" data-se="drop"${mine.busy ? " disabled" : ""} title="Take vislox's claim out and compile: ${esc(at)} keeps the timer">Remove vislox's claim</button>` +
+      (mine.msg || mine.err ? `<span class="ed-msg${mine.err ? " err" : ""}" role="status">${esc(mine.err || mine.msg)}</span>` : "") + "</div>"], count: 1 };
+  }
   const si = o.schedule, e = schedEdit(o.uuid), mine = SE.uuid === o.uuid ? SE : null, rows = [];
   const live = liveStreaming() ? liveSchedule(si) : undefined, cmp = live ? schedCompare(si, live) : null;
   const title = (u) => { const x = S.view?.objects[u]; return x ? displayTitle(x) : u; };
@@ -3390,7 +3397,9 @@ function seRows(o, row) {
   // The Miniserver runs other switching times: edited in the app, or not applied yet. A save, once applied, replaces them.
   if (cmp && !cmp.same) rows.push(`<div class="sch-note warn">⚠ The Miniserver runs other switching times (${esc(cmp.what)}), maybe changed in the app. Saving here and applying replaces them.</div>`);
   if (!mine?.open) {
-    const sets = (S.edits?.schedule_sets || []).filter((x) => x.name !== e?.set && x.timers.length && !x.timers.includes(o.uuid));
+    // Only sets of timers of the same kind: the server refuses an analog timer on a digital set and back.
+    const kind = (x) => S.view?.objects[x.timers[0]]?.schedule?.analog;
+    const sets = (S.edits?.schedule_sets || []).filter((x) => x.name !== e?.set && x.timers.length && !x.timers.includes(o.uuid) && kind(x) === si.analog);
     rows.push(`<div class="ed-bar"><button type="button" class="ed-btn small" data-se="open">Edit switching times</button>` +
       (sets.length ? `<label class="se-same">Use the same times as <select data-se="same"${mine?.busy ? " disabled" : ""}><option value="">…</option>${sets.map((x) => `<option value="${esc(x.name)}">${esc(x.timers.map(title).join(", "))}</option>`).join("")}</select></label>` : "") +
       (mine?.msg || mine?.err ? `<span class="ed-msg${mine.err ? " err" : ""}" role="status">${esc(mine.err || mine.msg)}</span>` : "") + "</div>");
@@ -3478,25 +3487,47 @@ async function seSend(o, st, op, label) {
   }
   renderProps();
 }
-/** Back to the deployed switching times: the set the deployed revision claimed, or no claim. */
+/** What Revert sends for timer `uuid` (`e`: its `schedules` entry; `sets`: `schedule_sets`): `{ value }`, or
+ *  `{ why }`. Back to the deployed switching times, for this timer only: the deployed set, or no claim. When
+ *  other timers claim that set now, rewriting it would change them too, so this timer gets the deployed times in
+ *  a set of its own (`modes` without `set`) instead. */
+function seRevertValue(e, sets, uuid) {
+  const d = e?.deployed ?? null;
+  if (!d) return { value: null };
+  const others = (sets.find((x) => x.name === d.set)?.timers || []).filter((u) => u !== uuid);
+  if (!others.length) return { value: d };
+  if (!d.modes) {
+    const names = others.map((u) => { const x = S.view?.objects[u]; return x ? displayTitle(x) : u; });
+    return { why: `The deployed switching times (${d.set}) cannot be read, and ${names.join(", ")} ${others.length === 1 ? "claims" : "claim"} that set now: revert in the module, or Discard.` };
+  }
+  return { value: { modes: d.modes } };
+}
 async function seRevert(uuid) {
   const o = S.view?.objects[uuid], st = o && seState(o), e = schedEdit(uuid);
   if (!st || !e) return;
-  await seSend(o, st, { op: "schedule", uuid, value: e.deployed ?? null }, `Revert the switching times of ${displayTitle(o)}`);
+  const r = seRevertValue(e, S.edits?.schedule_sets || [], uuid);
+  if (r.why) { SE.uuid = uuid; SE.err = r.why; SE.msg = ""; renderProps(); return; }
+  await seSend(o, st, { op: "schedule", uuid, value: r.value }, `Revert the switching times of ${displayTitle(o)}`);
+}
+/** Take vislox's claim out of a timer the module's own file claims too. */
+async function seDrop(uuid) {
+  const o = S.view?.objects[uuid], st = o && seState(o);
+  if (!st) return;
+  await seSend(o, st, { op: "schedule", uuid, value: null }, `Remove vislox's claim on the switching times of ${displayTitle(o)}`);
 }
 async function seSame(uuid, set) {
   const o = S.view?.objects[uuid], st = o && seState(o);
   if (!st || !set) return;
   await seSend(o, st, { op: "schedule", uuid, value: { set } });
 }
-/** A free hour (or what is left of it) at minute `at` of column `c`, or null when `at` is inside an interval. */
+/** A free hour (or what is left of it before the next interval) from minute `at` of column `c`, no later than
+ *  23:00; null when that start is inside an interval or no minute is free after it. */
 function seFree(c, at) {
-  if (c.spans.some((s) => s.from <= at && at < s.to)) return null;
-  const from = Math.min(at, 1380);
-  const next = Math.min(...c.spans.filter((s) => s.from >= from).map((s) => s.from), 1440);
-  const prev = Math.max(...c.spans.filter((s) => s.to <= from).map((s) => s.to), 0);
-  const f = Math.max(from, prev), t = Math.min(f + 60, next);
-  return t > f ? { from: f, to: t } : null;
+  const from = Math.max(0, Math.min(at, 1380));
+  if (c.spans.some((s) => s.from <= from && from < s.to)) return null;
+  const next = Math.min(...c.spans.filter((s) => s.from > from).map((s) => s.from), 1440);
+  const to = Math.min(from + 60, next);
+  return to > from ? { from, to } : null;
 }
 function seAdd(c, at, analog) {
   const free = seFree(c, at) ?? (() => { for (let m = 0; m < 1440; m += 60) { const f = seFree(c, m); if (f) return f; } return null; })();
@@ -3516,6 +3547,7 @@ $("props").addEventListener("click", (e) => {
   if (what === "cancel") return seClose();
   if (what === "save") return seSave();
   if (what === "revert") return seRevert(S.sel);
+  if (what === "drop") return seDrop(S.sel);
   if (SE.busy || !SE.open) return;
   const c = b.dataset.col ? seCol(b.dataset.col) : seCol(SE.sel);
   if (what === "pick") SE.sel = b.dataset.col;

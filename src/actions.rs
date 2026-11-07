@@ -156,9 +156,6 @@ fn file_blob(path: &Path) -> Option<String> {
         .map(|b| crate::history::blob_id(&b))
 }
 
-/// The ops that undo an edit (#62), sent back as an edit of its own, into
-/// the reply as `undo`; or, when they cannot be built, `undo: null` and why
-/// (`undo_error`). The edit itself stands either way.
 /// `GET /api/edits`' `schedules` and `schedule_sets` (#73). Per timer that
 /// vislox's file claims now or claimed in the deployed revision: the set and
 /// its switching times now (`set`, `modes`) and then (`deployed`, the value a
@@ -213,9 +210,12 @@ fn edit_schedules(
                 "modes": cur.and_then(|c| c.modes),
                 "deployed": dep,
                 "shared": set.as_deref().map(|s| uuids_of(s, tn)).unwrap_or_default(),
+                // As for a value: with something pending, a revision that
+                // was never deployed differs from it.
                 "pending": match (pending, deployed) {
                     (Some(p), Some(d)) => se::differs(p, d, &u),
-                    _ => false,
+                    (Some(_), None) => true,
+                    (None, _) => false,
                 },
             })
         })
@@ -230,6 +230,9 @@ fn edit_schedules(
     (json!(schedules), json!(sets))
 }
 
+/// The ops that undo an edit (#62), sent back as an edit of its own, into
+/// the reply as `undo`; or, when they cannot be built, `undo: null` and why
+/// (`undo_error`). The edit itself stands either way.
 fn undo_into(reply: &mut Value, undo: Result<Vec<edit::Op>, String>) {
     match undo {
         Ok(ops) => reply["undo"] = json!(ops),
@@ -2197,8 +2200,16 @@ impl Actions {
             }
         }
         // An edit compiles the whole module: it must not take along changes
-        // someone else made to it and has not compiled.
-        self.uncompiled(&p).await?;
+        // someone else made to it and has not compiled. Except dropping
+        // vislox's claim on switching times the module claims too (#73):
+        // lox compiles neither claim, and the module's is what it is for.
+        let mending = req.ops.iter().all(|o| {
+            matches!(o, edit::Op::Schedule { uuid, value: None }
+                if sched_claimed.contains_key(&uuid.to_ascii_lowercase()))
+        });
+        if !mending {
+            self.uncompiled(&p).await?;
+        }
         // Discard puts the lock and out back as they were before vislox's
         // first edit, where the last commit does not have them.
         snapshot_before_edit(dir, &p).await;
@@ -2270,13 +2281,34 @@ impl Actions {
         };
         // The UUIDs lox minted for the new blocks.
         let lock = edit::Lock::read(&p.lock);
+        // The switching times the request writes (#73): the timers it gives a
+        // set, and the sets it writes back for others.
+        let mut timed: Vec<String> = Vec::new();
+        let mut restored: Vec<String> = Vec::new();
+        for o in &req.ops {
+            if let edit::Op::Schedule {
+                uuid,
+                value: Some(v),
+            } = o
+            {
+                timed.push(uuid.clone());
+                restored.extend(v.restore.keys().cloned());
+            }
+        }
+        // The compiled config, read once for the checks below.
+        let out_doc = if !place.moves.is_empty() || !timed.is_empty() || adopting {
+            Some(
+                std::fs::read(&p.out)
+                    .map_err(|e| fail(e.to_string()))
+                    .and_then(|b| edit::parse_doc(&b).map_err(fail))?,
+            )
+        } else {
+            None
+        };
         // A move lox did not keep is refused, not shown as done. A page laid
         // out afresh places its blocks anew, moved or not.
-        if !place.moves.is_empty() {
-            let out = std::fs::read(&p.out)
-                .map_err(|e| fail(e.to_string()))
-                .and_then(|b| edit::parse_doc(&b).map_err(fail))?;
-            let missed = edit::moves_missed(&out, &base, &lock, place);
+        if let (false, Some(out)) = (place.moves.is_empty(), &out_doc) {
+            let missed = edit::moves_missed(out, &base, &lock, place);
             if !missed.is_empty() {
                 return Err(fail(format!(
                     "lox logic compile did not keep the new position of {}",
@@ -2286,22 +2318,8 @@ impl Actions {
         }
         // A schedule claim lox did not write onto its timer is refused, not
         // shown as done (#73).
-        let timed: Vec<String> = req
-            .ops
-            .iter()
-            .filter_map(|o| match o {
-                edit::Op::Schedule {
-                    uuid,
-                    value: Some(_),
-                } => Some(uuid.clone()),
-                _ => None,
-            })
-            .collect();
-        if !timed.is_empty() {
-            let out = std::fs::read(&p.out)
-                .map_err(|e| fail(e.to_string()))
-                .and_then(|b| edit::parse_doc(&b).map_err(fail))?;
-            let missed = crate::sched_edit::missed(&files, &out, &lock, &timed);
+        if let (false, Some(out)) = (timed.is_empty(), &out_doc) {
+            let missed = crate::sched_edit::missed(&files, out, &lock, &timed, &restored);
             if !missed.is_empty() {
                 return Err(fail(format!(
                     "lox logic compile did not write the switching times of {}",
@@ -2312,10 +2330,7 @@ impl Actions {
         // Adopting changes who owns a block, never what the Miniserver runs:
         // the pending config is what it was, each block exactly the base's.
         let mut adopted = Vec::new();
-        if adopting {
-            let out = std::fs::read(&p.out)
-                .map_err(|e| fail(e.to_string()))
-                .and_then(|b| edit::parse_doc(&b).map_err(fail))?;
+        if let (true, Some(out)) = (adopting, &out_doc) {
             let mut uuids: Vec<String> = Vec::new();
             for op in &req.ops {
                 match op {
@@ -2329,7 +2344,7 @@ impl Actions {
                     _ => {}
                 }
             }
-            crate::adopt::verify(&base, &doc, &out, &uuids)
+            crate::adopt::verify(&base, &doc, out, &uuids)
                 .map_err(|e| bad(format!("{e}. Nothing was adopted or handed back.")))?;
             for u in &uuids {
                 if let Some(a) = prepared.adoptions.get(u) {
@@ -7440,7 +7455,34 @@ esac
                     })
                     .collect(),
             )])),
+            ..Default::default()
         })
+    }
+
+    /// With something pending and no deployed revision (a project never
+    /// committed), a claimed timer counts as not deployed, as a value does.
+    #[test]
+    fn switching_times_with_no_deployed_revision_are_pending() {
+        let doc = edit::parse_doc(house_with_timer().as_bytes()).unwrap();
+        let s = edit::slug(UHR);
+        let files = edit::Files::from_texts(&std::collections::BTreeMap::from([(
+            "edits.loxl".to_string(),
+            format!(
+                "extern {s} = DayTimer(uuid: \"{UHR}\")\nschedule vx_a\n\tmon 01:00-02:00 = 3\nend\n{s}.schedule = vx_a\n"
+            ),
+        )]))
+        .unwrap();
+        let lock = edit::Lock::default();
+        let none = edit::Files::default();
+        let (v, sets) = edit_schedules(&files, &none, &lock, Some(&doc), None);
+        assert_eq!(v[0]["uuid"], UHR);
+        assert_eq!(v[0]["pending"], true);
+        assert_eq!(sets[0]["name"], "vx_a");
+        // Nothing pending: the pending config is the deployed one.
+        let (v, _) = edit_schedules(&files, &none, &lock, None, Some(&doc));
+        assert_eq!(v[0]["pending"], false);
+        let (v, _) = edit_schedules(&files, &files, &lock, Some(&doc), Some(&doc));
+        assert_eq!(v[0]["pending"], false);
     }
 
     /// A compile that does not write the claim onto its timer is refused,
@@ -7583,6 +7625,57 @@ esac
             msg.contains("project/pages/own.loxl:7 claims")
                 || msg.contains("pages/own.loxl:7 claims"),
             "{msg}"
+        );
+
+        // Claimed twice: vislox claims it again, then the module's file does
+        // too, uncompiled (lox compiles neither). Dropping vislox's claim is let
+        // through and compiles the module's.
+        std::fs::write(
+            d.join("pages/own.loxl"),
+            "# The module's own.\npage \"Obergeschoss\"\n",
+        )
+        .unwrap();
+        sh(
+            &d,
+            &format!("{} logic compile >/dev/null", Path::new(&lox).display()),
+        );
+        a.edit(
+            &edit::Request {
+                base: blob(&d, "out.Loxone"),
+                ops: vec![edit::Op::Schedule {
+                    uuid: UHR.into(),
+                    value: mon(&[(0, 60, "1")]),
+                }],
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        std::fs::write(
+            d.join("pages/own.loxl"),
+            format!(
+                "# The module's own.\npage \"Obergeschoss\"\nextern uhr = DayTimer(uuid: \"{UHR}\")\n\
+                 schedule abend\n\tmon 17:00-22:00 = 20\nend\nuhr.schedule = abend\n"
+            ),
+        )
+        .unwrap();
+        a.edit(
+            &edit::Request {
+                base: blob(&d, "out.Loxone"),
+                ops: vec![edit::Op::Schedule {
+                    uuid: UHR.into(),
+                    value: None,
+                }],
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(base_entries("out.Loxone"), [(1020, 1320, 20.0)]);
+        assert!(
+            !std::fs::read_to_string(d.join("pages").join(edit::FILE))
+                .unwrap()
+                .contains(".schedule")
         );
     }
 }

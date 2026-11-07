@@ -4792,6 +4792,7 @@ mod tests {
                     })
                     .collect()
             }),
+            ..Default::default()
         })
     }
 
@@ -4869,7 +4870,7 @@ mod tests {
             "{e:?}"
         );
         assert_eq!(e.len(), 5 * 2 + 2 + 1);
-        assert!(crate::sched_edit::missed(&files, &out, &lock, &[UHR.into()]).is_empty());
+        assert!(crate::sched_edit::missed(&files, &out, &lock, &[UHR.into()], &[]).is_empty());
         assert!(crate::sched_edit::differs(&out, &d, UHR));
 
         // Changed again: its own set is rewritten, and the previous is what it claimed.
@@ -4943,7 +4944,7 @@ mod tests {
         let out2 = compile_files(&d, &files, &mut l2).unwrap();
         assert_eq!(entries(&out2, UHR), entries(&out2, HEIZ));
         assert_eq!(entries(&out2, UHR), [(0, 1440, 16.0)]);
-        assert!(crate::sched_edit::missed(&files, &out2, &lock, &[HEIZ.into()]).is_empty());
+        assert!(crate::sched_edit::missed(&files, &out2, &lock, &[HEIZ.into()], &[]).is_empty());
 
         // A digital timer: no values.
         let e = apply_op(
@@ -5017,6 +5018,167 @@ mod tests {
         )
         .unwrap_err();
         assert!(e.contains("no operating mode"), "{e}");
+    }
+
+    /// Rewriting a set other timers share is undone whole: the undo puts
+    /// their switching times back too, not only this timer's claim (#73).
+    #[test]
+    fn undoing_a_rewrite_of_a_shared_set_gives_the_others_their_times_back() {
+        use crate::sched_edit::builtin_uuid;
+        let d = timers();
+        let names = BTreeSet::new();
+        let mut l = Lockfile::default();
+        let lock = lock_of(&l);
+        let ctx = Ctx {
+            doc: &d,
+            lock: &lock,
+            base: &d,
+            deployed: None,
+            names: &names,
+            drawn: &Default::default(),
+            adoptions: &Default::default(),
+            page_adoptions: &Default::default(),
+            sched_claimed: &Default::default(),
+        };
+        let mon = builtin_uuid(4);
+        let mut files = Files::default();
+        // Uhr on its set; Heizung on one of its own.
+        apply_op(
+            &mut files,
+            &ctx,
+            &Op::Schedule {
+                uuid: UHR.into(),
+                value: sched(None, &[(&mon, &[(60, 120, Some("20"))])]),
+            },
+        )
+        .unwrap();
+        apply_op(
+            &mut files,
+            &ctx,
+            &Op::Schedule {
+                uuid: HEIZ.into(),
+                value: sched(None, &[(&mon, &[(0, 30, Some("17"))])]),
+            },
+        )
+        .unwrap();
+        let start = files.clone();
+        let uhr_before = entries(&compile_files(&d, &files, &mut l.clone()).unwrap(), UHR);
+        for (label, heiz) in [("its own set", true), ("no claim", false)] {
+            files = start.clone();
+            if !heiz {
+                apply_op(
+                    &mut files,
+                    &ctx,
+                    &Op::Schedule {
+                        uuid: HEIZ.into(),
+                        value: None,
+                    },
+                )
+                .unwrap();
+            }
+            let was = files.clone();
+            // Heizung rewrites Uhr's set: both get 05:00-06:00.
+            let op = Op::Schedule {
+                uuid: HEIZ.into(),
+                value: sched(
+                    Some("vx_uhr_schedule"),
+                    &[(&mon, &[(300, 360, Some("21"))])],
+                ),
+            };
+            let a = apply_op(&mut files, &ctx, &op).unwrap();
+            let out = compile_files(&d, &files, &mut l).unwrap();
+            assert_eq!(entries(&out, UHR), [(300, 360, 21.0)], "{label}");
+            let undo = undo_ops(
+                std::slice::from_ref(&op),
+                std::slice::from_ref(&a.previous),
+                &[],
+            )
+            .unwrap();
+            let Op::Schedule { value: Some(v), .. } = &undo[0] else {
+                panic!("{label}: {undo:?}")
+            };
+            assert_eq!(
+                v.restore[&"vx_uhr_schedule".to_string()][&mon][0].from,
+                60,
+                "{label}"
+            );
+            assert_eq!(v.set.is_some(), heiz, "{label}");
+            // Undone: Uhr has its times again, Heizung its claim as it was.
+            let b = apply_op(&mut files, &ctx, &undo[0]).unwrap();
+            assert_eq!(files.claims, was.claims, "{label}");
+            let out = compile_files(&d, &files, &mut l).unwrap();
+            assert_eq!(entries(&out, UHR), uhr_before, "{label}");
+            assert!(
+                crate::sched_edit::missed(
+                    &files,
+                    &out,
+                    &lock,
+                    &[HEIZ.into()],
+                    &["vx_uhr_schedule".into()]
+                )
+                .is_empty()
+            );
+            // And the undo's own previous redoes it whole.
+            let redo = undo_ops(std::slice::from_ref(&undo[0]), &[b.previous], &[]).unwrap();
+            apply_op(&mut files, &ctx, &redo[0]).unwrap();
+            let out = compile_files(&d, &files, &mut l).unwrap();
+            assert_eq!(entries(&out, UHR), [(300, 360, 21.0)], "{label}");
+            assert_eq!(entries(&out, HEIZ), [(300, 360, 21.0)], "{label}");
+        }
+    }
+
+    /// A timer the module's own file claims too: vislox's claim can still be
+    /// dropped (every compile fails while both claim it), not changed (#73).
+    #[test]
+    fn a_claim_on_a_timer_the_module_claims_too_can_be_dropped() {
+        use crate::sched_edit::builtin_uuid;
+        let d = timers();
+        let names = BTreeSet::new();
+        let lock = Lock::default();
+        let mut ctx = Ctx {
+            doc: &d,
+            lock: &lock,
+            base: &d,
+            deployed: None,
+            names: &names,
+            drawn: &Default::default(),
+            adoptions: &Default::default(),
+            page_adoptions: &Default::default(),
+            sched_claimed: &Default::default(),
+        };
+        let mut files = Files::default();
+        let mon = builtin_uuid(4);
+        apply_op(
+            &mut files,
+            &ctx,
+            &Op::Schedule {
+                uuid: UHR.into(),
+                value: sched(None, &[(&mon, &[(60, 120, Some("20"))])]),
+            },
+        )
+        .unwrap();
+        let elsewhere = BTreeMap::from([(UHR.to_string(), "pages/uhr.loxl:4".to_string())]);
+        ctx.sched_claimed = &elsewhere;
+        let e = apply_op(
+            &mut files.clone(),
+            &ctx,
+            &Op::Schedule {
+                uuid: UHR.into(),
+                value: sched(None, &[(&mon, &[])]),
+            },
+        )
+        .unwrap_err();
+        assert!(e.contains("pages/uhr.loxl:4 claims"), "{e}");
+        apply_op(
+            &mut files,
+            &ctx,
+            &Op::Schedule {
+                uuid: UHR.into(),
+                value: None,
+            },
+        )
+        .unwrap();
+        assert!(files.claims.2.is_empty() && files.claims.0.is_empty());
     }
 
     #[test]
