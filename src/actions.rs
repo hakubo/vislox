@@ -55,6 +55,9 @@ pub struct Actions {
     edit_state: Mutex<EditState>,
     /// `GET /api/edits`, for the [`EditState::key`] it was worked out for.
     edits_cache: Mutex<Option<(String, Value)>>,
+    /// The module's `.loxl` files as last read (#64): read and hashed again
+    /// only when they change, for the key and for `sources`.
+    module_files: Mutex<crate::managed::ModuleFiles>,
     /// What vislox's last compile compiled: each module file's blob id (by
     /// its path from the project), and the blob id of the `out` it wrote.
     /// An edit checks the module against it by content ([`Self::uncompiled`]).
@@ -607,6 +610,7 @@ impl Actions {
             tx,
             edit_state: Mutex::new(EditState::default()),
             edits_cache: Mutex::new(None),
+            module_files: Mutex::default(),
             compiled: Mutex::new(None),
         };
         a.edit_state.lock().unwrap().why = a.why_not_edit_now();
@@ -676,19 +680,18 @@ impl Actions {
             .as_deref()
             .and_then(|d| loxone_config::Project::load(&d.join("lox.toml")).ok())
             .map(|p| {
-                // vislox's files, and the lockfile: which blocks lox can move
-                // comes from it, and lox or a Discard may change it alone.
-                let mut all: Vec<String> = edit::Files::texts(&p.module.join(edit::DIR))
-                    .iter()
-                    .map(|(n, x)| format!("{n}={}", crate::history::blob_id(x.as_bytes())))
+                // The module's files, vislox's among them: where each managed
+                // block is declared (#64) moves with them, compiled or not.
+                // And the lockfile: which blocks lox can move comes from it,
+                // and lox or a Discard may change it alone.
+                let mut all: Vec<String> = self
+                    .module_files
+                    .lock()
+                    .unwrap()
+                    .refresh(&p.root, &p.module)
+                    .into_iter()
+                    .map(|(n, b)| format!("{n}={b}"))
                     .collect();
-                // The module's files: where each managed block is declared
-                // (#64) moves with them, compiled or not.
-                all.extend(
-                    crate::managed::module_texts(&p.root, &p.module)
-                        .iter()
-                        .map(|(n, x)| format!("{n}={}", crate::history::blob_id(x.as_bytes()))),
-                );
                 if let Ok(lock) = std::fs::read(&p.lock) {
                     all.push(format!("lock={}", crate::history::blob_id(&lock)));
                 }
@@ -1576,10 +1579,12 @@ impl Actions {
         managed.sort();
         // Where the module declares each block it manages, the blocks added
         // here among them (#64): UUID → slug, file and line.
-        let sources = crate::managed::sources(
-            &crate::managed::module_texts(&p.root, &p.module),
-            &lock.slugs,
-        );
+        let texts = {
+            let mut m = self.module_files.lock().unwrap();
+            m.refresh(&p.root, &p.module);
+            m.texts()
+        };
+        let sources = crate::managed::sources(&texts, &lock.slugs);
         // The blocks lox can move (#60): those it manages that are drawn on a
         // page, and of them those the pending config draws elsewhere than the
         // deployed one, on the same page.

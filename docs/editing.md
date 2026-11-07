@@ -208,17 +208,25 @@ or in Loxone Config (where an edit to a managed block is overwritten on the next
 - **Managed** means the lockfile pins the block's UUID: an entry of its `objects` (slug → UUID). The `externals`,
   which `extern` names, are Loxone Config's and stay unmarked. The blocks added here (#59) are managed too.
 - `GET /api/edits` sends `sources`: UUID → `{ slug, file, line, how }`, `file` relative to the project and `line`
-  1-based. vislox reads them off the module's `.loxl` files with lox's own declaration scan (the one its language
-  server lists symbols with); `lox logic check --json` gives only errors' lines, and lox has no command that maps
-  a slug to its line.
+  1-based, relative to the project (to the module when it lies outside it; never absolute). vislox reads them off
+  the module's `.loxl` files with lox's own declaration scan (the one its language server lists symbols with), at
+  the top level only: what a `template … end` body declares is made once per instance, so it is never a block's
+  line. `lox logic check --json` gives only errors' lines, and lox has no command that maps a slug to its line.
   - `declared`: a block, named signal or template instance declared by that name.
   - `expression`: a block lox made for an expression, named `<sink>_<port key>__<op><n>` (lox's `desugar.rs`), at
     the line of the expression: the `<-` statement, the argument of the block it feeds, or the named signal
     (`<signal>__<op><n>`). Two expressions into one port share a prefix; the first one's line is given.
-  - `template`: a block a template instance made (`<instance>_<block>`), at the instance's line.
+  - `template`: a block a template instance made (`<instance>_<block>`), at the instance's line (pointing into the
+    template's body is left to #83).
+  - `ambiguous`: a name declared twice at the top level (lox refuses that module), or an expression into such a
+    name: no line, rather than a guess.
   - none (`file` null): the lockfile pins it, but no `.loxl` file declares it now.
 - Like the rest of `/api/edits`, it is worked out again only when its key changes; the key covers the module's
   `.loxl` files, so a line moved in the module and not compiled yet is followed within the next refresh (3 s).
+  Each refresh looks at the files' sizes and modification times, and reads and hashes only those that changed, or
+  whose time is under 3 s old (two writes in one tick may share it); `sources` uses the texts it read.
+- They are the lockfile and module as they are now, so the browser shows them on the newest config only (the
+  pending compile, else the deployed config on disk), not on an older revision of the History.
 - The browser draws a λ badge on each managed block, a *Lox Logic* section in Properties (slug, `file:line`,
   *Copy path*), a *managed* key and *Show managed blocks only* in the legend (only when the project has managed
   blocks), and finds a block by its slug in Ctrl+K. Values of a managed block are still refused in *Edit values*,

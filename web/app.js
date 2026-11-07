@@ -360,11 +360,29 @@ function renderLegend() {
 // The blocks the project's Lox Logic module manages (#64): the lockfile pins their UUIDs, and the module's
 // .loxl files declare them. GET /api/edits says where (`sources`), for a lox.toml project only.
 /** Where the module declares the block `uuid`: { slug, file, line, how }, or null when it does not manage it. */
-function managedSrc(uuid) { return S.edits?.sources?.[uuid] || null; }
-function hasManaged() { return !!S.edits?.sources && Object.keys(S.edits.sources).length > 0; }
+// They are today's lockfile and module, so they are shown on the newest config only (the pending compile, else
+// the deployed config on disk), never on an older revision of the History.
+function managedShown() { const r = editRev(); return !!(S.edits?.sources && r && S.rev === r.id); }
+function managedSrc(uuid) { return managedShown() ? S.edits.sources[uuid] || null : null; }
+function hasManaged() { return managedShown() && Object.keys(S.edits.sources).length > 0; }
+/** The managed blocks shown: what the canvas and the legend are drawn from. */
+function managedSet() { return hasManaged() ? Object.keys(S.edits.sources).sort().join(",") : ""; }
+function managedTip(m) {
+  return `Managed by the Lox Logic module: ${m.slug}${srcPath(m) ? ` (${srcPath(m)})` : ""}. Change it there; an edit made in Loxone Config is overwritten on the next push.`;
+}
+/** After /api/edits: redraw the page when the managed blocks shown changed; else only their badges' tooltips. */
+function managedRefresh(was) {
+  if (!S.view) return;
+  if (managedSet() !== was) { renderLegend(); renderPage(); applyFocus(); return; }
+  vpG.querySelectorAll(".blk.managed[data-uuid] .mbadge title").forEach((t) => {
+    const m = managedSrc(t.closest("[data-uuid]").dataset.uuid);
+    if (m) t.textContent = managedTip(m);
+  });
+}
 /** `pages/licht.loxl:12`, to paste into an editor or a prompt; null when the module has no line for it. */
 function srcPath(m) { return m?.file ? `${m.file}${m.line ? ":" + m.line : ""}` : null; }
 function srcHow(m) {
+  if (m?.how === "ambiguous") return "Declared more than once in the module, which lox refuses: no line is given.";
   if (!m?.file) return "Not found in the module's files: the lockfile pins it, but no .loxl file declares it now.";
   if (m.how === "expression") return "Made by lox for the expression on this line.";
   if (m.how === "template") return "Made by the template instance on this line.";
@@ -874,7 +892,7 @@ function drawBlock(parent, o) {
 /** A small badge at the block's upper left: the project's Lox Logic module manages it. */
 function drawManagedBadge(g, x, y, m) {
   const b = el("g", { class: "mbadge" }, g);
-  el("title", {}, b, `Managed by the Lox Logic module: ${m.slug}${srcPath(m) ? ` (${srcPath(m)})` : ""}. Change it there; an edit made in Loxone Config is overwritten on the next push.`);
+  el("title", {}, b, managedTip(m));
   // On the corner, clear of the name in the header.
   el("rect", { x: x - 130, y: y - 100, width: 220, height: 160, rx: 40 }, b);
   el("text", { x: x - 20, y: y + 24, "text-anchor": "middle" }, b, "λ");
@@ -1118,7 +1136,7 @@ function renderPropsBody() {
     section("Lox Logic", [
       row("Slug", `<span class="mono">${esc(ms.slug)}</span>`),
       row("Source", path
-        ? `<span class="mono src-path">${esc(path)}</span><button type="button" class="copy" data-copy="${esc(path)}" title="Copy the file and line, for an editor or a prompt">Copy path</button><div class="src-how">${esc(srcHow(ms))}</div>`
+        ? `<span class="mono src-path">${esc(path)}</span><button type="button" class="copy" data-copy="${esc(path)}" data-label="Copy path" title="Copy the file and line, for an editor or a prompt">Copy path</button><div class="src-how">${esc(srcHow(ms))}</div>`
         : `<span class="none-v">${esc(srcHow(ms))}</span>`),
       `<div class="ed-note">Change it in the module: an edit made in Loxone Config is overwritten on the next push.</div>`,
     ]);
@@ -1200,7 +1218,7 @@ function renderPropsBody() {
   if (iname && iname.value !== o.uuid) details.push(row("Short name", val(iname.value)));
   if (autoTitle(o.title) && o.title) details.push(row("Object number", esc(o.title)));
   if (o.path && !o.page) details.push(row("Location", esc(o.path)));
-  details.push(row("UUID", `<span class="mono">${esc(o.uuid)}</span><button type="button" class="copy" data-copy="${esc(o.uuid)}">Copy</button>`));
+  details.push(row("UUID", `<span class="mono">${esc(o.uuid)}</span><button type="button" class="copy" data-copy="${esc(o.uuid)}" data-label="Copy">Copy</button>`));
   section("Details", details);
 
   const raw = o.attrs.filter((a) => !["Title", "Type", "IName", ...(note ? ["Text"] : [])].includes(a.name) || (a.changed && a !== note)).map((a) => {
@@ -1271,7 +1289,7 @@ $("props").addEventListener("click", (e) => {
   }
   if (e.target.closest(".app-load")) { loadAppFromMs(); return; }
   const c = e.target.closest(".copy");
-  if (c) { const label = c.textContent; copyText(c.dataset.copy).then(() => { c.textContent = "Copied"; setTimeout(() => (c.textContent = label), 1200); }); return; }
+  if (c) { const label = c.dataset.label ??= c.textContent; copyText(c.dataset.copy).then(() => { c.textContent = "Copied"; setTimeout(() => (c.textContent = label), 1200); }); return; }
   const m = e.target.closest(".more");
   if (m) { m.previousElementSibling.classList.add("open"); m.remove(); return; }
   const a = e.target.closest("[data-go]");
@@ -2447,11 +2465,11 @@ S.edits = null; // GET /api/edits: what vislox's file claims, and which of it is
 S.edit = { uuid: null, open: false, draft: {}, bad: {}, busy: false, msg: "", err: "" };
 S.editsKey = null; // the server's key of what /api/edits says (vislox's file, deployed and pending config)
 async function loadEdits() {
-  if (!S.hist?.actions?.shown) { S.edits = null; return; }
-  const was = JSON.stringify(S.edits?.sources || {});
+  const was = managedSet();
+  if (!S.hist?.actions?.shown) { S.edits = null; managedRefresh(was); return; }
   try { S.edits = await api("/api/edits"); } catch { S.edits = null; S.editsKey = null; }
   // The managed blocks' badges and the legend follow the lockfile and the module (#64).
-  if (S.view && JSON.stringify(S.edits?.sources || {}) !== was) { renderLegend(); renderPage(); applyFocus(); }
+  managedRefresh(was);
   renderActions();
   if (S.sel && S.view) renderProps();
 }

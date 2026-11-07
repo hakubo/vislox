@@ -268,9 +268,11 @@ try {
     // Its values are edited in that file, which Properties names.
     await waitText('[data-body="Edit"]', /change its values in pages\/flur\.loxl:3/);
     await page.context().grantPermissions(["clipboard-read", "clipboard-write"], { origin: `http://127.0.0.1:${port}` });
-    await page.click('[data-body="Lox Logic"] button.copy');
+    // A double click copies twice and still puts the label back.
+    await page.dblclick('[data-body="Lox Logic"] button.copy');
     await waitText('[data-body="Lox Logic"] button.copy', /^Copied$/);
     assert.equal(await page.evaluate(() => navigator.clipboard.readText()), "pages/flur.loxl:3");
+    await waitText('[data-body="Lox Logic"] button.copy', /^Copy path$/);
     // A block the lock pins that no .loxl file declares: its slug, and why there is no line.
     await page.evaluate((u) => { gotoPage(S.objPage.get(u), { focus: u }); select(u); }, lagerUuid(3));
     await waitText('[data-body="Lox Logic"]', /lager_3[\s\S]*no \.loxl file declares it now/);
@@ -817,6 +819,24 @@ try {
     assert.deepEqual(ops, [{ op: "wire", from: [DIV, "AQ"], to: [METER, target] }]);
     ops = await undoKey(true, has, [[DIV, "AQ"], [METER, target], false]);
     assert.deepEqual(ops, [{ op: "unwire", from: [DIV, "AQ"], to: [METER, target] }]);
+  });
+  await step("an older revision shows no managed blocks: the lockfile is today's", async () => {
+    const pending = await page.evaluate(() => editRev().id);
+    assert.match(pending, /^pending:/);
+    const deployed = await page.evaluate(() => S.hist.history[0].id);
+    await page.selectOption("#sel-rev", deployed);
+    await page.waitForFunction((r) => S.viewRev === r, deployed, { timeout: 10000 });
+    await page.evaluate((u) => gotoPage(S.objPage.get(u), { focus: u }), FLUR);
+    await page.waitForSelector(`.blk[data-uuid="${FLUR}"]`);
+    assert.equal(await page.$(".mbadge"), null);
+    assert.equal(await page.$("#legend.managed"), null);
+    // Back on the newest config, following it again.
+    await page.selectOption("#sel-rev", pending);
+    await page.evaluate(() => { const f = $("chk-follow"); f.checked = true; f.dispatchEvent(new Event("change")); });
+    await page.waitForFunction((r) => S.follow && S.viewRev === r, pending, { timeout: 10000 });
+    await page.evaluate((u) => gotoPage(S.objPage.get(u), { focus: u }), FLUR);
+    await page.waitForSelector(`.blk.managed[data-uuid="${FLUR}"] .mbadge`);
+    await page.waitForSelector("#legend.managed");
   });
   await step("Discard drops the edits", async () => {
     await page.click("#btn-discard");
