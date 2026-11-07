@@ -83,6 +83,9 @@ pub trait ClaimKind: Sync {
     /// What the file claims on the block `slug`, said after "vislox's file
     /// claims ", and the pronoun for it (`them`, `it`).
     fn on(&self, c: &Claims, slug: &str) -> Option<(String, &'static str)>;
+    /// Every slug its claims and sets name (the blocks they are on, and the
+    /// blocks they name), for keeping externs: read once per prune or render.
+    fn mentions(&self, c: &Claims) -> Vec<String>;
     /// The names of its sets (one namespace for every kind).
     fn set_names<'a>(&self, c: &'a Claims) -> Vec<&'a str>;
     /// Read a statement of the file into `c`; `None`: not this kind's.
@@ -166,6 +169,14 @@ impl<K: SetKind> ClaimKind for Reg<K> {
             .iter()
             .find(|(_, lines)| K::named(lines).iter().any(|n| n == slug))
             .map(|(set, _)| (format!("it in its {} set `{set}`", K::KEYWORD), "it"))
+    }
+    fn mentions(&self, c: &Claims) -> Vec<String> {
+        let s = K::store(c);
+        let mut out: Vec<String> = s.claims.keys().cloned().collect();
+        for lines in s.sets.values() {
+            out.extend(K::named(lines));
+        }
+        out
     }
     fn set_names<'a>(&self, c: &'a Claims) -> Vec<&'a str> {
         K::store(c).sets.keys().map(String::as_str).collect()
@@ -295,6 +306,12 @@ pub trait SetKind: Clone + Debug + Default + PartialEq + 'static {
         restore: BTreeMap<String, Self::Content>,
     ) -> Self::Val;
     fn index<'a>(doc: &'a LoxoneDoc, lock: &'a Lock) -> Self::Index<'a>;
+    /// [`SetKind::index`] for a config that vislox's `files` edit: a kind
+    /// whose lines name vislox's own blocks (a tile's targets, #78) learns
+    /// those lox has not pinned yet. The default is `index`.
+    fn index_in<'a>(doc: &'a LoxoneDoc, lock: &'a Lock, _files: &Files) -> Self::Index<'a> {
+        Self::index(doc, lock)
+    }
     /// A set's lines as an op carries them; `None` when they cannot be read
     /// against the config `idx` was made of.
     fn content_of(lines: &[Self::Line], idx: &Self::Index<'_>) -> Option<Self::Content>;
@@ -570,7 +587,7 @@ pub fn apply<K: SetKind>(
         }
     }
     let before = K::store(&files.claims).clone();
-    let idx = K::index(ctx.doc, ctx.lock);
+    let idx = K::index_in(ctx.doc, ctx.lock, files);
     let mut previous = current::<K>(files, &target, &idx);
     // Sets of vislox's written back first (an undo's).
     if let Some(v) = value {
@@ -636,7 +653,8 @@ pub fn apply<K: SetKind>(
                 .insert(target.clone(), set);
             // An extern of the file names a block Loxone Config drew.
             if target == edit::slug(uuid) {
-                let c = files.claims.0.entry(uuid.to_string()).or_default();
+                let key = edit::extern_key(files, uuid);
+                let c = files.claims.0.entry(key).or_default();
                 c.ty = K::BLOCK.into();
             }
         }

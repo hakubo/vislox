@@ -58,13 +58,11 @@ pub struct Function {
 }
 
 impl Function {
-    /// `ctrls` as compared: lowercase (a save may write them either way).
-    pub fn ctrls_lower(&self) -> Vec<String> {
-        self.ctrls.iter().map(|u| u.to_ascii_lowercase()).collect()
-    }
-
-    fn same(&self, o: &Function) -> bool {
-        self.api == o.api && self.text == o.text && self.ctrls_lower() == o.ctrls_lower()
+    /// The same program: `ctrls` compare lowercase (a save may write them
+    /// either way).
+    pub fn same(&self, o: &Function) -> bool {
+        use crate::member_edit::lower;
+        self.api == o.api && self.text == o.text && lower(&self.ctrls) == lower(&o.ctrls)
     }
 }
 
@@ -76,7 +74,8 @@ pub struct Tile {
 }
 
 impl Tile {
-    /// Whether its functions are the same as `o`'s (`ctrls` case aside).
+    /// Whether its functions are the same as `o`'s (`ctrls` case aside): the
+    /// one comparison of the review (`model.rs`) and the pending flag.
     pub fn same(&self, o: &Tile) -> bool {
         self.index == o.index
             && self
@@ -172,9 +171,12 @@ impl Links {
     pub fn read(doc: &LoxoneDoc) -> Links {
         let objects = doc.objects();
         let el = |i: usize| doc.element_at(&objects[i].path);
+        // Every UUID is keyed lowercase: a save may write a connector, a
+        // wire's end or a `Ref=` in either case.
+        let lc = |u: &str| u.to_ascii_lowercase();
         // The API connectors of the Touch Pure Flex devices: actor UUID →
-        // device UUID (lowercase).
-        let mut actors: BTreeMap<&str, String> = BTreeMap::new();
+        // device UUID.
+        let mut actors: BTreeMap<String, String> = BTreeMap::new();
         for o in &objects {
             let Some(e) = doc.element_at(&o.path).filter(|e| is_flex(e)) else {
                 continue;
@@ -184,7 +186,7 @@ impl Links {
                     && c.attr("Type") == Some("ApiActor")
                     && let Some(u) = c.attr("U")
                 {
-                    actors.insert(u, o.uuid.to_ascii_lowercase());
+                    actors.insert(lc(u), lc(&o.uuid));
                 }
             }
         }
@@ -197,29 +199,33 @@ impl Links {
         for (i, _) in objects.iter().enumerate() {
             if let Some(e) = el(i) {
                 for p in ports(e) {
-                    port_owner.insert(p.uuid, (i, p.key));
+                    port_owner.insert(lc(&p.uuid), (i, p.key));
                 }
             }
         }
         let wires: Vec<(String, String)> = doc
             .wires()
             .into_iter()
-            .map(|w| (w.from_port, w.to_port))
+            .map(|w| (lc(&w.from_port), lc(&w.to_port)))
             .collect();
         let owner = |port: &str| port_owner.get(port).map(|(i, k)| (*i, k.as_str()));
-        // OutputRefs mirroring an actor whose `AQ` feeds its `I`: object →
-        // the device.
+        // OutputRefs mirroring an actor whose `AQ` feeds its `I` (the wire in
+        // either direction, as API wires are): object → the device.
         let mut mirrors: BTreeMap<usize, &String> = BTreeMap::new();
         for (from, to) in &wires {
-            let (Some((a, "I")), Some((r, "AQ"))) = (owner(to), owner(from)) else {
-                continue;
-            };
-            let au = objects[a].uuid.as_str();
-            if objects[r].block_type == "OutputRef"
-                && let Some(dev) = actors.get(au)
-                && el(r).and_then(|e| e.attr("Ref")) == Some(au)
-            {
-                mirrors.insert(r, dev);
+            for (x, y) in [(from, to), (to, from)] {
+                let (Some((a, "I")), Some((r, "AQ"))) = (owner(x), owner(y)) else {
+                    continue;
+                };
+                let au = lc(&objects[a].uuid);
+                if objects[r].block_type == "OutputRef"
+                    && let Some(dev) = actors.get(&au)
+                    && el(r)
+                        .and_then(|e| e.attr("Ref"))
+                        .is_some_and(|r| r.eq_ignore_ascii_case(&au))
+                {
+                    mirrors.insert(r, dev);
+                }
             }
         }
         // The device a port lets a command in at: an actor's `I`, or a
@@ -227,7 +233,7 @@ impl Links {
         let entry = |port: &str| -> Option<&String> {
             let (i, key) = owner(port)?;
             match key {
-                "I" => actors.get(objects[i].uuid.as_str()),
+                "I" => actors.get(&lc(&objects[i].uuid)),
                 "AI" => mirrors.get(&i).copied(),
                 _ => None,
             }
@@ -240,7 +246,7 @@ impl Links {
                 };
                 let Some(dev) = entry(e) else { continue };
                 let o = &objects[b];
-                if seen.insert((dev.clone(), o.uuid.to_ascii_lowercase())) {
+                if seen.insert((dev.clone(), lc(&o.uuid))) {
                     out.0
                         .entry(dev.clone())
                         .or_default()
@@ -325,6 +331,55 @@ mod tests {
         );
         assert_eq!(l.linked(FLEX, OST), None);
         assert!(l.of(TOUCH).is_empty());
+    }
+
+    /// UUIDs in another case on either end, the mirror's `Ref=` and its
+    /// wire into the actor recorded the other way round: the same links.
+    #[test]
+    fn links_are_found_whatever_the_case_and_the_mirror_wire_s_direction() {
+        let up = |u: &str| u.to_ascii_uppercase();
+        let mut x = house();
+        // Nord's reverse wire names the actor's `I` in upper case.
+        x = x.replacen(
+            &format!("<In Input=\"{}\"/>", co(ACTOR, 1)),
+            &format!("<In Input=\"{}\"/>", up(&co(ACTOR, 1))),
+            1,
+        );
+        // The mirror's Ref= in upper case.
+        x = x.replace(
+            &format!("Ref=\"{ACTOR}\""),
+            &format!("Ref=\"{}\"", up(ACTOR)),
+        );
+        // The mirror's distribution recorded on its AQ (naming the actor's I),
+        // not on the actor's I.
+        x = x.replace(
+            &format!(
+                "<Co K=\"I\" U=\"{}\">\n\t\t\t\t\t\t\t\t<In Input=\"{}\"/>\n\t\t\t\t\t\t\t</Co>",
+                co(ACTOR, 1),
+                co(MIRROR, 2)
+            ),
+            &format!("<Co K=\"I\" U=\"{}\"/>", co(ACTOR, 1)),
+        );
+        x = x.replace(
+            &format!("<Co K=\"AQ\" U=\"{}\"/>", co(MIRROR, 2)),
+            &format!(
+                "<Co K=\"AQ\" U=\"{}\">\n\t\t\t\t\t<In Input=\"{}\"/>\n\t\t\t\t</Co>",
+                up(&co(MIRROR, 2)),
+                co(ACTOR, 1)
+            ),
+        );
+        for want in [
+            format!("<In Input=\"{}\"/>", up(&co(ACTOR, 1))),
+            format!("Ref=\"{}\"", up(ACTOR)),
+            format!("<Co K=\"I\" U=\"{}\"/>", co(ACTOR, 1)),
+            up(&co(MIRROR, 2)),
+        ] {
+            assert!(x.contains(&want), "{want}");
+        }
+        let d = LoxoneDoc::parse(x.as_bytes()).unwrap();
+        let l = Links::read(&d);
+        let of: Vec<&str> = l.of(FLEX).iter().map(|(u, _)| u.as_str()).collect();
+        assert_eq!(of, [NORD, SUED, LIGHT]);
     }
 
     #[test]

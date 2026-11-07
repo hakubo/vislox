@@ -351,6 +351,9 @@ pub struct TileFnInfo {
     pub api: Option<String>,
     pub text: Option<String>,
     pub to: Vec<MemberInfo>,
+    /// The function as stored: what [`crate::tiles`] compares.
+    #[serde(skip)]
+    pub raw: crate::tiles::Function,
 }
 
 /// The block `m` names, as a link: by its UUID in either case, else the
@@ -388,8 +391,9 @@ fn tiles_info(c: &Ctx, links: &crate::tiles::Links, uuid: &str) -> Option<TilesI
                 .map(|((key, _), f)| TileFnInfo {
                     key,
                     to: f.ctrls.iter().map(|m| member_info(c, m)).collect(),
-                    api: f.api,
-                    text: f.text,
+                    api: f.api.clone(),
+                    text: f.text.clone(),
+                    raw: f,
                 })
                 .collect(),
         })
@@ -402,23 +406,29 @@ fn tiles_info(c: &Ctx, links: &crate::tiles::Links, uuid: &str) -> Option<TilesI
     Some(TilesInfo { tiles, linked })
 }
 
-/// A tile function's targets as compared: lowercase UUIDs, in order.
-fn fn_targets(f: &TileFnInfo) -> Vec<String> {
-    f.to.iter()
-        .map(|x| x.target.uuid.to_ascii_lowercase())
-        .collect()
-}
-
-/// Whether two readings of a device's tiles program them alike (the
-/// targets' case aside).
+/// Whether two readings of a device's tiles program them alike:
+/// [`crate::tiles::Tile::same`], as the pending flag compares them.
 fn same_tiles(a: &TilesInfo, b: &TilesInfo) -> bool {
     a.tiles.len() == b.tiles.len()
-        && a.tiles.iter().zip(&b.tiles).all(|(x, y)| {
-            x.index == y.index
-                && x.functions.iter().zip(&y.functions).all(|(p, q)| {
-                    p.api == q.api && p.text == q.text && fn_targets(p) == fn_targets(q)
-                })
-        })
+        && a.tiles
+            .iter()
+            .zip(&b.tiles)
+            .all(|(x, y)| x.raw().same(&y.raw()))
+}
+
+impl TileInfo {
+    /// The tile as stored.
+    fn raw(&self) -> crate::tiles::Tile {
+        crate::tiles::Tile {
+            index: self.index,
+            functions: std::array::from_fn(|i| {
+                self.functions
+                    .get(i)
+                    .map(|f| f.raw.clone())
+                    .unwrap_or_default()
+            }),
+        }
+    }
 }
 
 /// The tiles of a device that changed, as the change list reads them, per
@@ -443,6 +453,10 @@ fn tiles_changes(title: &str, old: &TilesInfo, new: &TilesInfo) -> Vec<String> {
             continue;
         };
         for (f, g) in t.functions.iter().zip(&o.functions) {
+            // Only what the stored programs' one comparison calls changed.
+            if f.raw.same(&g.raw) {
+                continue;
+            }
             let at = format!("{title} · tile {} {}", t.index, f.key);
             if f.api != g.api {
                 out.push(format!("{at}: {} → {}", q(&g.api), q(&f.api)));
@@ -450,7 +464,7 @@ fn tiles_changes(title: &str, old: &TilesInfo, new: &TilesInfo) -> Vec<String> {
             if f.text != g.text {
                 out.push(format!("{at} text: {} → {}", q(&g.text), q(&f.text)));
             }
-            if fn_targets(f) != fn_targets(g) {
+            if crate::member_edit::lower(&f.raw.ctrls) != crate::member_edit::lower(&g.raw.ctrls) {
                 out.push(format!("{at} targets: {} → {}", names(g), names(f)));
             }
         }

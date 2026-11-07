@@ -703,17 +703,6 @@ impl Claims {
         Ok(c)
     }
 
-    /// Whether a wire ends at `slug`.
-    pub fn wired(&self, slug: &str) -> bool {
-        self.1.iter().any(|w| w.touches(slug))
-    }
-
-    /// Whether a wire ends at `slug`, or a schedule (#73), moods (#74) or
-    /// members (#75) claim names it.
-    fn named(&self, slug: &str) -> bool {
-        self.wired(slug) || self.set_claimed(slug)
-    }
-
     /// Whether a set claim of the file (switching times, moods) or a member
     /// list (as the central block, or a member) names `slug`.
     pub fn set_claimed(&self, slug: &str) -> bool {
@@ -728,12 +717,27 @@ impl Claims {
             .find_map(|k| k.on(self, slug))
     }
 
+    /// Every slug a wire ends at, or a set or member claim names: read once
+    /// per prune or render, not once per extern.
+    fn named_slugs(&self) -> BTreeSet<String> {
+        let mut out: BTreeSet<String> = self
+            .1
+            .iter()
+            .flat_map(|w| [w.to.0.clone(), w.from.0.clone()])
+            .collect();
+        for k in crate::set_claim::KINDS {
+            out.extend(k.mentions(self));
+        }
+        out
+    }
+
     /// Drop the externs that claim nothing and no wire or set claim names.
     pub(crate) fn prune(&mut self) {
+        let named = self.named_slugs();
         let keep: BTreeSet<String> = self
             .0
             .keys()
-            .filter(|u| self.named(&slug(u)))
+            .filter(|u| named.contains(&slug(u)))
             .cloned()
             .collect();
         self.0.retain(|u, c| !c.is_empty() || keep.contains(u));
@@ -745,9 +749,10 @@ impl Claims {
             "# Values edited in vislox (Properties). vislox rewrites this file on every edit;\n\
              # see docs/editing.md in vislox. Deleting a line hands that value back to Loxone Config.\n",
         );
+        let named = self.named_slugs();
         for (uuid, c) in &self.0 {
             let s = slug(uuid);
-            if c.is_empty() && !self.named(&s) {
+            if c.is_empty() && !named.contains(&s) {
                 continue;
             }
             out.push_str(&format!(
@@ -6648,8 +6653,11 @@ mod tests {
         let t3 = tile_of(&out, FLEX, 3);
         assert_eq!(t3.functions[0].api.as_deref(), Some("SET(As;Cc;pulse)"));
         assert_eq!(t3.functions[0].text.as_deref(), Some("=ECHO(As)"));
-        assert_eq!(t3.functions[0].ctrls_lower(), [SUED]);
-        assert_eq!(t3.functions[1].ctrls_lower(), [NORD, SUED]);
+        assert_eq!(crate::member_edit::lower(&t3.functions[0].ctrls), [SUED]);
+        assert_eq!(
+            crate::member_edit::lower(&t3.functions[1].ctrls),
+            [NORD, SUED]
+        );
         assert_eq!(t3.functions[2], Default::default());
         // Tile 5 is not in the set: it keeps its program.
         assert_eq!(tile_of(&out, FLEX, 5), tile_of(&d, FLEX, 5));
@@ -6809,6 +6817,136 @@ mod tests {
         )
         .unwrap_err();
         assert!(e.contains("as a Pushbutton, not a AutoJalousie"), "{e}");
+    }
+
+    /// A block vislox added is a target by its slug: before lox pins it
+    /// (its link is lox's to check, its type is checked here, and `previous`
+    /// carries the slug), and after (resolved through the lock).
+    #[test]
+    fn a_block_added_here_is_a_target_by_its_slug_pinned_or_not() {
+        use crate::set_claim::SetKind;
+        use crate::tiles::fixture::*;
+        let d = LoxoneDoc::parse(house().as_bytes()).unwrap();
+        let (names, claimed) = (BTreeSet::new(), BTreeMap::new());
+        let mut l = Lockfile::default();
+        let lock0 = lock_of(&l);
+        let ctx = access_ctx(&d, &lock0, &names, &claimed);
+        let mut files = Files::default();
+        apply_op(
+            &mut files,
+            &ctx,
+            &add(PAGE, "LightController2", Some("Neu"), &[], &[]),
+        )
+        .unwrap();
+        let new = files
+            .pages
+            .values()
+            .flat_map(|p| &p.blocks)
+            .next()
+            .unwrap()
+            .slug
+            .clone();
+        let lico = |to: &str| {
+            tiles_op(
+                FLEX,
+                None,
+                Some(vec![tile(5, tf("SET(Lico;M+;pulse)", None, &[to]), None)]),
+            )
+        };
+        // Not pinned: named by its slug, its type checked.
+        let mut before = files.clone();
+        apply_op(&mut before, &ctx, &lico(&new)).unwrap();
+        assert!(
+            before.render()["edits.loxl"].contains(&format!("to: {new})")),
+            "{:?}",
+            before.render()
+        );
+        let e = apply_op(
+            &mut files.clone(),
+            &ctx,
+            &tiles_op(
+                FLEX,
+                None,
+                Some(vec![tile(5, tf("SET(As;Tg;pulse)", None, &[&new]), None)]),
+            ),
+        )
+        .unwrap_err();
+        assert!(
+            e.contains(&format!(
+                "`{new}` is a LightController2, but `SET(As;Tg;pulse)` addresses AutoJalousie"
+            )),
+            "{e}"
+        );
+        // The set reads back with the slug, which the undo takes as it is.
+        let idx = crate::tiles_edit::TilesKind::index_in(&d, &lock0, &before);
+        let v =
+            crate::set_claim::current::<crate::tiles_edit::TilesKind>(&before, &slug(FLEX), &idx)
+                .unwrap();
+        assert_eq!(
+            v.tiles.as_ref().unwrap()[0].click.as_ref().unwrap().to,
+            std::slice::from_ref(&new)
+        );
+        let a = apply_op(
+            &mut before,
+            &ctx,
+            &Op::Tiles {
+                uuid: FLEX.into(),
+                value: None,
+            },
+        )
+        .unwrap();
+        let undo = undo_ops(
+            &[Op::Tiles {
+                uuid: FLEX.into(),
+                value: None,
+            }],
+            &[a.previous],
+            &[],
+        )
+        .unwrap();
+        apply_op(&mut before, &ctx, &undo[0]).unwrap();
+        assert!(before.render()["edits.loxl"].contains(&format!("to: {new})")));
+        // Pinned once compiled: resolved through the lock to its UUID (no longer
+        // refused as no object), and refused only as not linked.
+        let out = compile_files(&d, &files, &mut l).unwrap();
+        let lock = lock_of(&l);
+        assert!(lock.uuid_of(&new).is_some());
+        let ctx2 = access_ctx(&out, &lock, &names, &claimed);
+        let e = apply_op(&mut files, &ctx2, &lico(&new)).unwrap_err();
+        assert!(e.contains("Neu is not API-linked to Flex Küche"), "{e}");
+    }
+
+    /// The device's extern is keyed as the file keys it: one `extern` line
+    /// whatever the case of the UUID.
+    #[test]
+    fn the_device_s_extern_is_one_whatever_the_case() {
+        use crate::tiles::fixture::*;
+        let d = LoxoneDoc::parse(house().as_bytes()).unwrap();
+        let (names, claimed) = (BTreeSet::new(), BTreeMap::new());
+        let lock = Lock::default();
+        let ctx = access_ctx(&d, &lock, &names, &claimed);
+        let mut files = Files::default();
+        files.claims.0.insert(
+            FLEX.to_ascii_uppercase(),
+            Claim {
+                ty: "TreeDevice".into(),
+                attrs: BTreeMap::from([(Which::Title, "Flex".to_string())]),
+                ..Default::default()
+            },
+        );
+        apply_op(
+            &mut files,
+            &ctx,
+            &tiles_op(FLEX, None, Some(vec![tile(2, None, None)])),
+        )
+        .unwrap();
+        let text = &files.render()["edits.loxl"];
+        assert_eq!(
+            text.matches(&format!("extern {} ", slug(FLEX))).count(),
+            1,
+            "{text}"
+        );
+        assert_eq!(files.claims.0.len(), 1);
     }
 
     #[test]

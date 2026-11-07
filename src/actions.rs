@@ -8685,7 +8685,7 @@ esac
         assert_eq!(r["undo"][0]["value"], Value::Null);
         let t = tile3();
         assert_eq!(t.functions[0].api.as_deref(), Some("SET(As;Cc;pulse)"));
-        assert_eq!(t.functions[0].ctrls_lower(), [SUED]);
+        assert_eq!(crate::member_edit::lower(&t.functions[0].ctrls), [SUED]);
         assert_eq!(t.functions[1], Default::default());
         let e = edits_of(&a, &d).await;
         assert_eq!(e["tiles"][0]["uuid"], FLEX);

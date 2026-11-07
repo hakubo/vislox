@@ -223,21 +223,60 @@ pub struct TilesKind;
 pub struct Index<'a> {
     doc: &'a LoxoneDoc,
     lock: &'a Lock,
-    links: Links,
+    /// The blocks of vislox's files lox has not pinned yet: slug → type.
+    own: BTreeMap<String, String>,
+    /// The API links, read only when a check needs them.
+    links: std::cell::OnceCell<Links>,
 }
 
-impl Index<'_> {
-    /// The block a target's slug names: an extern of vislox's file (its UUID
-    /// as the config writes it), or a block of vislox's files.
-    fn uuid_of(&self, slug: &str) -> Option<String> {
-        if let Some(u) = edit::slug_uuid(slug) {
-            return Some(
-                tiles::find_ci(&self.doc.xml.root, &u)
-                    .and_then(|e| e.attr("U"))
-                    .map_or(u, String::from),
-            );
+/// What a target's slug names.
+enum Resolved {
+    /// A block of the config, by its UUID as the config writes it.
+    Uuid(String),
+    /// A block of vislox's files lox has not pinned yet (no UUID before the
+    /// compile), and its type.
+    Own(String),
+}
+
+impl<'a> Index<'a> {
+    fn new(doc: &'a LoxoneDoc, lock: &'a Lock, own: BTreeMap<String, String>) -> Index<'a> {
+        Index {
+            doc,
+            lock,
+            own,
+            links: std::cell::OnceCell::new(),
         }
-        self.lock.uuid_of(slug).map(String::from)
+    }
+
+    fn links(&self) -> &Links {
+        self.links.get_or_init(|| Links::read(self.doc))
+    }
+
+    /// The one resolver of a target's slug: an extern of vislox's file (its
+    /// UUID), a block lox pinned (the lock's UUID: vislox's own or adopted),
+    /// or a block of vislox's files not pinned yet.
+    fn resolve(&self, slug: &str) -> Option<Resolved> {
+        let in_doc = |u: String| {
+            tiles::find_ci(&self.doc.xml.root, &u)
+                .and_then(|e| e.attr("U"))
+                .map_or(u, String::from)
+        };
+        if let Some(u) = edit::slug_uuid(slug) {
+            return Some(Resolved::Uuid(in_doc(u)));
+        }
+        if let Some(u) = self.lock.uuid_of(slug) {
+            return Some(Resolved::Uuid(in_doc(u.to_string())));
+        }
+        self.own.get(slug).map(|t| Resolved::Own(t.clone()))
+    }
+
+    /// The UUID a slug names; a block not pinned yet stays its slug, which an
+    /// op takes back as it is (so `previous` undoes it).
+    fn target(&self, slug: &str) -> String {
+        match self.resolve(slug) {
+            Some(Resolved::Uuid(u)) => u,
+            _ => slug.to_string(),
+        }
     }
 }
 
@@ -249,12 +288,7 @@ fn lock_slug<'a>(lock: &'a Lock, uuid: &str) -> Option<&'a str> {
         .map(|(s, _)| s.as_str())
 }
 
-fn title_of(el: &Element) -> String {
-    el.attr_decoded("Title")
-        .filter(|t| !t.trim().is_empty())
-        .map(|t| t.into_owned())
-        .unwrap_or_else(|| el.attr("Type").unwrap_or_default().to_string())
-}
+use crate::member_edit::{lower, title_of};
 
 /// A command or text as one line of the app's command language.
 fn one_line(what: &str, v: &str) -> Result<(), String> {
@@ -310,11 +344,17 @@ impl set_claim::SetKind for TilesKind {
         }
     }
     fn index<'a>(doc: &'a LoxoneDoc, lock: &'a Lock) -> Index<'a> {
-        Index {
-            doc,
-            lock,
-            links: Links::read(doc),
-        }
+        Index::new(doc, lock, BTreeMap::new())
+    }
+    fn index_in<'a>(doc: &'a LoxoneDoc, lock: &'a Lock, files: &Files) -> Index<'a> {
+        let own = files
+            .pages
+            .values()
+            .flat_map(|p| &p.blocks)
+            .filter(|b| lock.uuid_of(&b.slug).is_none())
+            .map(|b| (b.slug.clone(), b.ty.clone()))
+            .collect();
+        Index::new(doc, lock, own)
     }
     fn content_of(lines: &[TileLine], idx: &Index<'_>) -> Option<Vec<TileVal>> {
         lines
@@ -327,7 +367,7 @@ impl set_claim::SetKind for TilesKind {
                     Some(Some(FnVal {
                         api: f.api.clone(),
                         text: f.text.clone(),
-                        to: f.to.iter().map(|s| idx.uuid_of(s)).collect::<Option<_>>()?,
+                        to: f.to.iter().map(|s| idx.target(s)).collect(),
                     }))
                 };
                 Some(TileVal {
@@ -423,8 +463,10 @@ impl set_claim::SetKind for TilesKind {
                 let mut to = Vec::with_capacity(f.to.len());
                 for u in &f.to {
                     let u = u.trim();
-                    // A block of vislox's files lox has not pinned yet: its slug.
-                    let slug = if files.block(u).is_some() && ctx.lock.uuid_of(u).is_none() {
+                    // A block of vislox's files, by its slug (an undo's `previous`
+                    // carries one lox has not pinned yet as its slug): vislox's
+                    // files name it so, pinned or not.
+                    let slug = if files.block(u).is_some() {
                         u.to_string()
                     } else {
                         let el = tiles::find_ci(&ctx.doc.xml.root, u)
@@ -526,13 +568,29 @@ impl set_claim::SetKind for TilesKind {
                     let types = tiles::addressed_types(&f.api);
                     for t in &f.to {
                         let at = format!("`{set}`, tile {} {key}", l.index);
-                        let u = idx
-                            .uuid_of(t)
-                            .ok_or_else(|| format!("{at}: `{t}` names no block"))?;
+                        let u = match idx.resolve(t) {
+                            Some(Resolved::Uuid(u)) => u,
+                            // Not in the pending config yet: lox checks its link
+                            // when it compiles, and `missed` after; its type is
+                            // checked here.
+                            Some(Resolved::Own(ty)) => {
+                                if let Some(types) = &types
+                                    && !types.contains(&ty.as_str())
+                                {
+                                    return Err(format!(
+                                        "{at}: `{t}` is a {ty}, but `{}` addresses {}",
+                                        f.api,
+                                        types.join("/")
+                                    ));
+                                }
+                                continue;
+                            }
+                            None => return Err(format!("{at}: `{t}` names no block")),
+                        };
                         let target = tiles::find_ci(&idx.doc.xml.root, &u)
                             .map(title_of)
                             .unwrap_or_else(|| u.clone());
-                        let Some(ty) = idx.links.linked(du, &u) else {
+                        let Some(ty) = idx.links().linked(du, &u) else {
                             return Err(format!(
                                 "{at}: {target} is not API-linked to {name}; wire its OutputAPI \
                                  to the device's API connector (in Loxone Config, or through an \
@@ -585,7 +643,7 @@ pub fn missed(
     if sets.is_empty() {
         return bad;
     }
-    let idx = <TilesKind as set_claim::SetKind>::index(out, lock);
+    let idx = <TilesKind as set_claim::SetKind>::index_in(out, lock, files);
     for set in sets {
         let Some(lines) = s.sets.get(set) else {
             continue;
@@ -608,13 +666,10 @@ pub fn missed(
                     .all(|(got, want)| match want {
                         None => *got == tiles::Function::default(),
                         Some(w) => {
-                            let to: Option<Vec<String>> =
-                                w.to.iter()
-                                    .map(|x| idx.uuid_of(x).map(|u| u.to_ascii_lowercase()))
-                                    .collect();
+                            let to: Vec<String> = w.to.iter().map(|x| idx.target(x)).collect();
                             got.api.as_deref() == Some(w.api.as_str())
                                 && got.text == w.text
-                                && to.is_some_and(|to| to == got.ctrls_lower())
+                                && lower(&to) == lower(&got.ctrls)
                         }
                     })
             });

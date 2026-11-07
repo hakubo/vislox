@@ -1015,7 +1015,9 @@ vx_70000001_0000_0000_ffff504f94000001.tiles = vx_flex_kueche_tiles
   are as for the other set kinds: write vislox's set of that name and claim it, or with no `tiles` claim it as it is
   (*Use the same tiles as …*); drop the claim; write sets back first (an undo's). A new set is
   `vx_<name>_tiles`. `previous` carries the targets by UUID. A target Loxone Config drew gets an extern of vislox's
-  file (`vx_<uuid>`, its type), kept while a set names it; a block added or adopted here is named by its slug. A
+  file (`vx_<uuid>`, its type), kept while a set names it; a block added or adopted here is named by its slug,
+  resolved through the lockfile once lox pins it. One lox has not pinned yet (added in the same request, or carried
+  by an undo) is not in the pending config: its type is checked here, its link by lox and after the compile. A
   `tile` is written as lox's formatter writes it (`Module::to_text`), `text:`/`to:` once when every function with a
   command shares them, else per function (`click_text:`, `up_to:`), so `lox logic fmt --check` finds nothing.
 - **Checked before lox sees it**, with lox's rules: a `TreeDevice` with a tile layout, for every device on the set;
