@@ -3114,7 +3114,6 @@ try {
     };
     const pfile = () => { const p = join(dir, "pages", "vislox", "_periphery.loxl"); return existsSync(p) ? readFileSync(p, "utf8") : ""; };
     const row = (u) => `#tree .tn-row[data-uuid="${u}"]`;
-    const entryOf = (slug) => page.evaluate((s) => S.edits?.blocks?.find((b) => b.slug === s) || null, slug);
     // The calendar folder's Add in the project tree opens the entry form of the Operating modes view.
     await page.evaluate((u) => revealInTree(u), CAL_F);
     await page.waitForSelector(`${row(CAL_F)} [data-add-under]:not([disabled])`);
@@ -3153,7 +3152,7 @@ try {
     ops = await send(() => page.click('#md-form [data-mf-act="save"]'), "add an entry");
     assert.deepEqual(ops, [{ op: "add_block", page: CAL_F, type: "CalendarEntry", title: "Grillfest", params: {}, settings: { switches: grill, date: "from: 2026-07-04, to: 2026-07-05" } }]);
     assert.match(pfile(), /^vx_calendarentry_1 = CalendarEntry\("Grillfest", switches: vx_mode_1, from: 2026-07-04, to: 2026-07-05\)$/m);
-    const fest = (await entryOf("vx_calendarentry_1")).uuid;
+    const fest = await (await page.waitForFunction(() => S.edits?.blocks?.find((b) => b.slug === "vx_calendarentry_1")?.uuid, null, { timeout: 20000 })).jsonValue();
     // Compiled: on the year in its mode's colour, its days outlined as added, listed as added.
     await page.waitForSelector(`#md-grid [data-day="${d4}"].md-add`);
     await waitText("#md-list", /Grillfest[\s\S]*added/);

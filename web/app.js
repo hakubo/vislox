@@ -3197,6 +3197,7 @@ S.edit = { uuid: null, open: false, draft: {}, bad: {}, busy: false, msg: "", er
 S.editsKey = null; // the server's key of what /api/edits says (vislox's file, deployed and pending config)
 async function loadEdits() {
   const hwWas = JSON.stringify((S.edits?.blocks || []).filter((b) => b.hardware).map((b) => [b.uuid, b.paired]));
+  const mdWas = mdEditKey();
   const was = managedSet(), under = JSON.stringify(S.edits?.add_under || null), consts = JSON.stringify(S.edits?.constants || null), exprs = JSON.stringify([S.edits?.expressions || null, S.edits?.templates?.instances || null, S.edits?.templates?.templates || null]);
   if (!S.hist?.actions?.shown) { S.edits = null; managedRefresh(was); return; }
   try { S.edits = await api("/api/edits"); } catch { S.edits = null; S.editsKey = null; }
@@ -3212,8 +3213,9 @@ async function loadEdits() {
   if (S.view && (JSON.stringify(S.edits?.add_under || null) !== under ||
     JSON.stringify((S.edits?.blocks || []).filter((b) => b.hardware).map((b) => [b.uuid, b.paired])) !== hwWas)) renderTree();
   if (S.sel && S.view) renderProps();
-  // Add mode, Add entry and each entry's Edit follow the server (#86).
-  renderModes();
+  // Add mode, Add entry and each entry's Edit follow the server (#86): the year is drawn again only when what
+  // they say changed, the header's buttons always.
+  if (MD.open) mdEditKey() !== mdWas ? renderModes() : mdRenderEdit();
 }
 /** Fetch the edits again only when the server says they may have changed. */
 function editsChanged() {

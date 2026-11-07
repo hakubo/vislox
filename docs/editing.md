@@ -641,8 +641,11 @@ vx_calendarentry_3 = CalendarEntry("Fasching", switches: "Party", easter: -47)
 ```
 
 - **A mode** is added with `add_block` (`type: "Mode"`, `page` the Betriebsmodi folder, a name and nothing else).
-  It is renamed, taken out, deleted and undone as a block of vislox's files; one is not taken out or deleted while an
-  entry of vislox's switches it on (`blocks[].delete` names the entry). A built-in mode (`Mode=` ≥ 0) and one Loxone
+  It is renamed, taken out, deleted and undone as a block of vislox's files. Its name is no other mode's (compared
+  case-blind), so that a `switches: "Title"` or a schedule line naming a mode by its title keeps naming one. It is
+  not taken out or deleted while anything names it: an entry of vislox's (`switches: vx_mode_1`), a schedule set of
+  vislox's (`vx_mode_1 08:00-12:00`), or an entry Loxone Config made whose `CalType=` is its number
+  (`blocks[].delete` names them). A built-in mode (`Mode=` ≥ 0) and one Loxone
   Config made are not edited here (lox adopts a user mode with `adopt --uuid`; vislox's adoption, #72, moves page
   blocks only).
 - **An entry** is added with `add_block` (`type: "CalendarEntry"`, `page` the Betriebszeiten folder) and two
@@ -659,9 +662,11 @@ vx_calendarentry_3 = CalendarEntry("Fasching", switches: "Party", easter: -47)
     month and day, a day of the year (`02-29` is one).
   The stored attributes (`CalType`, `Mode`, `Month`, `From`, `EasterOffset`, `WeekDayInMonth`, …) are never
   settings: Properties shows the entry's *When* and *Switches on*, and Advanced the attributes.
-- **Undo** carries the mode by UUID, never by its spelling: `remove_block`'s `previous` of an entry is the
+- **Undo** carries the mode by UUID, never by its spelling (where `switches:` names no mode of the config any more,
+  the undo carries it as written, `"Urlaub"`, and puts exactly that back): `remove_block`'s `previous` of an entry is the
   `add_block` with `switches` the mode's UUID. `Files::ops` lists `entry_mode` and `entry_date` for each entry of
-  vislox's files, and `edit::current` reads both back from the config (`CalType=` through the modes' `Mode=` numbers;
+  vislox's files, and `edit::current` reads both back from the config (`CalType=` through the modes' `Mode=` numbers,
+  read once per config: a mode without a valid `Mode=` numbers nothing, and 0 with none is the holiday mode;
   the date as the source writes it), so *not deployed* compares the mode and the date, not their wording, and Revert
   works on a deployed entry.
 - **Which entries** are edited here is the server's: `GET /api/edits`' `entries` names each calendar entry of the

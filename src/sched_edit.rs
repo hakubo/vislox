@@ -468,6 +468,22 @@ impl set_claim::SetKind for SchedKind {
              Loxone Config"
         )
     }
+    /// The operating modes of vislox's files a set's lines name by slug
+    /// (#86): such a mode is not deleted while a set names it. A mode the
+    /// module names stays the module's.
+    fn named(lines: &[ScheduleLine]) -> Vec<String> {
+        let mut out: Vec<String> = lines
+            .iter()
+            .flat_map(|l| &l.days)
+            .filter_map(|d| match d {
+                Day::Slug(s) if s.starts_with(crate::blocks::SLUG_PREFIX) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
     fn parts(v: &Sched) -> set_claim::Parts<'_, Self> {
         (v.set.as_ref(), v.modes.as_ref(), &v.restore)
     }

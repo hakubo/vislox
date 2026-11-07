@@ -455,7 +455,8 @@ function mfOpen(what, uuid) {
   let draft = { title: "" };
   if (what === "entry" && uuid) {
     const o = S.view.objects[uuid], e = editsBlock(uuid)?.entry || {};
-    draft = { title: o?.title || "", mode: e.mode || "", ...mfDateDraft(e.date) };
+    // A mode that no longer resolves stays as written (`switches`), shown as unknown.
+    draft = { title: o?.title || "", mode: e.mode || e.switches || "", ...mfDateDraft(e.date) };
   } else if (what === "entry") {
     const modes = S.view.modes || [];
     const holiday = modes.find((m) => ciEq(m.uuid, seUuid(1)));
@@ -497,7 +498,10 @@ function mfRender() {
     html = `<h4 id="md-form-h">Add an operating mode</h4>${field("title", "Name", "Party", "The mode's name; lox numbers it")}`;
   } else {
     const modes = S.view?.modes || [];
-    const opts = modes.map((m) => `<option value="${esc(m.uuid)}"${ciEq(m.uuid, d.mode) ? " selected" : ""}>${esc(m.title)}</option>`).join("");
+    // A mode the config does not have (or none) is shown as such, never as the first mode.
+    const known = modes.some((m) => ciEq(m.uuid, d.mode));
+    const opts = (known ? "" : `<option value="${esc(d.mode || "")}" selected>${d.mode ? `(unknown: ${esc(d.mode)})` : "(none)"}</option>`) +
+      modes.map((m) => `<option value="${esc(m.uuid)}"${ciEq(m.uuid, d.mode) ? " selected" : ""}>${esc(m.title)}</option>`).join("");
     const kinds = MF_KINDS.map(([k, t]) => `<option value="${k}"${d.kind === k ? " selected" : ""}>${esc(t)}</option>`).join("");
     const dates = {
       every: field("every", "Day", "12-31", "Month and day, MM-DD: every year on that day"),
@@ -532,7 +536,7 @@ async function mfSave() {
       ops = [{ op: "add_block", page: st.folder, type: "CalendarEntry", title, params: {}, settings: { switches: d.mode, date: date.text } }];
       label = `Add the calendar entry ${title}`;
     } else {
-      if (title !== MF.orig.title) ops.push({ op: "title", uuid: MF.uuid, value: title });
+      if (title !== (MF.orig.title || "").trim()) ops.push({ op: "title", uuid: MF.uuid, value: title });
       if (!ciEq(d.mode, MF.orig.mode)) ops.push({ op: "entry_mode", uuid: MF.uuid, value: d.mode });
       if (date.text && date.text !== MF.orig.date) ops.push({ op: "entry_date", uuid: MF.uuid, value: date.text });
       label = `Calendar entry ${MF.orig.title || title}`;
@@ -583,6 +587,11 @@ function mfPick(a, b) {
   mfPaint();
 }
 
+/** What the year and the entries' Edit buttons follow of GET /api/edits: the entries, where to add, each entry's values. */
+function mdEditKey() {
+  const e = S.edits;
+  return e ? JSON.stringify([e.entries || null, e.add_under || null, (e.blocks || []).filter((b) => b.entry).map((b) => [b.uuid, b.entry])]) : "";
+}
 function mdRenderEdit() {
   for (const [id, ty, what] of [["md-add-mode", "ModeCaption", "a mode"], ["md-add-entry", "CalendarCaption", "a calendar entry"]]) {
     const st = mdAddState(ty), b = $(id);

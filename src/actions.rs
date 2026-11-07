@@ -3267,16 +3267,22 @@ impl Actions {
                 if now_side { slot.1.0 = v } else { slot.1.1 = v }
             }
         }
+        // The configs' modes by number, read once for every calendar entry (#86).
+        let pending_numbers = pending_doc.as_ref().map(crate::calendar_edit::Numbers::of);
+        let deployed_numbers = deployed_doc.as_ref().map(crate::calendar_edit::Numbers::of);
         let claims: Vec<Value> = slots
             .into_values()
             .map(|(op, (now, was))| {
-                let value_in = |d: &Option<loxone_config::LoxoneDoc>| {
-                    d.as_ref().and_then(|d| edit::current(d, &op))
-                };
-                let deployed_value = value_in(&deployed_doc);
+                let value_in =
+                    |d: &Option<loxone_config::LoxoneDoc>,
+                     n: &Option<crate::calendar_edit::Numbers>| {
+                        d.as_ref()
+                            .and_then(|d| edit::current_with(d, &op, n.as_ref()))
+                    };
+                let deployed_value = value_in(&deployed_doc, &deployed_numbers);
                 // Nothing pending: the pending config is the deployed one.
                 let pending_value = if pending.is_some() {
-                    value_in(&pending_doc)
+                    value_in(&pending_doc, &pending_numbers)
                 } else {
                     deployed_value.clone()
                 };

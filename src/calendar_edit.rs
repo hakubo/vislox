@@ -33,6 +33,7 @@ use crate::sched_edit::Modes;
 use loxone_config::LoxoneDoc;
 use loxone_config::logic::Value;
 use loxone_config::xml::Element;
+use std::collections::BTreeMap;
 
 /// The type of an operating mode, and of a calendar entry.
 pub const MODE: &str = "Mode";
@@ -53,8 +54,6 @@ const DATE_KEYS: &[&str] = &[EVERY, EASTER, FROM, TO];
 
 /// The first day a period may start on: Loxone counts periods from it.
 const FIRST_YEAR: i32 = 2009;
-/// The last year a period may reach (the year view's last).
-const LAST_YEAR: i32 = 9999;
 /// The most days an entry may lie before or after Easter Sunday.
 const MAX_EASTER: i64 = 366;
 
@@ -152,11 +151,6 @@ impl DateArgs {
                         if from.year() < FIRST_YEAR {
                             return Err(format!(
                                 "from: {f}: a period starts on {FIRST_YEAR}-01-01 or later"
-                            ));
-                        }
-                        if to.year() > LAST_YEAR {
-                            return Err(format!(
-                                "to: {t}: a period ends in {LAST_YEAR} at the latest"
                             ));
                         }
                         if to < from {
@@ -274,39 +268,109 @@ pub fn set_mode(args: &mut Vec<(String, Value)>, v: Option<Value>) {
 
 /// The mode `switches:` names, by UUID (lowercase), in `modes`.
 pub fn mode_uuid(modes: &Modes, args: &[(String, Value)]) -> Option<String> {
-    let v = args.iter().find(|(k, _)| k == SWITCHES).map(|(_, v)| v)?;
-    modes.uuid_of(v)
+    modes.uuid_of(switches(args)?)
 }
 
-/// The UUID of the operating mode numbered `n` in `doc` (the first in
-/// document order), else of the built-in mode with that number.
-fn mode_numbered(doc: &LoxoneDoc, n: i64) -> Option<String> {
-    fn walk(el: &Element, n: i64) -> Option<String> {
-        if el.name == "C" && el.attr("Type") == Some(MODE) {
-            let m = el
-                .attr("Mode")
-                .and_then(|v| v.trim().parse::<i64>().ok())
-                .unwrap_or(0);
-            if m == n {
-                return el.attr("U").map(str::to_ascii_lowercase);
+/// The `switches:` value of an entry's arguments.
+fn switches(args: &[(String, Value)]) -> Option<&Value> {
+    args.iter().find(|(k, _)| k == SWITCHES).map(|(_, v)| v)
+}
+
+/// What an entry's `switches:` names, for an op's `previous` and an undo:
+/// the mode's UUID (lowercase), else `switches:` as written (`"Urlaub"`,
+/// `vx_mode_1`) when it names no mode of the config any more.
+fn mode_or_text(modes: &Modes, args: &[(String, Value)]) -> Option<String> {
+    let v = switches(args)?;
+    Some(modes.uuid_of(v).unwrap_or_else(|| v.to_string()))
+}
+
+/// Whether `v` is written as a Loxone UUID (`8-4-4-16` hex digits).
+fn is_uuid(v: &str) -> bool {
+    let parts: Vec<&str> = v.split('-').collect();
+    parts.len() == 4
+        && parts
+            .iter()
+            .zip([8, 4, 4, 16])
+            .all(|(p, n)| p.len() == n && p.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// `switches:` for an op's value: a mode's UUID, spelled as lox takes it,
+/// or the text an undo carries back (`"Urlaub"`, a slug or a day word),
+/// written as it was; lox's compile checks that it names a mode.
+fn mode_value(modes: &Modes, v: &str) -> Result<Value, String> {
+    let v = v.trim();
+    if is_uuid(v) {
+        return modes.spell(v);
+    }
+    if v.starts_with('"') {
+        return serde_json::from_str::<String>(v)
+            .ok()
+            .filter(|t| !t.trim().is_empty() && !t.chars().any(char::is_control))
+            .map(Value::Str)
+            .ok_or_else(|| format!("{SWITCHES}: {v} is no mode's title"));
+    }
+    let ident = v.starts_with(|c: char| c.is_ascii_lowercase())
+        && v.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
+    if ident {
+        Ok(Value::Ref(v.to_string()))
+    } else {
+        Err(format!("{SWITCHES}: {v} names no operating mode"))
+    }
+}
+
+/// The operating modes of a config by their `Mode=` number (the first in
+/// document order of each; a mode without a valid number is left out).
+pub struct Numbers(BTreeMap<i64, String>);
+
+impl Numbers {
+    pub fn of(doc: &LoxoneDoc) -> Numbers {
+        fn walk(el: &Element, out: &mut BTreeMap<i64, String>) {
+            if el.name == "C"
+                && el.attr("Type") == Some(MODE)
+                && let (Some(n), Some(u)) = (
+                    el.attr("Mode").and_then(|v| v.trim().parse::<i64>().ok()),
+                    el.attr("U"),
+                )
+            {
+                out.entry(n).or_insert_with(|| u.to_ascii_lowercase());
+            }
+            for c in el.child_elements() {
+                walk(c, out);
             }
         }
-        el.child_elements().find_map(|c| walk(c, n))
+        let mut out = BTreeMap::new();
+        walk(&doc.xml.root, &mut out);
+        Numbers(out)
     }
-    walk(&doc.xml.root, n).or_else(|| {
-        u8::try_from(n)
-            .ok()
-            .and_then(|n| n.checked_add(1))
-            .filter(|n| *n <= 12)
-            .map(crate::sched_edit::builtin_uuid)
-    })
+
+    /// The mode numbered `n`: the config's, else the built-in mode with
+    /// that number (the holiday mode, 0, carries no `Mode=`).
+    pub fn uuid(&self, n: i64) -> Option<String> {
+        self.0.get(&n).cloned().or_else(|| {
+            u8::try_from(n)
+                .ok()
+                .and_then(|n| n.checked_add(1))
+                .filter(|n| *n <= 12)
+                .map(crate::sched_edit::builtin_uuid)
+        })
+    }
+
+    /// The number of the mode `uuid`, if the config numbers it.
+    fn number_of(&self, uuid: &str) -> Option<i64> {
+        self.0
+            .iter()
+            .find(|(_, u)| u.eq_ignore_ascii_case(uuid))
+            .map(|(n, _)| *n)
+    }
 }
 
-/// The mode the entry `el` of `doc` switches on, by UUID (lowercase), as
-/// its `CalType=` numbers it (absent: 0, the holiday mode).
-pub fn mode_of(doc: &LoxoneDoc, el: &Element) -> Option<String> {
-    let n = crate::calendar::mode_number(el.attr(crate::calendar::MODE_ATTR))?;
-    mode_numbered(doc, n)
+/// The mode the entry `el` switches on, by UUID (lowercase), as its
+/// `CalType=` numbers it (absent: 0, the holiday mode).
+pub fn mode_of(numbers: &Numbers, el: &Element) -> Option<String> {
+    numbers.uuid(crate::calendar::mode_number(
+        el.attr(crate::calendar::MODE_ATTR),
+    )?)
 }
 
 /// The date the entry `el` stores, as the source writes it; `None` for a
@@ -314,11 +378,6 @@ pub fn mode_of(doc: &LoxoneDoc, el: &Element) -> Option<String> {
 pub fn date_of(el: &Element) -> Option<String> {
     let d = crate::calendar::EntryDate::from_attrs(|a| el.attr(a)).ok()?;
     Some(DateArgs::of_stored(&d).text())
-}
-
-/// The value of `switches:` for the mode `uuid` of the pending config.
-pub fn spell(modes: &Modes, uuid: &str) -> Result<Value, String> {
-    modes.spell(uuid.trim())
 }
 
 /// The `entry_mode` or `entry_date` op on the entry `b` of vislox's files,
@@ -339,9 +398,9 @@ pub fn edit(
     let modes = Modes::new(ctx.doc, ctx.lock);
     match op {
         Op::EntryMode { .. } => {
-            let previous = mode_uuid(&modes, &b.args);
+            let previous = mode_or_text(&modes, &b.args);
             let v = value
-                .map(|u| spell(&modes, u).map_err(|e| format!("{name}: {e}")))
+                .map(|u| mode_value(&modes, u).map_err(|e| format!("{name}: {e}")))
                 .transpose()?;
             set_mode(&mut b.args, v);
             Ok(previous)
@@ -379,20 +438,21 @@ pub fn new_args(
         .ok_or("a new calendar entry needs its date")?;
     let modes = Modes::new(ctx.doc, ctx.lock);
     let mut args = Vec::new();
-    set_mode(&mut args, Some(spell(&modes, mode)?));
+    set_mode(&mut args, Some(mode_value(&modes, mode)?));
     set_date(&mut args, Some(&DateArgs::parse(date)?));
     Ok(args)
 }
 
 /// An `add_block`'s settings that add the entry `b` again: its mode by
-/// UUID, its date as written. `None` where it names a mode no more.
+/// UUID (as written when it names no mode of the config any more), its
+/// date as written.
 pub fn again_settings(
     ctx: &crate::edit::Ctx,
     b: &crate::blocks::NewBlock,
 ) -> std::collections::BTreeMap<String, String> {
     let modes = Modes::new(ctx.doc, ctx.lock);
     let mut out = std::collections::BTreeMap::new();
-    if let Some(u) = mode_uuid(&modes, &b.args) {
+    if let Some(u) = mode_or_text(&modes, &b.args) {
         out.insert(SWITCHES.to_string(), u);
     }
     if let Some(d) = date_text(&b.args) {
@@ -404,9 +464,18 @@ pub fn again_settings(
 /// Why the entry `uuid` is not edited here: the module declares it, or
 /// Loxone Config made it, or it is no calendar entry.
 pub fn not_ours(files: &crate::edit::Files, ctx: &crate::edit::Ctx, uuid: &str) -> String {
-    let Some(el) = crate::edit::find_ci(&ctx.doc.xml.root, uuid) else {
-        return format!("no object {uuid} in the pending config");
-    };
+    match crate::edit::find_ci(&ctx.doc.xml.root, uuid) {
+        Some(el) => not_ours_el(files, ctx, el, uuid),
+        None => format!("no object {uuid} in the pending config"),
+    }
+}
+
+fn not_ours_el(
+    files: &crate::edit::Files,
+    ctx: &crate::edit::Ctx,
+    el: &Element,
+    uuid: &str,
+) -> String {
     let name = el
         .attr_decoded("Title")
         .map(|t| t.into_owned())
@@ -449,7 +518,7 @@ pub fn edit_refusals(
                 .slug_of(u)
                 .is_some_and(|s| files.block(s).is_some());
             let why = if !ours {
-                Some(not_ours(files, ctx, u))
+                Some(not_ours_el(files, ctx, el, u))
             } else if date_of(el).is_none() {
                 Some("Its date cannot be read; undo the edit that wrote it".to_string())
             } else {
@@ -466,23 +535,115 @@ pub fn listed(modes: &Modes, b: &crate::blocks::NewBlock) -> Option<serde_json::
     (b.ty == ENTRY).then(|| {
         serde_json::json!({
             "mode": mode_uuid(modes, &b.args),
+            // As written, for a mode that no longer resolves.
+            "switches": switches(&b.args).map(|v| v.to_string()),
             "date": date_text(&b.args),
         })
     })
 }
 
-/// The entries of vislox's files that switch the mode `slug` on.
-pub fn switched_by(files: &crate::edit::Files, slug: &str) -> Vec<String> {
+/// The calendar entries that switch on the mode `slug` of vislox's files
+/// (UUID `uuid`): vislox's own (by its slug), and those of the pending
+/// config and the base it does not declare, by the mode's `CalType=`
+/// number. Deleting the mode would leave them naming none. By name.
+pub fn switched_by(
+    files: &crate::edit::Files,
+    ctx: &crate::edit::Ctx,
+    slug: &str,
+    uuid: &str,
+) -> Vec<String> {
+    fn walk<'a>(el: &'a Element, out: &mut Vec<&'a Element>) {
+        if el.name == "C" && el.attr("Type") == Some(ENTRY) {
+            out.push(el);
+        }
+        for c in el.child_elements() {
+            walk(c, out);
+        }
+    }
+    let mut out: Vec<String> = files
+        .pages
+        .values()
+        .flat_map(|p| p.blocks.iter())
+        .filter(|b| b.ty == ENTRY)
+        .filter(|b| matches!(switches(&b.args), Some(Value::Ref(s)) if s == slug))
+        .map(|b| b.title.clone().unwrap_or_else(|| b.slug.clone()))
+        .collect();
+    let mut seen = std::collections::BTreeSet::new();
+    for doc in [ctx.doc, ctx.base] {
+        let Some(n) = Numbers::of(doc).number_of(uuid) else {
+            continue;
+        };
+        let mut all = Vec::new();
+        walk(&doc.xml.root, &mut all);
+        for el in all {
+            let Some(u) = el.attr("U") else { continue };
+            let declared = ctx
+                .lock
+                .slug_of(u)
+                .is_some_and(|s| files.block(s).is_some());
+            let num = crate::calendar::mode_number(el.attr(crate::calendar::MODE_ATTR));
+            if !declared && num == Some(n) && seen.insert(u.to_ascii_lowercase()) {
+                out.push(
+                    el.attr_decoded("Title")
+                        .map(|t| t.into_owned())
+                        .unwrap_or_else(|| u.to_string()),
+                );
+            }
+        }
+    }
+    out
+}
+
+/// Why `title` cannot name a mode of vislox's files (the one with slug
+/// `except`, if renamed): another operating mode of the pending config or
+/// of vislox's files has it, compared case-blind. A `switches: "Title"` or
+/// a schedule line that names a mode by its title would no longer name one.
+pub fn mode_title_taken(
+    files: &crate::edit::Files,
+    ctx: &crate::edit::Ctx,
+    title: &str,
+    except: Option<&str>,
+) -> Option<String> {
+    fn walk<'a>(el: &'a Element, out: &mut Vec<&'a Element>) {
+        if el.name == "C" && el.attr("Type") == Some(MODE) {
+            out.push(el);
+        }
+        for c in el.child_elements() {
+            walk(c, out);
+        }
+    }
+    let same = |t: &str| t.trim().to_lowercase() == title.trim().to_lowercase();
+    let mine = except.and_then(|s| ctx.lock.uuid_of(s));
+    let mut all = Vec::new();
+    walk(&ctx.doc.xml.root, &mut all);
+    let theirs = all.into_iter().find(|el| {
+        let u = el.attr("U").unwrap_or_default();
+        !mine.is_some_and(|m| m.eq_ignore_ascii_case(u))
+            && el.attr_decoded("Title").is_some_and(|t| same(&t))
+    });
+    if let Some(el) = theirs {
+        let t = el.attr_decoded("Title").unwrap_or_default().into_owned();
+        return Some(format!(
+            "the operating mode \"{t}\" has that name already; lox names a mode by its title, so \
+             each needs its own"
+        ));
+    }
     files
         .pages
         .values()
         .flat_map(|p| p.blocks.iter())
-        .filter(|b| {
-            b.ty == ENTRY
-                && matches!(b.args.iter().find(|(k, _)| k == SWITCHES), Some((_, Value::Ref(s))) if s == slug)
+        .find(|b| {
+            b.ty == MODE
+                && Some(b.slug.as_str()) != except
+                && same(b.title.as_deref().unwrap_or(&b.slug))
         })
-        .map(|b| b.title.clone().unwrap_or_else(|| b.slug.clone()))
-        .collect()
+        .map(|b| {
+            format!(
+                "the operating mode `{}` of vislox's files has that name already; each mode \
+                 needs its own",
+                b.slug
+            )
+        })
 }
 
 #[cfg(test)]
