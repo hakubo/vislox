@@ -160,8 +160,10 @@ async function loadHistory(fromEvent) {
   if (S.live.on && h.live?.available) liveStart();
   renderLiveSwitch();
   renderPull();
+  undoSync();
   renderActions();
   editsChanged();
+  renderUndo();
   renderLog();
   if (fromEvent) {
     setStatus("updated " + new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }), "live flash");
@@ -1625,10 +1627,18 @@ window.addEventListener("keydown", (e) => {
     return;
   }
   if (AB.open) { if (e.key === "Escape") abClose(); return; }
+  if (e.key === "Escape" && !$("undo-pop").classList.contains("hidden")) { undoListToggle(false); $("btn-undo-list").focus(); return; }
   if ((e.ctrlKey || e.metaKey) && (e.key === "k" || e.key === "K")) { e.preventDefault(); openPalette(""); return; }
   if ((e.ctrlKey || e.metaKey) && e.key === "f") { e.preventDefault(); $("tree-filter").focus(); $("tree-filter").select(); return; }
   const tag = e.target.tagName;
   if (tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA") { if (e.key === "Escape") e.target.blur(); return; }
+  // Undo and redo the edits of this tab; in a text field they are the field's own.
+  if ((e.ctrlKey || e.metaKey) && !e.altKey && (e.key === "z" || e.key === "Z" || (!IS_MAC && e.ctrlKey && (e.key === "y" || e.key === "Y")))) {
+    if (!S.hist?.actions?.shown) return;
+    e.preventDefault();
+    undoStep(e.shiftKey || e.key === "y" || e.key === "Y");
+    return;
+  }
   if (e.altKey && !e.ctrlKey && !e.metaKey && MV_KEYS[e.key] && mvNudge(MV_KEYS[e.key], e.shiftKey ? 10 : 1)) { e.preventDefault(); return; }
   if (!e.ctrlKey && !e.metaKey && !e.altKey && (S.wsel || S.wmsg)) {
     if (e.key === "Escape" && wcardClose()) { e.preventDefault(); return; }
@@ -2532,11 +2542,11 @@ async function editSave() {
 }
 /** Send the edits; on success show the new pending revision. Returns "ok", "failed" (the server refused
  *  or did not answer: nothing changed), or "shown" (compiled, but showing the new revision failed). */
-async function editSend(uuid, rev, ops) {
+async function editSend(uuid, rev, ops, label) {
   S.edit.busy = true; S.edit.uuid = uuid; renderProps();
   let res;
   try {
-    res = await act("/api/edit", { base: rev.blob, ops });
+    res = await editAct(rev.blob, ops, label);
   } catch (err) {
     S.edit.busy = false; S.edit.err = err.message;
     renderProps();
@@ -2558,7 +2568,7 @@ async function editRevert(key) {
   const c = (S.edits?.claims || []).find((x) => editKey(x) === key && x.pending), o = c && S.view?.objects[c.uuid], st = o && editState(o);
   if (!st?.ok) return;
   const op = EDIT_ATTR[c.op] ? { op: c.op, uuid: c.uuid } : c.op === "param" ? { op: "param", uuid: c.uuid, port: c.port } : { op: "setting", uuid: c.uuid, name: c.name };
-  await editSend(c.uuid, st.rev, [{ ...op, value: c.deployed }]);
+  await editSend(c.uuid, st.rev, [{ ...op, value: c.deployed }], `Revert ${editLabel(o, c)} of ${displayTitle(o)}`);
 }
 /** Take out a block added here that is not deployed yet. */
 async function editRemove(uuid) {
@@ -2580,6 +2590,228 @@ async function editShowNewest(blob) {
   else if (r && S.viewRev !== r.id) await loadView();
 }
 function editGoNewest() { S.follow = true; $("chk-follow").checked = true; editShowNewest(); }
+
+// ── undo and redo (#62) ────────────────────────────────────────────────
+// Every edit's reply carries `undo`: the ops that undo it, built from each op's `previous`
+// (docs/editing.md). Undo sends them as an edit of its own, so it is checked and compiled like any
+// other (and refused like any other: never deployed, never over uncompiled module changes). Its reply's
+// `undo` is the redo. The stack belongs to the pending config it was built on (`blob`): when that
+// changes outside this tab (another tab's edit, a compile, Discard, Apply, Sync, a Pull), the stack no
+// longer describes it and is cleared, saying why. It is kept in localStorage under that blob, so a reload
+// or another tab showing the very same pending config picks it up.
+const UNDO_MAX = 50; // edits kept
+const UNDO_LAG = 20000; // ms the History may take to show this tab's own compile
+const UNDO_KEY = "vislox.undo.";
+// done: undoable edits, oldest first; undone: redoable ones, the next redo last. `blob`, `lastAt` and
+// `deployed`: the pending config, the server's last Apply/Sync/Discard and the deployed revision the
+// stack was built on; `prev`/`since`: the blob of the request this tab sent last, and when it ended.
+const UNDO = { blob: null, lastAt: null, deployed: null, done: [], undone: [], busy: 0, prev: null, since: 0, note: "" };
+const IS_MAC = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent);
+const UNDO_KEYS = IS_MAC ? ["⌘Z", "⇧⌘Z"] : ["Ctrl+Z", "Shift+Ctrl+Z"];
+/** A short name for an edit, from its ops, as the page names things now (before the edit shows). */
+function undoLabel(ops) {
+  const obj = (u) => { const o = S.view?.objects[u]; return o ? displayTitle(o) : "a block"; };
+  const end = (e) => { const o = S.view?.objects[e[0]]; return `${obj(e[0])} ${o ? portName(o, e[1]) : e[1]}`; };
+  const wire = (w) => `${end(w.from)} → ${end(w.to)}`;
+  const kinds = new Set(ops.map((o) => o.op));
+  const op = ops[0];
+  if (ops.every((o) => EDIT_ATTR[o.op] || o.op === "param" || o.op === "setting")) {
+    const uuids = new Set(ops.map((o) => o.uuid));
+    if (ops.length === 1) {
+      const o = S.view?.objects[op.uuid];
+      const what = EDIT_ATTR[op.op] || (op.op === "param" ? (o ? portName(o, op.port) : op.port) : op.name);
+      return `${what} of ${obj(op.uuid)}: ${op.value == null ? "Loxone Config's value" : op.value}`;
+    }
+    return uuids.size === 1 ? `${ops.length} values of ${obj(op.uuid)}` : `${ops.length} values`;
+  }
+  if (ops.length === 1 && op.op === "add_block") return `Add ${op.title || op.type}`;
+  if (ops.length === 1 && op.op === "remove_block") return `Remove ${obj(op.uuid)}`;
+  if (kinds.size === 1 && op.op === "move") return ops.length === 1 ? `Move ${obj(op.uuid)}` : `Move ${plural(ops.length, "block")}`;
+  if (ops.length === 1 && op.op === "relayout") return `Arrange ${S.pageOf?.get(op.page)?.title || "the page"}`;
+  if (ops.length === 1 && op.op === "wire") return `Wire ${wire(op)}`;
+  if (ops.length === 1 && op.op === "unwire") return `Delete wire ${wire(op)}`;
+  if (ops.length === 2 && op.op === "unwire" && ops[1].op === "wire") return `Reconnect ${wire(op)} to ${end(sameEnd(op.from, ops[1].from) ? ops[1].to : ops[1].from)}`;
+  return plural(ops.length, "edit");
+}
+/** What the server says now: the pending config, its last Apply/Sync/Discard, the deployed revision. */
+function undoNow() {
+  const r = editRev();
+  return r && { blob: r.blob, lastAt: S.hist?.actions?.last?.at ?? null, deployed: deployedRev()?.id ?? null };
+}
+function undoLoad(blob) {
+  try { return JSON.parse(localStorage.getItem(UNDO_KEY + blob) || "null"); } catch { return null; }
+}
+/** Keep the stack under its blob, and drop the ones kept for other blobs: they describe no config any more. */
+function undoSave() {
+  try {
+    for (let i = localStorage.length - 1; i >= 0; i--) {
+      const k = localStorage.key(i);
+      if (k?.startsWith(UNDO_KEY) && k !== UNDO_KEY + UNDO.blob) localStorage.removeItem(k);
+    }
+    if (!UNDO.blob) return;
+    if (UNDO.done.length || UNDO.undone.length) {
+      localStorage.setItem(UNDO_KEY + UNDO.blob, JSON.stringify({ lastAt: UNDO.lastAt, deployed: UNDO.deployed, done: UNDO.done, undone: UNDO.undone }));
+    } else localStorage.removeItem(UNDO_KEY + UNDO.blob);
+  } catch { /* private mode: the stack lives as long as the tab */ }
+}
+/** Whether a stack built on `was` still describes the config `now`. The server's last outcome is unknown
+ *  (null) after it restarted: then the blob and the deployed revision decide. */
+const undoSame = (was, now) => was.blob === now.blob && was.deployed === now.deployed && (now.lastAt == null || was.lastAt === now.lastAt);
+/** Check the stack against what the server says, and clear it (saying why) when the config changed
+ *  outside this tab. Called on every History update. */
+function undoSync() {
+  const now = undoNow();
+  if (!now || UNDO.busy) return;
+  if (UNDO.blob && undoSame(UNDO, now)) return;
+  // This tab's own compile, which the History shows a moment later.
+  if (UNDO.blob && now.blob === UNDO.prev && UNDO.deployed === now.deployed && (now.lastAt == null || UNDO.lastAt === now.lastAt) && Date.now() - UNDO.since < UNDO_LAG) return;
+  const had = UNDO.done.length + UNDO.undone.length, first = !UNDO.blob;
+  const why = first ? ""
+    : now.lastAt != null && now.lastAt !== UNDO.lastAt ? ({ apply: "Apply deployed", discard: "Discard dropped", sync: "Sync replaced" }[S.hist?.actions?.last?.kind] || "an Apply, Sync or Discard changed") + " the pending config"
+    : now.deployed !== UNDO.deployed ? "the deployed config changed (an Apply, Sync or Pull)"
+    : "the pending config changed outside this tab (an edit in another tab, or a compile)";
+  // Kept for this very config (a reload, or another tab's edits): picked up.
+  const kept = undoLoad(now.blob);
+  if (kept && undoSame({ ...kept, blob: now.blob }, now) && (kept.done?.length || kept.undone?.length)) {
+    Object.assign(UNDO, now, { done: kept.done || [], undone: kept.undone || [], prev: null, note: first ? "" : `Picked up the undo history kept for this config: ${why}.` });
+    return;
+  }
+  Object.assign(UNDO, now, { done: [], undone: [], prev: null, note: had ? `Undo history cleared: ${why}.` : "" });
+  undoSave();
+}
+/** lox mints new UUIDs for a block added again (an undo of Remove, a redo of Add): the reply names the
+ *  UUID it `restores`, and every edit kept here that names the old one names the new one from now on. */
+function undoRemap(added) {
+  for (const a of added || []) {
+    if (!a.restores || !a.uuid || a.restores === a.uuid) continue;
+    const swap = (v) => v === a.restores ? a.uuid : Array.isArray(v) ? v.map(swap)
+      : v && typeof v === "object" ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, swap(x)])) : v;
+    for (const e of [...UNDO.done, ...UNDO.undone]) { e.undo = swap(e.undo); e.redo = swap(e.redo); }
+    if (S.sel === a.restores) S.sel = a.uuid;
+  }
+}
+/** The stack's config is now the reply's. */
+function undoAt(res, sent) {
+  Object.assign(UNDO, undoNow() || {}, { blob: res.blob, prev: sent, since: Date.now() });
+}
+/** POST /api/edit, the one way an edit is sent: the edit is kept for undo (`label`: how the list names
+ *  it; by default made from the ops). Throws as act() does. */
+async function editAct(base, ops, label) {
+  undoSync();
+  const lbl = label || undoLabel(ops);
+  UNDO.busy++; renderUndo();
+  try {
+    const res = await act("/api/edit", { base, ops });
+    // Made on another config than the stack's: the stack no longer describes it.
+    if (UNDO.blob !== base) Object.assign(UNDO, { done: [], undone: [], note: UNDO.done.length + UNDO.undone.length ? "Undo history cleared: the edit was made on a config the history was not built on." : UNDO.note });
+    if (!res.unchanged) {
+      undoRemap(res.added);
+      if (Array.isArray(res.undo)) {
+        UNDO.done.push({ label: lbl, undo: res.undo, redo: ops, at: Date.now() });
+        if (UNDO.done.length > UNDO_MAX) UNDO.done.shift();
+        UNDO.note = "";
+      } else {
+        UNDO.done = [];
+        UNDO.note = `“${lbl}” cannot be undone (lox named no UUID for a block it added): the undo history before it was cleared.`;
+      }
+      UNDO.undone = [];
+    }
+    undoAt(res, base);
+    undoSave();
+    return res;
+  } finally {
+    UNDO.busy--;
+    UNDO.since = Date.now();
+    renderUndo();
+  }
+}
+/** Why undo or redo cannot run now, or null. */
+function undoWhy() {
+  const a = S.hist?.actions;
+  if (!a?.shown) return "Editing is off.";
+  if (!a.edit?.available) return `Editing is off: ${a.edit?.reason || "unknown"}.`;
+  if (!editRev()) return "The config on disk is not in the History yet.";
+  if (a.running) return `${a.running} is running.`;
+  if (UNDO.busy || S.mvBusy || S.wrBusy || AB.busy || S.edit.busy || MV) return "An edit is compiling.";
+  return null;
+}
+/** Undo the last edit, or (`redo`) redo the last one undone: its ops are sent as a new edit. */
+async function undoStep(redo) {
+  undoSync();
+  const from = redo ? UNDO.undone : UNDO.done;
+  const e = from[from.length - 1];
+  if (!e) return;
+  const why = undoWhy();
+  if (why) { deployMsg(`Cannot ${redo ? "redo" : "undo"} now: ${why}`, true); return; }
+  const base = editRev().blob, word = redo ? "Redo" : "Undo";
+  UNDO.busy++; renderUndo(); renderAddHud();
+  deployMsg(`${word}: ${e.label}… (compiling; nothing is deployed)`);
+  let res;
+  try {
+    res = await act("/api/edit", { base, ops: redo ? e.redo : e.undo });
+  } catch (err) {
+    UNDO.busy--; UNDO.since = Date.now();
+    deployMsg(`${word} of “${e.label}” refused: ${err.message}`, true);
+    renderUndo(); renderAddHud();
+    return;
+  }
+  // Undone: kept for redo, the reply's `undo` being the redo (and the other way round).
+  from.pop();
+  undoRemap(res.added);
+  if (Array.isArray(res.undo)) {
+    if (redo) { e.undo = res.undo; UNDO.done.push(e); } else { e.redo = res.undo; UNDO.undone.push(e); }
+  } else {
+    UNDO.undone = [];
+    UNDO.note = `“${e.label}” cannot be ${redo ? "undone" : "redone"} again (lox named no UUID for a block it added).`;
+  }
+  undoAt(res, base);
+  undoSave();
+  UNDO.busy--; UNDO.since = Date.now();
+  renderUndo(); renderAddHud();
+  deployMsg(`${redo ? "Redone" : "Undone"}: ${e.label}. Compiled: pending, not deployed. Review it, then Apply or Discard.`);
+  try {
+    await editShowNewest(res.blob);
+    if (S.sel && !S.view?.objects[S.sel]) select(null, { noReveal: true });
+    else if (S.sel) renderProps();
+  } catch (err) {
+    deployMsg(`${redo ? "Redone" : "Undone"} and compiled, but the page could not show it: ${err.message}`, true);
+  }
+}
+function renderUndo() {
+  const u = $("btn-undo"), r = $("btn-redo"), l = $("btn-undo-list");
+  if (!u) return;
+  const why = undoWhy(), last = UNDO.done[UNDO.done.length - 1], next = UNDO.undone[UNDO.undone.length - 1];
+  u.disabled = !last || !!why;
+  r.disabled = !next || !!why;
+  u.title = last ? `Undo: ${last.label} (${UNDO_KEYS[0]})${why ? `\n${why}` : ""}` : `Nothing to undo${UNDO.note ? `\n${UNDO.note}` : ""}`;
+  r.title = next ? `Redo: ${next.label} (${UNDO_KEYS[1]})${why ? `\n${why}` : ""}` : "Nothing to redo";
+  u.setAttribute("aria-label", last ? `Undo ${last.label}` : "Undo");
+  r.setAttribute("aria-label", next ? `Redo ${next.label}` : "Redo");
+  l.classList.toggle("note", !!UNDO.note);
+  l.title = UNDO.note ? `Recent edits\n${UNDO.note}` : "Recent edits";
+  if (!$("undo-pop").classList.contains("hidden")) renderUndoList();
+}
+/** The recent edits: those undone (to redo) above the line, the done ones below, newest first. */
+function renderUndoList() {
+  const t = (at) => new Date(at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  const li = (e, cls) => `<li class="${cls}"><span class="u-l">${esc(e.label)}</span><span class="u-t">${esc(t(e.at))}</span></li>`;
+  const undone = UNDO.undone.slice(-5), done = UNDO.done.slice().reverse().slice(0, 10);
+  $("undo-pop").innerHTML = `<h3>Recent edits in this tab</h3>` +
+    (UNDO.note ? `<p class="u-note" role="status">${esc(UNDO.note)}</p>` : "") +
+    (undone.length || done.length ? `<ol>${undone.map((e) => li(e, "undone")).join("")}${done.map((e, i) => li(e, i ? "" : "top")).join("")}</ol>` : '<p class="u-foot">No edits to undo.</p>') +
+    `<p class="u-foot">${UNDO_KEYS[0]} undoes the top one, ${UNDO_KEYS[1]} redoes. Each is compiled like an edit; nothing is deployed.</p>`;
+}
+function undoListToggle(open) {
+  const p = $("undo-pop"), b = $("btn-undo-list");
+  open ??= p.classList.contains("hidden");
+  p.classList.toggle("hidden", !open);
+  b.setAttribute("aria-expanded", String(open));
+  if (open) renderUndoList();
+}
+$("btn-undo").onclick = () => undoStep(false);
+$("btn-redo").onclick = () => undoStep(true);
+$("btn-undo-list").onclick = () => undoListToggle();
+document.addEventListener("click", (e) => { if (!e.target.closest("#undo-pop, #btn-undo-list")) undoListToggle(false); });
 
 // ── moving blocks (#60) ────────────────────────────────────────────────
 // A block the project's module manages is moved by dragging it (or Alt + an arrow key), snapped to
@@ -2698,13 +2930,13 @@ async function mvSend(m) {
 }
 /** Send move or relayout ops: the reply's pending revision is shown, a refusal in Properties. The drawn
  *  move is undone only when the edit failed, not when it compiled and showing it failed. */
-async function mvEdit(uuid, rev, ops, undo) {
+async function mvEdit(uuid, rev, ops, undo, label) {
   S.mvBusy = true; renderAddHud();
   let out = "ok";
   try {
-    if (uuid) out = await editSend(uuid, rev, ops);
+    if (uuid) out = await editSend(uuid, rev, ops, label);
     else {
-      const res = await act("/api/edit", { base: rev.blob, ops });
+      const res = await editAct(rev.blob, ops, label);
       deployMsg("Laid out and compiled: pending, not deployed. Review it, then Apply or Discard.");
       await editShowNewest(res.blob);
     }
@@ -2720,7 +2952,8 @@ async function mvEdit(uuid, rev, ops, undo) {
 async function mvRevert(uuid) {
   const m = editsMoved(uuid)[0], st = m && moveState(uuid);
   if (!st) return;
-  await mvEdit(uuid, st.rev, [{ op: "move", uuid, x: m.deployed[0], y: m.deployed[1] }]);
+  const o = S.view?.objects[uuid];
+  await mvEdit(uuid, st.rev, [{ op: "move", uuid, x: m.deployed[0], y: m.deployed[1] }], null, `Revert the move of ${o ? displayTitle(o) : "a block"}`);
 }
 /** "Arrange": lay out the page's managed blocks afresh. */
 async function mvRelayout() {
@@ -2930,7 +3163,7 @@ async function wrSend(ops, done, at, busy) {
   wcardMsg(at, busy || "Compiling…");
   S.wrBusy = true; renderAddHud();
   try {
-    const res = await act("/api/edit", { base: st.rev.blob, ops });
+    const res = await editAct(st.rev.blob, ops);
     S.wsel = null;
     wcardMsg(null);
     deployMsg(`${done} and compiled: pending, not deployed. Review it, then Apply or Discard.`);
@@ -3055,7 +3288,8 @@ function addState() {
 function renderAddHud() {
   const st = addState(), b = $("btn-add-block"), r = $("btn-relayout");
   $("hud-add").classList.toggle("hidden", !st);
-  if (!st) return;
+  if (!st) { undoListToggle(false); return; }
+  renderUndo();
   b.disabled = !st.ok;
   b.title = st.ok ? `Add a block to ${st.page.title || "this page"} (it is compiled, not deployed)` : st.why;
   const n = st.ok ? mvOnPage(st.page).length : 0;
@@ -3203,7 +3437,7 @@ async function abAdd() {
   if (Object.keys(bad).length) { AB.err = "Fix the marked values."; abForm(); $("ab-body").querySelector('[aria-invalid="true"]')?.focus(); return; }
   AB.busy = true; abForm();
   try {
-    const res = await act("/api/edit", { base: st.rev.blob, ops: [op] });
+    const res = await editAct(st.rev.blob, [op]);
     AB.busy = false;
     abClose();
     await editShowNewest(res.blob);

@@ -81,6 +81,12 @@ pub enum Op {
         /// `previous` of a `remove_block` carries the wires it took out.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         wires: Vec<Ends>,
+        /// The UUID of the block this adds again: set in the `previous` of a
+        /// `remove_block`. lox mints new UUIDs, so the reply's `added` names
+        /// it next to the new one, and undo and redo (#62) can follow the
+        /// block. It changes nothing in what is written.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        restores: Option<String>,
     },
     /// Take out a block added here that is not deployed yet. Its `previous`
     /// is the `add_block` that adds it again.
@@ -1191,6 +1197,41 @@ pub fn apply_op(files: &mut Files, ctx: &Ctx, op: &Op) -> Result<Applied, String
     }
 }
 
+/// The ops that undo a request (#62), from each op's `previous`: the last
+/// op's first, so a request of `unwire` then `wire` is undone by `unwire`
+/// then `wire` of the old ends. A value op's `previous` is the value it
+/// replaced; a `relayout`'s is a list of moves; the others' is the op.
+/// `minted` is, per op, the UUID lox minted for the block an `add_block`
+/// added: it is undone by `remove_block` of that UUID.
+///
+/// This is only a convenience over `previous`: the browser sends the list
+/// back as an ordinary edit, checked and compiled like any other.
+pub fn undo_ops(
+    ops: &[Op],
+    previous: &[serde_json::Value],
+    minted: &[Option<String>],
+) -> Result<Vec<Op>, String> {
+    let mut undo = Vec::new();
+    for (i, op) in ops.iter().enumerate().rev() {
+        let prev = previous.get(i).cloned().unwrap_or_default();
+        let bad = |e: serde_json::Error| format!("op {}: no undo ({e})", i + 1);
+        match op {
+            Op::AddBlock { .. } => match minted.get(i).cloned().flatten() {
+                Some(uuid) => undo.push(Op::RemoveBlock { uuid }),
+                None => return Err(format!("op {}: lox minted no UUID for the block", i + 1)),
+            },
+            Op::Relayout { .. } => {
+                undo.extend(serde_json::from_value::<Vec<Op>>(prev).map_err(bad)?);
+            }
+            Op::RemoveBlock { .. } | Op::Move { .. } | Op::Wire { .. } | Op::Unwire { .. } => {
+                undo.push(serde_json::from_value(prev).map_err(bad)?)
+            }
+            _ => undo.push(op.with_value(serde_json::from_value(prev).map_err(bad)?)),
+        }
+    }
+    Ok(undo)
+}
+
 /// The pages titled `title`, in document order.
 fn pages_titled<'a>(el: &'a Element, title: &str, out: &mut Vec<&'a Element>) {
     if el.attr("Type") == Some("Page") && el.attr_decoded("Title").is_some_and(|t| t == title) {
@@ -1247,6 +1288,7 @@ fn add_block(files: &mut Files, ctx: &Ctx, op: &Op) -> Result<Applied, String> {
         params,
         settings,
         wires,
+        ..
     } = op
     else {
         unreachable!()
@@ -1411,6 +1453,7 @@ fn remove_block(files: &mut Files, ctx: &Ctx, uuid: &str) -> Result<Applied, Str
         params,
         settings,
         wires,
+        restores: Some(uuid.to_string()),
     };
     let p = files.pages.get_mut(&file).expect("found");
     p.blocks.retain(|x| x.slug != slug);
@@ -2714,7 +2757,53 @@ mod tests {
             params: m(params),
             settings: m(settings),
             wires: vec![],
+            restores: None,
         }
+    }
+
+    #[test]
+    fn the_undo_of_a_request_is_each_previous_last_op_first() {
+        let t = |v: Option<&str>| Op::Title {
+            uuid: DIV.into(),
+            value: v.map(Into::into),
+        };
+        let mv = |x| Op::Move {
+            uuid: DIV.into(),
+            x,
+            y: 0,
+        };
+        let ops = vec![
+            t(Some("A")),
+            add("p", "And", None, &[], &[]),
+            Op::Relayout { page: "p".into() },
+            Op::RemoveBlock { uuid: "r".into() },
+        ];
+        let mut again = add("p", "Or", None, &[], &[]);
+        if let Op::AddBlock { restores, .. } = &mut again {
+            *restores = Some("r".into());
+        }
+        let previous = vec![
+            serde_json::json!(null),
+            serde_json::json!(null),
+            serde_json::json!([mv(96), mv(192)]),
+            serde_json::to_value(&again).unwrap(),
+        ];
+        let minted = [None, Some("n".to_string()), None, None];
+        assert_eq!(
+            undo_ops(&ops, &previous, &minted).unwrap(),
+            vec![
+                again,
+                mv(96),
+                mv(192),
+                Op::RemoveBlock { uuid: "n".into() },
+                t(None)
+            ]
+        );
+        // A block lox minted no UUID for cannot be taken out again.
+        assert!(undo_ops(&ops, &previous, &[]).is_err());
+        // `restores` is echoed, not written: it round-trips, and is left out when none.
+        let v = serde_json::to_value(add("p", "And", None, &[], &[])).unwrap();
+        assert_eq!(v.get("restores"), None);
     }
 
     /// The page an object is drawn on.
@@ -2909,10 +2998,12 @@ mod tests {
             drawn: &Default::default(),
         };
         let r = apply_op(&mut files, &ctx, &Op::RemoveBlock { uuid: mono.clone() }).unwrap();
-        assert_eq!(
-            serde_json::from_value::<Op>(r.previous).unwrap(),
-            add(OG, "Monoflop", Some("Treppe"), &[("Time", "45")], &[])
-        );
+        // It names the block it adds again (#62): lox mints new UUIDs for it.
+        let mut again = add(OG, "Monoflop", Some("Treppe"), &[("Time", "45")], &[]);
+        if let Op::AddBlock { restores, .. } = &mut again {
+            *restores = Some(mono.clone());
+        }
+        assert_eq!(serde_json::from_value::<Op>(r.previous).unwrap(), again);
         assert!(files.render()["obergeschoss.loxl"].contains("removed vx_monoflop_1\n"));
         let out = compile_files(&d, &files, &mut l).unwrap();
         assert!(find(&out.xml.root, &mono).is_none());
