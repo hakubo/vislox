@@ -1145,6 +1145,7 @@ function renderProps() {
 }
 function renderPropsBody() {
   meSync();
+  acSync();
   const box = $("props");
   const o = S.sel && S.view?.objects[S.sel];
   if (!o) {
@@ -1192,7 +1193,9 @@ function renderPropsBody() {
   }
   if (o.rights) {
     const rr = rightsRows(o, marks);
-    section(o.rights.kind === "access" ? "Access" : "Recipients", rr.rows, rr.count);
+    // Editing who may open an NFC Code Touch (#76).
+    if (o.rights.kind === "access") rr.rows.push(...acRows(o));
+    section(o.rights.kind === "access" ? "Access" : "Recipients", rr.rows, rr.count + (accessEdit(o.uuid)?.pending ? 1 : 0));
   }
   const opT = opTarget(o);
   if (opT) section("Operate", [opControls(opT)]);
@@ -2163,6 +2166,7 @@ function editsHere() {
   if (schedsPending().length) parts.push(`switching times of ${plural(schedsPending().length, "timer")} edited here`);
   if (moodsPending().length) parts.push(`moods of ${plural(moodsPending().length, "lighting controller")} edited here`);
   if (membersPending().length) parts.push(`members of ${plural(membersPending().length, "central block")} edited here`);
+  if (accessPending().length) parts.push(`access to ${accessPending().length} NFC Code Touch${accessPending().length === 1 ? "" : "es"} edited here`);
   const drawn = editsWires().filter((w) => w.now).length, out = editsWires().length - drawn;
   if (drawn) parts.push(`${plural(drawn, "wire")} drawn here`);
   if (out) parts.push(`${plural(out, "wire")} taken out here`);
@@ -2922,7 +2926,14 @@ function rightsApplyText(hw) {
     const src = by.length ? ` (${by.join(", ")})` : "";
     const gone = c.removed_block ? ", which this removes" : "";
     for (const u of c.lose || []) lose.push(c.kind === "access" ? `${u.title} loses access to ${c.title}${gone}${src}` : `${u.title} stops getting ${c.title}${gone}${src}`);
-    for (const u of c.gain || []) gain.push(c.kind === "access" ? `${u.title} gains access to ${c.title}` : `${u.title} starts getting ${c.title}`);
+    // A user who holds the new right directly gains it under its schedule: "alice gains access to Haustür (Always)".
+    const when = (u) => { const p = (c.added || []).find((x) => x.kind === "user" && x.uuid === u.uuid); return p?.schedule ? ` (${p.schedule})` : ""; };
+    for (const u of c.gain || []) gain.push(c.kind === "access" ? `${u.title} gains access to ${c.title}${when(u)}` : `${u.title} starts getting ${c.title}`);
+    // Who keeps access under another schedule (#76): "bob may open Haustür at Workdays, not Always".
+    for (const r of c.rescheduled || []) {
+      const to = r.principal.schedule || "—", from = r.from || "—";
+      gain.push(`${whoText(r.principal)} may open ${c.title} ${to === from ? `under another access schedule titled ${to}` : `at ${to}, not ${from}`}${src}`);
+    }
   }
   return (lose.length ? `⚠ ${lose.join("\n⚠ ")}\n\n` : "") + (gain.length ? `${gain.join("\n")}\n\n` : "");
 }
@@ -4184,6 +4195,264 @@ $("props").addEventListener("click", (e) => {
   ($("props").querySelector(`[data-me="${what}"][data-i="${j}"]:not([disabled])`) || $("props").querySelector(`[data-me="del"][data-i="${j}"]`) || $("props").querySelector('[data-me="add"]'))?.focus();
 }, true);
 
+// ── who may open an NFC Code Touch (#76) ───────────────────────────────
+// A Code Touch's access rights are a Lox Logic `access` set (users and groups, each with an access schedule) and
+// the Code Touch's `.access` claim, written into vislox's file of claims. The set is the whole list: whoever it
+// leaves out loses access. Properties' *Access* shows who holds the right (the review's, #68); *Edit access* adds or
+// removes a user or group and picks its schedule. The pickers' lists (every user, group and access schedule of the
+// config, by title) are personal data: they are asked for with the admin token (`POST /api/access/choices`), kept
+// in memory only while the editor is open, and never put in an address, the page title or storage. The draft and
+// every op name them by UUID. Before a save that takes access away, the editor names who loses it (*Save anyway*);
+// Apply's confirmation says it again (#68). Saving sends one `access` op: compiled, never deployed, undone through
+// `undo`. The draft belongs to one Code Touch and one pending config (`blob`): when either changes, it is dropped,
+// and a save sends the blob it was made on, which the server checks.
+const AC = { uuid: null, blob: null, open: false, rows: [], choices: null, busy: false, msg: "", err: "", warned: "", shareAll: true, dup: [], same: null };
+/** What `GET /api/edits` says of this Code Touch's access rights (#76), or null. */
+function accessEdit(uuid) { return (S.edits?.access || []).find((m) => m.uuid === uuid) || null; }
+/** The Code Touches whose access rights were edited here and are not deployed. */
+function accessPending() { return (S.edits?.access || []).filter((m) => m.pending); }
+/** Whether this Code Touch's access rights can be edited here now: `{ ok, rev }`, or null. */
+function acState(o) {
+  if (o.ty !== "NfcCodeTouch" || o.rights?.kind !== "access") return null;
+  const st = editState(o);
+  return st?.ok ? st : null;
+}
+/** The module's own claim on its access rights (a file other than vislox's), if any. */
+function acOther(o) { return claimsOf(o.uuid).find((c) => c.kind === "access" && !c.file.startsWith(`${S.edits?.dir}/`)) || null; }
+function acReset(extra) { Object.assign(AC, { open: false, rows: [], choices: null, dup: [], warned: "", same: null, msg: "", err: "" }, extra || {}); }
+/** Drop a draft made on another Code Touch or another pending config than the one shown now. */
+function acSync() {
+  if (AC.busy) return;
+  if (S.sel !== AC.uuid) { if (AC.open || AC.same || AC.msg || AC.err) acReset(); }
+  else if ((AC.open || AC.same) && editRev()?.blob !== AC.blob) acReset({ msg: "The pending config changed while editing: the draft was dropped. Edit access again." });
+}
+async function acOpen(uuid) {
+  const o = S.view?.objects[uuid], st = o && acState(o);
+  if (!st || AC.busy) return;
+  Object.assign(AC, { uuid, blob: st.rev.blob, busy: true, msg: "", err: "", warned: "", same: null });
+  renderProps();
+  let choices;
+  try { choices = await act("/api/access/choices"); } catch (err) { AC.busy = false; AC.err = `Cannot list the users: ${err.message}`; renderProps(); return; }
+  AC.busy = false;
+  // Selected elsewhere, or a new pending config, while the list was asked for: no draft.
+  if (S.sel !== uuid || editRev()?.blob !== AC.blob) { acReset(); renderProps(); return; }
+  // One right per user or group: a second schedule the config holds for one goes on save, and the draft says so.
+  const rows = [], dup = [];
+  for (const p of o.rights.list) {
+    const u = p.uuid.toLowerCase();
+    if (rows.some((r) => r.uuid === u)) { dup.push(whoText(p)); continue; }
+    rows.push({ kind: p.kind, uuid: u, schedule: (p.schedule_uuid || "").toLowerCase() });
+  }
+  Object.assign(AC, { open: true, rows, choices, dup, shareAll: true });
+  S.closed.delete("Access");
+  renderProps();
+  $("props").querySelector('[data-ac-p="0"], [data-ac="add"]')?.focus();
+}
+/** Titles two objects of a kind share cannot be named in Lox Logic: they cannot be picked. */
+function acTitles(list) {
+  const n = new Map();
+  for (const x of list) n.set(x.title, (n.get(x.title) || 0) + 1);
+  return (x) => (!x.title ? "it has no title" : n.get(x.title) > 1 ? "its title is not unique" : "");
+}
+/** A user or group of the pickers' lists, by UUID. */
+function acWho(kind, uuid) { return (kind === "group" ? AC.choices?.groups : AC.choices?.users)?.find((x) => x.uuid === uuid) || null; }
+/** The users a draft lets in: those it lists, and the users its groups reach. */
+function acUsers(rows) {
+  const s = new Set();
+  for (const r of rows) {
+    if (r.kind === "user") s.add(r.uuid);
+    else for (const u of acWho("group", r.uuid)?.users || []) s.add(u);
+  }
+  return s;
+}
+/** Who loses access to each Code Touch the save changes: this one, and those sharing its set when they change too. */
+function acLosses(o, keep) {
+  const e = accessEdit(o.uuid);
+  const doors = [o.uuid, ...(e?.set && e.shared?.length && AC.shareAll ? e.shared : [])];
+  const out = [];
+  for (const d of doors) {
+    const x = S.view?.objects[d];
+    const lost = (x?.rights?.users || []).filter((u) => !keep.has(u.uuid.toLowerCase()));
+    if (lost.length) out.push(`${lost.map((u) => u.title).join(", ")} ${lost.length === 1 ? "loses" : "lose"} access to ${x ? displayTitle(x) : d}`);
+  }
+  return out;
+}
+/** The rows of *Edit access*, below who holds the right. */
+function acRows(o) {
+  const rows = [], st = acState(o), e = accessEdit(o.uuid), mine = AC.uuid === o.uuid ? AC : null;
+  if (!st) return rows;
+  const other = acOther(o), dis = mine?.busy ? " disabled" : "";
+  const title = (u) => { const x = S.view?.objects[u]; return x ? displayTitle(x) : u; };
+  const msg = () => (mine?.msg || mine?.err ? `<span class="ed-msg${mine.err ? " err" : ""}" role="status">${esc(mine.err || mine.msg)}</span>` : "");
+  if (other && e?.set) {
+    rows.push(`<div class="sch-note warn">⚠ Claimed twice: ${esc(claimAt(other))} and vislox's ${esc(S.edits?.file || "")} both claim its access rights, and lox compiles neither until one goes.</div>`,
+      `<div class="ed-bar"><button type="button" class="ed-btn small" data-ac="drop"${dis} title="Take vislox's claim out and compile: ${esc(claimAt(other))} keeps the Code Touch">Remove vislox's claim</button>${msg()}</div>`);
+    return rows;
+  }
+  if (other) { rows.push(`<div class="ed-note">${esc(claimAt(other))} claims its access rights: change them there.</div>`); return rows; }
+  if (e?.set) {
+    rows.push(`<div class="ed-note">Written by vislox as <span class="mono">${esc(e.set)}</span> in ${esc(S.edits?.file || "")}${e.shared?.length ? `, shared with ${esc(e.shared.map(title).join(", "))}` : ""}. Whoever the set leaves out loses access.</div>`);
+    rows.push(...staleRows((S.edits?.access_sets || []).find((x) => x.name === e.set), "ac", mine));
+  }
+  if (e?.pending) {
+    const back = e.deployed ? "Back to the access rights deployed" : "Back to the access rights as last written: vislox's claim goes";
+    rows.push(propRow("Access", `<span class="ed-v">edited here</span><span class="ed-tag" title="Saved into the module and compiled, not on the Miniserver yet: Apply deploys it, Discard drops it">not deployed</span>` +
+      `<button type="button" class="ed-btn small" data-ac="revert"${dis} title="${esc(back)}">Revert</button>`, "pr-chg"));
+  }
+  if (mine?.same) {
+    rows.push(`<div class="sch-note warn" role="alert">⚠ ${esc(mine.same.lose.join("; "))}.</div>`,
+      `<div class="ed-bar"><button type="button" class="primary small" data-ac="sameok"${dis}>${mine.busy ? "Compiling…" : "Use anyway"}</button><button type="button" class="ed-btn small" data-ac="samecancel"${dis}>Cancel</button>${msg()}</div>`);
+    return rows;
+  }
+  if (!mine?.open) {
+    const sets = (S.edits?.access_sets || []).filter((x) => x.name !== e?.set && x.code_touches.length && !x.code_touches.includes(o.uuid));
+    rows.push(`<div class="ed-bar"><button type="button" class="ed-btn small" data-ac="open"${dis}>${mine?.busy ? "Listing users…" : "Edit access"}</button>` +
+      (sets.length ? `<label class="se-same">Same rights as <select data-ac="same"${dis}><option value="">…</option>${sets.map((x) => `<option value="${esc(x.name)}">${esc(x.code_touches.map(title).join(", "))}</option>`).join("")}</select></label>` : "") +
+      msg() + "</div>");
+    return rows;
+  }
+  // The editor: a row per user or group, its schedule, ✕; *Add user or group*.
+  const c = AC.choices, uWhy = acTitles(c.users), gWhy = acTitles(c.groups), sWhy = acTitles(c.schedules);
+  const taken = new Set(AC.rows.map((r) => r.uuid));
+  const opt = (x, kind, sel, why) => `<option value="${kind}|${esc(x.uuid)}"${sel ? " selected" : ""}${why && !sel ? " disabled" : ""}${!sel && taken.has(x.uuid) ? " disabled" : ""}>${esc(x.title || x.uuid)}${why ? ` (${esc(why)})` : ""}</option>`;
+  if (AC.dup.length) rows.push(`<div class="sch-note warn">⚠ ${esc(AC.dup.join(", "))} ${AC.dup.length === 1 ? "holds" : "hold"} a second right under another schedule: a set gives each user or group one schedule, so saving keeps the first.</div>`);
+  const items = AC.rows.map((r, i) => {
+    const who = acWho(r.kind, r.uuid), name = who?.title || r.uuid;
+    const pSel = `<select data-ac-p="${i}" aria-label="User or group ${i + 1}"${dis}>` +
+      `<optgroup label="Users">${c.users.map((x) => opt(x, "user", r.kind === "user" && x.uuid === r.uuid, uWhy(x))).join("")}</optgroup>` +
+      `<optgroup label="Groups">${c.groups.map((x) => opt(x, "group", r.kind === "group" && x.uuid === r.uuid, gWhy(x))).join("")}</optgroup></select>`;
+    const sSel = `<select data-ac-s="${i}" aria-label="Access schedule of ${esc(name)}"${dis}>${r.schedule && !c.schedules.some((x) => x.uuid === r.schedule) ? `<option value="" selected>—</option>` : ""}` +
+      c.schedules.map((x) => { const why = sWhy(x), sel = x.uuid === r.schedule; return `<option value="${esc(x.uuid)}"${sel ? " selected" : ""}${why && !sel ? " disabled" : ""}>${esc(x.title || x.uuid)}${why ? ` (${esc(why)})` : ""}</option>`; }).join("") + "</select>";
+    const bad = !who ? "not in this config" : (r.kind === "group" ? gWhy(who) : uWhy(who)) || (!c.schedules.some((x) => x.uuid === r.schedule) ? "no access schedule" : sWhy(c.schedules.find((x) => x.uuid === r.schedule)));
+    const tip = r.kind === "group" && who?.users?.length ? ` title="${esc(`Members: ${who.users.map((u) => acWho("user", u)?.title || u).join(", ")}`)}"` : "";
+    return `<li class="ac-item${bad ? " bad" : ""}"${tip}>${pSel}<span class="none-v">at</span>${sSel}` +
+      `<button type="button" class="se-x" data-ac="del" data-i="${i}" aria-label="Remove ${esc(name)}"${dis}>✕</button>${bad ? `<span class="ed-msg err">${esc(bad)}</span>` : ""}</li>`;
+  }).join("");
+  rows.push(AC.rows.length ? `<ul class="ac-list">${items}</ul>` : `<div class="sch-note warn">No user or group: saving revokes everyone's access.</div>`);
+  const free = c.users.some((x) => !taken.has(x.uuid) && !uWhy(x)) || c.groups.some((x) => !taken.has(x.uuid) && !gWhy(x));
+  rows.push(`<div class="ed-bar"><button type="button" class="ed-btn small" data-ac="add"${free && c.schedules.length ? "" : " disabled"}${dis}>Add user or group</button>` +
+    `<span class="none-v">Users, groups and access schedules come from Loxone Config and the app.</span></div>`);
+  if (e?.shared?.length) rows.push(`<label class="se-share"><input type="checkbox" data-ac="shareall"${AC.shareAll ? " checked" : ""}${dis}> Change ${esc(e.shared.map(title).join(", "))} too: ${e.shared.length === 1 ? "it shares" : "they share"} these rights (${esc(e.set)}). Off: this Code Touch gets a set of its own.</label>`);
+  if (AC.warned) rows.push(`<div class="sch-note warn" role="alert">⚠ ${esc(AC.warned)}</div>`);
+  rows.push(`<div class="ed-bar"><button type="button" class="primary small" data-ac="save"${dis}>${AC.busy ? "Compiling…" : AC.warned ? "Save anyway" : "Save"}</button>` +
+    `<button type="button" class="ed-btn small" data-ac="cancel"${dis}>Cancel</button>` +
+    `<span class="ed-msg${AC.err ? " err" : ""}" role="status" aria-live="polite">${esc(AC.err || AC.msg || "Saving claims the set in the module and compiles it; nothing is deployed.")}</span></div>`);
+  return rows;
+}
+async function acSend(o, base, op, label) {
+  AC.uuid = o.uuid; AC.busy = true; AC.err = ""; AC.msg = ""; renderProps();
+  try {
+    const res = await editAct(base, [op], label);
+    AC.busy = false;
+    acReset({ msg: res.unchanged ? "Nothing changed." : "Saved and compiled: pending, not deployed. Review it, then Apply or Discard." });
+    await editShowNewest(res.blob);
+  } catch (err) {
+    AC.busy = false; AC.err = err.message; AC.warned = "";
+  }
+  renderProps();
+}
+async function acSave() {
+  const o = S.view?.objects[AC.uuid], st = o && acState(o);
+  if (!st || AC.busy || !AC.open) return;
+  // Never save a draft over a newer config: the draft goes against the config it was made on.
+  if (st.rev.blob !== AC.blob) { acReset({ err: "The pending config changed while editing: the draft was dropped. Edit access again." }); renderProps(); return; }
+  if (AC.rows.some((r) => !acWho(r.kind, r.uuid) || !AC.choices.schedules.some((x) => x.uuid === r.schedule))) {
+    AC.err = "Pick a user or group and an access schedule on every row, or remove it.";
+    renderProps();
+    return;
+  }
+  // Warned once: taking access away is said before the save, as Apply's confirmation says it again.
+  const lose = acLosses(o, acUsers(AC.rows));
+  if (lose.length && !AC.warned) { AC.warned = `${lose.join("; ")}.`; renderProps(); return; }
+  const e = accessEdit(o.uuid);
+  const value = { grants: AC.rows.map((r) => ({ kind: r.kind, uuid: r.uuid, schedule: r.schedule })), ...(e?.set && e.shared?.length && AC.shareAll ? { set: e.set } : {}) };
+  await acSend(o, AC.blob, { op: "access", uuid: o.uuid, value });
+}
+/** What Revert sends: back to the deployed rights, for this Code Touch only (as moods do, `moRevertValue`). */
+function acRevertValue(e, sets, uuid) {
+  const d = e?.deployed ?? null;
+  if (!d) return { value: null };
+  const others = (sets.find((x) => x.name === d.set)?.code_touches || []).filter((u) => u !== uuid);
+  if (!others.length) return { value: d };
+  if (!d.grants) {
+    const names = others.map((u) => { const x = S.view?.objects[u]; return x ? displayTitle(x) : u; });
+    return { why: `The deployed access rights (${d.set}) cannot be read, and ${names.join(", ")} ${others.length === 1 ? "claims" : "claim"} that set now: revert in the module, or Discard.` };
+  }
+  return { value: { grants: d.grants } };
+}
+/** *Same rights as …*: claim another Code Touch's set as it is; who loses access is said first. */
+function acSame(o, set) {
+  const st = acState(o), x = (S.edits?.access_sets || []).find((s) => s.name === set);
+  if (!st || !x) return;
+  const keep = new Set(x.code_touches.flatMap((u) => (S.view?.objects[u]?.rights?.users || []).map((n) => n.uuid.toLowerCase())));
+  const lost = (o.rights?.users || []).filter((u) => !keep.has(u.uuid.toLowerCase()));
+  const label = `Same access as ${x.code_touches.map((u) => { const y = S.view?.objects[u]; return y ? displayTitle(y) : u; }).join(", ")} for ${displayTitle(o)}`;
+  if (!lost.length) return acSend(o, st.rev.blob, { op: "access", uuid: o.uuid, value: { set } }, label);
+  Object.assign(AC, { uuid: o.uuid, blob: st.rev.blob, open: false, msg: "", err: "", same: { set, label, lose: [`${lost.map((u) => u.title).join(", ")} ${lost.length === 1 ? "loses" : "lose"} access to ${displayTitle(o)}`] } });
+  renderProps();
+  $("props").querySelector('[data-ac="sameok"]')?.focus();
+}
+$("props").addEventListener("click", (e) => {
+  const b = e.target.closest("[data-ac]");
+  if (!b || b.tagName === "SELECT" || b.type === "checkbox") return;
+  e.stopPropagation();
+  const o = S.view?.objects[S.sel], what = b.dataset.ac;
+  if (!o) return;
+  if (what === "open") return acOpen(S.sel);
+  if (what === "cancel") { if (!AC.busy) { acReset(); renderProps(); $("props").querySelector('[data-ac="open"]')?.focus(); } return; }
+  if (what === "save") return acSave();
+  const st = acState(o), ed = accessEdit(o.uuid);
+  if (what === "samecancel") { if (!AC.busy) { acReset(); renderProps(); } return; }
+  if (what === "sameok") {
+    if (!st || AC.busy || !AC.same) return;
+    if (st.rev.blob !== AC.blob) { acReset({ err: "The pending config changed: nothing was saved. Pick again." }); renderProps(); return; }
+    const { set, label } = AC.same;
+    AC.same = null;
+    return acSend(o, AC.blob, { op: "access", uuid: o.uuid, value: { set } }, label);
+  }
+  if (what === "revert") {
+    if (!st || !ed) return;
+    const r = acRevertValue(ed, S.edits?.access_sets || [], o.uuid);
+    if (r.why) { AC.uuid = o.uuid; AC.err = r.why; AC.msg = ""; renderProps(); return; }
+    return acSend(o, st.rev.blob, { op: "access", uuid: o.uuid, value: r.value }, `Revert the access rights of ${displayTitle(o)}`);
+  }
+  if (what === "drop") { if (st) acSend(o, st.rev.blob, { op: "access", uuid: o.uuid, value: null }, `Remove vislox's claim on the access rights of ${displayTitle(o)}`); return; }
+  if (what === "dropstale") { if (st) acSend(o, st.rev.blob, { op: "access", uuid: b.dataset.u, value: null }, "Drop a stale claim on access rights"); return; }
+  if (AC.busy || !AC.open) return;
+  const i = +b.dataset.i;
+  if (what === "del") AC.rows.splice(i, 1);
+  else if (what === "add") {
+    const c = AC.choices, uWhy = acTitles(c.users), gWhy = acTitles(c.groups), sWhy = acTitles(c.schedules);
+    const taken = new Set(AC.rows.map((r) => r.uuid));
+    const u = c.users.find((x) => !taken.has(x.uuid) && !uWhy(x)), g = c.groups.find((x) => !taken.has(x.uuid) && !gWhy(x));
+    const s = c.schedules.find((x) => !sWhy(x));
+    if ((u || g) && s) AC.rows.push({ kind: u ? "user" : "group", uuid: (u || g).uuid, schedule: s.uuid });
+  }
+  AC.err = ""; AC.warned = "";
+  renderProps();
+  if (what === "add") $("props").querySelector(`[data-ac-p="${AC.rows.length - 1}"]`)?.focus();
+  else ($("props").querySelector(`[data-ac="del"][data-i="${Math.min(i, AC.rows.length - 1)}"]`) || $("props").querySelector('[data-ac="add"]'))?.focus();
+}, true);
+$("props").addEventListener("change", (e) => {
+  const t = e.target;
+  if (!t.closest?.("[data-ac], [data-ac-p], [data-ac-s]")) return;
+  const o = S.view?.objects[S.sel];
+  if (!o) return;
+  if (t.dataset.ac === "same") { if (t.value) acSame(o, t.value); return; }
+  if (AC.busy || !AC.open) return;
+  if (t.dataset.ac === "shareall") AC.shareAll = t.checked;
+  else if (t.dataset.acP != null) {
+    const r = AC.rows[+t.dataset.acP], [kind, uuid] = t.value.split("|");
+    if (r) Object.assign(r, { kind, uuid });
+  } else if (t.dataset.acS != null) {
+    const r = AC.rows[+t.dataset.acS];
+    if (r) r.schedule = t.value;
+  }
+  AC.err = ""; AC.warned = "";
+  renderProps();
+  $("props").querySelector(t.dataset.acP != null ? `[data-ac-p="${t.dataset.acP}"]` : t.dataset.acS != null ? `[data-ac-s="${t.dataset.acS}"]` : '[data-ac="shareall"]')?.focus();
+});
+
 // ── adopting blocks (#72) ──────────────────────────────────────────────
 // `lox logic adopt` puts a block Loxone Config drew under the module: its declaration goes into vislox's
 // file of the page, it keeps its UUIDs, and the config stays exactly as it is (the server checks). It is
@@ -4354,6 +4623,7 @@ function undoLabel(ops) {
   if (ops.length === 1 && op.op === "adopt") return op.blocks.length === 1 ? `Adopt ${obj(op.blocks[0].uuid)}` : `Adopt ${plural(op.blocks.length, "block")}`;
   if (ops.length === 1 && op.op === "adopt_page") return `Adopt the blocks of ${S.pageOf?.get(op.page)?.title || "the page"}`;
   if (ops.length === 1 && op.op === "unadopt") return op.uuids.length === 1 ? `Hand ${obj(op.uuids[0])} back to Loxone Config` : `Hand ${plural(op.uuids.length, "block")} back to Loxone Config`;
+  if (ops.length === 1 && op.op === "access") return `Access to ${obj(op.uuid)}${op.value == null ? ": as last written" : op.value.grants ? "" : ": shared set"}`;
   if (ops.length === 1 && op.op === "members") return `Members of ${obj(op.uuid)}${op.value == null ? ": as last written" : ""}`;
   if (ops.length === 1 && op.op === "moods") return `Moods of ${obj(op.uuid)}${op.value == null ? ": Loxone Config's" : op.value.moods ? "" : ": shared set"}`;
   if (ops.length === 1 && op.op === "schedule") return `Switching times of ${obj(op.uuid)}${op.value == null ? ": Loxone Config's" : op.value.modes ? "" : ": shared set"}`;

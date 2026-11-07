@@ -430,7 +430,8 @@ try {
     assert.doesNotMatch(asked[2], /pending revision is from before/, asked[2]);
     assert.match(asked[0], /The Miniserver runs other switching times than this config for:\n  Uhr: Feiertag \(claimed by pages\/access\.loxl:14\)\n/, asked[0]);
     // …and who loses a right, with the claim that takes it away (#68).
-    assert.match(asked[0], /⚠ alice loses access to Haustür \(pages\/access\.loxl:12\)\n⚠ alice stops getting Frostwarnung \(pages\/access\.loxl:13\)\n\nbob starts getting Frostwarnung\n\n/, asked[0]);
+    // Who keeps access under another schedule (#76): two schedules share the title Workdays, so it is said so.
+    assert.match(asked[0], /⚠ alice loses access to Haustür \(pages\/access\.loxl:12\)\n⚠ alice stops getting Frostwarnung \(pages\/access\.loxl:13\)\n\nbob may open Haustür under another access schedule titled Workdays \(pages\/access\.loxl:12\)\nbob starts getting Frostwarnung\n\n/, asked[0]);
     // The confirmation says which devices this reconfigures, and that the new serial is not on the bus.
     assert.match(asked[0], /⚠ Not on the bus \(lox extensions does not list it\): Touch Küche \(Touch Tree\), serial B03B9999/);
     assert.match(asked[0], /This reconfigures 1 device: it stores the new configuration/);

@@ -404,6 +404,17 @@ sends to the Miniserver see [miniserver.md](miniserver.md).
   file claims is changed there. An alarm's or smoke alarm's members are shown, not edited: they stay with Loxone
   Config. How: [editing.md](editing.md#members-of-a-central-block-75).
 
+- **Who may open an NFC Code Touch** (#76): Properties' *Access* (#68) has *Edit access* (the same project and
+  token): a row per user or group, each with its access schedule, picked from the config's users, groups and access
+  schedules by title (asked for with the admin token; a title two objects share cannot be picked, since Lox Logic
+  names them by title), ✕ and *Add user or group*. *Save* writes a Lox Logic `access` set and the Code Touch's
+  claim into vislox's file of the module and compiles. The set is the whole list: whoever it leaves out loses
+  access, and an empty set revokes everyone. Before a save that takes access away, the editor names who loses it
+  (*Ben loses access to Haustür*, *Save anyway*); the review and Apply's confirmation say it again. *Same rights as
+  …* lets several Code Touches share one set, and *Change … too* rewrites it for all of them. Saved and not
+  deployed, the section says so, with *Revert*. Users, groups, schedules, tags and codes stay with Loxone Config
+  and the app; no tag or code is ever shown. How: [editing.md](editing.md#who-may-open-an-nfc-code-touch-76).
+
 For a `lox.toml` project:
 
 ```bash

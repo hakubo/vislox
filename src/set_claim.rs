@@ -1,6 +1,7 @@
 //! Claims on a block's whole set, shared by several blocks: a DayTimer's
-//! switching times (`schedule`, #73) and a lighting controller's moods
-//! (`moods`, #74), and the next ones (#76 access, #77 recipients, #78 tiles).
+//! switching times (`schedule`, #73), a lighting controller's moods (`moods`,
+//! #74) and who may open an NFC Code Touch (`access`, #76), and the next ones
+//! (#77 recipients, #78 tiles).
 //!
 //! Lox Logic writes each as a named set and a claim per block
 //! (`<slug>.<keyword> = <set>`). Several blocks may claim one set; a block
@@ -185,6 +186,7 @@ pub fn taken(files: &Files, ctx: &Ctx, s: &str) -> bool {
         || files.names(s)
         || files.claims.2.sets.contains_key(s)
         || files.claims.3.sets.contains_key(s)
+        || files.claims.5.sets.contains_key(s)
         || files.claims.0.keys().any(|u| edit::slug(u) == s)
 }
 

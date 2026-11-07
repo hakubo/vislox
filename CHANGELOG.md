@@ -116,6 +116,17 @@ published under the same version (see [docker/README.md](docker/README.md)).
   twice*: *Remove vislox's claim*). Undo, Revert and the Deploy pane count it like the other edits; a member
   Loxone Config deleted is named, with *Drop the missing members*. Adopting a central block leaves its list as
   Loxone Config wrote it. Never deploys.
+- Edit who may open an NFC Code Touch (#76): *Access* in Properties has *Edit access*: a row per user or group
+  with its access schedule (pickers of the config's users, groups and access schedules by title, asked for with
+  the admin token from the new `POST /api/access/choices`; a title two objects share cannot be picked), ✕ and
+  *Add user or group*. *Save* sends the new op `access` (users and groups by UUID, each with its schedule's UUID),
+  which writes a Lox Logic `access vx_… end` set and the Code Touch's `.access` claim into
+  `<module>/vislox/edits.loxl` and compiles; the compile must give the Code Touch exactly those rights. Who loses
+  access is said before the save (*Save anyway*), and Apply's confirmation says it again, now with the schedule a
+  user gains access under and who keeps access under another schedule. *Same rights as …* shares a set between
+  Code Touches; *Change … too* rewrites a shared set, its undo gives the others theirs back. Built on
+  `set_claim.rs`. `ACT=` (operating it in the app) is kept. Credentials never leave the server; `GET /api/edits`
+  names users, groups and schedules by UUID only. Adopting a Code Touch leaves its rights as they are. Never deploys.
 - Fixed: Discard failed when the last commit had no lockfile (the first compile writes one), or one was staged
   but not committed. Discard now reads the last commit, never deletes a lock vislox did not write (one not in git
   goes back to how it was before vislox's first edit), and puts everything back when a step fails.

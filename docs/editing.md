@@ -2,8 +2,9 @@
 
 vislox becomes an editor in steps: edit values (#58), add blocks (#59), move blocks, inputs and outputs (#60),
 make and change connections (#61), undo and redo (#62), adopt the blocks Loxone Config drew (#72), edit a
-Daytimer's switching times (#73), a lighting controller's moods (#74) and a central block's members (#75). This
-page is the design they share. #58 to #62, #72 to #75 are built; the rest says where each step plugs in.
+Daytimer's switching times (#73), a lighting controller's moods (#74), a central block's members (#75) and who may
+open an NFC Code Touch (#76). This page is the design they share. #58 to #62, #72 to #76 are built; the rest says
+where each step plugs in.
 
 ## The rules
 
@@ -51,7 +52,9 @@ POST /api/edit
            { "op": "moods", "uuid": "…", "value": { "moods": [
                { "name": "Viel Licht", "values": "all on" },
                { "name": "Lesen", "values": "AQ1 on, AQ2 40%" } ] } },
-           { "op": "members", "uuid": "…", "value": [ "<member uuid>", "<member uuid>" ] } ] }
+           { "op": "members", "uuid": "…", "value": [ "<member uuid>", "<member uuid>" ] },
+           { "op": "access", "uuid": "…", "value": { "grants": [
+               { "kind": "group", "uuid": "<group uuid>", "schedule": "<access schedule uuid>" } ] } } ] }
 ```
 
 `adopt`, `adopt_page` and `unadopt` go in a request of their own (#72).
@@ -71,7 +74,8 @@ POST /api/edit
   `schedule` it is the `schedule` of what the timer claimed before: its set and that set's switching times, or
   no claim; when the op rewrote a set other timers still claim, it also carries that set's old switching times
   (`restore`), so the undo gives them back too. `moods` is the same for a controller's moods (#74). For
-  `members` it is the list vislox claimed before, or null (#75).
+  `members` it is the list vislox claimed before, or null (#75). `access` is as `moods`, for a Code Touch's
+  rights (#76).
   A reconnected wire is one request, `unwire` then `wire`:
   undone, the reverse list. The ops of one request see each other: `unwire` then `wire` of the same wire is
   accepted (and changes nothing). `remove_block`'s `add_block` carries the wires the removal took out
@@ -479,8 +483,8 @@ Later: the same simulator could drive an offline Liveview (simulated values on t
 A Lox Logic module can claim more than blocks and wires: `haustuer.access = bewohner` owns who may open an NFC
 Code Touch (and when), `frost.recipients = familie` who gets a push notification, and `uhr.schedule = abend` a
 Daytimer's switching times. None of these is on a logic page, and whoever a set leaves out loses the right on the
-next push, so the review shows them on their own. vislox reviews them, and edits switching times (#73, below);
-access and recipients are #76 and #77.
+next push, so the review shows them on their own. vislox reviews them, and edits switching times (#73) and access
+(#76, below); recipients are #77.
 
 - **From the compiled config, not the source.** `rights.rs` reads, with lox's own `AccessModel`, the `<PRM>`
   lists of every user and group: a `TIM=` on an `NfcCodeTouch` is an access right under that access schedule,
@@ -529,10 +533,11 @@ Whoever the set leaves out loses access on the next push.*), who holds the right
 revision, *Opens for* or *Sent to* (in effect), and who loses or gains it here. A Daytimer's *Schedule* section
 names its claim the same way.
 
-Hooks for the editing issues: #73 (switching times, built) adds the `schedule` op; #76 (access) and #77
-(recipients) add ops to `POST /api/edit` that write their claims into `<module>/vislox/` the same way (a set and
-claims in `edits.loxl`, kept like `sched_edit::Scheds`); the review, `set_claims` and Apply's warning need nothing
-more, since they read the compiled config and the module's files.
+Hooks for the editing issues: #73 (switching times, built) adds the `schedule` op, #76 (access, built) the
+`access` op; #77 (recipients) adds an op to `POST /api/edit` that writes its claims into `<module>/vislox/` the
+same way (a `SetKind` of `set_claim.rs`: `AccessKind` with `recipients`, `Notification` and no schedule); the
+review, `set_claims` and Apply's warning need nothing more, since they read the compiled config and the module's
+files.
 
 ## Switching times (#73)
 
@@ -608,7 +613,7 @@ the timers whose switching times are edited and not deployed.
 
 ## Shared sets (#73, #74)
 
-Switching times and moods, and the claims #76 (access), #77 (recipients) and #78 (tiles) will add, share one
+Switching times, moods and access (#76), and the claims #77 (recipients) and #78 (tiles) will add, share one
 shape: a named set, claims on blocks, several blocks per set, one set per block. `set_claim.rs` does what is the
 same for every kind, parameterised by a `SetKind` (its keyword, block type, content as an op carries it, how
 content becomes lines and how lines are checked for each block): resolve the block, choose the set (named, the
@@ -791,6 +796,75 @@ config (an undo, an edit elsewhere), drops it, and *Save* sends that config's bl
 checks as for any edit. *Save*, *Cancel*, *Revert*, and *Remove vislox's claim* when claimed twice. The Deploy pane counts the central blocks whose members are edited
 and not deployed.
 
+## Who may open an NFC Code Touch (#76)
+
+An NFC Code Touch's access rights are a named `access` set and the Code Touch's claim. vislox writes both into
+`edits.loxl`, after the externs (and after any `schedule` and `moods` sets):
+
+```text
+extern vx_50000009_0000_0090_ffff504f94000001 = NfcCodeTouch(uuid: "50000009-0000-0090-ffff504f94000001")
+
+# Access rights edited in vislox. A claim makes the set everyone who may open the
+# Code Touch: whoever it leaves out loses access. Deleting it leaves the rights as last written.
+access vx_haustuer_access
+	user "alice": "Always"
+	group "Bewohner": "Workdays"
+end
+
+vx_50000009_0000_0090_ffff504f94000001.access = vx_haustuer_access
+```
+
+- **Shown from the compiled config**, as #68 reads it (`rights.rs`): who holds the right directly, who may open it
+  in effect, and against the compared revision what changed. Nothing new is read for the view.
+- **The op** is `{ "op": "access", "uuid": <Code Touch>, "value": … }`. `value.grants` is the whole list, each
+  `{ kind, uuid, schedule }`: `user` or `group`, its UUID and its access schedule's (a `SwitchingTimer`). An empty
+  list is a set too: it revokes everyone. `value.set`, `value: null` and `value.restore` are as for moods: write
+  vislox's set of that name (for every Code Touch that claims it) and claim it, or with no `grants` claim it as it
+  is (*Same rights as …*); drop the claim; write sets back first (an undo's). A new set is
+  `vx_<name>_access`. `previous` carries UUIDs (lowercase), never titles, so an undo gives back exactly who held
+  the right.
+- **Checked before lox sees it**, with lox's rules: an `NfcCodeTouch` only; each user or group once (a set gives
+  each one schedule); every title, for every Code Touch on the set, names exactly one user, group or schedule in the
+  pending config (lox names them by title: a title two objects share, or none, would not compile, so it is refused
+  naming the title, and the pickers do not offer it); at most 500 rights. One set per Code Touch: one the rest of the
+  module claims is refused, naming that `file:line` (`set_claims` lists `access` claims), and so is a Code Touch
+  the rest of the module manages. Dropping vislox's claim is always let through, as for the other sets.
+- **What stays.** Users, groups, schedules, tags and codes stay with Loxone Config and the app. `ACT=` (operating
+  the block in the app) is no access right: lox keeps it, and vislox does not touch it. Dropping the claim leaves
+  the rights as last written (lox keeps no lock state for it): before Apply, the base's; after, the set's.
+- **Checked after the compile.** The pending config must give each Code Touch the request changed, and every
+  Code Touch sharing its set, exactly the set's rights (principal and schedule, by UUID, as `rights.rs` reads
+  them); otherwise the edit is refused and the files, lock and out are put back.
+- **Read back.** vislox reads the sets and claims of `edits.loxl` with lox's parser; an `access` set or claim not
+  named `vx_…`, a claim without its set, a claim on a slug that is neither an extern of the file nor a block of
+  vislox's files, and a `recipients` set (#77's) are refused. Handing an adopted block back is refused while vislox
+  claims its rights.
+- **Adopting a Code Touch** (#72): `lox logic adopt` lifts its rights as a set and a claim. vislox leaves both out,
+  so the door opens for the same people (a dropped claim leaves the rights as last written); editing them later
+  claims them in `edits.loxl`.
+- **Who may see it.** `GET /api/edits` sends `access` (per Code Touch vislox's file claims now or claimed in the
+  deployed revision: `set`, `grants`, `shared`, `deployed`, `pending`) and `access_sets` (each set with its
+  `code_touches`, `grants` and `stale` claimants), by UUID only. The pickers' list, every user, group (with the
+  users it reaches) and access schedule of the newest config by UUID and title, is `POST /api/access/choices`: it
+  needs the admin token (`X-Vislox-Token`, and `X-Vislox`), is sent `no-store`, never logged, and the browser keeps
+  it in memory only while the editor is open. No credential is read into it. Names otherwise reach the browser
+  only as the review (#68) already shows them, never in a URL, the page title or the event stream.
+- **Every change shows in the review and Apply's confirmation** (#68), since both read the compiled config: a
+  right taken away directly, through a shared set (*Change … too*, *Same rights as …*), through a group the set
+  drops, or because the Code Touch is gone. Apply's confirmation now also gives the schedule a user gains access
+  under (*alice gains access to Haustür (Always)*) and who keeps access under another schedule (*bob may open
+  Haustür at Workdays, not Always*).
+
+The browser: *Access* in Properties of an NFC Code Touch, on the newest config, with *Edit access*: it asks for
+the pickers' list (the admin token), then shows a row per user or group (a choice of the config's users and groups
+by title, *at*, a choice of its access schedules, ✕) and *Add user or group*. A principal with two rights on the
+door (two schedules) keeps the first, and the editor says so. *Save* first names who loses access, to this Code
+Touch and, when *Change … too* is on, to those sharing its set (*Save anyway*), then sends the op. *Same rights
+as …* (a Code Touch whose rights vislox claims) does the same: it claims at once when nobody loses access, else
+asks (*Use anyway*). *Revert*, and *Remove vislox's claim* when claimed twice, as for moods. The draft belongs to
+one Code Touch and one pending config: selecting another block, or a new pending config, drops it, and *Save*
+sends the blob it was made on. The Deploy pane counts the Code Touches whose access is edited and not deployed.
+
 ## Undo and redo (#62)
 
 Undo is not a second way to change the module: it sends the edit's `undo` back to `POST /api/edit` as an edit of
@@ -848,6 +922,7 @@ cannot express is left out, not worked around.
 | #73 switching times | `schedule vx_… end`, `x.schedule = vx_…` in `edits.loxl` | A DayTimer, extern or added/adopted here; several timers may share a set. |
 | #74 moods | `moods vx_… end`, `x.moods = vx_…` in `edits.loxl`; `Circuit<n>:` | A LightController2, extern or added/adopted here; several controllers may share a set. Circuits only on one added/adopted here. |
 | #75 members | `x.members = (a, b)` in `edits.loxl` | A CentralLight or CentralShade, extern or added/adopted here; members externs or blocks added/adopted here. An alarm's `Objects=` stays with Loxone Config. |
+| #76 access | `access vx_… end`, `x.access = vx_…` in `edits.loxl` | An NfcCodeTouch; users, groups and access schedules by a title that names exactly one; several Code Touches may share a set. |
 
 Blocks the module already manages (they are in the lockfile) are refused: they are edited in their own `.loxl`.
 The blocks vislox added or adopted (#72) are the exception: their `.loxl` is vislox's.
@@ -901,7 +976,7 @@ Each of these plugs in as new op kinds on `POST /api/edit`, written into `<modul
 | #73 (built) | Daytimer switching times (`schedule`, `.schedule`) |
 | #74 (built) | lighting moods and circuits (`moods`, `.moods`, `Circuit<n>:`) |
 | #75 (built) | members of a central block (`.members`) |
-| #76 | NFC Code Touch access (`access`, `.access`) |
+| #76 (built) | NFC Code Touch access (`access`, `.access`) |
 | #77 | notification recipients and messages (`recipients`, `OutputRefLM`) |
 | #78 | Touch Pure Flex tiles (`tiles`, `.tiles`) |
 | #79 | a managed block's label and settings (`Desc:`, `Type:`, `Formula:`, `Code: file(…)`, …) |

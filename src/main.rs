@@ -1,6 +1,7 @@
 //! vislox — a read-only, Loxone-Config-style view of the configs `lox` and
 //! `loxone-config` manage, with live reload, history and change review.
 
+mod access_edit;
 mod actions;
 mod adopt;
 mod appcalendar;
@@ -559,6 +560,10 @@ async fn main() -> Result<()> {
         .route("/api/discard", axum::routing::post(api_discard))
         .route("/api/edit", axum::routing::post(api_edit))
         .route("/api/edits", get(api_edits))
+        .route(
+            "/api/access/choices",
+            axum::routing::post(api_access_choices),
+        )
         .route("/api/check", get(api_check))
         .route("/api/compile", axum::routing::post(api_compile))
         .route("/api/block-types", get(api_block_types))
@@ -1785,6 +1790,45 @@ async fn api_edit(
 async fn api_edits(State(app): State<Arc<App>>) -> Response {
     let (deployed, pending) = edit_revisions(&app).await;
     Json(app.actions.edits(deployed, pending).await).into_response()
+}
+
+/// The users, groups and access schedules an access set may name (#76), by
+/// UUID and title, from the newest config (the pending one, else the
+/// deployed one): the pickers of *Edit access*. Personal data, so it needs
+/// the admin token, unlike the review (which names only who holds a right),
+/// and it is a POST, so no address and no cache keeps it. Never logged.
+async fn api_access_choices(
+    State(app): State<Arc<App>>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    if let Some(r) = not_from_vislox(&headers) {
+        return r;
+    }
+    if let Err(r) = app.actions.check(&headers) {
+        return refused(r);
+    }
+    let (deployed, pending) = edit_revisions(&app).await;
+    let Some(bytes) = pending.or(deployed.map(|d| d.bytes)) else {
+        return refused((StatusCode::CONFLICT, "no config to read".into()));
+    };
+    let v = tokio::task::spawn_blocking(move || {
+        loxone_config::LoxoneDoc::parse(&bytes)
+            .map(|d| access_edit::Directory::read(&d).choices())
+            .map_err(|e| e.to_string())
+    })
+    .await;
+    match v {
+        Ok(Ok(v)) => {
+            let mut r = Json(v).into_response();
+            r.headers_mut().insert(
+                axum::http::header::CACHE_CONTROL,
+                axum::http::HeaderValue::from_static("no-store"),
+            );
+            r
+        }
+        Ok(Err(e)) => refused((StatusCode::CONFLICT, format!("cannot read the config: {e}"))),
+        Err(e) => refused((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+    }
 }
 
 /// Whether the project's module compiles (#65): `lox logic check`'s

@@ -203,6 +203,32 @@ fn edit_moods(
     )
 }
 
+/// `GET /api/edits`' `access` and `access_sets` (#76). Per NFC Code Touch
+/// that vislox's file claims the access rights of now or claimed in the
+/// deployed revision: the set and its rights now (`set`, `grants`, each a
+/// user's or group's UUID and its access schedule's) and then (`deployed`, the
+/// value a Revert sends), the other Code Touches sharing its set (`shared`),
+/// and whether the pending config lets others in than the deployed one
+/// (`pending`). And vislox's sets, each with its Code Touches, its rights and
+/// the claimants the config shown lost (`stale`). UUIDs only: the titles are
+/// the review's, and the pickers' lists need the admin token.
+fn edit_access(
+    now: &edit::Files,
+    was: &edit::Files,
+    lock: &edit::Lock,
+    pending: Option<&loxone_config::LoxoneDoc>,
+    deployed: Option<&loxone_config::LoxoneDoc>,
+) -> (Value, Value) {
+    crate::set_claim::edits_section::<crate::access_edit::AccessKind>(
+        now,
+        was,
+        lock,
+        pending,
+        deployed,
+        crate::access_edit::differs,
+    )
+}
+
 /// The ops that undo an edit (#62), sent back as an edit of its own, into
 /// the reply as `undo`; or, when they cannot be built, `undo: null` and why
 /// (`undo_error`). The edit itself stands either way.
@@ -2080,6 +2106,7 @@ impl Actions {
             .ops
             .iter()
             .any(|o| matches!(o, edit::Op::Members { .. }));
+        let accessing = req.ops.iter().any(|o| matches!(o, edit::Op::Access { .. }));
         let names = if scheduling
             || mooding
             || req
@@ -2098,7 +2125,9 @@ impl Actions {
         let mut moods_claimed = std::collections::BTreeMap::new();
         // And the central blocks whose members it claims (#75).
         let mut members_claimed = std::collections::BTreeMap::new();
-        if scheduling || mooding || membering {
+        // And the NFC Code Touches whose access rights it claims (#76).
+        let mut access_claimed = std::collections::BTreeMap::new();
+        if scheduling || mooding || membering || accessing {
             let texts = {
                 let mut m = self.module_files.lock().unwrap();
                 m.refresh(&p.root, &p.module);
@@ -2113,6 +2142,7 @@ impl Actions {
                     "schedule" => &mut sched_claimed,
                     "moods" => &mut moods_claimed,
                     "members" => &mut members_claimed,
+                    "access" => &mut access_claimed,
                     _ => continue,
                 };
                 if !c.file.starts_with(&mine) {
@@ -2162,6 +2192,7 @@ impl Actions {
             sched_claimed: &sched_claimed,
             moods_claimed: &moods_claimed,
             members_claimed: &members_claimed,
+            access_claimed: &access_claimed,
         };
         // `removed` lines lox needs no more go first: their slugs are free.
         files.tidy(&lock);
@@ -2206,6 +2237,9 @@ impl Actions {
             }
             edit::Op::Members { uuid, value: None } => {
                 members_claimed.contains_key(&uuid.to_ascii_lowercase())
+            }
+            edit::Op::Access { uuid, value: None } => {
+                access_claimed.contains_key(&uuid.to_ascii_lowercase())
             }
             _ => false,
         });
@@ -2292,6 +2326,10 @@ impl Actions {
         let mut lit_restored: Vec<String> = Vec::new();
         // And the central blocks whose members it writes (#75).
         let mut centrals: Vec<String> = Vec::new();
+        // And the Code Touches whose access rights it writes, and the access
+        // sets written back (#76).
+        let mut doors: Vec<String> = Vec::new();
+        let mut doors_restored: Vec<String> = Vec::new();
         for o in &req.ops {
             match o {
                 edit::Op::Schedule {
@@ -2312,6 +2350,13 @@ impl Actions {
                     uuid,
                     value: Some(_),
                 } => centrals.push(uuid.clone()),
+                edit::Op::Access {
+                    uuid,
+                    value: Some(v),
+                } => {
+                    doors.push(uuid.clone());
+                    doors_restored.extend(v.restore.keys().cloned());
+                }
                 _ => {}
             }
         }
@@ -2320,6 +2365,7 @@ impl Actions {
             || !timed.is_empty()
             || !lit.is_empty()
             || !centrals.is_empty()
+            || !doors.is_empty()
             || adopting
         {
             Some(
@@ -2368,6 +2414,16 @@ impl Actions {
             if !missed.is_empty() {
                 return Err(fail(format!(
                     "lox logic compile did not write the members of {}",
+                    missed.join(", ")
+                )));
+            }
+        }
+        // Nor an access claim lox did not write onto its Code Touch (#76).
+        if let (false, Some(out)) = (doors.is_empty(), &out_doc) {
+            let missed = crate::access_edit::missed(&files, out, &lock, &doors, &doors_restored);
+            if !missed.is_empty() {
+                return Err(fail(format!(
+                    "lox logic compile did not write the access rights of {}",
                     missed.join(", ")
                 )));
             }
@@ -3042,7 +3098,7 @@ impl Actions {
         deployed: Option<DeployedRev>,
         pending: Option<Arc<Vec<u8>>>,
     ) -> Value {
-        let off = || json!({ "available": false, "reason": state.why, "claims": [], "managed": [], "sources": {}, "set_claims": [], "members_claims": [], "schedules": [], "schedule_sets": [], "moods": [], "mood_sets": [], "members": [] });
+        let off = || json!({ "available": false, "reason": state.why, "claims": [], "managed": [], "sources": {}, "set_claims": [], "members_claims": [], "schedules": [], "schedule_sets": [], "moods": [], "mood_sets": [], "members": [], "access": [], "access_sets": [] });
         let Some(dir) = self.s.project.as_deref() else {
             return off();
         };
@@ -3179,6 +3235,15 @@ impl Actions {
             pending_doc.as_ref(),
             deployed_doc.as_ref(),
         );
+        // And who may open the NFC Code Touches (#76), per Code Touch, and
+        // its sets.
+        let (access, access_sets) = edit_access(
+            &now,
+            &was,
+            &lock,
+            pending_doc.as_ref(),
+            deployed_doc.as_ref(),
+        );
         // The blocks lox can move (#60): those it manages that are drawn on a
         // page, and of them those the pending config draws elsewhere than the
         // deployed one, on the same page.
@@ -3309,6 +3374,7 @@ impl Actions {
                 sched_claimed: &Default::default(),
                 moods_claimed: &Default::default(),
                 members_claimed: &Default::default(),
+                access_claimed: &Default::default(),
             };
             for b in blocks.iter_mut().filter(|b| b["adopted"] == true) {
                 let Some(u) = b["uuid"].as_str().map(String::from) else {
@@ -3336,6 +3402,8 @@ impl Actions {
             "schedule_sets": schedule_sets,
             "moods": moods,
             "mood_sets": mood_sets,
+            "access": access,
+            "access_sets": access_sets,
             "movable": movable,
             "moves": moves,
             "arrange": arrange,
@@ -7932,6 +8000,201 @@ esac
             .unwrap_err();
         assert_eq!(code, axum::http::StatusCode::UNPROCESSABLE_ENTITY, "{msg}");
         assert!(msg.contains("pages/own.loxl:8 claims its moods"), "{msg}");
+    }
+
+    // ── access rights (#76) ────────────────────────────────────────────
+
+    fn access_val(grants: &[(&str, &str, &str)]) -> Option<crate::access_edit::AccessVal> {
+        Some(crate::access_edit::AccessVal {
+            grants: Some(
+                grants
+                    .iter()
+                    .map(|(k, u, s)| crate::access_edit::Grant {
+                        kind: k.to_string(),
+                        uuid: u.to_string(),
+                        schedule: s.to_string(),
+                    })
+                    .collect(),
+            ),
+            ..Default::default()
+        })
+    }
+
+    /// `GET /api/edits` lists a claimed Code Touch by UUIDs only: no title of
+    /// a user, group or schedule.
+    #[test]
+    fn access_is_listed_by_uuid_and_pending() {
+        use crate::access_edit::fixture::{ALWAYS, BOB, DOOR, house};
+        let doc = edit::parse_doc(house().as_bytes()).unwrap();
+        let s = edit::slug(DOOR);
+        let files = edit::Files::from_texts(&std::collections::BTreeMap::from([(
+            "edits.loxl".to_string(),
+            format!(
+                "extern {s} = NfcCodeTouch(uuid: \"{DOOR}\")\naccess vx_a\n\tuser \"bob\": \"Always\"\nend\n{s}.access = vx_a\n"
+            ),
+        )]))
+        .unwrap();
+        let lock = edit::Lock::default();
+        let none = edit::Files::default();
+        let (v, sets) = edit_access(&files, &none, &lock, Some(&doc), None);
+        assert_eq!(v[0]["uuid"], DOOR);
+        assert_eq!(v[0]["pending"], true);
+        assert_eq!(
+            v[0]["grants"],
+            json!([{ "kind": "user", "uuid": BOB, "schedule": ALWAYS }])
+        );
+        assert_eq!(sets[0]["code_touches"][0], DOOR);
+        let text = format!("{v}{sets}");
+        assert!(!text.contains("bob") && !text.contains("Always"), "{text}");
+        let (v, _) = edit_access(&files, &files, &lock, Some(&doc), Some(&doc));
+        assert_eq!(v[0]["pending"], false);
+        assert_eq!(v[0]["deployed"]["set"], "vx_a");
+    }
+
+    /// A compile that does not write the claim onto its Code Touch is
+    /// refused, and the module, lock and out are put back; nothing is deployed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn access_lox_did_not_write_is_refused_and_put_back() {
+        use crate::access_edit::fixture::{ALWAYS, BOB, DOOR, house};
+        let (tmp, a) = project_for_edits();
+        let d = tmp.path().join("project");
+        std::fs::write(d.join("base.Loxone"), house()).unwrap();
+        std::fs::write(d.join("out.Loxone"), house()).unwrap();
+        sh(&d, "git add -A && git commit -qm doors");
+        std::fs::write(
+            tmp.path().join("lox"),
+            "#!/bin/sh\necho \"$*\" >> ../calls.log\n[ \"$1 $2\" = \"logic compile\" ] || exit 2\n\
+             out=out.Loxone; prev=\nfor a in \"$@\"; do [ \"$prev\" = --out ] && out=$a; prev=$a; done\n\
+             cp base.Loxone \"$out\"\n",
+        )
+        .unwrap();
+        let req = edit::Request {
+            base: blob(&d, "out.Loxone"),
+            ops: vec![edit::Op::Access {
+                uuid: DOOR.into(),
+                value: access_val(&[("user", BOB, ALWAYS)]),
+            }],
+        };
+        let out_was = std::fs::read(d.join("out.Loxone")).unwrap();
+        let (code, msg) = a.edit(&req, None).await.unwrap_err();
+        assert_eq!(code, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            msg.contains("did not write the access rights of Haustür"),
+            "{msg}"
+        );
+        assert!(!d.join("pages/vislox/edits.loxl").exists());
+        assert_eq!(std::fs::read(d.join("out.Loxone")).unwrap(), out_was);
+        let calls = std::fs::read_to_string(tmp.path().join("calls.log")).unwrap();
+        assert!(
+            calls.lines().all(|l| l.starts_with("logic compile")),
+            "{calls}"
+        );
+    }
+
+    /// Access with the real lox (#76): set `VISLOX_TEST_LOX` to a lox binary
+    /// (v0.83.0) to run it; it never talks to a Miniserver. The set and claim
+    /// are compiled onto the Code Touch (alice loses access, bob gains it,
+    /// alice's `ACT=` stays), Apply's comparison says so, `GET /api/edits`
+    /// lists it as not deployed, the reply's undo puts alice back, and a Code
+    /// Touch the module's own file claims is refused, its drop let through.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn access_is_compiled_by_lox_and_undone() {
+        use crate::access_edit::fixture::{ALWAYS, BOB, DOOR, house};
+        let Some(lox) = std::env::var_os("VISLOX_TEST_LOX") else {
+            eprintln!("VISLOX_TEST_LOX is not set: skipped");
+            return;
+        };
+        let (tmp, a) = project_with_lox_base(Path::new(&lox), house().as_bytes());
+        let d = tmp.path().join("project");
+        let doc = |p: &str| edit::parse_doc(&std::fs::read(d.join(p)).unwrap()).unwrap();
+        let opens = |p: &str| {
+            crate::rights::read(&doc(p))[DOOR]
+                .list
+                .iter()
+                .map(|x| format!("{}={}", x.title, x.schedule.clone().unwrap_or_default()))
+                .collect::<Vec<_>>()
+        };
+        let before = opens("out.Loxone");
+        assert_eq!(before, ["alice=Always"]);
+        let r = a
+            .edit(
+                &edit::Request {
+                    base: blob(&d, "out.Loxone"),
+                    ops: vec![edit::Op::Access {
+                        uuid: DOOR.into(),
+                        value: access_val(&[("user", BOB, ALWAYS)]),
+                    }],
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(r["undo"][0]["op"], "access");
+        assert_eq!(r["undo"][0]["value"], Value::Null);
+        let file = std::fs::read_to_string(d.join("pages").join(edit::FILE)).unwrap();
+        assert!(
+            file.contains("access vx_haustuer_access\n\tuser \"bob\": \"Always\"\nend\n"),
+            "{file}"
+        );
+        assert_eq!(opens("out.Loxone"), ["bob=Always"]);
+        let xml = std::fs::read_to_string(d.join("out.Loxone")).unwrap();
+        assert!(
+            xml.contains(&format!("REF=\"{DOOR}\" ACT=\"3\"")),
+            "alice's ACT= is kept"
+        );
+        let ch = crate::model::apply_changes(&doc("out.Loxone"), &doc("base.Loxone")).rights;
+        let door = ch.iter().find(|c| c.uuid == DOOR).unwrap();
+        assert_eq!(door.lose[0].title, "alice");
+        assert_eq!(door.gain[0].title, "bob");
+        let e = edits_of(&a, &d).await;
+        assert_eq!(e["access"][0]["uuid"], DOOR);
+        assert_eq!(e["access"][0]["pending"], true);
+        assert_eq!(e["access_sets"][0]["code_touches"][0], DOOR);
+        // Undone: alice again.
+        let undo: Vec<edit::Op> = serde_json::from_value(r["undo"].clone()).unwrap();
+        a.edit(
+            &edit::Request {
+                base: blob(&d, "out.Loxone"),
+                ops: undo,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(opens("out.Loxone"), before);
+        // The module's own file claims it: refused, naming that line.
+        std::fs::write(
+            d.join("pages/own.loxl"),
+            format!(
+                "# The module's own.\npage \"Zugang\"\nextern haustuer = NfcCodeTouch(uuid: \"{DOOR}\")\n\
+                 access bewohner\n\tuser \"alice\": \"Always\"\nend\nhaustuer.access = bewohner\n"
+            ),
+        )
+        .unwrap();
+        sh(
+            &d,
+            &format!("{} logic compile >/dev/null", Path::new(&lox).display()),
+        );
+        let (code, msg) = a
+            .edit(
+                &edit::Request {
+                    base: blob(&d, "out.Loxone"),
+                    ops: vec![edit::Op::Access {
+                        uuid: DOOR.into(),
+                        value: access_val(&[("user", BOB, ALWAYS)]),
+                    }],
+                },
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(code, axum::http::StatusCode::UNPROCESSABLE_ENTITY, "{msg}");
+        assert!(
+            msg.contains("pages/own.loxl:7 claims its access rights"),
+            "{msg}"
+        );
     }
 
     // ── members of a central block (#75) ───────────────────────────────

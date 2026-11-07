@@ -401,6 +401,7 @@ mod tests {
                 sched_claimed: &Default::default(),
                 moods_claimed: &Default::default(),
                 members_claimed: $claimed,
+                access_claimed: &Default::default(),
             }
         };
     }
