@@ -48,9 +48,10 @@ Then open <http://127.0.0.1:7878>. Started without a path or `--ctx` in a direct
   members of a central light or shade block (`.members`), who may open an NFC Code Touch (an `access` set), who
   gets a push notification (a `recipients` set) and what a Touch Pure Flex's tiles do (a `tiles` set), a managed
   block's label and settings (a PulseAt's time, a Formula, a program block's program, constants with units), rename
-  and delete a managed block (`moved`, keeping its UUIDs; `removed`), then Apply, Sync and Discard from the browser.
+  and delete a managed block (`moved`, keeping its UUIDs; `removed`), make `let` constants and bind ports to them,
+  then Apply, Sync and Discard from the browser.
 - For a `lox.toml` project: the blocks its Lox Logic module manages marked, each with the `.loxl` file and line that
-  makes it.
+  makes it, and each parameter a `let` constant or a `defaults` statement gives named after it.
 - For a `lox.toml` project: `lox logic check` errors listed by file, line and block when the module doesn't compile
   (Apply is off until it does), and *Compile* when the pending config is from before the module's latest change.
 - For a `lox.toml` project: `lox logic lint` findings (unused names, blocks whose outputs feed nothing, users whose

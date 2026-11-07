@@ -161,8 +161,10 @@ fn file_blob(path: &Path) -> Option<String> {
 /// every kind that makes sets), must not be one of them.
 fn needs_module_names(ops: &[edit::Op]) -> bool {
     ops.iter().any(|o| {
-        matches!(o, edit::Op::AddBlock { .. })
-            || crate::set_claim::kind_of(o).is_some_and(|k| k.makes_sets())
+        matches!(
+            o,
+            edit::Op::AddBlock { .. } | edit::Op::Let { .. } | edit::Op::Param { .. }
+        ) || crate::set_claim::kind_of(o).is_some_and(|k| k.makes_sets())
     })
 }
 
@@ -2041,8 +2043,10 @@ impl Actions {
             .copied()
             .filter(|k| req.ops.iter().any(|o| k.op(o).is_some()))
             .collect();
-        let names = if needs_module_names(&req.ops) {
-            edit::module_names(&p.module)
+        // The module's names, and of them its `let` constants (#81), which a
+        // port's value may name.
+        let (names, lets) = if needs_module_names(&req.ops) {
+            edit::module_decls(&p.module)
         } else {
             Default::default()
         };
@@ -2114,6 +2118,7 @@ impl Actions {
             lock: &lock,
             deployed: deployed.as_ref(),
             names: &names,
+            lets: &lets,
             drawn: &drawn,
             adoptions: &prepared.adoptions,
             page_adoptions: &prepared.pages,
@@ -3051,7 +3056,7 @@ impl Actions {
         pending: Option<Arc<Vec<u8>>>,
     ) -> Value {
         let off = || {
-            let mut v = json!({ "available": false, "reason": state.why, "claims": [], "managed": [], "sources": {}, "set_claims": [], "members_claims": [], "set_kinds": {} });
+            let mut v = json!({ "available": false, "reason": state.why, "claims": [], "managed": [], "sources": {}, "set_claims": [], "members_claims": [], "constants": { "lets": [], "defaults": [], "uses": {} }, "set_kinds": {} });
             for k in crate::set_claim::KINDS {
                 for (key, _) in k.edits_section(
                     &Default::default(),
@@ -3178,6 +3183,10 @@ impl Actions {
         let set_claims = crate::managed::set_claims(&texts, &lock);
         // And on a central block's members (#75).
         let members_claims = crate::managed::members_claims(&texts, &lock);
+        // The module's `let` constants and `defaults`, and the ports that take
+        // their values from one (#81).
+        let mine = format!("{rel_dir}/");
+        let constants = crate::constants::constants(&texts, &lock, |f| f.starts_with(&mine));
         // What vislox's file claims on a block's whole content now or
         // claimed in the deployed revision: per kind (switching times #73,
         // moods #74, members #75, access #76) its entries and sets, and the
@@ -3323,6 +3332,7 @@ impl Actions {
                 lock: &lock,
                 deployed: None,
                 names: &Default::default(),
+                lets: &Default::default(),
                 drawn: &Default::default(),
                 adoptions: &none_a,
                 page_adoptions: &none_p,
@@ -3349,6 +3359,7 @@ impl Actions {
                 lock: &lock,
                 deployed: deployed_doc.as_ref(),
                 names: &Default::default(),
+                lets: &Default::default(),
                 drawn: &Default::default(),
                 adoptions: &none_a,
                 page_adoptions: &none_p,
@@ -3373,6 +3384,7 @@ impl Actions {
             "sources": sources,
             "set_claims": set_claims,
             "members_claims": members_claims,
+            "constants": constants,
             "set_kinds": set_kinds,
             "movable": movable,
             "moves": moves,
@@ -5608,6 +5620,24 @@ esac
             e["set_claims"],
             json!([{ "kind": "schedule", "slug": "temp", "set": "abend", "file": "pages/zeit.loxl", "line": 5,
                      "set_file": "pages/zeit.loxl", "set_line": 2, "blocks": [AND] }]),
+            "{e}"
+        );
+        // A `let` constant, and the port of the managed block bound to it (#81).
+        std::fs::write(
+            d.join("pages/main.loxl"),
+            "# the module\nlet teilung = 4\nteiler = Div(\"Teiler\", In2: teilung)\n",
+        )
+        .unwrap();
+        let e = edits_of(&a, &d).await;
+        assert_eq!(
+            e["constants"]["lets"],
+            json!([{ "name": "teilung", "value": "4", "file": "pages/main.loxl", "line": 2, "uses": 1, "ours": false }]),
+            "{e}"
+        );
+        assert_eq!(
+            e["constants"]["uses"][DIV]["Input2"],
+            json!({ "kind": "let", "name": "teilung", "value": "4", "file": "pages/main.loxl", "line": 2,
+                    "at_file": "pages/main.loxl", "at_line": 3, "ours": false, "at_ours": false }),
             "{e}"
         );
     }

@@ -502,6 +502,7 @@ mod tests {
                 lock: $lock,
                 deployed: None,
                 names: &Default::default(),
+                lets: &Default::default(),
                 drawn: &Default::default(),
                 adoptions: &Default::default(),
                 page_adoptions: &Default::default(),

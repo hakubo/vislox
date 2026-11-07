@@ -4,9 +4,9 @@ vislox becomes an editor in steps: edit values (#58), add blocks (#59), move blo
 make and change connections (#61), undo and redo (#62), adopt the blocks Loxone Config drew (#72), edit a
 Daytimer's switching times (#73), a lighting controller's moods (#74), a central block's members (#75), who may
 open an NFC Code Touch (#76), push notifications: who gets them and what they say (#77), the tiles of a Touch
-Pure Flex (#78), a managed block's label and settings, its program among them (#79), and deleting and renaming a
-managed block (#80). This page is the design they share. #58 to #62, #72 to #80 are built; the rest says where each
-step plugs in.
+Pure Flex (#78), a managed block's label and settings, its program among them (#79), deleting and renaming a
+managed block (#80), and `let` constants and `defaults` (#81). This page is the design they share. #58 to #62, #72
+to #81 are built (#81 in part: see *Constants and defaults*); the rest says where each step plugs in.
 
 ## The rules
 
@@ -16,7 +16,7 @@ step plugs in.
   uploads, so a change made only in `out.Loxone` would be lost on Apply, and `base.Loxone` is what the
   Miniserver runs.
 - **vislox writes one place: its own files under the module directory**, `<module>/vislox/`: `edits.loxl` for
-  the values it claims and the wires it draws, and one file per page for the blocks it adds
+  the values it claims, the wires it draws and the constants it makes (#81), and one file per page for the blocks it adds
   (`<module>/vislox/obergeschoss.loxl`), and a file per program a block of them runs (`vx_code16_1.c`, #79).
   The rest of the module is never touched. A module that is one file cannot be edited from vislox.
   The exceptions are the lockfile: a move (#60), since lox keeps a managed block's position there, not in the
@@ -62,7 +62,9 @@ POST /api/edit
            { "op": "recipients", "uuid": "…", "value": { "recipients": [
                { "kind": "user", "uuid": "<user uuid>" }, { "kind": "group", "uuid": "<group uuid>" } ] } },
            { "op": "add_block", "page": "<page uuid>", "type": "OutputRefLM",
-             "settings": { "mirrors": "<notification uuid>", "On": "Frost", "MinimumTime": "12h" } } ] }
+             "settings": { "mirrors": "<notification uuid>", "On": "Frost", "MinimumTime": "12h" } },
+           { "op": "let", "name": "vx_nachlauf", "value": "30min" },
+           { "op": "param", "uuid": "…", "port": "Time", "value": "vx_nachlauf" } ] }
 ```
 
 `adopt`, `adopt_page` and `unadopt` go in a request of their own (#72), and so does `rename` (#80). `restore_block`
@@ -87,6 +89,7 @@ is what undoes a `remove_block` of a deployed block (#80); vislox makes it, see 
   (`restore`), so the undo gives them back too. `moods` is the same for a controller's moods (#74). For
   `members` it is the list vislox claimed before, or null (#75). `access` is as `moods`, for a Code Touch's
   rights (#76), `recipients` for a notification's recipients (#77), and `tiles` for a Touch Pure Flex's tiles (#78).
+  `let` is a value op (#81): its `previous` is the constant's value before, or null when the op made it.
   A reconnected wire is one request, `unwire` then `wire`:
   undone, the reverse list. The ops of one request see each other: `unwire` then `wire` of the same wire is
   accepted (and changes nothing). `remove_block`'s `add_block` carries the wires the removal took out
@@ -332,6 +335,60 @@ vx_nachlauf = Monoflop("Nachlauf", Time: 30min)
 - Not offered: the settings lox refuses by name (an alarm's members, a meter's `Rec=`, `StatsType=`, a room
   controller's, `Task=`; see lox's `connectors::unclaimed_reason`), and any setting on a block the module does not
   manage.
+
+## Constants and defaults (#81)
+
+`let` constants and `defaults` statements set values in many places at once, and the compiled config keeps no
+trace of either: lox writes the value into each port's `Def=`. vislox reads them back from the module's source.
+
+```text
+let temp_schwelle = 28                # the module's own file
+teiler.In2 = temp_schwelle
+defaults Monoflop(Time: nachlauf)
+
+let vx_nachlauf = 30min               # vislox's edits.loxl
+vx_60000002_0000_0000_ffff504f94000001.Time = vx_nachlauf
+```
+
+- **Where a value comes from.** `GET /api/edits` sends `constants`: `lets` (name, value as written, `file`, `line`,
+  `uses`: the ports bound to it, through a default too, and `ours`: declared in vislox's files), `defaults` (`type`,
+  `file`, `line`, `params`, `uses`) and `uses`: object UUID (lowercase) → port key → `{ kind, name, constant, value,
+  file, line, at_file, at_line, ours, at_ours }`. `kind` is `let` or `defaults`; `name` the constant or the type;
+  `constant` the constant a default names (`defaults Monoflop(Time: nachlauf)`); `file`/`line` the statement;
+  `at_file`/`at_line` where the block binds it (the argument, or the `x.Port = name` line) or, for a default, the
+  block's declaration; `at_ours` whether that is a file of vislox's. They are read with lox's parser, at the top
+  level of each file (a template's body is #83's): a managed block's arguments (the lockfile's `objects`), an
+  extern's `x.Port = name` and its folded arguments (its `uuid: "…"`, else `externals`), and every managed block of
+  a type a `defaults` statement names that does not bind the port itself (lox's `defaults_taken`). An alias (`let x
+  = y.Q`) names a port, not a value, and is left out; a file that does not parse is left out (`lox logic check`
+  says why, #65). Like `sources` (#64) they are the module as it is now: shown on the newest config only.
+- **Properties** shows the source beside the value: `Time 30min (nachlauf)`, `ModbusPollingCycle 60 (defaults
+  ModbusASensor)`, the tooltip with the statement's `file:line` and how many ports take it.
+- **The Changes list** puts the parameter changes one constant or one `defaults` statement causes together, under
+  a heading `let vx_nachlauf = 45min · 2 changes` with the statement's `file:line` (a default that names a constant
+  goes under the constant). Next and previous go in that order. A single such change is marked `(let x)`. Each
+  `param` change carries its connector's key (`port`) for this.
+- **The `let` op** makes, changes or drops one of vislox's constants: `let vx_<name> = <value>` in `edits.loxl`.
+  The name is `vx_` and lowercase letters, digits and `_`, not one vislox names an object by, and not taken in the
+  module or its lockfile. The value is what a port takes: a number, one with its unit (`30min`, `70%`; lox scales a
+  time into each port's unit), a time of day (`19:00`) or `on`/`off` (lox checks it against every port bound to
+  it). A text constant is not made here. `value: null` drops it, refused while a port of vislox's files is bound to
+  it. `previous` is the value before, or null when the op made it, so undo drops a constant it made.
+- **Binding a port** is the `param` op with the constant's name as the value (`"value": "vx_nachlauf"`): on a claim
+  it is written `x.Time = vx_nachlauf`, on a block of vislox's files `Time: vx_nachlauf`. The name may be vislox's
+  constant or one the module declares. Any other value binds the port to a value of its own, as before. A bare
+  name of vislox's constant on an adopted block (#72) reads as the value, never as a wire from an object.
+- **Make a constant** (Properties, *Edit values*, under an unbound constant field) names the field's value: one
+  request of `let` and `param`, undone together. Another block takes it by its name, typed into its field (the
+  field offers the constants).
+- **Changing a value a constant gives** asks first: *Change the constant (N uses)*, which sends `let` and changes
+  every port bound to it, or *Only this block*, which sends `param` and binds this port to a value of its own.
+- **Not offered, a product decision:** changing a `let` or a `defaults` line of the module's own files. vislox
+  writes only its own files (see *The rules*), so a value from such a constant or default is changed only on the
+  block: *Only this block*, on a block of vislox's files or a claim. Where the module's own file binds the port (`x.Port
+  = name` on an extern), the field is read-only and names that line: a claim of vislox's on the same port would
+  claim it twice. The `let` op on a constant of the module's own files is refused, naming why. vislox never writes
+  a `defaults` statement: it changes every managed block of the type, the module's own among them.
 
 ## Moving blocks (#60)
 
@@ -1225,6 +1282,7 @@ cannot express is left out, not worked around.
 | #80 delete a managed block | drop it, `removed slug` | A block added or adopted here; deployed, Apply deletes it on the Miniserver (asking, #70). Undone with its UUIDs while lox keeps the tombstone. |
 | #80 rename a managed block | `moved old -> new`, lox's rename over vislox's files | A block added or adopted here; the config does not change. |
 | #79 block settings | `slug = Type("Label", At: 06:58, Desc: "…", Code: file("slug.c"))` | Only a block added or adopted here; a program in `<module>/vislox/<slug>.c`. Constants take a unit (`Time: 30min`, `x.Time = 1h`). |
+| #81 constants | `let vx_… = 30min` in `edits.loxl`; `x.Time = vx_…`, `Time: vx_…` | Made, changed and dropped in vislox's file; a port bound to it, or to a constant of the module. The module's own `let` and `defaults` lines are shown, not changed. |
 
 Blocks the module already manages (they are in the lockfile) are refused: they are edited in their own `.loxl`.
 The blocks vislox added or adopted (#72) are the exception: their `.loxl` is vislox's.
@@ -1289,7 +1347,7 @@ Each of these plugs in as new op kinds on `POST /api/edit`, written into `<modul
 | #78 (built) | Touch Pure Flex tiles (`tiles`, `.tiles`) |
 | #79 (built) | a managed block's label and settings (`Desc:`, `Type:`, `Formula:`, `Code: file(…)`, …), constants with units |
 | #80 (built) | delete and rename managed blocks (`removed`, `moved`) |
-| #81 | `let` and `defaults` |
+| #81 (built in part) | `let` constants made and changed in vislox's file, ports bound to them; the module's `let` and `defaults` shown |
 | #82 | expressions and named signals |
 | #83 | `template` instances |
 | #84 | virtual inputs, virtual and Modbus devices |
@@ -1339,7 +1397,7 @@ lost is deleted only with consent to exactly that list, see [features.md](featur
 - `GET /api/edits` lists what vislox's files claim now and in the deployed revision, which of it is not
   deployed, the blocks vislox added (`blocks`: slug, UUID, type, page, file, and whether the deployed config has
   it), the other blocks the module manages (`managed`), where the module makes each managed block (`sources`,
-  #64), the blocks lox can move (`movable`: managed and drawn on a page) and
+  #64), the module's `let` constants and `defaults` and the ports that take a value from one (`constants`, #81), the blocks lox can move (`movable`: managed and drawn on a page) and
   those the pending config draws elsewhere than the deployed one (`moves`: UUID, position, deployed position),
   for each page with such a block whether *Arrange* can lay it out (`arrange`: page UUID → null, or why not), and
   the wires vislox's files draw now or drew in the deployed revision (`wires`: `from`, `to`, `now`, `deployed`), the

@@ -120,6 +120,10 @@ The binary is an `axum` server with the UI embedded (plain JS and SVG, no build 
   `blocks::PageFile` keeps the `removed` and `moved` lines; `Files::tidy` drops those lox needs no more, and
   `Files::stale_lines` lists them. `actions.rs` checks the compiled config: a deleted block gone, a restored one
   back under its UUID, a rename changing nothing (`loxone_config::diff`).
+- `src/constants.rs` reads the module's `let` constants and `defaults` statements and the ports that take a value
+  from one (#81), with lox's parser and `defaults_taken`, for `GET /api/edits`' `constants`. vislox's own constants
+  are `Claims`' ninth field in `edit.rs` (`let vx_… = …` in `edits.loxl`); the `let` op is `set_constant`, and a
+  `param` op whose value names a constant (`Ctx::lets`, the module's) binds the port to it (`constant_ref`).
 - `src/set_claim.rs`' `KINDS` lists every kind of claim on a block's whole content (switching times, moods,
   access, recipients, tiles, members) as a `ClaimKind`; `edit.rs` and `actions.rs` loop over it instead of naming each kind.
 - `src/blocks.rs` is adding blocks (#59): the types vislox offers (`GET /api/block-types`, from lox's builtin
