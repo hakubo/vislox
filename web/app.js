@@ -13,7 +13,7 @@ const S = {
   hist: null, view: null, rev: null, base: null, page: null, sel: null,
   follow: true, marks: true, vp: {}, open: new Set(["__pages"]), chgOff: new Set(), chgHw: false,
   objPage: new Map(), pageOf: new Map(), loadSeq: 0, onlyChanged: false, chgIdx: -1,
-  closed: new Set(["Advanced"]), dim: true, treeFocus: null, hash: null, applyingHash: false,
+  closed: new Set(["Advanced"]), dim: true, onlyManaged: false, treeFocus: null, hash: null, applyingHash: false,
   app: null, appBusy: false, appErr: "", applyReads: 0, deployed: null,
   live: { on: pref("live", false), dim: pref("liveDim", true), query: pref("liveQuery", false), qes: null, qkey: "", qstat: null, es: null, status: null, values: new Map(), controls: {}, globals: {}, periods: null },
 };
@@ -352,6 +352,23 @@ async function loadView() {
 }
 function renderLegend() {
   $("legend").classList.toggle("diff", !!(S.view?.compared && S.marks));
+  const m = hasManaged();
+  $("legend").classList.toggle("managed", m);
+  if (!m) S.onlyManaged = false;
+  $("chk-only-managed").checked = S.onlyManaged;
+}
+// The blocks the project's Lox Logic module manages (#64): the lockfile pins their UUIDs, and the module's
+// .loxl files declare them. GET /api/edits says where (`sources`), for a lox.toml project only.
+/** Where the module declares the block `uuid`: { slug, file, line, how }, or null when it does not manage it. */
+function managedSrc(uuid) { return S.edits?.sources?.[uuid] || null; }
+function hasManaged() { return !!S.edits?.sources && Object.keys(S.edits.sources).length > 0; }
+/** `pages/licht.loxl:12`, to paste into an editor or a prompt; null when the module has no line for it. */
+function srcPath(m) { return m?.file ? `${m.file}${m.line ? ":" + m.line : ""}` : null; }
+function srcHow(m) {
+  if (!m?.file) return "Not found in the module's files: the lockfile pins it, but no .loxl file declares it now.";
+  if (m.how === "expression") return "Made by lox for the expression on this line.";
+  if (m.how === "template") return "Made by the template instance on this line.";
+  return "Declared on this line.";
 }
 function showMsg(t) {
   const m = $("canvas-msg");
@@ -519,6 +536,7 @@ function renderPage() {
   svg.classList.toggle("marks-on", marks);
   svg.classList.toggle("marks-off", !marks);
   svg.classList.toggle("dim-unchanged", marks && S.dim && !!p && p.changes > 0);
+  svg.classList.toggle("only-managed", S.onlyManaged && hasManaged());
   if (!p) { showMsg(S.view && !S.view.pages.length ? "This config has no logic pages." : ""); renderMinimap(); return; }
   showMsg(p.objects.length ? "" : "This page is empty.");
   svg.setAttribute("aria-label", `Logic page ${p.title}: ${plural(p.objects.filter((o) => o.shape !== "tag").length, "block")}. Drag or use the arrow keys to pan, scroll or plus and minus to zoom.`);
@@ -544,7 +562,8 @@ function renderPage() {
   const hops = wireHops(p.wires);
   p.wires.forEach((w, wi) => {
     const d = wirePath(hops[wi]);
-    const line = el("path", { class: `wire${w.analog ? " analog" : ""}${w.status ? " d-" + w.status : ""}`, d, "data-f": w.from[0], "data-t": w.to[0], "data-src": w.src }, L.wires);
+    const mw = managedSrc(w.from[0]) || managedSrc(w.to[0]) ? " m-wire" : "";
+    const line = el("path", { class: `wire${w.analog ? " analog" : ""}${w.status ? " d-" + w.status : ""}${mw}`, d, "data-f": w.from[0], "data-t": w.to[0], "data-src": w.src }, L.wires);
     const hit = el("path", { class: "wire-hit", d }, L.wires);
     const fo = objByUuid.get(w.from[0]), to = objByUuid.get(w.to[0]);
     hoverTip(hit, () => `<b>${esc(fo ? displayTitle(fo) : "")}</b>.${esc(portName(fo, w.from[1]))} → <b>${esc(to ? displayTitle(to) : "")}</b>.${esc(portName(to, w.to[1]))}<br><span class="tm">${w.analog ? "analog" : "digital"}${w.status ? " · " + w.status : ""}</span>${liveTip(w.src)}`);
@@ -849,6 +868,16 @@ function drawBlock(parent, o) {
     drawPins(g, o, 7);
   }
   if (S.view.objects[o.uuid]?.app?.shown) drawAppBadge(g, x, y + h);
+  const m = !o.moved_to && managedSrc(o.uuid);
+  if (m) { g.classList.add("managed"); drawManagedBadge(g, x, y, m); }
+}
+/** A small badge at the block's upper left: the project's Lox Logic module manages it. */
+function drawManagedBadge(g, x, y, m) {
+  const b = el("g", { class: "mbadge" }, g);
+  el("title", {}, b, `Managed by the Lox Logic module: ${m.slug}${srcPath(m) ? ` (${srcPath(m)})` : ""}. Change it there; an edit made in Loxone Config is overwritten on the next push.`);
+  // On the corner, clear of the name in the header.
+  el("rect", { x: x - 130, y: y - 100, width: 220, height: 160, rx: 40 }, b);
+  el("text", { x: x - 20, y: y + 24, "text-anchor": "middle" }, b, "λ");
 }
 /** A small phone at the block's lower left: the block is shown in the app. */
 function drawAppBadge(g, x, y) {
@@ -1083,6 +1112,17 @@ function renderPropsBody() {
 
   const ed = editRows(o, row);
   if (ed) section("Edit", ed.rows, ed.count);
+  const ms = managedSrc(o.uuid);
+  if (ms) {
+    const path = srcPath(ms);
+    section("Lox Logic", [
+      row("Slug", `<span class="mono">${esc(ms.slug)}</span>`),
+      row("Source", path
+        ? `<span class="mono src-path">${esc(path)}</span><button type="button" class="copy" data-copy="${esc(path)}" title="Copy the file and line, for an editor or a prompt">Copy path</button><div class="src-how">${esc(srcHow(ms))}</div>`
+        : `<span class="none-v">${esc(srcHow(ms))}</span>`),
+      `<div class="ed-note">Change it in the module: an edit made in Loxone Config is overwritten on the next push.</div>`,
+    ]);
+  }
   const opT = opTarget(o);
   if (opT) section("Operate", [opControls(opT)]);
   if (liveHere()) {
@@ -1179,6 +1219,7 @@ function renderPropsBody() {
   if (o.page) facts.push(`<button type="button" class="chip" data-page="${esc(o.page)}" data-go="${esc(o.uuid)}" title="Show on its page">▦ ${esc(S.pageOf.get(o.page)?.title || "page")}</button>`);
   if (o.room) facts.push(`<span class="chip" title="Room">⌂ ${esc(o.room)}</span>`);
   if (o.category) facts.push(`<span class="chip" title="Category">◆ ${esc(o.category)}</span>`);
+  if (ms) facts.push(`<span class="chip managed" title="Managed by the project's Lox Logic module">λ ${esc(ms.slug)}</span>`);
   if (o.target) facts.push(`<span class="chip" title="Mirrors">↪ ${linkTarget(o.target)}</span>`);
   if (marks && dv?.how) facts.push(`<span class="chip hw" title="${esc(HW_HOW[dv.how] || dv.how)}">⚙ hardware</span>`);
   const title = autoTitle(o.title) ? prettyType(o.ty) : o.title;
@@ -1230,7 +1271,7 @@ $("props").addEventListener("click", (e) => {
   }
   if (e.target.closest(".app-load")) { loadAppFromMs(); return; }
   const c = e.target.closest(".copy");
-  if (c) { copyText(c.dataset.copy).then(() => { c.textContent = "Copied"; setTimeout(() => (c.textContent = "Copy"), 1200); }); return; }
+  if (c) { const label = c.textContent; copyText(c.dataset.copy).then(() => { c.textContent = "Copied"; setTimeout(() => (c.textContent = label), 1200); }); return; }
   const m = e.target.closest(".more");
   if (m) { m.previousElementSibling.classList.add("open"); m.remove(); return; }
   const a = e.target.closest("[data-go]");
@@ -1537,7 +1578,8 @@ function renderPalette() {
   const blocks = [];
   for (const p of v.pages) for (const o of p.objects) {
     if (o.moved_to || o.shape === "tag") continue;
-    blocks.push({ kind: "block", title: displayTitle(o), meta: `${prettyType(o.ty)} · ${p.title}`, page: p.uuid, uuid: o.uuid });
+    // A block the module manages is found by its slug too (#64).
+    blocks.push({ kind: "block", title: displayTitle(o), meta: `${prettyType(o.ty)} · ${p.title}`, page: p.uuid, uuid: o.uuid, slug: managedSrc(o.uuid)?.slug });
   }
   // Views match a whole word they start with (“mod”, “calendar”), not any subsequence, and come after
   // pages and blocks, so that a short query still opens the best page or block.
@@ -1545,7 +1587,11 @@ function renderPalette() {
   let items;
   if (!q) items = [{ sec: "Pages" }, ...pages, ...(views.length ? [{ sec: "Views" }, ...views] : [])];
   else {
-    const score = (it) => { const m = fuzzy(q, it.title); return m ? { ...it, score: m.score + (it.kind === "page" ? 50 : 0), hits: m.hits } : null; };
+    const score = (it) => {
+      const m = fuzzy(q, it.title), s = it.slug ? fuzzy(q, it.slug) : null;
+      if (s && (!m || s.score > m.score)) return { ...it, score: s.score, hits: [], slugHits: s.hits };
+      return m ? { ...it, score: m.score + (it.kind === "page" ? 50 : 0), hits: m.hits } : null;
+    };
     const ps = pages.map(score).filter(Boolean).sort((a, b) => b.score - a.score).slice(0, 12);
     const bs = blocks.map(score).filter(Boolean).sort((a, b) => b.score - a.score).slice(0, 40);
     const vs = views.filter((it) => it.names.some((w) => w.startsWith(q))).map((it) => {
@@ -1559,7 +1605,7 @@ function renderPalette() {
   const ul = $("pal-list");
   ul.innerHTML = items.length ? items.map((it, i) => it.sec
     ? `<li class="sec" role="presentation">${esc(it.sec)}</li>`
-    : `<li role="option" id="pal-${i}" data-i="${i}" aria-selected="${i === pal.idx}"><span class="pk">${it.kind}</span><span class="pt">${mark(it.title, it.hits)}</span><span class="pm">${esc(it.meta)}</span></li>`).join("")
+    : `<li role="option" id="pal-${i}" data-i="${i}" aria-selected="${i === pal.idx}"><span class="pk">${it.kind}</span><span class="pt">${mark(it.title, it.hits)}</span><span class="pm">${esc(it.meta)}${it.slug ? ` · <span class="mono pal-slug">${mark(it.slug, it.slugHits)}</span>` : ""}</span></li>`).join("")
     : '<li class="sec" role="presentation">Nothing matches.</li>';
   $("pal-input").setAttribute("aria-activedescendant", pal.idx >= 0 ? `pal-${pal.idx}` : "");
 }
@@ -1618,6 +1664,7 @@ $("chk-live-dim").onchange = (e) => { S.live.dim = e.target.checked; setPref("li
 $("chk-live-query").checked = S.live.query;
 $("chk-live-query").onchange = (e) => { S.live.query = e.target.checked; setPref("liveQuery", S.live.query); renderLiveSwitch(); };
 $("chk-dim").onchange = (e) => { S.dim = e.target.checked; renderPage(); applyFocus(); };
+$("chk-only-managed").onchange = (e) => { S.onlyManaged = e.target.checked; renderPage(); applyFocus(); };
 $("chk-follow").onchange = (e) => { S.follow = e.target.checked; if (S.follow) { S.rev = null; loadHistory(); } writeHash(false); };
 
 window.addEventListener("keydown", (e) => {
@@ -2401,7 +2448,10 @@ S.edit = { uuid: null, open: false, draft: {}, bad: {}, busy: false, msg: "", er
 S.editsKey = null; // the server's key of what /api/edits says (vislox's file, deployed and pending config)
 async function loadEdits() {
   if (!S.hist?.actions?.shown) { S.edits = null; return; }
+  const was = JSON.stringify(S.edits?.sources || {});
   try { S.edits = await api("/api/edits"); } catch { S.edits = null; S.editsKey = null; }
+  // The managed blocks' badges and the legend follow the lockfile and the module (#64).
+  if (S.view && JSON.stringify(S.edits?.sources || {}) !== was) { renderLegend(); renderPage(); applyFocus(); }
   renderActions();
   if (S.sel && S.view) renderProps();
 }
@@ -2430,7 +2480,7 @@ function editState(o) {
   const a = S.hist?.actions;
   if (!a?.shown || !o.edit) return null;
   if (!a.edit?.available) return { why: `Editing is off: ${a.edit?.reason || "unknown"}.` };
-  if (S.edits?.managed?.includes(o.uuid)) return { why: "The project's module manages this block: change its values in its .loxl file." };
+  if (S.edits?.managed?.includes(o.uuid)) return { why: `The project's module manages this block: change its values in ${srcPath(managedSrc(o.uuid)) || "its .loxl file"}.` };
   const r = editRev();
   if (!r) return { why: "The config on disk is not in the History yet." };
   if (S.rev !== r.id) return { why: `Edits are made on the newest config (${r.kind === "pending" ? "Pending" : "deployed"}).`, newest: r };

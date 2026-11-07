@@ -44,7 +44,9 @@ Then open <http://127.0.0.1:7878>. Started without a path or `--ctx` in a direct
 - The Miniserver log and, opt-in, its Debug-Monitor.
 - For a `lox.toml` project: edit values in Properties, add blocks to a page, move the blocks the module manages and
   draw wires, then Apply, Sync and Discard from the browser.
-- Ctrl+K to find any page or block, links that reopen a page, block and revision, and full keyboard use (`?`).
+- For a `lox.toml` project: the blocks its Lox Logic module manages marked, each with the `.loxl` file and line that
+  makes it.
+- Ctrl+K to find any page or block (by name, or by its Lox Logic slug), links that reopen a page, block and revision, and full keyboard use (`?`).
 
 Details: [docs/features.md](docs/features.md).
 

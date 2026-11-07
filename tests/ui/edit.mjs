@@ -60,7 +60,8 @@ writeFileSync(join(dir, "base.Loxone"), base);
 writeFileSync(join(dir, "out.Loxone"), base);
 writeFileSync(join(dir, "lox.toml"), 'base = "base.Loxone"\nmodule = "pages"\nout = "out.Loxone"\n');
 writeFileSync(join(dir, "pages", "README"), "the module\n");
-writeFileSync(join(dir, "pages", "flur.loxl"), "# The module's own source (the stand-in lox reads only vislox's files).\n");
+// The module's own source (the stand-in lox reads only vislox's files): `flur` is declared on line 3.
+writeFileSync(join(dir, "pages", "flur.loxl"), '# The module\'s own source.\npage "Obergeschoss"\nflur = And("Flur")\n');
 const FLUR_AT = { px: 7104, py: 2880, px2: 8448, py2: 3576 };
 const lockObjects = { flur: { uuid: FLUR, type: "And", page_uuid: OG, layout: FLUR_AT } };
 for (let i = 0; i < LAGER_N; i++) lockObjects[`lager_${i}`] = { uuid: lagerUuid(i), type: "And", page_uuid: LAGER, layout: lagerAt(i) };
@@ -254,6 +255,53 @@ try {
     assert.deepEqual(await page.$$eval("#props [data-ed-field]", (n) => n.map((x) => x.dataset.edField)), ["title", "room", "p:Input2"]);
     assert.equal(await page.inputValue(field("room")), "Küche");
     assert.equal(await page.inputValue(field("p:Input2")), "1000");
+  });
+  await step("the blocks the module manages are marked, with the line that declares them (#64)", async () => {
+    await page.waitForFunction((u) => S.edits?.sources?.[u], FLUR);
+    await page.evaluate((u) => { gotoPage(S.objPage.get(u), { focus: u }); select(u); }, FLUR);
+    await page.waitForSelector(`.blk.managed[data-uuid="${FLUR}"] .mbadge`);
+    // The Monoflop beside it is Loxone Config's.
+    assert.equal(await page.$(`.blk[data-uuid="${MONO}"].managed`), null);
+    await page.waitForSelector('[data-body="Lox Logic"]');
+    assert.match(await page.textContent('[data-body="Lox Logic"]'), /flur[\s\S]*pages\/flur\.loxl:3[\s\S]*Declared on this line/);
+    assert.match(await page.textContent("#props .ph-facts"), /λ flur/);
+    // Its values are edited in that file, which Properties names.
+    await waitText('[data-body="Edit"]', /change its values in pages\/flur\.loxl:3/);
+    await page.context().grantPermissions(["clipboard-read", "clipboard-write"], { origin: `http://127.0.0.1:${port}` });
+    await page.click('[data-body="Lox Logic"] button.copy');
+    await waitText('[data-body="Lox Logic"] button.copy', /^Copied$/);
+    assert.equal(await page.evaluate(() => navigator.clipboard.readText()), "pages/flur.loxl:3");
+    // A block the lock pins that no .loxl file declares: its slug, and why there is no line.
+    await page.evaluate((u) => { gotoPage(S.objPage.get(u), { focus: u }); select(u); }, lagerUuid(3));
+    await waitText('[data-body="Lox Logic"]', /lager_3[\s\S]*no \.loxl file declares it now/);
+  });
+  await step("the legend fades the blocks the module does not manage", async () => {
+    await page.evaluate((u) => { gotoPage(S.objPage.get(u), { focus: u }); select(null); }, FLUR);
+    await page.waitForSelector("#legend.managed #chk-only-managed", { state: "visible" });
+    await page.check("#chk-only-managed");
+    await page.waitForSelector("#canvas.only-managed");
+    const op = (u) => page.$eval(`.blk[data-uuid="${u}"]`, (n) => +getComputedStyle(n).opacity);
+    assert.ok((await op(MONO)) < 0.5, "the Monoflop is faded");
+    assert.equal(await op(FLUR), 1);
+    await page.uncheck("#chk-only-managed");
+    await page.waitForFunction(() => !document.querySelector("#canvas.only-managed"));
+  });
+  await step("Ctrl+K finds a managed block by its slug", async () => {
+    await page.evaluate(() => document.activeElement?.blur());
+    await page.keyboard.press("Control+k");
+    await page.fill("#pal-input", "lager_12");
+    await page.waitForSelector("#pal-list [role=option][aria-selected=true] .pal-slug mark");
+    assert.match(await page.textContent("#pal-list [role=option][aria-selected=true]"), /Lager 12[\s\S]*lager_12/);
+    await page.press("#pal-input", "Enter");
+    await page.waitForFunction((u) => S.sel === u, lagerUuid(12));
+  });
+  await step("a line moved in the module, not compiled, is followed", async () => {
+    writeFileSync(join(dir, "pages", "flur.loxl"), '# The module\'s own source.\npage "Obergeschoss"\n\n# Flur\nflur = And("Flur")\n');
+    await page.evaluate((u) => { gotoPage(S.objPage.get(u), { focus: u }); select(u); }, FLUR);
+    await waitText('[data-body="Lox Logic"]', /pages\/flur\.loxl:5/);
+    // Back to the Divide block, whose form is still open, for the steps that follow.
+    await pick(DIV);
+    await page.waitForSelector(field("p:Input2"));
   });
   await step("a value that is not a number is refused in the browser", async () => {
     await page.fill(field("p:Input2"), "1,5");

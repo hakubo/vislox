@@ -13,6 +13,7 @@ mod hardware;
 mod history;
 mod live;
 mod log;
+mod managed;
 mod miniserver;
 mod model;
 mod monframe;

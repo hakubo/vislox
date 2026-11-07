@@ -682,6 +682,13 @@ impl Actions {
                     .iter()
                     .map(|(n, x)| format!("{n}={}", crate::history::blob_id(x.as_bytes())))
                     .collect();
+                // The module's files: where each managed block is declared
+                // (#64) moves with them, compiled or not.
+                all.extend(
+                    crate::managed::module_texts(&p.root, &p.module)
+                        .iter()
+                        .map(|(n, x)| format!("{n}={}", crate::history::blob_id(x.as_bytes()))),
+                );
                 if let Ok(lock) = std::fs::read(&p.lock) {
                     all.push(format!("lock={}", crate::history::blob_id(&lock)));
                 }
@@ -1469,8 +1476,7 @@ impl Actions {
         deployed: Option<DeployedRev>,
         pending: Option<Arc<Vec<u8>>>,
     ) -> Value {
-        let off =
-            || json!({ "available": false, "reason": state.why, "claims": [], "managed": [] });
+        let off = || json!({ "available": false, "reason": state.why, "claims": [], "managed": [], "sources": {} });
         let Some(dir) = self.s.project.as_deref() else {
             return off();
         };
@@ -1568,6 +1574,12 @@ impl Actions {
             .map(|(_, u)| u.clone())
             .collect();
         managed.sort();
+        // Where the module declares each block it manages, the blocks added
+        // here among them (#64): UUID → slug, file and line.
+        let sources = crate::managed::sources(
+            &crate::managed::module_texts(&p.root, &p.module),
+            &lock.slugs,
+        );
         // The blocks lox can move (#60): those it manages that are drawn on a
         // page, and of them those the pending config draws elsewhere than the
         // deployed one, on the same page.
@@ -1664,6 +1676,7 @@ impl Actions {
             "claims": claims,
             "blocks": blocks,
             "managed": managed,
+            "sources": sources,
             "movable": movable,
             "moves": moves,
             "arrange": arrange,
@@ -2768,6 +2781,44 @@ sed "s/Title=\"Testhaus\"/Title=\"Testhaus $w\"/" base.Loxone > "$out"
             calls.lines().all(|l| l.starts_with("logic compile")),
             "{calls}"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_managed_blocks_point_at_their_source_lines() {
+        const AND: &str = "10000004-0000-0040-ffff504f94000001";
+        let (tmp, a) = project_for_edits();
+        let d = tmp.path().join("project");
+        std::fs::write(
+            d.join("pages/main.loxl"),
+            "# the module\nteiler = Div(\"Teiler\")\n",
+        )
+        .unwrap();
+        std::fs::write(
+            d.join("logic.lock.json"),
+            format!(
+                r#"{{"objects":{{"teiler":{{"uuid":"{DIV}","type":"Div"}}}},"externals":{{"temp":{{"uuid":"{AND}"}}}}}}"#
+            ),
+        )
+        .unwrap();
+        let e = edits_of(&a, &d).await;
+        // The extern is not managed: Loxone Config owns it.
+        assert_eq!(
+            e["sources"],
+            json!({ DIV: { "slug": "teiler", "file": "pages/main.loxl", "line": 2, "how": "declared" } }),
+            "{e}"
+        );
+        // A line moved in the module, not compiled yet: the key changes, and
+        // the line follows.
+        let key = a.edit_state.lock().unwrap().key.clone();
+        std::fs::write(
+            d.join("pages/main.loxl"),
+            "# the module\n\n# Teiler\nteiler = Div(\"Teiler\")\n",
+        )
+        .unwrap();
+        let e = edits_of(&a, &d).await;
+        assert_ne!(a.edit_state.lock().unwrap().key, key);
+        assert_eq!(e["sources"][DIV]["line"], 4, "{e}");
     }
 
     #[cfg(unix)]

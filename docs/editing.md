@@ -200,6 +200,30 @@ vx_and_1.In1 <- vx_10000006_0000_0060_ffff504f94000001.AQ
 - In the pending revision the Changes list and the canvas show a wire added (green) or removed (red, dashed), as
   for any compile. Discard drops them with the rest; Apply deploys them (`lox config push` compiles the module).
 
+## Blocks the module manages (#64)
+
+The canvas marks the blocks the module manages, so a reviewer knows whether a block is changed in a `.loxl` file
+or in Loxone Config (where an edit to a managed block is overwritten on the next push).
+
+- **Managed** means the lockfile pins the block's UUID: an entry of its `objects` (slug → UUID). The `externals`,
+  which `extern` names, are Loxone Config's and stay unmarked. The blocks added here (#59) are managed too.
+- `GET /api/edits` sends `sources`: UUID → `{ slug, file, line, how }`, `file` relative to the project and `line`
+  1-based. vislox reads them off the module's `.loxl` files with lox's own declaration scan (the one its language
+  server lists symbols with); `lox logic check --json` gives only errors' lines, and lox has no command that maps
+  a slug to its line.
+  - `declared`: a block, named signal or template instance declared by that name.
+  - `expression`: a block lox made for an expression, named `<sink>_<port key>__<op><n>` (lox's `desugar.rs`), at
+    the line of the expression: the `<-` statement, the argument of the block it feeds, or the named signal
+    (`<signal>__<op><n>`). Two expressions into one port share a prefix; the first one's line is given.
+  - `template`: a block a template instance made (`<instance>_<block>`), at the instance's line.
+  - none (`file` null): the lockfile pins it, but no `.loxl` file declares it now.
+- Like the rest of `/api/edits`, it is worked out again only when its key changes; the key covers the module's
+  `.loxl` files, so a line moved in the module and not compiled yet is followed within the next refresh (3 s).
+- The browser draws a λ badge on each managed block, a *Lox Logic* section in Properties (slug, `file:line`,
+  *Copy path*), a *managed* key and *Show managed blocks only* in the legend (only when the project has managed
+  blocks), and finds a block by its slug in Ctrl+K. Values of a managed block are still refused in *Edit values*,
+  naming its `file:line`.
+
 ## Undo and redo (#62)
 
 Undo is not a second way to change the module: it sends the edit's `undo` back to `POST /api/edit` as an edit of
@@ -319,7 +343,7 @@ Each of these plugs in as new op kinds on `POST /api/edit`, written into `<modul
 | #87 | Automatic Designer rules (`rule`) |
 | #88 | new pages (`page "…" (room: …)`) |
 
-Around the module: #64 (mark managed blocks), #65 (`lox logic check` errors), #66 (lint), #67 (`lox logic test`),
+Around the module: #64 (mark managed blocks, built), #65 (`lox logic check` errors), #66 (lint), #67 (`lox logic test`),
 #68 (review claimed access, recipients and schedules), #70 (removals on Apply).
 
 ## The browser
@@ -354,7 +378,8 @@ Around the module: #64 (mark managed blocks), #65 (`lox logic check` errors), #6
   revision fails; Properties says so.
 - `GET /api/edits` lists what vislox's files claim now and in the deployed revision, which of it is not
   deployed, the blocks vislox added (`blocks`: slug, UUID, type, page, file, and whether the deployed config has
-  it), the other blocks the module manages, the blocks lox can move (`movable`: managed and drawn on a page) and
+  it), the other blocks the module manages (`managed`), where the module makes each managed block (`sources`,
+  #64), the blocks lox can move (`movable`: managed and drawn on a page) and
   those the pending config draws elsewhere than the deployed one (`moves`: UUID, position, deployed position),
   for each page with such a block whether *Arrange* can lay it out (`arrange`: page UUID → null, or why not), and
   the wires vislox's files draw now or drew in the deployed revision (`wires`: `from`, `to`, `now`, `deployed`), the

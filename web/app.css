@@ -631,6 +631,17 @@ rect.ghost, line.ghost { fill: #1f6fd10a; stroke: var(--moved); stroke-opacity: 
 .abadge circle { fill: #2f6fb3; stroke: #fff; stroke-width: 1.5px; vector-effect: non-scaling-stroke; }
 .abadge rect, .abadge line { fill: none; stroke: #fff; stroke-width: 16px; }
 .lg.in-app::before { border-color: #2f6fb3; background: #2f6fb3; border-radius: 50%; }
+/* Managed by the project's Lox Logic module (#64) */
+.mbadge rect { fill: #6b4fa8; stroke: #fff; stroke-width: 1.5px; vector-effect: non-scaling-stroke; }
+.mbadge text { fill: #fff; font-size: 130px; font-weight: 700; }
+.legend:not(.managed) .managed-only { display: none; }
+.lg.managed-k::before { border-color: #6b4fa8; background: #6b4fa8; border-radius: 4px; }
+.only-managed .blk:not(.managed):not(.lit), .only-managed .tag:not(.lit), .only-managed .xref:not(.lit) { opacity: .25; }
+.only-managed .wire:not(.m-wire):not(.lit) { opacity: .2; }
+.chip.managed { border-color: #6b4fa8; color: #6b4fa8; }
+.src-path { overflow-wrap: anywhere; }
+.src-how { color: var(--muted); font-size: 12px; margin-top: 2px; }
+.pal-slug { font-size: 11px; }
 .app-ic { width: 16px; height: 16px; vertical-align: -3px; margin-right: 4px; }
 .tn-ic.app { background: transparent; }
 .tn-ic.app .app-ic { margin: 0; }
