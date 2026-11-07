@@ -245,7 +245,7 @@ impl HwFile {
                             title: b.title,
                             at,
                         });
-                    } else if stats_value(&b.block_type).is_some() || is_io(&b.block_type) {
+                    } else if is_io(&b.block_type) {
                         let device = match take(&mut args, "device") {
                             Some(Value::Ref(d)) => d,
                             _ => return Err(bad()),
@@ -482,6 +482,39 @@ pub fn created_slug(files: &Files, ctx: &Ctx, uuid: &str) -> Option<String> {
         .map(|d| d.slug.clone())
 }
 
+/// Whether the object `uuid` hangs below a Tree device created here.
+pub fn below_created(files: &Files, ctx: &Ctx, uuid: &str) -> bool {
+    path(&ctx.doc.xml.root, uuid).is_some_and(|chain| {
+        chain.iter().rev().skip(1).any(|e| {
+            e.attr("U")
+                .is_some_and(|u| created_slug(files, ctx, u).is_some())
+        })
+    })
+}
+
+/// A designation (`IName=`) vislox declares an I/O by: letters and digits.
+fn valid_iname(i: &str) -> bool {
+    !i.is_empty() && i.chars().all(|c| c.is_ascii_alphanumeric())
+}
+
+/// The slug of the I/O `iname` of the device `dev` created here.
+fn io_slug(dev: &str, iname: &str) -> String {
+    format!("{dev}_{}", iname.to_ascii_lowercase())
+}
+
+/// Whether `s` is taken: by the rest of the module, the lockfile (its
+/// tombstones and externals among it) or vislox's files. `own` is the
+/// object the slug stands for, when known: its own lockfile entry and
+/// tombstone, and `removed` lines, do not count.
+pub fn slug_taken(files: &Files, ctx: &Ctx, s: &str, own: Option<&str>) -> bool {
+    let mine = |u: &str| own.is_some_and(|o| o.eq_ignore_ascii_case(u));
+    ctx.names.contains(s)
+        || ctx.lock.slugs.contains_key(s)
+        || ctx.lock.externals.get(s).is_some_and(|u| !mine(u))
+        || ctx.lock.tombs.iter().any(|(u, (t, _))| t == s && !mine(u))
+        || files.names_with(s, own.is_none())
+}
+
 /// The slug the rest of the module declares the object `uuid` by, when it
 /// does (a hardware declaration owns it).
 fn module_owner<'a>(files: &Files, ctx: &'a Ctx, uuid: &str) -> Option<&'a str> {
@@ -515,14 +548,30 @@ pub fn set_statistics(
         Some("off") => Some(false),
         Some(v) => return Err(format!("Statistics: on or off, not \"{v}\"")),
     };
-    // The claim as vislox's file has it, found by UUID or (below a device
-    // created here) by its designation.
-    let at = files.hardware.ios.iter().position(|io| {
-        let u = match &io.at {
-            IoAt::Uuid(u) => Some(u.as_str()),
-            IoAt::IName(_) => ctx.lock.externals.get(&io.slug).map(String::as_str),
-        };
-        u.is_some_and(|u| u.eq_ignore_ascii_case(uuid))
+    let chain = path(&ctx.doc.xml.root, uuid);
+    // The device created here it hangs below, if any, and its designation.
+    let created_dev = chain.as_ref().and_then(|c| {
+        c.iter()
+            .rev()
+            .skip(1)
+            .find_map(|e| e.attr("U").and_then(|u| created_slug(files, ctx, u)))
+    });
+    let iname = chain
+        .as_ref()
+        .and_then(|c| c.last().and_then(|e| e.attr("IName")));
+    // The claim as vislox's files have it now (an earlier op of the request
+    // may have written or dropped it): by UUID, or below a device created
+    // here by its designation; the lockfile only for an I/O gone since.
+    let at = files.hardware.ios.iter().position(|io| match &io.at {
+        IoAt::Uuid(u) => u.eq_ignore_ascii_case(uuid),
+        IoAt::IName(i) => match (&created_dev, iname) {
+            (Some(d), Some(n)) => io.device == *d && i == n,
+            _ => ctx
+                .lock
+                .externals
+                .get(&io.slug)
+                .is_some_and(|u| u.eq_ignore_ascii_case(uuid)),
+        },
     });
     let previous = at
         .and_then(|i| files.hardware.ios[i].stats)
@@ -531,7 +580,6 @@ pub fn set_statistics(
     if want.is_none() {
         // Dropping vislox's claim is always allowed.
         if let Some(i) = at {
-            files.hardware.ios[i].stats = None;
             files.hardware.ios.remove(i);
             files.hardware.prune();
         }
@@ -541,8 +589,7 @@ pub fn set_statistics(
             warnings: Vec::new(),
         });
     }
-    let chain = path(&ctx.doc.xml.root, uuid)
-        .ok_or_else(|| format!("no object {uuid} in the pending config"))?;
+    let chain = chain.ok_or_else(|| format!("no object {uuid} in the pending config"))?;
     let el = *chain.last().expect("found");
     let ty = el.attr("Type").unwrap_or_default().to_string();
     let name = named(el);
@@ -574,16 +621,15 @@ pub fn set_statistics(
     }
     if let Some(i) = at {
         files.hardware.ios[i].stats = want;
-    } else if let Some(dev_slug) = created_slug(files, ctx, &dev_uuid) {
+    } else if let Some(dev_slug) = created_dev {
         // Below a device created here: by its designation, since lox mints
         // its UUIDs anew until the device is deployed.
-        let iname = el
-            .attr("IName")
-            .filter(|i| !i.trim().is_empty())
-            .ok_or_else(|| format!("{name}: it has no designation (IName) to declare it by"))?
-            .to_string();
-        let slug = format!("{dev_slug}_{}", iname.to_ascii_lowercase());
-        if files.hardware.names(&slug) || ctx.names.contains(&slug) {
+        let iname = iname.filter(|i| valid_iname(i)).ok_or_else(|| {
+            format!("{name}: it has no designation of letters and digits (IName) to declare it by")
+        })?;
+        let iname = iname.to_string();
+        let slug = io_slug(&dev_slug, &iname);
+        if slug_taken(files, ctx, &slug, Some(uuid)) {
             return Err(format!("{name}: the name `{slug}` is taken"));
         }
         files.hardware.ios.push(Io {
@@ -600,7 +646,13 @@ pub fn set_statistics(
             ));
         }
         let dev_slug = hw_slug(&dev_uuid);
-        if !files.hardware.devices.iter().any(|d| d.slug == dev_slug) {
+        let has_dev = files.hardware.devices.iter().any(|d| d.slug == dev_slug);
+        for (s, u) in [(hw_slug(uuid), uuid), (dev_slug.clone(), dev_uuid.as_str())] {
+            if (s != dev_slug || !has_dev) && slug_taken(files, ctx, &s, Some(u)) {
+                return Err(format!("{name}: the name `{s}` is taken"));
+            }
+        }
+        if !has_dev {
             files.hardware.devices.push(Device {
                 slug: dev_slug.clone(),
                 ty: dev_ty,
@@ -625,13 +677,17 @@ pub fn set_statistics(
 
 // ── creating a Tree device ─────────────────────────────────────────────
 
-/// Why a Tree device cannot be added on the Tree extension `tree` now
-/// (`Ok`: it can).
-fn tree_ok(ctx: &Ctx, tree: &str) -> Result<(), String> {
-    let el = find_ci(&ctx.doc.xml.root, tree)
+/// The Tree extension `tree` of the pending config.
+fn tree_el<'a>(ctx: &'a Ctx, tree: &str) -> Result<&'a Element, String> {
+    find_ci(&ctx.doc.xml.root, tree)
         .filter(|e| e.attr("Type") == Some(TREE))
-        .ok_or_else(|| format!("no Tree extension {tree} in the pending config"))?;
-    if find_ci(&ctx.base.xml.root, tree).is_none() {
+        .ok_or_else(|| format!("no Tree extension {tree} in the pending config"))
+}
+
+/// Why a Tree device cannot be added on the Tree extension `el` now (`Ok`:
+/// it can); `in_base`: the base has it, which lox resolves the extern in.
+fn tree_ok(el: &Element, in_base: bool) -> Result<(), String> {
+    if !in_base {
         return Err(format!(
             "{}: it is not in the project's base config; Apply it first",
             named(el)
@@ -640,33 +696,50 @@ fn tree_ok(ctx: &Ctx, tree: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// [`tree_ok`] of the Tree extension `tree`: the element, once checked.
+fn tree_checked<'a>(ctx: &'a Ctx, tree: &str) -> Result<&'a Element, String> {
+    let el = tree_el(ctx, tree)?;
+    tree_ok(el, find_ci(&ctx.base.xml.root, tree).is_some())?;
+    Ok(el)
+}
+
+/// The Tree extensions of `el`, in document order.
+fn trees_of<'a>(el: &'a Element, out: &mut Vec<&'a Element>) {
+    if el.attr("Type") == Some(TREE) {
+        out.push(el);
+    }
+    for c in el.child_elements() {
+        trees_of(c, out);
+    }
+}
+
 /// For each Tree extension of the config shown, whether a device can be
 /// added there now (`null`), or why not (`GET /api/edits`' `add_under`).
+/// One walk of each config.
 pub fn add_refusals(ctx: &Ctx) -> serde_json::Map<String, Json> {
-    fn walk(el: &Element, out: &mut Vec<String>) {
-        if el.attr("Type") == Some(TREE)
-            && let Some(u) = el.attr("U")
-        {
-            out.push(u.to_string());
-        }
-        for c in el.child_elements() {
-            walk(c, out);
-        }
-    }
-    let mut at = Vec::new();
-    walk(&ctx.doc.xml.root, &mut at);
-    at.into_iter()
-        .map(|u| {
-            let why = tree_ok(ctx, &u).err();
-            (u, json!(why))
+    let (mut shown, mut based) = (Vec::new(), Vec::new());
+    trees_of(&ctx.doc.xml.root, &mut shown);
+    trees_of(&ctx.base.xml.root, &mut based);
+    let in_base: BTreeSet<String> = based
+        .iter()
+        .filter_map(|e| e.attr("U").map(str::to_ascii_lowercase))
+        .collect();
+    shown
+        .into_iter()
+        .filter_map(|el| {
+            let u = el.attr("U")?;
+            let why = tree_ok(el, in_base.contains(&u.to_ascii_lowercase())).err();
+            Some((u.to_string(), json!(why)))
         })
         .collect()
 }
 
-/// The setting of `add_block` that switches the statistics of a new
-/// device's I/O on or off: `<iname>.Statistics`. The undo of a delete
-/// carries them, so the device comes back as it was.
+/// The settings of `add_block` that switch the statistics of a new device's
+/// I/O on or off: `<iname>.Statistics`, with the I/O's type as
+/// `<iname>.Type`. The undo of a take-out carries them, so the device comes
+/// back as it was.
 const STATS_SUFFIX: &str = ".Statistics";
+const TYPE_SUFFIX: &str = ".Type";
 
 /// `add_block` of a `TreeDevice` on the Tree extension `page`: a device lox
 /// creates, unpaired. Its settings are `kind` and `branch`.
@@ -682,7 +755,7 @@ pub fn add_device(files: &mut Files, ctx: &Ctx, op: &Op) -> Result<Applied, Stri
     else {
         unreachable!()
     };
-    tree_ok(ctx, tree)?;
+    let tree_el = tree_checked(ctx, tree)?;
     if !params.is_empty() || !wires.is_empty() {
         return Err("a Tree device takes no constants or wires here".into());
     }
@@ -708,35 +781,57 @@ pub fn add_device(files: &mut Files, ctx: &Ctx, op: &Op) -> Result<Applied, Stri
     {
         return Err(format!("branch: left or right, not \"{b}\""));
     }
-    let mut stats = Vec::new();
+    // Per designation: (statistics, type).
+    let mut ios: BTreeMap<String, (Option<bool>, Option<String>)> = BTreeMap::new();
     for (k, v) in &settings {
-        let Some(iname) = k
-            .strip_suffix(STATS_SUFFIX)
-            .filter(|i| !i.is_empty() && i.chars().all(|c| c.is_ascii_alphanumeric()))
-        else {
+        let (iname, stats) = match (k.strip_suffix(STATS_SUFFIX), k.strip_suffix(TYPE_SUFFIX)) {
+            (Some(i), _) => (i, true),
+            (_, Some(i)) => (i, false),
+            _ => return Err(format!("a Tree device: {k} cannot be set here")),
+        };
+        if !valid_iname(iname) {
             return Err(format!("a Tree device: {k} cannot be set here"));
-        };
-        let on = match v.as_str() {
-            "on" => true,
-            "off" => false,
-            _ => return Err(format!("{k}: on or off, not \"{v}\"")),
-        };
-        stats.push((iname.to_string(), on));
+        }
+        let slot = ios.entry(iname.to_string()).or_default();
+        if stats {
+            slot.0 = Some(match v.as_str() {
+                "on" => true,
+                "off" => false,
+                _ => return Err(format!("{k}: on or off, not \"{v}\"")),
+            });
+        } else {
+            if stats_value(v).is_none() || !DEVICES[0].1.contains(&v.as_str()) {
+                return Err(format!(
+                    "{k}: a Tree input, digital output or analog sensor, not \"{v}\""
+                ));
+            }
+            slot.1 = Some(v.clone());
+        }
+    }
+    let mut stats = Vec::new();
+    for (iname, slot) in ios {
+        match slot {
+            (Some(on), Some(ty)) => stats.push((iname, ty, on)),
+            _ => {
+                return Err(format!(
+                    "a Tree device: {iname}{STATS_SUFFIX} and {iname}{TYPE_SUFFIX} go together"
+                ));
+            }
+        }
     }
     let title = title
         .as_deref()
         .map(|t| crate::edit::block_title(TREE_DEVICE, t))
         .transpose()?;
-    let tree_el = find_ci(&ctx.doc.xml.root, tree).expect("checked");
     let tree_uuid = tree_el.attr("U").unwrap_or(tree).to_string();
-    let taken = |s: &str| {
-        ctx.names.contains(s)
-            || ctx.lock.slugs.contains_key(s)
-            || ctx.lock.externals.contains_key(s)
-            || ctx.lock.tombstoned(s)
-            || files.names(s)
-    };
-    let slug = crate::blocks::new_slug(&kind, &taken);
+    let slug = crate::blocks::new_slug(&kind, &|s| slug_taken(files, ctx, s, None));
+    if let Some(s) = stats
+        .iter()
+        .map(|(i, ..)| io_slug(&slug, i))
+        .find(|s| slug_taken(files, ctx, s, None))
+    {
+        return Err(format!("the name `{s}` is taken"));
+    }
     // Everything is checked: from here on `files` changes.
     let hw = &mut files.hardware;
     if !hw.trees.iter().any(|u| u.eq_ignore_ascii_case(&tree_uuid)) {
@@ -752,10 +847,10 @@ pub fn add_device(files: &mut Files, ctx: &Ctx, op: &Op) -> Result<Applied, Stri
             branch,
         },
     });
-    for (iname, on) in stats {
+    for (iname, ty, on) in stats {
         hw.ios.push(Io {
-            slug: format!("{slug}_{}", iname.to_ascii_lowercase()),
-            ty: io_type(&iname),
+            slug: io_slug(&slug, &iname),
+            ty,
             device: slug.clone(),
             at: IoAt::IName(iname),
             stats: Some(on),
@@ -766,21 +861,6 @@ pub fn add_device(files: &mut Files, ctx: &Ctx, op: &Op) -> Result<Applied, Stri
         added: Some(slug),
         warnings: Vec::new(),
     })
-}
-
-/// The I/O type of a created device's designation: `AI…` an analog sensor,
-/// `AQ…` an analog output, `Q…` a digital output, else a digital input.
-fn io_type(iname: &str) -> String {
-    if iname.starts_with("AI") {
-        "TreeAsensor"
-    } else if iname.starts_with("AQ") {
-        "TreeAactor"
-    } else if iname.starts_with('Q') {
-        "TreeActor"
-    } else {
-        "TreeSensor"
-    }
-    .into()
 }
 
 /// The name of a created device, written into its declaration.
@@ -806,7 +886,7 @@ pub fn set_title(files: &mut Files, slug: &str, value: Option<&str>) -> Result<A
 
 /// Whether the created device `slug` (UUID `uuid`) can be deleted or taken
 /// out now: `Err` says why not. Changes nothing.
-pub fn removal(files: &Files, ctx: &Ctx, slug: &str, uuid: &str) -> Result<bool, String> {
+pub fn removal(files: &Files, ctx: &Ctx, uuid: &str) -> Result<bool, String> {
     let el = find_ci(&ctx.doc.xml.root, uuid)
         .ok_or_else(|| format!("no object {uuid} in the pending config"))?;
     let name = named(el);
@@ -862,15 +942,9 @@ pub fn removal(files: &Files, ctx: &Ctx, slug: &str, uuid: &str) -> Result<bool,
             ));
         }
     }
-    let deployed = ctx
+    Ok(ctx
         .deployed
-        .is_some_and(|d| find_ci(&d.xml.root, uuid).is_some());
-    if deployed && !ctx.lock.externals.contains_key(slug) {
-        return Err(format!(
-            "{name}: the lockfile has no entry for `{slug}`; compile the module first"
-        ));
-    }
-    Ok(deployed)
+        .is_some_and(|d| find_ci(&d.xml.root, uuid).is_some()))
 }
 
 /// `remove_block` of the device `slug` vislox created, with `removed
@@ -883,7 +957,7 @@ pub fn remove_device(
     slug: &str,
     uuid: &str,
 ) -> Result<Applied, String> {
-    let deployed = removal(files, ctx, slug, uuid)?;
+    let deployed = removal(files, ctx, uuid)?;
     let hw = &mut files.hardware;
     let d = hw.created(slug).expect("checked").clone();
     let DevAt::Create { kind, tree, branch } = &d.at else {
@@ -928,6 +1002,7 @@ pub fn remove_device(
         for io in &ios {
             if let (IoAt::IName(i), Some(s)) = (&io.at, io.stats) {
                 settings.insert(format!("{i}{STATS_SUFFIX}"), on_off(s).into());
+                settings.insert(format!("{i}{TYPE_SUFFIX}"), io.ty.clone());
             }
         }
         Op::AddBlock {
@@ -953,12 +1028,10 @@ pub fn remove_device(
     })
 }
 
-/// Whether a `restore_block`'s source is a device of [`FILE`].
-pub fn restores_device(source: &str) -> bool {
-    source
-        .lines()
-        .next()
-        .is_some_and(|l| l.contains(&format!("= {TREE_DEVICE}(")) && l.contains("kind:"))
+/// Whether a `restore_block` of `uuid` brings back a Tree device: what the
+/// lockfile's tombstone of it says, never the request.
+pub fn restores_device(ctx: &Ctx, uuid: &str) -> bool {
+    ctx.lock.tomb(uuid).is_some_and(|t| t.2 == TREE_DEVICE)
 }
 
 /// `restore_block` of a device vislox created and deleted while lox keeps
@@ -1013,16 +1086,10 @@ pub fn restore_device(files: &mut Files, ctx: &Ctx, op: &Op) -> Result<Applied, 
     {
         return Err(format!("{} is no {kind}", named(el)));
     }
-    tree_ok(ctx, page)?;
-    let in_use = |s: &str| {
-        ctx.names.contains(s)
-            || ctx.lock.slugs.contains_key(s)
-            || ctx.lock.externals.contains_key(s)
-            || files.names_except_removed(s)
-    };
+    tree_checked(ctx, page)?;
     if let Some(s) = std::iter::once(&d.slug)
         .chain(parsed.ios.iter().map(|i| &i.slug))
-        .find(|s| in_use(s))
+        .find(|s| slug_taken(files, ctx, s, Some(tomb_uuid)))
     {
         return Err(format!("the name `{s}` is taken now"));
     }

@@ -1924,7 +1924,7 @@ impl Files {
     }
 
     /// [`Files::names`] without the `removed` lines.
-    pub fn names_except_removed(&self, slug: &str) -> bool {
+    fn names_except_removed(&self, slug: &str) -> bool {
         (self.hardware.names(slug) && !self.hardware.removed.contains(slug))
             || self.claims.8.contains_key(slug)
             || crate::set_claim::KINDS
@@ -2153,7 +2153,7 @@ pub fn apply_op(files: &mut Files, ctx: &Ctx, op: &Op) -> Result<Applied, String
             Some(slug) => crate::hw_edit::remove_device(files, ctx, &slug, uuid),
             None => remove_block(files, ctx, uuid),
         },
-        Op::RestoreBlock { source, .. } if crate::hw_edit::restores_device(source) => {
+        Op::RestoreBlock { uuid, .. } if crate::hw_edit::restores_device(ctx, uuid) => {
             crate::hw_edit::restore_device(files, ctx, op)
         }
         Op::RestoreBlock { .. } => restore_block(files, ctx, op),
@@ -2224,7 +2224,7 @@ pub fn apply_op(files: &mut Files, ctx: &Ctx, op: &Op) -> Result<Applied, String
                 // would name nothing.
                 None if op.value().is_some()
                     && find_ci(&ctx.base.xml.root, uuid).is_none()
-                    && find_ci(&ctx.doc.xml.root, uuid).is_some() =>
+                    && crate::hw_edit::below_created(files, ctx, uuid) =>
                 {
                     Err(format!(
                         "{}: it is not in the project's base config yet; edit it once Apply \
@@ -2794,7 +2794,7 @@ pub fn delete_refusals(files: &Files, ctx: &Ctx, uuids: &[String]) -> Vec<Option
         .iter()
         .map(|u| match crate::hw_edit::created_slug(files, ctx, u) {
             // A Tree device created here (#85).
-            Some(s) => crate::hw_edit::removal(files, ctx, &s, u).err(),
+            Some(_) => crate::hw_edit::removal(files, ctx, u).err(),
             None => removal(files, ctx, u, &below).err(),
         })
         .collect()
@@ -9962,6 +9962,20 @@ mod tests {
         let mono = l.objects["vx_treppe_ausgang"].uuid.clone();
         let el = find(&out.xml.root, &mono).unwrap();
         assert_eq!(el.attr_decoded("Title").as_deref(), Some("Flur"));
+        // A member's value op is not taken for one below a Tree device created
+        // here (#85), whether the lock knows it yet or not.
+        for lk in [lock_of(&l), Lock::default()] {
+            let ctx = ctx_of(&out, &d, &lk, None, &names);
+            let title = Op::Title {
+                uuid: mono.clone(),
+                value: Some("Gang".into()),
+            };
+            let r = apply_op(&mut files.clone(), &ctx, &title);
+            assert!(
+                !r.as_ref().is_err_and(|e| e.contains("base config")),
+                "{r:?}"
+            );
+        }
         // Its call as the op takes it: the text unquoted.
         let (_, def) = files.instance("vx_treppe").unwrap();
         let call = crate::template_edit::call_of(def);
@@ -11444,6 +11458,74 @@ mod tests {
     }
 
     #[test]
+    fn a_new_device_s_input_is_claimed_and_dropped_in_one_request_by_its_designation() {
+        let d = doc("hardware.Loxone");
+        let names = BTreeSet::new();
+        let mut files = Files::default();
+        let mut l = Lockfile::default();
+        let lock = lock_of(&l);
+        let ctx = ctx_of(&d, &d, &lock, None, &names);
+        apply_op(
+            &mut files,
+            &ctx,
+            &add(HW_TREE, "TreeDevice", None, &[], &[("kind", "TouchTree")]),
+        )
+        .unwrap();
+        let out = compile_files(&d, &files, &mut l).unwrap();
+        let dev = l.externals["vx_touchtree_1"].uuid.clone();
+        let ai1 = io_of(&out, &dev, "AI1");
+        // The lock does not know the I/O's declaration yet: on, off, then
+        // Revert in one request each see the one before.
+        let lock = lock_of(&l);
+        let ctx = ctx_of(&out, &d, &lock, None, &names);
+        let mut f = files.clone();
+        let a = apply_op(&mut f, &ctx, &stats(&ai1, Some("on"))).unwrap();
+        assert_eq!(a.previous, serde_json::Value::Null);
+        let b = apply_op(&mut f, &ctx, &stats(&ai1, Some("off"))).unwrap();
+        assert_eq!(b.previous, serde_json::json!("on"));
+        assert_eq!(f.hardware.ios.len(), 1);
+        let c = apply_op(&mut f, &ctx, &stats(&ai1, None)).unwrap();
+        assert_eq!(c.previous, serde_json::json!("off"));
+        assert!(f.hardware.ios.is_empty(), "{:?}", f.hardware.ios);
+        // And on again: not "taken" by the claim dropped a moment ago.
+        apply_op(&mut f, &ctx, &stats(&ai1, Some("on"))).unwrap();
+        assert_eq!(f.hardware.ios[0].slug, "vx_touchtree_1_ai1");
+        assert_eq!(f.hardware.ios[0].ty, "TreeAsensor");
+
+        // A designation that is no identifier is refused, as add_block would.
+        let xml = String::from_utf8(out.to_bytes())
+            .unwrap()
+            .replace("IName=\"AI1\"", "IName=\"A-1\"");
+        let odd = LoxoneDoc::parse(xml.as_bytes()).unwrap();
+        let ctx = ctx_of(&odd, &d, &lock, None, &names);
+        let e = apply_op(&mut files.clone(), &ctx, &stats(&ai1, Some("on"))).unwrap_err();
+        assert!(e.contains("letters and digits"), "{e}");
+
+        // Its undo carries each I/O's type: one left out, or another, is refused.
+        let ctx = ctx_of(&d, &d, &lock, None, &names);
+        for (settings, why) in [
+            (vec![("I1.Statistics", "on")], "go together"),
+            (
+                vec![("I1.Statistics", "on"), ("I1.Type", "VoltageIn")],
+                "not \"VoltageIn\"",
+            ),
+            (vec![("I-1.Statistics", "on")], "cannot be set here"),
+        ] {
+            let mut all = vec![("kind", "TouchTree")];
+            all.extend(settings);
+            let e = apply_op(
+                &mut files.clone(),
+                &ctx,
+                &add(HW_TREE, "TreeDevice", None, &[], &all),
+            )
+            .unwrap_err();
+            assert!(e.contains(why), "{why}: {e}");
+        }
+        // A restore is a Tree device's only by the lockfile's tombstone.
+        assert!(!crate::hw_edit::restores_device(&ctx, &dev));
+    }
+
+    #[test]
     fn the_hardware_file_takes_only_what_vislox_writes() {
         for text in [
             "a = And()\n",
@@ -11582,6 +11664,7 @@ mod tests {
                 ("kind", "PresenceSensorTree"),
                 ("branch", "left"),
                 ("I1.Statistics", "on"),
+                ("I1.Type", "TreeSensor"),
             ],
         );
         if let Op::AddBlock { restores, .. } = &mut want {

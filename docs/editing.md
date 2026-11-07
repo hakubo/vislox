@@ -676,9 +676,10 @@ vx_hw_20000003_0000_0031_ffff504f94000002 = TreeAsensor(device: vx_hw_20000003_0
 - **Taken out or deleted** with *Remove*/*Delete* (`remove_block`): its declaration and its I/O's go, with `removed
   <slug>` (lox keeps a created device from its first compile on and refuses to let its declaration go without it).
   Not deployed: its `previous` is the `add_block` with its kind, branch, name and its I/O's statistics
-  (`<iname>.Statistics`); lox creates it under a new UUID. Deployed: Apply deletes it, and its `previous` is the
-  `restore_block` (its declaration as the `source`, the extension as `page`), which brings it back with its UUID while
-  lox keeps the tombstone; vislox rebuilds its lockfile entries from the deployed config, checks the tombstone, the
+  (`<iname>.Statistics` with the I/O's type, `<iname>.Type`); lox creates it under a new UUID. A designation is letters
+  and digits, its slug `<device>_<iname>`. Deployed: Apply deletes it, and its `previous` is the
+  `restore_block` (its declaration as the `source`, the extension as `page`; it is taken for a Tree device's by the
+  lockfile's tombstone, never by the source), which brings it back with its UUID while lox keeps the tombstone; vislox rebuilds its lockfile entries from the deployed config, checks the tombstone, the
   slug, the kind and the extension, and never takes them from the request. Refused while a wire (drawn in Loxone
   Config or anywhere) leaves one of its objects (lox does not delete a device that feeds a wire), and while vislox's
   file claims a value of one of them. Not offered: renaming it (`blocks[].renames: false`).

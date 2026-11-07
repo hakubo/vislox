@@ -2552,12 +2552,13 @@ fn obj_info(
         api_linked: Vec::new(),
         device,
         edit: if gone { None } else { crate::edit::caps(el) },
+        // Only where lox switches them, as `caps` offers them (#85).
         statistics_old: old
-            .filter(|_| d.on)
+            .filter(|_| d.on && crate::hw_edit::stats_value(&ty).is_some())
             .and_then(|o| o.el(uuid))
             .and_then(crate::hw_edit::stats_state)
             .filter(|o| crate::hw_edit::stats_state(el).as_ref() != Some(o)),
-        statistics: crate::hw_edit::stats_state(el),
+        statistics: crate::hw_edit::stats_value(&ty).and_then(|_| crate::hw_edit::stats_state(el)),
         uuid: uuid.to_string(),
         title: c.title(uuid),
         old_title: d.renamed.get(uuid).cloned().flatten(),
@@ -5184,6 +5185,17 @@ mod tests {
         assert_eq!(
             v.objects["20000005-0000-0051-ffff504f94000002"].statistics,
             None
+        );
+        // An analog output lox records no statistics on: none shown, whatever it has.
+        let ao = hw_edited(&[(
+            "<C Type=\"TreeAsensor\" IName=\"AI1\"",
+            "<C Type=\"TreeAactor\" StatsType=\"11\" IName=\"AQ1\"",
+        )]);
+        let v = build(&doc(&ao), Some(&doc(HW)), "t");
+        let o = &v.objects["20000003-0000-0031-ffff504f94000002"];
+        assert_eq!(
+            (o.statistics.as_deref(), o.statistics_old.as_deref()),
+            (None, None)
         );
     }
 
