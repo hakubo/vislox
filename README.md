@@ -46,6 +46,8 @@ Then open <http://127.0.0.1:7878>. Started without a path or `--ctx` in a direct
   draw wires, then Apply, Sync and Discard from the browser.
 - For a `lox.toml` project: the blocks its Lox Logic module manages marked, each with the `.loxl` file and line that
   makes it.
+- For a `lox.toml` project: `lox logic check` errors listed by file, line and block when the module doesn't compile
+  (Apply is off until it does), and *Compile* when the pending config is from before the module's latest change.
 - Ctrl+K to find any page or block (by name, or by its Lox Logic slug), links that reopen a page, block and revision, and full keyboard use (`?`).
 
 Details: [docs/features.md](docs/features.md).
@@ -115,6 +117,7 @@ Opt-ins:
 |---|---|---|
 | Apply | `--admin-token-file`, then the token in the browser | `lox config push --force`: upload and program restart |
 | Sync, Discard | `--admin-token-file`, then the token | nothing; they change the project and its git repository |
+| Compile (a module changed outside vislox) | `--admin-token-file`, then the token | nothing; it runs `lox logic compile` |
 | Edit values, add and move blocks, draw wires | `--admin-token-file`, then the token | nothing; vislox writes its files in the module (and positions in the lockfile) and runs `lox logic compile` |
 | Operate virtual inputs | `--operate` with `--admin-token-file` | `jdev/sps/io/<uuid>/<cmd>`, only to `VirtualIn` objects, each confirmed |
 | Query blocks on this page | a toggle in the legend, off by default | read-only `jdev/sps/io/<uuid>/all`, at most 20 a second |

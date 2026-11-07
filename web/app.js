@@ -1131,15 +1131,18 @@ function renderPropsBody() {
   const ed = editRows(o, row);
   if (ed) section("Edit", ed.rows, ed.count);
   const ms = managedSrc(o.uuid);
-  if (ms) {
+  // The errors of lox logic check whose line names this block (#65): on the newest config only.
+  const ce = S.rev === editRev()?.id ? checkErrors(o.uuid) : [];
+  if (ms || ce.length) {
     const path = srcPath(ms);
-    section("Lox Logic", [
+    const rows = ce.map((e) => `<div class="ed-note ck-err">⚠ Doesn't compile${e.file ? ` (${esc(checkAt(e))})` : ""}: ${esc(e.message)}</div>`);
+    if (ms) rows.push(
       row("Slug", `<span class="mono">${esc(ms.slug)}</span>`),
       row("Source", path
         ? `<span class="mono src-path">${esc(path)}</span><button type="button" class="copy" data-copy="${esc(path)}" data-label="Copy path" title="Copy the file and line, for an editor or a prompt">Copy path</button><div class="src-how">${esc(srcHow(ms))}</div>`
         : `<span class="none-v">${esc(srcHow(ms))}</span>`),
-      `<div class="ed-note">Change it in the module: an edit made in Loxone Config is overwritten on the next push.</div>`,
-    ]);
+      `<div class="ed-note">Change it in the module: an edit made in Loxone Config is overwritten on the next push.</div>`);
+    section("Lox Logic", rows, ce.length || undefined);
   }
   const opT = opTarget(o);
   if (opT) section("Operate", [opControls(opT)]);
@@ -2069,15 +2072,17 @@ function renderActions() {
   if (!a?.shown) return;
   const busy = !!a.running;
   const pend = pendingChange();
+  renderCheck();
   $("deploy-pend").classList.toggle("idle", !pend && !a.running);
   $("deploy-pend").textContent = a.running === "Apply" ? "Deploying to the Miniserver… (download, check, upload, restart, verify)"
     : a.running === "Edit" ? "Compiling the edit… (lox logic compile; nothing is deployed)"
+    : a.running === "Compile" ? "Compiling the module… (lox logic compile; nothing is deployed)"
     : a.running ? `${a.running}…` : pend ? `Compiled changes are pending (${fmtWhen(pend.time)}), not deployed.` +
       editsHere() + " Review them, then apply."
     : !a.apply.available ? `Apply is off: ${a.apply.reason}.`
     : `Nothing pending. ${a.edit?.available ? "Edit values in Properties, add blocks to a page, or edit" : "Edit"} the project's module and compile it (lox logic …); the result shows here for review.`;
   $("deploy-row").classList.toggle("hidden", !pend && !a.running);
-  $("btn-apply").disabled = !a.apply.available || busy || !pend || applyAsking;
+  $("btn-apply").disabled = !a.apply.available || busy || !pend || applyAsking || checkBroken();
   const sync = $("btn-sync");
   sync.disabled = !a.apply.available || busy || !!pend;
   sync.classList.toggle("busy", a.running === "Sync");
@@ -2087,12 +2092,13 @@ function renderActions() {
     : "Make the Miniserver's running config the project's base (lox config merge), then commit and push" + msWarn("sync");
   $("btn-discard").disabled = !a.apply.available || busy || !pend;
   $("btn-apply").title = !a.apply.available ? `Cannot apply: ${a.apply.reason}`
+    : checkBroken() ? "Cannot apply: the module doesn't compile (see above)"
     : "Deploy to the Miniserver with lox config push, then commit and push to git" + msWarn("apply");
   renderSteps(a);
   const last = a.last;
   if (last && last.at !== renderActions.shownAt) {
     renderActions.shownAt = last.at;
-    const head = { apply: [last.warn ? "Applied, but not verified.\n" : "Applied.\n", "Apply failed.\n"], sync: ["", "Sync failed.\n"], discard: ["", "Discard failed.\n"] }[last.kind] || ["", ""];
+    const head = { apply: [last.warn ? "Applied, but not verified.\n" : "Applied.\n", "Apply failed.\n"], sync: ["", "Sync failed.\n"], discard: ["", "Discard failed.\n"], compile: ["", "Compile failed.\n"] }[last.kind] || ["", ""];
     deployMsg(head[last.ok ? 0 : 1] + last.message, !last.ok, last.ok && last.warn);
     // What the new program logged as it started.
     if (last.kind === "apply") logStale();
@@ -2415,7 +2421,10 @@ async function apply() {
   const [, calNow, hw] = await Promise.all([loadMs(true), loadCal(true), pendingHardware(pend)]);
   const stale = staleText();
   const sched = await pendingScheduleText(pend);
-  if (!window.confirm((stale ? `⚠ ${stale} Applying overwrites what changed there since.\n\n` : "") + sched +
+  const src = S.check?.available && S.check.ok && S.check.stale;
+  const srcText = src ? `⚠ The pending revision is from before the latest edit to ${src.files?.length ? src.files.join(", ") : "the module"}. ` +
+    "lox config push compiles the module as it is, so Apply deploys changes this review does not show. Compile first to review them.\n\n" : "";
+  if (!window.confirm((stale ? `⚠ ${stale} Applying overwrites what changed there since.\n\n` : "") + srcText + sched +
     calApplyWarning(calNow) + hwApplyText(hw) +
     "Deploy the pending changes to the Miniserver?\n\nlox config push uploads the config and restarts the Miniserver's program (a few seconds), " +
     "checks that it runs exactly the compiled config, then vislox commits and pushes to git.")) return;
@@ -2477,7 +2486,82 @@ async function loadEdits() {
 function editsChanged() {
   const key = S.hist?.actions?.edit?.key ?? null;
   if (key !== S.editsKey) { S.editsKey = key; loadEdits(); }
+  // The server checks the module when it changes and counts the checks it keeps.
+  const ck = S.hist?.actions?.edit?.check ?? null;
+  if (ck !== S.checkKey) { S.checkKey = ck; loadCheck(); }
 }
+
+// ── whether the module compiles (#65) ──────────────────────────────────
+// The server runs lox logic check on the project's module whenever it changes; GET /api/check reads the
+// last check (`actions.edit.check` counts them). While it has errors,
+// out.Loxone stays at the last compile that worked, so the review would show an older change than the
+// source: the Deploy pane says so, lists each error with its file, line and the blocks its line names,
+// and Apply is off. A module that compiles to something else than the pending config (changed outside
+// vislox, not compiled yet) offers Compile. lox logic fmt --check is a hint only.
+S.check = null;
+S.checkKey = null;
+S.checkSeq = 0;
+async function loadCheck() {
+  const seq = ++S.checkSeq;
+  if (!S.hist?.actions?.shown) { S.check = null; renderActions(); return; }
+  let c;
+  try { c = await api("/api/check"); } catch { c = null; }
+  // An older request answering late does not overwrite a newer one.
+  if (seq !== S.checkSeq) return;
+  S.check = c;
+  renderActions();
+  if (S.sel && S.view) renderProps();
+}
+/** The module does not compile (lox logic check found errors). */
+function checkBroken() { return !!(S.check?.available && S.check.ok === false); }
+/** `pages/a.loxl:5`, or the file alone. */
+function checkAt(e) { return e.file ? `${e.file}${e.line ? ":" + e.line : ""}` : ""; }
+/** The errors whose line names the block `uuid`. */
+function checkErrors(uuid) { return checkBroken() ? S.check.errors.filter((e) => e.blocks?.includes(uuid)) : []; }
+function renderCheck() {
+  const box = $("deploy-check"), c = S.check;
+  const stale = c?.available && c.ok && c.stale;
+  const fmt = c?.available ? c.unformatted || [] : [];
+  box.className = "deploy-check" + (checkBroken() || stale?.error ? " error" : stale ? "" : " hint") + (checkBroken() || stale || fmt.length ? "" : " hidden");
+  const parts = [];
+  if (checkBroken()) {
+    const n = c.errors.length + (c.truncated || 0);
+    const items = c.errors.map((e) => {
+      const blocks = (e.blocks || []).filter((u) => S.view?.objects[u]).map((u) =>
+        `<button type="button" class="go" data-go="${esc(u)}" title="Show this block">${esc(displayTitle(S.view.objects[u]))}</button>`).join("");
+      return `<li>${e.file ? `<span class="ck-at">${esc(checkAt(e))}</span>` : ""}${esc(e.message)} ${blocks}</li>`;
+    });
+    if (c.truncated) items.push(`<li>… and ${plural(c.truncated, "more error")}</li>`);
+    parts.push(`<div class="ck-h">The module doesn't compile: ${plural(n, "error")}</div>`,
+      `<div class="ck-sub">${pendingChange() ? "The pending revision is from the last compile that worked, not from the module as it is." : "Nothing new is compiled until it does."} Apply is off until it compiles.</div>`,
+      `<ul>${items.join("")}</ul>`);
+  } else if (stale) {
+    const files = stale.files?.length ? stale.files.join(", ") : "the module";
+    const a = S.hist?.actions, busy = !!a?.running;
+    // A module that does not compile against the base would only fail again.
+    const why = !a?.apply?.available ? `Cannot compile: ${a?.apply?.reason || ""}`
+      : stale.error ? "Cannot compile: the module doesn't compile against the base (see above)" : "";
+    parts.push(`<div class="ck-h">${pendingChange() ? `Pending is from before the latest edit to ${esc(files)}.` : `The module changed (${esc(files)}) and is not compiled yet.`}</div>`,
+      stale.error ? `<div class="ck-sub">It doesn't compile against the base:</div><pre>${esc(stale.error)}</pre>`
+        : `<div class="ck-sub">Compile it to review what Apply would deploy: lox config push compiles the module as it is.</div>`,
+      `<div class="ck-row"><button type="button" id="btn-compile" class="ghost small"${why || busy ? " disabled" : ""}
+        title="${esc(why || "Compile the module into the pending revision (lox logic compile). Nothing is deployed.")}">${a?.running === "Compile" ? "Compiling…" : "Compile"}</button></div>`);
+  }
+  if (fmt.length) parts.push(`<div class="ck-fmt">Not formatted as lox logic fmt writes it: ${esc(fmt.join(", "))}. A hint only; lox logic fmt --write formats it.</div>`);
+  box.innerHTML = parts.join("");
+}
+$("deploy-check").addEventListener("click", async (e) => {
+  if (e.target.closest("#btn-compile")) {
+    deployMsg("");
+    try { const j = await act("/api/compile"); deployMsg(j.message); } catch (err) { deployMsg(err.message, true); }
+    return;
+  }
+  const g = e.target.closest("[data-go]");
+  if (!g) return;
+  const u = g.dataset.go, pg = S.view?.objects[u]?.page;
+  if (pg) gotoPage(pg, { focus: u });
+  select(u);
+});
 /** One claimed value, whatever the order of the list: its op, object and port or setting. */
 function editKey(c) { return [c.op, c.uuid, c.port ?? c.name ?? ""].join("|"); }
 /** The revision edits are made against: the newest compile, else the deployed config on disk. */

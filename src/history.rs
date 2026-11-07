@@ -107,6 +107,9 @@ pub struct History {
     /// Bumped on every change, for the UI's event stream.
     pub version: u64,
     pub last_error: Option<String>,
+    /// The watched file and the pending one as the last poll read them, by
+    /// blob id (`None`: not readable).
+    on_disk: (Option<String>, Option<String>),
 }
 
 pub fn blob_id(bytes: &[u8]) -> String {
@@ -220,9 +223,11 @@ impl History {
     /// Returns whether anything changed.
     pub fn poll_files(&mut self) -> bool {
         let mut changed = false;
+        self.on_disk = (None, None);
         match std::fs::read(&self.current_path) {
             Ok(bytes) => {
                 let blob = blob_id(&bytes);
+                self.on_disk.0 = Some(blob.clone());
                 if self.live.last().map(|r| &r.blob) != Some(&blob) {
                     let first = self.live.is_empty();
                     let n = self.live.len();
@@ -251,6 +256,7 @@ impl History {
             && let Ok(bytes) = std::fs::read(&path)
         {
             let blob = blob_id(&bytes);
+            self.on_disk.1 = Some(blob.clone());
             if self.pending.last().map(|r| &r.blob) != Some(&blob) {
                 let n = self.pending.len();
                 self.contents.insert(blob.clone(), Arc::new(bytes));
@@ -270,6 +276,12 @@ impl History {
             self.version += 1;
         }
         changed
+    }
+
+    /// The watched file and the pending one on disk, by blob id, as the last
+    /// [`Self::poll_files`] read them.
+    pub fn on_disk(&self) -> (Option<String>, Option<String>) {
+        self.on_disk.clone()
     }
 
     /// (pending, history), newest first, each with its comparison base.

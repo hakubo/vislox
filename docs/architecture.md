@@ -33,6 +33,11 @@ The binary is an `axum` server with the UI embedded (plain JS and SVG, no build 
 - `src/managed.rs` finds where the module's `.loxl` files make each block the lockfile manages (#64): its
   declaration, the expression lox made it for, or the template instance, with lox's own declaration scan.
   `GET /api/edits` sends it as `sources`.
+- `src/check.rs` reads `lox logic check --json` and `lox logic fmt --check` (#65) and points each error at the
+  blocks its line names. `actions.rs` runs them in a check worker when the module, lock, base or out changes
+  (`GET /api/check` reads the result), makes *Module compiles* Apply's first step, and compiles on request
+  (`POST /api/compile`). Every compile and write of the project holds one compile lock. The module's directory is
+  watched recursively, so a change there is checked at once.
 - `src/restart.rs` follows the program restart during Apply: out of service, back online, new config loaded.
 - `src/backups.rs` lists and downloads the Miniserver's own backups for the History and caches their programs
   by blob id; `history.rs` shows each with the Pull of the same bytes, or between the Pulls around it.

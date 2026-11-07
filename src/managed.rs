@@ -127,7 +127,7 @@ impl ModuleFiles {
 /// the module's directory (a module linked in from elsewhere), compared as
 /// canonical paths; else its name alone. Never absolute: it is shown, and
 /// pasted into prompts.
-fn shown(root: &Path, module: &Path, file: &Path) -> String {
+pub fn shown(root: &Path, module: &Path, file: &Path) -> String {
     let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
     let f = canon(file);
     let module = canon(module);
