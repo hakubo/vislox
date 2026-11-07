@@ -25,6 +25,10 @@ const EG = "10000002-0000-0020-ffff504f94000001";
 const AND = "10000004-0000-0040-ffff504f94000001", METER = "10000005-0000-0050-ffff504f94000001";
 // A block the project's module manages (in the lock as `flur`), drawn on the upper floor.
 const FLUR = "1000000b-0000-00b0-ffff504f94000001";
+// A page of more managed blocks than one request takes ops (200).
+const LAGER = "20000000-0000-0000-ffff504f94000001", LAGER_N = 210;
+const lagerUuid = (i) => `2${String(i).padStart(7, "0")}-0000-0001-ffff504f94000001`;
+const lagerAt = (i) => { const px = 960 + 1920 * (i % 15), py = 960 + 960 * Math.floor(i / 15); return { px, py, px2: px + 1344, py2: py + 696 }; };
 const KITCHEN = "30000a01-0000-0000-ffff504f94000001", BATH = "30000a02-0000-0000-ffff504f94000001";
 const root = mkdtempSync(join(tmpdir(), "vislox-edit-"));
 const dir = join(root, "project");
@@ -47,14 +51,20 @@ const base = readFileSync(fixture, "utf8").replace('<Co K="Q" U="10000009-0000-0
   .replace('\t\t<C Type="Page" V="178" U="10000002', `\t\t<C Type="Place" V="178" U="${KITCHEN}" Title="Küche"/>
 \t\t<C Type="Place" V="178" U="${BATH}" Title="Bad"/>
 \t\t<C Type="Page" V="178" U="10000002`)
-  .replace('<Co K="Input1" Nc="1" U="10000006', `<IoData Visu="true" Pr="${KITCHEN}"/>\n\t\t\t\t<Co K="Input1" Nc="1" U="10000006`);
+  .replace('<Co K="Input1" Nc="1" U="10000006', `<IoData Visu="true" Pr="${KITCHEN}"/>\n\t\t\t\t<Co K="Input1" Nc="1" U="10000006`)
+  .replace("\t\t</C>\n\t</C>\n</ControlList>", `\t\t</C>\n\t\t<C Type="Page" V="178" U="${LAGER}" Title="Lager" WF="16384">\n` +
+    Array.from({ length: LAGER_N }, (_, i) => { const L = lagerAt(i); return `\t\t\t<C Type="And" V="178" U="${lagerUuid(i)}" Title="Lager ${i}" Px="${L.px}" Py="${L.py}" Px2="${L.px2}" Py2="${L.py2}" Cl="141,255,112" Nio="3" WF="16384"/>\n`; }).join("") +
+    "\t\t</C>\n\t</C>\n</ControlList>");
+assert.ok(base.includes(lagerUuid(LAGER_N - 1)), "the Lager page is in the base");
 writeFileSync(join(dir, "base.Loxone"), base);
 writeFileSync(join(dir, "out.Loxone"), base);
 writeFileSync(join(dir, "lox.toml"), 'base = "base.Loxone"\nmodule = "pages"\nout = "out.Loxone"\n');
 writeFileSync(join(dir, "pages", "README"), "the module\n");
 writeFileSync(join(dir, "pages", "flur.loxl"), "# The module's own source (the stand-in lox reads only vislox's files).\n");
 const FLUR_AT = { px: 7104, py: 2880, px2: 8448, py2: 3576 };
-writeFileSync(join(dir, "logic.lock.json"), JSON.stringify({ objects: { flur: { uuid: FLUR, type: "And", page_uuid: OG, layout: FLUR_AT } } }));
+const lockObjects = { flur: { uuid: FLUR, type: "And", page_uuid: OG, layout: FLUR_AT } };
+for (let i = 0; i < LAGER_N; i++) lockObjects[`lager_${i}`] = { uuid: lagerUuid(i), type: "And", page_uuid: LAGER, layout: lagerAt(i) };
+writeFileSync(join(dir, "logic.lock.json"), JSON.stringify({ objects: lockObjects }));
 // Compiled after the module's files: nothing is uncompiled.
 writeFileSync(join(dir, "out.Loxone"), base);
 git("init", "-q");
@@ -99,7 +109,9 @@ for (const line of src.split("\\n")) {
 const lockFile = "logic.lock.json";
 const lock = fs.existsSync(lockFile) ? JSON.parse(fs.readFileSync(lockFile, "utf8")) : { objects: {} };
 const objects = {};
-let n = Object.keys(lock.objects).length;
+// Like lox, a block added again gets a UUID it never had: the count of UUIDs minted is kept.
+const mintFile = ${JSON.stringify(join(loxDir, "minted"))};
+let n = fs.existsSync(mintFile) ? +fs.readFileSync(mintFile, "utf8") : 0;
 for (const f of fs.existsSync("pages/vislox") ? fs.readdirSync("pages/vislox") : []) {
   if (f === "edits.loxl" || !f.endsWith(".loxl")) continue;
   let pageAt = -1;
@@ -108,7 +120,7 @@ for (const f of fs.existsSync("pages/vislox") ? fs.readdirSync("pages/vislox") :
     if ((m = line.match(/^page "(.*)"$/))) { pageAt = out.findIndex((l) => l.includes('Type="Page"') && l.includes(\`Title="\${m[1]}"\`)); continue; }
     if (!(m = line.match(/^(vx_\\w+) = (\\w+)\\((.*)\\)$/))) continue;
     const [, slug, ty, rest] = m;
-    const uuid = lock.objects[slug]?.uuid || \`bbbbbbb\${++n}-0000-0000-ffff504f94000001\`;
+    const uuid = lock.objects[slug]?.uuid || \`bbbbbb\${String(++n).padStart(2, "0")}-0000-0000-ffff504f94000001\`;
     const page_uuid = out[pageAt].match(/U="([^"]+)"/)[1];
     objects[slug] = { uuid, type: ty, page_uuid, layout: lock.objects[slug]?.layout || { px: 96, py: 96, px2: 1440, py2: 792 } };
     const title = rest.match(/^"((?:[^"\\\\]|\\\\.)*)"/);
@@ -119,14 +131,16 @@ for (const f of fs.existsSync("pages/vislox") ? fs.readdirSync("pages/vislox") :
 // The blocks the rest of the module manages stay in the lock.
 for (const [s, o] of Object.entries(lock.objects)) if (!s.startsWith("vx_")) objects[s] = o;
 const relayout = process.argv.flatMap((a, i) => process.argv[i - 1] === "--relayout" ? [a] : []);
-let col = 0;
+const cols = {};
 for (const o of Object.values(objects)) {
   const pg = out.find((l) => l.includes('Type="Page"') && l.includes(\`U="\${o.page_uuid}"\`));
   if (!pg || !relayout.some((t) => pg.includes(\`Title="\${t}"\`))) continue;
   const w = o.layout.px2 - o.layout.px, h = o.layout.py2 - o.layout.py;
-  const x = 9600 + 1920 * col++;
+  // Ten a row, from (9600, 960).
+  const c = (cols[o.page_uuid] = (cols[o.page_uuid] ?? -1) + 1);
+  const x = 9600 + 1920 * (c % 10), y = 960 + 960 * Math.floor(c / 10);
   o.superseded_layout = o.layout;
-  o.layout = { px: x, py: 960, px2: x + w, py2: 960 + h };
+  o.layout = { px: x, py: y, px2: x + w, py2: y + h };
 }
 for (const o of Object.values(objects)) {
   const i = out.findIndex((l) => l.includes(\`U="\${o.uuid}"\`));
@@ -152,6 +166,7 @@ for (const line of src.split("\\n")) {
   out[to] = out[to].replace(/\\/>$/, \`><In Input="\${srcU}"/></Co>\`);
 }
 fs.writeFileSync(lockFile, JSON.stringify({ objects }));
+fs.writeFileSync(mintFile, String(n));
 const to = process.argv.indexOf("--out");
 fs.writeFileSync(to > 0 ? process.argv[to + 1] : "out.Loxone", out.join("\\n"));
 `);
@@ -185,6 +200,8 @@ try {
   page.on("console", (m) => { if (m.type() === "error" && !/status of 422/.test(m.text())) errors.push(m.text()); });
   const edits = [];
   page.on("request", (r) => { if (new URL(r.url()).pathname === "/api/edit") edits.push(JSON.parse(r.postData())); });
+  const statuses = [];
+  page.on("response", (r) => { if (new URL(r.url()).pathname === "/api/edit") statuses.push(r.status()); });
   page.on("dialog", (d) => d.accept());
   await page.addInitScript(() => localStorage.setItem("vislox.token", "secret"));
   await page.goto(`http://127.0.0.1:${port}/`);
@@ -197,6 +214,18 @@ try {
   const field = (f) => `#props [data-ed-field="${f}"]`;
   // What the page shows once it settles: an edit's reply, the History and /api/edits come one after another.
   const waitText = (sel, re) => page.waitForFunction(([s, src]) => new RegExp(src).test(document.querySelector(s)?.textContent || ""), [sel, re.source], { timeout: 10000 });
+  // Undo and redo (#62): the key, then the one request it sent, once the page settled on what it
+  // compiled (`done`: what the page shows then).
+  const settled = () => page.waitForFunction(() => !UNDO.busy && S.viewRev === S.rev && S.rev === editRev()?.id, null, { timeout: 10000 });
+  const undoKey = async (redo, done, arg) => {
+    const n = edits.length;
+    await page.evaluate(() => document.activeElement?.blur());
+    await page.keyboard.press(redo ? "Control+Shift+z" : "Control+z");
+    await page.waitForFunction(done, arg, { timeout: 10000 });
+    await settled();
+    assert.equal(edits.length, n + 1, "one request");
+    return edits[n].ops;
+  };
 
   await step("nothing is pending, and Properties offers to edit the Divide block", async () => {
     await page.waitForSelector("#deploy-pane:not(.hidden)");
@@ -237,6 +266,29 @@ try {
     assert.match(file, /^extern vx_10000006_0000_0060_ffff504f94000001 = Div\(uuid: "10000006-0000-0060-ffff504f94000001"\)$/m);
     assert.match(file, /\.In2 = 100$/m);
   });
+  await step("undo puts the values back as a new edit, redo makes it again", async () => {
+    await page.waitForSelector("#btn-undo:not([disabled])");
+    assert.match(await page.getAttribute("#btn-undo", "title"), /^Undo: 3 values of .+ \((Ctrl\+Z|⌘Z)\)/);
+    assert.equal(await page.isDisabled("#btn-redo"), true);
+    let ops = await undoKey(false, (u) => S.view?.objects[u]?.title !== "Teiler" && S.view.objects[u].room === "Küche", DIV);
+    // The reply's `undo`: each op's previous, the last op's first.
+    assert.deepEqual(ops, [
+      { op: "param", uuid: DIV, port: "Input2", value: null },
+      { op: "room", uuid: DIV, value: null },
+      { op: "title", uuid: DIV, value: null },
+    ]);
+    assert.equal(await page.evaluate((u) => S.view.objects[u].ports.find((p) => p.key === "Input2").def, DIV), "1000");
+    assert.doesNotMatch(existsSync(join(dir, "pages/vislox/edits.loxl")) ? readFileSync(join(dir, "pages/vislox/edits.loxl"), "utf8") : "", /title|In2/);
+    await waitText("#deploy-msg", /Undone: 3 values of .*Compiled: pending, not deployed/);
+    assert.match(await page.getAttribute("#btn-redo", "title"), /^Redo: 3 values of /);
+    ops = await undoKey(true, (u) => S.view?.objects[u]?.title === "Teiler" && S.view.objects[u].room === "Bad", DIV);
+    assert.deepEqual(ops, edits[0].ops);
+    await page.waitForFunction(() => document.querySelectorAll("#props .ed-tag").length === 3);
+    // The list of recent edits names it.
+    await page.click("#btn-undo-list");
+    await waitText("#undo-pop", /3 values of/);
+    await page.click("#btn-undo-list");
+  });
   await step("a value out of its documented range is refused by the server, and nothing changes", async () => {
     await pick(MONO);
     await page.click('#props [data-ed="open"]');
@@ -256,6 +308,65 @@ try {
     await page.waitForFunction(() => document.querySelectorAll("#props .ed-tag").length === 2);
     assert.deepEqual(edits[n].ops, [{ op: "param", uuid: DIV, port: "Input2", value: null }]);
     assert.doesNotMatch(readFileSync(join(dir, "pages/vislox/edits.loxl"), "utf8"), /In2/);
+  });
+  const saveTitle = async (t) => {
+    await pick(DIV);
+    await page.click('#props [data-ed="open"]');
+    await page.fill(field("title"), t);
+    await page.press(field("title"), "Enter");
+  };
+  const titleIs = (t) => page.waitForFunction((t) => S.view?.objects["10000006-0000-0060-ffff504f94000001"]?.title === t && !UNDO.busy && !UNDO.inflight && S.viewRev === S.rev && S.rev === editRev()?.id, t, { timeout: 15000 });
+  await step("a quick Ctrl+Z right after a save undoes that save, and quick steps wait their turn", async () => {
+    const n = edits.length, k = statuses.length;
+    await saveTitle("Schnell");
+    // At once: the save is still compiling, and the History has not shown it.
+    await page.evaluate(() => document.activeElement?.blur());
+    await page.keyboard.press("Control+z");
+    await titleIs("Teiler");
+    assert.equal(edits.length, n + 2, "the save, then its undo");
+    assert.deepEqual(edits[n + 1].ops, [{ op: "title", uuid: DIV, value: "Teiler" }]);
+    // Three keys in a row: redo, undo, redo, each against the config the one before left.
+    await page.keyboard.press("Control+Shift+z");
+    await page.keyboard.press("Control+z");
+    await page.keyboard.press("Control+Shift+z");
+    await titleIs("Schnell");
+    await page.waitForFunction(() => !UNDO.busy);
+    assert.equal(edits.length, n + 5);
+    assert.deepEqual(statuses.slice(k), [200, 200, 200, 200, 200], "no stale base, no 409");
+    await page.keyboard.press("Control+z");
+    await titleIs("Teiler");
+  });
+  await step("an undo that changes nothing is done, and its redo kept", async () => {
+    await saveTitle("Gleich");
+    await titleIs("Gleich");
+    // The undo is sent as a claim of what is claimed already: the server compiles nothing.
+    await page.route("**/api/edit", (r) => r.continue({ postData: JSON.stringify({ ...JSON.parse(r.request().postData()), ops: [{ op: "title", uuid: DIV, value: "Gleich" }] }) }), { times: 1 });
+    await page.keyboard.press("Control+z");
+    await waitText("#deploy-msg", /Undone: Name of .*Nothing changed/);
+    await page.waitForFunction(() => !UNDO.busy && /Gleich/.test(UNDO.undone.at(-1)?.label || ""));
+    assert.equal(await page.evaluate(() => UNDO.note), "");
+    // Its redo is the edit as made (the config already is that way), and the undo after it is real.
+    await page.keyboard.press("Control+Shift+z");
+    await page.waitForFunction(() => !UNDO.busy && /Gleich/.test(UNDO.done.at(-1)?.label || "") && !UNDO.undone.length);
+    await page.keyboard.press("Control+z");
+    await titleIs("Teiler");
+  });
+  await step("a redo whose reply has no undo clears the history and says why", async () => {
+    await page.route("**/api/edit", async (r) => {
+      const res = await r.fetch(), j = await res.json();
+      delete j.undo;
+      j.undo_error = "op 1 (title): no way back for the test";
+      await r.fulfill({ response: res, json: j });
+    }, { times: 1 });
+    await page.keyboard.press("Control+Shift+z");
+    await titleIs("Gleich");
+    await page.waitForFunction(() => !UNDO.done.length && !UNDO.undone.length);
+    assert.match(await page.evaluate(() => UNDO.note), /cannot be undone: op 1 \(title\): no way back for the test\. The undo history was cleared\./);
+    await waitText("#deploy-msg", /cannot be undone/);
+    await page.waitForSelector("#btn-undo[disabled]", { state: "attached" });
+    // Back to the name the later steps expect: an edit of its own.
+    await saveTitle("Teiler");
+    await titleIs("Teiler");
   });
   await step("Add block offers the types lox can create, and checks values in the browser", async () => {
     await page.evaluate((u) => gotoPage(u), OG);
@@ -296,6 +407,18 @@ try {
     await waitText("#deploy-pend", /1 block added here/);
     await waitText(".changes", /Nachlauf/);
   });
+  await step("undo takes the new block out, redo adds it again under a new UUID", async () => {
+    let ops = await undoKey(false, (u) => S.view && !S.view.objects[u], added);
+    assert.deepEqual(ops, [{ op: "remove_block", uuid: added }]);
+    assert.match(await page.getAttribute("#btn-redo", "title"), /^Redo: Add Nachlauf/);
+    ops = await undoKey(true, () => Object.values(S.view?.objects || {}).some((o) => o.title === "Nachlauf"));
+    assert.equal(ops[0].op, "add_block");
+    assert.equal(ops[0].restores, added);
+    assert.deepEqual(ops[0].params, { Time: "30" });
+    added = await page.evaluate(() => Object.values(S.view.objects).find((o) => o.title === "Nachlauf").uuid);
+    await pick(added);
+    await waitText("#props", /added here/);
+  });
   await step("a block added here is edited like any other", async () => {
     await page.click('#props [data-ed="open"]');
     // Its declaration takes the name and constants; lox has no room or category for it.
@@ -315,6 +438,22 @@ try {
     assert.match(file, /^removed vx_monoflop_1$/m);
     assert.doesNotMatch(file, /= Monoflop/);
     await page.waitForFunction(() => !/added here/.test(document.querySelector("#deploy-pend")?.textContent || ""));
+  });
+  await step("undo adds the removed block again, and later undos follow its new UUID", async () => {
+    let ops = await undoKey(false, () => Object.values(S.view?.objects || {}).some((o) => o.title === "Nachlauf"));
+    assert.equal(ops[0].op, "add_block");
+    assert.equal(ops[0].restores, added);
+    const again = await page.evaluate(() => Object.values(S.view.objects).find((o) => o.title === "Nachlauf").uuid);
+    assert.notEqual(again, added, "lox minted a new UUID");
+    assert.equal(await page.evaluate((u) => S.view.objects[u].ports.find((p) => p.key === "Time").def, again), "45");
+    // The edit of Time made before the removal now names the new UUID.
+    ops = await undoKey(false, (u) => S.view?.objects[u]?.ports.find((p) => p.key === "Time")?.def === "30", again);
+    assert.deepEqual(ops, [{ op: "param", uuid: again, port: "Time", value: "30" }]);
+    ops = await undoKey(true, (u) => S.view?.objects[u]?.ports.find((p) => p.key === "Time")?.def === "45", again);
+    assert.deepEqual(ops, [{ op: "param", uuid: again, port: "Time", value: "45" }]);
+    ops = await undoKey(true, (u) => S.view && !S.view.objects[u], again);
+    assert.deepEqual(ops, [{ op: "remove_block", uuid: again }]);
+    assert.match(readFileSync(join(dir, "pages/vislox/obergeschoss.loxl"), "utf8"), /^removed vx_monoflop_\d+$/m);
   });
   // Moving (#60): lox keeps a managed block's position in the lock; vislox writes it there and compiles.
   const flurNow = () => page.evaluate((u) => curPage()?.objects.find((o) => o.uuid === u && !o.moved_to), FLUR);
@@ -365,6 +504,14 @@ try {
     assert.equal(edits.length, n + 1);
     assert.deepEqual(edits[n].ops, [{ op: "move", uuid: FLUR, x: moved.x + 96, y: moved.y }]);
   });
+  await step("undo and redo a move", async () => {
+    const at = ([u, r0, x]) => S.rev !== r0 && !MV && !S.mvBusy && curPage()?.objects.find((o) => o.uuid === u && !o.moved_to)?.rect[0] === x;
+    let ops = await undoKey(false, at, [FLUR, await rev(), moved.x]);
+    assert.deepEqual(ops, [{ op: "move", uuid: FLUR, x: moved.x, y: moved.y }]);
+    ops = await undoKey(true, at, [FLUR, await rev(), moved.x + 96]);
+    assert.deepEqual(ops, [{ op: "move", uuid: FLUR, x: moved.x + 96, y: moved.y }]);
+    await page.evaluate((u) => select(u), FLUR);
+  });
   await step("nudged past the top of the page, it stops at the edge", async () => {
     const n = edits.length, r0 = await rev(), x = (await flurNow()).rect[0];
     for (let i = 0; i < 4; i++) await page.keyboard.press("Alt+Shift+ArrowUp");
@@ -405,6 +552,39 @@ try {
     await flurAt(r0, 9600, true);
     assert.deepEqual(edits[n].ops, [{ op: "relayout", page: OG }]);
     assert.match(readFileSync(calls, "utf8"), /^logic compile --relayout Obergeschoss$/m);
+  });
+  await step("undo moves the arranged block back, redo arranges it again", async () => {
+    const at = ([u, r0, x]) => S.rev !== r0 && curPage()?.objects.find((o) => o.uuid === u && !o.moved_to)?.rect[0] === x;
+    let ops = await undoKey(false, at, [FLUR, await rev(), 7104]);
+    assert.deepEqual(ops, [{ op: "place", moves: [{ uuid: FLUR, x: 7104, y: 2880 }] }]);
+    assert.equal(flurLock().layout.px, 7104);
+    ops = await undoKey(true, at, [FLUR, await rev(), 9600]);
+    assert.deepEqual(ops, [{ op: "place", moves: [{ uuid: FLUR, x: 9600, y: 960 }] }]);
+    assert.equal(flurLock().layout.px, 9600);
+  });
+  await step("Arrange on a page of 210 managed blocks is undone in one op", async () => {
+    await page.evaluate((pg) => gotoPage(pg), LAGER);
+    await page.waitForSelector("#btn-relayout:not([disabled])");
+    const n = edits.length, r0 = await rev(), last = lagerUuid(LAGER_N - 1);
+    const rectOf = (u) => page.evaluate((u) => curPage()?.objects.find((o) => o.uuid === u && !o.moved_to)?.rect.slice(0, 2), u);
+    const shows = ([u, r0, x, y]) => S.rev !== r0 && S.viewRev === S.rev && S.rev === editRev()?.id && !S.mvBusy && !UNDO.busy &&
+      (([a, b]) => a === x && b === y)(curPage()?.objects.find((o) => o.uuid === u && !o.moved_to)?.rect || []);
+    const moved = ([u, r0, x]) => S.rev !== r0 && S.viewRev === S.rev && S.rev === editRev()?.id && !S.mvBusy &&
+      curPage()?.objects.find((o) => o.uuid === u && !o.moved_to)?.rect[0] !== x;
+    await page.click("#btn-relayout");
+    await page.waitForFunction(moved, [last, r0, lagerAt(LAGER_N - 1).px], { timeout: 15000 });
+    assert.deepEqual(edits[n].ops, [{ op: "relayout", page: LAGER }]);
+    const arranged = await rectOf(last);
+    let ops = await undoKey(false, shows, [last, await rev(), lagerAt(LAGER_N - 1).px, lagerAt(LAGER_N - 1).py]);
+    assert.equal(ops.length, 1, "one op, not one per block");
+    assert.equal(ops[0].op, "place");
+    assert.equal(ops[0].moves.length, LAGER_N);
+    assert.deepEqual(await rectOf(lagerUuid(7)), [lagerAt(7).px, lagerAt(7).py]);
+    ops = await undoKey(true, shows, [last, await rev(), ...arranged]);
+    assert.equal(ops.length, 1);
+    assert.equal(ops[0].moves.length, LAGER_N);
+    // Back where it was, for the steps after.
+    await undoKey(false, shows, [lagerUuid(0), await rev(), lagerAt(0).px, lagerAt(0).py]);
   });
   await step("a block Loxone Config drew is not moved: dragging it pans the page", async () => {
     await page.evaluate(([pg, u]) => { gotoPage(pg); focusObj(u, 0.05); }, ["10000002-0000-0020-ffff504f94000001", DIV]);
@@ -463,6 +643,15 @@ try {
     await waitText("#deploy-pend", /1 wire drawn here/);
     await waitText(".changes", /\+Teiler\.AQ → O1001\.In2/);
     await page.waitForFunction(() => curPage().wires.some((w) => w.status === "added"));
+  });
+  await step("undo takes the drawn wire out, redo draws it again", async () => {
+    const has = ([f, t, there]) => S.viewRev === S.rev && curPage()?.wires.some((w) => w.from.join() === f.join() && w.to.join() === t.join() && w.status !== "removed") === there;
+    let ops = await undoKey(false, has, [[DIV, "AQ"], [AND, "I2"], false]);
+    assert.deepEqual(ops, [{ op: "unwire", from: [DIV, "AQ"], to: [AND, "I2"] }]);
+    assert.doesNotMatch(wireFile(), /<-/);
+    ops = await undoKey(true, has, [[DIV, "AQ"], [AND, "I2"], true]);
+    assert.deepEqual(ops, [{ op: "wire", from: [DIV, "AQ"], to: [AND, "I2"] }]);
+    assert.match(wireFile(), /\.In2 <- /);
   });
   await step("a link Loxone Config would not have is refused in the browser, with the reason", async () => {
     const n = edits.length;
@@ -526,6 +715,22 @@ try {
     await wireShown([DIV, "AQ"], [AND, "I2"], false);
     assert.doesNotMatch(wireFile(), /In2 <-/);
   });
+  await step("undo of a reconnect is one edit that puts the old wire back", async () => {
+    const has = ([f, t, there]) => S.viewRev === S.rev && curPage()?.wires.some((w) => w.from.join() === f.join() && w.to.join() === t.join() && w.status !== "removed") === there;
+    assert.match(await page.getAttribute("#btn-undo", "title"), /^Undo: Reconnect /);
+    let ops = await undoKey(false, has, [[DIV, "AQ"], [AND, "I2"], true]);
+    assert.deepEqual(ops, [
+      { op: "unwire", from: [DIV, "AQ"], to: [METER, target] },
+      { op: "wire", from: [DIV, "AQ"], to: [AND, "I2"] },
+    ]);
+    await wireShown([DIV, "AQ"], [METER, target], false);
+    ops = await undoKey(true, has, [[DIV, "AQ"], [METER, target], true]);
+    assert.deepEqual(ops, [
+      { op: "unwire", from: [DIV, "AQ"], to: [AND, "I2"] },
+      { op: "wire", from: [DIV, "AQ"], to: [METER, target] },
+    ]);
+    await wireShown([DIV, "AQ"], [AND, "I2"], false);
+  });
   await step("Delete takes a wire drawn here out again", async () => {
     await clickWire([DIV, "AQ"], [METER, target]);
     const n = edits.length;
@@ -535,11 +740,48 @@ try {
     assert.doesNotMatch(wireFile(), /<-/);
     await page.waitForFunction(() => !/wire/.test(document.querySelector("#deploy-pend")?.textContent || ""));
   });
+  await step("the undo history survives a reload: Delete is undone after it", async () => {
+    const has = ([f, t, there]) => S.viewRev === S.rev && curPage()?.wires.some((w) => w.from.join() === f.join() && w.to.join() === t.join() && w.status !== "removed") === there;
+    await page.reload();
+    await page.waitForSelector(".tab");
+    await page.waitForFunction(() => UNDO.blob && S.view && S.viewRev === S.rev, null, { timeout: 10000 });
+    assert.match(await page.evaluate(() => UNDO.done.at(-1)?.label || ""), /^Delete wire /);
+    await page.evaluate(([pg, u]) => { gotoPage(pg); focusObj(u, 0.05); }, [EG, DIV]);
+    let ops = await undoKey(false, has, [[DIV, "AQ"], [METER, target], true]);
+    assert.deepEqual(ops, [{ op: "wire", from: [DIV, "AQ"], to: [METER, target] }]);
+    ops = await undoKey(true, has, [[DIV, "AQ"], [METER, target], false]);
+    assert.deepEqual(ops, [{ op: "unwire", from: [DIV, "AQ"], to: [METER, target] }]);
+  });
   await step("Discard drops the edits", async () => {
     await page.click("#btn-discard");
     await page.waitForFunction(() => /Nothing pending/.test(document.querySelector("#deploy-pend")?.textContent || ""), null, { timeout: 10000 });
     assert.equal(existsSync(join(dir, "pages/vislox")), false);
     await page.waitForFunction(() => !document.querySelector("#props .ed-tag"));
+  });
+  await step("Discard clears the undo history and says why", async () => {
+    await page.waitForFunction(() => /Discard dropped the pending config/.test(UNDO.note) && !UNDO.done.length, null, { timeout: 10000 });
+    await page.waitForSelector("#btn-undo[disabled]");
+    assert.match(await page.getAttribute("#btn-undo", "title"), /Nothing to undo\nUndo history cleared: Discard dropped/);
+    await page.click("#btn-undo-list");
+    await waitText("#undo-pop .u-note", /Discard dropped the pending config/);
+    await page.click("#btn-undo-list");
+    // The key sends nothing now.
+    const n = edits.length;
+    await page.keyboard.press("Control+z");
+    assert.equal(edits.length, n);
+  });
+  await step("a compile made outside this tab clears it too", async () => {
+    await pick(DIV);
+    await page.click('#props [data-ed="open"]');
+    await page.fill(field("title"), "Außen");
+    await page.press(field("title"), "Enter");
+    await page.waitForFunction(() => UNDO.done.length === 1 && S.rev?.startsWith("pending:") && S.viewRev === S.rev, null, { timeout: 10000 });
+    // Someone compiles the module elsewhere: the pending config is another one.
+    writeFileSync(join(dir, "out.Loxone"), readFileSync(join(dir, "out.Loxone"), "utf8") + "\n<!-- compiled elsewhere -->\n");
+    await page.waitForFunction(() => /changed outside this tab/.test(UNDO.note) && !UNDO.done.length, null, { timeout: 15000 });
+    await page.click("#btn-discard");
+    await page.waitForFunction(() => /Nothing pending/.test(document.querySelector("#deploy-pend")?.textContent || ""), null, { timeout: 10000 });
+    assert.equal(existsSync(join(dir, "pages/vislox")), false);
   });
   await step("nothing was deployed: lox only compiled", async () => {
     const ran = readFileSync(calls, "utf8").trim().split("\n");

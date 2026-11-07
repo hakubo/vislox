@@ -196,6 +196,21 @@ button.chip { cursor: pointer; } button.chip:hover { border-color: var(--brand);
 .hud-add button { height: 30px; border: none; background: transparent; font-weight: 600; padding: 0 12px; }
 .hud-add button:hover:not(:disabled) { background: var(--brand-soft); }
 .hud-add button:disabled { opacity: .55; cursor: not-allowed; }
+.hud-add .hud-sep { width: 1px; background: var(--line-2); margin: 5px 2px; }
+.hud-add #btn-undo-list { padding: 0 8px; }
+.hud-add #btn-undo-list.note { color: var(--changed); }
+.undo-pop { position: absolute; left: 10px; top: 46px; z-index: 5; width: min(360px, calc(100% - 20px)); max-height: 60%; overflow: auto;
+  background: #fff; border: 1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow); padding: 8px 10px; font-size: 12.5px; }
+.undo-pop h3 { margin: 0 0 6px; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+.undo-pop ol { list-style: none; margin: 0; padding: 0; }
+.undo-pop li { display: flex; gap: 8px; padding: 3px 0; border-top: 1px solid var(--line-2); }
+.undo-pop li:first-child { border-top: none; }
+.undo-pop li .u-l { flex: 1; overflow-wrap: anywhere; }
+.undo-pop li .u-t { color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.undo-pop li.undone .u-l { color: var(--muted); text-decoration: line-through; }
+.undo-pop li.top .u-l { font-weight: 600; }
+.undo-pop .u-note { margin: 0 0 8px; padding: 6px 8px; border-radius: 4px; background: var(--changed-bg); color: var(--text); }
+.undo-pop .u-foot { margin-top: 8px; color: var(--muted); }
 .hud-zoom button { min-width: 32px; height: 30px; border: none; border-right: 1px solid var(--line-2); background: transparent; font-size: 15px; }
 .hud-zoom button:last-child { border-right: none; font-size: 13px; padding: 0 10px; }
 .hud-zoom button.pct { font-size: 12px; min-width: 52px; color: var(--muted); font-variant-numeric: tabular-nums; }

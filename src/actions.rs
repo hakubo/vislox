@@ -68,6 +68,19 @@ struct Compiled {
     out: String,
 }
 
+/// The ops that undo an edit (#62), sent back as an edit of its own, into
+/// the reply as `undo`; or, when they cannot be built, `undo: null` and why
+/// (`undo_error`). The edit itself stands either way.
+fn undo_into(reply: &mut Value, undo: Result<Vec<edit::Op>, String>) {
+    match undo {
+        Ok(ops) => reply["undo"] = json!(ops),
+        Err(why) => {
+            reply["undo"] = Value::Null;
+            reply["undo_error"] = json!(why);
+        }
+    }
+}
+
 /// Each file of the module (as lox reads it: not hidden ones), by its path
 /// from the project, with its blob id.
 fn module_blobs(p: &loxone_config::Project) -> std::collections::BTreeMap<String, String> {
@@ -1210,14 +1223,17 @@ impl Actions {
         files.follow_pages(&base);
         let before = files.clone();
         let mut previous = Vec::new();
-        let mut added = Vec::new();
+        // Per op, the slug of the block it added.
+        let mut slugs = Vec::new();
         for op in &req.ops {
             let a = edit::apply_op(&mut files, &ctx, op).map_err(bad)?;
             previous.push(a.previous);
-            added.extend(a.added);
+            slugs.push(a.added);
         }
         if files == before {
-            return Ok(json!({ "previous": previous, "blob": req.base, "unchanged": true }));
+            let mut r = json!({ "previous": previous, "blob": req.base, "unchanged": true });
+            undo_into(&mut r, edit::undo_ops(&req.ops, &previous, &[]));
+            return Ok(r);
         }
         let mut new = files.render();
         // lox refuses a module directory without a `.loxl` file.
@@ -1307,13 +1323,32 @@ impl Actions {
                 )));
             }
         }
-        let added: Vec<Value> = added
+        let minted: Vec<Option<String>> = slugs
             .iter()
-            .map(|s| json!({ "slug": s, "uuid": lock.uuid_of(s) }))
+            .map(|s| s.as_deref().and_then(|s| lock.uuid_of(s)).map(String::from))
+            .collect();
+        let added: Vec<Value> = req
+            .ops
+            .iter()
+            .zip(&slugs)
+            .filter_map(|(op, s)| {
+                let s = s.as_deref()?;
+                let mut a = json!({ "slug": s, "uuid": lock.uuid_of(s) });
+                if let edit::Op::AddBlock {
+                    restores: Some(was),
+                    ..
+                } = op
+                {
+                    a["restores"] = json!(was);
+                }
+                Some(a)
+            })
             .collect();
         undo.keep();
         *self.compiled.lock().unwrap() = Some(compiled);
-        Ok(json!({ "previous": previous, "blob": blob, "added": added }))
+        let mut r = json!({ "previous": previous, "blob": blob, "added": added });
+        undo_into(&mut r, edit::undo_ops(&req.ops, &previous, &minted));
+        Ok(r)
     }
 
     /// Refuse when the module holds changes that are not compiled into the
@@ -2508,6 +2543,7 @@ echo "{\"objects\":{$objs}}" > "$lock"
             params: [("I2".to_string(), "1".to_string())].into(),
             settings: Default::default(),
             wires: vec![],
+            restores: None,
         };
         let r = a.edit(&req(vec![add.clone()]), None).await.unwrap();
         let uuid = "aaaaaaa1-0000-0000-ffff504f94000001";
@@ -2608,7 +2644,7 @@ echo "{\"objects\":{$objs}}" > "$lock"
     /// A stand-in lox for moves: it draws the Divide block, which the
     /// module manages (as `teiler`), where the lock's `layout` puts it, and
     /// keeps what it was handed. It does not keep a block put at x 9600, and
-    /// `--relayout` puts it at the page's corner.
+    /// `--relayout` puts it at the page's corner (in the lock too).
     #[cfg(unix)]
     fn lox_that_places(tmp: &Path) {
         std::fs::write(
@@ -2621,7 +2657,8 @@ for a in "$@"; do [ "$prev" = --out ] && out=$a; [ "$prev" = --lock ] && lock=$a
 cp "$lock" ../lock-seen.json
 px=$(sed -n '/"layout"/,/}/s/.*"px": *\(-\{0,1\}[0-9]*\).*/\1/p' "$lock" | head -1)
 py=$(sed -n '/"layout"/,/}/s/.*"py": *\(-\{0,1\}[0-9]*\).*/\1/p' "$lock" | head -1)
-case "$*" in *--relayout*) px=96; py=96 ;; esac
+# Laid out afresh: placed at the corner, and kept there in the lock, as lox does.
+case "$*" in *--relayout*) px=96; py=96; sed -i.bak 's/"px": *[0-9-]*/"px":96/; s/"py": *[0-9-]*/"py":96/' "$lock"; rm -f "$lock.bak" ;; esac
 [ "$px" = 9600 ] && px=4032
 sed '/U="10000006-0000-0060-ffff504f94000001"/s/Px="[0-9-]*" Py="[0-9-]*"/Px="'"$px"'" Py="'"$py"'"/' base.Loxone > "$out"
 "#,
@@ -2839,7 +2876,7 @@ sed "s/Title=\"Testhaus\"/Title=\"Testhaus $w\"/" base.Loxone > "$out"
             .unwrap();
         assert_eq!(
             r["previous"],
-            json!([[{ "op": "move", "uuid": DIV, "x": 4032, "y": 2880 }]])
+            json!([{ "op": "place", "moves": [{ "uuid": DIV, "x": 4032, "y": 2880 }] }])
         );
         // Only compiles: nothing was deployed.
         let calls = std::fs::read_to_string(tmp.path().join("calls.log")).unwrap();
@@ -2853,6 +2890,189 @@ sed "s/Title=\"Testhaus\"/Title=\"Testhaus $w\"/" base.Loxone > "$out"
                 .last()
                 .unwrap()
                 .ends_with("--relayout Erdgeschoss"),
+            "{calls}"
+        );
+    }
+
+    /// Undo and redo (#62) as the browser does them: each reply's `undo`
+    /// sent back as an edit of its own puts the module, the lock's layout
+    /// and the pending config back exactly; the undo's own `undo` is the redo.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn undo_and_redo_are_the_replys_undo_sent_back_as_edits() {
+        const OR: &str = "10000009-0000-0090-ffff504f94000001";
+        const AND: &str = "10000004-0000-0040-ffff504f94000001";
+        const EG: &str = "10000002-0000-0020-ffff504f94000001";
+        const OG: &str = "10000008-0000-0080-ffff504f94000001";
+        let end = |u: &str, k: &str| [u.to_string(), k.to_string()];
+        /// What an edit changes: vislox's files, the lock's layout, out.
+        fn state(
+            d: &Path,
+        ) -> (
+            std::collections::BTreeMap<String, String>,
+            Option<Value>,
+            String,
+        ) {
+            // What the files declare. Left out: comments (a file of them only
+            // is the placeholder lox needs in a module with no other `.loxl`),
+            // and a page file's `page` and `removed` lines, which say that a
+            // block added here was taken out again (lox's lock keeps a
+            // tombstone of it).
+            let files: std::collections::BTreeMap<String, String> =
+                edit::Files::texts(&d.join("pages").join(edit::DIR))
+                    .into_iter()
+                    .map(|(f, t)| {
+                        let t: Vec<&str> = t
+                            .lines()
+                            .filter(|l| {
+                                !l.trim().is_empty()
+                                    && !l.starts_with('#')
+                                    && !l.starts_with("page ")
+                                    && !l.starts_with("removed ")
+                            })
+                            .collect();
+                        (f, t.join("\n"))
+                    })
+                    .filter(|(_, t)| !t.is_empty())
+                    .collect();
+            let lock = std::fs::read(d.join("logic.lock.json"))
+                .ok()
+                .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+                .map(|l| l["objects"]["teiler"]["layout"].clone())
+                .filter(|l| !l.is_null())
+                // Where it is: a move keeps the size the page draws, which
+                // the stand-in's lock does not have.
+                .map(|l| json!([l["px"], l["py"]]));
+            (files, lock, blob(d, "out.Loxone"))
+        }
+        async fn send(a: &Actions, d: &Path, ops: Value) -> Value {
+            let ops: Vec<edit::Op> = serde_json::from_value(ops).unwrap();
+            let req = edit::Request {
+                base: blob(d, "out.Loxone"),
+                ops,
+            };
+            let r = a.edit(&req, None).await.unwrap();
+            assert!(r["undo"].is_array(), "{r}");
+            r
+        }
+        /// Edit, undo, redo, undo again: each lands where it should. Returns
+        /// the replies of the edit, the first undo and the redo.
+        async fn round_trip(a: &Actions, d: &Path, ops: Vec<edit::Op>) -> [Value; 3] {
+            let before = state(d);
+            let r = send(a, d, serde_json::to_value(&ops).unwrap()).await;
+            let after = state(d);
+            assert_ne!(after, before, "{ops:?} changed nothing");
+            let u = send(a, d, r["undo"].clone()).await;
+            assert_eq!(state(d), before, "undo of {ops:?}");
+            let re = send(a, d, u["undo"].clone()).await;
+            assert_eq!(state(d), after, "redo of {ops:?}");
+            send(a, d, re["undo"].clone()).await;
+            assert_eq!(state(d), before, "undo again of {ops:?}");
+            [r, u, re]
+        }
+
+        // Values: a claim, then one changed again and one handed back.
+        let (tmp, a) = project_for_edits();
+        let d = tmp.path().join("project");
+        let t = |v: Option<&str>| edit::Op::Title {
+            uuid: DIV.into(),
+            value: v.map(Into::into),
+        };
+        let [r, ..] = round_trip(&a, &d, vec![t(Some("Teiler"))]).await;
+        assert_eq!(
+            r["undo"],
+            json!([{ "op": "title", "uuid": DIV, "value": null }])
+        );
+        send(&a, &d, json!([t(Some("Teiler"))])).await;
+        // Two ops of one request on one value: undone last first.
+        let [r, ..] = round_trip(&a, &d, vec![t(Some("Eins")), t(None)]).await;
+        assert_eq!(
+            r["undo"],
+            json!([
+                { "op": "title", "uuid": DIV, "value": "Eins" },
+                { "op": "title", "uuid": DIV, "value": "Teiler" }
+            ])
+        );
+
+        // Wires: drawn, reconnected (one request), taken out.
+        let (tmp, a) = project_for_edits();
+        lox_that_wires(tmp.path());
+        let d = tmp.path().join("project");
+        let wire = |to: &str| edit::Op::Wire {
+            from: end(DIV, "AQ"),
+            to: end(to, "I2"),
+        };
+        let unwire = |to: &str| edit::Op::Unwire {
+            from: end(DIV, "AQ"),
+            to: end(to, "I2"),
+        };
+        round_trip(&a, &d, vec![wire(OR)]).await;
+        send(&a, &d, json!([wire(OR)])).await;
+        let [r, ..] = round_trip(&a, &d, vec![unwire(OR), wire(AND)]).await;
+        assert_eq!(r["undo"], json!([unwire(AND), wire(OR)]));
+        round_trip(&a, &d, vec![unwire(OR)]).await;
+
+        // Blocks: added, then taken out. Adding it again mints a new UUID
+        // in lox: the reply names the one it restores.
+        let (tmp, a) = project_for_edits();
+        lox_that_adds_blocks(tmp.path());
+        let d = tmp.path().join("project");
+        let add = edit::Op::AddBlock {
+            page: OG.into(),
+            ty: "And".into(),
+            title: Some("Licht".into()),
+            params: [("I2".to_string(), "1".to_string())].into(),
+            settings: Default::default(),
+            wires: vec![],
+            restores: None,
+        };
+        let [r, u, re] = round_trip(&a, &d, vec![add.clone()]).await;
+        let uuid = r["added"][0]["uuid"].as_str().unwrap().to_string();
+        assert_eq!(r["undo"], json!([{ "op": "remove_block", "uuid": uuid }]));
+        assert_eq!(r["added"][0].get("restores"), None);
+        assert_eq!(u["undo"][0]["op"], "add_block");
+        assert_eq!(u["undo"][0]["restores"], json!(uuid));
+        assert_eq!(re["added"][0]["restores"], json!(uuid));
+        let again = re["added"][0]["uuid"].as_str().unwrap();
+        assert_eq!(re["undo"], json!([{ "op": "remove_block", "uuid": again }]));
+        let r = send(&a, &d, json!([add])).await;
+        let uuid = r["added"][0]["uuid"].as_str().unwrap().to_string();
+        round_trip(&a, &d, vec![edit::Op::RemoveBlock { uuid }]).await;
+
+        // Moves and Arrange, which go into the lock.
+        let (tmp, a) = project_for_edits();
+        lox_that_places(tmp.path());
+        let d = tmp.path().join("project");
+        std::fs::write(d.join("pages/main.loxl"), "# the module\n").unwrap();
+        std::fs::write(
+            d.join("logic.lock.json"),
+            format!(
+                r#"{{"objects":{{"teiler":{{"uuid":"{DIV}","type":"Div","page_uuid":"{EG}","layout":{{"px":4032,"py":2880,"px2":5376,"py2":3576}}}}}}}}"#
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            d.join("out.Loxone"),
+            std::fs::read(d.join("base.Loxone")).unwrap(),
+        )
+        .unwrap();
+        sh(&d, "git add -A && git commit -qm managed");
+        let mv = edit::Op::Move {
+            uuid: DIV.into(),
+            x: 1920,
+            y: 960,
+        };
+        round_trip(&a, &d, vec![mv.clone()]).await;
+        send(&a, &d, json!([mv])).await;
+        let [r, ..] = round_trip(&a, &d, vec![edit::Op::Relayout { page: EG.into() }]).await;
+        assert_eq!(
+            r["undo"],
+            json!([{ "op": "place", "moves": [{ "uuid": DIV, "x": 1920, "y": 960 }] }])
+        );
+        // Only compiles: nothing was deployed.
+        let calls = std::fs::read_to_string(tmp.path().join("calls.log")).unwrap();
+        assert!(
+            calls.lines().all(|l| l.starts_with("logic compile")),
             "{calls}"
         );
     }
@@ -2876,6 +3096,7 @@ sed "s/Title=\"Testhaus\"/Title=\"Testhaus $w\"/" base.Loxone > "$out"
                     params: Default::default(),
                     settings: Default::default(),
                     wires: vec![],
+                    restores: None,
                 }],
             },
             None,
@@ -2945,6 +3166,7 @@ sed "s/Title=\"Testhaus\"/Title=\"Testhaus $w\"/" base.Loxone > "$out"
                 params: Default::default(),
                 settings: Default::default(),
                 wires: vec![],
+                restores: None,
             }],
         };
         a.edit(&add(blob(&d, "out.Loxone")), None).await.unwrap();
@@ -2978,6 +3200,7 @@ sed "s/Title=\"Testhaus\"/Title=\"Testhaus $w\"/" base.Loxone > "$out"
                 params: Default::default(),
                 settings: Default::default(),
                 wires: vec![],
+                restores: None,
             }],
         };
         a.edit(&req(blob(&d, "out.Loxone")), None).await.unwrap();

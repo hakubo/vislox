@@ -25,6 +25,12 @@ published under the same version (see [docker/README.md](docker/README.md)).
   as added or removed, with Revert. A link Loxone Config would not have (an input to an input, text into a number,
   an inverted input, a pair already wired, a connector vislox cannot tell the kind of) is refused with the reason. A wire Loxone Config drew cannot be taken
   out: lox removes only the wires its source draws. Never deploys (#61).
+- Undo and redo the edits (#62): *Undo* and *Redo* next to *Add block* (Ctrl/⌘+Z, Shift+Ctrl/⌘+Z), each
+  naming the edit in its tooltip, and a list of recent edits. An undo is sent as an edit of its own (the reply of
+  every edit now carries `undo`, the ops that undo it), so it is compiled and checked like any edit and never
+  deploys. The history is cleared, saying why, when the pending config changes outside the page (another edit, a
+  compile, Discard, Apply, Sync). It is the tab's own, kept for the config it was made on, so it survives a reload.
+  A relayout is undone by one new op, `place`, however many blocks the page has.
 - Fixed: Discard failed when the last commit had no lockfile (the first compile writes one), or one was staged
   but not committed. Discard now reads the last commit, never deletes a lock vislox did not write (one not in git
   goes back to how it was before vislox's first edit), and puts everything back when a step fails.

@@ -79,7 +79,12 @@
       <div class="hud hud-add hidden" id="hud-add">
         <button id="btn-add-block" type="button" aria-haspopup="dialog"><span aria-hidden="true">+</span> Add block</button>
         <button id="btn-relayout" type="button"><span aria-hidden="true">⇄</span> Arrange</button>
+        <span class="hud-sep" aria-hidden="true"></span>
+        <button id="btn-undo" type="button" aria-keyshortcuts="Control+Z Meta+Z"><span aria-hidden="true">↶</span> Undo</button>
+        <button id="btn-redo" type="button" aria-keyshortcuts="Control+Shift+Z Meta+Shift+Z"><span aria-hidden="true">↷</span> Redo</button>
+        <button id="btn-undo-list" type="button" aria-haspopup="dialog" aria-expanded="false" aria-controls="undo-pop" title="Recent edits">▾</button>
       </div>
+      <div class="undo-pop hidden" id="undo-pop" role="dialog" aria-label="Recent edits"></div>
       <div class="hud hud-zoom" role="group" aria-label="Zoom">
         <button id="btn-zoom-out" type="button" title="Zoom out (−)" aria-label="Zoom out">−</button>
         <button id="btn-zoom-pct" type="button" title="Zoom to 100%" class="pct">100%</button>
@@ -240,6 +245,8 @@
       <dt><kbd>+</kbd> <kbd>−</kbd> <kbd>0</kbd> <kbd>1</kbd></dt><dd>Zoom in, out, fit page, 100%</dd>
       <dt><kbd>Esc</kbd></dt><dd>Clear the selection</dd>
       <dt><kbd>Delete</kbd></dt><dd>Take out the wire whose card is open (one drawn here)</dd>
+      <dt><kbd>Ctrl</kbd> <kbd>Z</kbd></dt><dd>Undo the last edit made in this tab (<kbd>⌘</kbd> on a Mac)</dd>
+      <dt><kbd>Shift</kbd> <kbd>Ctrl</kbd> <kbd>Z</kbd></dt><dd>Redo it</dd>
       <dt>Double-click</dt><dd>Zoom to a block · follow a reference to its page</dd>
       <dt>Click history</dt><dd>Show that revision</dd>
       <dt>Shift + click history</dt><dd>Compare what you see with that revision (again: stop comparing)</dd>
