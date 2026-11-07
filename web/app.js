@@ -1255,8 +1255,10 @@ function renderPropsBody() {
     section("Device", rows);
   }
   // A constant with the unit Lox Logic writes it with (#79): `Time 30min`, not 1800.
+  // From a `let` constant or a `defaults` statement (#81): `28 (temp_schwelle)`.
+  const constOf = (q) => { const u = constUse(o.uuid, q.key); return u ? ` <span class="const-of" title="${esc(constTip(u))}">(${esc(constName(u))})</span>` : ""; };
   const params = o.ports.filter((q) => q.def != null || q.def_changed || q.inv)
-    .map((q) => row(q.name + (q.inv ? " (inverted)" : ""), chg(q.old_def_text ?? q.old_def, q.def_text ?? q.def, q.def_changed), marks && q.def_changed ? "pr-chg" : ""));
+    .map((q) => row(q.name + (q.inv ? " (inverted)" : ""), chg(q.old_def_text ?? q.old_def, q.def_text ?? q.def, q.def_changed) + constOf(q), marks && q.def_changed ? "pr-chg" : ""));
   section("Parameters", params, params.length);
   const sets = settingsRows(o, row, marks, chg);
   if (sets) section("Settings", sets.rows, sets.count);
@@ -1324,6 +1326,8 @@ $("props").addEventListener("keydown", (e) => {
   if (e.target.id === "ad-slug" && e.key === "Escape") { e.preventDefault(); e.stopPropagation(); adoptClose(); return; }
   if (e.target.id === "rn-slug" && e.key === "Enter") { e.preventDefault(); renameSave(S.sel); return; }
   if (e.target.id === "rn-slug" && e.key === "Escape") { e.preventDefault(); e.stopPropagation(); renameClose(); return; }
+  if (e.target.id === "ed-mk" && e.key === "Enter") { e.preventDefault(); constMake(); return; }
+  if (e.target.id === "ed-mk" && e.key === "Escape") { e.preventDefault(); e.stopPropagation(); constMkClose(); return; }
   const f = e.target.closest("[data-ed-field]");
   // In a program (#79) Enter is a line break; Ctrl+Enter (⌘ on a Mac) saves.
   if (f && e.key === "Enter" && (f.tagName !== "TEXTAREA" || e.ctrlKey || e.metaKey)) { e.preventDefault(); editSave(); return; }
@@ -1334,6 +1338,7 @@ $("props").addEventListener("keydown", (e) => {
 $("props").addEventListener("input", (e) => {
   if (e.target.id === "ad-slug") { AD.slug = e.target.value; return; }
   if (e.target.id === "rn-slug") { RN.slug = e.target.value; return; }
+  if (e.target.dataset.edScope && S.edit.uuid === S.sel) { (S.edit.scope ||= {})[e.target.dataset.edScope] = e.target.value; return; }
   const f = e.target.closest("[data-ed-field]");
   if (!f || S.edit.uuid !== S.sel) return;
   S.edit.draft[f.dataset.edField] = f.value;
@@ -1358,6 +1363,9 @@ $("props").addEventListener("click", (e) => {
     else if (what === "adopt-cancel") adoptClose();
     else if (what === "unadopt") adoptHandBack(S.sel);
     else if (what === "newest") editGoNewest();
+    else if (what === "mk-open") constMkOpen(eb.dataset.field);
+    else if (what === "mk-cancel") constMkClose();
+    else if (what === "mk-save") constMake();
     return;
   }
   const ob = e.target.closest("[data-op]");
@@ -1558,7 +1566,37 @@ $("tree-filter").addEventListener("input", renderTree);
 
 // ── changes ────────────────────────────────────────────────────────────
 const KIND = { added: ["+", "added"], removed: ["−", "removed"], renamed: ["~", "renamed"], param: ["~", "parameters"], attr: ["~", "settings"], rights: ["~", "rights"], "wire+": ["+", "wires added"], "wire-": ["−", "wires removed"], moved: ["↔", "moved"] };
-function shownChanges() { return (S.view?.changes || []).filter((c) => !S.chgOff.has(c.kind) && (!S.chgHw || c.hw)); }
+/** The `let` or `defaults` a parameter change comes from (#81), on the newest config: `let x`, `defaults T`. */
+function chgConst(c) {
+  if (c.kind !== "param" || !c.obj || !c.port) return null;
+  const u = constUse(c.obj, c.port), l = constLet(u);
+  return u ? (l ? `let ${l}` : `defaults ${u.name}`) : null;
+}
+/** The changes listed: those the filters let through, and the parameter changes one `let` or `defaults` causes
+ *  (two or more) together, where the first of them is. Next and previous go in this order. */
+function shownChanges() {
+  const list = (S.view?.changes || []).filter((c) => !S.chgOff.has(c.kind) && (!S.chgHw || c.hw));
+  const key = new Map(), n = new Map();
+  for (const c of list) { const k = chgConst(c); if (k) { key.set(c, k); n.set(k, (n.get(k) || 0) + 1); } }
+  if (![...n.values()].some((x) => x > 1)) return list;
+  const by = new Map();
+  for (const c of list) { const k = key.get(c); if (k && n.get(k) > 1) (by.get(k) || by.set(k, []).get(k)).push(c); }
+  const out = [], done = new Set();
+  for (const c of list) {
+    const k = key.get(c);
+    if (!k || n.get(k) < 2) out.push(c);
+    else if (!done.has(k)) { done.add(k); out.push(...by.get(k)); }
+  }
+  return out;
+}
+/** The heading over the changes one `let` or `defaults` causes. */
+function chgConstHead(k, count) {
+  const [kind, name] = k.split(" ");
+  const l = kind === "let" && constLets().find((x) => x.name === name);
+  const d = kind === "defaults" && (S.edits?.constants?.defaults || []).find((x) => x.type === name);
+  const at = l ? constAt(l.file, l.line) : d ? constAt(d.file, d.line) : "";
+  return `<div class="chg-grp" role="listitem"><span class="mono">${esc(l ? `let ${l.name} = ${l.value}` : k)}</span> · ${plural(count, "change")}${at ? `<span class="p">${esc(at)}</span>` : ""}</div>`;
+}
 function renderChanges() {
   const v = S.view, box = $("changes"), filt = $("chg-filter");
   box.innerHTML = ""; filt.innerHTML = "";
@@ -1605,13 +1643,19 @@ function renderChanges() {
   }
   if (!v.changes.length) { box.innerHTML = '<div class="empty">No differences between these revisions.</div>'; return; }
   const list = shownChanges().slice(0, 2000);
+  const groups = new Map();
+  for (const c of list) { const k = chgConst(c); if (k) groups.set(k, (groups.get(k) || 0) + 1); }
+  let inGroup = null;
   list.forEach((c, i) => {
+    const k = chgConst(c), grouped = k && groups.get(k) > 1;
+    if (grouped && k !== inGroup) box.insertAdjacentHTML("beforeend", chgConstHead(k, groups.get(k)));
+    inGroup = grouped ? k : null;
     const d = document.createElement("button");
     d.type = "button";
-    d.className = "chg" + (i === S.chgIdx ? " cur" : "");
+    d.className = "chg" + (i === S.chgIdx ? " cur" : "") + (grouped ? " in-grp" : "");
     d.setAttribute("role", "listitem");
     const where = c.page ? S.pageOf.get(c.page)?.title : c.obj ? v.objects[c.obj]?.path : "";
-    d.innerHTML = `<span class="k ${esc(c.kind)}${c.how ? " " + esc(c.how) : ""}" aria-label="${esc(KIND[c.kind]?.[1] || c.kind)}">${c.how === "added" ? "+" : c.how === "removed" ? "−" : KIND[c.kind]?.[0] || "~"}</span><span class="x"><span class="t">${esc(c.text)}</span>${where ? `<span class="p">${esc(where)}</span>` : ""}</span>${c.hw ? '<span class="hw-tag" title="Reconfigures a device">hardware</span>' : ""}`;
+    d.innerHTML = `<span class="k ${esc(c.kind)}${c.how ? " " + esc(c.how) : ""}" aria-label="${esc(KIND[c.kind]?.[1] || c.kind)}">${c.how === "added" ? "+" : c.how === "removed" ? "−" : KIND[c.kind]?.[0] || "~"}</span><span class="x"><span class="t">${esc(c.text)}${k && !grouped ? ` <span class="const-of">(${esc(k)})</span>` : ""}</span>${where ? `<span class="p">${esc(where)}</span>` : ""}</span>${c.hw ? '<span class="hw-tag" title="Reconfigures a device">hardware</span>' : ""}`;
     d.onclick = () => gotoChange(i);
     box.appendChild(d);
   });
@@ -3080,13 +3124,13 @@ S.edits = null; // GET /api/edits: what vislox's file claims, and which of it is
 S.edit = { uuid: null, open: false, draft: {}, bad: {}, busy: false, msg: "", err: "" };
 S.editsKey = null; // the server's key of what /api/edits says (vislox's file, deployed and pending config)
 async function loadEdits() {
-  const was = managedSet();
+  const was = managedSet(), consts = JSON.stringify(S.edits?.constants || null);
   if (!S.hist?.actions?.shown) { S.edits = null; managedRefresh(was); return; }
   try { S.edits = await api("/api/edits"); } catch { S.edits = null; S.editsKey = null; }
   // The managed blocks' badges and the legend follow the lockfile and the module (#64).
   managedRefresh(was);
-  // The claims' λ file:line in Rights and schedules too (#68).
-  if (S.view) renderRights();
+  // The claims' λ file:line in Rights and schedules too (#68); the changes a constant causes, grouped (#81).
+  if (S.view) S.view.compared && JSON.stringify(S.edits?.constants || null) !== consts ? renderChanges() : renderRights();
   renderActions();
   if (S.sel && S.view) renderProps();
 }
@@ -3335,7 +3379,12 @@ function adoptedUncommitted() { return (S.edits?.blocks || []).filter((b) => b.a
 /** The blocks added here (#59) that are not deployed yet, or the one with UUID `uuid`. */
 function editsAdded(uuid) { return (S.edits?.blocks || []).filter((b) => b.uuid && !b.deployed && (!uuid || b.uuid === uuid)); }
 /** The values vislox edited and has not deployed yet, of one object or of all; not those of a new block, which is new as a whole. */
-function editsPending(uuid) { return (S.edits?.claims || []).filter((c) => c.pending && (!uuid || c.uuid === uuid) && !editsAdded(c.uuid).length); }
+function editsPending(uuid) { return (S.edits?.claims || []).filter((c) => c.pending && (c.op === "let" ? !uuid : (!uuid || c.uuid === uuid) && !editsAdded(c.uuid).length)); }
+/** vislox's constants (#81) whose value is not deployed, that a port of `o` takes. */
+function constsPending(o) {
+  const names = new Set(o.ports.map((q) => constUse(o.uuid, q.key)).filter((u) => u?.ours).map(constLet).filter(Boolean));
+  return (S.edits?.claims || []).filter((c) => c.op === "let" && c.pending && names.has(c.name));
+}
 /** Whether `o` can be edited now: `{ ok }`, or `{ why }` and maybe `{ newest }` to go to. */
 function editState(o) {
   const a = S.hist?.actions;
@@ -3365,6 +3414,63 @@ function editPlaces(ty) {
 }
 /** A constant as the form starts it: with the unit Lox Logic writes it with (`30min`), else as stored. */
 function portNow(o, key) { const q = o.ports.find((x) => x.key === key); return q?.def_text ?? q?.def ?? "0"; }
+// ── let constants and defaults (#81) ──────────────────────────────────
+// lox writes a `let` constant's value, and a type's `defaults`, into each port that takes it, so the config keeps
+// no trace of either. GET /api/edits says which port of which block takes its value from one (`constants.uses`,
+// UUID lowercase → port key), on the newest config only, as `sources` (#64).
+/** Where port `key` of block `uuid` takes its value from: { kind: "let"|"defaults", name, constant?, value, file,
+ *  line, at_file, at_line, ours, at_ours }, or null. */
+function constUse(uuid, key) { return managedShown() ? S.edits.constants?.uses?.[(uuid || "").toLowerCase()]?.[key] || null : null; }
+function constLets() { return managedShown() ? S.edits.constants?.lets || [] : []; }
+/** The `let` a port's value comes from, through a default too. */
+function constLet(u) { return u && (u.kind === "let" ? u.name : u.constant) || null; }
+/** How Properties names where a value comes from: `temp_schwelle`, `defaults ModbusASensor`. */
+function constName(u) { return u.kind === "let" ? u.name : `defaults ${u.name}${u.constant ? `, ${u.constant}` : ""}`; }
+function constAt(file, line) { return file ? `${file}${line ? ":" + line : ""}` : ""; }
+/** How many ports take the value `u` names: the constant's (also through defaults), else the statement's. */
+function constCount(u) {
+  const l = constLet(u);
+  if (l) return constLets().find((x) => x.name === l)?.uses || 0;
+  return (S.edits?.constants?.defaults || []).find((d) => d.type === u.name)?.uses || 0;
+}
+function constTip(u) {
+  const at = constAt(u.file, u.line);
+  return u.kind === "let"
+    ? `From the constant ${u.name} = ${u.value}${at ? ` (${at})` : ""}, which ${plural(constCount(u), "port")} take. lox writes its value into each one.`
+    : `From defaults ${u.name}${at ? ` (${at})` : ""}: every block of the type that does not bind the port takes it${u.constant ? `, here the constant ${u.constant} = ${u.value}` : ""}.`;
+}
+/** Whether the module's own file binds this field's port to a constant (`x.Port = name`): changed there. */
+function constLocked(o, field) {
+  const [k, key] = field.split(/:(.*)/s);
+  const u = k === "p" ? constUse(o.uuid, key) : null;
+  return !!u && u.kind === "let" && !u.at_ours;
+}
+/** The note and the choice under a field whose value a constant or default gives (#81). */
+function constFieldRows(o, field, mine, kind) {
+  const [k, key] = field.split(/:(.*)/s);
+  if (k !== "p") return "";
+  const u = constUse(o.uuid, key), id = `ed-${field.replace(/[^\w-]/g, "_")}`;
+  const busy = mine.busy ? " disabled" : "";
+  if (mine.mk?.field === field) {
+    return `<div class="const-mk"><label for="ed-mk">Constant</label><input id="ed-mk" data-ed-field="mk" value="${esc(mine.draft.mk ?? mine.mk.name)}" autocomplete="off" spellcheck="false"${busy}>` +
+      `<button type="button" class="primary small" data-ed="mk-save"${busy}>Make it</button><button type="button" class="ed-btn small" data-ed="mk-cancel"${busy}>Cancel</button>` +
+      `<div class="const-why">vislox writes <span class="mono">let ${esc(mine.draft.mk ?? mine.mk.name)} = ${esc(mine.draft[field] ?? portNow(o, key))}</span> into ${esc(S.edits?.file || "its file")} and binds this port to it. Type its name into another block's field to bind that one too.</div></div>`;
+  }
+  if (!u) {
+    return kind === "quantity" && S.edits?.dir ? `<button type="button" class="lnk const-mk-open" data-ed="mk-open" data-field="${esc(field)}"${busy} title="Name this value: a let constant in vislox's file that other blocks can take too">Make a constant</button>` : "";
+  }
+  const n = constCount(u), at = constAt(u.file, u.line);
+  const from = `From <span class="mono">${esc(constName(u))}</span>${at ? ` (${esc(at)})` : ""}, ${plural(n, "use")}.`;
+  if (u.kind === "let" && u.ours) {
+    const scope = mine.scope?.[field] || "constant";
+    const radio = (v, label) => `<label class="const-scope"><input type="radio" name="${id}-scope" data-ed-scope="${esc(field)}" value="${v}"${scope === v ? " checked" : ""}${busy}> ${label}</label>`;
+    return `<div class="const-why">${from}</div>` + radio("constant", `Change the constant (${plural(n, "use")})`) + radio("block", "Only this block");
+  }
+  // Bound in the module's own file (`x.Port = name` on an extern): changed there, never claimed twice.
+  if (!u.at_ours) return `<div class="const-why">${from} Bound in ${esc(constAt(u.at_file, u.at_line))}: change it there; vislox writes only its own files.</div>`;
+  const own = u.kind === "let" ? "the constant is in the module's own file: change it there" : "the default is in the module's own file: change it there";
+  return `<div class="const-why">${from} Saving binds only this block's port; ${own}, vislox writes only its own files.</div>`;
+}
 /** A constant: a number, or one with a unit (#79); the server checks that the port takes the unit. */
 const EDIT_QUANTITY = /^-?\d+(\.\d+)?(ms|s|min|h|%|K|°)?$/;
 /** The fields of the edit form: [field, label, value now, kind, unit]. */
@@ -3413,6 +3519,13 @@ function editRows(o, row) {
     rows.push(row(editLabel(o, c), `<span class="ed-v">${v}</span><span class="ed-tag" title="Saved into the module and compiled, not on the Miniserver yet: Apply deploys it, Discard drops it">not deployed</span>` +
       (st.ok ? `<button type="button" class="ed-btn small" data-ed="revert" data-key="${esc(editKey(c))}" title="${c.deployed == null ? "Hand the value back to Loxone Config" : c.name === "Code" ? "Back to the program as deployed" : `Back to ${esc(c.deployed)}, as deployed`}">Revert</button>` : ""), "pr-chg"));
   }
+  // A constant of vislox's this block takes, changed and not deployed (#81): Revert puts back the deployed value;
+  // one made here is dropped by reverting the ports bound to it.
+  for (const c of constsPending(o)) {
+    const back = c.deployed != null && st.ok
+      ? `<button type="button" class="ed-btn small" data-ed="revert" data-key="${esc(editKey(c))}" title="Back to ${esc(c.deployed)}, as deployed, in every port bound to it">Revert</button>` : "";
+    rows.push(row(`Constant ${c.name}`, `<span class="ed-v">${esc(c.value)}</span><span class="ed-tag" title="${c.deployed == null ? "Made here, not deployed: revert the ports bound to it to drop it" : `Deployed as ${esc(c.deployed)}`}">not deployed</span>${back}`, "pr-chg"));
+  }
   if (!st.ok) {
     rows.push(`<div class="ed-note">${esc(st.why)}${st.newest ? ' <button type="button" class="lnk" data-ed="newest">View it</button>' : ""}</div>`);
   } else if (!mine?.open) {
@@ -3422,7 +3535,9 @@ function editRows(o, row) {
     for (const [field, label, now, kind, unit, choices] of editFields(o)) {
       const v = mine.draft[field] ?? now, bad = mine.bad[field];
       const id = `ed-${field.replace(/[^\w-]/g, "_")}`;
-      const attrs = `id="${id}" data-ed-field="${esc(field)}"${bad ? ` aria-invalid="true" aria-describedby="${id}-e"` : ""}${mine.busy ? " disabled" : ""}`;
+      // A port the module's own file binds to a constant (#81) is changed there.
+      const locked = constLocked(o, field);
+      const attrs = `id="${id}" data-ed-field="${esc(field)}"${bad ? ` aria-invalid="true" aria-describedby="${id}-e"` : ""}${mine.busy || locked ? " disabled" : ""}`;
       const input = kind === "Place" || kind === "Category"
         ? `<select ${attrs}>${editPlaces(kind).map(([t, n]) => `<option value="${esc(t)}"${t === v ? " selected" : ""}${n > 1 ? ' disabled title="Two of them have this title: rename one in Loxone Config to pick it"' : ""}>${esc(t)}</option>`).join("")}</select>`
         : kind === "choice" || kind === "on_off"
@@ -3430,15 +3545,17 @@ function editRows(o, row) {
         // After a line break: HTML drops the first one after <textarea>, so a program starting with a blank line keeps it.
         : kind === "program"
         ? `<textarea ${attrs} class="prog" rows="14" autocomplete="off" spellcheck="false" placeholder="Empty: Loxone Config's program">\n${esc(v)}</textarea>`
-        : `<input ${attrs} value="${esc(v)}" ${kind === "number" || kind === "time" ? `inputmode="decimal" class="num"${kind === "time" ? ' placeholder="HH:MM"' : ""}` : kind === "quantity" ? 'class="num" title="A number, or one with its unit: 30min, 250ms, 70%"' : kind === "duration" ? 'class="num" placeholder="5s"' : ""} autocomplete="off" spellcheck="false">`;
+        : `<input ${attrs} value="${esc(v)}" ${kind === "number" || kind === "time" ? `inputmode="decimal" class="num"${kind === "time" ? ' placeholder="HH:MM"' : ""}` : kind === "quantity" ? `class="num" list="ed-consts" title="A number, or one with its unit: 30min, 250ms, 70%; or the name of a constant"` : kind === "duration" ? 'class="num" placeholder="5s"' : ""} autocomplete="off" spellcheck="false">`;
       rows.push(`<div class="pr ed-row${kind === "program" ? " ed-prog" : ""}"><label class="k" for="${id}">${esc(label)}</label><div class="v">${input}` +
-        (unit ? `<span class="ed-unit">${esc(unit)}</span>` : "") + (bad ? `<div class="ed-bad" id="${id}-e">${esc(bad)}</div>` : "") + "</div></div>");
+        (unit ? `<span class="ed-unit">${esc(unit)}</span>` : "") + (bad ? `<div class="ed-bad" id="${id}-e">${esc(bad)}</div>` : "") + constFieldRows(o, field, mine, kind) + "</div></div>");
     }
+    // The constants a port may be bound to (#81): typed by name into a field.
+    if (constLets().length) rows.push(`<datalist id="ed-consts">${constLets().map((l) => `<option value="${esc(l.name)}">${esc(`= ${l.value}`)}</option>`).join("")}</datalist>`);
     rows.push(`<div class="ed-bar"><button type="button" class="primary small" data-ed="save"${mine.busy ? " disabled" : ""}>${mine.busy ? "Compiling…" : "Save"}</button>` +
       `<button type="button" class="ed-btn small" data-ed="cancel"${mine.busy ? " disabled" : ""}>Cancel</button>` +
       `<span class="ed-msg${mine.err ? " err" : ""}" role="status" aria-live="polite">${esc(mine.err || mine.msg || "Saving compiles the module; nothing is deployed.")}</span></div>`);
   }
-  return { rows, count: editsPending(o.uuid).length + editsAdded(o.uuid).length + mv.count };
+  return { rows, count: editsPending(o.uuid).length + constsPending(o).length + editsAdded(o.uuid).length + mv.count };
 }
 function editOpen(uuid) {
   S.edit = { uuid, open: true, draft: {}, bad: {}, busy: false, msg: "", err: "" };
@@ -3456,12 +3573,25 @@ const EDIT_NUMBER = /^-?\d+(\.\d+)?$/;
 async function editSave() {
   const o = S.view?.objects[S.edit.uuid], st = o && editState(o);
   if (!st?.ok || S.edit.busy || !S.edit.open) return;
-  const ops = [], bad = {}, added = !!editsBlock(o.uuid);
+  const ops = [], bad = {}, added = !!editsBlock(o.uuid), lets = new Set(constLets().map((l) => l.name)), changed = new Map();
   for (const [field, , now, kind] of editFields(o)) {
     const v = S.edit.draft[field];
-    if (v == null || v === now) continue;
+    if (v == null || v === now || constLocked(o, field)) continue;
     const t = kind === "number" || kind === "quantity" || kind === "time" || kind === "duration" ? v.trim() : v;
     const [k, key] = field.split(/:(.*)/s);
+    // A constant's name binds the port to it (#81).
+    if (k === "p" && lets.has(t)) { ops.push({ op: "param", uuid: o.uuid, port: key, value: t }); continue; }
+    // A value of vislox's own constant changes the constant, unless only this block is to change.
+    const u = k === "p" ? constUse(o.uuid, key) : null;
+    if (u?.kind === "let" && u.ours && (S.edit.scope?.[field] || "constant") === "constant") {
+      if (!EDIT_QUANTITY.test(t) && !AB_TIME.test(t) && !/^(on|off)$/.test(t)) { bad[field] = "A number, one with its unit (30min, 70%), a time of day (19:00), or on or off."; continue; }
+      // Two fields of one constant: one value, or say which differ.
+      const was = changed.get(u.name);
+      if (was && was.value !== t) { bad[field] = `${u.name} is ${was.value} in ${was.label}: give both the same value, or change one for this block only.`; continue; }
+      if (!was) ops.push({ op: "let", name: u.name, value: t });
+      changed.set(u.name, { value: t, label: portName(o, key) });
+      continue;
+    }
     // On a block added here an empty setting is dropped: Loxone Config's value again.
     if (added && k === "s" && !t.trim()) { ops.push({ op: "setting", uuid: o.uuid, name: key, value: null }); continue; }
     if (kind === "number" && !EDIT_NUMBER.test(t)) { bad[field] = /,/.test(t) ? "Write a decimal point, not a comma." : "A number, like 12 or -2.5."; continue; }
@@ -3501,10 +3631,45 @@ async function editSend(uuid, rev, ops, label) {
   }
   return "ok";
 }
+/** Make a constant (#81): a name for this port's value, `let vx_… = value` in vislox's file, and the port bound to
+ *  it, in one request (undone together). */
+function constMkOpen(field) {
+  const o = S.view?.objects[S.edit.uuid];
+  if (!o || S.edit.busy) return;
+  const [, key] = field.split(/:(.*)/s);
+  const taken = new Set(constLets().map((l) => l.name));
+  const stem = `vx_${(portName(o, key) || key).toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "") || "wert"}`;
+  let name = stem;
+  for (let i = 2; taken.has(name); i++) name = `${stem}_${i}`;
+  S.edit.mk = { field, name };
+  delete S.edit.draft.mk;
+  renderProps();
+  $("ed-mk")?.focus();
+}
+function constMkClose() {
+  if (S.edit.busy) return;
+  S.edit.mk = null;
+  delete S.edit.draft.mk;
+  renderProps();
+}
+async function constMake() {
+  const o = S.view?.objects[S.edit.uuid], st = o && editState(o), mk = S.edit.mk;
+  if (!st?.ok || !mk || S.edit.busy) return;
+  const [, key] = mk.field.split(/:(.*)/s);
+  const name = (S.edit.draft.mk ?? mk.name).trim(), value = (S.edit.draft[mk.field] ?? portNow(o, key)).trim();
+  S.edit.bad = {};
+  if (!/^vx_[a-z0-9_]+$/.test(name)) S.edit.bad[mk.field] = "vislox's constants are named vx_ and then lowercase letters, digits and _.";
+  else if (!EDIT_QUANTITY.test(value)) S.edit.bad[mk.field] = "A number, like 12 or -2.5, or one with its unit, like 30min.";
+  if (S.edit.bad[mk.field]) { S.edit.err = "Fix the marked values."; renderProps(); return; }
+  await editSend(o.uuid, st.rev, [{ op: "let", name, value }, { op: "param", uuid: o.uuid, port: key, value: name }]);
+}
 /** Back to the deployed value: claim what the deployed revision claimed, or nothing. */
 async function editRevert(key) {
-  const c = (S.edits?.claims || []).find((x) => editKey(x) === key && x.pending), o = c && S.view?.objects[c.uuid], st = o && editState(o);
+  const c = (S.edits?.claims || []).find((x) => editKey(x) === key && x.pending);
+  // A constant (#81) is reverted from a block that takes it: the one selected.
+  const o = c && S.view?.objects[c.op === "let" ? S.sel : c.uuid], st = o && editState(o);
   if (!st?.ok) return;
+  if (c.op === "let") { await editSend(o.uuid, st.rev, [{ op: "let", name: c.name, value: c.deployed }], `Revert the constant ${c.name}`); return; }
   const op = EDIT_ATTR[c.op] ? { op: c.op, uuid: c.uuid } : c.op === "param" ? { op: "param", uuid: c.uuid, port: c.port } : { op: "setting", uuid: c.uuid, name: c.name };
   await editSend(c.uuid, st.rev, [{ ...op, value: c.deployed }], `Revert ${editLabel(o, c)} of ${displayTitle(o)}`);
 }
@@ -5090,6 +5255,9 @@ function undoLabel(ops) {
     return uuids.size === 1 ? `${ops.length} values of ${obj(op.uuid)}` : `${ops.length} values`;
   }
   if (ops.length === 1 && op.op === "add_block") return `Add ${op.title || op.type}`;
+  // Constants (#81): changed, made (and bound), dropped.
+  if (op.op === "let" && ops.length === 1) return op.value == null ? `Drop the constant ${op.name}` : `Constant ${op.name}: ${op.value}`;
+  if (op.op === "let" && ops.slice(1).every((o) => o.op === "param" && o.value === op.name)) return `Make the constant ${op.name} = ${op.value}`;
   // Made when the op is made, and kept on its history entry: a deleted block is gone from the view afterwards.
   if (ops.length === 1 && op.op === "remove_block") { const b = editsBlock(op.uuid); return `${b?.deployed || b?.adopted ? "Delete" : "Remove"} ${obj(op.uuid)}`; }
   if (ops.length === 1 && op.op === "restore_block") {

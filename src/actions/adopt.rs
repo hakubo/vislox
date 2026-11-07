@@ -239,7 +239,13 @@ impl Actions {
         use axum::http::StatusCode;
         let bad = |e: String| (StatusCode::UNPROCESSABLE_ENTITY, e);
         let fail = |e: String| (StatusCode::INTERNAL_SERVER_ERROR, e);
-        let (names, lets) = edit::module_decls(&p.module);
+        // The module's names, and the bare names lox reads as themselves (its
+        // constants and aliases, vislox's constants): an adopted block keeps them.
+        // A module that does not read names none; the check after writing says why.
+        let decls = edit::module_decls(&p.module).unwrap_or_default();
+        let names = decls.names.clone();
+        let mut lets = decls.bare();
+        lets.extend(files.claims.8.keys().cloned());
         let mut chosen: BTreeSet<String> = BTreeSet::new();
         let taken = |s: &str, chosen: &BTreeSet<String>| {
             names.contains(s)

@@ -406,7 +406,7 @@ impl<'a> Index<'a> {
 
 /// The lines (0-based) inside `template … end`, the `end` among them: what
 /// they declare is the template's, made once per instance.
-fn template_bodies(lines: &[&str]) -> BTreeSet<usize> {
+pub(crate) fn template_bodies(lines: &[&str]) -> BTreeSet<usize> {
     let mut out = BTreeSet::new();
     let mut inside = false;
     for (n, line) in lines.iter().enumerate() {
@@ -427,7 +427,7 @@ fn template_bodies(lines: &[&str]) -> BTreeSet<usize> {
 }
 
 /// The text of a line before its `#` comment (not one inside a string).
-fn code(line: &str) -> &str {
+pub(crate) fn code(line: &str) -> &str {
     let mut quoted = false;
     let mut escaped = false;
     for (i, c) in line.char_indices() {
@@ -442,7 +442,7 @@ fn code(line: &str) -> &str {
     line
 }
 
-fn is_name(s: &str) -> bool {
+pub(crate) fn is_name(s: &str) -> bool {
     s.chars()
         .next()
         .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
@@ -458,7 +458,7 @@ fn wire_sink(line: &str) -> Option<(String, String)> {
 
 /// The keyword arguments of the call that starts on line `start`, with the
 /// line each is on (0-based): `Port:` at the call's own depth.
-fn bindings(lines: &[&str], start: usize) -> Vec<(String, usize)> {
+pub(crate) fn bindings(lines: &[&str], start: usize) -> Vec<(String, usize)> {
     let mut out = Vec::new();
     let mut depth = 0usize;
     let mut opened = false;

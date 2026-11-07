@@ -10,6 +10,7 @@ mod blocks;
 mod calendar;
 mod check;
 mod configdate;
+mod constants;
 mod discover;
 mod edit;
 mod hardware;

@@ -380,7 +380,14 @@ impl PageFile {
 
     /// Read a file vislox wrote. Only what vislox writes is accepted, so
     /// that a rewrite never drops a statement someone added by hand.
+    #[cfg(test)]
     pub fn parse(text: &str) -> Result<PageFile, String> {
+        PageFile::parse_with(text, &BTreeSet::new())
+    }
+
+    /// [`PageFile::parse`], knowing vislox's constants (#81): a bare name of
+    /// one on an adopted block is its value, not a wire from an object.
+    pub fn parse_with(text: &str, consts: &BTreeSet<String>) -> Result<PageFile, String> {
         // A fragment: an adopted block names the externs of `edits.loxl`.
         let m = Module::parse_fragment(text).map_err(|e| e.to_string())?;
         let mut file: Option<PageFile> = None;
@@ -422,19 +429,25 @@ impl PageFile {
                                 ..
                             }) if port == MIRRORS => args.push((port.clone(), v.clone())),
                             // A bare name of vislox's on an adopted block: the
-                            // default output of the object it names. Any other
-                            // bare name is a value: a `let` constant, a day word.
+                            // default output of the object it names, unless it
+                            // is one of vislox's constants (#81). Any other bare
+                            // name is a value: a `let` constant, a day word.
                             ArgItem::Binding(Binding {
                                 port,
                                 kind: BindingKind::Param(Value::Ref(src)),
                                 ..
-                            }) if adopted && src.starts_with(SLUG_PREFIX) => wires.push((
-                                port.clone(),
-                                PortRef {
-                                    slug: src.clone(),
-                                    port: String::new(),
-                                },
-                            )),
+                            }) if adopted
+                                && src.starts_with(SLUG_PREFIX)
+                                && !consts.contains(src) =>
+                            {
+                                wires.push((
+                                    port.clone(),
+                                    PortRef {
+                                        slug: src.clone(),
+                                        port: String::new(),
+                                    },
+                                ))
+                            }
                             ArgItem::Binding(Binding {
                                 port,
                                 kind: BindingKind::Param(v),

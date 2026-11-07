@@ -166,6 +166,12 @@ published under the same version (see [docker/README.md](docker/README.md)).
   once deployed or adopted, deleted (*Delete*: `removed <slug>`; the review shows it removed, Apply deletes it on the
   Miniserver after the removals are confirmed, and Undo brings it back with its UUIDs while lox keeps the
   tombstone). The Deploy pane offers to drop the `removed` and `moved` lines lox needs no more. Never deploys.
+- Constants and defaults (#81): Properties names the `let` constant or the `defaults` statement a parameter takes
+  its value from (`Time 30min (nachlauf)`), with its file and line, and the Changes list puts the changes one
+  constant causes together under it. *Make a constant* names a value in vislox's file (`let vx_… = 30min`) and binds
+  the port to it; another block takes it by its name. Changing it asks: the constant (every port bound to it) or
+  only this block. The module's own `let` and `defaults` lines are shown, not changed: vislox writes only its own
+  files. Never deploys.
 
 ## 0.2.0
 

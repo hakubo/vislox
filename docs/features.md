@@ -341,6 +341,15 @@ sends to the Miniserver see [miniserver.md](miniserver.md).
   pending revision and the Changes list; its Properties edit its name and constants, and *Remove* takes it out
   again until it is deployed.
 
+- **Constants and defaults** (the same project and token, #81): a parameter whose value a `let` constant or a
+  `defaults` statement of the module gives says so in Properties (`Time 30min (nachlauf)`, `ModbusPollingCycle 60
+  (defaults ModbusASensor)`), with the statement's file and line and how many ports take it. Comparing the newest
+  revision, the Changes list puts the parameter changes one constant causes under it (`let vx_nachlauf = 45min · 2
+  changes`). In *Edit values*, *Make a constant* names a field's value (`let vx_… = …` in vislox's file, the port
+  bound to it); another block takes it by its name, typed into its field. Changing a value one of vislox's constants
+  gives asks: *Change the constant (N uses)* or *Only this block*. The module's own `let` and `defaults` lines are
+  changed in its files; vislox binds only the block. How: [editing.md](editing.md#constants-and-defaults-81).
+
 - **Delete and rename managed blocks** (the same project and token, #80): Properties of a block added or adopted
   here shows its slug with *Rename* and, once deployed or adopted, *Delete*. *Rename* rewrites the slug in vislox's
   files with lox's own rename and adds `moved <old> -> <new>`: the block keeps its UUIDs and the config does not

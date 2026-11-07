@@ -57,6 +57,19 @@ const zeitenXml = `\t\t<C Type="Page" V="178" U="${ZEITEN}" Title="Zeiten" WF="1
 \t\t\t</C>
 \t\t</C>
 `;
+// Constants (#81): a page Konstanten that Loxone Config drew, with three Monoflops. The module's own file binds K1's
+// Time to its constant `nachlauf` (30min); K2 runs 30min and K3 1min, values of their own.
+const KONST = "60000000-0000-0000-ffff504f94000001", K1 = "60000001-0000-0000-ffff504f94000001";
+const K2 = "60000002-0000-0000-ffff504f94000001", K3 = "60000003-0000-0000-ffff504f94000001";
+const monoXml = (u, title, y, time) => `\t\t\t<C Type="Monoflop" V="178" U="${u}" Title="${title}" Px="960" Py="${y}" Px2="2304" Py2="${y + 696}" Cl="141,255,112" Nio="4" WF="16384">
+\t\t\t\t<Co K="InputTrigger" U="${u.slice(0, 9)}0000-0001-ffff504f94000001"/>
+\t\t\t\t<Co K="Time" Def="${time}" U="${u.slice(0, 9)}0000-0002-ffff504f94000001"/>
+\t\t\t\t<Co K="Q" U="${u.slice(0, 9)}0000-0003-ffff504f94000001"/>
+\t\t\t</C>
+`;
+const konstXml = `\t\t<C Type="Page" V="178" U="${KONST}" Title="Konstanten" WF="16384">
+${monoXml(K1, "Treppe", 960, 1800)}${monoXml(K2, "Keller", 2880, 1800)}${monoXml(K3, "Garten", 4800, 60)}\t\t</C>
+`;
 const usersXml = `\t\t<C Type="LoxCaption" V="178" U="40000010-0000-0000-ffff504f94000001" Title="Users and Permissions" CaptionType="20" SubType="20">
 \t\t\t<C Type="User" V="178" U="${ANNA}" Title="Anna" UsR="-1" NFCArr="0A1B2C3D4E5F" CodeArr="00112233">
 \t\t\t\t<PH NUM="2">
@@ -194,7 +207,7 @@ const base0 = readFileSync(fixture, "utf8").replace('<Co K="Q" U="10000009-0000-
     "\t\t</C>\n" +
     `\t\t<C Type="Page" V="178" U="${MELDUNGEN}" Title="Meldungen" WF="16384">\n` +
     `\t\t\t<C Type="OutputRefLM" V="178" U="${WARN}" Title="Frostwarnung" Px="960" Py="960" Px2="2304" Py2="1656" Cl="0,0,0" Nio="2" Ref="${FROST}"><Co K="AI" U="40000031-0000-0001-ffff504f94000001"/><Co K="AQ" U="40000031-0000-0002-ffff504f94000001"/><LoggerMailer RefNotification="${FROST}" On="Frost im Garten" MinimumTime="43200000" NL="1"/></C>\n` +
-    "\t\t</C>\n" + zeitenXml + "\t</C>\n</ControlList>");
+    "\t\t</C>\n" + zeitenXml + konstXml + "\t</C>\n</ControlList>");
 const base = base0.replace(`\t\t<C Type="Place" V="178" U="${KITCHEN}"`, `${flexXml}\t\t<C Type="Place" V="178" U="${KITCHEN}"`)
   .replace(`\t\t<C Type="Page" V="178" U="${MELDUNGEN}"`, `${beschXml}\t\t<C Type="Page" V="178" U="${MELDUNGEN}"`);
 assert.ok(base.includes(FLEX) && base.includes(OST), "the Touch Pure Flex is in the base");
@@ -205,6 +218,8 @@ writeFileSync(join(dir, "lox.toml"), 'base = "base.Loxone"\nmodule = "pages"\nou
 writeFileSync(join(dir, "pages", "README"), "the module\n");
 // The module's own source (the stand-in lox reads only vislox's files): `flur` is declared on line 3.
 writeFileSync(join(dir, "pages", "flur.loxl"), '# The module\'s own source.\npage "Obergeschoss"\nflur = And("Flur")\n');
+// The module's own constant (#81), and K1's Time bound to it on line 3.
+writeFileSync(join(dir, "pages", "konst.loxl"), `let nachlauf = 30min\nextern k1 = Monoflop(uuid: "${K1}")\nk1.Time = nachlauf\n`);
 const FLUR_AT = { px: 7104, py: 2880, px2: 8448, py2: 3576 };
 const lockObjects = { flur: { uuid: FLUR, type: "And", page_uuid: OG, layout: FLUR_AT } };
 for (let i = 0; i < LAGER_N; i++) lockObjects[`lager_${i}`] = { uuid: lagerUuid(i), type: "And", page_uuid: LAGER, layout: lagerAt(i) };
@@ -343,6 +358,8 @@ const settingAttrs = (rest) => {
 const withAttrs = (line, a) => Object.entries(a).reduce((l, [k, v]) => l.replace(new RegExp(\` \${k}="[^"]*"\`), "").replace(/^(\\s*<C [^>]*?)(\\/?>)/, \`$1 \${k}="\${v}"$2\`), line);
 const xml = (v) => v.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
 const claimed = [];
+// vislox's constants (#81): \`let vx_… = value\`; a claim that names one takes its value.
+const lets = Object.fromEntries([...src.matchAll(/^let (\\w+) = (.*)$/gm)].map((m) => [m[1], m[2]]));
 for (const line of src.split("\\n")) {
   let m;
   if ((m = line.match(/^extern (\\w+) = \\w+\\(uuid: "([^"]+)"\\)/))) { slugs[m[1]] = m[2]; continue; }
@@ -359,7 +376,7 @@ for (const line of src.split("\\n")) {
   }
   const key = KEYS[m[2]] || m[2];
   const j = out.findIndex((l, n) => n > i && l.includes(\`<Co K="\${key}"\`));
-  out[j] = out[j].replace(/ Def="[^"]*"/, "").replace(\`<Co K="\${key}"\`, \`<Co K="\${key}" Def="\${scale(unq(m[3]))}"\`);
+  out[j] = out[j].replace(/ Def="[^"]*"/, "").replace(\`<Co K="\${key}"\`, \`<Co K="\${key}" Def="\${scale(unq(lets[m[3]] ?? m[3]))}"\`);
 }
 // Switching times (#73): each \`schedule\` set of vislox's file, written onto the timers its claims name as lox
 // writes them: a column per mode the set names and the seven weekdays, in \`Mode=\` order, an <Entry> per interval.
@@ -2435,6 +2452,92 @@ try {
     assert.deepEqual(ops, [{ op: "unadopt", uuids: [NACH] }]);
     assert.equal(readFileSync(join(dir, "out.Loxone"), "utf8"), outWas);
     assert.equal(lockNow().objects.vx_nach, undefined);
+  });
+  await step("let constants are shown, made, bound and changed in every port at once, and undone (#81)", async () => {
+    await settled();
+    const params = '#props [data-body="Parameters"]', edit = '#props [data-body="Edit"]';
+    const claims = () => readFileSync(join(dir, "pages", "vislox", "edits.loxl"), "utf8");
+    const time = (u) => `S.view.objects["${u}"].ports.find((p) => p.key === "Time").def`;
+    const send = async (act, what) => {
+      const n = edits.length;
+      await act();
+      await until(() => edits.length > n && statuses[n] !== undefined, what);
+      assert.equal(statuses[n], 200, what);
+      await settled();
+      return edits[n].ops;
+    };
+    // The module's own constant: its name beside the value; the port is changed in the module's file.
+    await pick(K1);
+    await page.waitForFunction((u) => S.edits?.constants?.uses?.[u]?.Time, K1);
+    await waitText(params, /Time\s*30min \(nachlauf\)/);
+    assert.match(await page.getAttribute(`${params} .const-of`, "title"), /nachlauf = 30min \(pages\/konst\.loxl:1\)/);
+    await page.click('#props [data-ed="open"]');
+    assert.ok(await page.isDisabled(field("p:Time")));
+    await waitText(edit, /From nachlauf \(pages\/konst\.loxl:1\), 1 use\. Bound in pages\/konst\.loxl:3: change it there/);
+    await page.click('#props [data-ed="cancel"]');
+    // Make a constant of K2's time: `let vx_time = 30min`, and K2's Time bound to it, in one request.
+    await pick(K2);
+    await page.click('#props [data-ed="open"]');
+    await page.click('#props [data-ed="mk-open"][data-field="p:Time"]');
+    assert.equal(await page.inputValue("#ed-mk"), "vx_time");
+    let ops = await send(() => page.press("#ed-mk", "Enter"), "make a constant");
+    assert.deepEqual(ops, [{ op: "let", name: "vx_time", value: "30min" }, { op: "param", uuid: K2, port: "Time", value: "vx_time" }]);
+    assert.match(claims(), /^let vx_time = 30min$/m);
+    assert.match(claims(), new RegExp(`^vx_${K2.replace(/-/g, "_")}\\.Time = vx_time$`, "m"));
+    await page.waitForFunction((u) => S.edits?.constants?.uses?.[u]?.Time?.name === "vx_time", K2, { timeout: 10000 });
+    await waitText(params, /Time\s*30min \(vx_time\)/);
+    // K3 takes it by its name.
+    await pick(K3);
+    await page.click('#props [data-ed="open"]');
+    await page.fill(field("p:Time"), "vx_time");
+    ops = await send(() => page.press(field("p:Time"), "Enter"), "bind K3");
+    assert.deepEqual(ops, [{ op: "param", uuid: K3, port: "Time", value: "vx_time" }]);
+    await page.waitForFunction(`${time(K3)} === "1800"`, null, { timeout: 10000 });
+    // Applied (as Apply leaves it: the base is the compile, committed), so the constant has a deployed value.
+    writeFileSync(join(dir, "base.Loxone"), readFileSync(join(dir, "out.Loxone")));
+    git("add", "-A");
+    git("commit", "-q", "-m", "Applied the constant");
+    await page.waitForFunction(() => /Nothing pending/.test(document.querySelector("#deploy-pend")?.textContent || "") &&
+      (S.edits?.claims || []).some((c) => c.op === "let" && c.deployed === "30min" && !c.pending), null, { timeout: 20000 });
+    await settled();
+    // Changed on K2, it asks: the constant (2 uses) or only this block. The constant changes both ports.
+    await pick(K2);
+    await page.waitForFunction(() => S.edits?.constants?.lets?.find((l) => l.name === "vx_time")?.uses === 2, null, { timeout: 10000 });
+    await page.click('#props [data-ed="open"]');
+    await waitText(edit, /Change the constant \(2 uses\)[\s\S]*Only this block/);
+    await page.fill(field("p:Time"), "45min");
+    ops = await send(() => page.click('#props [data-ed="save"]'), "change the constant");
+    assert.deepEqual(ops, [{ op: "let", name: "vx_time", value: "45min" }]);
+    await page.waitForFunction(`${time(K2)} === "2700" && ${time(K3)} === "2700"`, null, { timeout: 10000 });
+    // The Changes list groups the two under the constant, next to each other.
+    await waitText("#changes", /let vx_time = 45min · 2 changes/);
+    const list = await page.$$eval("#changes > *", (els) => els.map((e) => [e.className, e.textContent]));
+    const at = list.findIndex(([c]) => c === "chg-grp");
+    assert.match(list[at][1], /pages\/vislox\/edits\.loxl:\d+/);
+    assert.deepEqual(list.slice(at + 1, at + 3).map(([c, t]) => [c.includes("in-grp"), /Keller|Garten/.test(t)]), [[true, true], [true, true]]);
+    // The constant is a claim not deployed: Revert puts back its deployed value, in both ports.
+    await waitText(edit, /Constant vx_time\s*45min\s*not deployed\s*Revert/);
+    ops = await send(() => page.click(`#props [data-ed="revert"][data-key="let||vx_time"]`), "revert the constant");
+    assert.deepEqual(ops, [{ op: "let", name: "vx_time", value: "30min" }]);
+    await page.waitForFunction(`${time(K2)} === "1800" && ${time(K3)} === "1800"`, null, { timeout: 10000 });
+    assert.match(claims(), /^let vx_time = 30min$/m);
+    // Only this block: K3's own value; the constant stays.
+    await pick(K3);
+    await page.click('#props [data-ed="open"]');
+    await page.check('#props [data-ed-scope="p:Time"][value="block"]');
+    await page.fill(field("p:Time"), "20min");
+    ops = await send(() => page.click('#props [data-ed="save"]'), "only this block");
+    assert.deepEqual(ops, [{ op: "param", uuid: K3, port: "Time", value: "20min" }]);
+    await page.waitForFunction(`${time(K3)} === "1200" && ${time(K2)} === "1800"`, null, { timeout: 10000 });
+    // Undone step by step, back to what is deployed.
+    ops = await undoKey(false, `${time(K3)} === "1800"`);
+    assert.deepEqual(ops, [{ op: "param", uuid: K3, port: "Time", value: "vx_time" }]);
+    ops = await undoKey(false, `${time(K2)} === "2700" && ${time(K3)} === "2700"`);
+    assert.deepEqual(ops, [{ op: "let", name: "vx_time", value: "45min" }]);
+    ops = await undoKey(false, `${time(K2)} === "1800" && ${time(K3)} === "1800"`);
+    assert.deepEqual(ops, [{ op: "let", name: "vx_time", value: "30min" }]);
+    await page.waitForFunction(() => /Nothing pending/.test(document.querySelector("#deploy-pend")?.textContent || ""), null, { timeout: 15000 });
+    assert.match(claims(), /^let vx_time = 30min$/m);
   });
   await step("nothing was deployed: lox only compiled, checked, linted and tested", async () => {
     const ran = readFileSync(calls, "utf8").trim().split("\n");

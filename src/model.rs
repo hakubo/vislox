@@ -988,6 +988,10 @@ pub struct Change {
     /// For a `rights` change: `added`, `removed` or `changed`, to colour it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub how: Option<&'static str>,
+    /// For a `param` change: the connector's key, so the browser groups the
+    /// changes one `let` or `defaults` edit causes (#81).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port: Option<String>,
 }
 
 fn rect(l: &Layout) -> [i64; 4] {
@@ -2674,6 +2678,7 @@ fn changes(view: &mut View, nc: &Ctx, oc: &Ctx, d: &Delta) {
             hw: d.hw.contains_key(&u).then(|| u.clone()),
             obj: Some(u),
             how: None,
+            port: None,
         });
     }
     for u in sorted(&d.removed, oc) {
@@ -2688,6 +2693,7 @@ fn changes(view: &mut View, nc: &Ctx, oc: &Ctx, d: &Delta) {
             hw: d.hw.contains_key(&u).then(|| u.clone()),
             obj: Some(u),
             how: None,
+            port: None,
         });
     }
     let mut changed: Vec<String> = nc
@@ -2707,6 +2713,7 @@ fn changes(view: &mut View, nc: &Ctx, oc: &Ctx, d: &Delta) {
                 obj: Some(u.clone()),
                 hw: None,
                 how: None,
+                port: None,
             });
         }
         let ty = nc.ty(&u);
@@ -2734,6 +2741,7 @@ fn changes(view: &mut View, nc: &Ctx, oc: &Ctx, d: &Delta) {
                 obj: Some(u.clone()),
                 hw: None,
                 how: None,
+                port: Some(key.clone()),
             });
         }
         let (mut lines, mut covered) = view
@@ -2757,6 +2765,7 @@ fn changes(view: &mut View, nc: &Ctx, oc: &Ctx, d: &Delta) {
                 obj: Some(u.clone()),
                 hw: None,
                 how: None,
+                port: None,
             });
         }
         if let Some(rc) = view.rights.iter().find(|c| c.uuid == u) {
@@ -2768,6 +2777,7 @@ fn changes(view: &mut View, nc: &Ctx, oc: &Ctx, d: &Delta) {
                     obj: Some(u.clone()),
                     hw: None,
                     how: Some(how),
+                    port: None,
                 });
             }
         }
@@ -2782,6 +2792,7 @@ fn changes(view: &mut View, nc: &Ctx, oc: &Ctx, d: &Delta) {
                     obj: Some(u.clone()),
                     hw: None,
                     how: None,
+                    port: None,
                 });
             }
         }
@@ -2796,6 +2807,7 @@ fn changes(view: &mut View, nc: &Ctx, oc: &Ctx, d: &Delta) {
                     obj: Some(u.clone()),
                     hw: None,
                     how: None,
+                    port: None,
                 });
             }
         }
@@ -2810,6 +2822,7 @@ fn changes(view: &mut View, nc: &Ctx, oc: &Ctx, d: &Delta) {
                     obj: Some(u.clone()),
                     hw: None,
                     how: None,
+                    port: None,
                 });
             }
         }
@@ -2822,6 +2835,7 @@ fn changes(view: &mut View, nc: &Ctx, oc: &Ctx, d: &Delta) {
                     obj: Some(u.clone()),
                     hw: None,
                     how: None,
+                    port: None,
                 });
             }
         }
@@ -2856,6 +2870,7 @@ fn changes(view: &mut View, nc: &Ctx, oc: &Ctx, d: &Delta) {
                     obj: Some(u.clone()),
                     hw,
                     how: None,
+                    port: None,
                 });
             }
         }
@@ -2897,6 +2912,7 @@ fn changes(view: &mut View, nc: &Ctx, oc: &Ctx, d: &Delta) {
                 obj: Some(u.clone()),
                 hw: None,
                 how: None,
+                port: None,
             });
         }
         // Said above, with the names, for what has an `<IoData>`.
@@ -2908,6 +2924,7 @@ fn changes(view: &mut View, nc: &Ctx, oc: &Ctx, d: &Delta) {
                 obj: Some(u.clone()),
                 hw: None,
                 how: None,
+                port: None,
             });
         }
     }
@@ -2939,6 +2956,7 @@ fn changes(view: &mut View, nc: &Ctx, oc: &Ctx, d: &Delta) {
             obj: wire_obj(nc, w),
             hw: None,
             how: None,
+            port: None,
         });
     }
     let mut wr: Vec<_> = d.wires_removed.iter().collect();
@@ -2952,6 +2970,7 @@ fn changes(view: &mut View, nc: &Ctx, oc: &Ctx, d: &Delta) {
             obj: wire_obj(oc, w),
             hw: None,
             how: None,
+            port: None,
         });
     }
     let mut moved: Vec<_> = d
@@ -2977,6 +2996,7 @@ fn changes(view: &mut View, nc: &Ctx, oc: &Ctx, d: &Delta) {
             obj: Some(u),
             hw: None,
             how: None,
+            port: None,
         });
     }
     // A removed Code Touch or notification takes its rights with it (#68),
@@ -2990,6 +3010,7 @@ fn changes(view: &mut View, nc: &Ctx, oc: &Ctx, d: &Delta) {
                 obj: Some(rc.uuid.clone()),
                 hw: None,
                 how: Some(how),
+                port: None,
             });
         }
     }

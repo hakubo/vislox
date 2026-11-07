@@ -923,3 +923,16 @@ rect.ghost, line.ghost { fill: #1f6fd10a; stroke: var(--moved); stroke-opacity: 
 .ti-picks { display: flex; flex-wrap: wrap; gap: 2px 10px; }
 .ti-pick { display: inline-flex; align-items: center; gap: 3px; white-space: nowrap; }
 .ti-pick.bad { color: var(--removed); }
+
+/* let constants and defaults (#81) */
+.const-of { color: var(--muted); font-size: 12px; }
+.const-why { color: var(--muted); font-size: 12px; margin-top: 3px; white-space: normal; }
+.const-scope { display: block; font-size: 12px; margin-top: 2px; }
+.const-mk { margin-top: 4px; display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; }
+.const-mk label { font-size: 12px; color: var(--muted); }
+.ed-row .const-mk input { width: 12em; font-family: ui-monospace, "DejaVu Sans Mono", monospace; }
+.const-mk .const-why { flex: 1 1 100%; }
+.const-mk-open { display: block; margin-top: 2px; font-size: 12px; }
+.changes .chg-grp { padding: 6px 10px 3px; font-size: 12px; font-weight: 600; border-bottom: 1px solid var(--line-2); background: #f7f9f6; display: flex; flex-wrap: wrap; gap: 0 6px; align-items: baseline; }
+.changes .chg-grp .p { color: var(--muted); font-weight: 400; }
+.changes .chg.in-grp { padding-left: 22px; }

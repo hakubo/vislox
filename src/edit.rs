@@ -218,6 +218,13 @@ pub enum Op {
         uuid: String,
         value: Option<crate::tiles_edit::TilesVal>,
     },
+    /// A `let` constant of vislox's file (#81): `let <name> = <value>` in
+    /// [`FILE`]. Every port bound to it takes the new value (lox scales a
+    /// suffixed one into each port's unit). A new name makes the constant;
+    /// `None` drops it, once nothing is bound to it. A constant the module's
+    /// own files declare is changed there. Its `previous` is the value before
+    /// (none: it did not exist).
+    Let { name: String, value: Option<String> },
 }
 
 /// Where a `place` puts one block: its top left corner, as `move` takes it.
@@ -255,6 +262,7 @@ impl Op {
             | Op::Adopt { .. }
             | Op::AdoptPage { .. }
             | Op::Unadopt { .. }
+            | Op::Let { .. }
             | Op::Tidy => None,
         }
     }
@@ -266,7 +274,8 @@ impl Op {
             | Op::Room { value, .. }
             | Op::Category { value, .. }
             | Op::Param { value, .. }
-            | Op::Setting { value, .. } => value.as_deref(),
+            | Op::Setting { value, .. }
+            | Op::Let { value, .. } => value.as_deref(),
             Op::AddBlock { .. }
             | Op::RemoveBlock { .. }
             | Op::RestoreBlock { .. }
@@ -297,7 +306,8 @@ impl Op {
             | Op::Room { value, .. }
             | Op::Category { value, .. }
             | Op::Param { value, .. }
-            | Op::Setting { value, .. } => *value = v,
+            | Op::Setting { value, .. }
+            | Op::Let { value, .. } => *value = v,
             Op::AddBlock { .. }
             | Op::RemoveBlock { .. }
             | Op::RestoreBlock { .. }
@@ -556,6 +566,8 @@ pub struct Claims(
     pub crate::recipients_edit::RecipientSets,
     /// The tiles of the Touch Pure Flex devices it claims (#78).
     pub crate::tiles_edit::TileSets,
+    /// The `let` constants made here (#81): name → value.
+    pub BTreeMap<String, Value>,
 );
 
 /// A wire vislox draws: `to.port <- from.port`, each end a slug (an
@@ -732,6 +744,17 @@ impl Claims {
                         .attrs
                         .insert(which, plain(&a.value));
                 }
+                // A constant made here (#81): `vx_…`, a value, never an alias.
+                Item::Let(l) => {
+                    let value = matches!(
+                        l.value,
+                        Value::Number(_) | Value::Unit { .. } | Value::Clock(_) | Value::Bool(_)
+                    );
+                    if !own_constant(&l.name) || !value {
+                        return Err(foreign(&format!("`let {} = {}`", l.name, l.value)));
+                    }
+                    c.8.insert(l.name, l.value);
+                }
                 Item::Gap | Item::FragmentEnd | Item::Comment(_) => {}
                 // Switching times, moods, members, access: each kind reads
                 // its own sets and claims.
@@ -805,6 +828,14 @@ impl Claims {
             "# Values edited in vislox (Properties). vislox rewrites this file on every edit;\n\
              # see docs/editing.md in vislox. Deleting a line hands that value back to Loxone Config.\n",
         );
+        if !self.8.is_empty() {
+            out.push_str(
+                "\n# Constants made in vislox. Every port bound to one takes its value.\n",
+            );
+        }
+        for (n, v) in &self.8 {
+            out.push_str(&format!("let {n} = {v}\n"));
+        }
         let named = self.named_slugs();
         for (uuid, c) in &self.0 {
             let s = slug(uuid);
@@ -863,7 +894,8 @@ impl Claims {
             | Op::Members { .. }
             | Op::Access { .. }
             | Op::Recipients { .. }
-            | Op::Tiles { .. } => None,
+            | Op::Tiles { .. }
+            | Op::Let { .. } => None,
         }
     }
 
@@ -891,6 +923,13 @@ impl Claims {
                     });
                 }
             }
+        }
+        // The constants made here (#81), by name.
+        for (n, val) in &self.8 {
+            v.push(Op::Let {
+                name: n.clone(),
+                value: Some(val.to_string()),
+            });
         }
         v
     }
@@ -956,12 +995,145 @@ fn text(s: &str, what: &str, empty_ok: bool) -> Result<String, String> {
     Ok(s.to_string())
 }
 
+// ── constants (#81) ─────────────────────────────────────────────────────
+
+/// Whether a typed value is a bare name (`vx_nachlauf`, `temp_schwelle`): it
+/// may name a constant (#81); a number never does.
+pub fn bare_name(v: &str) -> bool {
+    let v = v.trim();
+    v.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+        && v.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Whether `name` may be one of vislox's constants: `vx_` and a name of its
+/// own, not one vislox names an object of Loxone Config's by.
+fn own_constant(name: &str) -> bool {
+    name.starts_with(SLUG_PREFIX) && name.len() > SLUG_PREFIX.len() && slug_uuid(name).is_none()
+}
+
+/// A port's value typed as the name of a `let` constant (#81), vislox's own
+/// (`ours`) or one the module declares (`module`): the binding to it. lox
+/// checks the constant's value against the port, scaling a unit.
+fn constant_ref(
+    ours: &BTreeMap<String, Value>,
+    module: &BTreeSet<String>,
+    v: &str,
+) -> Option<Value> {
+    let n = v.trim();
+    (ours.contains_key(n) || module.contains(n)).then(|| Value::Ref(n.to_string()))
+}
+
+/// A constant's value as Lox Logic writes it: a number, one with its unit
+/// (`30min`, `70%`), a time of day (`19:00`) or `on`/`off`. lox checks it
+/// against each port bound to it.
+fn constant_value(v: &str) -> Result<Value, String> {
+    let t = v.trim();
+    match t {
+        "on" => return Ok(Value::Bool(true)),
+        "off" => return Ok(Value::Bool(false)),
+        _ => {}
+    }
+    if logic::clock_seconds(t).is_some() {
+        return Ok(Value::Clock(t.to_string()));
+    }
+    if let Ok(n) = number(t) {
+        return Ok(Value::Number(n));
+    }
+    if t.starts_with(|c: char| c.is_ascii_digit() || c == '-')
+        && let Some(u @ Value::Unit { .. }) = crate::units::lox_value(t)
+    {
+        return Ok(u);
+    }
+    Err(format!(
+        "`{t}` is no constant: a number, one with its unit (30min, 70%), a time of day (19:00), \
+         or on or off"
+    ))
+}
+
+/// How many ports vislox's files bind to the constant `name`.
+pub fn constant_uses(files: &Files, name: &str) -> usize {
+    let is = |v: &Value| matches!(v, Value::Ref(r) if r == name);
+    let claims: usize = files
+        .claims
+        .0
+        .values()
+        .map(|c| c.sets.values().filter(|v| is(v)).count())
+        .sum();
+    let blocks: usize = files
+        .pages
+        .values()
+        .flat_map(|p| &p.blocks)
+        .map(|b| b.args.iter().filter(|(_, v)| is(v)).count())
+        .sum();
+    claims + blocks
+}
+
+/// The `let` op: make, change or drop one of vislox's constants. Returns the
+/// value before (`None`: there was none).
+fn set_constant(
+    files: &mut Files,
+    ctx: &Ctx,
+    name: &str,
+    value: Option<&str>,
+) -> Result<Option<String>, String> {
+    let name = name.trim();
+    let previous = files.claims.8.get(name).map(|v| v.to_string());
+    if previous.is_none() {
+        if ctx.lets.contains(name) {
+            return Err(format!(
+                "`{name}` is a constant of the module's own files: change it there (vislox \
+                 writes only its own files), or bind this block's port to a value of its own"
+            ));
+        }
+        let Some(_) = value else {
+            return Err(format!("vislox's file has no constant `{name}`"));
+        };
+        logic::valid_slug(name).map_err(|e| e.to_string())?;
+        if !own_constant(name) {
+            return Err(format!(
+                "vislox's constants are named {SLUG_PREFIX} and then lowercase letters, digits \
+                 and _"
+            ));
+        }
+        if name.contains("__") {
+            return Err("`__` is lox's for the blocks an expression makes".into());
+        }
+        if ctx.names.contains(name)
+            || ctx.lock.slugs.contains_key(name)
+            || ctx.lock.tombstoned(name)
+            || files.names(name)
+        {
+            return Err(format!(
+                "`{name}` is taken: the module or its lockfile has that name"
+            ));
+        }
+    }
+    match value {
+        Some(v) => {
+            let v = constant_value(v)?;
+            files.claims.8.insert(name.to_string(), v);
+        }
+        None => {
+            let n = constant_uses(files, name);
+            if n > 0 {
+                return Err(format!(
+                    "`{name}` is still bound to {n} port{}: give them values of their own first",
+                    if n == 1 { "" } else { "s" }
+                ));
+            }
+            files.claims.8.remove(name);
+        }
+    }
+    Ok(previous)
+}
+
 /// Apply `op` to `claims`, checked against the pending config `doc`.
 /// Returns the value claimed before (`None`: none), which undoes it.
 pub fn apply(
     claims: &mut Claims,
     doc: &LoxoneDoc,
     managed: &HashSet<String>,
+    lets: &BTreeSet<String>,
     op: &Op,
 ) -> Result<Option<String>, String> {
     let uuid = op
@@ -1031,9 +1203,13 @@ pub fn apply(
         Op::Param { port, value, .. } => {
             let pname = port_names::name_of(&ty, port).to_string();
             let v = match value {
-                Some(v) if caps.params.iter().any(|p| &p.key == port) => Some(
-                    crate::units::port_value(&ty, port, v).map_err(|e| format!("{pname}: {e}"))?,
-                ),
+                Some(v) if caps.params.iter().any(|p| &p.key == port) => {
+                    Some(match constant_ref(&claims.8, lets, v) {
+                        Some(c) => c,
+                        None => crate::units::port_value(&ty, port, v)
+                            .map_err(|e| format!("{pname}: {e}"))?,
+                    })
+                }
                 Some(_) => {
                     return Err(format!(
                         "{name}: {pname} cannot be edited here (it is wired, or not an input)"
@@ -1083,7 +1259,8 @@ pub fn apply(
         | Op::Members { .. }
         | Op::Access { .. }
         | Op::Recipients { .. }
-        | Op::Tiles { .. } => {
+        | Op::Tiles { .. }
+        | Op::Let { .. } => {
             unreachable!("not a value")
         }
     };
@@ -1293,15 +1470,19 @@ impl Files {
             ..Files::default()
         };
         let mut programs = BTreeMap::new();
+        // The claims first: a page file's bare name of one of its constants
+        // (#81) is a value.
+        if let Some(text) = texts.get(CLAIMS) {
+            f.claims = Claims::parse(text).map_err(|e| format!("{CLAIMS}: {e}"))?;
+        }
+        let consts: BTreeSet<String> = f.claims.8.keys().cloned().collect();
         for (name, text) in texts {
             if name.ends_with(PROGRAM_EXT) {
                 programs.insert(name.clone(), text.replace("\r\n", "\n"));
-            } else if name == CLAIMS {
-                f.claims = Claims::parse(text).map_err(|e| format!("{name}: {e}"))?;
-            } else {
+            } else if name != CLAIMS {
                 f.pages.insert(
                     name.clone(),
-                    PageFile::parse(text).map_err(|e| format!("{name}: {e}"))?,
+                    PageFile::parse_with(text, &consts).map_err(|e| format!("{name}: {e}"))?,
                 );
             }
         }
@@ -1409,6 +1590,7 @@ impl Files {
         let mut out = BTreeMap::new();
         if !self.claims.0.values().all(Claim::is_empty)
             || !self.claims.1.is_empty()
+            || !self.claims.8.is_empty()
             || crate::set_claim::KINDS
                 .iter()
                 .any(|k| !k.is_empty(&self.claims))
@@ -1536,13 +1718,18 @@ impl Files {
             .find_map(|p| p.blocks.iter_mut().find(|b| b.slug == slug))
     }
 
-    /// Whether a block, removal or rename of vislox's files is named `slug`.
+    /// Whether a block, removal, rename, set or constant (#81) of vislox's files is
+    /// named `slug`.
     pub fn names(&self, slug: &str) -> bool {
-        self.pages.values().any(|p| {
-            p.removed.contains(slug)
-                || p.moved.iter().any(|(f, t)| f == slug || t == slug)
-                || p.blocks.iter().any(|b| b.slug == slug)
-        })
+        self.claims.8.contains_key(slug)
+            || crate::set_claim::KINDS
+                .iter()
+                .any(|k| k.set_names(&self.claims).contains(&slug))
+            || self.pages.values().any(|p| {
+                p.removed.contains(slug)
+                    || p.moved.iter().any(|(f, t)| f == slug || t == slug)
+                    || p.blocks.iter().any(|b| b.slug == slug)
+            })
     }
 
     /// Drop the `removed` and `moved` lines lox needs no more (what `lox
@@ -1660,6 +1847,8 @@ pub struct Ctx<'a> {
     pub deployed: Option<&'a LoxoneDoc>,
     /// The names the module's other files declare.
     pub names: &'a BTreeSet<String>,
+    /// Of them, the `let` constants (#81): a port may be bound to one.
+    pub lets: &'a BTreeSet<String>,
     /// The wires vislox's file drew when the request began: one the
     /// pending config has and an earlier op of the request took out is not
     /// wired any more (#61).
@@ -1738,6 +1927,7 @@ pub fn apply_op(files: &mut Files, ctx: &Ctx, op: &Op) -> Result<Applied, String
             crate::recipients_edit::apply(files, ctx, uuid, value.as_ref())
         }
         Op::Tiles { uuid, value } => crate::tiles_edit::apply(files, ctx, uuid, value.as_ref()),
+        Op::Let { name, value } => set_constant(files, ctx, name, value.as_deref()).map(done),
         _ => {
             let uuid = op.uuid().unwrap_or_default();
             match ctx.lock.slug_of(uuid) {
@@ -1747,7 +1937,7 @@ pub fn apply_op(files: &mut Files, ctx: &Ctx, op: &Op) -> Result<Applied, String
                 }
                 _ => {
                     let managed: HashSet<String> = ctx.lock.slugs.values().cloned().collect();
-                    apply(&mut files.claims, ctx.doc, &managed, op).map(done)
+                    apply(&mut files.claims, ctx.doc, &managed, ctx.lets, op).map(done)
                 }
             }
         }
@@ -2568,7 +2758,8 @@ fn restore_block(files: &mut Files, ctx: &Ctx, op: &Op) -> Result<Applied, Strin
             String::new()
         }
     );
-    let pf = PageFile::parse(&text).map_err(|e| format!("its declaration: {e}"))?;
+    let consts: BTreeSet<String> = files.claims.8.keys().cloned().collect();
+    let pf = PageFile::parse_with(&text, &consts).map_err(|e| format!("its declaration: {e}"))?;
     let [b] = pf.blocks.as_slice() else {
         return Err("its declaration is one block".into());
     };
@@ -3913,6 +4104,7 @@ fn edit_new_block(
         )
         .map_err(|e| format!("{name}: {e}"))?;
     }
+    let lets = files.claims.8.clone();
     let b = files.block_mut(slug).expect("checked");
     match op {
         Op::Title { value, .. } => {
@@ -3928,10 +4120,13 @@ fn edit_new_block(
                 .ok_or_else(|| format!("{name}: {port} cannot be edited here"))?;
             let previous = b.get(pname).map(plain);
             let v = match value {
-                Some(v) if caps.params.iter().any(|p| &p.key == port) => Some(
-                    crate::units::port_value(&b.ty, port, v)
-                        .map_err(|e| format!("{pname}: {e}"))?,
-                ),
+                Some(v) if caps.params.iter().any(|p| &p.key == port) => {
+                    Some(match constant_ref(&lets, ctx.lets, v) {
+                        Some(c) => c,
+                        None => crate::units::port_value(&b.ty, port, v)
+                            .map_err(|e| format!("{pname}: {e}"))?,
+                    })
+                }
                 Some(_) => {
                     return Err(format!(
                         "{name}: {pname} cannot be edited here (it is wired, or not an input)"
@@ -3990,42 +4185,75 @@ fn edit_new_block(
     }
 }
 
-/// The names the module declares (blocks, externs, signals, instances,
-/// constants), so that a new slug is none of them. Empty when the module
-/// does not read; then the check after writing says why.
-pub fn module_names(module: &Path) -> BTreeSet<String> {
-    module_decls(module).0
+/// What the module's own files declare (vislox's directory, [`DIR`], left
+/// out: what vislox's files declare is read from [`Files`] as the request
+/// changes it, #81).
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Decls {
+    /// Every name (blocks, externs, signals, instances, sets, constants), so
+    /// that a new name is none of them.
+    pub names: BTreeSet<String>,
+    /// Of them, the `let` constants of a value, which a port may be bound to.
+    pub lets: BTreeSet<String>,
+    /// And the aliases (`let x = y.Q`), which name a port, not a value.
+    pub aliases: BTreeSet<String>,
 }
 
-/// [`module_names`], and of them the `let` constants (a bare name in an
-/// argument names one of those before an object).
-pub fn module_decls(module: &Path) -> (BTreeSet<String>, BTreeSet<String>) {
-    let Some(m) = module
-        .to_str()
-        .and_then(|p| loxone_config::cli::read_module(p).ok())
-    else {
-        return Default::default();
-    };
-    let mut names = BTreeSet::new();
-    let mut lets = BTreeSet::new();
-    for i in &m.items {
-        match i {
-            Item::Block(b) | Item::Instance(b) => names.insert(b.slug.clone()),
-            Item::Extern(e) => names.insert(e.slug.clone()),
-            Item::Signal(s) => names.insert(s.slug.clone()),
-            // The sets share the namespace (#73 picks a set's name).
-            Item::Schedule(s) => names.insert(s.name.clone()),
-            Item::Tiles(s) => names.insert(s.name.clone()),
-            Item::Moods(s) => names.insert(s.name.clone()),
-            Item::Access(s) => names.insert(s.name.clone()),
-            Item::Let(l) => {
-                lets.insert(l.name.clone());
-                names.insert(l.name.clone())
-            }
-            _ => false,
-        };
+impl Decls {
+    /// The bare names lox reads as themselves before an object: the
+    /// constants and the aliases (an adopted block keeps them, #72).
+    pub fn bare(&self) -> BTreeSet<String> {
+        self.lets.union(&self.aliases).cloned().collect()
     }
-    (names, lets)
+}
+
+/// [`Decls`] of the module's own `.loxl` files. A file that does not read is
+/// an error naming it (shown relative to the module).
+pub fn module_decls(module: &Path) -> Result<Decls, String> {
+    let mut paths = Vec::new();
+    if module.is_file() {
+        paths.push(module.to_path_buf());
+    } else {
+        let ours = module.join(DIR);
+        module_files(module, &mut |f, _| {
+            if f.extension().is_some_and(|x| x == "loxl") && !f.starts_with(&ours) {
+                paths.push(f.to_path_buf());
+            }
+        });
+    }
+    paths.sort();
+    let mut d = Decls::default();
+    for f in paths {
+        let shown = f
+            .strip_prefix(module)
+            .unwrap_or(&f)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let text = std::fs::read_to_string(&f).map_err(|e| format!("{shown}: {e}"))?;
+        let m = Module::parse_fragment(&text).map_err(|e| format!("{shown}: {e}"))?;
+        for i in &m.items {
+            match i {
+                Item::Block(b) | Item::Instance(b) => d.names.insert(b.slug.clone()),
+                Item::Extern(e) => d.names.insert(e.slug.clone()),
+                Item::Signal(s) => d.names.insert(s.slug.clone()),
+                // The sets share the namespace (#73 picks a set's name).
+                Item::Schedule(s) => d.names.insert(s.name.clone()),
+                Item::Tiles(s) => d.names.insert(s.name.clone()),
+                Item::Moods(s) => d.names.insert(s.name.clone()),
+                Item::Access(s) => d.names.insert(s.name.clone()),
+                Item::Let(l) => {
+                    if matches!(l.value, Value::Port(_)) {
+                        d.aliases.insert(l.name.clone());
+                    } else {
+                        d.lets.insert(l.name.clone());
+                    }
+                    d.names.insert(l.name.clone())
+                }
+                _ => false,
+            };
+        }
+    }
+    Ok(d)
 }
 
 /// Check the whole module, with vislox's files as written, the way `lox logic
@@ -4098,7 +4326,8 @@ pub fn current(doc: &LoxoneDoc, op: &Op) -> Option<String> {
         | Op::Members { .. }
         | Op::Access { .. }
         | Op::Recipients { .. }
-        | Op::Tiles { .. } => None,
+        | Op::Tiles { .. }
+        | Op::Let { .. } => None,
     }
 }
 
@@ -4128,6 +4357,8 @@ pub fn module_files(dir: &Path, found: &mut dyn FnMut(&Path, std::time::SystemTi
 mod tests {
     use super::*;
     use loxone_config::{Lockfile, logic::CompileOptions};
+
+    static NO_LETS: BTreeSet<String> = BTreeSet::new();
 
     const DIV: &str = "10000006-0000-0060-ffff504f94000001";
     const AND: &str = "10000004-0000-0040-ffff504f94000001";
@@ -4207,14 +4438,26 @@ mod tests {
         let none = HashSet::new();
         let mut c = Claims::default();
         assert_eq!(
-            apply(&mut c, &d, &none, &param(DIV, "Input2", Some("100"))),
+            apply(
+                &mut c,
+                &d,
+                &none,
+                &BTreeSet::new(),
+                &param(DIV, "Input2", Some("100"))
+            ),
             Ok(None)
         );
         assert_eq!(
-            apply(&mut c, &d, &none, &param(DIV, "Input2", Some("50"))),
+            apply(
+                &mut c,
+                &d,
+                &none,
+                &BTreeSet::new(),
+                &param(DIV, "Input2", Some("50"))
+            ),
             Ok(Some("100".into()))
         );
-        let err = |op: Op| apply(&mut c.clone(), &d, &none, &op).unwrap_err();
+        let err = |op: Op| apply(&mut c.clone(), &d, &none, &BTreeSet::new(), &op).unwrap_err();
         assert!(err(param(DIV, "Input2", Some("1,5"))).contains("decimal point"));
         assert!(err(param(DIV, "Input2", Some("abc"))).contains("not a number"));
         assert!(err(param(DIV, "Input1", Some("3"))).contains("wired"));
@@ -4228,13 +4471,19 @@ mod tests {
         assert!(err(param("nope", "I2", Some("1"))).contains("no object"));
         let managed = HashSet::from([DIV.to_string()]);
         assert!(
-            apply(&mut c.clone(), &d, &managed, &title("x"))
+            apply(&mut c.clone(), &d, &managed, &BTreeSet::new(), &title("x"))
                 .unwrap_err()
                 .contains("module manages")
         );
         // Dropping the claim hands the value back; the object leaves the file.
         assert_eq!(
-            apply(&mut c, &d, &none, &param(DIV, "Input2", None)),
+            apply(
+                &mut c,
+                &d,
+                &none,
+                &BTreeSet::new(),
+                &param(DIV, "Input2", None)
+            ),
             Ok(Some("50".into()))
         );
         assert!(c.0.is_empty());
@@ -4247,20 +4496,27 @@ mod tests {
         };
         let mut c = Claims::default();
         assert!(
-            apply(&mut c, &h, &none, &set("MinChange", "-1"))
+            apply(&mut c, &h, &none, &BTreeSet::new(), &set("MinChange", "-1"))
                 .unwrap_err()
                 .contains("below 0")
         );
         assert!(
-            apply(&mut c, &h, &none, &set("Unit", "V"))
+            apply(&mut c, &h, &none, &BTreeSet::new(), &set("Unit", "V"))
                 .unwrap_err()
                 .contains("cannot be edited")
         );
-        apply(&mut c, &h, &none, &set("MinChange", "0.5")).unwrap();
-        apply(&mut c, &h, &none, &set("Desc", "Pegel")).unwrap();
+        apply(
+            &mut c,
+            &h,
+            &none,
+            &BTreeSet::new(),
+            &set("MinChange", "0.5"),
+        )
+        .unwrap();
+        apply(&mut c, &h, &none, &BTreeSet::new(), &set("Desc", "Pegel")).unwrap();
         assert_eq!(c.ops().len(), 2);
         // An optional text clears to empty (lox writes `Desc=""`); a name cannot.
-        apply(&mut c, &h, &none, &set("Desc", "")).unwrap();
+        apply(&mut c, &h, &none, &BTreeSet::new(), &set("Desc", "")).unwrap();
         assert!(c.render().contains(".Desc = \"\""), "{}", c.render());
         assert!(compile(&h, &c.render()).contains(r#"Desc="""#));
         let no_name = Op::Title {
@@ -4268,7 +4524,7 @@ mod tests {
             value: Some(String::new()),
         };
         assert!(
-            apply(&mut c, &h, &none, &no_name)
+            apply(&mut c, &h, &none, &BTreeSet::new(), &no_name)
                 .unwrap_err()
                 .contains("cannot be empty")
         );
@@ -4287,7 +4543,7 @@ mod tests {
             },
             param(AND, "I2", Some("1")),
         ] {
-            apply(&mut c, &d, &none, &op).unwrap();
+            apply(&mut c, &d, &none, &BTreeSet::new(), &op).unwrap();
         }
         let text = c.render();
         assert!(
@@ -4308,6 +4564,7 @@ mod tests {
             &mut c,
             &h,
             &none,
+            &BTreeSet::new(),
             &Op::Setting {
                 uuid: AI_IN.into(),
                 name: "MinChange".into(),
@@ -4348,11 +4605,11 @@ mod tests {
             value: Some(v.into()),
         };
         let mut c = Claims::default();
-        let err = |c: &mut Claims, op: Op| apply(c, &d, &none, &op).unwrap_err();
+        let err = |c: &mut Claims, op: Op| apply(c, &d, &none, &BTreeSet::new(), &op).unwrap_err();
         assert!(err(&mut c, room(DIV, "Keller")).contains("no room"));
         assert!(err(&mut c, room(DIV, "Flur")).contains("more than one"));
         assert!(err(&mut c, room(AND, "Bad")).contains("has no room"));
-        apply(&mut c, &d, &none, &room(DIV, "Bad")).unwrap();
+        apply(&mut c, &d, &none, &BTreeSet::new(), &room(DIV, "Bad")).unwrap();
         let text = c.render();
         assert!(text.contains(".room = \"Bad\""), "{text}");
         assert_eq!(Claims::parse(&text).unwrap(), c);
@@ -4600,6 +4857,7 @@ mod tests {
                 base: &d,
                 deployed: None,
                 names: &names,
+                lets: &Default::default(),
                 drawn: &Default::default(),
                 adoptions: &Default::default(),
                 page_adoptions: &Default::default(),
@@ -4633,6 +4891,7 @@ mod tests {
             base: &d,
             deployed: None,
             names: &names,
+            lets: &Default::default(),
             drawn: &Default::default(),
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
@@ -4703,6 +4962,7 @@ mod tests {
             base: &d,
             deployed: Some(&d),
             names: &names,
+            lets: &Default::default(),
             drawn: &Default::default(),
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
@@ -4766,6 +5026,7 @@ mod tests {
             base: &d,
             deployed: Some(&d),
             names: &names,
+            lets: &Default::default(),
             drawn: &Default::default(),
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
@@ -4794,6 +5055,7 @@ mod tests {
             base: &d,
             deployed: Some(&out),
             names: &names,
+            lets: &Default::default(),
             drawn: &Default::default(),
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
@@ -4818,6 +5080,7 @@ mod tests {
             lock: &lock,
             deployed: None,
             names: &names,
+            lets: &Default::default(),
             drawn: &Default::default(),
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
@@ -4850,6 +5113,7 @@ mod tests {
             lock: &lock,
             deployed: None,
             names: &names,
+            lets: &Default::default(),
             drawn: &Default::default(),
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
@@ -4884,6 +5148,7 @@ mod tests {
             lock: &lock,
             deployed: Some(&renamed),
             names: &names,
+            lets: &Default::default(),
             drawn: &Default::default(),
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
@@ -4914,6 +5179,7 @@ mod tests {
             base: &d,
             deployed: None,
             names: &names,
+            lets: &Default::default(),
             drawn: &Default::default(),
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
@@ -5014,6 +5280,7 @@ mod tests {
             base: &d,
             deployed: None,
             names: &names,
+            lets: &Default::default(),
             drawn: &Default::default(),
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
@@ -5068,6 +5335,7 @@ mod tests {
             base: &d,
             deployed: None,
             names: &names,
+            lets: &Default::default(),
             drawn: &Default::default(),
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
@@ -5104,6 +5372,7 @@ mod tests {
             base: &d,
             deployed: None,
             names: &names,
+            lets: &Default::default(),
             drawn: &Default::default(),
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
@@ -5154,6 +5423,7 @@ mod tests {
             base: &d,
             deployed: None,
             names: &names,
+            lets: &Default::default(),
             drawn: &Default::default(),
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
@@ -5172,6 +5442,7 @@ mod tests {
             base: &base,
             deployed: Some(&base),
             names: &names,
+            lets: &Default::default(),
             drawn: &Default::default(),
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
@@ -5255,6 +5526,7 @@ mod tests {
             base: &d,
             deployed: None,
             names: &names,
+            lets: &Default::default(),
             drawn: &Default::default(),
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
@@ -5270,6 +5542,7 @@ mod tests {
             base: &d,
             deployed: None,
             names: &names,
+            lets: &Default::default(),
             drawn: &Default::default(),
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
@@ -5377,6 +5650,7 @@ mod tests {
             base: &d,
             deployed: None,
             names: &names,
+            lets: &Default::default(),
             drawn: &Default::default(),
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
@@ -5402,6 +5676,7 @@ mod tests {
                 base: &base,
                 deployed: Some(&base),
                 names: &names,
+                lets: &Default::default(),
                 drawn: &Default::default(),
                 adoptions: &Default::default(),
                 page_adoptions: &Default::default(),
@@ -5473,6 +5748,7 @@ mod tests {
             base: &d,
             deployed: None,
             names: &names,
+            lets: &Default::default(),
             drawn: &Default::default(),
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
@@ -5527,6 +5803,7 @@ mod tests {
             base: &d,
             deployed: None,
             names: &names,
+            lets: &Default::default(),
             drawn: &Default::default(),
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
@@ -5616,6 +5893,7 @@ mod tests {
             base: &d,
             deployed: None,
             names: &names,
+            lets: &Default::default(),
             drawn: &Default::default(),
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
@@ -5662,6 +5940,7 @@ mod tests {
             base: &d,
             deployed: None,
             names: &names,
+            lets: &Default::default(),
             drawn: &drawn,
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
@@ -5700,6 +5979,7 @@ mod tests {
             base: &d,
             deployed: None,
             names: &names,
+            lets: &Default::default(),
             drawn: &Default::default(),
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
@@ -5749,6 +6029,7 @@ mod tests {
             base: &t,
             deployed: None,
             names: &names,
+            lets: &Default::default(),
             drawn: &Default::default(),
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
@@ -5785,6 +6066,7 @@ mod tests {
             base: &d,
             deployed: None,
             names: &names,
+            lets: &Default::default(),
             drawn: &Default::default(),
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
@@ -5824,6 +6106,7 @@ mod tests {
             base: &d,
             deployed: None,
             names: &names,
+            lets: &Default::default(),
             drawn: &Default::default(),
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
@@ -5839,6 +6122,7 @@ mod tests {
             base: &d,
             deployed: None,
             names: &names,
+            lets: &Default::default(),
             drawn: &Default::default(),
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
@@ -5875,6 +6159,7 @@ mod tests {
             base: &d,
             deployed: None,
             names: &names,
+            lets: &Default::default(),
             drawn: &Default::default(),
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
@@ -5913,6 +6198,7 @@ mod tests {
             base: &d,
             deployed: None,
             names: &names,
+            lets: &Default::default(),
             drawn: &Default::default(),
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
@@ -6004,6 +6290,7 @@ mod tests {
             lock: &lock,
             deployed: None,
             names: &Default::default(),
+            lets: &Default::default(),
             drawn: &Default::default(),
             adoptions: &adoptions,
             page_adoptions: &pages,
@@ -6149,6 +6436,7 @@ mod tests {
             base: &d,
             deployed: None,
             names: &names,
+            lets: &Default::default(),
             drawn: &Default::default(),
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
@@ -6369,6 +6657,7 @@ mod tests {
             base: &d,
             deployed: None,
             names: &names,
+            lets: &Default::default(),
             drawn: &Default::default(),
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
@@ -6475,6 +6764,7 @@ mod tests {
             base: &d,
             deployed: None,
             names: &names,
+            lets: &Default::default(),
             drawn: &Default::default(),
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
@@ -6587,6 +6877,7 @@ mod tests {
             base: d,
             deployed: None,
             names,
+            lets: &NO_LETS,
             drawn: &EMPTY_WIRES,
             adoptions: &EMPTY_ADOPT,
             page_adoptions: &EMPTY_PAGES,
@@ -7119,6 +7410,7 @@ mod tests {
             base: d,
             deployed: None,
             names,
+            lets: &NO_LETS,
             drawn: &EMPTY_WIRES,
             adoptions: &EMPTY_ADOPT,
             page_adoptions: &EMPTY_PAGES,
@@ -8232,6 +8524,7 @@ mod tests {
             lock,
             deployed,
             names,
+            lets: &NO_LETS,
             drawn: &NONE_W,
             adoptions: &NONE_A,
             page_adoptions: &NONE_P,
@@ -8753,5 +9046,238 @@ mod tests {
             e
         );
         assert_eq!(g, f);
+    }
+
+    // ── constants (#81) ─────────────────────────────────────────────────
+
+    fn let_op(name: &str, v: Option<&str>) -> Op {
+        Op::Let {
+            name: name.into(),
+            value: v.map(Into::into),
+        }
+    }
+
+    /// The constant of connector `key` of `uuid` in `doc`.
+    fn def_of(doc: &LoxoneDoc, uuid: &str, key: &str) -> Option<String> {
+        current(doc, &param(uuid, key, None))
+    }
+
+    #[test]
+    fn a_constant_made_here_is_bound_to_ports_and_changes_them_all() {
+        let d = doc("house.Loxone");
+        let names = BTreeSet::new();
+        let mut files = Files::default();
+        let mut l = Lockfile::default();
+        let lock = lock_of(&l);
+        let ctx = ctx_of(&d, &d, &lock, None, &names);
+        apply_op(
+            &mut files,
+            &ctx,
+            &add(OG, "Monoflop", Some("Nachlauf"), &[("Time", "30")], &[]),
+        )
+        .unwrap();
+        // Made, then bound in one request: the Divide block's divisor (a
+        // claim on an extern of Loxone Config's).
+        let made = apply_op(&mut files, &ctx, &let_op("vx_zeit", Some("100"))).unwrap();
+        assert_eq!(made.previous, serde_json::json!(null));
+        let bound = apply_op(&mut files, &ctx, &param(DIV, "Input2", Some("vx_zeit"))).unwrap();
+        assert_eq!(bound.previous, serde_json::json!(null));
+        let out = compile_files(&d, &files, &mut l).unwrap();
+        assert_eq!(def_of(&out, DIV, "Input2").as_deref(), Some("100"));
+        // And the Monoflop added here: its declaration names the constant.
+        let mono = l.objects["vx_monoflop_1"].uuid.clone();
+        let lock = lock_of(&l);
+        let ctx = ctx_of(&out, &d, &lock, None, &names);
+        let was = apply_op(&mut files, &ctx, &param(&mono, "Time", Some("vx_zeit"))).unwrap();
+        assert_eq!(was.previous, serde_json::json!("30"));
+        let text = files.render();
+        assert!(
+            text["edits.loxl"].contains("let vx_zeit = 100\n"),
+            "{}",
+            text["edits.loxl"]
+        );
+        assert!(
+            text["edits.loxl"].contains(".In2 = vx_zeit\n"),
+            "{}",
+            text["edits.loxl"]
+        );
+        assert!(
+            text["obergeschoss.loxl"].contains("Time: vx_zeit"),
+            "{}",
+            text["obergeschoss.loxl"]
+        );
+        // Read back as written.
+        assert_eq!(Files::from_texts(&text).unwrap().render(), text);
+        let out = compile_files(&d, &files, &mut l).unwrap();
+        assert_eq!(def_of(&out, &mono, "Time").as_deref(), Some("100"));
+        // Changing the constant changes both ports.
+        let ctx = ctx_of(&out, &d, &lock, None, &names);
+        let r = apply_op(&mut files, &ctx, &let_op("vx_zeit", Some("250"))).unwrap();
+        assert_eq!(r.previous, serde_json::json!("100"));
+        let out = compile_files(&d, &files, &mut l).unwrap();
+        assert_eq!(def_of(&out, DIV, "Input2").as_deref(), Some("250"));
+        assert_eq!(def_of(&out, &mono, "Time").as_deref(), Some("250"));
+        // A constant still bound is not dropped.
+        let ctx = ctx_of(&out, &d, &lock, None, &names);
+        let e = apply_op(&mut files.clone(), &ctx, &let_op("vx_zeit", None)).unwrap_err();
+        assert!(e.contains("still bound to 2 ports"), "{e}");
+        // The undo of making it and binding it: the bindings go first, then
+        // the constant.
+        let ops = [
+            let_op("vx_neu", Some("5")),
+            param(DIV, "Input2", Some("vx_neu")),
+        ];
+        let mut prev = Vec::new();
+        for op in &ops {
+            prev.push(apply_op(&mut files, &ctx, op).unwrap().previous);
+        }
+        let undo = undo_ops(&ops, &prev, &[None, None]).unwrap();
+        assert_eq!(
+            undo,
+            vec![
+                param(DIV, "Input2", Some("vx_zeit")),
+                let_op("vx_neu", None)
+            ]
+        );
+        for op in &undo {
+            apply_op(&mut files, &ctx, op).unwrap();
+        }
+        assert!(!files.claims.8.contains_key("vx_neu"));
+        assert_eq!(files.render(), text_with(&files));
+    }
+
+    /// The files' texts, read back and rendered again: a fixed point.
+    fn text_with(files: &Files) -> BTreeMap<String, String> {
+        Files::from_texts(&files.render()).unwrap().render()
+    }
+
+    #[test]
+    fn a_constant_takes_a_name_of_its_own_and_a_value_lox_takes() {
+        let d = doc("house.Loxone");
+        let names: BTreeSet<String> = ["vx_belegt".to_string(), "schwelle".to_string()].into();
+        let lets: BTreeSet<String> = ["schwelle".to_string()].into();
+        let lock = Lock::default();
+        let mut ctx = ctx_of(&d, &d, &lock, None, &names);
+        ctx.lets = &lets;
+        let mut files = Files::default();
+        let err = |files: &mut Files, op: Op| apply_op(files, &ctx, &op).unwrap_err();
+        assert!(err(&mut files, let_op("zeit", Some("1"))).contains("vx_"));
+        assert!(err(&mut files, let_op("vx_Zeit", Some("1"))).contains("invalid slug"));
+        assert!(err(&mut files, let_op("vx_belegt", Some("1"))).contains("is taken"));
+        assert!(err(&mut files, let_op(&slug(DIV), Some("1"))).contains("vx_"));
+        // The module's own constant is changed in its file.
+        assert!(err(&mut files, let_op("schwelle", Some("1"))).contains("module's own files"));
+        assert!(err(&mut files, let_op("vx_x", None)).contains("has no constant"));
+        assert!(err(&mut files, let_op("vx_x", Some("12,5"))).contains("no constant"));
+        assert!(err(&mut files, let_op("vx_x", Some("\"Text\""))).contains("no constant"));
+        for (v, written) in [
+            ("-2.5", "-2.5"),
+            ("30min", "30min"),
+            ("70%", "70%"),
+            ("19:00", "19:00"),
+            ("on", "on"),
+            ("off", "off"),
+        ] {
+            apply_op(&mut files, &ctx, &let_op("vx_x", Some(v))).unwrap();
+            let t = files.render();
+            assert!(
+                t["edits.loxl"].contains(&format!("let vx_x = {written}\n")),
+                "{t:?}"
+            );
+            assert_eq!(text_with(&files), t);
+        }
+        // A port may name the module's constant, or vislox's.
+        let c = apply_op(&mut files, &ctx, &param(DIV, "Input2", Some("schwelle"))).unwrap();
+        assert_eq!(c.previous, serde_json::json!(null));
+        assert_eq!(
+            files.claims.0[&DIV.to_ascii_lowercase()].sets["In2"],
+            Value::Ref("schwelle".into())
+        );
+        // A name that is no constant is still no number.
+        assert!(err(&mut files, param(DIV, "Input2", Some("vx_nichts"))).contains("not a number"));
+    }
+
+    #[test]
+    fn the_claims_file_takes_only_constants_vislox_writes() {
+        for (text, ok) in [
+            ("let vx_a = 1\n", true),
+            ("let vx_a = 2h\n", true),
+            ("let a = 1\n", false),
+            ("let vx_a = \"Text\"\n", false),
+            ("let vx_10000006_0000_0060_ffff504f94000001 = 1\n", false),
+        ] {
+            assert_eq!(Claims::parse(text).is_ok(), ok, "{text}");
+        }
+        assert!(Claims::parse("extern x = Div(uuid: \"u\")\nlet vx_a = x.AQ\n").is_err());
+    }
+
+    #[test]
+    fn a_bare_name_of_a_constant_on_an_adopted_block_is_a_value() {
+        let texts: BTreeMap<String, String> = [
+            ("edits.loxl".to_string(), "let vx_zeit = 30\n".to_string()),
+            (
+                "obergeschoss.loxl".to_string(),
+                format!(
+                    "page \"Obergeschoss\"\n\n# {}: drawn there.\nvx_nachlauf = Monoflop(\"Nachlauf\", Time: vx_zeit)\n",
+                    crate::blocks::ADOPTED_LINE
+                ),
+            ),
+        ]
+        .into();
+        let f = Files::from_texts(&texts).unwrap();
+        let b = f.block("vx_nachlauf").unwrap().1;
+        assert!(b.wires.is_empty(), "{b:?}");
+        assert_eq!(b.get("Time"), Some(&Value::Ref("vx_zeit".into())));
+        assert_eq!(constant_uses(&f, "vx_zeit"), 1);
+    }
+
+    #[test]
+    fn a_constant_dropped_and_made_again_in_one_request_is_vislox_s_to_name() {
+        let d = doc("house.Loxone");
+        let names = BTreeSet::new();
+        let lock = Lock::default();
+        let ctx = ctx_of(&d, &d, &lock, None, &names);
+        let mut files = Files::default();
+        apply_op(&mut files, &ctx, &let_op("vx_a", Some("1"))).unwrap();
+        // The module's names leave vislox's own files out: what vislox's files
+        // name is the request's, as it goes.
+        let mut again = files.clone();
+        for op in [let_op("vx_a", None), let_op("vx_a", Some("2"))] {
+            apply_op(&mut again, &ctx, &op).unwrap();
+        }
+        assert_eq!(again.claims.8["vx_a"], Value::Number("2".into()));
+        // Dropped earlier in the request, it names nothing.
+        let mut gone = files.clone();
+        apply_op(&mut gone, &ctx, &let_op("vx_a", None)).unwrap();
+        let e = apply_op(&mut gone, &ctx, &param(DIV, "Input2", Some("vx_a"))).unwrap_err();
+        assert!(e.contains("not a number"), "{e}");
+        // vislox's own names count its constants.
+        assert!(files.names("vx_a"));
+    }
+
+    #[test]
+    fn the_module_s_names_leave_vislox_s_files_out_and_say_what_does_not_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let module = tmp.path().join("pages");
+        std::fs::create_dir_all(module.join(DIR)).unwrap();
+        std::fs::write(
+            module.join("main.loxl"),
+            "let t = 4\nlet aussen = licht.Q\nlicht = Monoflop(\"Licht\")\n",
+        )
+        .unwrap();
+        std::fs::write(module.join(DIR).join("edits.loxl"), "let vx_a = 1\n").unwrap();
+        let d = module_decls(&module).unwrap();
+        assert_eq!(
+            d.names,
+            ["aussen", "licht", "t"]
+                .map(String::from)
+                .into_iter()
+                .collect()
+        );
+        assert_eq!(d.lets, ["t".to_string()].into());
+        assert_eq!(d.aliases, ["aussen".to_string()].into());
+        std::fs::write(module.join("kaputt.loxl"), "let = (\n").unwrap();
+        let e = module_decls(&module).unwrap_err();
+        assert!(e.starts_with("kaputt.loxl: "), "{e}");
     }
 }
