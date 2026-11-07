@@ -464,7 +464,7 @@ pub fn target_of(files: &Files, lock: &Lock, uuid: &str) -> String {
 pub fn taken(files: &Files, ctx: &Ctx, s: &str) -> bool {
     ctx.names.contains(s)
         || ctx.lock.slugs.contains_key(s)
-        || ctx.lock.tombstones.contains(s)
+        || ctx.lock.tombstoned(s)
         || ctx.lock.externals.contains_key(s)
         || files.names(s)
         || KINDS
@@ -690,6 +690,7 @@ pub fn apply<K: SetKind>(
     Ok(Applied {
         previous: json!(previous),
         added: None,
+        warnings: Vec::new(),
     })
 }
 

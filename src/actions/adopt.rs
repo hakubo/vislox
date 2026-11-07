@@ -244,7 +244,7 @@ impl Actions {
         let taken = |s: &str, chosen: &BTreeSet<String>| {
             names.contains(s)
                 || lock.slugs.contains_key(s)
-                || lock.tombstones.contains(s)
+                || lock.tombstoned(s)
                 || lock.externals.contains_key(s)
                 || files.names(s)
                 || files.claims.0.keys().any(|u| edit::slug(u) == s)

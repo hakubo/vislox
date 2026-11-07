@@ -88,9 +88,54 @@ pub enum Op {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         restores: Option<String>,
     },
-    /// Take out a block added here that is not deployed yet. Its `previous`
-    /// is the `add_block` that adds it again.
+    /// Delete a block of vislox's files: its declaration goes, and
+    /// `removed <slug>` tells lox. One added here and not deployed yet is
+    /// simply taken out: its `previous` is the `add_block` that adds it again
+    /// (with new UUIDs). A deployed or adopted one (#80) is deleted from the
+    /// config, and the Miniserver on Apply: its `previous` is the
+    /// `restore_block` that brings it back with its UUIDs.
     RemoveBlock { uuid: String },
+    /// Bring back a block `remove_block` deleted while lox still keeps its
+    /// tombstone (#80): its declaration as it was, its lockfile entry (so it
+    /// keeps its UUIDs, layout and wires) and the wires drawn here at it.
+    /// Only the `previous` of a `remove_block` makes one. Its `previous` is
+    /// the `remove_block`.
+    RestoreBlock {
+        uuid: String,
+        /// The page it is on (its file's).
+        page: String,
+        /// Adopted from Loxone Config (#72): its file's *adopted* section.
+        #[serde(default)]
+        adopted: bool,
+        /// Its declaration, and the wires out of it its file wrote (an
+        /// adopted block's), as vislox writes them.
+        source: String,
+        /// Its program (#79), when its declaration names one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        program: Option<String>,
+        /// The wires drawn here (#61) that went with it; an empty UUID is
+        /// this block.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        wires: Vec<Ends>,
+        /// vislox's externs its source names: object UUID → type.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        externs: BTreeMap<String, String>,
+        /// Its lockfile entry (`objects.<slug>`).
+        lock: serde_json::Value,
+        /// The `extern_wires` entries out of its ports.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        lock_wires: Vec<serde_json::Value>,
+    },
+    /// Rename a block of vislox's files (#80): its slug becomes `slug` in its
+    /// declaration and everything vislox's files name it by, and `moved <old>
+    /// -> <new>` tells lox to keep its UUIDs. The config does not change: a
+    /// block without a name keeps the label its old slug gave it. Its
+    /// `previous` is the `rename` back. In a request of its own.
+    Rename { uuid: String, slug: String },
+    /// Drop the `removed` and `moved` lines lox needs no more (#80, lox's
+    /// `stale-lifecycle`). Every edit does this first; this asks for nothing
+    /// else. Its `previous` is a `tidy` too.
+    Tidy,
     /// Move a block the module manages (#60): its top left corner to
     /// (`x`, `y`) on its page, snapped to Loxone Config's grid. lox keeps a
     /// managed block's position in the lockfile, not in the source, so this
@@ -193,6 +238,8 @@ impl Op {
             | Op::Param { uuid, .. }
             | Op::Setting { uuid, .. }
             | Op::RemoveBlock { uuid }
+            | Op::RestoreBlock { uuid, .. }
+            | Op::Rename { uuid, .. }
             | Op::Move { uuid, .. }
             | Op::Schedule { uuid, .. }
             | Op::Moods { uuid, .. }
@@ -207,7 +254,8 @@ impl Op {
             | Op::Unwire { .. }
             | Op::Adopt { .. }
             | Op::AdoptPage { .. }
-            | Op::Unadopt { .. } => None,
+            | Op::Unadopt { .. }
+            | Op::Tidy => None,
         }
     }
 
@@ -221,6 +269,9 @@ impl Op {
             | Op::Setting { value, .. } => value.as_deref(),
             Op::AddBlock { .. }
             | Op::RemoveBlock { .. }
+            | Op::RestoreBlock { .. }
+            | Op::Rename { .. }
+            | Op::Tidy
             | Op::Move { .. }
             | Op::Relayout { .. }
             | Op::Place { .. }
@@ -249,6 +300,9 @@ impl Op {
             | Op::Setting { value, .. } => *value = v,
             Op::AddBlock { .. }
             | Op::RemoveBlock { .. }
+            | Op::RestoreBlock { .. }
+            | Op::Rename { .. }
+            | Op::Tidy
             | Op::Move { .. }
             | Op::Relayout { .. }
             | Op::Place { .. }
@@ -793,6 +847,9 @@ impl Claims {
             Op::Setting { name, .. } => c.sets.get(name).map(plain),
             Op::AddBlock { .. }
             | Op::RemoveBlock { .. }
+            | Op::RestoreBlock { .. }
+            | Op::Rename { .. }
+            | Op::Tidy
             | Op::Move { .. }
             | Op::Relayout { .. }
             | Op::Place { .. }
@@ -848,6 +905,9 @@ pub fn find<'a>(el: &'a Element, uuid: &str) -> Option<&'a Element> {
     }
     el.child_elements().find_map(|c| find(c, uuid))
 }
+
+/// The element with UUID `uuid`, case aside (one walk, kept in `tiles`).
+pub use crate::tiles::find_ci;
 
 /// How many objects of type `ty` are titled `title`: a room or category is
 /// claimed by its title, which must name exactly one.
@@ -1007,6 +1067,9 @@ pub fn apply(
         }
         Op::AddBlock { .. }
         | Op::RemoveBlock { .. }
+        | Op::RestoreBlock { .. }
+        | Op::Rename { .. }
+        | Op::Tidy
         | Op::Move { .. }
         | Op::Relayout { .. }
         | Op::Place { .. }
@@ -1051,8 +1114,9 @@ pub fn apply(
 /// drawn on a page are.
 #[derive(Default, Clone, Debug)]
 pub struct Lock {
+    /// The managed blocks: slug → UUID ([`Lock::read`] derives it from
+    /// `entries`).
     pub slugs: BTreeMap<String, String>,
-    pub tombstones: BTreeSet<String>,
     /// The blocks lox keeps a position (`layout`) for, so drawn on a page
     /// (#60): slug → the page it pins them to (`page_uuid`; `None` in a lock
     /// from before lox pinned pages). Objects of the object tree have none.
@@ -1064,6 +1128,13 @@ pub struct Lock {
     /// UUID. Loxone Config's, not managed; an extern by title (`Notification(
     /// title: "Frost")`) names its object only here (#68).
     pub externals: BTreeMap<String, String>,
+    /// Each managed block's entry as the lock has it (`objects.<slug>`): what
+    /// restoring a deleted block (#80) puts back, so it keeps its UUIDs. Read
+    /// through [`Lock::entry`], which checks it against `slugs`.
+    pub entries: BTreeMap<String, serde_json::Value>,
+    /// The removal tombstones (`removed`): object UUID → (slug, type). The
+    /// one place they are kept; [`Lock::tombstoned`] asks by slug.
+    pub tombs: BTreeMap<String, (String, String)>,
 }
 
 impl Lock {
@@ -1074,24 +1145,15 @@ impl Lock {
         let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
             return Lock::default();
         };
-        let slugs = v
+        let entries: BTreeMap<String, serde_json::Value> = v
             .get("objects")
             .and_then(|o| o.as_object())
-            .map(|o| {
-                o.iter()
-                    .filter_map(|(s, x)| Some((s.clone(), x.get("uuid")?.as_str()?.to_string())))
-                    .collect()
-            })
+            .map(|o| o.iter().map(|(s, x)| (s.clone(), x.clone())).collect())
             .unwrap_or_default();
-        let tombstones = v
-            .get("removed")
-            .and_then(|o| o.as_object())
-            .map(|o| {
-                o.values()
-                    .filter_map(|x| Some(x.get("slug")?.as_str()?.to_string()))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let slugs = entries
+            .iter()
+            .filter_map(|(s, x)| Some((s.clone(), x.get("uuid")?.as_str()?.to_string())))
+            .collect();
         let placed = v
             .get("objects")
             .and_then(|o| o.as_object())
@@ -1131,19 +1193,58 @@ impl Lock {
                     .collect()
             })
             .unwrap_or_default();
+        let tombs = v
+            .get("removed")
+            .and_then(|o| o.as_object())
+            .map(|o| {
+                o.iter()
+                    .filter_map(|(u, x)| {
+                        let slug = x.get("slug")?.as_str()?.to_string();
+                        let ty = x.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                        Some((u.clone(), (slug, ty.to_string())))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         Lock {
             slugs,
-            tombstones,
             placed,
             wires,
             externals,
+            entries,
+            tombs,
         }
+    }
+
+    /// Whether a removal tombstone has the slug `slug` (not picked again).
+    pub fn tombstoned(&self, slug: &str) -> bool {
+        self.tombs.values().any(|(s, _)| s == slug)
+    }
+
+    /// The lockfile entry of the managed block `slug`, when it is the one
+    /// `slugs` names.
+    pub fn entry(&self, slug: &str) -> Option<&serde_json::Value> {
+        let uuid = self.slugs.get(slug)?;
+        self.entries.get(slug).filter(|e| {
+            e.get("uuid")
+                .and_then(|u| u.as_str())
+                .is_some_and(|u| u.eq_ignore_ascii_case(uuid))
+        })
+    }
+
+    /// The tombstone of the object `uuid` (case aside): its UUID as the lock
+    /// spells it, its slug and its type.
+    pub fn tomb(&self, uuid: &str) -> Option<(&str, &str, &str)> {
+        self.tombs
+            .iter()
+            .find(|(u, _)| u.eq_ignore_ascii_case(uuid))
+            .map(|(u, (s, t))| (u.as_str(), s.as_str(), t.as_str()))
     }
 
     pub fn slug_of(&self, uuid: &str) -> Option<&str> {
         self.slugs
             .iter()
-            .find(|(_, u)| u.as_str() == uuid)
+            .find(|(_, u)| u.eq_ignore_ascii_case(uuid))
             .map(|(s, _)| s.as_str())
     }
 
@@ -1435,20 +1536,39 @@ impl Files {
             .find_map(|p| p.blocks.iter_mut().find(|b| b.slug == slug))
     }
 
-    /// Whether a block or removal of vislox's files is named `slug`.
+    /// Whether a block, removal or rename of vislox's files is named `slug`.
     pub fn names(&self, slug: &str) -> bool {
-        self.pages
-            .values()
-            .any(|p| p.removed.contains(slug) || p.blocks.iter().any(|b| b.slug == slug))
+        self.pages.values().any(|p| {
+            p.removed.contains(slug)
+                || p.moved.iter().any(|(f, t)| f == slug || t == slug)
+                || p.blocks.iter().any(|b| b.slug == slug)
+        })
     }
 
-    /// Drop the `removed` lines lox needs no more: the lockfile has
-    /// forgotten the block (or never knew it, when it was added and taken
-    /// out before a compile).
+    /// Drop the `removed` and `moved` lines lox needs no more (what `lox
+    /// logic lint` calls `stale-lifecycle`): the lockfile has forgotten the
+    /// block (or never knew it, when it was added and taken out before a
+    /// compile; a deployed one stays deleted by its tombstone), or the old
+    /// slug of a rename (lox renamed the entry).
     pub fn tidy(&mut self, lock: &Lock) {
         for p in self.pages.values_mut() {
             p.removed.retain(|s| lock.slugs.contains_key(s));
+            p.moved.retain(|from, _| lock.slugs.contains_key(from));
         }
+    }
+
+    /// The lines [`Files::tidy`] would drop, as written.
+    pub fn stale_lines(&self, lock: &Lock) -> Vec<String> {
+        let mut out = Vec::new();
+        for p in self.pages.values() {
+            for s in p.removed.iter().filter(|s| !lock.slugs.contains_key(*s)) {
+                out.push(format!("removed {s}"));
+            }
+            for (f, t) in p.moved.iter().filter(|(f, _)| !lock.slugs.contains_key(*f)) {
+                out.push(format!("moved {f} -> {t}"));
+            }
+        }
+        out
     }
 
     /// Every value vislox claims or wrote into a block it added (by the
@@ -1570,6 +1690,9 @@ impl Ctx<'_> {
 pub struct Applied {
     pub previous: serde_json::Value,
     pub added: Option<String>,
+    /// What it could not do and left out, for the reply (`warnings`): a
+    /// wire a restored block had whose other end is gone (#80).
+    pub warnings: Vec<String>,
 }
 
 /// Apply `op` to vislox's files, checked against `ctx`.
@@ -1577,10 +1700,18 @@ pub fn apply_op(files: &mut Files, ctx: &Ctx, op: &Op) -> Result<Applied, String
     let done = |p: Option<String>| Applied {
         previous: serde_json::json!(p),
         added: None,
+        warnings: Vec::new(),
     };
     match op {
         Op::AddBlock { .. } => add_block(files, ctx, op),
         Op::RemoveBlock { uuid } => remove_block(files, ctx, uuid),
+        Op::RestoreBlock { .. } => restore_block(files, ctx, op),
+        Op::Rename { uuid, slug } => rename_block(files, ctx, uuid, slug),
+        Op::Tidy => Ok(Applied {
+            previous: op_value(&Op::Tidy),
+            added: None,
+            warnings: Vec::new(),
+        }),
         Op::Move { uuid, x, y } => move_block(files, ctx, uuid, *x, *y),
         Op::Relayout { page } => relayout(files, ctx, page),
         Op::Place { moves } => place(files, ctx, moves),
@@ -1659,6 +1790,9 @@ pub fn undo_ops(
                 }
             },
             Op::RemoveBlock { .. }
+            | Op::RestoreBlock { .. }
+            | Op::Rename { .. }
+            | Op::Tidy
             | Op::Move { .. }
             | Op::Relayout { .. }
             | Op::Place { .. }
@@ -1928,7 +2062,7 @@ fn add_block(files: &mut Files, ctx: &Ctx, op: &Op) -> Result<Applied, String> {
     let taken = |s: &str| {
         ctx.names.contains(s)
             || ctx.lock.slugs.contains_key(s)
-            || ctx.lock.tombstones.contains(s)
+            || ctx.lock.tombstoned(s)
             || files.names(s)
     };
     let slug = blocks::new_slug(ty, &taken);
@@ -1985,87 +2119,27 @@ fn add_block(files: &mut Files, ctx: &Ctx, op: &Op) -> Result<Applied, String> {
     Ok(Applied {
         previous: serde_json::Value::Null,
         added: Some(slug),
+        warnings: Vec::new(),
     })
 }
 
 fn remove_block(files: &mut Files, ctx: &Ctx, uuid: &str) -> Result<Applied, String> {
-    let el = find(&ctx.doc.xml.root, uuid)
-        .ok_or_else(|| format!("no object {uuid} in the pending config"))?;
-    let name = el.attr_decoded("Title").unwrap_or_default().into_owned();
-    let slug = match ctx.lock.slug_of(uuid) {
-        Some(s) if files.block(s).is_some_and(|(_, b)| b.adopted) => {
-            return Err(format!(
-                "{name} was adopted from Loxone Config, so it is deployed: vislox takes out only a \
-                 block added here and not applied yet. Undo the adoption to hand it back to Loxone Config"
-            ));
-        }
-        Some(s) if files.block(s).is_some() => s.to_string(),
-        Some(_) => {
-            return Err(format!(
-                "{name}: the module manages this block; delete it in its .loxl file"
-            ));
-        }
-        None => return Err(format!("{name}: only a block added here can be taken out")),
-    };
-    if let Some((what, them)) = files.claims.claim_on(&slug) {
-        return Err(format!(
-            "{name}: vislox's file claims {what}; take {them} out first (Revert them, or undo the \
-             edit)"
-        ));
+    let r = removal(files, ctx, uuid)?;
+    if r.delete {
+        return delete_block(files, ctx, &r.slug, r.wires);
     }
-    if ctx
-        .deployed
-        .is_some_and(|d| find(&d.xml.root, uuid).is_some())
-    {
-        return Err(format!(
-            "{name} is deployed: vislox takes out only a block added here and not applied yet"
-        ));
-    }
+    let slug = r.slug;
     let (file, b) = files.block(&slug).expect("checked");
     let (file, b) = (file.to_string(), b.clone());
-    let pf = &files.pages[&file];
-    let page = match &pf.uuid {
-        Some(u) => u.clone(),
-        None => {
-            let mut same = Vec::new();
-            pages_titled(&ctx.base.xml.root, &pf.page, &mut same);
-            same.first()
-                .and_then(|e| e.attr("U"))
-                .unwrap_or_default()
-                .to_string()
-        }
-    };
     let (params, settings) = split_args(&b);
-    // Its wires, which go with it: drawn again when it is added again.
-    let here = |e: &(String, String)| -> Option<[String; 2]> {
-        if e.0 == slug {
-            Some([
-                String::new(),
-                port_names::key_or_raw(&b.ty, &e.1).to_string(),
-            ])
-        } else {
-            wire_end_at(files, ctx.lock, e)
-        }
-    };
-    let wires = files
-        .claims
-        .1
-        .iter()
-        .filter(|w| w.touches(&slug))
-        .filter_map(|w| {
-            Some(Ends {
-                from: here(&w.from)?,
-                to: here(&w.to)?,
-            })
-        })
-        .collect();
     let again = Op::AddBlock {
-        page,
+        page: file_page(files, ctx, &file),
         ty: b.ty.clone(),
         title: b.title.clone(),
         params,
         settings,
-        wires,
+        // Its wires, which go with it: drawn again when it is added again.
+        wires: r.wires,
         restores: Some(uuid.to_string()),
     };
     let p = files.pages.get_mut(&file).expect("found");
@@ -2079,6 +2153,651 @@ fn remove_block(files: &mut Files, ctx: &Ctx, uuid: &str) -> Result<Applied, Str
     Ok(Applied {
         previous: op_value(&again),
         added: None,
+        warnings: Vec::new(),
+    })
+}
+
+// ── deleting and renaming managed blocks (#80) ─────────────────────────
+
+/// How `remove_block` of a block goes, worked out without changing anything.
+struct Removal {
+    slug: String,
+    /// Deployed or adopted: deleted from the config (`removed`), undone by
+    /// `restore_block`. Else taken out, undone by `add_block`.
+    delete: bool,
+    /// The wires drawn here at it, which go with it.
+    wires: Vec<Ends>,
+}
+
+/// Whether `remove_block` of `uuid` is refused now, and why (`None`: it is
+/// not). Changes nothing: `GET /api/edits` asks it for every block.
+pub fn delete_refusal(files: &Files, ctx: &Ctx, uuid: &str) -> Option<String> {
+    removal(files, ctx, uuid).err()
+}
+
+fn removal(files: &Files, ctx: &Ctx, uuid: &str) -> Result<Removal, String> {
+    let el = find_ci(&ctx.doc.xml.root, uuid)
+        .ok_or_else(|| format!("no object {uuid} in the pending config"))?;
+    let name = el.attr_decoded("Title").unwrap_or_default().into_owned();
+    let slug = match ctx.lock.slug_of(uuid) {
+        Some(s) if files.block(s).is_some() => s.to_string(),
+        Some(_) => {
+            return Err(format!(
+                "{name}: the module manages this block; delete it in its .loxl file"
+            ));
+        }
+        None => {
+            return Err(format!(
+                "{name}: only a block added or adopted here can be deleted here"
+            ));
+        }
+    };
+    if let Some((what, them)) = files.claims.claim_on(&slug) {
+        return Err(format!(
+            "{name}: vislox's file claims {what}; take {them} out first (Revert them, or undo the \
+             edit)"
+        ));
+    }
+    let (_, b) = files.block(&slug).expect("checked");
+    let wires = wires_at(files, ctx, &slug, &b.ty).map_err(|w| {
+        format!(
+            "{name}: the wire `{w}` drawn here names an end vislox cannot find; take it out first"
+        )
+    })?;
+    let delete = b.adopted
+        || ctx
+            .deployed
+            .is_some_and(|d| find_ci(&d.xml.root, uuid).is_some());
+    if delete {
+        // A block whose declaration takes a wire from it would lose that wire,
+        // and its declaration is its own: delete that one first.
+        for p in files.pages.values() {
+            for o in p.blocks.iter().filter(|o| o.slug != slug) {
+                if let Some((port, _)) = o.wires.iter().find(|(_, src)| src.slug == slug) {
+                    let other = ctx
+                        .lock
+                        .uuid_of(&o.slug)
+                        .and_then(|u| find_ci(&ctx.doc.xml.root, u))
+                        .and_then(|e| e.attr_decoded("Title").map(|t| t.into_owned()))
+                        .filter(|t| !t.trim().is_empty())
+                        .unwrap_or_else(|| o.slug.clone());
+                    return Err(format!(
+                        "{name}: {other} takes a wire from it in its declaration ({port}); delete \
+                         {other} first, or hand it back to Loxone Config"
+                    ));
+                }
+            }
+            if let Some(w) = p
+                .wires
+                .iter()
+                .find(|w| w.to.slug == slug && w.from.slug != slug)
+            {
+                return Err(format!(
+                    "{name}: the wire `{}` of vislox's files ends at it; take it out first",
+                    w.render()
+                ));
+            }
+        }
+        if ctx.lock.entry(&slug).is_none() {
+            return Err(format!(
+                "{name}: the lockfile has no entry for `{slug}`; compile the module first"
+            ));
+        }
+    }
+    Ok(Removal {
+        slug,
+        delete,
+        wires,
+    })
+}
+
+/// The page UUID of vislox's page file `file`: its `# page uuid:` line, else
+/// the first page of the base with its title.
+fn file_page(files: &Files, ctx: &Ctx, file: &str) -> String {
+    let pf = &files.pages[file];
+    match &pf.uuid {
+        Some(u) => u.clone(),
+        None => {
+            let mut same = Vec::new();
+            pages_titled(&ctx.base.xml.root, &pf.page, &mut same);
+            same.first()
+                .and_then(|e| e.attr("U"))
+                .unwrap_or_default()
+                .to_string()
+        }
+    }
+}
+
+/// Every wire drawn here (#61) at the block `slug` of type `ty`, by its ends
+/// as `add_block` and `restore_block` take them (an empty UUID for the block
+/// itself). `Err`: a wire whose other end vislox cannot name by UUID (as
+/// written), which an undo could not draw again.
+fn wires_at(files: &Files, ctx: &Ctx, slug: &str, ty: &str) -> Result<Vec<Ends>, String> {
+    let here = |e: &(String, String)| -> Option<[String; 2]> {
+        if e.0 == slug {
+            Some([String::new(), port_names::key_or_raw(ty, &e.1).to_string()])
+        } else {
+            wire_end_at(files, ctx.lock, e)
+        }
+    };
+    files
+        .claims
+        .1
+        .iter()
+        .filter(|w| w.touches(slug))
+        .map(|w| match (here(&w.from), here(&w.to)) {
+            (Some(from), Some(to)) => Ok(Ends { from, to }),
+            _ => Err(w.render()),
+        })
+        .collect()
+}
+
+/// A lockfile entry's port UUIDs (and its own), lowercase.
+fn port_set(entry: &serde_json::Value) -> BTreeSet<String> {
+    crate::adopt::ports_of(entry)
+        .into_iter()
+        .map(|u| u.to_ascii_lowercase())
+        .collect()
+}
+
+/// Delete a deployed or adopted block of vislox's files ([`removal`] checked
+/// it): its declaration goes, `removed <slug>` tells lox to take it out of
+/// the config (lox keeps a tombstone, and the push deletes it on the
+/// Miniserver), and the wires drawn here at it go with it. Its `previous` is
+/// the `restore_block` that brings it back with its UUIDs while the tombstone
+/// is there.
+fn delete_block(
+    files: &mut Files,
+    ctx: &Ctx,
+    slug: &str,
+    wires: Vec<Ends>,
+) -> Result<Applied, String> {
+    let (file, b) = files.block(slug).expect("checked");
+    let (file, b) = (file.to_string(), b.clone());
+    let entry = ctx.lock.entry(slug).cloned().expect("checked");
+    let ports = port_set(&entry);
+    let lock_wires: Vec<serde_json::Value> = ctx
+        .lock
+        .wires
+        .iter()
+        .filter(|(from, _)| ports.contains(&from.to_ascii_lowercase()))
+        .map(|(from, to)| serde_json::json!({ "from": from, "to": to }))
+        .collect();
+    let out_wires: Vec<&blocks::FileWire> = files.pages[&file]
+        .wires
+        .iter()
+        .filter(|w| w.from.slug == slug)
+        .collect();
+    let mut source = b.render();
+    source.push('\n');
+    for w in &out_wires {
+        source.push_str(&w.render());
+        source.push('\n');
+    }
+    let program = b.args.iter().find_map(|(_, v)| match v {
+        Value::File { text: Some(t), .. } => Some(t.clone()),
+        _ => None,
+    });
+    // vislox's externs its source names: brought back with it.
+    let mut named: Vec<String> = b.wires.iter().map(|(_, src)| src.slug.clone()).collect();
+    named.extend(out_wires.iter().map(|w| w.to.slug.clone()));
+    if let Some(Value::Ref(n)) = b.get(blocks::MIRRORS) {
+        named.push(n.clone());
+    }
+    let externs: BTreeMap<String, String> = files
+        .claims
+        .0
+        .iter()
+        .filter(|(u, _)| named.contains(&self::slug(u)))
+        .map(|(u, c)| (u.clone(), c.ty.clone()))
+        .collect();
+    let again = Op::RestoreBlock {
+        uuid: ctx.lock.uuid_of(slug).unwrap_or_default().to_string(),
+        page: file_page(files, ctx, &file),
+        adopted: b.adopted,
+        source,
+        program,
+        wires,
+        externs,
+        lock: entry,
+        lock_wires,
+    };
+    // Everything is checked: from here on `files` changes.
+    let p = files.pages.get_mut(&file).expect("found");
+    p.blocks.retain(|x| x.slug != slug);
+    p.wires.retain(|w| w.from.slug != slug);
+    p.removed.insert(slug.to_string());
+    files.claims.1.retain(|w| !w.touches(slug));
+    files.layout.moves.remove(slug);
+    files.repin();
+    Ok(Applied {
+        previous: op_value(&again),
+        added: None,
+        warnings: Vec::new(),
+    })
+}
+
+/// The fields lox writes into a managed block's lockfile entry.
+const ENTRY_FIELDS: &[&str] = &[
+    "uuid",
+    "type",
+    "ports",
+    "layout",
+    "superseded_layout",
+    "page_uuid",
+    "gui_defaults",
+    "expr_owned",
+    "states",
+];
+
+/// Check the lockfile entry a `restore_block` brings against what it is
+/// for: the tombstone (its UUID and type), the declaration's type, and the
+/// object the base has under that UUID: each port is one of that object's
+/// connectors (by key and UUID), and its page is the page it is drawn on.
+/// So an op that was tampered with, or is stale, cannot pin another
+/// object's UUIDs.
+fn check_entry(
+    ctx: &Ctx,
+    tomb_uuid: &str,
+    ty: &str,
+    page: &str,
+    entry: &serde_json::Value,
+) -> Result<(), String> {
+    let bad = |why: String| Err(format!("its lockfile entry {why}"));
+    let Some(o) = entry.as_object() else {
+        return bad("is not an object".into());
+    };
+    if let Some(k) = o.keys().find(|k| !ENTRY_FIELDS.contains(&k.as_str())) {
+        return bad(format!("has `{k}`, which lox does not write"));
+    }
+    if !o
+        .get("uuid")
+        .and_then(|u| u.as_str())
+        .is_some_and(|u| u.eq_ignore_ascii_case(tomb_uuid))
+    {
+        return bad(format!("is not {tomb_uuid}'s"));
+    }
+    if o.get("type").and_then(|t| t.as_str()) != Some(ty) {
+        return bad(format!("is not a {ty}'s"));
+    }
+    if o.get("expr_owned")
+        .is_some_and(|x| x != &serde_json::Value::Bool(false))
+    {
+        return bad("is an expression's".into());
+    }
+    let el = find_ci(&ctx.base.xml.root, tomb_uuid)
+        .ok_or_else(|| format!("the project's base has no object {tomb_uuid} any more"))?;
+    let none = serde_json::Map::new();
+    let ports = match o.get("ports") {
+        None => &none,
+        Some(p) => match p.as_object() {
+            Some(p) => p,
+            None => return bad("has ports that are not a map".into()),
+        },
+    };
+    for (k, u) in ports {
+        let ok = u.as_str().is_some_and(|u| {
+            el.child_elements().any(|c| {
+                c.name == "Co"
+                    && c.attr("K") == Some(k.as_str())
+                    && c.attr("U").is_some_and(|x| x.eq_ignore_ascii_case(u))
+            })
+        });
+        if !ok {
+            return bad(format!(
+                "names port {k} {u}, which is not one of its connectors"
+            ));
+        }
+    }
+    for f in ["layout", "superseded_layout"] {
+        let Some(l) = o.get(f) else { continue };
+        let n = |k: &str| l.get(k).and_then(|v| v.as_i64());
+        let ok = match (n("px"), n("py"), n("px2"), n("py2")) {
+            (Some(x), Some(y), Some(x2), Some(y2)) => {
+                [x, y, x2, y2].iter().all(|v| v.abs() <= MAX_COORD) && x < x2 && y < y2
+            }
+            _ => false,
+        };
+        if !ok {
+            return bad(format!("has no rectangle as its {f}"));
+        }
+    }
+    if let Some(pu) = o.get("page_uuid") {
+        let drawn = el
+            .attr("U")
+            .and_then(|u| drawn_at(ctx.base, u))
+            .map(|(p, _)| p);
+        let ok = pu.as_str().is_some_and(|pu| {
+            pu.eq_ignore_ascii_case(page) && drawn.is_some_and(|d| d.eq_ignore_ascii_case(pu))
+        });
+        if !ok {
+            return bad("names another page than the one it is drawn on".into());
+        }
+    }
+    if o.get("gui_defaults").is_some_and(|g| !g.is_boolean()) {
+        return bad("has gui_defaults that are not true or false".into());
+    }
+    if o.get("states").is_some_and(|s| {
+        !s.as_array()
+            .is_some_and(|a| a.iter().all(serde_json::Value::is_string))
+    }) {
+        return bad("has states that are not names".into());
+    }
+    Ok(())
+}
+
+/// Draw one wire of a restored block `b` again, as `add_block` does.
+fn redraw(files: &mut Files, ctx: &Ctx, b: &NewBlock, w: &Ends) -> Result<(), String> {
+    let mut geo = Geo::new();
+    let mut at = |files: &Files, e: &[String; 2]| {
+        if e[0].is_empty() {
+            new_end(b, &e[1])
+        } else {
+            end(files, ctx, e, &mut geo)
+        }
+    };
+    let src = at(files, &w.from)?;
+    let dst = at(files, &w.to)?;
+    connect(files, ctx, &src, &dst)
+}
+
+/// Bring back a block [`delete_block`] deleted, while lox keeps its
+/// tombstone: its declaration, its lockfile entry and the tombstone's
+/// removal (so lox writes its old UUIDs, layout and wires again), and the
+/// wires drawn here at it. A wire whose other end is gone is left out and
+/// said (`warnings`): the block comes back all the same.
+fn restore_block(files: &mut Files, ctx: &Ctx, op: &Op) -> Result<Applied, String> {
+    let Op::RestoreBlock {
+        uuid,
+        page,
+        adopted,
+        source,
+        program,
+        wires,
+        externs,
+        lock,
+        lock_wires,
+    } = op
+    else {
+        unreachable!()
+    };
+    let (tomb_uuid, slug, ty) = match ctx.lock.tomb(uuid) {
+        Some((u, s, t)) => (u.to_string(), s.to_string(), t.to_string()),
+        None if ctx.lock.slug_of(uuid).is_some() => {
+            return Err(format!(
+                "{uuid} is not deleted: there is nothing to bring back"
+            ));
+        }
+        None => {
+            return Err(format!(
+                "lox keeps no tombstone of {uuid} any more (its deletion was applied or \
+                 discarded): it cannot come back with its UUIDs"
+            ));
+        }
+    };
+    if files.block(&slug).is_some() || ctx.lock.slugs.contains_key(&slug) {
+        return Err(format!(
+            "`{slug}` names another block now; rename that one first"
+        ));
+    }
+    if find_ci(&ctx.base.xml.root, uuid).is_none() {
+        return Err(format!(
+            "the project's base has no object {uuid} any more: it cannot come back with its UUIDs"
+        ));
+    }
+    let pg = find(&ctx.base.xml.root, page)
+        .filter(|e| e.attr("Type") == Some("Page"))
+        .ok_or_else(|| format!("no page {page} in the project's base config"))?;
+    let page_title = pg.attr_decoded("Title").unwrap_or_default().into_owned();
+    let mut same = Vec::new();
+    pages_titled(&ctx.base.xml.root, &page_title, &mut same);
+    if page_title.trim().is_empty() || same.first().and_then(|e| e.attr("U")) != Some(page.as_str())
+    {
+        return Err(format!(
+            "lox puts a block on the first page titled \"{page_title}\", and that is not its page \
+             any more"
+        ));
+    }
+    // Read as vislox reads its files: only what it writes.
+    let text = format!(
+        "{}\n{}{source}\n",
+        blocks::render_page_line(&page_title),
+        if *adopted {
+            format!("# {}\n", blocks::ADOPTED_LINE)
+        } else {
+            String::new()
+        }
+    );
+    let pf = PageFile::parse(&text).map_err(|e| format!("its declaration: {e}"))?;
+    let [b] = pf.blocks.as_slice() else {
+        return Err("its declaration is one block".into());
+    };
+    if b.slug != slug || !pf.removed.is_empty() || !pf.moved.is_empty() {
+        return Err(format!("its declaration is not `{slug}`'s"));
+    }
+    if !ty.is_empty() && b.ty != ty {
+        return Err(format!("`{slug}` was a {ty}, not a {}", b.ty));
+    }
+    if pf.wires.iter().any(|w| w.from.slug != slug) {
+        return Err("its declaration's wires are out of it only".into());
+    }
+    check_entry(ctx, &tomb_uuid, &b.ty, page, lock)?;
+    let ports = port_set(lock);
+    for w in lock_wires {
+        let from = w.get("from").and_then(|f| f.as_str()).unwrap_or("");
+        if w.get("to").and_then(|t| t.as_str()).is_none()
+            || !ports.contains(&from.to_ascii_lowercase())
+        {
+            return Err("its lockfile wires are out of its ports only".into());
+        }
+    }
+    for (u, t) in externs {
+        if t.trim().is_empty() || find_ci(&ctx.doc.xml.root, u).is_none() {
+            return Err(format!("no object {u} in the pending config"));
+        }
+    }
+    // Every name its declaration uses: an extern it brings, one of the
+    // claims file, or a block of vislox's files.
+    let mut named: Vec<&str> = b.wires.iter().map(|(_, src)| src.slug.as_str()).collect();
+    named.extend(pf.wires.iter().map(|w| w.to.slug.as_str()));
+    if let Some(Value::Ref(n)) = b.get(blocks::MIRRORS) {
+        named.push(n);
+    }
+    for n in named {
+        let ext = externs
+            .keys()
+            .chain(files.claims.0.keys())
+            .any(|u| self::slug(u) == n);
+        if n != slug && !ext && files.block(n).is_none() {
+            return Err(format!(
+                "its declaration names `{n}`, which is neither an extern of vislox's files nor \
+                 a block of them"
+            ));
+        }
+    }
+    let mut b = b.clone();
+    let taken = files.programs();
+    for (_, v) in b.args.iter_mut() {
+        if let Value::File { path, text } = v {
+            if !ours(path) || !path.ends_with(PROGRAM_EXT) || taken.contains_key(path.as_str()) {
+                return Err(format!("its program file {path} is another block's"));
+            }
+            let t = program
+                .as_deref()
+                .ok_or("its declaration names a program, and the op has none")?;
+            *text = Some(program_text(t)?);
+        }
+    }
+    // Everything is checked: from here on `files` changes.
+    for (u, t) in externs {
+        let c = files.claims.0.entry(extern_key(files, u)).or_default();
+        if c.ty.is_empty() {
+            c.ty = t.clone();
+        }
+    }
+    let file = match files
+        .pages
+        .iter()
+        .find(|(_, p)| p.uuid.as_deref() == Some(page.as_str()))
+    {
+        Some((n, _)) => n.clone(),
+        None => blocks::file_name(&page_title, &|n| n == CLAIMS || files.pages.contains_key(n)),
+    };
+    for p in files.pages.values_mut() {
+        p.removed.remove(&slug);
+    }
+    let f = files.pages.entry(file).or_insert_with(|| PageFile {
+        uuid: Some(page.clone()),
+        ..PageFile::new(&page_title)
+    });
+    f.page = page_title;
+    f.blocks.push(b.clone());
+    f.wires.extend(pf.wires.iter().cloned());
+    // Each wire on a copy: one whose other end is gone is left out, said,
+    // and the block comes back all the same.
+    let mut warnings = Vec::new();
+    for w in wires {
+        let mut t = files.clone();
+        match redraw(&mut t, ctx, &b, w) {
+            Ok(()) => *files = t,
+            Err(e) => warnings.push(format!(
+                "the wire {} → {} was not drawn again: {e}",
+                w.from.join(" "),
+                w.to.join(" ")
+            )),
+        }
+    }
+    files.repin();
+    let le = &mut files.lock_edits;
+    le.add.insert(slug.clone(), lock.clone());
+    le.untomb.insert(tomb_uuid);
+    le.wires.extend(lock_wires.iter().cloned());
+    Ok(Applied {
+        previous: op_value(&Op::RemoveBlock { uuid: uuid.clone() }),
+        added: None,
+        warnings,
+    })
+}
+
+/// Rename the block `uuid` of vislox's files to `new` (#80): lox's own
+/// rename (`rename_slug`) over vislox's files, and `moved <old> -> <new>`, so
+/// lox moves its lockfile entry and it keeps its UUIDs. A block without a
+/// name shows its slug: it keeps the old one as its name, so nothing in the
+/// config changes; renamed back, it shows its slug again.
+fn rename_block(files: &mut Files, ctx: &Ctx, uuid: &str, new: &str) -> Result<Applied, String> {
+    let name = find_ci(&ctx.doc.xml.root, uuid)
+        .and_then(|e| e.attr_decoded("Title").map(|t| t.into_owned()))
+        .filter(|t| !t.trim().is_empty())
+        .unwrap_or_else(|| uuid.to_string());
+    let old = match ctx.lock.slug_of(uuid) {
+        Some(s) if files.block(s).is_some() => s.to_string(),
+        Some(s) => {
+            return Err(format!(
+                "{name}: the module manages it as `{s}` in its own .loxl file; rename it there \
+                 (lox logic rename)"
+            ));
+        }
+        None => {
+            return Err(format!(
+                "{name}: only a block added or adopted here is renamed here"
+            ));
+        }
+    };
+    let new = new.trim();
+    if new == old {
+        return Err(format!("{name} is `{new}` already"));
+    }
+    logic::valid_slug(new).map_err(|e| e.to_string())?;
+    if !new.starts_with(SLUG_PREFIX) || new.len() == SLUG_PREFIX.len() {
+        return Err(format!(
+            "vislox's blocks are named {SLUG_PREFIX} and then lowercase letters, digits and _"
+        ));
+    }
+    if new.contains("__") {
+        return Err("`__` is lox's for the blocks an expression makes".into());
+    }
+    if slug_uuid(new).is_some() {
+        return Err(format!(
+            "`{new}` is how vislox names an object of Loxone Config's"
+        ));
+    }
+    if ctx.names.contains(new)
+        || ctx.lock.slugs.contains_key(new)
+        || ctx.lock.tombstoned(new)
+        || files.names(new)
+    {
+        return Err(format!(
+            "`{new}` is taken: the module or its lockfile has that name"
+        ));
+    }
+    // lox's rename, file by file: declarations, wires, set claims, targets.
+    let mut texts = files.render();
+    for t in texts.values_mut() {
+        let mut m = Module::parse_fragment(t).map_err(|e| e.to_string())?;
+        logic::rename_slug(&mut m, &old, new);
+        *t = m.to_text();
+    }
+    for (n, t) in files.programs() {
+        texts.insert(n.to_string(), t.to_string());
+    }
+    let mut renamed = Files::from_texts(&texts)
+        .map_err(|e| format!("vislox's files do not read back after the rename: {e}"))?;
+    renamed.present = files.present.clone();
+    renamed.layout = files.layout.clone();
+    renamed.lock_edits = files.lock_edits.clone();
+    // A rename of a rename lox has not applied yet is one rename; back to the
+    // old slug, none.
+    let file = renamed
+        .block(new)
+        .map(|(f, _)| f.to_string())
+        .ok_or_else(|| format!("lox's rename left no block `{new}` in vislox's files"))?;
+    let earlier = renamed.pages.values().find_map(|p| {
+        p.moved
+            .iter()
+            .find(|(_, t)| t.as_str() == new)
+            .map(|(f, _)| f.clone())
+    });
+    for p in renamed.pages.values_mut() {
+        p.moved.retain(|_, t| t != new);
+    }
+    match earlier {
+        Some(from) if from == new => {}
+        Some(from) => {
+            if let Some(p) = renamed.pages.get_mut(&file) {
+                p.moved.insert(from, new.to_string());
+            }
+        }
+        None => {
+            if let Some(p) = renamed.pages.get_mut(&file) {
+                p.moved.insert(old.clone(), new.to_string());
+            }
+        }
+    }
+    let b = renamed
+        .block_mut(new)
+        .ok_or_else(|| format!("lox's rename left no block `{new}` in vislox's files"))?;
+    if b.ty != blocks::MESSAGE_REF {
+        match &b.title {
+            None => b.title = Some(old.clone()),
+            Some(t) if t == new => b.title = None,
+            Some(_) => {}
+        }
+    }
+    for (_, v) in b.args.iter_mut() {
+        if let Value::File { path, .. } = v
+            && *path == program_file(&old)
+        {
+            *path = program_file(new);
+        }
+    }
+    *files = renamed;
+    Ok(Applied {
+        previous: op_value(&Op::Rename {
+            uuid: uuid.to_string(),
+            slug: old,
+        }),
+        added: None,
+        warnings: Vec::new(),
     })
 }
 
@@ -2159,6 +2878,7 @@ fn adopt(files: &mut Files, ctx: &Ctx, uuids: &[String]) -> Result<Applied, Stri
             uuids: uuids.to_vec(),
         }),
         added: None,
+        warnings: Vec::new(),
     })
 }
 
@@ -2336,6 +3056,7 @@ fn unadopt(files: &mut Files, ctx: &Ctx, uuids: &[String]) -> Result<Applied, St
     Ok(Applied {
         previous: op_value(&Op::Adopt { blocks: picks }),
         added: None,
+        warnings: Vec::new(),
     })
 }
 
@@ -2407,6 +3128,7 @@ fn move_block(files: &mut Files, ctx: &Ctx, uuid: &str, x: i64, y: i64) -> Resul
             y: now.py,
         }),
         added: None,
+        warnings: Vec::new(),
     })
 }
 
@@ -2426,6 +3148,7 @@ fn place(files: &mut Files, ctx: &Ctx, moves: &[Placed]) -> Result<Applied, Stri
     Ok(Applied {
         previous: op_value(&Op::Place { moves: back }),
         added: None,
+        warnings: Vec::new(),
     })
 }
 
@@ -2505,6 +3228,7 @@ fn relayout(files: &mut Files, ctx: &Ctx, page: &str) -> Result<Applied, String>
     Ok(Applied {
         previous: op_value(&Op::Place { moves: back }),
         added: None,
+        warnings: Vec::new(),
     })
 }
 
@@ -2975,6 +3699,7 @@ fn wire(
             to: to.clone(),
         }),
         added: None,
+        warnings: Vec::new(),
     })
 }
 
@@ -3118,6 +3843,7 @@ fn unwire(
             to: to.clone(),
         }),
         added: None,
+        warnings: Vec::new(),
     })
 }
 
@@ -3356,6 +4082,9 @@ pub fn current(doc: &LoxoneDoc, op: &Op) -> Option<String> {
         Op::Setting { name, .. } => decoded(el, connectors::attr_name(ty, name)),
         Op::AddBlock { .. }
         | Op::RemoveBlock { .. }
+        | Op::RestoreBlock { .. }
+        | Op::Rename { .. }
+        | Op::Tidy
         | Op::Move { .. }
         | Op::Relayout { .. }
         | Op::Place { .. }
@@ -3734,7 +4463,6 @@ mod tests {
                 .iter()
                 .map(|(s, o)| (s.clone(), o.uuid.clone()))
                 .collect(),
-            tombstones: l.removed.values().map(|t| t.slug.clone()).collect(),
             placed: l
                 .objects
                 .iter()
@@ -3750,6 +4478,16 @@ mod tests {
                 .externals
                 .iter()
                 .map(|(s, e)| (s.clone(), e.uuid.clone()))
+                .collect(),
+            entries: l
+                .objects
+                .iter()
+                .map(|(s, o)| (s.clone(), serde_json::to_value(o).unwrap()))
+                .collect(),
+            tombs: l
+                .removed
+                .iter()
+                .map(|(u, t)| (u.clone(), (t.slug.clone(), t.block_type.clone())))
                 .collect(),
         }
     }
@@ -3910,7 +4648,8 @@ mod tests {
             a,
             Applied {
                 previous: serde_json::Value::Null,
-                added: Some("vx_monoflop_1".into())
+                added: Some("vx_monoflop_1".into()),
+                warnings: Vec::new(),
             }
         );
         let b = apply_op(
@@ -4045,7 +4784,8 @@ mod tests {
         // Once lox has forgotten it, the line goes.
         files.tidy(&lock_of(&l));
         assert!(!files.render()["obergeschoss.loxl"].contains("removed"));
-        // A deployed block is not taken out here.
+        // A deployed block is deleted (#80): its undo brings it back with its
+        // UUIDs, not as a new block.
         let pulse = l.objects["vx_pulseat_1"].uuid.clone();
         let lock = lock_of(&l);
         let ctx = Ctx {
@@ -4059,10 +4799,10 @@ mod tests {
             page_adoptions: &Default::default(),
             claimed: &Default::default(),
         };
-        let e = apply_op(&mut files, &ctx, &Op::RemoveBlock { uuid: pulse }).unwrap_err();
-        assert!(e.contains("is deployed"), "{e}");
+        let r = apply_op(&mut files.clone(), &ctx, &Op::RemoveBlock { uuid: pulse }).unwrap();
+        assert_eq!(r.previous["op"], "restore_block");
         let e = apply_op(&mut files, &ctx, &Op::RemoveBlock { uuid: DIV.into() }).unwrap_err();
-        assert!(e.contains("only a block added here"), "{e}");
+        assert!(e.contains("only a block added or adopted here"), "{e}");
     }
 
     #[test]
@@ -4392,7 +5132,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(Lock::read(&lock).placed["a"].as_deref(), Some("P"));
-        assert!(l.tombstones.contains("b"));
+        assert!(l.tombstoned("b"));
         assert!(Lock::read(&tmp.path().join("none")).slugs.is_empty());
     }
 
@@ -7461,5 +8201,557 @@ mod tests {
                 .unwrap_err()
                 .contains("neither an extern")
         );
+    }
+
+    // ── deleting and renaming managed blocks (#80) ──────────────────────
+
+    /// `l` with the lockfile edits of an op made, as the edit writes them.
+    fn edit_lock(l: &Lockfile, e: &crate::adopt::LockEdits) -> Lockfile {
+        let bytes = serde_json::to_vec(l).unwrap();
+        serde_json::from_slice(&crate::adopt::write_lock(&bytes, e).unwrap()).unwrap()
+    }
+
+    fn ctx_of<'a>(
+        doc: &'a LoxoneDoc,
+        base: &'a LoxoneDoc,
+        lock: &'a Lock,
+        deployed: Option<&'a LoxoneDoc>,
+        names: &'a BTreeSet<String>,
+    ) -> Ctx<'a> {
+        static NONE_A: std::sync::LazyLock<BTreeMap<String, crate::adopt::Adoption>> =
+            std::sync::LazyLock::new(BTreeMap::new);
+        static NONE_P: std::sync::LazyLock<BTreeMap<String, Vec<String>>> =
+            std::sync::LazyLock::new(BTreeMap::new);
+        static NONE_W: std::sync::LazyLock<BTreeSet<Wire>> =
+            std::sync::LazyLock::new(BTreeSet::new);
+        static NONE_C: std::sync::LazyLock<crate::set_claim::Claimed> =
+            std::sync::LazyLock::new(Default::default);
+        Ctx {
+            doc,
+            base,
+            lock,
+            deployed,
+            names,
+            drawn: &NONE_W,
+            adoptions: &NONE_A,
+            page_adoptions: &NONE_P,
+            claimed: &NONE_C,
+        }
+    }
+
+    /// The UUIDs of an element and its connectors, and the inputs they take.
+    fn identity(doc: &LoxoneDoc, uuid: &str) -> String {
+        let el = find(&doc.xml.root, uuid).unwrap();
+        let mut out = format!("{} {:?}", uuid, el.attr("Title"));
+        for c in el.child_elements() {
+            out.push_str(&format!(
+                " {}={}",
+                c.attr("K").unwrap_or(""),
+                c.attr("U").unwrap_or("")
+            ));
+        }
+        out
+    }
+
+    #[test]
+    fn a_deployed_block_is_deleted_and_comes_back_with_its_uuids() {
+        let d = doc("house.Loxone");
+        let names = BTreeSet::new();
+        let mut files = Files::default();
+        let mut l = Lockfile::default();
+        let lock = lock_of(&l);
+        let ctx = ctx_of(&d, &d, &lock, None, &names);
+        apply_op(
+            &mut files,
+            &ctx,
+            &add(OG, "Monoflop", Some("Nachlauf"), &[("Time", "30")], &[]),
+        )
+        .unwrap();
+        let out = compile_files(&d, &files, &mut l).unwrap();
+        let mono = l.objects["vx_monoflop_1"].uuid.clone();
+        // A wire drawn here into it, from the Divide block.
+        let lock = lock_of(&l);
+        let ctx = ctx_of(&out, &d, &lock, None, &names);
+        apply_op(
+            &mut files,
+            &ctx,
+            &Op::Wire {
+                from: [DIV.into(), "AQ".into()],
+                to: [mono.clone(), "InputTrigger".into()],
+            },
+        )
+        .unwrap();
+        // Applied: the base, and so the deployed revision, has it now.
+        let deployed = compile_files(&d, &files, &mut l).unwrap();
+        let base = deployed.clone();
+        let was = identity(&deployed, &mono);
+
+        // Deleted: `removed`, the wire goes with it, and its undo is a restore.
+        let lock = lock_of(&l);
+        let ctx = ctx_of(&deployed, &base, &lock, Some(&deployed), &names);
+        let r = apply_op(&mut files, &ctx, &Op::RemoveBlock { uuid: mono.clone() }).unwrap();
+        let again: Op = serde_json::from_value(r.previous).unwrap();
+        let Op::RestoreBlock {
+            ref source,
+            ref wires,
+            ref lock,
+            ..
+        } = again
+        else {
+            panic!("{again:?}")
+        };
+        assert_eq!(source, "vx_monoflop_1 = Monoflop(\"Nachlauf\", Time: 30)\n");
+        assert_eq!(wires.len(), 1, "{wires:?}");
+        assert_eq!(lock["uuid"], mono.as_str());
+        let text = &files.render()["obergeschoss.loxl"];
+        assert!(text.contains("removed vx_monoflop_1\n"), "{text}");
+        assert!(!text.contains("= Monoflop"), "{text}");
+        assert!(files.claims.1.is_empty());
+        let gone = compile_files(&base, &files, &mut l).unwrap();
+        assert!(find(&gone.xml.root, &mono).is_none());
+        assert_eq!(lock_of(&l).tomb(&mono).map(|t| t.1), Some("vx_monoflop_1"));
+        // The line is done once lox keeps the tombstone: the next edit drops it.
+        let lock = lock_of(&l);
+        assert!(!files.stale_lines(&lock).is_empty());
+        files.tidy(&lock);
+        assert!(!files.render().contains_key("obergeschoss.loxl"));
+
+        let ctx = ctx_of(&gone, &base, &lock, Some(&deployed), &names);
+        // A tampered or stale entry is refused, and changes nothing: another
+        // object's connector as a port, another type, a field lox never writes,
+        // another page.
+        let div_port = find(&base.xml.root, DIV)
+            .unwrap()
+            .child_elements()
+            .find_map(|c| c.attr("U"))
+            .unwrap()
+            .to_string();
+        let tamper = |f: &dyn Fn(&mut serde_json::Value)| {
+            let mut op = again.clone();
+            if let Op::RestoreBlock { lock, .. } = &mut op {
+                f(lock);
+            }
+            op
+        };
+        for (op, why) in [
+            (
+                tamper(&|l| l["ports"]["Q"] = serde_json::json!(div_port)),
+                "not one of its connectors",
+            ),
+            (
+                tamper(&|l| l["type"] = serde_json::json!("And")),
+                "is not a Monoflop's",
+            ),
+            (
+                tamper(&|l| l["owner"] = serde_json::json!("me")),
+                "lox does not write",
+            ),
+            (
+                tamper(&|l| l["page_uuid"] = serde_json::json!(EG)),
+                "another page",
+            ),
+            (tamper(&|l| l["uuid"] = serde_json::json!(DIV)), "is not"),
+        ] {
+            let mut f = files.clone();
+            let e = apply_op(&mut f, &ctx, &op).unwrap_err();
+            assert!(e.contains(why), "{why}: {e}");
+            assert_eq!(f, files);
+        }
+        // A wire whose other end is gone is left out and said; the block comes
+        // back all the same.
+        let mut lost = again.clone();
+        if let Op::RestoreBlock { wires, .. } = &mut lost {
+            wires.push(Ends {
+                from: ["deadbeef-0000-0000-ffff504f94000001".into(), "AQ".into()],
+                to: [String::new(), "InputTrigger".into()],
+            });
+        }
+        let r = apply_op(&mut files.clone(), &ctx, &lost).unwrap();
+        assert_eq!(r.warnings.len(), 1, "{:?}", r.warnings);
+        assert!(
+            r.warnings[0].contains("not drawn again"),
+            "{:?}",
+            r.warnings
+        );
+
+        // Restored: the same UUIDs, its wire drawn again, the config as deployed.
+        let r = apply_op(&mut files, &ctx, &again).unwrap();
+        assert_eq!(
+            serde_json::from_value::<Op>(r.previous).unwrap(),
+            Op::RemoveBlock { uuid: mono.clone() }
+        );
+        assert!(files.lock_edits.untomb.contains(&mono));
+        l = edit_lock(&l, &files.lock_edits);
+        files.lock_edits = Default::default();
+        let back = compile_files(&base, &files, &mut l).unwrap();
+        assert_eq!(identity(&back, &mono), was);
+        let diff = loxone_config::diff::diff(&deployed, &back);
+        assert!(diff.logic_is_empty(), "{diff:?}");
+        assert!(l.removed.is_empty(), "{:?}", l.removed);
+
+        // A restore lox has no tombstone for is refused.
+        let lock = lock_of(&l);
+        let ctx = ctx_of(&back, &base, &lock, Some(&deployed), &names);
+        let e = apply_op(&mut files, &ctx, &again).unwrap_err();
+        assert!(e.contains("not deleted"), "{e}");
+    }
+
+    /// An AND gate Loxone Config drew, adopted here (#72) with a wire into it
+    /// from the virtual input and two out of it, as `lox logic adopt` writes
+    /// them in vislox's names.
+    fn adopted_gate() -> (Files, Lockfile) {
+        let vi = slug(VI);
+        let meter = slug("10000005-0000-0050-ffff504f94000001");
+        let licht = slug("10000009-0000-0090-ffff504f94000001");
+        let texts = BTreeMap::from([
+            (
+                "erdgeschoss.loxl".to_string(),
+                format!(
+                    "page \"Erdgeschoss\"\n# Adopted from Loxone Config\nvx_gate = And(\"O1001\", \
+                     In1: {vi})\n{meter}.Power <- vx_gate\n{licht}.In1 <- vx_gate\n"
+                ),
+            ),
+            (
+                CLAIMS.to_string(),
+                format!(
+                    "extern {vi} = VirtualIn(uuid: \"{VI}\")\nextern {meter} = MeterAbsUni(uuid: \
+                     \"10000005-0000-0050-ffff504f94000001\")\nextern {licht} = Or(uuid: \
+                     \"10000009-0000-0090-ffff504f94000001\")\n"
+                ),
+            ),
+        ]);
+        let mut f = Files::from_texts(&texts).unwrap();
+        f.repin();
+        let l: Lockfile = serde_json::from_value(serde_json::json!({
+            "lockfile_version": 8,
+            "objects": { "vx_gate": { "uuid": AND, "type": "And",
+                "ports": { "I1": "10000004-0000-0041-00ff504f94000001", "I2": "10000004-0000-0042-01ff504f94000001", "Q": "10000004-0000-0043-02ff504f94000001" },
+                "layout": { "px": 4032, "py": 768, "px2": 5376, "py2": 1464 },
+                "page_uuid": EG } },
+            "extern_wires": [
+                { "from": "10000004-0000-0043-02ff504f94000001", "to": "10000005-0000-0051-00ff504f94000001" },
+                { "from": "10000004-0000-0043-02ff504f94000001", "to": "10000009-0000-0091-00ff504f94000001" } ]
+        }))
+        .unwrap();
+        (f, l)
+    }
+
+    #[test]
+    fn an_adopted_block_is_deleted_with_its_wires_and_comes_back() {
+        let d = doc("house.Loxone");
+        let names = BTreeSet::new();
+        let (mut files, mut l) = adopted_gate();
+        let out = compile_files(&d, &files, &mut l).unwrap();
+        assert!(loxone_config::diff::diff(&d, &out).logic_is_empty());
+        let was = identity(&out, AND);
+
+        let lock = lock_of(&l);
+        let ctx = ctx_of(&out, &d, &lock, Some(&d), &names);
+        let r = apply_op(&mut files, &ctx, &Op::RemoveBlock { uuid: AND.into() }).unwrap();
+        let again: Op = serde_json::from_value(r.previous).unwrap();
+        let Op::RestoreBlock {
+            adopted,
+            ref source,
+            ref externs,
+            ref lock_wires,
+            ..
+        } = again
+        else {
+            panic!("{again:?}")
+        };
+        assert!(adopted);
+        assert_eq!(source.lines().count(), 3, "{source}");
+        assert_eq!(externs.len(), 3, "{externs:?}");
+        assert_eq!(lock_wires.len(), 2, "{lock_wires:?}");
+        // Its externs go with it: nothing else names them.
+        let r = files.render();
+        assert!(!r[CLAIMS].contains("extern"), "{r:?}");
+        assert!(r["erdgeschoss.loxl"].contains("removed vx_gate\n"), "{r:?}");
+        let gone = compile_files(&d, &files, &mut l).unwrap();
+        assert!(find(&gone.xml.root, AND).is_none());
+        let diff = loxone_config::diff::diff(&d, &gone);
+        assert_eq!(diff.removed.len(), 1, "{diff:?}");
+
+        let lock = lock_of(&l);
+        files.tidy(&lock);
+        let ctx = ctx_of(&gone, &d, &lock, Some(&d), &names);
+        apply_op(&mut files, &ctx, &again).unwrap();
+        l = edit_lock(&l, &files.lock_edits);
+        files.lock_edits = Default::default();
+        let back = compile_files(&d, &files, &mut l).unwrap();
+        assert_eq!(identity(&back, AND), was);
+        let diff = loxone_config::diff::diff(&d, &back);
+        assert!(diff.logic_is_empty(), "{diff:?}");
+    }
+
+    #[test]
+    fn a_block_another_declaration_feeds_from_is_not_deleted() {
+        let d = doc("house.Loxone");
+        let names = BTreeSet::new();
+        let lock = Lock {
+            slugs: BTreeMap::from([
+                ("vx_a".to_string(), AND.to_string()),
+                (
+                    "vx_b".to_string(),
+                    "10000005-0000-0050-ffff504f94000001".to_string(),
+                ),
+            ]),
+            entries: BTreeMap::from([
+                ("vx_a".to_string(), serde_json::json!({ "uuid": AND })),
+                (
+                    "vx_b".to_string(),
+                    serde_json::json!({ "uuid": "10000005-0000-0050-ffff504f94000001" }),
+                ),
+            ]),
+            ..Default::default()
+        };
+        let mut f = Files::from_texts(&BTreeMap::from([(
+            "eg.loxl".to_string(),
+            "page \"Erdgeschoss\"\n# Adopted from Loxone Config\nvx_a = And(\"O1001\")\nvx_b = \
+             MeterAbsUni(\"Zähler\", Power: vx_a)\n"
+                .to_string(),
+        )]))
+        .unwrap();
+        let ctx = ctx_of(&d, &d, &lock, Some(&d), &names);
+        let e = apply_op(&mut f, &ctx, &Op::RemoveBlock { uuid: AND.into() }).unwrap_err();
+        assert!(e.contains("Zähler takes a wire from it"), "{e}");
+        assert_eq!(delete_refusal(&f, &ctx, AND), Some(e));
+        // The block it feeds goes first, then it.
+        apply_op(
+            &mut f,
+            &ctx,
+            &Op::RemoveBlock {
+                uuid: "10000005-0000-0050-ffff504f94000001".into(),
+            },
+        )
+        .unwrap();
+        apply_op(&mut f, &ctx, &Op::RemoveBlock { uuid: AND.into() }).unwrap();
+        let text = &f.render()["eg.loxl"];
+        assert!(text.contains("removed vx_a\nremoved vx_b\n"), "{text}");
+    }
+
+    #[test]
+    fn a_block_is_renamed_keeping_its_uuids_and_the_config() {
+        let d = doc("house.Loxone");
+        let names = BTreeSet::from(["flur".to_string()]);
+        let mut files = Files::default();
+        let mut l = Lockfile::default();
+        let lock = lock_of(&l);
+        let ctx = ctx_of(&d, &d, &lock, None, &names);
+        apply_op(
+            &mut files,
+            &ctx,
+            &add(OG, "Monoflop", None, &[("Time", "30")], &[]),
+        )
+        .unwrap();
+        apply_op(&mut files, &ctx, &add(OG, "And", Some("Licht"), &[], &[])).unwrap();
+        let out = compile_files(&d, &files, &mut l).unwrap();
+        let (mono, and) = (
+            l.objects["vx_monoflop_1"].uuid.clone(),
+            l.objects["vx_and_1"].uuid.clone(),
+        );
+        // Wired, and the Monoflop among nothing else: a wire names it by its slug.
+        let lock = lock_of(&l);
+        let ctx = ctx_of(&out, &d, &lock, None, &names);
+        apply_op(
+            &mut files,
+            &ctx,
+            &Op::Wire {
+                from: [mono.clone(), "Q".into()],
+                to: [and.clone(), "I1".into()],
+            },
+        )
+        .unwrap();
+        let out = compile_files(&d, &files, &mut l).unwrap();
+        let was = (identity(&out, &mono), identity(&out, &and));
+
+        let lock = lock_of(&l);
+        let ctx = ctx_of(&out, &d, &lock, None, &names);
+        let rename = |slug: &str| Op::Rename {
+            uuid: mono.clone(),
+            slug: slug.into(),
+        };
+        // Names lox or vislox would refuse.
+        for (bad, why) in [
+            ("vx_monoflop_1", "already"),
+            ("treppe", "named vx_"),
+            ("vx_Treppe", "invalid slug"),
+            ("vx_and_1", "taken"),
+            ("flur", "named vx_"),
+            ("vx_a__b", "expression"),
+            ("vx_10000006_0000_0060_ffff504f94000001", "Loxone Config's"),
+        ] {
+            let e = apply_op(&mut files.clone(), &ctx, &rename(bad)).unwrap_err();
+            assert!(e.contains(why), "{bad}: {e}");
+        }
+        let r = apply_op(&mut files, &ctx, &rename("vx_treppe")).unwrap();
+        assert_eq!(
+            serde_json::from_value::<Op>(r.previous).unwrap(),
+            rename("vx_monoflop_1")
+        );
+        let all = files.render();
+        let text = &all["obergeschoss.loxl"];
+        // It keeps the label its slug gave it, and lox is told.
+        assert!(
+            text.contains("vx_treppe = Monoflop(\"vx_monoflop_1\", Time: 30)\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("moved vx_monoflop_1 -> vx_treppe\n"),
+            "{text}"
+        );
+        assert!(
+            all[CLAIMS].contains("vx_and_1.In1 <- vx_treppe.Q"),
+            "{all:?}"
+        );
+        let renamed = compile_files(&d, &files, &mut l).unwrap();
+        assert_eq!(l.objects["vx_treppe"].uuid, mono);
+        assert!(!l.objects.contains_key("vx_monoflop_1"));
+        assert_eq!((identity(&renamed, &mono), identity(&renamed, &and)), was);
+        let diff = loxone_config::diff::diff(&out, &renamed);
+        assert!(diff.logic_is_empty(), "{diff:?}");
+
+        // Undone: the slug again, and the label shown by it.
+        let lock = lock_of(&l);
+        assert!(!files.stale_lines(&lock).is_empty());
+        files.tidy(&lock);
+        let ctx = ctx_of(&renamed, &d, &lock, None, &names);
+        apply_op(&mut files, &ctx, &rename("vx_monoflop_1")).unwrap();
+        let text = &files.render()["obergeschoss.loxl"];
+        assert!(
+            text.contains("vx_monoflop_1 = Monoflop(Time: 30)\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("moved vx_treppe -> vx_monoflop_1\n"),
+            "{text}"
+        );
+        assert!(!text.contains("moved vx_monoflop_1 ->"), "{text}");
+        let back = compile_files(&d, &files, &mut l).unwrap();
+        assert!(loxone_config::diff::diff(&out, &back).logic_is_empty());
+
+        // A module's own block is renamed in its own file.
+        let e = apply_op(
+            &mut files.clone(),
+            &ctx_of(
+                &back,
+                &d,
+                &Lock {
+                    slugs: BTreeMap::from([("flur".to_string(), DIV.to_string())]),
+                    ..Default::default()
+                },
+                None,
+                &names,
+            ),
+            &Op::Rename {
+                uuid: DIV.into(),
+                slug: "vx_x".into(),
+            },
+        )
+        .unwrap_err();
+        assert!(e.contains("lox logic rename"), "{e}");
+    }
+
+    #[test]
+    fn a_renamed_adopted_block_keeps_its_wires_and_program() {
+        let d = doc("house.Loxone");
+        let names = BTreeSet::new();
+        let (mut files, mut l) = adopted_gate();
+        let out = compile_files(&d, &files, &mut l).unwrap();
+        let lock = lock_of(&l);
+        let ctx = ctx_of(&out, &d, &lock, Some(&d), &names);
+        apply_op(
+            &mut files,
+            &ctx,
+            &Op::Rename {
+                uuid: AND.into(),
+                slug: "vx_tor".into(),
+            },
+        )
+        .unwrap();
+        let text = &files.render()["erdgeschoss.loxl"];
+        assert!(text.contains("vx_tor = And(\"O1001\""), "{text}");
+        assert!(text.contains(".Power <- vx_tor\n"), "{text}");
+        let renamed = compile_files(&d, &files, &mut l).unwrap();
+        assert_eq!(l.objects["vx_tor"].uuid, AND);
+        let diff = loxone_config::diff::diff(&d, &renamed);
+        assert!(diff.logic_is_empty(), "{diff:?}");
+
+        // A program block's file follows its slug.
+        let lock = lock_of(&l);
+        files.tidy(&lock);
+        let ctx = ctx_of(&renamed, &d, &lock, Some(&d), &names);
+        apply_op(
+            &mut files,
+            &ctx,
+            &add(
+                EG,
+                "Code16",
+                Some("Hue"),
+                &[],
+                &[("Code", "setoutput(0, 1);\n")],
+            ),
+        )
+        .unwrap();
+        let out = compile_files(&d, &files, &mut l).unwrap();
+        let hue = l.objects["vx_code16_1"].uuid.clone();
+        let lock = lock_of(&l);
+        let ctx = ctx_of(&out, &d, &lock, Some(&d), &names);
+        apply_op(
+            &mut files,
+            &ctx,
+            &Op::Rename {
+                uuid: hue.clone(),
+                slug: "vx_hue".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            files.programs().into_iter().collect::<Vec<_>>(),
+            vec![("vx_hue.c", "setoutput(0, 1);\n")]
+        );
+        assert!(
+            files
+                .render()
+                .values()
+                .any(|t| t.contains("vx_hue = Code16(\"Hue\", Code: file(\"vx_hue.c\"))")),
+            "{:?}",
+            files.render()
+        );
+        let again = compile_files(&d, &files, &mut l).unwrap();
+        assert!(loxone_config::diff::diff(&out, &again).logic_is_empty());
+        assert_eq!(l.objects["vx_hue"].uuid, hue);
+    }
+
+    #[test]
+    fn a_wire_whose_end_cannot_be_named_refuses_the_delete() {
+        let d = doc("house.Loxone");
+        let names = BTreeSet::new();
+        // `vx_c` is declared but never compiled: the lock names no UUID for it,
+        // so an undo could not draw the wire to it again.
+        let lock = Lock {
+            slugs: BTreeMap::from([("vx_a".to_string(), AND.to_string())]),
+            entries: BTreeMap::from([("vx_a".to_string(), serde_json::json!({ "uuid": AND }))]),
+            ..Default::default()
+        };
+        let f = Files::from_texts(&BTreeMap::from([
+            (
+                "eg.loxl".to_string(),
+                "page \"Erdgeschoss\"\n# Adopted from Loxone Config\nvx_a = And(\"O1001\")\nvx_c = \
+                 And(\"C\")\n"
+                    .to_string(),
+            ),
+            (CLAIMS.to_string(), "vx_c.I1 <- vx_a.Q\n".to_string()),
+        ]))
+        .unwrap();
+        let ctx = ctx_of(&d, &d, &lock, Some(&d), &names);
+        let e = delete_refusal(&f, &ctx, AND).unwrap();
+        assert!(e.contains("cannot find"), "{e}");
+        let mut g = f.clone();
+        assert_eq!(
+            apply_op(&mut g, &ctx, &Op::RemoveBlock { uuid: AND.into() }).unwrap_err(),
+            e
+        );
+        assert_eq!(g, f);
     }
 }

@@ -1322,6 +1322,8 @@ function renderPropsBody() {
 $("props").addEventListener("keydown", (e) => {
   if (e.target.id === "ad-slug" && e.key === "Enter") { e.preventDefault(); adoptSave(S.sel); return; }
   if (e.target.id === "ad-slug" && e.key === "Escape") { e.preventDefault(); e.stopPropagation(); adoptClose(); return; }
+  if (e.target.id === "rn-slug" && e.key === "Enter") { e.preventDefault(); renameSave(S.sel); return; }
+  if (e.target.id === "rn-slug" && e.key === "Escape") { e.preventDefault(); e.stopPropagation(); renameClose(); return; }
   const f = e.target.closest("[data-ed-field]");
   // In a program (#79) Enter is a line break; Ctrl+Enter (⌘ on a Mac) saves.
   if (f && e.key === "Enter" && (f.tagName !== "TEXTAREA" || e.ctrlKey || e.metaKey)) { e.preventDefault(); editSave(); return; }
@@ -1331,6 +1333,7 @@ $("props").addEventListener("keydown", (e) => {
 });
 $("props").addEventListener("input", (e) => {
   if (e.target.id === "ad-slug") { AD.slug = e.target.value; return; }
+  if (e.target.id === "rn-slug") { RN.slug = e.target.value; return; }
   const f = e.target.closest("[data-ed-field]");
   if (!f || S.edit.uuid !== S.sel) return;
   S.edit.draft[f.dataset.edField] = f.value;
@@ -1345,6 +1348,10 @@ $("props").addEventListener("click", (e) => {
     else if (what === "cancel") editClose();
     else if (what === "revert") editRevert(eb.dataset.key);
     else if (what === "remove") editRemove(S.sel);
+    else if (what === "delete") editDelete(S.sel);
+    else if (what === "rename-open") renameOpen(S.sel);
+    else if (what === "rename-cancel") renameClose();
+    else if (what === "rename") renameSave(S.sel);
     else if (what === "unmove") mvRevert(S.sel);
     else if (what === "adopt-open") adoptOpen(S.sel);
     else if (what === "adopt") adoptSave(S.sel);
@@ -2231,6 +2238,7 @@ function renderActions() {
     : "Deploy to the Miniserver with lox config push, then commit and push to git" + msWarn("apply");
   renderSteps(a);
   renderPush(a);
+  renderStaleLines(a);
   const last = a.last;
   if (last && last.at !== renderActions.shownAt) {
     renderActions.shownAt = last.at;
@@ -2271,6 +2279,30 @@ function renderPush(a) {
     `<div class="ck-row"><button type="button" id="btn-push" class="ghost small"${why ? " disabled" : ""}
       title="${esc(why || "Check the commits not pushed yet for personal data again (lox logic scan), then git push")}">${a.running === "Push" ? "Pushing…" : "Push to git"}</button></div>`;
 }
+// ── lines lox needs no more (#80) ─────────────────────────────────────
+// A `removed` or `moved` line of vislox's files is done once the compile applied it (lox logic lint calls it
+// stale-lifecycle). The next edit drops it; this box offers to drop them now, as an edit of its own.
+function renderStaleLines(a) {
+  const box = $("deploy-lines"), lines = S.edits?.stale_lines || [];
+  const r = editRev(), shown = !!lines.length && !!r && S.rev === r.id && !!a.edit?.available;
+  box.classList.toggle("hidden", !shown);
+  if (!shown) { box.innerHTML = ""; return; }
+  const why = a.running ? `${a.running} is running` : UNDO.busy || UNDO.inflight ? "An edit is compiling" : "";
+  box.innerHTML = `<div class="ck-h">${plural(lines.length, "line")} of vislox's files lox needs no more</div>` +
+    `<div class="ck-sub">The compile applied ${lines.length === 1 ? "it" : "them"} (lint: stale-lifecycle); the next edit drops ${lines.length === 1 ? "it" : "them"} too.</div>` +
+    `<ul class="ps-list">${lines.map((l) => `<li class="mono">${esc(l)}</li>`).join("")}</ul>` +
+    `<div class="ck-row"><button type="button" id="btn-tidy" class="ghost small"${why ? ` disabled title="${esc(why)}"` : ' title="Take the lines out of vislox\'s files and compile: the config does not change"'}>Drop ${lines.length === 1 ? "it" : "them"}</button></div>`;
+}
+$("deploy-lines").addEventListener("click", async (e) => {
+  if (!e.target.closest("#btn-tidy")) return;
+  const r = editRev();
+  if (!r) return;
+  deployMsg("");
+  try {
+    const res = await editAct(r.blob, [{ op: "tidy" }], "Drop lines lox needs no more");
+    await editShowNewest(res.blob);
+  } catch (err) { deployMsg(err.message, true); }
+});
 $("deploy-push").addEventListener("click", async (e) => {
   if (!e.target.closest("#btn-push")) return;
   deployMsg("");
@@ -3369,6 +3401,7 @@ function editRows(o, row) {
   if (!st) return mv.rows.length || ad.length ? { rows: [...ad, ...mv.rows], count: mv.count } : null;
   const rows = [...ad, ...mv.rows];
   const mine = S.edit.uuid === o.uuid ? S.edit : null;
+  rows.push(...lifecycleRows(o, row, st));
   // A block added here and not deployed: Remove takes it out again.
   for (const b of editsAdded(o.uuid)) {
     rows.push(row("Block", `<span class="ed-v">added here</span><span class="ed-tag" title="Declared in ${esc(b.file)} and compiled, not on the Miniserver yet: Apply deploys it, Discard drops it">not deployed</span>` +
@@ -4936,12 +4969,74 @@ async function adoptPage() {
     (sk.length ? ` ${plural(sk.length, "block")} stay${sk.length === 1 ? "s" : ""} Loxone Config's: ${sk.map((x) => `${x.title} (${x.why})`).join("; ")}` : ""), false, !!sk.length);
 }
 $("btn-adopt-page").onclick = adoptPage;
+// ── deleting and renaming managed blocks (#80) ────────────────────────
+// A block of vislox's files (added or adopted here) is renamed by its slug: lox keeps its UUIDs (`moved`), and
+// the config does not change. A deployed or adopted one is deleted (`removed`): lox takes it out of the config
+// with a tombstone, Apply deletes it on the Miniserver (asking for that list, #70), and Undo brings it back with
+// its UUIDs until then. The rename draft belongs to one block and one pending config: it closes when either changes.
+const RN = { uuid: null, blob: null, open: false, slug: "", err: "" };
+/** The Edit rows of a block of vislox's files: its slug with Rename, and Delete when it is deployed or adopted. */
+function lifecycleRows(o, row, st) {
+  const nb = editsBlock(o.uuid);
+  if (!nb || !st) return [];
+  const blob = editRev()?.blob ?? null;
+  if (RN.open && !(S.edit.busy && S.edit.uuid === o.uuid) && (RN.uuid !== o.uuid || RN.blob !== blob)) Object.assign(RN, { open: false, err: "" });
+  const deletes = nb.deployed || nb.adopted;
+  const busy = S.edit.busy && S.edit.uuid === o.uuid;
+  if (RN.open && RN.uuid === o.uuid) {
+    return [`<div class="pr ed-row"><label class="k" for="rn-slug">Slug</label><div class="v"><input id="rn-slug" value="${esc(RN.slug)}" autocomplete="off" spellcheck="false"${busy ? " disabled" : ""}></div></div>`,
+      `<div class="ed-bar"><button type="button" class="primary small" data-ed="rename"${busy || !st.ok ? " disabled" : ""}>${busy ? "Renaming…" : "Rename"}</button>` +
+      `<button type="button" class="ed-btn small" data-ed="rename-cancel"${busy ? " disabled" : ""}>Cancel</button>` +
+      `<span class="ed-msg${RN.err ? " err" : ""}" role="status" aria-live="polite">${esc(RN.err || "lox keeps its UUIDs (moved); the config does not change.")}</span></div>`];
+  }
+  const del = deletes && st.ok
+    ? `<button type="button" class="ed-btn small" data-ed="delete"${nb.delete ? " disabled" : ""} title="${esc(nb.delete || "Delete it from the config (removed): Apply deletes it on the Miniserver, Undo brings it back with its UUIDs")}">Delete</button>` : "";
+  return [row("Slug", `<span class="ed-v mono">${esc(nb.slug)}</span>` +
+      (st.ok ? `<button type="button" class="ed-btn small" data-ed="rename-open" title="Rename its slug in vislox's files; lox keeps its UUIDs">Rename</button>` : "") + del),
+    ...(deletes && st.ok && nb.delete ? [`<div class="ed-note">Delete: ${esc(nb.delete)}</div>`] : [])];
+}
+function renameOpen(uuid) {
+  const nb = editsBlock(uuid), st = S.view?.objects[uuid] && editState(S.view.objects[uuid]);
+  if (!nb || !st?.ok) return;
+  Object.assign(RN, { uuid, blob: st.rev.blob, open: true, slug: nb.slug, err: "" });
+  S.closed.delete("Edit");
+  renderProps();
+  const f = $("rn-slug");
+  if (f) { f.focus(); f.select(); }
+}
+function renameClose() {
+  if (S.edit.busy) return;
+  Object.assign(RN, { open: false, err: "" });
+  renderProps();
+  $("props").querySelector('[data-ed="rename-open"]')?.focus();
+}
+async function renameSave(uuid) {
+  const o = S.view?.objects[uuid], st = o && editState(o), nb = editsBlock(uuid);
+  if (!RN.open || RN.uuid !== uuid || !st?.ok || !nb || S.edit.busy) return;
+  const slug = ($("rn-slug")?.value ?? RN.slug).trim();
+  RN.slug = slug;
+  if (slug === nb.slug) { renameClose(); return; }
+  if (!/^vx_[a-z0-9_]+$/.test(slug)) { RN.err = "A slug is vx_ and then lowercase letters, digits and _."; renderProps(); $("rn-slug")?.focus(); return; }
+  RN.err = "";
+  const r = await editSend(uuid, st.rev, [{ op: "rename", uuid, slug }], `Rename ${displayTitle(o)} to ${slug}`);
+  if (r === "failed") { RN.err = S.edit.err; S.edit.err = ""; renderProps(); $("rn-slug")?.focus(); return; }
+  Object.assign(RN, { open: false, err: "" });
+  S.edit.msg = `Renamed to ${slug}: lox keeps its UUIDs, and the config does not change.`;
+  renderProps();
+}
+/** Delete a deployed or adopted block of vislox's files. */
+async function editDelete(uuid) {
+  const o = S.view?.objects[uuid], st = o && editState(o), nb = editsBlock(uuid);
+  if (!st?.ok || !nb || nb.delete || !(nb.deployed || nb.adopted)) return;
+  if (!window.confirm(`Delete ${displayTitle(o)}? lox takes it out of the config; Apply then deletes it on the Miniserver, after you confirm the list. Undo brings it back with its UUIDs until then.`)) return;
+  await editSend(uuid, st.rev, [{ op: "remove_block", uuid }], `Delete ${displayTitle(o)}`);
+}
 /** Take out a block added here that is not deployed yet. */
 async function editRemove(uuid) {
   const o = S.view?.objects[uuid], st = o && editState(o);
   if (!st?.ok || !editsAdded(uuid).length) return;
   if (!window.confirm(`Remove ${displayTitle(o)}? It was added here and is not deployed.`)) return;
-  await editSend(uuid, st.rev, [{ op: "remove_block", uuid }]);
+  await editSend(uuid, st.rev, [{ op: "remove_block", uuid }], `Remove ${displayTitle(o)}`);
 }
 /** Show the newest config, once the History has the compile `blob` (its file watcher may lag behind the reply). */
 async function editShowNewest(blob) {
@@ -4995,7 +5090,14 @@ function undoLabel(ops) {
     return uuids.size === 1 ? `${ops.length} values of ${obj(op.uuid)}` : `${ops.length} values`;
   }
   if (ops.length === 1 && op.op === "add_block") return `Add ${op.title || op.type}`;
-  if (ops.length === 1 && op.op === "remove_block") return `Remove ${obj(op.uuid)}`;
+  // Made when the op is made, and kept on its history entry: a deleted block is gone from the view afterwards.
+  if (ops.length === 1 && op.op === "remove_block") { const b = editsBlock(op.uuid); return `${b?.deployed || b?.adopted ? "Delete" : "Remove"} ${obj(op.uuid)}`; }
+  if (ops.length === 1 && op.op === "restore_block") {
+    const m = (op.source || "").match(/^(\w+) = \w+\((?:"((?:[^"\\]|\\.)*)")?/);
+    return `Bring back ${S.view?.objects[op.uuid] ? obj(op.uuid) : m?.[2] || m?.[1] || "a block"}`;
+  }
+  if (ops.length === 1 && op.op === "rename") return `Rename ${obj(op.uuid)} to ${op.slug}`;
+  if (ops.length === 1 && op.op === "tidy") return "Drop lines lox needs no more";
   if (kinds.size === 1 && op.op === "move") return ops.length === 1 ? `Move ${obj(op.uuid)}` : `Move ${plural(ops.length, "block")}`;
   if (ops.length === 1 && op.op === "relayout") return `Arrange ${S.pageOf?.get(op.page)?.title || "the page"}`;
   if (ops.length === 1 && op.op === "adopt") return op.blocks.length === 1 ? `Adopt ${obj(op.blocks[0].uuid)}` : `Adopt ${plural(op.blocks.length, "block")}`;
@@ -5182,7 +5284,9 @@ async function undoRun(redo) {
     return;
   }
   const cleared = !UNDO.done.length && !UNDO.undone.length && UNDO.note;
-  deployMsg(cleared ? UNDO.note : `${redo ? "Redone" : "Undone"}: ${e.label}. ${res.unchanged ? "Nothing changed: the config already was that way." : "Compiled: pending, not deployed. Review it, then Apply or Discard."}`, false, !!cleared);
+  // What the step left out (#80: a wire whose other end is gone when a deleted block comes back).
+  const left = res.warnings?.length ? ` Left out: ${res.warnings.join("; ")}.` : "";
+  deployMsg(cleared ? UNDO.note : `${redo ? "Redone" : "Undone"}: ${e.label}. ${res.unchanged ? "Nothing changed: the config already was that way." : "Compiled: pending, not deployed. Review it, then Apply or Discard."}${left}`, false, !!cleared || !!left);
   try {
     await editShowNewest(res.blob);
     if (S.sel && !S.view?.objects[S.sel]) select(null, { noReveal: true });

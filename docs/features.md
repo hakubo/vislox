@@ -341,6 +341,14 @@ sends to the Miniserver see [miniserver.md](miniserver.md).
   pending revision and the Changes list; its Properties edit its name and constants, and *Remove* takes it out
   again until it is deployed.
 
+- **Delete and rename managed blocks** (the same project and token, #80): Properties of a block added or adopted
+  here shows its slug with *Rename* and, once deployed or adopted, *Delete*. *Rename* rewrites the slug in vislox's
+  files with lox's own rename and adds `moved <old> -> <new>`: the block keeps its UUIDs and the config does not
+  change (vislox checks). *Delete* drops the declaration and adds `removed <slug>`: the review shows the block
+  removed, Apply deletes it on the Miniserver after you confirm the removals (as any removal), and Undo brings it
+  back with its UUIDs until then. Once compiled, the Deploy pane offers to drop the lines lox needs no more (lint's
+  `stale-lifecycle`). How: [editing.md](editing.md#deleting-and-renaming-managed-blocks-80).
+
 - **Draw wires** (the same project and token): drag from an output to an input of another block (or the other way
   round). The ports it may end at light up; one it may not (an output, a text port for a number, an inverted
   input, a pair already wired) says why. The wire is written into vislox's file of the module and compiled, and

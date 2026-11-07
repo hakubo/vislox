@@ -161,6 +161,11 @@ published under the same version (see [docker/README.md](docker/README.md)).
   added or adopted here they are edited in *Edit values*: a program in a text area, written into a file of its own
   (`<module>/vislox/<slug>.c`, `Code: file(…)`); constants take a unit (`1h`, `250ms`). On a block Loxone Config
   drew they are read-only until it is adopted. Never deploys.
+- Delete and rename managed blocks (#80): a block added or adopted here is renamed in Properties (*Rename*: lox's own
+  rename over vislox's files and `moved <old> -> <new>`, so it keeps its UUIDs and the config does not change) and,
+  once deployed or adopted, deleted (*Delete*: `removed <slug>`; the review shows it removed, Apply deletes it on the
+  Miniserver after the removals are confirmed, and Undo brings it back with its UUIDs while lox keeps the
+  tombstone). The Deploy pane offers to drop the `removed` and `moved` lines lox needs no more. Never deploys.
 
 ## 0.2.0
 
