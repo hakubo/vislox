@@ -250,13 +250,19 @@ moved vx_nach -> vx_nachlauf
   has it. A block not deployed yet is taken out as before (#59).
 - **Refused** while vislox's file claims a set on it or names it in one (Revert that first), and while another block
   of vislox's files takes a wire from it in its declaration (an adopted block bound to it: delete that one first, or
-  hand it back). `blocks[].delete` in `GET /api/edits` says why (the same op, tried on a copy), and *Delete* is off
-  with that reason. A wire into it from the module's own files is lox's to refuse, and its words come back.
+  hand it back), and while a wire drawn here at it names an end vislox cannot find by UUID (its undo could not draw
+  it again). `blocks[].delete` in `GET /api/edits` says why (`edit::delete_refusal`: the checks the op makes first,
+  which change nothing), and *Delete* is off with that reason. Deployed means the deployed revision has its UUID,
+  case aside, for the browser and the server alike. A wire into it from the module's own files is lox's to refuse, and its words come back.
 - **Undo** is `restore_block`: what `remove_block`'s `previous` names, never written by hand. It carries the
   declaration and its wire lines as vislox wrote them (read back with vislox's own parser: one block, its slug the
   tombstone's), its program, the wires drawn here (by UUID), vislox's externs its declaration names (UUID → type),
   its lockfile entry (`objects.<slug>`: UUIDs, ports, layout, page) and its `extern_wires`. It is accepted only while
-  the lockfile keeps the block's tombstone and the base still has it: the entry goes back, the tombstone goes, the
+  the lockfile keeps the block's tombstone and the base still has it, and the entry is checked, never trusted: only
+  the fields lox writes, the tombstone's UUID, the declaration's type, each port one of the connectors the base's
+  object has (by key and UUID), a rectangle for a layout, and the page it is drawn on; a tampered or stale entry is
+  refused and changes nothing. A wire drawn here whose other end is gone is left out and said (`warnings` in the
+  reply, shown with the undo); the block comes back all the same. Then the entry goes back, the tombstone goes, the
   entry's `extern_wires` come back (and leave `removed_wires`), and the `removed` line goes, so lox writes the block
   with its old UUIDs and the config is as it was. After the compile vislox checks that the config has it again under
   its UUID. Once the deletion was applied (or discarded) there is no tombstone, and it is refused.

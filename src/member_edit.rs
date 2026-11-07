@@ -129,6 +129,7 @@ pub fn apply(
     let done = |p: Option<Vec<String>>| Applied {
         previous: json!(p),
         added: None,
+        warnings: Vec::new(),
     };
     // Dropping vislox's claim is always let through, whatever the block has
     // become (deleted in Loxone Config, managed or claimed by the module): a

@@ -2133,10 +2133,13 @@ impl Actions {
         let mut previous = Vec::new();
         // Per op, the slug of the block it added.
         let mut slugs = Vec::new();
+        // What the ops left out (a wire a restored block cannot have again).
+        let mut warnings: Vec<String> = Vec::new();
         for op in &req.ops {
             let a = edit::apply_op(&mut files, &ctx, op).map_err(bad)?;
             previous.push(a.previous);
             slugs.push(a.added);
+            warnings.extend(a.warnings);
         }
         if files == before {
             let mut r = json!({ "previous": previous, "blob": req.base, "unchanged": true });
@@ -2413,6 +2416,9 @@ impl Actions {
         undo.keep();
         *self.compiled.lock().unwrap() = Some(compiled);
         let mut r = json!({ "previous": previous, "blob": blob, "added": added });
+        if !warnings.is_empty() {
+            r["warnings"] = json!(warnings);
+        }
         if adopting {
             r["adopted"] = json!(adopted);
             r["skipped"] = json!(prepared.skipped);
@@ -3245,9 +3251,10 @@ impl Actions {
                     "adopted": b.adopted,
                     // In vislox's files as the deployed revision's commit has them.
                     "committed": was.block(&b.slug).is_some(),
+                    // As `remove_block` tells a delete from a take-out (#80).
                     "deployed": uuid.is_some_and(|u| deployed_doc
                         .as_ref()
-                        .is_some_and(|d| edit::find(&d.xml.root, u).is_some())),
+                        .is_some_and(|d| edit::find_ci(&d.xml.root, u).is_some())),
                 })
             })
             .collect();
@@ -3331,7 +3338,7 @@ impl Actions {
             }
         }
         // Whether each block of vislox's files can be deleted now (#80), or why
-        // not: the same op the button sends, tried on a copy of the files.
+        // not: the checks `remove_block` makes first, which change nothing.
         if let Some(doc) = shown
             && state.why.is_none()
         {
@@ -3351,8 +3358,7 @@ impl Actions {
                 let Some(u) = b["uuid"].as_str().map(String::from) else {
                     continue;
                 };
-                let op = edit::Op::RemoveBlock { uuid: u };
-                b["delete"] = json!(edit::apply_op(&mut now.clone(), &ctx, &op).err());
+                b["delete"] = json!(edit::delete_refusal(&now, &ctx, &u));
             }
         }
         let mut out = json!({

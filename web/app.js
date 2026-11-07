@@ -5036,7 +5036,7 @@ async function editRemove(uuid) {
   const o = S.view?.objects[uuid], st = o && editState(o);
   if (!st?.ok || !editsAdded(uuid).length) return;
   if (!window.confirm(`Remove ${displayTitle(o)}? It was added here and is not deployed.`)) return;
-  await editSend(uuid, st.rev, [{ op: "remove_block", uuid }]);
+  await editSend(uuid, st.rev, [{ op: "remove_block", uuid }], `Remove ${displayTitle(o)}`);
 }
 /** Show the newest config, once the History has the compile `blob` (its file watcher may lag behind the reply). */
 async function editShowNewest(blob) {
@@ -5090,7 +5090,8 @@ function undoLabel(ops) {
     return uuids.size === 1 ? `${ops.length} values of ${obj(op.uuid)}` : `${ops.length} values`;
   }
   if (ops.length === 1 && op.op === "add_block") return `Add ${op.title || op.type}`;
-  if (ops.length === 1 && op.op === "remove_block") return `${editsBlock(op.uuid)?.deployed || editsBlock(op.uuid)?.adopted ? "Delete" : "Remove"} ${obj(op.uuid)}`;
+  // Made when the op is made, and kept on its history entry: a deleted block is gone from the view afterwards.
+  if (ops.length === 1 && op.op === "remove_block") { const b = editsBlock(op.uuid); return `${b?.deployed || b?.adopted ? "Delete" : "Remove"} ${obj(op.uuid)}`; }
   if (ops.length === 1 && op.op === "restore_block") {
     const m = (op.source || "").match(/^(\w+) = \w+\((?:"((?:[^"\\]|\\.)*)")?/);
     return `Bring back ${S.view?.objects[op.uuid] ? obj(op.uuid) : m?.[2] || m?.[1] || "a block"}`;
@@ -5283,7 +5284,9 @@ async function undoRun(redo) {
     return;
   }
   const cleared = !UNDO.done.length && !UNDO.undone.length && UNDO.note;
-  deployMsg(cleared ? UNDO.note : `${redo ? "Redone" : "Undone"}: ${e.label}. ${res.unchanged ? "Nothing changed: the config already was that way." : "Compiled: pending, not deployed. Review it, then Apply or Discard."}`, false, !!cleared);
+  // What the step left out (#80: a wire whose other end is gone when a deleted block comes back).
+  const left = res.warnings?.length ? ` Left out: ${res.warnings.join("; ")}.` : "";
+  deployMsg(cleared ? UNDO.note : `${redo ? "Redone" : "Undone"}: ${e.label}. ${res.unchanged ? "Nothing changed: the config already was that way." : "Compiled: pending, not deployed. Review it, then Apply or Discard."}${left}`, false, !!cleared || !!left);
   try {
     await editShowNewest(res.blob);
     if (S.sel && !S.view?.objects[S.sel]) select(null, { noReveal: true });
