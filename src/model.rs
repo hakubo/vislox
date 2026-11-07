@@ -3266,8 +3266,9 @@ fn attr_text(title: &str, label: &str, old: Option<&str>, new: Option<&str>) -> 
 /// The block settings of a block of type `ty` (#79), from its attributes:
 /// every attribute parameter of lox's table, set or not.
 fn settings_of(ty: &str, attrs: &[AttrInfo]) -> Vec<SettingInfo> {
-    // A push notification's message has a section of its own (#77).
-    if ty == crate::blocks::MESSAGE_REF {
+    // A push notification's message has a section of its own (#77), and so
+    // has a calendar entry's date (#86), which Lox Logic writes as a date.
+    if ty == crate::blocks::MESSAGE_REF || ty == crate::calendar::ENTRY {
         return Vec::new();
     }
     connectors::attr_params(ty)

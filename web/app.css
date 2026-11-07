@@ -974,3 +974,13 @@ rect.ghost, line.ghost { fill: #1f6fd10a; stroke: var(--moved); stroke-opacity: 
 .tn-add:disabled { opacity: .5; cursor: default; }
 /* A Tree device created here and not paired yet (#85). */
 .tn-tag { margin-left: 6px; padding: 0 5px; border-radius: 8px; font-size: 11px; color: var(--changed); border: 1px solid currentColor; flex: none; }
+/* Adding modes, adding and editing calendar entries (#86). */
+.md-form { border-bottom: 1px solid var(--line); padding: 6px 0 2px; }
+.md-form h4 { margin: 0; padding: 4px 12px 2px; font-size: 13px; }
+.md-form .ed-msg:only-child { display: block; padding: 6px 12px; }
+.md-li { position: relative; }
+.md-edit { position: absolute; top: 6px; right: 8px; z-index: 1; }
+.md-li .md-e { padding-right: 56px; }
+.md-d.md-pickable { cursor: crosshair; user-select: none; }
+.md-d.md-draft { outline: 2px dashed var(--added); outline-offset: -1px; }
+.md-d.md-pick { background-color: var(--sel-soft); box-shadow: inset 0 0 0 2px var(--sel); }

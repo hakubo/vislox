@@ -132,6 +132,11 @@ pub fn setting_kind(ty: &str, param: &str) -> Option<Kind> {
 
 /// The settings vislox offers on a new block of `ty`, in lox's order.
 pub fn settings(ty: &str) -> Vec<(&'static str, Kind)> {
+    // A calendar entry's stored date is no source (#86): its mode and date
+    // are values of their own (`crate::calendar_edit`).
+    if ty == crate::calendar_edit::ENTRY {
+        return Vec::new();
+    }
     connectors::attr_params(ty)
         .into_iter()
         .chain(connectors::message_params(ty).iter().copied())

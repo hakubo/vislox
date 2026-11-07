@@ -57,9 +57,23 @@ pub struct Type {
     pub text: &'static [&'static str],
 }
 
-/// The types, as lox's table has them (`lox logic types`); operating modes
-/// and calendar entries, of the same table, are #86's.
+/// The types, as lox's table has them (`lox logic types`).
 pub const TYPES: &[Type] = &[
+    // An operating mode (#86): only its name; lox mints its `Mode=` number.
+    Type {
+        ty: "Mode",
+        home: Home::Folder("ModeCaption"),
+        required: &[],
+        text: &[],
+    },
+    // A calendar entry (#86): its mode and date are no settings but two
+    // values of their own ([`crate::calendar_edit`]).
+    Type {
+        ty: "CalendarEntry",
+        home: Home::Folder("CalendarCaption"),
+        required: &[],
+        text: &[],
+    },
     Type {
         ty: "VirtualIn",
         home: Home::Folder("VirtualInCaption"),
@@ -452,6 +466,8 @@ pub fn folder_name(ty: &str) -> &'static str {
         "VirtualInCaption" => "Virtual Inputs",
         "VirtualOutCaption" => "Virtual Outputs",
         "WeatherCaption" => "Network Devices (Netzwerkperipherie)",
+        "ModeCaption" => "Operating Modes (Betriebsmodi)",
+        "CalendarCaption" => "Calendar (Betriebszeiten)",
         _ => "of its type",
     }
 }
@@ -487,6 +503,9 @@ pub fn palette(doc: &dyn Fn(&str) -> Option<String>) -> Json {
                 "folder": folder,
                 "devices": devices,
                 "settings": settings,
+                // A calendar entry is added in the Operating modes view, where
+                // its mode and date are picked (#86).
+                "view": (t.ty == crate::calendar_edit::ENTRY).then_some("modes"),
             })
         })
         .collect()
@@ -525,12 +544,14 @@ mod tests {
                 assert!(connectors::port_unit(t.ty, s).is_none(), "{} {s}", t.ty);
             }
         }
-        // Every periphery type lox creates but modes and calendar entries (#86).
+        // Every periphery type lox creates.
         for ty in connectors::BUILTIN_TYPES {
-            if connectors::object_tree(ty) && !matches!(*ty, "Mode" | "CalendarEntry") {
+            if connectors::object_tree(ty) {
                 assert!(of(ty).is_some(), "{ty}");
             }
         }
+        assert_eq!(added_under("ModeCaption"), ["Mode"]);
+        assert_eq!(added_under("CalendarCaption"), ["CalendarEntry"]);
         assert_eq!(added_under("VirtualInCaption").len(), 4);
         assert_eq!(
             added_under("ModbusDev"),

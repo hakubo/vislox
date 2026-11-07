@@ -2318,6 +2318,8 @@ let applyAsking = false;
 function renderActions() {
   const a = S.hist?.actions;
   $("deploy-pane").classList.toggle("hidden", !a?.shown);
+  // Add mode and Add entry wait while Apply or another action runs (#86).
+  if (MD.open) mdRenderEdit();
   renderStale();
   renderAddHud();
   if (!a?.shown) return;
@@ -3210,6 +3212,8 @@ async function loadEdits() {
   if (S.view && (JSON.stringify(S.edits?.add_under || null) !== under ||
     JSON.stringify((S.edits?.blocks || []).filter((b) => b.hardware).map((b) => [b.uuid, b.paired])) !== hwWas)) renderTree();
   if (S.sel && S.view) renderProps();
+  // Add mode, Add entry and each entry's Edit follow the server (#86).
+  renderModes();
 }
 /** Fetch the edits again only when the server says they may have changed. */
 function editsChanged() {
@@ -3475,12 +3479,14 @@ function editState(o) {
   if (UNDO.busy) return { why: "Undo or redo is compiling." };
   return { ok: true, rev: r };
 }
-const EDIT_ATTR = { title: "Name", room: "Room", category: "Category", statistics: "Statistics" };
+const EDIT_ATTR = { title: "Name", room: "Room", category: "Category", statistics: "Statistics", entry_mode: "Switches on", entry_date: "Date" };
 function editLabel(o, c) { return EDIT_ATTR[c.op] || (c.op === "param" ? portName(o, c.port) : SET_LABEL[c.name] || c.name); }
 /** A claimed value as the Edit section lists it: a program (#79) by its size, the rest as written. */
 function editValue(c) {
   if (c.value == null) return '<span class="none-v">back to Loxone Config\'s value</span>';
   if (c.op === "setting" && c.name === "Code") return `<span class="none-v">edited here, ${plural(c.value.split("\n").length - (c.value.endsWith("\n") ? 1 : 0), "line")}</span>`;
+  // A calendar entry's mode (#86), by its name.
+  if (c.op === "entry_mode") return esc(mdModeTitle(c.value));
   return esc(c.value);
 }
 /** The config's rooms or categories by title; a title two of them share cannot be picked (lox claims by title). */
@@ -4024,7 +4030,7 @@ function editRows(o, row) {
   for (const c of editsPending(o.uuid)) {
     const v = editValue(c);
     rows.push(row(editLabel(o, c), `<span class="ed-v">${v}</span><span class="ed-tag" title="Saved into the module and compiled, not on the Miniserver yet: Apply deploys it, Discard drops it">not deployed</span>` +
-      (st.ok ? `<button type="button" class="ed-btn small" data-ed="revert" data-key="${esc(editKey(c))}" title="${c.deployed == null ? "Hand the value back to Loxone Config" : c.name === "Code" ? "Back to the program as deployed" : `Back to ${esc(c.deployed)}, as deployed`}">Revert</button>` : ""), "pr-chg"));
+      (st.ok ? `<button type="button" class="ed-btn small" data-ed="revert" data-key="${esc(editKey(c))}" title="${c.deployed == null ? "Hand the value back to Loxone Config" : c.name === "Code" ? "Back to the program as deployed" : `Back to ${esc(c.op === "entry_mode" ? mdModeTitle(c.deployed) : c.deployed)}, as deployed`}">Revert</button>` : ""), "pr-chg"));
   }
   // A constant of vislox's this block takes, changed and not deployed (#81): Revert puts back the deployed value;
   // one made here is dropped by reverting the ports bound to it.
@@ -5756,6 +5762,8 @@ function undoLabel(ops) {
   const wire = (w) => `${end(w.from)} → ${end(w.to)}`;
   const kinds = new Set(ops.map((o) => o.op));
   const op = ops[0];
+  // A calendar entry (#86): its name, mode and date, saved together.
+  if (ops.some((o) => o.op === "entry_mode" || o.op === "entry_date") && new Set(ops.map((o) => o.uuid)).size === 1) return `Calendar entry ${obj(op.uuid)}`;
   if (ops.every((o) => EDIT_ATTR[o.op] || o.op === "param" || o.op === "setting")) {
     const uuids = new Set(ops.map((o) => o.uuid));
     if (ops.length === 1) {
@@ -5765,6 +5773,7 @@ function undoLabel(ops) {
     }
     return uuids.size === 1 ? `${ops.length} values of ${obj(op.uuid)}` : `${ops.length} values`;
   }
+  if (ops.length === 1 && op.op === "add_block" && op.type === "Mode") return `Add the mode ${op.title}`;
   if (ops.length === 1 && op.op === "add_block") return `Add ${op.title || op.type}`;
   // Constants (#81): changed, made (and bound), dropped.
   if (op.op === "let" && ops.length === 1) return op.value == null ? `Drop the constant ${op.name}` : `Constant ${op.name}: ${op.value}`;
@@ -6517,6 +6526,9 @@ async function abOpenUnder(uuid) {
   $("ab-h").textContent = "Add an object";
   $("ab-page").textContent = `in ${AB.parent.title}`;
   if (!(await abLoadTypes()) || !AB.open) return;
+  // A calendar entry is added in the Operating modes view, where its mode and date are picked (#86).
+  const under = periphUnder(n.ty);
+  if (under.length && under.every((t) => t.view === "modes")) { abClose(); modesOpen(); mfOpen("entry"); return; }
   abPick("");
 }
 /** Whether a block can be added to the page shown: `{ ok, rev, page }`, or `{ why }`; null: not offered at all. */

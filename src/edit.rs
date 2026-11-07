@@ -261,6 +261,16 @@ pub enum Op {
     /// hardware file ([`crate::hw_edit`]). `None` drops vislox's claim: the
     /// I/O records as the base has it. A value op.
     Statistics { uuid: String, value: Option<String> },
+    /// The operating mode a calendar entry of vislox's files switches on
+    /// (#86), by the mode's UUID: `switches:` in its declaration, spelled as
+    /// lox takes it ([`crate::calendar_edit`]). `None` drops it (lox then
+    /// switches the holiday mode). A value op.
+    EntryMode { uuid: String, value: Option<String> },
+    /// The date of a calendar entry of vislox's files (#86), as the source
+    /// writes it: `every: 12-31`, `easter: 1`, `from: 2026-07-04, to:
+    /// 2026-09-05` or `from: 10-01, to: 04-30`. `None` drops it (lox then
+    /// writes 1 January). A value op.
+    EntryDate { uuid: String, value: Option<String> },
 }
 
 /// Where a `place` puts one block: its top left corner, as `move` takes it.
@@ -291,6 +301,8 @@ impl Op {
             | Op::Recipients { uuid, .. }
             | Op::Expr { uuid, .. }
             | Op::Statistics { uuid, .. }
+            | Op::EntryMode { uuid, .. }
+            | Op::EntryDate { uuid, .. }
             | Op::Tiles { uuid, .. } => Some(uuid),
             Op::AddBlock { .. }
             | Op::Signal { .. }
@@ -317,6 +329,8 @@ impl Op {
             | Op::Setting { value, .. }
             | Op::Expr { value, .. }
             | Op::Statistics { value, .. }
+            | Op::EntryMode { value, .. }
+            | Op::EntryDate { value, .. }
             | Op::Let { value, .. } => value.as_deref(),
             Op::AddBlock { .. }
             | Op::Signal { .. }
@@ -353,6 +367,8 @@ impl Op {
             | Op::Setting { value, .. }
             | Op::Expr { value, .. }
             | Op::Statistics { value, .. }
+            | Op::EntryMode { value, .. }
+            | Op::EntryDate { value, .. }
             | Op::Let { value, .. } => *value = v,
             Op::AddBlock { .. }
             | Op::Signal { .. }
@@ -986,6 +1002,8 @@ impl Claims {
             | Op::Recipients { .. }
             | Op::Tiles { .. }
             | Op::Statistics { .. }
+            | Op::EntryMode { .. }
+            | Op::EntryDate { .. }
             | Op::Let { .. } => None,
         }
     }
@@ -1251,6 +1269,8 @@ pub fn apply(
                     | Op::Recipients { .. }
                     | Op::Tiles { .. }
                     | Op::Statistics { .. }
+                    | Op::EntryMode { .. }
+                    | Op::EntryDate { .. }
             )
         })
         .ok_or_else(|| "not a value".to_string())?;
@@ -1366,6 +1386,8 @@ pub fn apply(
         | Op::Signal { .. }
         | Op::Instance { .. }
         | Op::Statistics { .. }
+        | Op::EntryMode { .. }
+        | Op::EntryDate { .. }
         | Op::Let { .. } => {
             unreachable!("not a value")
         }
@@ -1989,7 +2011,15 @@ impl Files {
 
     /// Every value vislox claims or wrote into a block it added (by the
     /// block's UUID in `lock`), as the ops that set it.
+    #[cfg(test)]
     pub fn ops(&self, lock: &Lock) -> Vec<Op> {
+        self.ops_in(lock, None)
+    }
+
+    /// [`Files::ops`], with the mode a calendar entry switches on (#86) by
+    /// its UUID in `doc`, which a title names.
+    pub fn ops_in(&self, lock: &Lock, doc: Option<&LoxoneDoc>) -> Vec<Op> {
+        let modes = doc.map(|d| crate::sched_edit::Modes::new(d, lock));
         let mut v = self.claims.ops();
         v.extend(self.hardware.ops(lock));
         for p in self.pages.values() {
@@ -2026,6 +2056,24 @@ impl Files {
                         value: Some(e.text.clone()),
                     });
                 }
+                // A calendar entry's mode and date (#86).
+                if b.ty == crate::calendar_edit::ENTRY {
+                    if let Some(m) = modes
+                        .as_ref()
+                        .and_then(|m| crate::calendar_edit::mode_uuid(m, &b.args))
+                    {
+                        v.push(Op::EntryMode {
+                            uuid: uuid.into(),
+                            value: Some(m),
+                        });
+                    }
+                    if let Some(d) = crate::calendar_edit::date_text(&b.args) {
+                        v.push(Op::EntryDate {
+                            uuid: uuid.into(),
+                            value: Some(d),
+                        });
+                    }
+                }
             }
         }
         v
@@ -2040,6 +2088,11 @@ pub fn split_args(b: &NewBlock) -> (BTreeMap<String, String>, BTreeMap<String, S
         // The device an I/O hangs below (#84): where it is, which `add_block`
         // takes as its `page`, never a value.
         if k == crate::periphery::DEVICE {
+            continue;
+        }
+        // A calendar entry's mode and date (#86): values of their own, read
+        // with the config (`entry_mode`, `entry_date`).
+        if b.ty == crate::calendar_edit::ENTRY && crate::calendar_edit::is_entry_arg(k) {
             continue;
         }
         let key = blocks::port_key(&b.ty, k);
@@ -2217,6 +2270,11 @@ pub fn apply_op(files: &mut Files, ctx: &Ctx, op: &Op) -> Result<Applied, String
                 Some(slug) if files.block(slug).is_some() => {
                     let slug = slug.to_string();
                     edit_new_block(files, ctx, &slug, op).map(done)
+                }
+                // A calendar entry's mode and date (#86) are edited only on an
+                // entry of vislox's files.
+                _ if matches!(op, Op::EntryMode { .. } | Op::EntryDate { .. }) => {
+                    Err(crate::calendar_edit::not_ours(files, ctx, uuid))
                 }
                 // Not in the base, and no block of the module's: an object
                 // below a Tree device created here and not deployed yet (#85),
@@ -2661,14 +2719,20 @@ fn add_object(
         ));
     }
     let title = title.as_deref().map(|t| block_title(ty, t)).transpose()?;
+    // A calendar entry (#86): its mode and its date, never stored attributes.
+    let entry = ty == crate::calendar_edit::ENTRY;
     let offered = blocks::settings(ty);
     if let Some(name) = settings
         .keys()
-        .find(|n| !offered.iter().any(|(o, _)| o == n))
+        .find(|n| !entry && !offered.iter().any(|(o, _)| o == n))
     {
         return Err(format!("{ty}: {name} cannot be set here"));
     }
-    let mut args = Vec::new();
+    let mut args = if entry {
+        crate::calendar_edit::new_args(ctx, settings)?
+    } else {
+        Vec::new()
+    };
     if let Some(d) = at.name() {
         args.push((crate::periphery::DEVICE.to_string(), Value::Ref(d)));
     }
@@ -2740,7 +2804,11 @@ fn remove_block(files: &mut Files, ctx: &Ctx, uuid: &str) -> Result<Applied, Str
     let slug = r.slug;
     let (file, b) = files.block(&slug).expect("checked");
     let (file, b) = (file.to_string(), b.clone());
-    let (params, settings) = split_args(&b);
+    let (params, mut settings) = split_args(&b);
+    // A calendar entry (#86) is added again with its mode by UUID.
+    if b.ty == crate::calendar_edit::ENTRY {
+        settings = crate::calendar_edit::again_settings(ctx, &b);
+    }
     let again = Op::AddBlock {
         page: block_page(files, ctx, &file, &b),
         ty: b.ty.clone(),
@@ -2822,6 +2890,13 @@ fn removal(
             ));
         }
     };
+    // An operating mode an entry of vislox's switches on (#86): lox would
+    // find no mode for the entry.
+    if let Some(e) = crate::calendar_edit::switched_by(files, &slug).first() {
+        return Err(format!(
+            "{name}: the calendar entry {e} switches it on; change or delete that first"
+        ));
+    }
     // An expression or a wire of vislox's that reads it (#82) would name nothing.
     if let Some(what) = crate::expr_edit::read_by_expression(files, &slug) {
         return Err(format!("{name}: {what} reads it; take that out first"));
@@ -4724,6 +4799,10 @@ fn edit_new_block(
             b.set(setting, v);
             Ok(previous)
         }
+        // A calendar entry's mode and date (#86).
+        Op::EntryMode { value, .. } | Op::EntryDate { value, .. } => {
+            crate::calendar_edit::edit(ctx, &name, b, op, value.as_deref())
+        }
         _ => Err(format!(
             "{name}: a block added here has no room or category lox can set; \
              only its name, its inputs' constants and its settings are edited"
@@ -4869,6 +4948,10 @@ pub fn current(doc: &LoxoneDoc, op: &Op) -> Option<String> {
         // A block setting may be stored under another name (`At:` is `Sec=`).
         Op::Setting { name, .. } => decoded(el, connectors::attr_name(ty, name)),
         Op::Statistics { .. } => crate::hw_edit::stats_state(el),
+        // A calendar entry (#86): its mode by UUID, its date as the source
+        // writes it, both read from what the config stores.
+        Op::EntryMode { .. } => crate::calendar_edit::mode_of(doc, el),
+        Op::EntryDate { .. } => crate::calendar_edit::date_of(el),
         Op::AddBlock { .. }
         | Op::RemoveBlock { .. }
         | Op::RestoreBlock { .. }
@@ -11770,5 +11853,247 @@ mod tests {
         let again = compile_files(&base, &files, &mut l).unwrap();
         assert_eq!(identity(&again, &dev), was);
         assert!(l.removed.is_empty(), "{:?}", l.removed);
+    }
+
+    // ── operating modes and calendar entries (#86) ──────────────────────
+
+    const MODE_F: &str = "10000010-0000-0100-ffff504f94000001";
+    const CAL_F: &str = "10000012-0000-0120-ffff504f94000001";
+    const HEILIGABEND: &str = "10000013-0000-0130-ffff504f94000001";
+
+    #[test]
+    fn modes_and_calendar_entries_are_added_and_edited_as_lox_compiles_them() {
+        let d = doc("house.Loxone");
+        let names = BTreeSet::new();
+        let mut files = Files::default();
+        let mut l = Lockfile::default();
+        let lock = lock_of(&l);
+        let ctx = ctx_of(&d, &d, &lock, None, &names);
+        apply_op(
+            &mut files,
+            &ctx,
+            &add(MODE_F, "Mode", Some("Grill"), &[], &[]),
+        )
+        .unwrap();
+        // A mode takes no settings, and goes into its folder only.
+        assert!(
+            apply_op(
+                &mut files.clone(),
+                &ctx,
+                &add(CAL_F, "Mode", Some("X"), &[], &[])
+            )
+            .unwrap_err()
+            .contains("Operating Modes")
+        );
+        let out = compile_files(&d, &files, &mut l).unwrap();
+        let grill = l.objects["vx_mode_1"].uuid.clone();
+        let el = find(&out.xml.root, &grill).unwrap();
+        // One below the lowest in use (Party is -1).
+        assert_eq!(el.attr("Mode"), Some("-2"));
+        assert_eq!(parent_of(&out, &grill).as_deref(), Some(MODE_F));
+
+        // Entries: of the mode just made (by slug), of a built-in mode (by its
+        // day word) and of a mode Loxone Config made (by its title).
+        let lock = lock_of(&l);
+        let ctx = ctx_of(&out, &d, &lock, None, &names);
+        let vacation = crate::sched_edit::builtin_uuid(2);
+        let entry = |title: &str, mode: &str, date: &str| {
+            add(
+                CAL_F,
+                "CalendarEntry",
+                Some(title),
+                &[],
+                &[("switches", mode), ("date", date)],
+            )
+        };
+        for op in [
+            entry("Grillfest", &grill, "from: 2026-07-04, to: 2026-07-05"),
+            entry("Betriebsurlaub", &vacation.to_uppercase(), "every: 08-01"),
+            entry("Fasching", PARTY, "easter: -47"),
+        ] {
+            apply_op(&mut files, &ctx, &op).unwrap();
+        }
+        // Refused, changing nothing: no date, a date lox refuses, a stored
+        // attribute, a mode the config does not have.
+        for (op, says) in [
+            (
+                add(CAL_F, "CalendarEntry", None, &[], &[("switches", PARTY)]),
+                "needs its date",
+            ),
+            (entry("X", PARTY, "every: 02-30"), "no day of the year"),
+            (
+                entry("X", PARTY, "from: 2008-12-30, to: 2009-01-02"),
+                "2009-01-01",
+            ),
+            (
+                add(CAL_F, "CalendarEntry", None, &[], &[("Month", "1")]),
+                "not Month",
+            ),
+            (
+                entry("X", "10000099-0000-0000-ffff504f94000001", "every: 01-01"),
+                "no operating mode",
+            ),
+        ] {
+            let was = files.clone();
+            let e = apply_op(&mut files, &ctx, &op).unwrap_err();
+            assert!(e.contains(says), "{e}");
+            assert_eq!(files, was);
+        }
+        let text = files.render()[crate::periphery::FILE].clone();
+        for line in [
+            "vx_mode_1 = Mode(\"Grill\")\n",
+            "vx_calendarentry_1 = CalendarEntry(\"Grillfest\", switches: vx_mode_1, from: 2026-07-04, to: 2026-07-05)\n",
+            "vx_calendarentry_2 = CalendarEntry(\"Betriebsurlaub\", switches: vacation, every: 08-01)\n",
+            "vx_calendarentry_3 = CalendarEntry(\"Fasching\", switches: \"Party\", easter: -47)\n",
+        ] {
+            assert!(text.contains(line), "{text}");
+        }
+        // Read back as written.
+        assert_eq!(
+            Files::from_texts(&files.render()).unwrap().pages,
+            files.pages
+        );
+        let out = compile_files(&d, &files, &mut l).unwrap();
+        let at = |l: &Lockfile, out: &LoxoneDoc, s: &str| {
+            let u = l.objects[s].uuid.clone();
+            let el = find(&out.xml.root, &u).unwrap();
+            let get = |a: &str| el.attr(a).map(String::from);
+            (u, get("CalType"), get("Mode"), get("From"), get("To"))
+        };
+        let (fest, cal, mode, from, to) = at(&l, &out, "vx_calendarentry_1");
+        assert_eq!(parent_of(&out, &fest).as_deref(), Some(CAL_F));
+        assert_eq!(
+            (
+                cal.as_deref(),
+                mode.as_deref(),
+                from.as_deref(),
+                to.as_deref()
+            ),
+            (Some("-2"), Some("3"), Some("6393"), Some("6394"))
+        );
+        assert_eq!(at(&l, &out, "vx_calendarentry_2").1.as_deref(), Some("1"));
+        assert_eq!(at(&l, &out, "vx_calendarentry_3").1.as_deref(), Some("-1"));
+        // What the config stores reads as vislox wrote it.
+        let date = |u: &str, v: Option<&str>| Op::EntryDate {
+            uuid: u.into(),
+            value: v.map(Into::into),
+        };
+        let mode = |u: &str, v: Option<&str>| Op::EntryMode {
+            uuid: u.into(),
+            value: v.map(Into::into),
+        };
+        assert_eq!(
+            current(&out, &date(&fest, None)).as_deref(),
+            Some("from: 2026-07-04, to: 2026-07-05")
+        );
+        assert_eq!(
+            current(&out, &mode(&fest, None)),
+            Some(grill.to_lowercase())
+        );
+        let (fasching, ..) = at(&l, &out, "vx_calendarentry_3");
+        assert_eq!(
+            current(&out, &mode(&fasching, None)),
+            Some(PARTY.to_lowercase())
+        );
+        let ops = files.ops_in(&lock_of(&l), Some(&out));
+        assert!(
+            ops.contains(&mode(&fest, Some(&grill.to_lowercase()))),
+            "{ops:?}"
+        );
+        assert!(ops.contains(&date(&fest, Some("from: 2026-07-04, to: 2026-07-05"))));
+        assert!(
+            !ops.iter().any(|o| matches!(o, Op::Setting { .. })),
+            "{ops:?}"
+        );
+
+        // Edited: another mode and another kind of date, undone as a whole.
+        let lock = lock_of(&l);
+        let ctx = ctx_of(&out, &d, &lock, None, &names);
+        let before = files.clone();
+        let holiday = crate::sched_edit::builtin_uuid(1);
+        let req = [date(&fest, Some("easter: 49")), mode(&fest, Some(&holiday))];
+        let mut prev = Vec::new();
+        for op in &req {
+            prev.push(apply_op(&mut files, &ctx, op).unwrap().previous);
+        }
+        assert_eq!(
+            prev[0],
+            serde_json::json!("from: 2026-07-04, to: 2026-07-05")
+        );
+        assert_eq!(prev[1], serde_json::json!(grill.to_lowercase()));
+        assert!(
+            files.render()[crate::periphery::FILE]
+                .contains("CalendarEntry(\"Grillfest\", switches: holiday, easter: 49)"),
+            "{:?}",
+            files.render()
+        );
+        let out2 = compile_files(&d, &files, &mut l).unwrap();
+        let (_, cal, mode2, ..) = at(&l, &out2, "vx_calendarentry_1");
+        assert_eq!((cal, mode2.as_deref()), (None, Some("1")));
+        assert_eq!(
+            current(&out2, &date(&fest, None)).as_deref(),
+            Some("easter: 49")
+        );
+        let undo = undo_ops(&req, &prev, &[None, None]).unwrap();
+        let lock = lock_of(&l);
+        let ctx = ctx_of(&out2, &d, &lock, None, &names);
+        for op in &undo {
+            apply_op(&mut files, &ctx, op).unwrap();
+        }
+        assert_eq!(files.render(), before.render());
+
+        // Refused: a bad date, an entry Loxone Config made, a mode an entry
+        // switches on.
+        let was = files.clone();
+        let e = apply_op(
+            &mut files,
+            &ctx,
+            &date(&fest, Some("from: 2026-07-05, to: 2026-07-04")),
+        )
+        .unwrap_err();
+        assert!(e.contains("before"), "{e}");
+        let e = apply_op(&mut files, &ctx, &date(HEILIGABEND, Some("every: 12-23"))).unwrap_err();
+        assert!(e.contains("Loxone Config made"), "{e}");
+        let e = apply_op(
+            &mut files,
+            &ctx,
+            &Op::RemoveBlock {
+                uuid: grill.clone(),
+            },
+        )
+        .unwrap_err();
+        assert!(e.contains("Grillfest"), "{e}");
+        assert_eq!(files, was);
+        let why = crate::calendar_edit::edit_refusals(&files, &ctx);
+        assert!(why[&fest].is_null());
+        assert!(why[HEILIGABEND].as_str().unwrap().contains("Loxone Config"));
+
+        // Taken out and added again: with its mode by UUID and its date.
+        let r = apply_op(&mut files, &ctx, &Op::RemoveBlock { uuid: fest.clone() }).unwrap();
+        let again: Op = serde_json::from_value(r.previous).unwrap();
+        let Op::AddBlock { settings, .. } = &again else {
+            panic!("{again:?}")
+        };
+        assert_eq!(settings["switches"], grill.to_lowercase());
+        assert_eq!(settings["date"], "from: 2026-07-04, to: 2026-07-05");
+        apply_op(&mut files, &ctx, &again).unwrap();
+        compile_files(&d, &files, &mut l).unwrap();
+    }
+
+    #[test]
+    fn a_mode_whose_slug_names_a_day_or_a_title_shared_is_spelled_as_lox_takes_it() {
+        let d = doc("house.Loxone");
+        let l = Lockfile::default();
+        let lock = lock_of(&l);
+        let modes = crate::sched_edit::Modes::new(&d, &lock);
+        let sp = |u: &str| crate::calendar_edit::spell(&modes, u).unwrap().to_string();
+        assert_eq!(sp(&crate::sched_edit::builtin_uuid(1)), "holiday");
+        assert_eq!(sp(&crate::sched_edit::builtin_uuid(11)), "heating");
+        assert_eq!(sp(PARTY), "\"Party\"");
+        // Read back by the same rules.
+        for u in [crate::sched_edit::builtin_uuid(3), PARTY.to_lowercase()] {
+            let v = crate::calendar_edit::spell(&modes, &u).unwrap();
+            assert_eq!(modes.uuid_of(&v), Some(u.to_lowercase()));
+        }
     }
 }

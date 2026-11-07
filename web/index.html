@@ -115,12 +115,15 @@
           </div>
           <button type="button" id="md-today" class="ghost small">This year</button>
           <div class="spacer"></div>
+          <button type="button" id="md-add-mode" class="ed-btn small hidden">Add mode</button>
+          <button type="button" id="md-add-entry" class="ed-btn small hidden">Add entry</button>
           <button type="button" id="md-close" class="icon-btn" title="Back to the page (Esc)" aria-label="Close the Operating modes view">×</button>
         </header>
         <div class="md-legend" id="md-legend" role="group" aria-label="Modes"></div>
         <div class="md-body">
           <div class="md-grid" id="md-grid" role="img"></div>
           <div class="md-side">
+            <div class="md-form hidden" id="md-form" role="group" aria-labelledby="md-form-h"></div>
             <h3>Calendar entries <span class="count" id="md-count"></span></h3>
             <ul class="md-list" id="md-list"></ul>
           </div>

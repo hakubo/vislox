@@ -8,6 +8,7 @@ mod appcalendar;
 mod backups;
 mod blocks;
 mod calendar;
+mod calendar_edit;
 mod check;
 mod configdate;
 mod constants;

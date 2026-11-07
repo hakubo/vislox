@@ -52,7 +52,8 @@ Then open <http://127.0.0.1:7878>. Started without a path or `--ctx` in a direct
   feed an input from an expression and name it as a signal (`x.Port <- a.Q and b.AQ >= 28`, `vx_warm = …`),
   add and edit template instances (the module's templates or lox's library: `vx_ost = Treppenlicht(…)`),
   add virtual inputs, virtual HTTP/UDP inputs and outputs and Modbus devices from the project tree and edit their
-  settings,
+  settings, add operating modes and add or edit calendar entries on the year (`CalendarEntry("…", switches: party,
+  every: 12-31)`),
   then Apply, Sync and Discard from the browser.
 - For a `lox.toml` project: the blocks its Lox Logic module manages marked, each with the `.loxl` file and line that
   makes it, each parameter a `let` constant or a `defaults` statement gives named after it, and the blocks lox made

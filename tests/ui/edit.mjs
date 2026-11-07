@@ -122,6 +122,10 @@ const periphXml = `\t\t<C Type="VirtualOutCaption" V="178" U="7e000000-0000-0000
   `\t\t\t<C Type="ModbusServer" V="178" U="${WP}" Title="Wärmepumpe" Cl="0,0,0" WF="16384" Address="192.0.2.12:502" Timeout="2000">\n\t\t\t</C>\n\t\t</C>\n`;
 // Tree hardware (#85): a Tree Extension (HW_T) with a Touch Tree (HW_D) whose temperature (HW_A) records no
 // statistics and whose first touch zone (HW_S) records them (StatsType 7).
+// Operating modes and calendar entries (#86): the house's Betriebsmodi folder (with Party, a mode Loxone Config made),
+// its Betriebszeiten folder, and Heiligabend, an entry Loxone Config made. PARTY is declared below.
+const MODE_F = "10000010-0000-0100-ffff504f94000001", CAL_F = "10000012-0000-0120-ffff504f94000001";
+const HEILIGABEND = "10000013-0000-0130-ffff504f94000001";
 const HW_T = "7f000001-0000-0000-ffff504f94000001", HW_D = "7f000002-0000-0000-ffff504f94000001";
 const HW_A = "7f000003-0000-0000-ffff504f94000001", HW_S = "7f000004-0000-0000-ffff504f94000001";
 const hwXml = `\t\t<C Type="LoxTree" V="178" U="${HW_T}" Title="Tree Extension" WF="16384" Serial="13000001">
@@ -581,7 +585,26 @@ const instance = (slug, tname, rest, pageAt) => {
 // Objects of the object tree (#84): vislox's _periphery.loxl, with no page. A device goes into its folder, an I/O
 // below the device its \`device:\` names (an extern of edits.loxl, or a device declared above it), each with the
 // settings its declaration binds as attributes.
-const FOLDER = { VirtualIn: "VirtualInCaption", VirtualHttpIn: "VirtualInCaption", VirtualUdpIn: "VirtualInCaption", VirtualTextIn: "VirtualInCaption", VirtualOut: "VirtualOutCaption", ModbusServer: "WeatherCaption" };
+// Operating modes and calendar entries (#86): a mode is numbered one below the lowest in use, in file order; an
+// entry's mode (a day word, a slug, a title) is its CalType=, its date the Mode=/Month/Day/… attributes it stores.
+const modeOf = (l) => +((l.match(/ Mode="(-?\\d+)"/) || [0, 0])[1]);
+let nextMode = Math.min(0, ...out.filter((l) => l.includes('Type="Mode"')).map(modeOf));
+const modeNo = {};
+const DAYS = { holiday: 0, vacation: 1, dayoff: 2, mon: 3, tue: 4, wed: 5, thu: 6, fri: 7, sat: 8, sun: 9, heating: 10, cooling: 11 };
+const since2009 = (s) => { const [y, m, d] = s.split("-").map(Number); return Math.round((Date.UTC(y, m - 1, d) - Date.UTC(2009, 0, 1)) / 864e5); };
+const entryAttrs = (rest) => {
+  const sw = rest.match(/switches: ("(?:[^"\\\\]|\\\\.)*"|\\w+)/);
+  let no = 0;
+  if (sw && sw[1].startsWith('"')) { const l = out.find((x) => x.includes('Type="Mode"') && x.includes(\`Title="\${xml(JSON.parse(sw[1]))}"\`)); no = l ? modeOf(l) : 0; }
+  else if (sw) no = sw[1] in DAYS ? DAYS[sw[1]] : modeNo[sw[1]] ?? 0;
+  let a = no ? \` CalType="\${no}"\` : "", m;
+  if ((m = rest.match(/every: (\\d\\d)-(\\d\\d)/))) a += \` Month="\${+m[1]}" Day="\${+m[2]}"\`;
+  else if ((m = rest.match(/easter: (-?\\d+)/))) a += \` Mode="1" EasterOffset="\${m[1]}"\`;
+  else if ((m = rest.match(/from: (\\d{4}-\\d\\d-\\d\\d), to: (\\d{4}-\\d\\d-\\d\\d)/))) a += \` Mode="3" From="\${since2009(m[1])}" To="\${since2009(m[2])}"\`;
+  else if ((m = rest.match(/from: (\\d\\d)-(\\d\\d), to: (\\d\\d)-(\\d\\d)/))) a += \` Mode="4" Month="\${+m[1]}" Day="\${+m[2]}" Month2="\${+m[3]}" Day2="\${+m[4]}"\`;
+  return a + ' WeekDayInMonth="1"';
+};
+const FOLDER = { VirtualIn: "VirtualInCaption", VirtualHttpIn: "VirtualInCaption", VirtualUdpIn: "VirtualInCaption", VirtualTextIn: "VirtualInCaption", VirtualOut: "VirtualOutCaption", ModbusServer: "WeatherCaption", Mode: "ModeCaption", CalendarEntry: "CalendarCaption" };
 if (fs.existsSync("pages/vislox/_periphery.loxl")) {
   for (const line of fs.readFileSync("pages/vislox/_periphery.loxl", "utf8").split("\\n")) {
     const m = line.match(/^(vx_\\w+) = (\\w+)\\((.*)\\)$/);
@@ -593,7 +616,7 @@ if (fs.existsSync("pages/vislox/_periphery.loxl")) {
     const i = out.findIndex((l) => l.includes("<C ") && (at ? l.includes(\`U="\${at}"\`) : l.includes(\`Type="\${FOLDER[ty]}"\`)));
     if (i < 0) { console.error(\`error: compile error: \\\`\${slug}\\\`: no \${at ? "device " + at : FOLDER[ty]} in the base\`); process.exit(1); }
     const title = rest.match(/^"((?:[^"\\\\]|\\\\.)*)"/);
-    const attrs = [...rest.matchAll(/(\\w+): ("(?:[^"\\\\]|\\\\.)*"|[^,]+)/g)].filter(([, k]) => k !== "device")
+    const attrs = ty === "Mode" ? \` Mode="\${(modeNo[slug] = --nextMode)}"\` : ty === "CalendarEntry" ? entryAttrs(rest) : [...rest.matchAll(/(\\w+): ("(?:[^"\\\\]|\\\\.)*"|[^,]+)/g)].filter(([, k]) => k !== "device")
       .map(([, k, v]) => \` \${k}="\${xml(v.startsWith('"') ? JSON.parse(v) : v === "on" ? "true" : v === "off" ? "false" : scale(v))}"\`).join("");
     out.splice(i + 1, 0, \`\\t\\t\\t<C Type="\${ty}" V="178" U="\${uuid}" Title="\${xml(title ? JSON.parse('"' + title[1] + '"') : slug)}"\${attrs}>\`, "\\t\\t\\t</C>");
   }
@@ -3078,6 +3101,94 @@ try {
     await page.waitForSelector('#props [data-ed="remove"]:not([disabled])');
     await send(() => page.click('#props [data-ed="remove"]'), "take the device out again");
     assert.doesNotMatch(hfile(), /= TreeDevice\(/);
+  });
+  await step("operating modes are added, and calendar entries added, picked on the year, edited and undone (#86)", async () => {
+    await settled();
+    const send = async (act, what, status = 200) => {
+      const n = edits.length;
+      await act();
+      await until(() => edits.length > n && statuses[n] !== undefined, what);
+      assert.equal(statuses[n], status, what);
+      await settled();
+      return edits[n].ops;
+    };
+    const pfile = () => { const p = join(dir, "pages", "vislox", "_periphery.loxl"); return existsSync(p) ? readFileSync(p, "utf8") : ""; };
+    const row = (u) => `#tree .tn-row[data-uuid="${u}"]`;
+    const entryOf = (slug) => page.evaluate((s) => S.edits?.blocks?.find((b) => b.slug === s) || null, slug);
+    // The calendar folder's Add in the project tree opens the entry form of the Operating modes view.
+    await page.evaluate((u) => revealInTree(u), CAL_F);
+    await page.waitForSelector(`${row(CAL_F)} [data-add-under]:not([disabled])`);
+    await page.click(`${row(CAL_F)} [data-add-under]`);
+    await page.waitForFunction(() => MD.open && MF.open && MF.what === "entry");
+    await waitText("#md-form", /Add a calendar entry/);
+    await page.click('#md-form [data-mf-act="cancel"]');
+    await page.waitForFunction(() => !MF.open);
+    // An entry Loxone Config made is not edited here, and says why.
+    await page.waitForSelector(`[data-md-edit="${HEILIGABEND}"][disabled]`);
+    assert.match(await page.getAttribute(`[data-md-edit="${HEILIGABEND}"]`, "title"), /Loxone Config made this entry/);
+    // Add mode: only its name; lox numbers it.
+    await page.click("#md-add-mode:not([disabled])");
+    await page.fill("#mf-title", "Grill");
+    let ops = await send(() => page.click('#md-form [data-mf-act="save"]'), "add a mode");
+    assert.deepEqual(ops, [{ op: "add_block", page: MODE_F, type: "Mode", title: "Grill", params: {}, settings: {} }]);
+    assert.match(pfile(), /^vx_mode_1 = Mode\("Grill"\)$/m);
+    await waitText("#md-legend", /Grill/);
+    await waitText("#md-form", /Added and compiled: pending, not deployed/);
+    const grill = await page.evaluate(() => S.view.modes.find((m) => m.title === "Grill").uuid);
+    // Add entry: the mode picked, the days dragged on the year (4 to 5 July 2026), outlined while drafted.
+    await page.evaluate(() => { MD.year = 2026; renderModes(); });
+    await page.click("#md-add-entry:not([disabled])");
+    await page.fill("#mf-title", "Grillfest");
+    await page.selectOption("#mf-mode", grill);
+    const [d4, d5] = await page.evaluate(() => [mdDay(2026, 7, 4), mdDay(2026, 7, 5)]);
+    await page.hover(`#md-grid [data-day="${d4}"]`);
+    await page.mouse.down();
+    await page.hover(`#md-grid [data-day="${d5}"]`);
+    await page.mouse.up();
+    assert.equal(await page.inputValue("#mf-kind"), "period");
+    assert.equal(await page.inputValue("#mf-from"), "2026-07-04");
+    assert.equal(await page.inputValue("#mf-to"), "2026-07-05");
+    await page.waitForSelector(`#md-grid [data-day="${d5}"].md-draft`);
+    assert.equal(await page.$$eval("#md-grid .md-draft", (n) => n.length), 2);
+    ops = await send(() => page.click('#md-form [data-mf-act="save"]'), "add an entry");
+    assert.deepEqual(ops, [{ op: "add_block", page: CAL_F, type: "CalendarEntry", title: "Grillfest", params: {}, settings: { switches: grill, date: "from: 2026-07-04, to: 2026-07-05" } }]);
+    assert.match(pfile(), /^vx_calendarentry_1 = CalendarEntry\("Grillfest", switches: vx_mode_1, from: 2026-07-04, to: 2026-07-05\)$/m);
+    const fest = (await entryOf("vx_calendarentry_1")).uuid;
+    // Compiled: on the year in its mode's colour, its days outlined as added, listed as added.
+    await page.waitForSelector(`#md-grid [data-day="${d4}"].md-add`);
+    await waitText("#md-list", /Grillfest[\s\S]*added/);
+    assert.equal(await page.$$eval("#md-grid .md-draft", (n) => n.length), 0);
+    // Edit: another mode (Loxone Config's, by its title) and another kind of date.
+    await page.click(`[data-md-edit="${fest}"]:not([disabled])`);
+    assert.equal(await page.inputValue("#mf-title"), "Grillfest");
+    assert.equal(await page.inputValue("#mf-mode"), grill);
+    await page.selectOption("#mf-mode", PARTY);
+    await page.selectOption("#mf-kind", "easter");
+    await page.fill("#mf-easter", "49");
+    ops = await send(() => page.click('#md-form [data-mf-act="save"]'), "edit the entry");
+    assert.deepEqual(ops, [{ op: "entry_mode", uuid: fest, value: PARTY }, { op: "entry_date", uuid: fest, value: "easter: 49" }]);
+    assert.match(pfile(), /^vx_calendarentry_1 = CalendarEntry\("Grillfest", switches: "Party", easter: 49\)$/m);
+    await page.waitForFunction(() => S.edits?.blocks?.find((b) => b.slug === "vx_calendarentry_1")?.entry?.date === "easter: 49");
+    // A date lox refuses: the server says why, and nothing changes.
+    await page.click(`[data-md-edit="${fest}"]:not([disabled])`);
+    await page.selectOption("#mf-kind", "yearly");
+    await page.fill("#mf-yfrom", "02-30");
+    await page.fill("#mf-yto", "03-01");
+    await send(() => page.click('#md-form [data-mf-act="save"]'), "a refused date", 422);
+    await waitText("#md-form", /no day of the year/);
+    assert.match(pfile(), /easter: 49\)$/m);
+    await page.click('#md-form [data-mf-act="cancel"]');
+    // The mode cannot go while an entry switches it on: Properties says so.
+    await undoKey(false, () => S.edits?.blocks?.find((b) => b.slug === "vx_calendarentry_1")?.entry?.date === "from: 2026-07-04, to: 2026-07-05");
+    assert.match(pfile(), /switches: vx_mode_1, from: 2026-07-04, to: 2026-07-05\)$/m);
+    await page.evaluate((u) => select(u, { noReveal: true }), grill);
+    await page.waitForSelector('#props [data-ed="remove"][disabled]');
+    assert.match(await page.getAttribute('#props [data-ed="remove"]', "title"), /Grillfest switches it on/);
+    // Undone in turn: the entry, then the mode.
+    await undoKey(false, () => !S.edits?.blocks.some((b) => b.slug === "vx_calendarentry_1"));
+    await undoKey(false, () => !S.edits?.blocks.some((b) => b.slug === "vx_mode_1"));
+    assert.doesNotMatch(pfile(), /= (Mode|CalendarEntry)\(/);
+    await page.evaluate(() => modesClose());
   });
   await step("nothing was deployed: lox only compiled, checked, linted and tested", async () => {
     const ran = readFileSync(calls, "utf8").trim().split("\n");

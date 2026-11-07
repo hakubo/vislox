@@ -150,6 +150,11 @@ The binary is an `axum` server with the UI embedded (plain JS and SVG, no build 
   with `Statistics:`, `removed` lines), the `statistics` op, `add_block` of a `TreeDevice` (`add_device`), and
   `remove_block`/`restore_block` of a created device, whose lockfile entries (`externals`, `hardware`) `adopt.rs`'
   `LockEdits::created` writes back. `edit::check_module` validates the expanded module, where a declaration is an extern.
+- `src/calendar_edit.rs` is operating modes and calendar entries (#86): a `Mode` and a `CalendarEntry` are
+  `periphery.rs` types in `_periphery.loxl`; an entry's mode (`switches:`, spelled by `sched_edit::Modes::spell`) and
+  date (`every:`, `easter:`, `from:`/`to:`, `DateArgs`) are the `entry_mode` and `entry_date` value ops, read back from
+  the config by `edit::current` (`mode_of`, `date_of`), and `GET /api/edits`' `entries` says which entries are edited
+  here. `web/modes.js` has the form and the picking on the year.
 - `src/set_claim.rs`' `KINDS` lists every kind of claim on a block's whole content (switching times, moods,
   access, recipients, tiles, members) as a `ClaimKind`; `edit.rs` and `actions.rs` loop over it instead of naming each kind.
 - `src/blocks.rs` is adding blocks (#59): the types vislox offers (`GET /api/block-types`, from lox's builtin
