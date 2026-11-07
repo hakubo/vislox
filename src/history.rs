@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Revision {
     pub id: String,
-    /// `pending`, `live`, `git` or `backup`.
+    /// `pending`, `live`, `git`, `backup` or `rollback`.
     pub kind: &'static str,
     pub label: String,
     pub detail: String,
@@ -56,6 +56,9 @@ pub struct Lists {
     pub history: Vec<Revision>,
     /// The Miniserver backups that show on their own, newest first.
     pub backups: Vec<Revision>,
+    /// What a Roll back would deploy (#69), while it is about the deployed
+    /// revision: compared with it.
+    pub rollback: Vec<Revision>,
     by_id: HashMap<String, Revision>,
 }
 
@@ -110,6 +113,8 @@ pub struct History {
     /// The watched file and the pending one as the last poll read them, by
     /// blob id (`None`: not readable).
     on_disk: (Option<String>, Option<String>),
+    /// What a Roll back would deploy, [`History::set_rollback`].
+    rollback: Option<Revision>,
 }
 
 pub fn blob_id(bytes: &[u8]) -> String {
@@ -371,16 +376,26 @@ impl History {
                 })
                 .collect()
         };
+        // Only while it is about what the Miniserver runs: the newest commit.
+        let deployed = hist.iter().find(|r| r.kind == "git").map(|r| r.id.clone());
+        let rollback: Vec<Revision> = self
+            .rollback
+            .iter()
+            .filter(|r| r.base.is_some() && r.base == deployed)
+            .cloned()
+            .collect();
         let by_id = pending
             .iter()
             .chain(&hist)
             .chain(&backups)
+            .chain(&rollback)
             .map(|r| (r.id.clone(), r.clone()))
             .collect();
         Lists {
             pending,
             history: hist,
             backups,
+            rollback,
             by_id,
         }
     }
@@ -399,6 +414,33 @@ impl History {
         self.zone = zone;
         self.version += 1;
         true
+    }
+
+    /// What a Roll back of commit `base` (`git:<hash>`) would deploy (#69):
+    /// shown as `rollback:<hash>`, compared with that commit, while it is the
+    /// newest one.
+    pub fn set_rollback(
+        &mut self,
+        base: &str,
+        label: String,
+        detail: String,
+        bytes: Vec<u8>,
+    ) -> String {
+        let blob = blob_id(&bytes);
+        let id = format!("rollback:{}", base.trim_start_matches("git:"));
+        self.contents.insert(blob.clone(), Arc::new(bytes));
+        self.rollback = Some(Revision {
+            id: id.clone(),
+            kind: "rollback",
+            label,
+            detail,
+            time: now(),
+            blob,
+            base: Some(base.to_string()),
+            ..Revision::default()
+        });
+        self.version += 1;
+        id
     }
 
     /// Something else the History shows changed (a backup's download
@@ -667,6 +709,63 @@ mod tests {
         assert_eq!(hist.len(), 3);
         assert!(hist.iter().all(|r| r.kind == "git"));
         assert!(hist[0].current);
+    }
+
+    #[test]
+    fn a_rollback_shows_while_it_is_about_the_deployed_commit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().canonicalize().unwrap();
+        let base = dir.join("base.Loxone");
+        git(&dir, &["init", "-q"]);
+        fs::write(&base, "before").unwrap();
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-qm", "one"]);
+        fs::write(&base, "applied").unwrap();
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-qm", "Apply"]);
+        let mut h = History::new(base.clone(), None);
+        let (_, hist) = h.list();
+        let applied = hist[0].id.clone();
+        let id = h.set_rollback(
+            &applied,
+            "Roll back: Apply".into(),
+            "backups/x".into(),
+            b"before".to_vec(),
+        );
+        assert_eq!(
+            id,
+            format!("rollback:{}", applied.trim_start_matches("git:"))
+        );
+        let l = h.lists();
+        assert_eq!(l.rollback.len(), 1);
+        let r = h.find(&id).unwrap();
+        assert_eq!(
+            (r.kind, r.base.as_deref()),
+            ("rollback", Some(applied.as_str()))
+        );
+        assert_eq!(r.blob, blob_id(b"before"));
+        assert_eq!(h.content(&r.blob).unwrap().as_slice(), b"before");
+        // The older commit is not what the Miniserver runs: no rollback of it shows.
+        let older = hist[1].id.clone();
+        h.set_rollback(
+            &older,
+            "Roll back: one".into(),
+            String::new(),
+            b"x".to_vec(),
+        );
+        assert!(h.lists().rollback.is_empty());
+        // Nor once another commit is deployed.
+        h.set_rollback(
+            &applied,
+            "Roll back: Apply".into(),
+            String::new(),
+            b"before".to_vec(),
+        );
+        fs::write(&base, "before").unwrap();
+        git(&dir, &["commit", "-qam", "Roll back: Apply"]);
+        assert!(h.refresh_git());
+        assert!(h.lists().rollback.is_empty());
+        assert!(h.find(&id).is_none());
     }
 
     #[test]

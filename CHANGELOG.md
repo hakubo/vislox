@@ -31,6 +31,14 @@ published under the same version (see [docker/README.md](docker/README.md)).
   deploys. The history is cleared, saying why, when the pending config changes outside the page (another edit, a
   compile, Discard, Apply, Sync). It is the tab's own, kept for the config it was made on, so it survives a reload.
   A relayout is undone by one new op, `place`, however many blocks the page has.
+- Roll back an Apply (#69): in the History, the deployed Apply has *Roll back to before this* when its push left
+  the download from before it in `backups/`. vislox shows what that deploys (the module and lockfile from before
+  the Apply, compiled onto that download, which must give it back) as a revision compared with what runs now,
+  asks with Apply's confirmation, then runs Apply's steps: the tests, `lox config push --force --patched-from
+  <the Apply's post-push download>` (which refuses unless the Miniserver still runs exactly that), the program
+  restart, verification, a commit (`Roll back: <subject>`) and git push. It refuses on any doubt: changes not
+  committed, a later deploy, a download that is missing, unreadable or two different programs, a module that does
+  not give it back. A failure before lox verified the push leaves the project as it was.
 - Fixed: Discard failed when the last commit had no lockfile (the first compile writes one), or one was staged
   but not committed. Discard now reads the last commit, never deletes a lock vislox did not write (one not in git
   goes back to how it was before vislox's first edit), and puts everything back when a step fails.

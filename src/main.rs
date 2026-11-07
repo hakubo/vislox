@@ -25,6 +25,7 @@ mod query;
 mod reason;
 mod restart;
 mod rights;
+mod rollback;
 mod route;
 mod running;
 mod schedule;
@@ -532,6 +533,8 @@ async fn main() -> Result<()> {
         .route("/api/running", get(api_running))
         .route("/api/backups/read", axum::routing::post(api_backups_read))
         .route("/api/apply", axum::routing::post(api_apply))
+        .route("/api/rollback/plan", axum::routing::post(api_rollback_plan))
+        .route("/api/rollback", axum::routing::post(api_rollback))
         .route("/api/discard", axum::routing::post(api_discard))
         .route("/api/edit", axum::routing::post(api_edit))
         .route("/api/edits", get(api_edits))
@@ -749,6 +752,8 @@ async fn api_history(State(app): State<Arc<App>>) -> impl IntoResponse {
         "pending": l.pending,
         "history": l.history,
         "backups": l.backups,
+        "rollback": l.rollback,
+        "rollbacks": app.actions.rollbacks(&l.history),
         "ms_backups": app.backups.info(),
         "error": h.last_error,
         "live": app.live.info(),
@@ -1394,6 +1399,88 @@ async fn api_apply(
     match res {
         Ok(m) => Json(serde_json::json!({ "message": m })).into_response(),
         // What the user could allow to retry (a newer Loxone Config, custom changes).
+        Err((status, msg)) => (
+            status,
+            Json(serde_json::json!({
+                "error": reason::explain(&msg),
+                "hints": actions::apply_hints(&msg),
+            })),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct RollbackBody {
+    /// The commit to roll back (`git:<hash>` or the hash).
+    commit: String,
+    #[serde(flatten)]
+    opts: actions::ApplyOpts,
+}
+
+/// What a Roll back of a commit would deploy (#69), shown as a revision
+/// (`rollback:<hash>`) compared with that commit, for the review and the
+/// confirmation. Deploys nothing, and changes nothing in the project.
+async fn api_rollback_plan(
+    State(app): State<Arc<App>>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<RollbackBody>,
+) -> Response {
+    if let Err(r) = app.actions.check(&headers) {
+        return refused(r);
+    }
+    if let Some(what) = app.actions.running() {
+        return refused((StatusCode::CONFLICT, format!("{what} is running")));
+    }
+    let plan = match app.actions.rollback_plan(&body.commit).await {
+        Ok(p) => p,
+        Err(e) => return refused((StatusCode::CONFLICT, e)),
+    };
+    let short = plan.commit[..10.min(plan.commit.len())].to_string();
+    let (rev, v) = {
+        let mut h = app.history.lock().unwrap();
+        let rev = h.set_rollback(
+            &format!("git:{}", plan.commit),
+            format!("Roll back: {}", plan.subject),
+            format!("{} · what ran before {short}", plan.backup),
+            plan.compiled.clone(),
+        );
+        (rev, h.version)
+    };
+    let _ = app.tx.send(v);
+    Json(serde_json::json!({
+        "rev": rev,
+        "base": format!("git:{}", plan.commit),
+        "commit": plan.commit,
+        "subject": plan.subject,
+        "backup": plan.backup,
+        "same_bytes": plan.same_bytes,
+    }))
+    .into_response()
+}
+
+/// Roll back a commit (#69): Apply's path, with the same preflight, onto the
+/// Miniserver's download from before it.
+async fn api_rollback(
+    State(app): State<Arc<App>>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<RollbackBody>,
+) -> Response {
+    if let Err(r) = app.actions.check(&headers) {
+        return refused(r);
+    }
+    if app.actions.wants_miniserver()
+        && let Some(r) = preflight(&app, miniserver::Action::Apply).await
+    {
+        return r;
+    }
+    let res = app.actions.rollback(&body.commit, &body.opts).await;
+    let a = app.clone();
+    let _ = tokio::task::spawn_blocking(move || refresh(&a)).await;
+    app.ms.forget();
+    reread_calendar(&app);
+    match res {
+        Ok(m) => Json(serde_json::json!({ "message": m })).into_response(),
         Err((status, msg)) => (
             status,
             Json(serde_json::json!({
