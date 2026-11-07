@@ -247,6 +247,15 @@ pub enum Op {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         title: Option<String>,
     },
+    /// A template instance of vislox's page file of `page` (#83): `<slug> =
+    /// <Template>("label", param: arg, …)`. A new slug makes it; `value:
+    /// None` drops it (not once it is deployed). Its `previous` is the
+    /// `instance` op that puts back what was.
+    Instance {
+        slug: String,
+        page: String,
+        value: Option<crate::template_edit::Call>,
+    },
 }
 
 /// Where a `place` puts one block: its top left corner, as `move` takes it.
@@ -279,6 +288,7 @@ impl Op {
             | Op::Tiles { uuid, .. } => Some(uuid),
             Op::AddBlock { .. }
             | Op::Signal { .. }
+            | Op::Instance { .. }
             | Op::Relayout { .. }
             | Op::Place { .. }
             | Op::Wire { .. }
@@ -303,6 +313,7 @@ impl Op {
             | Op::Let { value, .. } => value.as_deref(),
             Op::AddBlock { .. }
             | Op::Signal { .. }
+            | Op::Instance { .. }
             | Op::RemoveBlock { .. }
             | Op::RestoreBlock { .. }
             | Op::Rename { .. }
@@ -337,6 +348,7 @@ impl Op {
             | Op::Let { value, .. } => *value = v,
             Op::AddBlock { .. }
             | Op::Signal { .. }
+            | Op::Instance { .. }
             | Op::RemoveBlock { .. }
             | Op::RestoreBlock { .. }
             | Op::Rename { .. }
@@ -940,6 +952,7 @@ impl Claims {
                 .map(|e| e.text.clone()),
             Op::AddBlock { .. }
             | Op::Signal { .. }
+            | Op::Instance { .. }
             | Op::RemoveBlock { .. }
             | Op::RestoreBlock { .. }
             | Op::Rename { .. }
@@ -1335,6 +1348,7 @@ pub fn apply(
         | Op::Tiles { .. }
         | Op::Expr { .. }
         | Op::Signal { .. }
+        | Op::Instance { .. }
         | Op::Let { .. } => {
             unreachable!("not a value")
         }
@@ -1519,6 +1533,10 @@ pub struct Files {
     pub layout: Placement,
     /// What adopting a block (#72) or its undo changes in the lockfile.
     pub lock_edits: crate::adopt::LockEdits,
+    /// The templates of lox's library vislox copied in for its instances
+    /// (#83), by name: [`TEMPLATES`]. One goes with the last instance of
+    /// vislox's that calls it.
+    pub templates: BTreeMap<String, logic::TemplateDecl>,
 }
 
 /// The positions an edit gives managed blocks, and the pages it lays out
@@ -1533,8 +1551,15 @@ pub struct Placement {
     pub relayout: BTreeMap<String, String>,
 }
 
+/// No templates: a [`Ctx`] of a request that names none (#83).
+#[cfg(test)]
+pub(crate) static NO_TEMPLATES: BTreeMap<String, logic::TemplateDecl> = BTreeMap::new();
+
 /// The name of [`FILE`] in [`DIR`].
 pub(crate) const CLAIMS: &str = "edits.loxl";
+
+/// The file of the library templates vislox copied in (#83), in [`DIR`].
+pub(crate) const TEMPLATES: &str = "templates.loxl";
 
 impl Files {
     /// The files from their texts, by name ([`Files::texts`]). A file
@@ -1554,6 +1579,9 @@ impl Files {
         for (name, text) in texts {
             if name.ends_with(PROGRAM_EXT) {
                 programs.insert(name.clone(), text.replace("\r\n", "\n"));
+            } else if name == TEMPLATES {
+                f.templates = crate::template_edit::parse_templates(text)
+                    .map_err(|e| format!("{name}: {e}"))?;
             } else if name != CLAIMS {
                 f.pages.insert(
                     name.clone(),
@@ -1598,7 +1626,7 @@ impl Files {
         // A block adopted here names externs of the claims file, or blocks of
         // vislox's files; those externs stay while it does.
         for (s, file) in f.adopted_names() {
-            if f.block(&s).is_some() || f.signal(&s).is_some() {
+            if f.block(&s).is_some() || f.signal(&s).is_some() || f.instance(&s).is_some() {
                 continue;
             }
             match f.claims.0.iter_mut().find(|(u, _)| slug(u) == s) {
@@ -1678,6 +1706,12 @@ impl Files {
                 out.insert(name.clone(), p.render());
             }
         }
+        if !self.templates.is_empty() {
+            out.insert(
+                TEMPLATES.to_string(),
+                crate::template_edit::render_templates(&self.templates),
+            );
+        }
         out
     }
 
@@ -1748,6 +1782,12 @@ impl Files {
     pub fn adopted_names(&self) -> Vec<(String, String)> {
         let mut out = Vec::new();
         for (name, p) in &self.pages {
+            // What the template instances here name (#83).
+            for x in &p.instances {
+                for n in &x.names {
+                    out.push((n.clone(), name.clone()));
+                }
+            }
             for b in p.blocks.iter().filter(|b| b.adopted) {
                 for (_, src) in &b.wires {
                     out.push((src.slug.clone(), name.clone()));
@@ -1833,7 +1873,19 @@ impl Files {
                     || p.moved.iter().any(|(f, t)| f == slug || t == slug)
                     || p.blocks.iter().any(|b| b.slug == slug)
                     || p.signals.iter().any(|x| x.slug == slug)
+                    || p.instances.iter().any(|x| x.slug == slug)
             })
+    }
+
+    /// The template instance of vislox's files `slug` (#83): its file and
+    /// itself.
+    pub fn instance(&self, slug: &str) -> Option<(&str, &blocks::InstanceDef)> {
+        self.pages.iter().find_map(|(n, p)| {
+            p.instances
+                .iter()
+                .find(|x| x.slug == slug)
+                .map(|x| (n.as_str(), x))
+        })
     }
 
     /// Drop the `removed` and `moved` lines lox needs no more (what `lox
@@ -1846,6 +1898,7 @@ impl Files {
             p.removed.retain(|s| lock.slugs.contains_key(s));
             let kept = p.removed.clone();
             p.dropped.retain(|s| kept.contains(s));
+            p.unstamped.retain(|s| kept.contains(s));
             p.moved.retain(|from, _| lock.slugs.contains_key(from));
         }
     }
@@ -1976,6 +2029,9 @@ pub struct Ctx<'a> {
     /// or access rights (#76) the rest of the module claims, per kind: a
     /// block takes one such claim ([`Ctx::claimed`]).
     pub claimed: &'a crate::set_claim::Claimed,
+    /// The templates the module's own files declare (#83), by name: an
+    /// instance of vislox's may call one.
+    pub templates: &'a BTreeMap<String, logic::TemplateDecl>,
 }
 
 impl Ctx<'_> {
@@ -2046,6 +2102,7 @@ pub fn apply_op(files: &mut Files, ctx: &Ctx, op: &Op) -> Result<Applied, String
             crate::expr_edit::set_expr(files, ctx, uuid, port, value.as_deref()).map(done)
         }
         Op::Signal { .. } => crate::expr_edit::set_signal(files, ctx, op),
+        Op::Instance { .. } => crate::template_edit::set_instance(files, ctx, op),
         _ => {
             let uuid = op.uuid().unwrap_or_default();
             match ctx.lock.slug_of(uuid) {
@@ -2109,6 +2166,7 @@ pub fn undo_ops(
             | Op::Adopt { .. }
             | Op::AdoptPage { .. }
             | Op::Signal { .. }
+            | Op::Instance { .. }
             | Op::Unadopt { .. } => undo.push(serde_json::from_value(prev).map_err(bad)?),
             Op::Moods { uuid, .. } => undo.push(Op::Moods {
                 uuid: uuid.clone(),
@@ -4329,6 +4387,8 @@ pub struct Decls {
     pub lets: BTreeSet<String>,
     /// And the aliases (`let x = y.Q`), which name a port, not a value.
     pub aliases: BTreeSet<String>,
+    /// The templates (#83), by name.
+    pub templates: BTreeMap<String, logic::TemplateDecl>,
 }
 
 impl Decls {
@@ -4368,6 +4428,12 @@ pub fn module_decls(module: &Path) -> Result<Decls, String> {
                 Item::Block(b) | Item::Instance(b) => d.names.insert(b.slug.clone()),
                 Item::Extern(e) => d.names.insert(e.slug.clone()),
                 Item::Signal(s) => d.names.insert(s.slug.clone()),
+                Item::Template(t) => {
+                    d.templates
+                        .entry(t.name.clone())
+                        .or_insert_with(|| t.clone());
+                    false
+                }
                 // The sets share the namespace (#73 picks a set's name).
                 Item::Schedule(s) => d.names.insert(s.name.clone()),
                 Item::Tiles(s) => d.names.insert(s.name.clone()),
@@ -4461,6 +4527,7 @@ pub fn current(doc: &LoxoneDoc, op: &Op) -> Option<String> {
         | Op::Tiles { .. }
         | Op::Expr { .. }
         | Op::Signal { .. }
+        | Op::Instance { .. }
         | Op::Let { .. } => None,
     }
 }
@@ -4996,6 +5063,7 @@ mod tests {
                 adoptions: &Default::default(),
                 page_adoptions: &Default::default(),
                 claimed: &Default::default(),
+                templates: &Default::default(),
             };
             apply_op(&mut files, &ctx, &add(EG, t, None, &[], &[])).unwrap();
             let mut l = Lockfile::default();
@@ -5030,6 +5098,7 @@ mod tests {
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
             claimed: &Default::default(),
+            templates: &Default::default(),
         };
         let a = apply_op(
             &mut files,
@@ -5101,6 +5170,7 @@ mod tests {
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
             claimed: &Default::default(),
+            templates: &Default::default(),
         };
         let title = Op::Title {
             uuid: mono.clone(),
@@ -5165,6 +5235,7 @@ mod tests {
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
             claimed: &Default::default(),
+            templates: &Default::default(),
         };
         let r = apply_op(&mut files, &ctx, &Op::RemoveBlock { uuid: mono.clone() }).unwrap();
         // It names the block it adds again (#62): lox mints new UUIDs for it.
@@ -5194,6 +5265,7 @@ mod tests {
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
             claimed: &Default::default(),
+            templates: &Default::default(),
         };
         let r = apply_op(&mut files.clone(), &ctx, &Op::RemoveBlock { uuid: pulse }).unwrap();
         assert_eq!(r.previous["op"], "restore_block");
@@ -5219,6 +5291,7 @@ mod tests {
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
             claimed: &Default::default(),
+            templates: &Default::default(),
         };
         apply_op(&mut files, &ctx, &add(OG, "And", Some("Licht"), &[], &[])).unwrap();
         let text = files.render()["obergeschoss.loxl"].clone();
@@ -5252,6 +5325,7 @@ mod tests {
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
             claimed: &Default::default(),
+            templates: &Default::default(),
         };
         apply_op(&mut files, &ctx, &add(OG, "Or", None, &[], &[])).unwrap();
         let r = files.render();
@@ -5287,6 +5361,7 @@ mod tests {
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
             claimed: &Default::default(),
+            templates: &Default::default(),
         };
         for s in ["vx_and_1", "vx_or_1"] {
             let uuid = l.objects[s].uuid.clone();
@@ -5318,6 +5393,7 @@ mod tests {
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
             claimed: &Default::default(),
+            templates: &Default::default(),
         };
         let mut files = Files::default();
         let prog = "int main() {\r\n  setoutput(0, 1);\r\n}\r\n";
@@ -5419,6 +5495,7 @@ mod tests {
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
             claimed: &Default::default(),
+            templates: &Default::default(),
         };
         let mut files = Files::default();
         apply_op(
@@ -5474,6 +5551,7 @@ mod tests {
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
             claimed: &Default::default(),
+            templates: &Default::default(),
         };
         let mut files = Files::default();
         let err = |op: Op| apply_op(&mut files.clone(), &ctx, &op).unwrap_err();
@@ -5511,6 +5589,7 @@ mod tests {
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
             claimed: &Default::default(),
+            templates: &Default::default(),
         };
         let e = apply_op(&mut Files::default(), &ctx, &add(OG, "And", None, &[], &[])).unwrap_err();
         assert!(e.contains("2 pages are titled"), "{e}");
@@ -5562,6 +5641,7 @@ mod tests {
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
             claimed: &Default::default(),
+            templates: &Default::default(),
         };
         apply_op(&mut files, &ctx, &add(OG, "And", Some("Licht"), &[], &[])).unwrap();
         // Deployed: the base draws it where lox placed it.
@@ -5581,6 +5661,7 @@ mod tests {
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
             claimed: &Default::default(),
+            templates: &Default::default(),
         };
         // Snapped to the grid, the size kept; `previous` moves it back.
         let mut files = Files::from_texts(&files.render()).unwrap();
@@ -5665,6 +5746,7 @@ mod tests {
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
             claimed: &Default::default(),
+            templates: &Default::default(),
         };
         apply_op(&mut files, &ctx, &add(OG, "And", None, &[], &[])).unwrap();
         apply_op(&mut files, &ctx, &add(OG, "Or", None, &[], &[])).unwrap();
@@ -5681,6 +5763,7 @@ mod tests {
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
             claimed: &Default::default(),
+            templates: &Default::default(),
         };
         let err = |op: Op| apply_op(&mut files.clone(), &ctx, &op).unwrap_err();
         // Drawn in Loxone Config: lox does not move it.
@@ -5789,6 +5872,7 @@ mod tests {
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
             claimed: &Default::default(),
+            templates: &Default::default(),
         };
         apply_op(&mut files, &ctx, &add(OG, "And", None, &[], &[])).unwrap();
         let out = compile_files(&d, &files, &mut l).unwrap();
@@ -5815,6 +5899,7 @@ mod tests {
                 adoptions: &Default::default(),
                 page_adoptions: &Default::default(),
                 claimed: &Default::default(),
+                templates: &Default::default(),
             };
             files.layout = Placement::default();
             apply_op(
@@ -5887,6 +5972,7 @@ mod tests {
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
             claimed: &Default::default(),
+            templates: &Default::default(),
         };
         apply_op(&mut files, &ctx, &add(OG, "And", None, &[], &[])).unwrap();
         apply_op(&mut files, &ctx, &add(EG, "Or", None, &[], &[])).unwrap();
@@ -5942,6 +6028,7 @@ mod tests {
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
             claimed: &Default::default(),
+            templates: &Default::default(),
         };
         apply_op(&mut files, &ctx, &add(OG, "And", None, &[], &[])).unwrap();
         let out = compile_files(&d, &files, &mut l).unwrap();
@@ -6032,6 +6119,7 @@ mod tests {
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
             claimed: &Default::default(),
+            templates: &Default::default(),
         };
         // The Divide block's output onto the upper floor's OR: another page.
         let w = wire_op((DIV, "AQ"), (OR, "I2"));
@@ -6079,6 +6167,7 @@ mod tests {
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
             claimed: &Default::default(),
+            templates: &Default::default(),
         };
         // One request may take a wire out and draw it again (an undo and a
         // redo, a reconnect to the same port): the ops see each other.
@@ -6118,6 +6207,7 @@ mod tests {
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
             claimed: &Default::default(),
+            templates: &Default::default(),
         };
         let err = |op: Op| apply_op(&mut Files::default(), &ctx, &op).unwrap_err();
         assert!(err(wire_op((DIV, "Input2"), (OR, "I2"))).contains("is an input"));
@@ -6168,6 +6258,7 @@ mod tests {
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
             claimed: &Default::default(),
+            templates: &Default::default(),
         };
         let e = apply_op(
             &mut Files::default(),
@@ -6205,6 +6296,7 @@ mod tests {
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
             claimed: &Default::default(),
+            templates: &Default::default(),
         };
         let e = apply_op(
             &mut Files::default(),
@@ -6245,6 +6337,7 @@ mod tests {
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
             claimed: &Default::default(),
+            templates: &Default::default(),
         };
         apply_op(&mut files, &ctx, &add(OG, "And", None, &[("I2", "1")], &[])).unwrap();
         let out = compile_files(&d, &files, &mut l).unwrap();
@@ -6261,6 +6354,7 @@ mod tests {
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
             claimed: &Default::default(),
+            templates: &Default::default(),
         };
         // Its input with a constant takes no wire; the other does.
         let e = apply_op(&mut files, &ctx, &wire_op((DIV, "AQ"), (&new, "I2"))).unwrap_err();
@@ -6298,6 +6392,7 @@ mod tests {
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
             claimed: &Default::default(),
+            templates: &Default::default(),
         };
         let undo = apply_op(&mut files, &ctx, &Op::RemoveBlock { uuid: new.clone() })
             .unwrap()
@@ -6337,6 +6432,7 @@ mod tests {
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
             claimed: &Default::default(),
+            templates: &Default::default(),
         };
         let a = apply_op(&mut files, &ctx, &undo).unwrap();
         let slug2 = a.added.unwrap();
@@ -6429,6 +6525,7 @@ mod tests {
             adoptions: &adoptions,
             page_adoptions: &pages,
             claimed: &Default::default(),
+            templates: &Default::default(),
         };
         let back = |f: &mut Files, u: &str| {
             apply_op(
@@ -6575,6 +6672,7 @@ mod tests {
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
             claimed: &claimed,
+            templates: &Default::default(),
         };
         let (mon, sat, hol) = (builtin_uuid(4), builtin_uuid(9), builtin_uuid(1));
         let wk: Vec<(String, Vec<Sp>)> = (4..=8)
@@ -6796,6 +6894,7 @@ mod tests {
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
             claimed: &Default::default(),
+            templates: &Default::default(),
         };
         let mon = builtin_uuid(4);
         let mut files = Files::default();
@@ -6903,6 +7002,7 @@ mod tests {
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
             claimed: &Default::default(),
+            templates: &Default::default(),
         };
         let mut files = Files::default();
         let mon = builtin_uuid(4);
@@ -7016,6 +7116,7 @@ mod tests {
             adoptions: &EMPTY_ADOPT,
             page_adoptions: &EMPTY_PAGES,
             claimed,
+            templates: &NO_TEMPLATES,
         }
     }
 
@@ -7549,6 +7650,7 @@ mod tests {
             adoptions: &EMPTY_ADOPT,
             page_adoptions: &EMPTY_PAGES,
             claimed,
+            templates: &NO_TEMPLATES,
         }
     }
 
@@ -8663,6 +8765,7 @@ mod tests {
             adoptions: &NONE_A,
             page_adoptions: &NONE_P,
             claimed: &NONE_C,
+            templates: &NO_TEMPLATES,
         }
     }
 
@@ -9413,6 +9516,260 @@ mod tests {
         std::fs::write(module.join("kaputt.loxl"), "let = (\n").unwrap();
         let e = module_decls(&module).unwrap_err();
         assert!(e.starts_with("kaputt.loxl: "), "{e}");
+    }
+
+    // ── template instances (#83) ────────────────────────────────────────
+
+    fn inst(slug: &str, template: &str, args: &[(&str, &str)], label: Option<&str>) -> Op {
+        Op::Instance {
+            slug: slug.into(),
+            page: OG.into(),
+            value: Some(crate::template_edit::Call {
+                template: template.into(),
+                label: label.map(Into::into),
+                args: args
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            }),
+        }
+    }
+
+    #[test]
+    fn a_library_template_instance_is_made_changed_and_dropped() {
+        let d = doc("house.Loxone");
+        let names = BTreeSet::new();
+        let mut files = Files::default();
+        let mut l = Lockfile::default();
+        let lock = lock_of(&l);
+        let ctx = ctx_of(&d, &d, &lock, None, &names);
+        let vi = slug(VI);
+        let op = inst(
+            "vx_treppe",
+            "Treppenlicht",
+            &[("taster", &vi), ("dauer", "5min"), ("titel", "Flur")],
+            None,
+        );
+        let a = apply_op(&mut files, &ctx, &op).unwrap();
+        // Undone, it is dropped.
+        let undo = undo_ops(std::slice::from_ref(&op), &[a.previous], &[]).unwrap();
+        assert_eq!(
+            undo[0],
+            Op::Instance {
+                slug: "vx_treppe".into(),
+                page: OG.into(),
+                value: None
+            }
+        );
+        let texts = files.render();
+        let page = texts.values().find(|t| t.contains("vx_treppe")).unwrap();
+        assert!(
+            page.contains("# Template instances")
+                && page.contains(&format!(
+                    "vx_treppe = Treppenlicht(taster: {vi}, dauer: 5min, titel: \"Flur\")\n"
+                )),
+            "{page}"
+        );
+        // The library template is copied in, and the object's extern made.
+        assert!(
+            texts[TEMPLATES].contains("template Treppenlicht("),
+            "{}",
+            texts[TEMPLATES]
+        );
+        assert!(texts[CLAIMS].contains(&format!("extern {vi} = VirtualIn(uuid: \"{VI}\")")));
+        let back = Files::from_texts(&texts).unwrap();
+        assert_eq!(
+            (&back.pages, &back.templates),
+            (&files.pages, &files.templates)
+        );
+        let out = compile_files(&d, &files, &mut l).unwrap();
+        let mono = l.objects["vx_treppe_ausgang"].uuid.clone();
+        let el = find(&out.xml.root, &mono).unwrap();
+        assert_eq!(el.attr_decoded("Title").as_deref(), Some("Flur"));
+        // Its call as the op takes it: the text unquoted.
+        let (_, def) = files.instance("vx_treppe").unwrap();
+        let call = crate::template_edit::call_of(def);
+        assert_eq!(call.args["titel"], "Flur");
+        assert_eq!(call.args["dauer"], "5min");
+        // Changed: the same blocks.
+        let lock = lock_of(&l);
+        let ctx = ctx_of(&out, &d, &lock, None, &names);
+        let a = apply_op(
+            &mut files,
+            &ctx,
+            &inst(
+                "vx_treppe",
+                "Treppenlicht",
+                &[("taster", &vi), ("dauer", "2min")],
+                None,
+            ),
+        )
+        .unwrap();
+        assert_eq!(serde_json::from_value::<Op>(a.previous).unwrap(), op);
+        let out2 = compile_files(&d, &files, &mut l).unwrap();
+        assert_eq!(l.objects["vx_treppe_ausgang"].uuid, mono);
+        let el = find(&out2.xml.root, &mono).unwrap();
+        assert_eq!(el.attr_decoded("Title").as_deref(), Some("Treppenlicht"));
+        // Checked as lox checks a call.
+        let lock = lock_of(&l);
+        let ctx = ctx_of(&out2, &d, &lock, None, &names);
+        for (args, label, why) in [
+            (
+                vec![("taster", vi.as_str()), ("dauer", "5")],
+                None,
+                "duration parameter",
+            ),
+            (
+                vec![("taster", vi.as_str()), ("nope", "1")],
+                None,
+                "no parameter `nope`",
+            ),
+            (vec![("dauer", "5min")], None, "needs taster"),
+            (vec![("taster", vi.as_str())], Some("X"), "takes no label"),
+            (vec![("taster", "flur")], None, "names nothing"),
+            (vec![("taster", "vx_treppe")], None, "does not read itself"),
+        ] {
+            let e = apply_op(
+                &mut files.clone(),
+                &ctx,
+                &inst("vx_treppe", "Treppenlicht", &args, label),
+            )
+            .unwrap_err();
+            assert!(e.contains(why), "{why}: {e}");
+        }
+        let e = apply_op(
+            &mut files.clone(),
+            &ctx,
+            &inst("vx_treppe", "Bewegungslicht", &[("bewegung", &vi)], None),
+        )
+        .unwrap_err();
+        assert!(e.contains("lox keeps its blocks' types"), "{e}");
+        let e = apply_op(&mut files.clone(), &ctx, &inst("vx_x", "Nope", &[], None)).unwrap_err();
+        assert!(e.contains("no template"), "{e}");
+        // A name another one's blocks start with, or one starting with an instance's.
+        let e = apply_op(
+            &mut files.clone(),
+            &ctx,
+            &inst(
+                "vx_treppe_ausgang",
+                "Treppenlicht",
+                &[("taster", &vi)],
+                None,
+            ),
+        )
+        .unwrap_err();
+        assert!(e.contains("taken"), "{e}");
+        let taken: BTreeSet<String> = ["vx_q_licht".to_string()].into();
+        let ctx2 = ctx_of(&out2, &d, &lock, None, &taken);
+        let e = apply_op(
+            &mut files.clone(),
+            &ctx2,
+            &inst("vx_q", "Treppenlicht", &[("taster", &vi)], None),
+        )
+        .unwrap_err();
+        assert!(e.contains("starts so"), "{e}");
+        // Dropping: refused once deployed; else `removed` for each block.
+        let drop = Op::Instance {
+            slug: "vx_treppe".into(),
+            page: OG.into(),
+            value: None,
+        };
+        let ctx = ctx_of(&out2, &d, &lock, Some(&out2), &names);
+        let e = apply_op(&mut files.clone(), &ctx, &drop).unwrap_err();
+        assert!(e.contains("deployed"), "{e}");
+        let ctx = ctx_of(&out2, &d, &lock, Some(&d), &names);
+        let a = apply_op(&mut files, &ctx, &drop).unwrap();
+        let texts = files.render();
+        assert!(
+            !texts.contains_key(TEMPLATES),
+            "the copy goes with the last instance"
+        );
+        assert!(
+            texts
+                .values()
+                .any(|t| t.contains("removed vx_treppe_ausgang"))
+        );
+        files = Files::from_texts(&texts).unwrap();
+        assert!(
+            files
+                .pages
+                .values()
+                .any(|p| p.unstamped.contains("vx_treppe_ausgang"))
+        );
+        compile_files(&d, &files, &mut l).unwrap();
+        assert!(!l.objects.contains_key("vx_treppe_ausgang"));
+        // Made again before lox forgot it: the line is taken back.
+        let lock = lock_of(&l);
+        let _ = lock;
+        let mut again = files.clone();
+        apply_op(
+            &mut again,
+            &ctx,
+            &serde_json::from_value(a.previous).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            !again
+                .render()
+                .values()
+                .any(|t| t.contains("removed vx_treppe"))
+        );
+    }
+
+    #[test]
+    fn an_instance_of_a_module_template_reads_vislox_s_blocks() {
+        let d = doc("house.Loxone");
+        let names = BTreeSet::new();
+        let mut files = Files::default();
+        let lock = Lock::default();
+        let t = Module::parse_fragment(
+            "template Paar(label: string = \"P\", quelle: input, grenze: number = 28) -> (Q: g.Q)\n\tg = GreaterEqual(\"{label}\", In1: quelle, In2: grenze)\nend\n",
+        )
+        .unwrap();
+        let Item::Template(t) = t.items.into_iter().next().unwrap() else {
+            panic!()
+        };
+        let templates: BTreeMap<String, logic::TemplateDecl> = [(t.name.clone(), t)].into();
+        let mut ctx = ctx_of(&d, &d, &lock, None, &names);
+        ctx.templates = &templates;
+        apply_op(
+            &mut files,
+            &ctx,
+            &sig("vx_warm", Some(&format!("{}.AQ >= 3", slug(DIV))), None),
+        )
+        .unwrap();
+        apply_op(
+            &mut files,
+            &ctx,
+            &inst(
+                "vx_p",
+                "Paar",
+                &[("quelle", "vx_warm.Q and vx_warm.Q"), ("grenze", "30")],
+                Some("Paar 1"),
+            ),
+        )
+        .unwrap();
+        let texts = files.render();
+        assert!(
+            !texts.contains_key(TEMPLATES),
+            "the module's template is not copied"
+        );
+        let page = texts.values().find(|t| t.contains("vx_p =")).unwrap();
+        assert!(
+            page.contains("vx_p = Paar(\"Paar 1\", quelle: vx_warm.Q and vx_warm.Q, grenze: 30)"),
+            "{page}"
+        );
+        // What reads the signal: its instance; dropping it is refused.
+        let e = apply_op(&mut files.clone(), &ctx, &sig("vx_warm", None, None)).unwrap_err();
+        assert!(e.contains("the instance vx_p"), "{e}");
+        // A text parameter: the value given without quotes; a value: its kind.
+        let e = apply_op(
+            &mut files.clone(),
+            &ctx,
+            &inst("vx_p", "Paar", &[("grenze", "5min")], None),
+        )
+        .unwrap_err();
+        assert!(e.contains("number parameter"), "{e}");
     }
 
     // ── expressions and named signals (#82) ─────────────────────────────

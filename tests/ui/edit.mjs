@@ -105,6 +105,12 @@ const gateXml = (ty, u, title, y, ins) => `\t\t\t<C Type="${ty}" V="178" U="${u}
 \t\t\t\t<Co K="Q" U="${u.slice(0, 14)}0003-${u.slice(19)}"/>
 \t\t\t</C>
 `;
+// Template instances (#83): a page Vorlagen, where the module's own file calls its template Paar as `nord`: lox made
+// nord's one block, `nord_g` in the lock (NORD_G).
+const VORLAGEN = "90000000-0000-0000-ffff504f94000001", NORD_G = "90000001-0000-0000-ffff504f94000001";
+const vorlagenXml = `\t\t<C Type="Page" V="178" U="${VORLAGEN}" Title="Vorlagen" WF="16384">
+${gateXml("GreaterEqual", NORD_G, "Nord", 960, null)}\t\t</C>
+`;
 const ausdruckXml = `\t\t<C Type="Page" V="178" U="${AUSDRUCK}" Title="Ausdruck" WF="16384">
 ${gateXml("GreaterEqual", EXG, "teiler.AQ &gt;= 28", 960, null)}${gateXml("And", EXA, "licht.Q and teiler.AQ &gt;= 28", 2880, `${EXG.slice(0, 14)}0003-${EXG.slice(19)}`)}${gateXml("And", MARK, "Markise", 4800, `${EXA.slice(0, 14)}0003-${EXA.slice(19)}`)}${gateXml("And", PUMPE, "Pumpe", 6720, null)}\t\t</C>
 `;
@@ -221,7 +227,7 @@ const base0 = readFileSync(fixture, "utf8").replace('<Co K="Q" U="10000009-0000-
     "\t\t</C>\n" +
     `\t\t<C Type="Page" V="178" U="${MELDUNGEN}" Title="Meldungen" WF="16384">\n` +
     `\t\t\t<C Type="OutputRefLM" V="178" U="${WARN}" Title="Frostwarnung" Px="960" Py="960" Px2="2304" Py2="1656" Cl="0,0,0" Nio="2" Ref="${FROST}"><Co K="AI" U="40000031-0000-0001-ffff504f94000001"/><Co K="AQ" U="40000031-0000-0002-ffff504f94000001"/><LoggerMailer RefNotification="${FROST}" On="Frost im Garten" MinimumTime="43200000" NL="1"/></C>\n` +
-    "\t\t</C>\n" + zeitenXml + konstXml + ausdruckXml + "\t</C>\n</ControlList>");
+    "\t\t</C>\n" + zeitenXml + konstXml + ausdruckXml + vorlagenXml + "\t</C>\n</ControlList>");
 const base = base0.replace(`\t\t<C Type="Place" V="178" U="${KITCHEN}"`, `${flexXml}\t\t<C Type="Place" V="178" U="${KITCHEN}"`)
   .replace(`\t\t<C Type="Page" V="178" U="${MELDUNGEN}"`, `${beschXml}\t\t<C Type="Page" V="178" U="${MELDUNGEN}"`);
 assert.ok(base.includes(FLEX) && base.includes(OST), "the Touch Pure Flex is in the base");
@@ -236,10 +242,13 @@ writeFileSync(join(dir, "pages", "flur.loxl"), '# The module\'s own source.\npag
 writeFileSync(join(dir, "pages", "konst.loxl"), `let nachlauf = 30min\nextern k1 = Monoflop(uuid: "${K1}")\nk1.Time = nachlauf\n`);
 // The module's own expression (#82), on line 5.
 writeFileSync(join(dir, "pages", "ausdruck.loxl"), `extern markise = And(uuid: "${MARK}")\nextern licht = Or(uuid: "10000009-0000-0090-ffff504f94000001")\nextern teiler = Div(uuid: "${DIV}")\n\nmarkise.In2 <- licht.Q and teiler.AQ >= 28\n`);
+// The module's own template and its instance (#83): the template on line 2, the call on line 6.
+writeFileSync(join(dir, "pages", "vorlage.loxl"), 'page "Vorlagen"\ntemplate Paar(label: string = "P", quelle: input, grenze: number = 28) -> (Q: g.Q)\n\tg = GreaterEqual("{label}", In1: quelle, In2: grenze)\nend\n\nnord = Paar("Nord", quelle: teiler.AQ)\n');
 const FLUR_AT = { px: 7104, py: 2880, px2: 8448, py2: 3576 };
 const lockObjects = { flur: { uuid: FLUR, type: "And", page_uuid: OG, layout: FLUR_AT } };
 for (let i = 0; i < LAGER_N; i++) lockObjects[`lager_${i}`] = { uuid: lagerUuid(i), type: "And", page_uuid: LAGER, layout: lagerAt(i) };
 lockObjects.markise_i2__ge1 = { uuid: EXG, type: "GreaterEqual", page_uuid: AUSDRUCK, layout: { px: 960, py: 960, px2: 2304, py2: 1656 }, expr_owned: true };
+lockObjects.nord_g = { uuid: NORD_G, type: "GreaterEqual", page_uuid: VORLAGEN, layout: { px: 960, py: 960, px2: 2304, py2: 1656 } };
 lockObjects.markise_i2__and1 = { uuid: EXA, type: "And", page_uuid: AUSDRUCK, layout: { px: 960, py: 2880, px2: 2304, py2: 3576 }, expr_owned: true };
 writeFileSync(join(dir, "logic.lock.json"), JSON.stringify({ objects: lockObjects }));
 // Compiled after the module's files: nothing is uncompiled.
@@ -518,12 +527,45 @@ const exprBlock = (slug, text, pageAt, owned, title) => {
   out.splice(pageAt + 1, 0, \`\\t\\t\\t<C Type="\${ty}" V="178" U="\${uuid}" Title="\${xml(label)}" Px="96" Py="96" Px2="1440" Py2="792" Nio="3">\`, co("I1", 1), co("I2", 2), co(q, 3), "\\t\\t\\t</C>");
   return \`\${uuid.slice(0, 9)}0000-0030-ffff504f94000001\`;
 };
+// Templates (#83): \`template Name(params)\` … \`end\` of the module's files and vislox's templates.loxl, each body
+// block \`name = Type("title", …)\` (a title may interpolate a string parameter, \`{label}\`).
+const templates = {};
+for (const path of [...own().map(([p]) => p), "pages/vislox/templates.loxl"]) {
+  if (!fs.existsSync(path)) continue;
+  let cur = null;
+  for (const line of fs.readFileSync(path, "utf8").split("\\n")) {
+    const h = line.match(/^template (\\w+)\\((.*?)\\)(?: ->.*)?$/);
+    if (h) { cur = templates[h[1]] = { params: {}, body: [] }; for (const [, k, v] of h[2].matchAll(/(\\w+): \\w+(?: = ("(?:[^"\\\\]|\\\\.)*"|[^,]+))?/g)) cur.params[k] = v; continue; }
+    if (line.trim() === "end") { cur = null; continue; }
+    const b = cur && line.match(/^\\s+(\\w+) = (\\w+)\\((?:"((?:[^"\\\\]|\\\\.)*)")?/);
+    if (b) cur.body.push({ name: b[1], ty: b[2], title: b[3] });
+  }
+}
+// An instance of vislox's: each body block as \`<instance>_<name>\`, its UUID kept by slug, on the call's page.
+const instance = (slug, tname, rest, pageAt) => {
+  const t = templates[tname];
+  if (!t) { console.error(\`error: compile error: \\\`\${slug} = \${tname}(…)\\\` instantiates unknown template \\\`\${tname}\\\`\`); process.exit(1); }
+  const args = { ...t.params };
+  const lab = rest.match(/^"((?:[^"\\\\]|\\\\.)*)"/);
+  if (lab) args.label = \`"\${lab[1]}"\`;
+  for (const [, k, v] of rest.matchAll(/(\\w+): ("(?:[^"\\\\]|\\\\.)*"|[^,]+)/g)) args[k] = v.trim();
+  for (const b of t.body) {
+    const s = \`\${slug}_\${b.name}\`;
+    const uuid = lock.objects[s]?.uuid || \`cccc\${String(++n).padStart(4, "0")}-0000-0000-ffff504f94000001\`;
+    const page_uuid = out[pageAt].match(/U="([^"]+)"/)[1];
+    objects[s] = { uuid, type: b.ty, page_uuid, layout: lock.objects[s]?.layout || { px: 2880, py: 2880, px2: 4224, py2: 3576 } };
+    const title = (b.title ?? s).replace(/\\{(\\w+)\\}/g, (_, k) => (args[k] ? JSON.parse(args[k]) : ""));
+    out.splice(pageAt + 1, 0, \`\\t\\t\\t<C Type="\${b.ty}" V="178" U="\${uuid}" Title="\${xml(title)}" Px="96" Py="96" Px2="1440" Py2="792" Nio="2"><Co K="Q" U="\${uuid.slice(0, 9)}0000-0030-ffff504f94000001"/></C>\`);
+  }
+};
 for (const f of fs.existsSync("pages/vislox") ? fs.readdirSync("pages/vislox") : []) {
-  if (f === "edits.loxl" || !f.endsWith(".loxl")) continue;
-  let pageAt = -1;
+  if (f === "edits.loxl" || f === "templates.loxl" || !f.endsWith(".loxl")) continue;
+  let pageAt = -1, instancing = false;
   for (const line of fs.readFileSync("pages/vislox/" + f, "utf8").split("\\n")) {
     let m;
     if ((m = line.match(/^page "(.*)"$/))) { pageAt = out.findIndex((l) => l.includes('Type="Page"') && l.includes(\`Title="\${m[1]}"\`)); continue; }
+    if (line.startsWith("#")) { instancing = line.startsWith("# Template instances"); continue; }
+    if (instancing && (m = line.match(/^(vx_\\w+) = (\\w+)\\((.*)\\)$/))) { instance(m[1], m[2], m[3], pageAt); continue; }
     // A named signal (#82): its top block, labelled with its .title or its expression.
     if ((m = line.match(/^(vx_\\w+) = (.+)$/)) && !/^\\w+\\(/.test(m[2])) {
       const t = fs.readFileSync("pages/vislox/" + f, "utf8").match(new RegExp(\`^\${m[1]}\\\\.title = "((?:[^"\\\\\\\\]|\\\\\\\\.)*)"$\`, "m"));
@@ -2203,6 +2245,8 @@ try {
     assert.match(pf, /^vx_outputreflm_1 = OutputRefLM\(mirrors: vx_40000022_0000_0000_ffff504f94000001, On: "Es regnet", MinimumTime: 30min\)$/m);
     assert.match(file(), /^extern vx_40000022_0000_0000_ffff504f94000001 = Notification\(uuid: "40000022-0000-0000-ffff504f94000001"\)$/m);
     const added = await page.evaluate(() => S.sel);
+    // /api/edits names it as a block of vislox's once it has loaded after the compile.
+    await page.waitForFunction((u) => editsBlock(u), added, { timeout: 10000 });
     // A block added here with nothing caps() offers (no `o.edit`) still gets its form, never a TypeError.
     assert.deepEqual(await page.evaluate((u) => editFields({ ...S.view.objects[u], ty: "And", edit: null }).map((f) => f[0]), added), ["title", "s:On", "s:Off", "s:MinimumTime"]);
     await waitText(msg, /Notification\s*Regen[\s\S]*On\s*Es regnet[\s\S]*Minimum time\s*30min/);
@@ -2694,6 +2738,81 @@ try {
     await undoKey(false, (i) => S.edits?.expressions?.find((e) => e.id === i)?.top_type === "GreaterEqual", id);
     await undoKey(false, (i) => !S.edits?.expressions?.some((e) => e.id === i), id);
     assert.ok(!claims().includes(pumpe), claims());
+  });
+  await step("template instances are framed, named in Properties, added from lox's library, edited and removed (#83)", async () => {
+    await settled();
+    const tp = '#props [data-body="Template"]';
+    const send = async (act, what) => {
+      const n = edits.length;
+      await act();
+      await until(() => edits.length > n && statuses[n] !== undefined, what);
+      assert.equal(statuses[n], 200, what);
+      await settled();
+      return edits[n].ops;
+    };
+    const vfile = (f) => { const p = join(dir, "pages", "vislox", f); return existsSync(p) ? readFileSync(p, "utf8") : ""; };
+    // The module's own instance: its block framed, the frame headed by the call.
+    await page.evaluate((p) => gotoPage(p), VORLAGEN);
+    await page.waitForSelector('.tpl-head[data-inst="nord"]', { timeout: 10000 });
+    assert.equal(await page.getAttribute('.tpl-head[data-inst="nord"]', "aria-label"), 'nord: Paar "Nord"');
+    assert.match(await page.textContent('.tpl-head[data-inst="nord"]'), /quelle: teiler\.AQ\s+→ Q/);
+    // Fitted to its blocks, the page may draw the header under the toolbar: clicked where it is.
+    await page.dispatchEvent('.tpl-head[data-inst="nord"] .tpl-t', "click");
+    await page.waitForFunction((u) => S.sel === u, NORD_G);
+    await waitText(tp, /Block\s*nord\.g/);
+    await waitText(tp, /Template\s*Paar\s*pages\/vorlage\.loxl:2/);
+    await waitText(tp, /quelle\s*teiler\.AQ/);
+    await waitText(tp, /pages\/vorlage\.loxl:6/);
+    await waitText(tp, /Written in the module's own file: change it there/);
+    assert.equal(await page.$(`${tp} [data-tp="save"]`), null);
+    // Add block offers lox's library's templates: an instance of Treppenlicht, named for it.
+    const vi = `vx_${"10000001-0000-0010-ffff504f94000001".replace(/-/g, "_")}`;
+    await page.click("#btn-add-block");
+    await page.waitForSelector("#ab-q");
+    await page.fill("#ab-q", "Treppenlicht");
+    assert.match(await page.textContent("#ab-list [aria-selected=true]"), /Treppenlicht[\s\S]*Template/);
+    await page.press("#ab-q", "Enter");
+    await page.waitForSelector('#ab-body [data-ab-field="slug"]');
+    assert.equal(await page.inputValue('#ab-body [data-ab-field="slug"]'), "vx_treppenlicht_1");
+    // Its object parameter is required.
+    await page.click('#ab-body [data-ab="add"]');
+    await page.waitForSelector('#ab-body [data-ab-field="a:taster"][aria-invalid="true"]');
+    await page.fill('#ab-body [data-ab-field="a:taster"]', vi);
+    await page.fill('#ab-body [data-ab-field="a:titel"]', "Flur");
+    let ops = await send(() => page.press('#ab-body [data-ab-field="a:titel"]', "Enter"), "add an instance");
+    assert.deepEqual(ops, [{ op: "instance", slug: "vx_treppenlicht_1", page: VORLAGEN, value: { template: "Treppenlicht", args: { taster: vi, titel: "Flur" } } }]);
+    assert.match(vfile("vorlagen.loxl"), /# Template instances[^\n]*\nvx_treppenlicht_1 = Treppenlicht\(taster: vx_10000001_0000_0010_ffff504f94000001, titel: "Flur"\)\n/);
+    assert.match(vfile("templates.loxl"), /^template Treppenlicht\(/m);
+    // Its block is selected, framed, and named in Properties; the instance is edited there.
+    await page.waitForFunction(() => { const x = S.edits?.templates?.instances?.find((i) => i.path === "vx_treppenlicht_1"); return x?.ours && x.blocks.length && ciEq(S.sel, x.blocks[0].uuid); }, null, { timeout: 10000 });
+    await page.waitForSelector('.tpl-head[data-inst="vx_treppenlicht_1"]');
+    await waitText(tp, /Block\s*vx_treppenlicht_1\.ausgang/);
+    await waitText(tp, /lox's library/);
+    await waitText(tp, /Not deployed: vx_treppenlicht_1 is new/);
+    await page.fill(`${tp} [data-tp-field="e:a:dauer"]`, "5min");
+    ops = await send(() => page.press(`${tp} [data-tp-field="e:a:dauer"]`, "Enter"), "change an argument");
+    assert.deepEqual(ops, [{ op: "instance", slug: "vx_treppenlicht_1", page: VORLAGEN, value: { template: "Treppenlicht", args: { taster: vi, dauer: "5min", titel: "Flur" } } }]);
+    assert.match(vfile("vorlagen.loxl"), /vx_treppenlicht_1 = Treppenlicht\(taster: \w+, dauer: 5min, titel: "Flur"\)/);
+    // A value of the wrong kind: lox's words, nothing changed.
+    await page.waitForFunction(() => document.querySelector('#props [data-tp-field="e:a:dauer"]'));
+    await page.fill(`${tp} [data-tp-field="e:a:dauer"]`, "5");
+    await page.press(`${tp} [data-tp-field="e:a:dauer"]`, "Enter");
+    await waitText(tp, /dauer is a duration parameter/);
+    assert.match(vfile("vorlagen.loxl"), /dauer: 5min/);
+    // The Changes list puts its changes under the instance.
+    await waitText("#changes", /vx_treppenlicht_1: Treppenlicht \(new\)/);
+    // Not deployed: it can be removed; undone, it is back.
+    await page.waitForFunction(() => document.querySelector('#props [data-tp="drop"]'));
+    ops = await send(() => page.click(`${tp} [data-tp="drop"]`), "remove the instance");
+    assert.deepEqual(ops, [{ op: "instance", slug: "vx_treppenlicht_1", page: VORLAGEN, value: null }]);
+    await page.waitForFunction(() => S.edits && !S.edits.templates.instances.some((i) => i.path === "vx_treppenlicht_1"), null, { timeout: 10000 });
+    assert.doesNotMatch(vfile("vorlagen.loxl"), /vx_treppenlicht_1 =/);
+    assert.equal(vfile("templates.loxl"), "", "the library's copy goes with its last instance");
+    await undoKey(false, () => S.edits?.templates?.instances?.some((i) => i.path === "vx_treppenlicht_1"));
+    assert.match(vfile("vorlagen.loxl"), /dauer: 5min/);
+    await undoKey(false, () => S.edits?.templates?.instances?.some((i) => i.path === "vx_treppenlicht_1" && !i.args.some(([k]) => k === "dauer")));
+    await undoKey(false, () => S.edits && !S.edits.templates.instances.some((i) => i.path === "vx_treppenlicht_1"));
+    assert.equal(vfile("templates.loxl"), "");
   });
   await step("nothing was deployed: lox only compiled, checked, linted and tested", async () => {
     const ran = readFileSync(calls, "utf8").trim().split("\n");

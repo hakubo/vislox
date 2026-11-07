@@ -507,6 +507,7 @@ mod tests {
                 adoptions: &Default::default(),
                 page_adoptions: &Default::default(),
                 claimed: $claimed,
+                templates: &Default::default(),
             }
         };
     }

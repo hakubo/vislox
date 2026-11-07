@@ -132,7 +132,11 @@ impl ExprSrc {
 /// The externs an expression's operands need (key in the claims, type),
 /// each checked: a block of vislox's files by its slug, one Loxone Config
 /// drew as `vx_<uuid>` (in the base, not managed), or a constant.
-fn operands(files: &Files, ctx: &Ctx, names: &[String]) -> Result<Vec<(String, String)>, String> {
+pub(crate) fn operands(
+    files: &Files,
+    ctx: &Ctx,
+    names: &[String],
+) -> Result<Vec<(String, String)>, String> {
     let mut out = Vec::new();
     for n in names {
         if files.block(n).is_some() || files.signal(n).is_some() {
@@ -226,7 +230,7 @@ fn unfeed(files: &mut Files, slug_: &str, uuid: &str, port: &str) {
         .retain(|w| !(w.to.0 == slug_ && w.to.1 == port));
 }
 
-fn add_externs(files: &mut Files, externs: Vec<(String, String)>) {
+pub(crate) fn add_externs(files: &mut Files, externs: Vec<(String, String)>) {
     for (key, ty) in externs {
         let c = files.claims.0.entry(key).or_default();
         if c.ty.is_empty() {
@@ -469,6 +473,14 @@ fn reads(files: &Files, s: &str) -> Option<String> {
 /// block's declaration, a signal), which go with it.
 pub(crate) fn read_by_expression(files: &Files, s: &str) -> Option<String> {
     let c8 = &files.claims.8;
+    // An argument of a template instance (#83).
+    for p in files.pages.values() {
+        for x in p.instances.iter().filter(|x| x.slug != s) {
+            if x.names.iter().any(|n| n == s) {
+                return Some(format!("the instance {}", x.slug));
+            }
+        }
+    }
     for (u, c) in &files.claims.0 {
         for (k, e) in &c.exprs {
             if e.reads(c8).any(|n| n == s) {
