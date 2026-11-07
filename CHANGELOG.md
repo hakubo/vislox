@@ -29,7 +29,8 @@ published under the same version (see [docker/README.md](docker/README.md)).
   naming the edit in its tooltip, and a list of recent edits. An undo is sent as an edit of its own (the reply of
   every edit now carries `undo`, the ops that undo it), so it is compiled and checked like any edit and never
   deploys. The history is cleared, saying why, when the pending config changes outside the page (another edit, a
-  compile, Discard, Apply, Sync); it is kept in the browser for the config it was made on, so it survives a reload.
+  compile, Discard, Apply, Sync). It is the tab's own, kept for the config it was made on, so it survives a reload.
+  A relayout is undone by one new op, `place`, however many blocks the page has.
 - Fixed: Discard failed when the last commit had no lockfile (the first compile writes one), or one was staged
   but not committed. Discard now reads the last commit, never deletes a lock vislox did not write (one not in git
   goes back to how it was before vislox's first edit), and puts everything back when a step fails.

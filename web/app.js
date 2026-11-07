@@ -163,7 +163,6 @@ async function loadHistory(fromEvent) {
   undoSync();
   renderActions();
   editsChanged();
-  renderUndo();
   renderLog();
   if (fromEvent) {
     setStatus("updated " + new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }), "live flash");
@@ -2436,6 +2435,7 @@ function editState(o) {
   if (!r) return { why: "The config on disk is not in the History yet." };
   if (S.rev !== r.id) return { why: `Edits are made on the newest config (${r.kind === "pending" ? "Pending" : "deployed"}).`, newest: r };
   if (a.running) return { why: `${a.running} is running.` };
+  if (UNDO.busy) return { why: "Undo or redo is compiling." };
   return { ok: true, rev: r };
 }
 const EDIT_ATTR = { title: "Name", room: "Room", category: "Category" };
@@ -2595,17 +2595,21 @@ function editGoNewest() { S.follow = true; $("chk-follow").checked = true; editS
 // Every edit's reply carries `undo`: the ops that undo it, built from each op's `previous`
 // (docs/editing.md). Undo sends them as an edit of its own, so it is checked and compiled like any
 // other (and refused like any other: never deployed, never over uncompiled module changes). Its reply's
-// `undo` is the redo. The stack belongs to the pending config it was built on (`blob`): when that
-// changes outside this tab (another tab's edit, a compile, Discard, Apply, Sync, a Pull), the stack no
-// longer describes it and is cleared, saying why. It is kept in localStorage under that blob, so a reload
-// or another tab showing the very same pending config picks it up.
+// `undo` is the redo. The stack is this tab's, and belongs to the pending config it was built on
+// (`blob`): when that changes outside this tab (another tab's edit, a compile, Discard, Apply, Sync, a
+// Pull), the stack no longer describes it and is cleared, saying why. It is kept in sessionStorage
+// under that blob, so a reload of this tab picks it up, and only on that very config.
 const UNDO_MAX = 50; // edits kept
 const UNDO_LAG = 20000; // ms the History may take to show this tab's own compile
+const UNDO_QUEUE = 3; // undo and redo steps waiting their turn: a held key does not pile up more
 const UNDO_KEY = "vislox.undo.";
 // done: undoable edits, oldest first; undone: redoable ones, the next redo last. `blob`, `lastAt` and
 // `deployed`: the pending config, the server's last Apply/Sync/Discard and the deployed revision the
 // stack was built on; `prev`/`since`: the blob of the request this tab sent last, and when it ended.
-const UNDO = { blob: null, lastAt: null, deployed: null, done: [], undone: [], busy: 0, prev: null, since: 0, note: "" };
+// `inflight`: requests on the way; `busy`: undo and redo steps queued or running (`chain`), each until
+// the page shows what it compiled; `sending`: the edit being sent.
+const UNDO = { blob: null, lastAt: null, deployed: null, done: [], undone: [], prev: null, since: 0, note: "",
+  inflight: 0, busy: 0, chain: Promise.resolve(), sending: null };
 const IS_MAC = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent);
 const UNDO_KEYS = IS_MAC ? ["⌘Z", "⇧⌘Z"] : ["Ctrl+Z", "Shift+Ctrl+Z"];
 /** A short name for an edit, from its ops, as the page names things now (before the edit shows). */
@@ -2639,44 +2643,49 @@ function undoNow() {
   return r && { blob: r.blob, lastAt: S.hist?.actions?.last?.at ?? null, deployed: deployedRev()?.id ?? null };
 }
 function undoLoad(blob) {
-  try { return JSON.parse(localStorage.getItem(UNDO_KEY + blob) || "null"); } catch { return null; }
+  try { return JSON.parse(sessionStorage.getItem(UNDO_KEY + blob) || "null"); } catch { return null; }
 }
 /** Keep the stack under its blob, and drop the ones kept for other blobs: they describe no config any more. */
 function undoSave() {
   try {
-    for (let i = localStorage.length - 1; i >= 0; i--) {
-      const k = localStorage.key(i);
-      if (k?.startsWith(UNDO_KEY) && k !== UNDO_KEY + UNDO.blob) localStorage.removeItem(k);
+    for (let i = sessionStorage.length - 1; i >= 0; i--) {
+      const k = sessionStorage.key(i);
+      if (k?.startsWith(UNDO_KEY) && k !== UNDO_KEY + UNDO.blob) sessionStorage.removeItem(k);
     }
     if (!UNDO.blob) return;
     if (UNDO.done.length || UNDO.undone.length) {
-      localStorage.setItem(UNDO_KEY + UNDO.blob, JSON.stringify({ lastAt: UNDO.lastAt, deployed: UNDO.deployed, done: UNDO.done, undone: UNDO.undone }));
-    } else localStorage.removeItem(UNDO_KEY + UNDO.blob);
-  } catch { /* private mode: the stack lives as long as the tab */ }
+      sessionStorage.setItem(UNDO_KEY + UNDO.blob, JSON.stringify({ lastAt: UNDO.lastAt, deployed: UNDO.deployed, done: UNDO.done, undone: UNDO.undone }));
+    } else sessionStorage.removeItem(UNDO_KEY + UNDO.blob);
+  } catch { /* storage off: the stack lives as long as the page */ }
 }
 /** Whether a stack built on `was` still describes the config `now`. The server's last outcome is unknown
  *  (null) after it restarted: then the blob and the deployed revision decide. */
 const undoSame = (was, now) => was.blob === now.blob && was.deployed === now.deployed && (now.lastAt == null || was.lastAt === now.lastAt);
+/** Empty the stack; `note` says why, when there was something to lose (or `always`). */
+function undoClear(note, always) {
+  if (always || UNDO.done.length || UNDO.undone.length) UNDO.note = note;
+  UNDO.done = []; UNDO.undone = [];
+}
 /** Check the stack against what the server says, and clear it (saying why) when the config changed
  *  outside this tab. Called on every History update. */
 function undoSync() {
   const now = undoNow();
-  if (!now || UNDO.busy) return;
+  if (!now || UNDO.inflight) return;
   if (UNDO.blob && undoSame(UNDO, now)) return;
   // This tab's own compile, which the History shows a moment later.
   if (UNDO.blob && now.blob === UNDO.prev && UNDO.deployed === now.deployed && (now.lastAt == null || UNDO.lastAt === now.lastAt) && Date.now() - UNDO.since < UNDO_LAG) return;
-  const had = UNDO.done.length + UNDO.undone.length, first = !UNDO.blob;
-  const why = first ? ""
-    : now.lastAt != null && now.lastAt !== UNDO.lastAt ? ({ apply: "Apply deployed", discard: "Discard dropped", sync: "Sync replaced" }[S.hist?.actions?.last?.kind] || "an Apply, Sync or Discard changed") + " the pending config"
-    : now.deployed !== UNDO.deployed ? "the deployed config changed (an Apply, Sync or Pull)"
-    : "the pending config changed outside this tab (an edit in another tab, or a compile)";
-  // Kept for this very config (a reload, or another tab's edits): picked up.
-  const kept = undoLoad(now.blob);
+  const first = !UNDO.blob;
+  // Kept for this very config by this tab (a reload): picked up.
+  const kept = first && undoLoad(now.blob);
   if (kept && undoSame({ ...kept, blob: now.blob }, now) && (kept.done?.length || kept.undone?.length)) {
-    Object.assign(UNDO, now, { done: kept.done || [], undone: kept.undone || [], prev: null, note: first ? "" : `Picked up the undo history kept for this config: ${why}.` });
+    Object.assign(UNDO, now, { done: kept.done || [], undone: kept.undone || [], prev: null, note: "" });
     return;
   }
-  Object.assign(UNDO, now, { done: [], undone: [], prev: null, note: had ? `Undo history cleared: ${why}.` : "" });
+  const why = now.lastAt != null && now.lastAt !== UNDO.lastAt ? ({ apply: "Apply deployed", discard: "Discard dropped", sync: "Sync replaced" }[S.hist?.actions?.last?.kind] || "an Apply, Sync or Discard changed") + " the pending config"
+    : now.deployed !== UNDO.deployed ? "the deployed config changed (an Apply, Sync or Pull)"
+    : "the pending config changed outside this tab (an edit in another tab, or a compile)";
+  if (!first) undoClear(`Undo history cleared: ${why}.`);
+  Object.assign(UNDO, now, { prev: null });
   undoSave();
 }
 /** lox mints new UUIDs for a block added again (an undo of Remove, a redo of Add): the reply names the
@@ -2690,85 +2699,109 @@ function undoRemap(added) {
     if (S.sel === a.restores) S.sel = a.uuid;
   }
 }
-/** The stack's config is now the reply's. */
-function undoAt(res, sent) {
-  Object.assign(UNDO, undoNow() || {}, { blob: res.blob, prev: sent, since: Date.now() });
-}
-/** POST /api/edit, the one way an edit is sent: the edit is kept for undo (`label`: how the list names
- *  it; by default made from the ops). Throws as act() does. */
-async function editAct(base, ops, label) {
-  undoSync();
-  const lbl = label || undoLabel(ops);
-  UNDO.busy++; renderUndo();
+/** Send `ops` against `base`, and keep what the reply says: a new edit named `label`, or the step that
+ *  undoes (`redo` false) or redoes `entry`. The one way an edit, an undo or a redo is sent. Throws as
+ *  act() does, and then keeps nothing. */
+async function undoSend(base, ops, { label, entry, redo } = {}) {
+  UNDO.inflight++;
+  renderAddHud();
   try {
     const res = await act("/api/edit", { base, ops });
     // Made on another config than the stack's: the stack no longer describes it.
-    if (UNDO.blob !== base) Object.assign(UNDO, { done: [], undone: [], note: UNDO.done.length + UNDO.undone.length ? "Undo history cleared: the edit was made on a config the history was not built on." : UNDO.note });
-    if (!res.unchanged) {
-      undoRemap(res.added);
-      if (Array.isArray(res.undo)) {
-        UNDO.done.push({ label: lbl, undo: res.undo, redo: ops, at: Date.now() });
-        if (UNDO.done.length > UNDO_MAX) UNDO.done.shift();
-        UNDO.note = "";
-      } else {
-        UNDO.done = [];
-        UNDO.note = `“${lbl}” cannot be undone (lox named no UUID for a block it added): the undo history before it was cleared.`;
+    if (UNDO.blob !== base) undoClear("Undo history cleared: the edit was made on a config the history was not built on.");
+    const name = entry ? entry.label : label;
+    if (res.unchanged) {
+      // Nothing to compile: the config already is what the step leads to. The step is done, its ops kept.
+      if (entry && (redo ? UNDO.undone : UNDO.done).at(-1) === entry) {
+        (redo ? UNDO.undone : UNDO.done).pop();
+        (redo ? UNDO.done : UNDO.undone).push(entry);
       }
-      UNDO.undone = [];
+    } else {
+      undoRemap(res.added);
+      const inv = Array.isArray(res.undo) && res.undo.length ? res.undo : null;
+      if (!inv) {
+        // What came before no longer leads here: none of it can be undone safely.
+        undoClear(`“${name}” cannot be ${entry && !redo ? "redone" : "undone"}: ${res.undo_error || "the server sent no way back"}. The undo history was cleared.`, true);
+      } else if (!entry) {
+        UNDO.done.push({ label: name, undo: inv, redo: ops, at: Date.now() });
+        if (UNDO.done.length > UNDO_MAX) UNDO.done.shift();
+        UNDO.undone = [];
+        UNDO.note = "";
+      } else if (redo) {
+        UNDO.undone.pop(); entry.undo = inv; UNDO.done.push(entry);
+      } else {
+        UNDO.done.pop(); entry.redo = inv; UNDO.undone.push(entry);
+      }
     }
-    undoAt(res, base);
+    Object.assign(UNDO, undoNow() || {}, { blob: res.blob, prev: base });
     undoSave();
     return res;
   } finally {
-    UNDO.busy--;
+    UNDO.inflight--;
     UNDO.since = Date.now();
-    renderUndo();
+    renderAddHud();
   }
 }
-/** Why undo or redo cannot run now, or null. */
-function undoWhy() {
+/** POST /api/edit for an edit of the page: kept for undo (`label`: how the list names it; by default
+ *  made from the ops). Throws as act() does. */
+async function editAct(base, ops, label) {
+  undoSync();
+  const p = undoSend(base, ops, { label: label || undoLabel(ops) });
+  UNDO.sending = p;
+  try { return await p; } finally { if (UNDO.sending === p) UNDO.sending = null; }
+}
+/** Why undo or redo cannot run now, or null. `queue`: for a step that waits its turn behind the undo
+ *  and redo steps and the edit being sent. Edits are made on the newest config, shown: the same rule as
+ *  every other edit. */
+function undoWhy(queue) {
   const a = S.hist?.actions;
   if (!a?.shown) return "Editing is off.";
   if (!a.edit?.available) return `Editing is off: ${a.edit?.reason || "unknown"}.`;
-  if (!editRev()) return "The config on disk is not in the History yet.";
+  const r = editRev();
+  if (!r) return "The config on disk is not in the History yet.";
+  if (S.rev !== r.id) return `Undo and redo change the newest config (${r.kind === "pending" ? "Pending" : "deployed"}): show it first.`;
   if (a.running) return `${a.running} is running.`;
-  if (UNDO.busy || S.mvBusy || S.wrBusy || AB.busy || S.edit.busy || MV) return "An edit is compiling.";
+  if (queue) return null;
+  if (UNDO.busy || UNDO.inflight || S.mvBusy || S.wrBusy || AB.busy || S.edit.busy || MV) return "An edit is compiling.";
   return null;
 }
-/** Undo the last edit, or (`redo`) redo the last one undone: its ops are sent as a new edit. */
-async function undoStep(redo) {
-  undoSync();
-  const from = redo ? UNDO.undone : UNDO.done;
-  const e = from[from.length - 1];
-  if (!e) return;
-  const why = undoWhy();
+/** Undo the last edit, or (`redo`) redo the last one undone. A step waits its turn behind the steps
+ *  before it and the edit being sent, so a quick Ctrl+Z after a save undoes that save. */
+function undoStep(redo) {
+  const why = undoWhy(true);
   if (why) { deployMsg(`Cannot ${redo ? "redo" : "undo"} now: ${why}`, true); return; }
-  const base = editRev().blob, word = redo ? "Redo" : "Undo";
-  UNDO.busy++; renderUndo(); renderAddHud();
+  if (UNDO.busy >= UNDO_QUEUE) return;
+  UNDO.busy++;
+  renderAddHud();
+  // Done: the page drew blocks as not movable while it ran.
+  UNDO.chain = UNDO.chain.then(() => undoRun(redo)).catch(() => {}).finally(() => { UNDO.busy--; renderAddHud(); if (!UNDO.busy && S.view) renderPage(); });
+}
+/** Resolves once `ok()` holds, or after `ms`. */
+async function until(ok, ms) {
+  for (const end = Date.now() + ms; !ok() && Date.now() < end;) await new Promise((r) => setTimeout(r, 50));
+}
+async function undoRun(redo) {
+  const word = redo ? "Redo" : "Undo";
+  // The edit before it first: sent, compiled, and shown.
+  if (UNDO.sending) await UNDO.sending.catch(() => {});
+  await until(() => !S.mvBusy && !S.wrBusy && !AB.busy && !S.edit.busy && !MV, 10000);
+  if (UNDO.blob && editRev()?.blob !== UNDO.blob) await editShowNewest(UNDO.blob).catch(() => {});
+  undoSync();
+  const e = (redo ? UNDO.undone : UNDO.done).at(-1);
+  if (!e) return;
+  const why = undoWhy(true) || (editRev()?.blob !== UNDO.blob ? "the History does not show the last edit yet" : null);
+  if (why) { deployMsg(`Cannot ${word.toLowerCase()} now: ${why}`, true); return; }
   deployMsg(`${word}: ${e.label}… (compiling; nothing is deployed)`);
   let res;
   try {
-    res = await act("/api/edit", { base, ops: redo ? e.redo : e.undo });
+    // Against the stack's own config, which the History shows (checked above).
+    res = await undoSend(UNDO.blob, redo ? e.redo : e.undo, { entry: e, redo });
   } catch (err) {
-    UNDO.busy--; UNDO.since = Date.now();
     deployMsg(`${word} of “${e.label}” refused: ${err.message}`, true);
-    renderUndo(); renderAddHud();
     return;
   }
-  // Undone: kept for redo, the reply's `undo` being the redo (and the other way round).
-  from.pop();
-  undoRemap(res.added);
-  if (Array.isArray(res.undo)) {
-    if (redo) { e.undo = res.undo; UNDO.done.push(e); } else { e.redo = res.undo; UNDO.undone.push(e); }
-  } else {
-    UNDO.undone = [];
-    UNDO.note = `“${e.label}” cannot be ${redo ? "undone" : "redone"} again (lox named no UUID for a block it added).`;
-  }
-  undoAt(res, base);
-  undoSave();
-  UNDO.busy--; UNDO.since = Date.now();
-  renderUndo(); renderAddHud();
-  deployMsg(`${redo ? "Redone" : "Undone"}: ${e.label}. Compiled: pending, not deployed. Review it, then Apply or Discard.`);
+  const cleared = !UNDO.done.length && !UNDO.undone.length && UNDO.note;
+  deployMsg(cleared ? UNDO.note : `${redo ? "Redone" : "Undone"}: ${e.label}. ${res.unchanged ? "Nothing changed: the config already was that way." : "Compiled: pending, not deployed. Review it, then Apply or Discard."}`, false, !!cleared);
   try {
     await editShowNewest(res.blob);
     if (S.sel && !S.view?.objects[S.sel]) select(null, { noReveal: true });
@@ -2780,7 +2813,7 @@ async function undoStep(redo) {
 function renderUndo() {
   const u = $("btn-undo"), r = $("btn-redo"), l = $("btn-undo-list");
   if (!u) return;
-  const why = undoWhy(), last = UNDO.done[UNDO.done.length - 1], next = UNDO.undone[UNDO.undone.length - 1];
+  const why = undoWhy(), last = UNDO.done.at(-1), next = UNDO.undone.at(-1);
   u.disabled = !last || !!why;
   r.disabled = !next || !!why;
   u.title = last ? `Undo: ${last.label} (${UNDO_KEYS[0]})${why ? `\n${why}` : ""}` : `Nothing to undo${UNDO.note ? `\n${UNDO.note}` : ""}`;
@@ -2828,7 +2861,7 @@ function editsMoved(uuid) { return (S.edits?.moves || []).filter((m) => (!uuid |
 /** Whether the block `uuid` can be moved now: `{ rev }`, else null. */
 function moveState(uuid) {
   const a = S.hist?.actions;
-  if (!a?.shown || !a.edit?.available || a.running || MD.open || S.mvBusy) return null;
+  if (!a?.shown || !a.edit?.available || a.running || MD.open || S.mvBusy || UNDO.busy) return null;
   if (!S.edits?.movable?.includes(uuid)) return null;
   const r = editRev();
   return r && S.rev === r.id ? { rev: r } : null;
@@ -3283,6 +3316,7 @@ function addState() {
   if (S.rev !== r.id) return { why: `Blocks are added on the newest config (${r.kind === "pending" ? "Pending" : "deployed"}).` };
   if (pg.status === "removed") return { why: "This page is not in the config any more." };
   if (a.running) return { why: `${a.running} is running.` };
+  if (UNDO.busy) return { why: "Undo or redo is compiling." };
   return { ok: true, rev: r, page: pg };
 }
 function renderAddHud() {

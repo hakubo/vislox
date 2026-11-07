@@ -68,6 +68,19 @@ struct Compiled {
     out: String,
 }
 
+/// The ops that undo an edit (#62), sent back as an edit of its own, into
+/// the reply as `undo`; or, when they cannot be built, `undo: null` and why
+/// (`undo_error`). The edit itself stands either way.
+fn undo_into(reply: &mut Value, undo: Result<Vec<edit::Op>, String>) {
+    match undo {
+        Ok(ops) => reply["undo"] = json!(ops),
+        Err(why) => {
+            reply["undo"] = Value::Null;
+            reply["undo_error"] = json!(why);
+        }
+    }
+}
+
 /// Each file of the module (as lox reads it: not hidden ones), by its path
 /// from the project, with its blob id.
 fn module_blobs(p: &loxone_config::Project) -> std::collections::BTreeMap<String, String> {
@@ -1218,10 +1231,9 @@ impl Actions {
             slugs.push(a.added);
         }
         if files == before {
-            let undo = edit::undo_ops(&req.ops, &previous, &[]).ok();
-            return Ok(
-                json!({ "previous": previous, "undo": undo, "blob": req.base, "unchanged": true }),
-            );
+            let mut r = json!({ "previous": previous, "blob": req.base, "unchanged": true });
+            undo_into(&mut r, edit::undo_ops(&req.ops, &previous, &[]));
+            return Ok(r);
         }
         let mut new = files.render();
         // lox refuses a module directory without a `.loxl` file.
@@ -1332,12 +1344,11 @@ impl Actions {
                 Some(a)
             })
             .collect();
-        // The ops that undo this edit (#62), sent back as an edit of its
-        // own; none when lox minted no UUID for a block it added.
-        let undo_ops = edit::undo_ops(&req.ops, &previous, &minted).ok();
         undo.keep();
         *self.compiled.lock().unwrap() = Some(compiled);
-        Ok(json!({ "previous": previous, "undo": undo_ops, "blob": blob, "added": added }))
+        let mut r = json!({ "previous": previous, "blob": blob, "added": added });
+        undo_into(&mut r, edit::undo_ops(&req.ops, &previous, &minted));
+        Ok(r)
     }
 
     /// Refuse when the module holds changes that are not compiled into the
@@ -2865,7 +2876,7 @@ sed "s/Title=\"Testhaus\"/Title=\"Testhaus $w\"/" base.Loxone > "$out"
             .unwrap();
         assert_eq!(
             r["previous"],
-            json!([[{ "op": "move", "uuid": DIV, "x": 4032, "y": 2880 }]])
+            json!([{ "op": "place", "moves": [{ "uuid": DIV, "x": 4032, "y": 2880 }] }])
         );
         // Only compiles: nothing was deployed.
         let calls = std::fs::read_to_string(tmp.path().join("calls.log")).unwrap();
@@ -3056,7 +3067,7 @@ sed "s/Title=\"Testhaus\"/Title=\"Testhaus $w\"/" base.Loxone > "$out"
         let [r, ..] = round_trip(&a, &d, vec![edit::Op::Relayout { page: EG.into() }]).await;
         assert_eq!(
             r["undo"],
-            json!([{ "op": "move", "uuid": DIV, "x": 1920, "y": 960 }])
+            json!([{ "op": "place", "moves": [{ "uuid": DIV, "x": 1920, "y": 960 }] }])
         );
         // Only compiles: nothing was deployed.
         let calls = std::fs::read_to_string(tmp.path().join("calls.log")).unwrap();

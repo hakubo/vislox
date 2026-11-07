@@ -98,8 +98,12 @@ pub enum Op {
     Move { uuid: String, x: i64, y: i64 },
     /// Lay out the managed blocks of the page with UUID `page` afresh, as
     /// lox places new blocks (`lox logic compile --relayout`). Its
-    /// `previous` is the list of `move`s that put each block back.
+    /// `previous` is the `place` that puts each block back.
     Relayout { page: String },
+    /// Move several blocks the module manages at once, each as `move` does:
+    /// the undo of a `relayout` (#62), one op however many blocks the page
+    /// has. Its `previous` is the `place` that puts them back.
+    Place { moves: Vec<Placed> },
     /// Draw a wire (#61) from the output `from` to the input `to`, each
     /// `[object UUID, connector key]` as the page names a wire's ends. It is
     /// written as `to <- from` in [`FILE`]. Its `previous` is the `unwire`.
@@ -108,6 +112,14 @@ pub enum Op {
     /// wires its source draws; one Loxone Config drew is refused. Its
     /// `previous` is the `wire` that draws it again.
     Unwire { from: [String; 2], to: [String; 2] },
+}
+
+/// Where a `place` puts one block: its top left corner, as `move` takes it.
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq)]
+pub struct Placed {
+    pub uuid: String,
+    pub x: i64,
+    pub y: i64,
 }
 
 impl Op {
@@ -121,7 +133,11 @@ impl Op {
             | Op::Setting { uuid, .. }
             | Op::RemoveBlock { uuid }
             | Op::Move { uuid, .. } => Some(uuid),
-            Op::AddBlock { .. } | Op::Relayout { .. } | Op::Wire { .. } | Op::Unwire { .. } => None,
+            Op::AddBlock { .. }
+            | Op::Relayout { .. }
+            | Op::Place { .. }
+            | Op::Wire { .. }
+            | Op::Unwire { .. } => None,
         }
     }
 
@@ -137,6 +153,7 @@ impl Op {
             | Op::RemoveBlock { .. }
             | Op::Move { .. }
             | Op::Relayout { .. }
+            | Op::Place { .. }
             | Op::Wire { .. }
             | Op::Unwire { .. } => None,
         }
@@ -155,6 +172,7 @@ impl Op {
             | Op::RemoveBlock { .. }
             | Op::Move { .. }
             | Op::Relayout { .. }
+            | Op::Place { .. }
             | Op::Wire { .. }
             | Op::Unwire { .. } => {}
         }
@@ -599,6 +617,7 @@ impl Claims {
             | Op::RemoveBlock { .. }
             | Op::Move { .. }
             | Op::Relayout { .. }
+            | Op::Place { .. }
             | Op::Wire { .. }
             | Op::Unwire { .. } => None,
         }
@@ -791,6 +810,7 @@ pub fn apply(
         | Op::RemoveBlock { .. }
         | Op::Move { .. }
         | Op::Relayout { .. }
+        | Op::Place { .. }
         | Op::Wire { .. }
         | Op::Unwire { .. } => {
             unreachable!("not a value")
@@ -1179,6 +1199,7 @@ pub fn apply_op(files: &mut Files, ctx: &Ctx, op: &Op) -> Result<Applied, String
         Op::RemoveBlock { uuid } => remove_block(files, ctx, uuid),
         Op::Move { uuid, x, y } => move_block(files, ctx, uuid, *x, *y),
         Op::Relayout { page } => relayout(files, ctx, page),
+        Op::Place { moves } => place(files, ctx, moves),
         Op::Wire { from, to } => wire(files, ctx, from, to),
         Op::Unwire { from, to } => unwire(files, ctx, from, to),
         _ => {
@@ -1199,8 +1220,9 @@ pub fn apply_op(files: &mut Files, ctx: &Ctx, op: &Op) -> Result<Applied, String
 
 /// The ops that undo a request (#62), from each op's `previous`: the last
 /// op's first, so a request of `unwire` then `wire` is undone by `unwire`
-/// then `wire` of the old ends. A value op's `previous` is the value it
-/// replaced; a `relayout`'s is a list of moves; the others' is the op.
+/// then `wire` of the old ends: one op for each op of the request, so it
+/// never holds more than [`MAX_OPS`]. A value op's `previous` is the value
+/// it replaced; the others' is the op.
 /// `minted` is, per op, the UUID lox minted for the block an `add_block`
 /// added: it is undone by `remove_block` of that UUID.
 ///
@@ -1214,22 +1236,41 @@ pub fn undo_ops(
     let mut undo = Vec::new();
     for (i, op) in ops.iter().enumerate().rev() {
         let prev = previous.get(i).cloned().unwrap_or_default();
-        let bad = |e: serde_json::Error| format!("op {}: no undo ({e})", i + 1);
+        let bad = |e: serde_json::Error| {
+            format!(
+                "op {} ({}): its previous is no op ({e})",
+                i + 1,
+                op_name(op)
+            )
+        };
         match op {
             Op::AddBlock { .. } => match minted.get(i).cloned().flatten() {
                 Some(uuid) => undo.push(Op::RemoveBlock { uuid }),
-                None => return Err(format!("op {}: lox minted no UUID for the block", i + 1)),
+                None => {
+                    return Err(format!(
+                        "op {} (add_block): lox named no UUID for the block it added",
+                        i + 1
+                    ));
+                }
             },
-            Op::Relayout { .. } => {
-                undo.extend(serde_json::from_value::<Vec<Op>>(prev).map_err(bad)?);
-            }
-            Op::RemoveBlock { .. } | Op::Move { .. } | Op::Wire { .. } | Op::Unwire { .. } => {
-                undo.push(serde_json::from_value(prev).map_err(bad)?)
-            }
+            Op::RemoveBlock { .. }
+            | Op::Move { .. }
+            | Op::Relayout { .. }
+            | Op::Place { .. }
+            | Op::Wire { .. }
+            | Op::Unwire { .. } => undo.push(serde_json::from_value(prev).map_err(bad)?),
             _ => undo.push(op.with_value(serde_json::from_value(prev).map_err(bad)?)),
         }
     }
     Ok(undo)
+}
+
+/// The name an op has in a request (`title`, `add_block`, …).
+fn op_name(op: &Op) -> String {
+    serde_json::to_value(op)
+        .ok()
+        .and_then(|v| v["op"].as_str().map(String::from))
+        .unwrap_or_default()
 }
 
 /// The pages titled `title`, in document order.
@@ -1463,7 +1504,7 @@ fn remove_block(files: &mut Files, ctx: &Ctx, uuid: &str) -> Result<Applied, Str
     let p = files.pages.get_mut(&file).expect("found");
     p.removed.insert(slug);
     Ok(Applied {
-        previous: serde_json::to_value(&again).unwrap_or_default(),
+        previous: op_value(&again),
         added: None,
     })
 }
@@ -1530,9 +1571,37 @@ fn move_block(files: &mut Files, ctx: &Ctx, uuid: &str, x: i64, y: i64) -> Resul
     };
     files.layout.moves.insert(slug.to_string(), at);
     Ok(Applied {
-        previous: serde_json::to_value(move_back(ctx.doc, uuid)).unwrap_or_default(),
+        previous: op_value(&Op::Move {
+            uuid: uuid.to_string(),
+            x: now.px,
+            y: now.py,
+        }),
         added: None,
     })
+}
+
+/// Move several managed blocks, each as [`move_block`] does.
+fn place(files: &mut Files, ctx: &Ctx, moves: &[Placed]) -> Result<Applied, String> {
+    if moves.is_empty() {
+        return Err("place: no blocks to move".into());
+    }
+    let mut back = Vec::new();
+    for m in moves {
+        let a = move_block(files, ctx, &m.uuid, m.x, m.y)?;
+        match serde_json::from_value(a.previous) {
+            Ok(Op::Move { uuid, x, y }) => back.push(Placed { uuid, x, y }),
+            _ => unreachable!("a move's previous is a move"),
+        }
+    }
+    Ok(Applied {
+        previous: op_value(&Op::Place { moves: back }),
+        added: None,
+    })
+}
+
+/// An op as the reply carries it. An op always serializes: never Null.
+fn op_value(op: &Op) -> serde_json::Value {
+    serde_json::to_value(op).expect("an op serializes")
 }
 
 /// The title lox lays the page `page` out by (`--relayout <title>`), or why
@@ -1586,16 +1655,25 @@ pub fn relayout_title(
 /// module does not manage stays beside it.
 fn relayout(files: &mut Files, ctx: &Ctx, page: &str) -> Result<Applied, String> {
     let title = relayout_title(ctx.base, ctx.doc, ctx.lock, page)?;
-    let back: Vec<Op> = ctx
+    let back: Vec<Placed> = ctx
         .lock
         .placed
         .iter()
         .filter(|(_, p)| p.as_deref() == Some(page))
-        .filter_map(|(s, _)| move_back(ctx.doc, ctx.lock.uuid_of(s)?))
+        .filter_map(|(s, _)| match move_back(ctx.doc, ctx.lock.uuid_of(s)?)? {
+            Op::Move { uuid, x, y } => Some(Placed { uuid, x, y }),
+            _ => None,
+        })
         .collect();
+    // Its undo puts these back; with none, there would be nothing to undo.
+    if back.is_empty() {
+        return Err(format!(
+            "{title}: the pending config draws none of the blocks the module manages on this page"
+        ));
+    }
     files.layout.relayout.insert(page.to_string(), title);
     Ok(Applied {
-        previous: serde_json::to_value(back).unwrap_or_default(),
+        previous: op_value(&Op::Place { moves: back }),
         added: None,
     })
 }
@@ -2045,11 +2123,10 @@ fn wire(
     );
     connect(files, ctx, &src, &dst)?;
     Ok(Applied {
-        previous: serde_json::to_value(Op::Unwire {
+        previous: op_value(&Op::Unwire {
             from: from.clone(),
             to: to.clone(),
-        })
-        .unwrap_or_default(),
+        }),
         added: None,
     })
 }
@@ -2182,11 +2259,10 @@ fn unwire(
     files.claims.1.remove(&w);
     files.claims.prune();
     Ok(Applied {
-        previous: serde_json::to_value(Op::Wire {
+        previous: op_value(&Op::Wire {
             from: from.clone(),
             to: to.clone(),
-        })
-        .unwrap_or_default(),
+        }),
         added: None,
     })
 }
@@ -2367,6 +2443,7 @@ pub fn current(doc: &LoxoneDoc, op: &Op) -> Option<String> {
         | Op::RemoveBlock { .. }
         | Op::Move { .. }
         | Op::Relayout { .. }
+        | Op::Place { .. }
         | Op::Wire { .. }
         | Op::Unwire { .. } => None,
     }
@@ -2767,10 +2844,16 @@ mod tests {
             uuid: DIV.into(),
             value: v.map(Into::into),
         };
-        let mv = |x| Op::Move {
-            uuid: DIV.into(),
-            x,
-            y: 0,
+        // A relayout of however many blocks is undone by one `place`: the
+        // undo of a request never has more ops than the request.
+        let place = Op::Place {
+            moves: (0..500)
+                .map(|i| Placed {
+                    uuid: format!("u{i}"),
+                    x: 96 * i,
+                    y: 0,
+                })
+                .collect(),
         };
         let ops = vec![
             t(Some("A")),
@@ -2785,22 +2868,23 @@ mod tests {
         let previous = vec![
             serde_json::json!(null),
             serde_json::json!(null),
-            serde_json::json!([mv(96), mv(192)]),
+            serde_json::to_value(place.clone()).unwrap(),
             serde_json::to_value(&again).unwrap(),
         ];
         let minted = [None, Some("n".to_string()), None, None];
         assert_eq!(
             undo_ops(&ops, &previous, &minted).unwrap(),
-            vec![
-                again,
-                mv(96),
-                mv(192),
-                Op::RemoveBlock { uuid: "n".into() },
-                t(None)
-            ]
+            vec![again, place, Op::RemoveBlock { uuid: "n".into() }, t(None)]
         );
-        // A block lox minted no UUID for cannot be taken out again.
-        assert!(undo_ops(&ops, &previous, &[]).is_err());
+        assert_eq!(undo_ops(&ops, &previous, &minted).unwrap().len(), ops.len());
+        // A block lox minted no UUID for cannot be taken out again; and a
+        // previous that is no op says which op.
+        let e = undo_ops(&ops, &previous, &[]).unwrap_err();
+        assert!(e.contains("op 2 (add_block)"), "{e}");
+        let mut broken = previous.clone();
+        broken[2] = serde_json::Value::Null;
+        let e = undo_ops(&ops, &broken, &minted).unwrap_err();
+        assert!(e.contains("op 3 (relayout)"), "{e}");
         // `restores` is echoed, not written: it round-trips, and is left out when none.
         let v = serde_json::to_value(add("p", "And", None, &[], &[])).unwrap();
         assert_eq!(v.get("restores"), None);
@@ -3343,11 +3427,29 @@ mod tests {
             files.layout.relayout,
             BTreeMap::from([(OG.to_string(), "Obergeschoss".to_string())])
         );
-        // `previous` puts each block back.
-        let back: Vec<Op> = serde_json::from_value(a.previous).unwrap();
+        // `previous` puts each block back, in one `place` (#62).
+        let Op::Place { moves: back } = serde_json::from_value(a.previous).unwrap() else {
+            panic!("not a place")
+        };
         assert_eq!(back.len(), 2);
-        assert!(back.iter().all(|o| matches!(o, Op::Move { .. })));
-        assert!(back.iter().any(|o| o.uuid() == Some(and.as_str())));
+        assert!(back.iter().any(|m| m.uuid == and));
+        // A `place` moves each block as `move` does, and its previous is the
+        // `place` back.
+        let mut again = files.clone();
+        let p = apply_op(
+            &mut again,
+            &ctx,
+            &Op::Place {
+                moves: back.clone(),
+            },
+        )
+        .unwrap();
+        assert!(
+            matches!(serde_json::from_value(p.previous).unwrap(), Op::Place { moves } if moves.len() == 2)
+        );
+        assert_eq!(again.layout.moves.len(), 2);
+        let e = apply_op(&mut again, &ctx, &Op::Place { moves: vec![] }).unwrap_err();
+        assert!(e.contains("no blocks"), "{e}");
     }
 
     #[test]

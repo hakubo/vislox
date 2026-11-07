@@ -38,6 +38,7 @@ POST /api/edit
            { "op": "remove_block", "uuid": "…" },
            { "op": "move", "uuid": "…", "x": 1920, "y": 960 },
            { "op": "relayout", "page": "<page uuid>" },
+           { "op": "place", "moves": [ { "uuid": "…", "x": 1920, "y": 960 } ] },
            { "op": "wire",   "from": ["<uuid>", "AQ"], "to": ["<uuid>", "I2"] },
            { "op": "unwire", "from": ["<uuid>", "Q"],  "to": ["<uuid>", "I1"] } ] }
 ```
@@ -50,7 +51,8 @@ POST /api/edit
   UUIDs lox minted (`added: [{ slug, uuid }]`). For a value, `previous` is the value vislox claimed before: the
   op with that value undoes it. For `remove_block` it is the `add_block` that adds the block again; for
   `add_block` it is null, and `remove_block` with the new UUID undoes it. For `move` it is the `move` back to
-  where the block was; for `relayout`, the list of `move`s that put each block back. For `wire` it is the
+  where the block was; for `relayout`, the `place` that puts each block back (one op however many
+  blocks the page has; `place` moves several managed blocks as `move` does), and for `place`, the `place` back. For `wire` it is the
   `unwire` of the same ends, and for `unwire` the `wire`. A reconnected wire is one request, `unwire` then `wire`:
   undone, the reverse list. The ops of one request see each other: `unwire` then `wire` of the same wire is
   accepted (and changes nothing). `remove_block`'s `add_block` carries the wires the removal took out
@@ -59,7 +61,9 @@ POST /api/edit
   echoes it next to the new UUID).
 - The reply also has `undo`: the ops that undo the whole request, built from `previous` (the last op's first; a
   value op with the value it replaced; `add_block` as `remove_block` of the UUID lox minted; a `relayout` as its
-  moves). It is null only when lox named no UUID for a block the request added. See *Undo and redo*.
+  moves, one `place`). It has one op per op of the request, so it never holds more than a request takes. When it
+  cannot be built (lox named no UUID for a block the request added), it is null and `undo_error` says why. A
+  `previous` that is not a value is always an op, never null. See *Undo and redo*.
 - All ops of one request are checked first, then written and compiled once. If anything fails, or the request
   goes away mid-compile (a closed tab), the file, the lock and `out.Loxone` are put back as they were.
 - **An edit never takes along someone else's uncompiled changes.** The compile covers the whole module, so
@@ -204,28 +208,36 @@ like any edit (a module with uncompiled changes, a block deployed since, a stale
 The reply's `undo` is the redo, and the redo's reply the next undo, so each step is built from what the server did,
 not guessed in the browser.
 
-- The history lives in the browser. Every edit of the page (values, Revert, *Add block*, *Remove*, moves, *Arrange*,
-  wires) goes through one function, which keeps the edit (its ops, its `undo`, a name made from the ops) on the
-  undo stack and empties the redo stack. Up to 50 edits are kept. An edit that changed nothing is not kept.
+- The history lives in the browser tab. Every edit of the page (values, Revert, *Add block*, *Remove*, moves,
+  *Arrange*, wires), every undo and every redo goes through one function, which sends it and keeps what the reply
+  says: a new edit (its ops, its `undo`, a name made from the ops) goes on the undo stack and empties the redo
+  stack; an undo moves the edit to the redo stack with the reply's `undo` as its redo, and a redo the other way.
+  Up to 50 edits are kept. An edit that changed nothing is not kept; an undo or redo that changed nothing (the
+  config already was that way) moves its edit across with its ops as they were. A reply with no `undo` empties
+  both stacks, since what came before no longer leads to this config, and says why (`undo_error`).
 - *Undo* and *Redo* sit next to *Add block* (Ctrl+Z and Shift+Ctrl+Z, ⌘ on a Mac; Ctrl+Y redoes too, but not on a
   Mac); each one's tooltip names the edit it undoes or redoes. In a text field the keys are the field's own. The
   list next to them shows the recent edits, those undone struck through, and why the history was cleared.
+- Like every edit, undo and redo change the newest config while it is shown; on an older revision they are off.
+  Each step is sent against the config the stack was built on, after the edit or step before it was compiled and
+  the History shows it: a Ctrl+Z right after a save waits for the save and undoes it, and quick presses run one
+  after another (up to three wait), never against a config the server has moved past. While they run, the other
+  edits are off.
 - **A block added again gets new UUIDs**: lox mints them. The reply names the old UUID next to the new one
   (`added[].restores`), and the browser renames it in every edit it keeps, so an undo of a value edited before a
   *Remove* changes the block that came back.
 - **The history belongs to one pending config**: the blob it was made on, the server's last Apply, Sync or Discard,
-  and the deployed revision. When any of them changes and this page did not do it (an edit in another tab, `lox
+  and the deployed revision. When any of them changes and this tab did not do it (an edit in another tab, `lox
   logic compile` run elsewhere, Discard, Apply, Sync, a Pull), the ops kept may no longer undo anything sensible,
   so the history is cleared and the list says why ("Discard dropped the pending config", "the pending config
   changed outside this tab"). It is not rebased: an edit someone else made is theirs to undo. A moment after this
-  page's own edit, before the History has the new compile, does not count.
-- **Kept across a reload**: the history is stored in `localStorage` under the pending config's blob
-  (`vislox.undo.<blob>`), with the last outcome and deployed revision it was made on, and only the newest is kept. A
-  page that loads, or sees the config change, to exactly that config picks the history up. So it survives a reload,
-  and two tabs on one config share it: an edit made in one is undone in the other, never on another config.
-  After a server restart the last outcome is unknown; the blob and the deployed revision decide.
-- Undo and redo are off while another edit compiles, or Apply, Sync or Discard runs. A refused undo leaves the
-  history as it was and says why.
+  tab's own edit, before the History has the new compile, does not count.
+- **One tab, kept across a reload**: the history is this tab's, stored in `sessionStorage` under the pending
+  config's blob (`vislox.undo.<blob>`) with the last outcome and deployed revision it was made on. A reload of the
+  tab picks it up when the config is still exactly that one. Another tab has its own history, and an edit made
+  there clears this one. After a server restart the last outcome is unknown; the blob and the deployed revision
+  decide.
+- A refused undo or redo leaves the history as it was and says why.
 
 vislox offers only what lox (v0.83.0, the version `Cargo.lock` and the Docker image pin) can express. What lox
 cannot express is left out, not worked around.
