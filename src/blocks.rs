@@ -247,7 +247,11 @@ pub fn palette() -> Json {
     types.push(message_ref_type());
     // The objects of the object tree (#84): added from the project tree, in
     // a folder or below a device, never on a page.
-    let periphery = crate::periphery::palette(&|ty| type_doc(ty).summary);
+    let mut periphery = crate::periphery::palette(&|ty| type_doc(ty).summary);
+    // A Tree device on a Tree extension (#85).
+    if let Some(a) = periphery.as_array_mut() {
+        a.push(crate::hw_edit::palette());
+    }
     json!({ "types": types, "periphery": periphery })
 }
 
@@ -909,7 +913,8 @@ pub fn file_name(title: &str, taken: &dyn Fn(&str) -> bool) -> String {
     stem = stem.trim_end_matches('-').to_string();
     // `edits.loxl` is the file of #58's claims, `templates.loxl` that of the
     // library templates vislox copies in (#83). `_periphery.loxl`, that of the
-    // objects of the object tree (#84), starts with `_`, which no stem does.
+    // objects of the object tree (#84), and `_hardware.loxl`, that of Tree and
+    // Air hardware (#85), start with `_`, which no stem does.
     if stem.is_empty() || stem == "edits" || stem == "templates" {
         stem = format!("page-{stem}").trim_end_matches('-').to_string();
     }

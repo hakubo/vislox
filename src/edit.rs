@@ -256,6 +256,11 @@ pub enum Op {
         page: String,
         value: Option<crate::template_edit::Call>,
     },
+    /// The statistics of the Tree or Air input or output `uuid` (#85):
+    /// `on` or `off`, a hardware declaration with `Statistics:` in vislox's
+    /// hardware file ([`crate::hw_edit`]). `None` drops vislox's claim: the
+    /// I/O records as the base has it. A value op.
+    Statistics { uuid: String, value: Option<String> },
 }
 
 /// Where a `place` puts one block: its top left corner, as `move` takes it.
@@ -285,6 +290,7 @@ impl Op {
             | Op::Access { uuid, .. }
             | Op::Recipients { uuid, .. }
             | Op::Expr { uuid, .. }
+            | Op::Statistics { uuid, .. }
             | Op::Tiles { uuid, .. } => Some(uuid),
             Op::AddBlock { .. }
             | Op::Signal { .. }
@@ -310,6 +316,7 @@ impl Op {
             | Op::Param { value, .. }
             | Op::Setting { value, .. }
             | Op::Expr { value, .. }
+            | Op::Statistics { value, .. }
             | Op::Let { value, .. } => value.as_deref(),
             Op::AddBlock { .. }
             | Op::Signal { .. }
@@ -345,6 +352,7 @@ impl Op {
             | Op::Param { value, .. }
             | Op::Setting { value, .. }
             | Op::Expr { value, .. }
+            | Op::Statistics { value, .. }
             | Op::Let { value, .. } => *value = v,
             Op::AddBlock { .. }
             | Op::Signal { .. }
@@ -424,6 +432,10 @@ pub struct Caps {
     pub category: bool,
     pub params: Vec<ParamCap>,
     pub settings: Vec<SettingCap>,
+    /// A Tree or Air input or output whose statistics Lox Logic switches
+    /// (#85): `on`, `off`, or the other kind Loxone Config set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub statistics: Option<String>,
 }
 
 #[derive(Serialize, Debug, PartialEq)]
@@ -578,12 +590,14 @@ pub fn caps(el: &Element) -> Option<Caps> {
         category: bound("Cr"),
         params,
         settings,
+        statistics: crate::hw_edit::stats_value(ty).and_then(|_| crate::hw_edit::stats_state(el)),
     };
     (caps.title
         || caps.room
         || caps.category
         || !caps.params.is_empty()
-        || !caps.settings.is_empty())
+        || !caps.settings.is_empty()
+        || caps.statistics.is_some())
     .then_some(caps)
 }
 
@@ -971,6 +985,7 @@ impl Claims {
             | Op::Access { .. }
             | Op::Recipients { .. }
             | Op::Tiles { .. }
+            | Op::Statistics { .. }
             | Op::Let { .. } => None,
         }
     }
@@ -1235,6 +1250,7 @@ pub fn apply(
                     | Op::Access { .. }
                     | Op::Recipients { .. }
                     | Op::Tiles { .. }
+                    | Op::Statistics { .. }
             )
         })
         .ok_or_else(|| "not a value".to_string())?;
@@ -1349,6 +1365,7 @@ pub fn apply(
         | Op::Expr { .. }
         | Op::Signal { .. }
         | Op::Instance { .. }
+        | Op::Statistics { .. }
         | Op::Let { .. } => {
             unreachable!("not a value")
         }
@@ -1401,6 +1418,9 @@ pub struct Lock {
     /// The removal tombstones (`removed`): object UUID → (slug, type). The
     /// one place they are kept; [`Lock::tombstoned`] asks by slug.
     pub tombs: BTreeMap<String, (String, String)>,
+    /// The externals a hardware declaration owns (`owned`, #85): the module
+    /// writes their title, room, category and settings.
+    pub owned: BTreeSet<String>,
 }
 
 impl Lock {
@@ -1472,6 +1492,16 @@ impl Lock {
                     .collect()
             })
             .unwrap_or_default();
+        let owned = v
+            .get("externals")
+            .and_then(|o| o.as_object())
+            .map(|o| {
+                o.iter()
+                    .filter(|(_, x)| x.get("owned").and_then(|b| b.as_bool()) == Some(true))
+                    .map(|(s, _)| s.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
         Lock {
             slugs,
             placed,
@@ -1479,6 +1509,7 @@ impl Lock {
             externals,
             entries,
             tombs,
+            owned,
         }
     }
 
@@ -1537,6 +1568,8 @@ pub struct Files {
     /// (#83), by name: [`TEMPLATES`]. One goes with the last instance of
     /// vislox's that calls it.
     pub templates: BTreeMap<String, logic::TemplateDecl>,
+    /// The Tree and Air hardware it declares (#85): [`crate::hw_edit::FILE`].
+    pub hardware: crate::hw_edit::HwFile,
 }
 
 /// The positions an edit gives managed blocks, and the pages it lays out
@@ -1584,6 +1617,10 @@ impl Files {
                 // its file: a page file has a page line, the templates file none.
                 f.templates = crate::template_edit::parse_templates(text)
                     .map_err(|e| format!("{name}: {e}"))?;
+            } else if name == crate::hw_edit::FILE {
+                // Tree and Air hardware (#85): no page line.
+                f.hardware =
+                    crate::hw_edit::HwFile::parse(text).map_err(|e| format!("{name}: {e}"))?;
             } else if name == crate::periphery::FILE {
                 // The objects of the object tree (#84): no page line.
                 f.pages.insert(
@@ -1713,6 +1750,9 @@ impl Files {
             if !p.is_empty() {
                 out.insert(name.clone(), p.render());
             }
+        }
+        if !self.hardware.is_empty() {
+            out.insert(crate::hw_edit::FILE.to_string(), self.hardware.render());
         }
         if !self.templates.is_empty() && !self.pages.contains_key(TEMPLATES) {
             out.insert(
@@ -1875,13 +1915,23 @@ impl Files {
     /// [`Files::names`]; a `removed` line counts only with `removed` (#82: a
     /// signal dropped here and made again).
     pub fn names_with(&self, slug: &str, removed: bool) -> bool {
-        self.claims.8.contains_key(slug)
+        self.names_except_removed(slug)
+            || (removed && self.hardware.removed.contains(slug))
+            || self
+                .pages
+                .values()
+                .any(|p| removed && p.removed.contains(slug))
+    }
+
+    /// [`Files::names`] without the `removed` lines.
+    fn names_except_removed(&self, slug: &str) -> bool {
+        (self.hardware.names(slug) && !self.hardware.removed.contains(slug))
+            || self.claims.8.contains_key(slug)
             || crate::set_claim::KINDS
                 .iter()
                 .any(|k| k.set_names(&self.claims).contains(&slug))
             || self.pages.values().any(|p| {
-                (removed && p.removed.contains(slug))
-                    || p.moved.iter().any(|(f, t)| f == slug || t == slug)
+                p.moved.iter().any(|(f, t)| f == slug || t == slug)
                     || p.blocks.iter().any(|b| b.slug == slug)
                     || p.signals.iter().any(|x| x.slug == slug)
                     || p.instances.iter().any(|x| x.slug == slug)
@@ -1912,6 +1962,10 @@ impl Files {
             p.unstamped.retain(|s| kept.contains(s));
             p.moved.retain(|from, _| lock.slugs.contains_key(from));
         }
+        // A created device's (#85): the lockfile keeps it as an extern.
+        self.hardware
+            .removed
+            .retain(|s| lock.externals.contains_key(s));
     }
 
     /// The lines [`Files::tidy`] would drop, as written.
@@ -1925,6 +1979,11 @@ impl Files {
                 out.push(format!("moved {f} -> {t}"));
             }
         }
+        for s in &self.hardware.removed {
+            if !lock.externals.contains_key(s) {
+                out.push(format!("removed {s}"));
+            }
+        }
         out
     }
 
@@ -1932,6 +1991,7 @@ impl Files {
     /// block's UUID in `lock`), as the ops that set it.
     pub fn ops(&self, lock: &Lock) -> Vec<Op> {
         let mut v = self.claims.ops();
+        v.extend(self.hardware.ops(lock));
         for p in self.pages.values() {
             for b in &p.blocks {
                 let Some(uuid) = lock.uuid_of(&b.slug) else {
@@ -2084,9 +2144,22 @@ pub fn apply_op(files: &mut Files, ctx: &Ctx, op: &Op) -> Result<Applied, String
         warnings: Vec::new(),
     };
     match op {
+        // A Tree device created on a Tree extension (#85).
+        Op::AddBlock { ty, .. } if ty == crate::hw_edit::TREE_DEVICE => {
+            crate::hw_edit::add_device(files, ctx, op)
+        }
         Op::AddBlock { .. } => add_block(files, ctx, op),
-        Op::RemoveBlock { uuid } => remove_block(files, ctx, uuid),
+        Op::RemoveBlock { uuid } => match crate::hw_edit::created_slug(files, ctx, uuid) {
+            Some(slug) => crate::hw_edit::remove_device(files, ctx, &slug, uuid),
+            None => remove_block(files, ctx, uuid),
+        },
+        Op::RestoreBlock { uuid, .. } if crate::hw_edit::restores_device(ctx, uuid) => {
+            crate::hw_edit::restore_device(files, ctx, op)
+        }
         Op::RestoreBlock { .. } => restore_block(files, ctx, op),
+        Op::Statistics { uuid, value } => {
+            crate::hw_edit::set_statistics(files, ctx, uuid, value.as_deref())
+        }
         Op::Rename { uuid, slug } => rename_block(files, ctx, uuid, slug),
         Op::Tidy => Ok(Applied {
             previous: op_value(&Op::Tidy),
@@ -2127,10 +2200,37 @@ pub fn apply_op(files: &mut Files, ctx: &Ctx, op: &Op) -> Result<Applied, String
         Op::Instance { .. } => crate::template_edit::set_instance(files, ctx, op),
         _ => {
             let uuid = op.uuid().unwrap_or_default();
+            // A Tree device created here (#85): its name is in its declaration.
+            if let Some(slug) = crate::hw_edit::created_slug(files, ctx, uuid) {
+                return match op {
+                    Op::Title { value, .. } => {
+                        crate::hw_edit::set_title(files, &slug, value.as_deref())
+                    }
+                    _ => Err(format!(
+                        "{}: a Tree device created here takes its name here; its other values \
+                         once Loxone Config paired it",
+                        crate::adopt::name_in(ctx.doc, uuid)
+                    )),
+                };
+            }
             match ctx.lock.slug_of(uuid) {
                 Some(slug) if files.block(slug).is_some() => {
                     let slug = slug.to_string();
                     edit_new_block(files, ctx, &slug, op).map(done)
+                }
+                // Not in the base, and no block of the module's: an object
+                // below a Tree device created here and not deployed yet (#85),
+                // whose UUIDs lox mints anew on every compile. An extern of it
+                // would name nothing.
+                None if op.value().is_some()
+                    && find_ci(&ctx.base.xml.root, uuid).is_none()
+                    && crate::hw_edit::below_created(files, ctx, uuid) =>
+                {
+                    Err(format!(
+                        "{}: it is not in the project's base config yet; edit it once Apply \
+                         deployed it",
+                        crate::adopt::name_in(ctx.doc, uuid)
+                    ))
                 }
                 _ => {
                     let managed: HashSet<String> = ctx.lock.slugs.values().cloned().collect();
@@ -2692,7 +2792,11 @@ pub fn delete_refusals(files: &Files, ctx: &Ctx, uuids: &[String]) -> Vec<Option
     let below = crate::periphery::below(files);
     uuids
         .iter()
-        .map(|u| removal(files, ctx, u, &below).err())
+        .map(|u| match crate::hw_edit::created_slug(files, ctx, u) {
+            // A Tree device created here (#85).
+            Some(_) => crate::hw_edit::removal(files, ctx, u).err(),
+            None => removal(files, ctx, u, &below).err(),
+        })
         .collect()
 }
 
@@ -4714,7 +4818,13 @@ pub fn check_module(module: &Path) -> Result<(), String> {
         .to_str()
         .ok_or_else(|| "the module's path is not UTF-8".to_string())?;
     let m = loxone_config::cli::read_module(path).map_err(|e| e.to_string())?;
-    logic::validate_ports(&m).map_err(|e| e.to_string())?;
+    // As `lox logic check` does: on the expanded, desugared module, where a
+    // hardware declaration (#85) is an extern of its object.
+    let (desugared, _) = m
+        .expand()
+        .and_then(|x| x.desugar())
+        .map_err(|e| e.to_string())?;
+    logic::validate_ports(&desugared).map_err(|e| e.to_string())?;
     let out_of_range: Vec<String> = logic::lint_source(&m)
         .map_err(|e| e.to_string())?
         .into_iter()
@@ -4758,6 +4868,7 @@ pub fn current(doc: &LoxoneDoc, op: &Op) -> Option<String> {
         }
         // A block setting may be stored under another name (`At:` is `Sec=`).
         Op::Setting { name, .. } => decoded(el, connectors::attr_name(ty, name)),
+        Op::Statistics { .. } => crate::hw_edit::stats_state(el),
         Op::AddBlock { .. }
         | Op::RemoveBlock { .. }
         | Op::RestoreBlock { .. }
@@ -5153,7 +5264,13 @@ mod tests {
         }
         let m =
             loxone_config::cli::read_module(module.to_str().unwrap()).map_err(|e| e.to_string())?;
-        logic::validate_ports(&m).map_err(|e| e.to_string())?;
+        // As `lox logic check` does: on the expanded, desugared module, where
+        // a hardware declaration (#85) is an extern.
+        let (desugared, _) = m
+            .expand()
+            .and_then(|x| x.desugar())
+            .map_err(|e| e.to_string())?;
+        logic::validate_ports(&desugared).map_err(|e| e.to_string())?;
         let opts = CompileOptions {
             machine: [0x50, 0x4f, 0x94, 0, 0, 1],
             mint_time_unix: 0,
@@ -5198,6 +5315,12 @@ mod tests {
                 .removed
                 .iter()
                 .map(|(u, t)| (u.clone(), (t.slug.clone(), t.block_type.clone())))
+                .collect(),
+            owned: l
+                .externals
+                .iter()
+                .filter(|(_, e)| e.owned)
+                .map(|(s, _)| s.clone())
                 .collect(),
         }
     }
@@ -9839,6 +9962,20 @@ mod tests {
         let mono = l.objects["vx_treppe_ausgang"].uuid.clone();
         let el = find(&out.xml.root, &mono).unwrap();
         assert_eq!(el.attr_decoded("Title").as_deref(), Some("Flur"));
+        // A member's value op is not taken for one below a Tree device created
+        // here (#85), whether the lock knows it yet or not.
+        for lk in [lock_of(&l), Lock::default()] {
+            let ctx = ctx_of(&out, &d, &lk, None, &names);
+            let title = Op::Title {
+                uuid: mono.clone(),
+                value: Some("Gang".into()),
+            };
+            let r = apply_op(&mut files.clone(), &ctx, &title);
+            assert!(
+                !r.as_ref().is_err_and(|e| e.contains("base config")),
+                "{r:?}"
+            );
+        }
         // Its call as the op takes it: the text unquoted.
         let (_, def) = files.instance("vx_treppe").unwrap();
         let call = crate::template_edit::call_of(def);
@@ -11184,5 +11321,454 @@ mod tests {
                 .contains("not in the project's base"),
             "{m:?}"
         );
+    }
+
+    // ── Tree and Air hardware (#85) ────────────────────────────────────
+
+    const HW_TREE: &str = "20000002-0000-0020-ffff504f94000002";
+    const HW_TOUCH: &str = "20000003-0000-0030-ffff504f94000002";
+    const HW_TEMP: &str = "20000003-0000-0031-ffff504f94000002";
+    const HW_VOLT: &str = "20000005-0000-0051-ffff504f94000002";
+    const HW_PAGE: &str = "20000010-0000-0100-ffff504f94000002";
+
+    fn stats(uuid: &str, v: Option<&str>) -> Op {
+        Op::Statistics {
+            uuid: uuid.into(),
+            value: v.map(String::from),
+        }
+    }
+
+    fn stats_type(doc: &LoxoneDoc, uuid: &str) -> Option<String> {
+        find_ci(&doc.xml.root, uuid).and_then(|e| e.attr("StatsType").map(String::from))
+    }
+
+    /// The UUID of the I/O `iname` below the device `dev`.
+    fn io_of(doc: &LoxoneDoc, dev: &str, iname: &str) -> String {
+        find_ci(&doc.xml.root, dev)
+            .unwrap()
+            .child_elements()
+            .find(|c| c.attr("IName") == Some(iname))
+            .and_then(|c| c.attr("U"))
+            .unwrap()
+            .to_string()
+    }
+
+    #[test]
+    fn statistics_are_a_hardware_declaration_lox_writes_and_drops() {
+        let d = doc("hardware.Loxone");
+        let names = BTreeSet::new();
+        let mut files = Files::default();
+        let mut l = Lockfile::default();
+        let lock = lock_of(&l);
+        let ctx = ctx_of(&d, &d, &lock, None, &names);
+        assert_eq!(current(&d, &stats(HW_TEMP, None)).as_deref(), Some("off"));
+        let r = apply_op(&mut files, &ctx, &stats(HW_TEMP, Some("on"))).unwrap();
+        assert_eq!(r.previous, serde_json::Value::Null);
+        let text = files.render()[crate::hw_edit::FILE].clone();
+        let dev = crate::hw_edit::hw_slug(HW_TOUCH);
+        assert!(
+            text.contains(&format!("{dev} = TreeDevice(uuid: \"{HW_TOUCH}\")\n")),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "{} = TreeAsensor(device: {dev}, uuid: \"{HW_TEMP}\", Statistics: on)\n",
+                crate::hw_edit::hw_slug(HW_TEMP)
+            )),
+            "{text}"
+        );
+        // Read back as written.
+        let back = Files::from_texts(&files.render()).unwrap();
+        assert_eq!(back.hardware, files.hardware);
+        let out = compile_files(&d, &files, &mut l).unwrap();
+        assert_eq!(stats_type(&out, HW_TEMP).as_deref(), Some("11"));
+        assert_eq!(current(&out, &stats(HW_TEMP, None)).as_deref(), Some("on"));
+        // The device keeps its name: the declaration states nothing else.
+        assert_eq!(
+            find_ci(&out.xml.root, HW_TOUCH)
+                .unwrap()
+                .attr_decoded("Title")
+                .unwrap(),
+            "Touch Küche"
+        );
+        let lock = lock_of(&l);
+        assert!(files.ops(&lock).contains(&stats(HW_TEMP, Some("on"))));
+
+        // Off removes it; the undo is the value before.
+        let ctx = ctx_of(&out, &d, &lock, None, &names);
+        let op = stats(HW_TEMP, Some("off"));
+        let r = apply_op(&mut files, &ctx, &op).unwrap();
+        assert_eq!(r.previous, serde_json::json!("on"));
+        assert_eq!(
+            undo_ops(&[op], &[r.previous], &[]).unwrap(),
+            vec![stats(HW_TEMP, Some("on"))]
+        );
+        let out = compile_files(&d, &files, &mut l).unwrap();
+        assert_eq!(stats_type(&out, HW_TEMP), None);
+
+        // Dropping the claim takes the declarations out: the base's again.
+        let r = apply_op(&mut files, &ctx, &stats(HW_TEMP, None)).unwrap();
+        assert_eq!(r.previous, serde_json::json!("off"));
+        assert!(files.hardware.is_empty(), "{:?}", files.hardware);
+        assert!(!files.render().contains_key(crate::hw_edit::FILE));
+
+        // Refused, changing nothing: a type lox records no statistics on, a
+        // device, a word lox does not take, an I/O the module declares.
+        for (op, why) in [
+            (stats(HW_VOLT, Some("on")), "only on a Tree or Air"),
+            (stats(HW_TOUCH, Some("on")), "only on a Tree or Air"),
+            (stats(HW_TEMP, Some("yes")), "on or off"),
+        ] {
+            let mut f = files.clone();
+            let e = apply_op(&mut f, &ctx, &op).unwrap_err();
+            assert!(e.contains(why), "{why}: {e}");
+            assert_eq!(f, files);
+        }
+        let mut own = lock.clone();
+        own.externals.insert("taster".into(), HW_TOUCH.into());
+        own.owned.insert("taster".into());
+        let ctx = ctx_of(&out, &d, &own, None, &names);
+        let e = apply_op(&mut files.clone(), &ctx, &stats(HW_TEMP, Some("on"))).unwrap_err();
+        assert!(e.contains("`taster`"), "{e}");
+        // A claim is always dropped, whoever else declares it.
+        apply_op(&mut files.clone(), &ctx, &stats(HW_TEMP, None)).unwrap();
+    }
+
+    #[test]
+    fn where_a_tree_device_can_be_added_is_served_with_the_reason() {
+        let d = doc("hardware.Loxone");
+        let names = BTreeSet::new();
+        let lock = Lock::default();
+        let ctx = ctx_of(&d, &d, &lock, None, &names);
+        let m = crate::hw_edit::add_refusals(&ctx);
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[HW_TREE], serde_json::Value::Null);
+        // A Tree extension the base does not have yet: lox resolves the extern there.
+        let house = doc("house.Loxone");
+        let ctx = ctx_of(&d, &house, &lock, None, &names);
+        let m = crate::hw_edit::add_refusals(&ctx);
+        assert!(
+            m[HW_TREE].as_str().unwrap().contains("Apply it first"),
+            "{m:?}"
+        );
+        // The palette offers it on a Tree extension, with the kinds lox creates.
+        let p = crate::hw_edit::palette();
+        assert_eq!(p["devices"], serde_json::json!(["LoxTree"]));
+        assert_eq!(p["settings"][0]["choices"].as_array().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn a_new_device_s_input_is_claimed_and_dropped_in_one_request_by_its_designation() {
+        let d = doc("hardware.Loxone");
+        let names = BTreeSet::new();
+        let mut files = Files::default();
+        let mut l = Lockfile::default();
+        let lock = lock_of(&l);
+        let ctx = ctx_of(&d, &d, &lock, None, &names);
+        apply_op(
+            &mut files,
+            &ctx,
+            &add(HW_TREE, "TreeDevice", None, &[], &[("kind", "TouchTree")]),
+        )
+        .unwrap();
+        let out = compile_files(&d, &files, &mut l).unwrap();
+        let dev = l.externals["vx_touchtree_1"].uuid.clone();
+        let ai1 = io_of(&out, &dev, "AI1");
+        // The lock does not know the I/O's declaration yet: on, off, then
+        // Revert in one request each see the one before.
+        let lock = lock_of(&l);
+        let ctx = ctx_of(&out, &d, &lock, None, &names);
+        let mut f = files.clone();
+        let a = apply_op(&mut f, &ctx, &stats(&ai1, Some("on"))).unwrap();
+        assert_eq!(a.previous, serde_json::Value::Null);
+        let b = apply_op(&mut f, &ctx, &stats(&ai1, Some("off"))).unwrap();
+        assert_eq!(b.previous, serde_json::json!("on"));
+        assert_eq!(f.hardware.ios.len(), 1);
+        let c = apply_op(&mut f, &ctx, &stats(&ai1, None)).unwrap();
+        assert_eq!(c.previous, serde_json::json!("off"));
+        assert!(f.hardware.ios.is_empty(), "{:?}", f.hardware.ios);
+        // And on again: not "taken" by the claim dropped a moment ago.
+        apply_op(&mut f, &ctx, &stats(&ai1, Some("on"))).unwrap();
+        assert_eq!(f.hardware.ios[0].slug, "vx_touchtree_1_ai1");
+        assert_eq!(f.hardware.ios[0].ty, "TreeAsensor");
+
+        // A designation that is no identifier is refused, as add_block would.
+        let xml = String::from_utf8(out.to_bytes())
+            .unwrap()
+            .replace("IName=\"AI1\"", "IName=\"A-1\"");
+        let odd = LoxoneDoc::parse(xml.as_bytes()).unwrap();
+        let ctx = ctx_of(&odd, &d, &lock, None, &names);
+        let e = apply_op(&mut files.clone(), &ctx, &stats(&ai1, Some("on"))).unwrap_err();
+        assert!(e.contains("letters and digits"), "{e}");
+
+        // Its undo carries each I/O's type: one left out, or another, is refused.
+        let ctx = ctx_of(&d, &d, &lock, None, &names);
+        for (settings, why) in [
+            (vec![("I1.Statistics", "on")], "go together"),
+            (
+                vec![("I1.Statistics", "on"), ("I1.Type", "VoltageIn")],
+                "not \"VoltageIn\"",
+            ),
+            (vec![("I-1.Statistics", "on")], "cannot be set here"),
+        ] {
+            let mut all = vec![("kind", "TouchTree")];
+            all.extend(settings);
+            let e = apply_op(
+                &mut files.clone(),
+                &ctx,
+                &add(HW_TREE, "TreeDevice", None, &[], &all),
+            )
+            .unwrap_err();
+            assert!(e.contains(why), "{why}: {e}");
+        }
+        // A restore is a Tree device's only by the lockfile's tombstone.
+        assert!(!crate::hw_edit::restores_device(&ctx, &dev));
+    }
+
+    #[test]
+    fn the_hardware_file_takes_only_what_vislox_writes() {
+        for text in [
+            "a = And()\n",
+            "extern x = LoxTree(serial: \"13000001\")\n",
+            "vx_x = TreeDevice(\"T\", serial: \"B0\")\n",
+            "vx_hw_1 = TreeDevice(uuid: \"1\")\nvx_y = TreeSensor(device: vx_hw_1, uuid: \"2\", MinTime: 5)\n",
+            "vx_y = TreeSensor(device: vx_nope, iname: \"I1\", Statistics: on)\n",
+            "vx_d = TreeDevice(kind: \"TouchTree\", tree: vx_hw_nope)\n",
+        ] {
+            assert!(crate::hw_edit::HwFile::parse(text).is_err(), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_tree_device_is_created_unpaired_and_taken_out_or_deleted() {
+        let d = doc("hardware.Loxone");
+        let names = BTreeSet::new();
+        let mut files = Files::default();
+        let mut l = Lockfile::default();
+        let lock = lock_of(&l);
+        let ctx = ctx_of(&d, &d, &lock, None, &names);
+        let new = add(
+            HW_TREE,
+            "TreeDevice",
+            Some("Melder Flur"),
+            &[],
+            &[("kind", "PresenceSensorTree"), ("branch", "left")],
+        );
+        // Refused, changing nothing: a kind lox does not create, a branch it
+        // does not know, somewhere that is no Tree extension, a setting.
+        for (op, why) in [
+            (
+                add(HW_TREE, "TreeDevice", None, &[], &[("kind", "Banana")]),
+                "cannot create a Banana",
+            ),
+            (
+                add(
+                    HW_TREE,
+                    "TreeDevice",
+                    None,
+                    &[],
+                    &[("kind", "TouchTree"), ("branch", "middle")],
+                ),
+                "left or right",
+            ),
+            (
+                add(HW_TOUCH, "TreeDevice", None, &[], &[("kind", "TouchTree")]),
+                "no Tree extension",
+            ),
+            (
+                add(
+                    HW_TREE,
+                    "TreeDevice",
+                    None,
+                    &[],
+                    &[("kind", "TouchTree"), ("Serial", "1")],
+                ),
+                "cannot be set here",
+            ),
+        ] {
+            let mut f = files.clone();
+            let e = apply_op(&mut f, &ctx, &op).unwrap_err();
+            assert!(e.contains(why), "{why}: {e}");
+            assert_eq!(f, files);
+        }
+        let r = apply_op(&mut files, &ctx, &new).unwrap();
+        assert_eq!(r.added.as_deref(), Some("vx_presencesensortree_1"));
+        let text = files.render()[crate::hw_edit::FILE].clone();
+        let tree = crate::hw_edit::hw_slug(HW_TREE);
+        assert!(
+            text.contains(&format!(
+                "vx_presencesensortree_1 = TreeDevice(\"Melder Flur\", kind: \
+                 \"PresenceSensorTree\", tree: {tree}, branch: \"left\")\n"
+            )),
+            "{text}"
+        );
+        let out = compile_files(&d, &files, &mut l).unwrap();
+        let dev = l.externals["vx_presencesensortree_1"].uuid.clone();
+        let el = find_ci(&out.xml.root, &dev).unwrap();
+        assert_eq!(el.attr("Serial"), Some("00000000"));
+        assert_eq!(el.attr_decoded("Title").unwrap(), "Melder Flur");
+
+        // Its statistics by its designation: lox mints its I/O anew on each compile.
+        let lock = lock_of(&l);
+        let ctx = ctx_of(&out, &d, &lock, None, &names);
+        let i1 = io_of(&out, &dev, "I1");
+        apply_op(&mut files, &ctx, &stats(&i1, Some("on"))).unwrap();
+        assert!(files.render()[crate::hw_edit::FILE].contains(
+            "vx_presencesensortree_1_i1 = TreeSensor(device: vx_presencesensortree_1, \
+                 iname: \"I1\", Statistics: on)\n"
+        ));
+        // Its name is its declaration's; the rest waits for Apply.
+        apply_op(
+            &mut files,
+            &ctx,
+            &Op::Title {
+                uuid: dev.clone(),
+                value: Some("Melder Diele".into()),
+            },
+        )
+        .unwrap();
+        let e = apply_op(
+            &mut files.clone(),
+            &ctx,
+            &Op::Title {
+                uuid: i1.clone(),
+                value: Some("Bewegung".into()),
+            },
+        )
+        .unwrap_err();
+        assert!(e.contains("not in the project's base"), "{e}");
+        let out = compile_files(&d, &files, &mut l).unwrap();
+        assert_eq!(
+            find_ci(&out.xml.root, &dev)
+                .unwrap()
+                .attr_decoded("Title")
+                .unwrap(),
+            "Melder Diele"
+        );
+        assert_eq!(
+            stats_type(&out, &io_of(&out, &dev, "I1")).as_deref(),
+            Some("7")
+        );
+
+        // Not deployed: taken out, and added again by its undo with what it had.
+        let lock = lock_of(&l);
+        let ctx = ctx_of(&out, &d, &lock, None, &names);
+        let r = apply_op(&mut files, &ctx, &Op::RemoveBlock { uuid: dev.clone() }).unwrap();
+        let again: Op = serde_json::from_value(r.previous).unwrap();
+        let mut want = add(
+            HW_TREE,
+            "TreeDevice",
+            Some("Melder Diele"),
+            &[],
+            &[
+                ("kind", "PresenceSensorTree"),
+                ("branch", "left"),
+                ("I1.Statistics", "on"),
+                ("I1.Type", "TreeSensor"),
+            ],
+        );
+        if let Op::AddBlock { restores, .. } = &mut want {
+            *restores = Some(dev.clone());
+        }
+        assert_eq!(again, want);
+        assert!(files.hardware.devices.is_empty(), "{:?}", files.hardware);
+        assert!(files.hardware.removed.contains("vx_presencesensortree_1"));
+        let gone = compile_files(&d, &files, &mut l).unwrap();
+        assert!(find_ci(&gone.xml.root, &dev).is_none());
+        let lock = lock_of(&l);
+        let ctx = ctx_of(&gone, &d, &lock, None, &names);
+        // The `removed` line is done: lox forgot the device.
+        assert_eq!(
+            files.stale_lines(&lock),
+            ["removed vx_presencesensortree_1"]
+        );
+        files.tidy(&lock);
+        let r = apply_op(&mut files, &ctx, &again).unwrap();
+        assert_eq!(r.added.as_deref(), Some("vx_presencesensortree_1"));
+        let out = compile_files(&d, &files, &mut l).unwrap();
+        let dev = l.externals["vx_presencesensortree_1"].uuid.clone();
+
+        // Deployed, with a wire Loxone Config drew from it into a block:
+        // refused, as lox would keep the device.
+        let lock = lock_of(&l);
+        let ctx = ctx_of(&out, &d, &lock, None, &names);
+        apply_op(&mut files, &ctx, &add(HW_PAGE, "And", None, &[], &[])).unwrap();
+        let base = compile_files(&d, &files, &mut l).unwrap();
+        let and = l.objects["vx_and_1"].uuid.clone();
+        let q = find_ci(&base.xml.root, &io_of(&base, &dev, "I1"))
+            .unwrap()
+            .child_elements()
+            .find(|c| c.attr("K") == Some("Q"))
+            .and_then(|c| c.attr("U"))
+            .unwrap()
+            .to_string();
+        let i1 = find_ci(&base.xml.root, &and)
+            .unwrap()
+            .child_elements()
+            .find(|c| c.attr("K") == Some("I1"))
+            .and_then(|c| c.attr("U"))
+            .unwrap()
+            .to_string();
+        let xml = String::from_utf8(base.to_bytes()).unwrap().replace(
+            &format!("<Co K=\"I1\" U=\"{i1}\"/>"),
+            &format!("<Co K=\"I1\" U=\"{i1}\"><In Input=\"{q}\"/></Co>"),
+        );
+        let drawn = LoxoneDoc::parse(xml.as_bytes()).unwrap();
+        assert_eq!(drawn.wires().len(), 1);
+        let lock = lock_of(&l);
+        let ctx = ctx_of(&drawn, &drawn, &lock, Some(&drawn), &names);
+        let e = apply_op(
+            &mut files.clone(),
+            &ctx,
+            &Op::RemoveBlock { uuid: dev.clone() },
+        )
+        .unwrap_err();
+        assert!(e.contains("wired to a block"), "{e}");
+        assert_eq!(
+            delete_refusals(&files, &ctx, std::slice::from_ref(&dev))[0].as_deref(),
+            Some(e.as_str())
+        );
+        let was = identity(&base, &dev);
+
+        // Deleted with `removed`, and brought back under its UUID.
+        let lock = lock_of(&l);
+        let ctx = ctx_of(&base, &base, &lock, Some(&base), &names);
+        assert_eq!(
+            delete_refusals(&files, &ctx, std::slice::from_ref(&dev))[0],
+            None
+        );
+        let r = apply_op(&mut files, &ctx, &Op::RemoveBlock { uuid: dev.clone() }).unwrap();
+        let back: Op = serde_json::from_value(r.previous).unwrap();
+        assert!(matches!(back, Op::RestoreBlock { .. }), "{back:?}");
+        assert!(files.render()[crate::hw_edit::FILE].contains("removed vx_presencesensortree_1\n"));
+        let gone = compile_files(&base, &files, &mut l).unwrap();
+        assert!(find_ci(&gone.xml.root, &dev).is_none());
+        let lock = lock_of(&l);
+        assert_eq!(
+            lock.tomb(&dev).map(|t| t.1),
+            Some("vx_presencesensortree_1")
+        );
+        assert_eq!(
+            files.stale_lines(&lock),
+            ["removed vx_presencesensortree_1"]
+        );
+        files.tidy(&lock);
+        // A forged restore is refused: another slug, another device.
+        let ctx = ctx_of(&gone, &base, &lock, Some(&base), &names);
+        let mut forged = back.clone();
+        if let Op::RestoreBlock { source, .. } = &mut forged {
+            *source = source.replace("vx_presencesensortree_1", "vx_other");
+        }
+        assert!(apply_op(&mut files.clone(), &ctx, &forged).is_err());
+        let r = apply_op(&mut files, &ctx, &back).unwrap();
+        assert_eq!(
+            serde_json::from_value::<Op>(r.previous).unwrap(),
+            Op::RemoveBlock { uuid: dev.clone() }
+        );
+        l = edit_lock(&l, &files.lock_edits);
+        files.lock_edits = Default::default();
+        let again = compile_files(&base, &files, &mut l).unwrap();
+        assert_eq!(identity(&again, &dev), was);
+        assert!(l.removed.is_empty(), "{:?}", l.removed);
     }
 }

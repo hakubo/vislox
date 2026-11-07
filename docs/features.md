@@ -382,6 +382,15 @@ sends to the Miniserver see [miniserver.md](miniserver.md).
   (with each command of a device added with it) and a changed setting old → new. Nothing is sent to the device.
   Adopting one Loxone Config made is not offered yet. How: [editing.md](editing.md#virtual-inputs-virtual-and-modbus-devices-84).
 
+- **Tree and Air hardware** (the same project and token, #85): *Edit values* on a Tree or Air input, digital output
+  or analog sensor switches its *Statistics* on or off (shown read-only on every revision, old → new when comparing).
+  *Add* on a Tree extension of the project tree creates a Tree device lox can create (Touch Tree, Presence Sensor
+  Tree, LED Ceiling Light RGBW Tree, Valve Actuator Tree) on the left or right branch, unpaired: the tree tags it
+  *unpaired*, Properties and Apply's confirmation say to pair it with a Tree search in Loxone Config. It is taken out
+  or deleted with Remove/Delete, and Undo brings it back (with its UUID once deployed); one with a wire is not
+  deleted. vislox writes `<module>/vislox/_hardware.loxl`. Pairing, search and firmware stay in Loxone Config. How:
+  [editing.md](editing.md#tree-and-air-hardware-85).
+
 - **Delete and rename managed blocks** (the same project and token, #80): Properties of a block added or adopted
   here shows its slug with *Rename* and, once deployed or adopted, *Delete*. *Rename* rewrites the slug in vislox's
   files with lox's own rename and adds `moved <old> -> <new>`: the block keeps its UUIDs and the config does not

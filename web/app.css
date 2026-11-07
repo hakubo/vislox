@@ -972,3 +972,5 @@ rect.ghost, line.ghost { fill: #1f6fd10a; stroke: var(--moved); stroke-opacity: 
 /* Add on a folder or device of the object tree (#84). */
 .tn-add + .badge, .tn-add + .tn-n { margin-left: 6px; }
 .tn-add:disabled { opacity: .5; cursor: default; }
+/* A Tree device created here and not paired yet (#85). */
+.tn-tag { margin-left: 6px; padding: 0 5px; border-radius: 8px; font-size: 11px; color: var(--changed); border: 1px solid currentColor; flex: none; }

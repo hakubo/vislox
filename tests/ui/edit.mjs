@@ -120,6 +120,17 @@ const VI_F = "10000000-0000-0002-ffff504f94000001", NET_F = "7e000001-0000-0000-
 const periphXml = `\t\t<C Type="VirtualOutCaption" V="178" U="7e000000-0000-0000-ffff504f94000001" Title="Virtuelle Ausgänge">\n\t\t</C>\n` +
   `\t\t<C Type="WeatherCaption" V="178" U="${NET_F}" Title="Netzwerkperipherie">\n` +
   `\t\t\t<C Type="ModbusServer" V="178" U="${WP}" Title="Wärmepumpe" Cl="0,0,0" WF="16384" Address="192.0.2.12:502" Timeout="2000">\n\t\t\t</C>\n\t\t</C>\n`;
+// Tree hardware (#85): a Tree Extension (HW_T) with a Touch Tree (HW_D) whose temperature (HW_A) records no
+// statistics and whose first touch zone (HW_S) records them (StatsType 7).
+const HW_T = "7f000001-0000-0000-ffff504f94000001", HW_D = "7f000002-0000-0000-ffff504f94000001";
+const HW_A = "7f000003-0000-0000-ffff504f94000001", HW_S = "7f000004-0000-0000-ffff504f94000001";
+const hwXml = `\t\t<C Type="LoxTree" V="178" U="${HW_T}" Title="Tree Extension" WF="16384" Serial="13000001">
+\t\t\t<C Type="TreeDevice" TId="TouchTree" V="178" U="${HW_D}" Title="Touch Bad" WF="16384" Serial="B0B0B001" SubType="32771" TreeType="32771">
+\t\t\t\t<C Type="TreeAsensor" IName="AI1" V="178" U="${HW_A}" Title="Temperatur Bad" Nio="2" WF="16400" Analog="true"><Co K="AQ" U="7f000003-0000-0001-ffff504f94000001"/></C>
+\t\t\t\t<C Type="TreeSensor" IName="I1" V="178" U="${HW_S}" Title="Taste Bad" Nio="2" WF="16384" StatsType="7"><Co K="Q" U="7f000004-0000-0001-ffff504f94000001"/></C>
+\t\t\t</C>
+\t\t</C>
+`;
 const KITCHEN = "30000a01-0000-0000-ffff504f94000001", BATH = "30000a02-0000-0000-ffff504f94000001";
 // Two analog Daytimers on the upper floor (#73): Uhr, on Mondays 06:30–08:00 and in the Party mode 18:00–23:00,
 // and Heizung, with no switching times; and Licht, a digital one.
@@ -236,8 +247,9 @@ const base0 = readFileSync(fixture, "utf8").replace('<Co K="Q" U="10000009-0000-
     "\t\t</C>\n" + zeitenXml + konstXml + ausdruckXml + vorlagenXml + "\t</C>\n</ControlList>");
 const base = base0.replace(`\t\t<C Type="Place" V="178" U="${KITCHEN}"`, `${flexXml}\t\t<C Type="Place" V="178" U="${KITCHEN}"`)
   .replace(`\t\t<C Type="Page" V="178" U="${MELDUNGEN}"`, `${beschXml}\t\t<C Type="Page" V="178" U="${MELDUNGEN}"`)
-  .replace('\t\t<C Type="ModeCaption"', `${periphXml}\t\t<C Type="ModeCaption"`);
+  .replace('\t\t<C Type="ModeCaption"', `${periphXml}${hwXml}\t\t<C Type="ModeCaption"`);
 assert.ok(base.includes(WP), "the Modbus server is in the base");
+assert.ok(base.includes(HW_A), "the Tree Extension is in the base");
 assert.ok(base.includes(FLEX) && base.includes(OST), "the Touch Pure Flex is in the base");
 assert.ok(base.includes(lagerUuid(LAGER_N - 1)), "the Lager page is in the base");
 writeFileSync(join(dir, "base.Loxone"), base);
@@ -587,7 +599,7 @@ if (fs.existsSync("pages/vislox/_periphery.loxl")) {
   }
 }
 for (const f of fs.existsSync("pages/vislox") ? fs.readdirSync("pages/vislox") : []) {
-  if (f === "edits.loxl" || f === "templates.loxl" || f === "_periphery.loxl" || !f.endsWith(".loxl")) continue;
+  if (f === "edits.loxl" || f === "templates.loxl" || f === "_periphery.loxl" || f === "_hardware.loxl" || !f.endsWith(".loxl")) continue;
   let pageAt = -1, instancing = false;
   for (const line of fs.readFileSync("pages/vislox/" + f, "utf8").split("\\n")) {
     let m;
@@ -830,7 +842,50 @@ for (const line of src.split("\\n")) {
   const srcU = out[from].match(/U="([^"]+)"/)[1];
   out[to] = out[to].replace(/\\/>$/, \`><In Input="\${srcU}"/></Co>\`);
 }
-fs.writeFileSync(lockFile, JSON.stringify(removed ? { objects, removed } : { objects }));
+// Tree and Air hardware (#85): vislox's _hardware.loxl. A created device (\`kind:\`) goes below its Tree extension,
+// unpaired (Serial="00000000"), with one digital input I1, its UUID kept by slug in the lock's externals and
+// hardware; one the file leaves out without \`removed\` is refused, as lox refuses it. \`Statistics: on\` writes the
+// StatsType its type records with (an analog sensor's 11, else 7), \`off\` removes it.
+const externals = {}, hardware = {};
+{
+  const hw = {}, text = fs.existsSync("pages/vislox/_hardware.loxl") ? fs.readFileSync("pages/vislox/_hardware.loxl", "utf8") : "";
+  for (const [slug, e] of Object.entries(lock.externals || {})) {
+    if (e.matched_by === "created" && !new RegExp(\`^(\${slug} = |removed \${slug}$)\`, "m").test(text)) {
+      console.error(\`error: compile error: \\\`\${slug}\\\` created the Tree device \${e.uuid}, and the source no longer declares it. To delete the device, add \\\`removed \${slug}\\\`\`);
+      process.exit(1);
+    }
+  }
+  for (const line of text.split("\\n")) {
+    let m;
+    if ((m = line.match(/^extern (vx_\\w+) = LoxTree\\(uuid: "([^"]+)"\\)$/))) { hw[m[1]] = m[2]; continue; }
+    if (!(m = line.match(/^(vx_\\w+) = (\\w+)\\((.*)\\)$/))) continue;
+    const [, slug, ty, rest] = m;
+    const kind = rest.match(/kind: "(\\w+)"/), byU = rest.match(/uuid: "([^"]+)"/);
+    if (kind) {
+      const tree = hw[rest.match(/tree: (\\w+)/)[1]];
+      const uuid = lock.externals?.[slug]?.uuid || \`ffffff\${String(++n).padStart(2, "0")}-0000-0000-ffff504f94000001\`;
+      const title = rest.match(/^"((?:[^"\\\\]|\\\\.)*)"/);
+      const i = out.findIndex((l) => l.includes(\`U="\${tree}"\`) && l.includes("<C "));
+      out.splice(i + 1, 0, \`\\t\\t\\t<C Type="TreeDevice" TId="\${kind[1]}" V="178" U="\${uuid}" Title="\${xml(title ? JSON.parse('"' + title[1] + '"') : kind[1])}" WF="16384" Serial="00000000">\`,
+        \`\\t\\t\\t\\t<C Type="TreeSensor" IName="I1" V="178" U="\${uuid.slice(0, 9)}0000-0001-ffff504f94000001" Title="Motion" Nio="2"><Co K="Q" U="\${uuid.slice(0, 9)}0000-0002-ffff504f94000001"/></C>\`, "\\t\\t\\t</C>");
+      hw[slug] = uuid;
+      externals[slug] = { uuid, matched_by: "created", owned: true };
+      hardware[slug] = uuid;
+    } else if (byU && !rest.includes("device:")) {
+      hw[slug] = byU[1];
+      externals[slug] = { uuid: byU[1], matched_by: "uuid", owned: true };
+    } else {
+      const dev = hw[rest.match(/device: (\\w+)/)[1]], iname = rest.match(/iname: "(\\w+)"/);
+      const d = out.findIndex((l) => l.includes(\`U="\${dev}"\`) && l.includes("<C "));
+      const i = byU ? out.findIndex((l) => l.includes(\`U="\${byU[1]}"\`) && l.includes("<C ")) : out.findIndex((l, x) => x > d && l.includes(\`IName="\${iname[1]}"\`));
+      const st = rest.match(/Statistics: (on|off)/);
+      if (st) out[i] = out[i].replace(/ StatsType="[^"]*"/, "").replace(/^(\\s*<C [^>]*?)(\\/?>)/, st[1] === "on" ? \`$1 StatsType="\${ty.includes("Asensor") ? 11 : 7}"$2\` : "$1$2");
+      externals[slug] = { uuid: out[i].match(/U="([^"]+)"/)[1], matched_by: byU ? "uuid" : "iname", owned: true };
+    }
+  }
+}
+const hwLock = { ...(Object.keys(externals).length ? { externals } : {}), ...(Object.keys(hardware).length ? { hardware } : {}) };
+fs.writeFileSync(lockFile, JSON.stringify(removed ? { objects, removed, ...hwLock } : { objects, ...hwLock }));
 if (lockAt < 0) fs.writeFileSync(mintFile, String(n));
 const to = process.argv.indexOf("--out");
 fs.writeFileSync(to > 0 ? process.argv[to + 1] : "out.Loxone", out.join("\\n"));
@@ -2939,6 +2994,90 @@ try {
     await undoKey(false, () => !S.edits?.blocks.some((b) => b.slug === "vx_virtualhttpincmd_1"));
     await undoKey(false, () => !S.edits?.blocks.some((b) => b.slug === "vx_virtualhttpin_1"));
     assert.doesNotMatch(pfile(), /= Virtual/);
+  });
+  await step("statistics are switched on a Tree input, and a Tree device is created unpaired and taken out (#85)", async () => {
+    await settled();
+    const send = async (act, what) => {
+      const n = edits.length;
+      await act();
+      await until(() => edits.length > n && statuses[n] !== undefined, what);
+      assert.equal(statuses[n], 200, what);
+      await settled();
+      return edits[n].ops;
+    };
+    const hfile = () => { const p = join(dir, "pages", "vislox", "_hardware.loxl"); return existsSync(p) ? readFileSync(p, "utf8") : ""; };
+    const row = (u) => `#tree .tn-row[data-uuid="${u}"]`;
+    const hwSlug = (u) => `vx_hw_${u.replace(/-/g, "_")}`;
+    // The temperature records nothing; the touch zone does, read-only on any revision.
+    await page.evaluate((u) => { select(u); revealInTree(u); }, HW_S);
+    await waitText("#props", /Statistics\s*on/);
+    await page.evaluate((u) => { select(u); revealInTree(u); }, HW_A);
+    await waitText("#props", /Statistics\s*off/);
+    await page.waitForSelector('#props [data-ed="open"]');
+    await page.click('#props [data-ed="open"]');
+    assert.equal(await page.inputValue(field("statistics")), "off");
+    await page.selectOption(field("statistics"), "on");
+    let ops = await send(() => page.click('#props [data-ed="save"]'), "switch statistics on");
+    assert.deepEqual(ops, [{ op: "statistics", uuid: HW_A, value: "on" }]);
+    assert.match(hfile(), new RegExp(`^${hwSlug(HW_D)} = TreeDevice\\(uuid: "${HW_D}"\\)$`, "m"));
+    assert.match(hfile(), new RegExp(`^${hwSlug(HW_A)} = TreeAsensor\\(device: ${hwSlug(HW_D)}, uuid: "${HW_A}", Statistics: on\\)$`, "m"));
+    // Pending: on in the config, not deployed, with Revert; the Changes list names it.
+    await waitText("#props", /Statistics\s*off\s*on/);
+    await page.waitForSelector('#props [data-ed="revert"]');
+    await waitText("#changes", /Temperatur Bad/);
+    ops = await send(() => page.click('#props [data-ed="revert"]'), "revert the statistics");
+    assert.deepEqual(ops, [{ op: "statistics", uuid: HW_A, value: null }]);
+    assert.equal(hfile(), "");
+    // The Tree Extension offers Add, for a Tree device of the kinds lox creates.
+    await page.evaluate((u) => revealInTree(u), HW_T);
+    await page.waitForSelector(`${row(HW_T)} [data-add-under]:not([disabled])`);
+    await page.click(`${row(HW_T)} [data-add-under]`);
+    await page.waitForSelector("#ab-q");
+    assert.deepEqual(await page.$$eval("#ab-list [role=option] .ac", (n) => n.map((x) => x.textContent)), ["TreeDevice"]);
+    await page.press("#ab-q", "Enter");
+    await page.waitForSelector('#ab-body [data-ab-field="s:kind"]');
+    assert.deepEqual(await page.$$eval('#ab-body [data-ab-field="s:kind"] option', (n) => n.map((x) => x.value).filter(Boolean)), ["TouchTree", "PresenceSensorTree", "CorridorLightTree", "ValveTree"]);
+    await page.fill('#ab-body [data-ab-field="title"]', "Melder Flur");
+    await page.selectOption('#ab-body [data-ab-field="s:kind"]', "PresenceSensorTree");
+    await page.selectOption('#ab-body [data-ab-field="s:branch"]', "left");
+    ops = await send(() => page.click('#ab-body [data-ab="add"]'), "add a Tree device");
+    assert.deepEqual(ops, [{ op: "add_block", page: HW_T, type: "TreeDevice", title: "Melder Flur", params: {}, settings: { kind: "PresenceSensorTree", branch: "left" } }]);
+    assert.match(hfile(), new RegExp(`^extern ${hwSlug(HW_T)} = LoxTree\\(uuid: "${HW_T}"\\)$`, "m"));
+    assert.match(hfile(), new RegExp(`^vx_presencesensortree_1 = TreeDevice\\("Melder Flur", kind: "PresenceSensorTree", tree: ${hwSlug(HW_T)}, branch: "left"\\)$`, "m"));
+    // Selected, marked unpaired in the tree and in Properties, added here and not deployed.
+    const dev = await (await page.waitForFunction(() => S.edits?.blocks?.find((b) => b.slug === "vx_presencesensortree_1")?.uuid, null, { timeout: 20000 })).jsonValue();
+    await page.waitForFunction((u) => ciEq(S.sel, u), dev);
+    await page.waitForSelector(`${row(dev)} .tn-tag`);
+    assert.equal(await page.textContent(`${row(dev)} .tn-tag`), "unpaired");
+    await waitText("#props", /Pairing\s*Created here, not paired/);
+    await waitText('[data-body="Edit"]', /added here[\s\S]*not deployed/);
+    assert.equal(await page.$('#props [data-ed="rename-open"]'), null);
+    // Its input's statistics: by its designation, the only value it takes before Apply.
+    const i1 = dev.slice(0, 9) + "0000-0001-ffff504f94000001";
+    await page.evaluate((u) => { select(u); revealInTree(u); }, i1);
+    await page.waitForSelector('#props [data-ed="open"]');
+    await page.click('#props [data-ed="open"]');
+    assert.deepEqual(await page.$$eval("#props [data-ed-field]", (n) => n.map((x) => x.dataset.edField)), ["statistics"]);
+    await page.selectOption(field("statistics"), "on");
+    ops = await send(() => page.click('#props [data-ed="save"]'), "statistics of the new device's input");
+    assert.deepEqual(ops, [{ op: "statistics", uuid: i1, value: "on" }]);
+    assert.match(hfile(), /^vx_presencesensortree_1_i1 = TreeSensor\(device: vx_presencesensortree_1, iname: "I1", Statistics: on\)$/m);
+    // Taken out: \`removed\`, since lox keeps it from its first compile on; undone, it comes back as it was.
+    await page.evaluate((u) => { select(u); revealInTree(u); }, dev);
+    await page.waitForSelector('#props [data-ed="remove"]:not([disabled])');
+    ops = await send(() => page.click('#props [data-ed="remove"]'), "take the device out");
+    assert.deepEqual(ops, [{ op: "remove_block", uuid: dev }]);
+    assert.doesNotMatch(hfile(), /= TreeDevice\(/);
+    assert.match(hfile(), /^removed vx_presencesensortree_1$/m);
+    await undoKey(false, () => S.edits?.blocks.some((b) => b.hardware && b.uuid));
+    assert.match(hfile(), /= TreeDevice\("Melder Flur", kind: "PresenceSensorTree"/);
+    assert.match(hfile(), /_i1 = TreeSensor\(device: vx_presencesensortree_\d, iname: "I1", Statistics: on\)$/m);
+    // Taken out again, for the steps after this one.
+    const back = await page.evaluate(() => S.edits.blocks.find((b) => b.hardware && b.uuid).uuid);
+    await page.evaluate((u) => { select(u); revealInTree(u); }, back);
+    await page.waitForSelector('#props [data-ed="remove"]:not([disabled])');
+    await send(() => page.click('#props [data-ed="remove"]'), "take the device out again");
+    assert.doesNotMatch(hfile(), /= TreeDevice\(/);
   });
   await step("nothing was deployed: lox only compiled, checked, linted and tested", async () => {
     const ran = readFileSync(calls, "utf8").trim().split("\n");
