@@ -22,7 +22,7 @@ use crate::edit::Lock;
 use crate::managed::{Declarations, bindings, code, template_bodies};
 use loxone_config::LoxoneDoc;
 use loxone_config::logic::{
-    ArgItem, Attr, BindingKind, Expr, Item, MatchSpec, Module, Operand, Value,
+    ArgItem, Attr, BindingKind, CmpOp, Expr, Item, MatchSpec, Module, Operand, Value,
 };
 use loxone_config::port_names;
 use loxone_config::xml::Element;
@@ -47,7 +47,7 @@ pub const TYPES: &[&str] = &[
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Expression {
     /// The prefix of its blocks' slugs: `<sink>_<port key>__` or
-    /// `<signal>__`. Unique in a module lox compiles.
+    /// `<signal>__`; a second expression on one prefix is `<prefix>#2`.
     pub id: String,
     /// `wire` (`x.Port <- …`), `argument` (`Port: …` in a declaration) or
     /// `signal` (`slug = …`).
@@ -74,8 +74,12 @@ pub struct Expression {
     pub top_type: Option<&'static str>,
     /// The UUIDs of its blocks, the top one first.
     pub blocks: Vec<String>,
-    /// What the deployed revision had: filled in by [`deployed`].
+    /// What the deployed revision had: filled in by [`compare`].
     pub deployed: Option<Deployed>,
+    /// The pending config's top label read back as Lox Logic, as
+    /// `deployed.text` is: the two compare like with like.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub now: Option<String>,
     /// Whether that differs from what it is now (a new expression, a
     /// changed one, a new label).
     pub pending: bool,
@@ -91,6 +95,11 @@ pub struct Deployed {
     pub text: String,
     /// The UUIDs of its blocks then, the top one first.
     pub blocks: Vec<String>,
+    /// The chain as compiled: each block's type, label and attributes and
+    /// what feeds each of its connectors, its own blocks by structure (they
+    /// get new UUIDs), the rest by UUID and connector.
+    #[serde(skip)]
+    pub shape: String,
 }
 
 /// The label lox gives an expression's block (`desugar::expr_label`).
@@ -109,38 +118,67 @@ pub fn unlabel(label: &str) -> String {
         .replace('％', "%")
 }
 
-/// The slug operator of an expression node lox makes a block for, and the
-/// block counts per operator, post-order, as lox's desugar walks it; `None`
-/// for a bare operand (no block).
-fn walk(e: &Expr, counts: &mut BTreeMap<&'static str, usize>) -> Option<&'static str> {
-    let op = match e {
-        Expr::And(a, b) | Expr::Or(a, b) => {
-            walk(a, counts);
-            walk(b, counts);
-            if matches!(e, Expr::And(..)) {
-                "and"
-            } else {
-                "or"
+/// The slugs lox gives the blocks of expression `e`, post-order, as its
+/// desugar emits them: `<prefix><op><n>` with one counter per operator
+/// shared by every expression of the prefix (`counters`), except a named
+/// signal's top block, which takes the signal's slug and no number. The top
+/// block's slug comes last.
+fn slugs(
+    e: &Expr,
+    prefix: &str,
+    signal: Option<&str>,
+    counters: &mut BTreeMap<(String, &'static str), usize>,
+) -> Vec<String> {
+    fn node(
+        e: &Expr,
+        root: bool,
+        prefix: &str,
+        signal: Option<&str>,
+        counters: &mut BTreeMap<(String, &'static str), usize>,
+        out: &mut Vec<String>,
+    ) {
+        let op = match e {
+            Expr::And(a, b) | Expr::Or(a, b) => {
+                node(a, false, prefix, signal, counters, out);
+                node(b, false, prefix, signal, counters, out);
+                if matches!(e, Expr::And(..)) {
+                    "and"
+                } else {
+                    "or"
+                }
             }
+            Expr::Not(x) => {
+                node(x, false, prefix, signal, counters, out);
+                "not"
+            }
+            Expr::Cmp { .. } if e.is_formula() => "f",
+            Expr::Cmp { op, .. } => match op {
+                CmpOp::Ge => "ge",
+                CmpOp::Gt => "gt",
+                CmpOp::Le => "le",
+                CmpOp::Lt => "lt",
+                CmpOp::Eq => "eq",
+                CmpOp::Ne => "ne",
+            },
+            Expr::Arith { .. } => "f",
+            // lox makes the Formula of the inner expression: never the root's.
+            Expr::Atom(Operand::Arith(x)) => {
+                node(x, false, prefix, signal, counters, out);
+                return;
+            }
+            Expr::Atom(_) => return,
+        };
+        if root && let Some(s) = signal {
+            out.push(s.to_string());
+            return;
         }
-        Expr::Not(x) => {
-            walk(x, counts);
-            "not"
-        }
-        Expr::Cmp { .. } if e.is_formula() => "f",
-        Expr::Cmp { op, .. } => match op {
-            loxone_config::logic::CmpOp::Ge => "ge",
-            loxone_config::logic::CmpOp::Gt => "gt",
-            loxone_config::logic::CmpOp::Le => "le",
-            loxone_config::logic::CmpOp::Lt => "lt",
-            loxone_config::logic::CmpOp::Eq => "eq",
-            loxone_config::logic::CmpOp::Ne => "ne",
-        },
-        Expr::Arith { .. } | Expr::Atom(Operand::Arith(_)) => "f",
-        Expr::Atom(_) => return None,
-    };
-    *counts.entry(op).or_insert(0) += 1;
-    Some(op)
+        let n = counters.entry((prefix.to_string(), op)).or_insert(0);
+        *n += 1;
+        out.push(format!("{prefix}{op}{n}"));
+    }
+    let mut out = Vec::new();
+    node(e, true, prefix, signal, counters, &mut out);
+    out
 }
 
 /// One file parsed, with its lines.
@@ -217,13 +255,15 @@ pub fn expressions<T: AsRef<str>>(
         }
     }
     // Expression-owned entries of the lock, by slug.
-    let owned: Vec<(&str, &str)> = lock
+    let owned: BTreeMap<&str, &str> = lock
         .entries
         .iter()
         .filter(|(_, e)| e.get("expr_owned").and_then(|x| x.as_bool()) == Some(true))
         .filter_map(|(s, e)| Some((s.as_str(), e.get("uuid")?.as_str()?)))
         .collect();
     let mut counters: BTreeMap<(String, &'static str), usize> = BTreeMap::new();
+    // Expressions per prefix so far: a second one's id is `<prefix>#2`.
+    let mut seen: BTreeMap<String, usize> = BTreeMap::new();
     let mut out = Vec::new();
     for p in &parsed {
         let mut add = |kind: &'static str,
@@ -233,32 +273,27 @@ pub fn expressions<T: AsRef<str>>(
                        signal: Option<&str>,
                        e: &Expr,
                        line: Option<usize>| {
-            let mut counts = BTreeMap::new();
-            let top_op = walk(e, &mut counts);
-            for (op, n) in &counts {
-                *counters.entry((prefix.clone(), op)).or_insert(0) += n;
-            }
-            let top_slug = match signal {
-                Some(s) => Some(s.to_string()),
-                None => top_op.map(|op| format!("{prefix}{op}{}", counters[&(prefix.clone(), op)])),
+            // Each block is this expression's alone, by the slug lox gives it:
+            // two expressions on one prefix number on.
+            let mine = slugs(e, &prefix, signal, &mut counters);
+            let uuid = |s: &String| -> Option<String> {
+                if signal == Some(s.as_str()) {
+                    return lock.uuid_of(s).map(String::from);
+                }
+                owned.get(s.as_str()).map(|u| u.to_string())
             };
-            let top = top_slug
-                .as_ref()
-                .and_then(|s| lock.uuid_of(s))
-                .map(String::from);
+            let top = mine.last().and_then(uuid);
             let mut blocks: Vec<String> = top.iter().cloned().collect();
-            let mut rest: Vec<&str> = owned
-                .iter()
-                .filter(|(s, u)| {
-                    s.starts_with(prefix.as_str())
-                        && top.as_deref().is_none_or(|t| !t.eq_ignore_ascii_case(u))
-                })
-                .map(|(_, u)| *u)
-                .collect();
-            rest.sort();
-            blocks.extend(rest.into_iter().map(String::from));
+            blocks.extend(mine.iter().rev().skip(1).filter_map(uuid));
+            let n = seen.entry(prefix.clone()).or_insert(0);
+            *n += 1;
+            let id = if *n == 1 {
+                prefix.clone()
+            } else {
+                format!("{prefix}#{n}")
+            };
             out.push(Expression {
-                id: prefix,
+                id,
                 kind,
                 sink,
                 to,
@@ -271,6 +306,7 @@ pub fn expressions<T: AsRef<str>>(
                 top_type: e.top_block_type(),
                 blocks,
                 deployed: None,
+                now: None,
                 pending: false,
             });
         };
@@ -419,11 +455,52 @@ pub fn deployed(deployed: &Index, pending: Option<&Index>, e: &Expression) -> Op
         }
     }
     let label = top.attr_decoded("Title").unwrap_or_default().into_owned();
+    let shape = shape(deployed, top, &blocks, 0);
     Some(Deployed {
         text: unlabel(&label),
         label,
         blocks,
+        shape,
     })
+}
+
+/// [`Deployed::shape`] of the chain `chain` (UUIDs) from `el`.
+fn shape(ix: &Index, el: &Element, chain: &[String], depth: usize) -> String {
+    const SKIP: &[&str] = &["U", "V", "Px", "Py", "Px2", "Py2", "Cl", "Nio", "WF"];
+    let mut out = String::from(el.attr("Type").unwrap_or_default());
+    for a in &el.attrs {
+        if !SKIP.contains(&a.name.as_str()) {
+            out.push_str(&format!(" {}={:?}", a.name, a.value));
+        }
+    }
+    let mut cos: Vec<&Element> = el.child_elements().filter(|c| c.name == "Co").collect();
+    cos.sort_by_key(|c| c.attr("K").unwrap_or_default());
+    for co in cos {
+        out.push_str(&format!(" [{}", co.attr("K").unwrap_or_default()));
+        if let Some(d) = co.attr("Def") {
+            out.push_str(&format!("={d}"));
+        }
+        for i in co.child_elements().filter(|i| i.name == "In") {
+            let input = i.attr("Input").unwrap_or_default().to_ascii_lowercase();
+            let Some(src) = ix.owner.get(&input) else {
+                out.push_str(&format!(" <-?{input}"));
+                continue;
+            };
+            let su = src.attr("U").unwrap_or_default();
+            if depth < 64 && chain.iter().any(|b| b.eq_ignore_ascii_case(su)) {
+                out.push_str(&format!(" <-({})", shape(ix, src, chain, depth + 1)));
+            } else {
+                let key = src
+                    .child_elements()
+                    .find(|c| c.attr("U").is_some_and(|u| u.eq_ignore_ascii_case(&input)))
+                    .and_then(|c| c.attr("K"))
+                    .unwrap_or_default();
+                out.push_str(&format!(" <-{}.{key}", su.to_ascii_lowercase()));
+            }
+        }
+        out.push(']');
+    }
+    out
 }
 
 /// Fill in what the deployed revision had for each expression, and whether
@@ -443,13 +520,14 @@ pub fn compare(
         e.deployed = deployed(&dix, pix.as_ref(), e);
         let Some(p) = &pix else { continue };
         let now = deployed(p, None, e);
+        // The chain as compiled, not only its top label: a titled signal's
+        // label stays when its expression changes.
         e.pending = match (&e.deployed, &now) {
-            (Some(was), Some(now)) => {
-                was.label != now.label || !was.blocks[0].eq_ignore_ascii_case(&now.blocks[0])
-            }
+            (Some(was), Some(now)) => was.shape != now.shape,
             (None, None) => false,
             _ => true,
         };
+        e.now = now.map(|n| n.text);
     }
 }
 
@@ -539,6 +617,26 @@ mod tests {
         let got = expressions(&files, &l, |_| false);
         assert_eq!(got[0].top.as_deref(), Some("u1"));
         assert_eq!(got[1].top.as_deref(), Some("u2"));
+        // Each block is one expression's: no overlap, and distinct ids.
+        assert_eq!(got[0].blocks, ["u1"]);
+        assert_eq!(got[1].blocks, ["u2"]);
+        assert_eq!(
+            (got[0].id.as_str(), got[1].id.as_str()),
+            ("x_i1__", "x_i1__#2")
+        );
+        // Deeper chains number on across both: `a and b or c` takes and1, or1;
+        // the second's `d and e or f` and2, or2.
+        let text = "x.I1 <- a.Q and b.Q or c.Q\nx.I1 <- d.Q and e.Q or f.Q\n";
+        let l = lock(&[
+            ("x_i1__and1", "a1", true),
+            ("x_i1__or1", "o1", true),
+            ("x_i1__and2", "a2", true),
+            ("x_i1__or2", "o2", true),
+        ]);
+        let files = vec![("m.loxl".to_string(), text)];
+        let got = expressions(&files, &l, |_| false);
+        assert_eq!(got[0].blocks, ["o1", "a1"]);
+        assert_eq!(got[1].blocks, ["o2", "a2"]);
     }
 
     #[test]
@@ -581,6 +679,7 @@ mod tests {
             top_type: Some("And"),
             blocks: vec!["and".into()],
             deployed: None,
+            now: None,
             pending: false,
         };
         let d = deployed(&ix, None, &e).unwrap();

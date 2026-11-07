@@ -64,42 +64,68 @@ pub fn parse_feed(text: &str) -> Result<Feed, String> {
     }
 }
 
-/// The names an expression (as written) reads from: the slugs of its port
-/// operands, and the bare names of vislox's that are no constant of
-/// `consts` (a bare block name reads its default output). Empty when it
-/// does not read.
-pub fn operand_names(text: &str, consts: &BTreeMap<String, Value>) -> Vec<String> {
-    match parse_feed(text) {
-        Ok(Feed::Port(p)) => vec![p.slug],
-        Ok(Feed::Expr(e)) => names_of(&e, consts),
-        Err(_) => Vec::new(),
+/// An expression of vislox's files as written (`text`, as lox prints it),
+/// with what it reads and the type of its top block, read once when it is
+/// parsed rather than on every check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExprSrc {
+    pub text: String,
+    /// The slugs of its port operands and its bare names of vislox's (a
+    /// bare block name reads its default output, unless it is a constant).
+    names: Vec<String>,
+    top: Option<&'static str>,
+}
+
+impl std::fmt::Display for ExprSrc {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text)
     }
 }
 
-fn names_of(e: &Expr, consts: &BTreeMap<String, Value>) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    for o in e.operands() {
-        let n = match o {
-            Operand::Port(p) => p.slug.clone(),
-            Operand::Value(Value::Ref(n))
-                if n.starts_with(blocks::SLUG_PREFIX) && !consts.contains_key(n) =>
-            {
-                n.clone()
+impl ExprSrc {
+    pub fn of(e: &Expr) -> ExprSrc {
+        let mut names: Vec<String> = Vec::new();
+        for o in e.operands() {
+            let n = match o {
+                Operand::Port(p) => p.slug.clone(),
+                Operand::Value(Value::Ref(n)) if n.starts_with(blocks::SLUG_PREFIX) => n.clone(),
+                _ => continue,
+            };
+            if !names.contains(&n) {
+                names.push(n);
             }
-            _ => continue,
-        };
-        if !out.contains(&n) {
-            out.push(n);
+        }
+        ExprSrc {
+            text: e.to_string(),
+            names,
+            top: e.top_block_type(),
         }
     }
-    out
-}
 
-/// The output a signal's expression gives: `AQ` for a `Formula`, else `Q`.
-pub fn signal_output(expr: &str) -> &'static str {
-    match parse_feed(expr) {
-        Ok(Feed::Expr(e)) if e.top_block_type() == Some("Formula") => "AQ",
-        _ => "Q",
+    /// Read `text`; a bare port is no expression.
+    #[cfg(test)]
+    pub fn parse(text: &str) -> Result<ExprSrc, String> {
+        match parse_feed(text)? {
+            Feed::Expr(e) => Ok(ExprSrc::of(&e)),
+            Feed::Port(p) => Err(format!("`{p}` is a port, not an expression")),
+        }
+    }
+
+    /// The names it reads, but for the constants of `consts`.
+    pub fn reads<'a>(
+        &'a self,
+        consts: &'a BTreeMap<String, Value>,
+    ) -> impl Iterator<Item = &'a String> {
+        self.names.iter().filter(move |n| !consts.contains_key(*n))
+    }
+
+    /// The output it gives as a signal: `AQ` for a `Formula`, else `Q`.
+    pub fn output(&self) -> &'static str {
+        if self.top == Some("Formula") {
+            "AQ"
+        } else {
+            "Q"
+        }
     }
 }
 
@@ -158,19 +184,19 @@ fn operands(files: &Files, ctx: &Ctx, names: &[String]) -> Result<Vec<(String, S
 /// What vislox's files feed into `port` (a Lox Logic name) of the block
 /// `slug` (vislox's name for it) with UUID `uuid`: its expression, else the
 /// wire into it, as `slug.Port`.
-fn fed(files: &Files, slug_: &str, uuid: &str, port: &str) -> Option<String> {
+pub(crate) fn fed(files: &Files, slug_: &str, uuid: &str, port: &str) -> Option<String> {
     let expr = match files.block(slug_) {
         Some((_, b)) => b
             .exprs
             .iter()
             .find(|(k, _)| k == port)
-            .map(|(_, e)| e.clone()),
+            .map(|(_, e)| e.text.clone()),
         None => files
             .claims
             .0
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case(uuid))
-            .and_then(|(_, c)| c.exprs.get(port).cloned()),
+            .and_then(|(_, c)| c.exprs.get(port).map(|e| e.text.clone())),
     };
     expr.or_else(|| {
         files
@@ -256,11 +282,7 @@ pub fn set_expr(
     };
     let port = dst.port.clone();
     let previous = fed(files, &sink, &dst.uuid, &port);
-    let Some(text) = value.map(str::trim) else {
-        unfeed(files, &sink, &dst.uuid, &port);
-        files.repin();
-        return Ok(previous);
-    };
+    let text = value.unwrap_or_default().trim();
     let label = format!("{}.{}", dst.name, dst.port);
     if dst.input != Some(true) {
         return Err(format!(
@@ -308,36 +330,84 @@ pub fn set_expr(
     }
     match parse_feed(text)? {
         Feed::Port(p) => {
-            // A port of vislox's: a wire (what *Name this expression* leaves).
-            let from_port = if p.port.is_empty() {
-                match files.signal(&p.slug) {
-                    Some((_, x)) => signal_output(&x.expr).to_string(),
-                    None => {
+            // A port of vislox's: a wire (what *Name this expression* leaves),
+            // checked as the `wire` op checks one, on a copy until it passes.
+            let mut next = files.clone();
+            unfeed(&mut next, &sink, &dst.uuid, &port);
+            let signal = files.signal(&p.slug).map(|(_, x)| x.expr.output());
+            let compiled = ctx
+                .lock
+                .uuid_of(&p.slug)
+                .filter(|u| crate::tiles::find_ci(&ctx.doc.xml.root, u).is_some());
+            match (signal, compiled) {
+                // A signal not compiled yet (made by this request): its output.
+                (Some(out), None) => {
+                    if !p.port.is_empty() && p.port != out {
+                        return Err(format!("{}: a signal's output is {}.{out}", p.slug, p.slug));
+                    }
+                    if p.slug == sink {
                         return Err(format!(
-                            "`{}` is a bare name: say which output (`{}.Q`), or write an \
-                             expression",
-                            p.slug, p.slug
+                            "{label}: a block's own output does not feed its input here"
                         ));
                     }
+                    // The sink's extern, as the wire op declares it.
+                    if !dst.added {
+                        let key = extern_key(&next, &dst.uuid);
+                        let c = next.claims.0.entry(key).or_default();
+                        if c.ty.is_empty() {
+                            c.ty = dst.ty.clone();
+                        }
+                    }
+                    next.claims.1.insert(Wire {
+                        to: (sink.clone(), port.clone()),
+                        from: (p.slug, out.to_string()),
+                    });
                 }
-            } else {
-                p.port.clone()
-            };
-            if p.slug == sink {
-                return Err(format!(
-                    "{label}: a block's own output does not feed its input here"
-                ));
+                _ => {
+                    let from_port = match (signal, p.port.is_empty()) {
+                        (Some(out), true) => out.to_string(),
+                        (None, true) => {
+                            return Err(format!(
+                                "`{}` is a bare name: say which output (`{}.Q`), or write an \
+                                 expression",
+                                p.slug, p.slug
+                            ));
+                        }
+                        _ => p.port.clone(),
+                    };
+                    let uuid = match compiled {
+                        Some(u) => u.to_string(),
+                        None if files.block(&p.slug).is_some() => {
+                            return Err(format!("{} is not compiled yet: compile first", p.slug));
+                        }
+                        None => {
+                            operands(files, ctx, std::slice::from_ref(&p.slug))?;
+                            slug_uuid(&p.slug).expect("checked")
+                        }
+                    };
+                    let el = crate::tiles::find_ci(&ctx.doc.xml.root, &uuid).ok_or_else(|| {
+                        format!("`{}` names no object of the pending config", p.slug)
+                    })?;
+                    let ty = el.attr("Type").unwrap_or_default();
+                    let at = [
+                        el.attr("U").unwrap_or(&uuid).to_string(),
+                        loxone_config::port_names::key_or_raw(ty, &from_port).to_string(),
+                    ];
+                    let src = end(&next, ctx, &at, &mut geo)?;
+                    crate::edit::connect(&mut next, ctx, &src, &dst)?;
+                }
             }
-            let externs = operands(files, ctx, std::slice::from_ref(&p.slug))?;
-            unfeed(files, &sink, &dst.uuid, &port);
-            add_externs(files, externs);
-            files.claims.1.insert(Wire {
-                to: (sink.clone(), port.clone()),
-                from: (p.slug, from_port),
-            });
+            next.repin();
+            *files = next;
+            return Ok(previous);
         }
         Feed::Expr(e) => {
-            let externs = operands(files, ctx, &names_of(&e, &files.claims.8))?;
+            let src = ExprSrc::of(&e);
+            let externs = operands(
+                files,
+                ctx,
+                &src.reads(&files.claims.8).cloned().collect::<Vec<_>>(),
+            )?;
             if files.block(&sink).is_none()
                 && let Some((_, c)) = files
                     .claims
@@ -352,18 +422,17 @@ pub fn set_expr(
                     dst.uuid, c.ty, dst.ty
                 ));
             }
-            let text = e.to_string();
             unfeed(files, &sink, &dst.uuid, &port);
             add_externs(files, externs);
             if let Some(b) = files.block_mut(&sink) {
-                b.exprs.push((port.clone(), text));
+                b.exprs.push((port.clone(), src));
             } else {
                 let key = extern_key(files, &dst.uuid);
                 let c = files.claims.0.entry(key).or_default();
                 if c.ty.is_empty() {
                     c.ty = dst.ty.clone();
                 }
-                c.exprs.insert(port.clone(), text);
+                c.exprs.insert(port.clone(), src);
             }
         }
     }
@@ -402,7 +471,7 @@ pub(crate) fn read_by_expression(files: &Files, s: &str) -> Option<String> {
     let c8 = &files.claims.8;
     for (u, c) in &files.claims.0 {
         for (k, e) in &c.exprs {
-            if operand_names(e, c8).iter().any(|n| n == s) {
+            if e.reads(c8).any(|n| n == s) {
                 return Some(format!("the expression on {}.{k}", slug(u)));
             }
         }
@@ -410,13 +479,13 @@ pub(crate) fn read_by_expression(files: &Files, s: &str) -> Option<String> {
     for p in files.pages.values() {
         for b in p.blocks.iter().filter(|b| b.slug != s) {
             for (k, e) in &b.exprs {
-                if operand_names(e, c8).iter().any(|n| n == s) {
+                if e.reads(c8).any(|n| n == s) {
                     return Some(format!("the expression on {}.{k}", b.slug));
                 }
             }
         }
         for x in p.signals.iter().filter(|x| x.slug != s) {
-            if operand_names(&x.expr, c8).iter().any(|n| n == s) {
+            if x.expr.reads(c8).any(|n| n == s) {
                 return Some(format!("the signal {}", x.slug));
             }
         }
@@ -444,7 +513,7 @@ pub fn set_signal(files: &mut Files, ctx: &Ctx, op: &Op) -> Result<Applied, Stri
             .as_ref()
             .map(|(f, _)| page_of(files, ctx, f))
             .unwrap_or_else(|| page.clone()),
-        value: existing.as_ref().map(|(_, x)| x.expr.clone()),
+        value: existing.as_ref().map(|(_, x)| x.expr.text.clone()),
         title: existing.as_ref().and_then(|(_, x)| x.title.clone()),
     };
     let done = |added: Option<String>| Applied {
@@ -477,9 +546,11 @@ pub fn set_signal(files: &mut Files, ctx: &Ctx, op: &Op) -> Result<Applied, Stri
         }
         let p = files.pages.get_mut(&file).expect("found");
         p.signals.retain(|x| x.slug != s);
-        // lox refuses a managed block the source lost without it.
+        // lox refuses a managed block the source lost without it; marked as
+        // a dropped signal's, which only making it again takes back.
         if ctx.lock.slugs.contains_key(&s) {
             p.removed.insert(s.clone());
+            p.dropped.insert(s.clone());
         }
         files.repin();
         return Ok(done(None));
@@ -512,7 +583,8 @@ pub fn set_signal(files: &mut Files, ctx: &Ctx, op: &Op) -> Result<Applied, Stri
         Some(t) if !t.is_empty() => Some(block_title(top, t)?),
         _ => None,
     };
-    let names = names_of(&e, &files.claims.8);
+    let src = ExprSrc::of(&e);
+    let names: Vec<String> = src.reads(&files.claims.8).cloned().collect();
     if names.contains(&s) {
         return Err(format!("{s}: a signal does not read itself"));
     }
@@ -536,20 +608,24 @@ pub fn set_signal(files: &mut Files, ctx: &Ctx, op: &Op) -> Result<Applied, Stri
             },
         ));
     }
-    let text = e.to_string();
     let added = match existing {
         Some((file, _)) => {
             let p = files.pages.get_mut(&file).expect("found");
             let x = p.signals.iter_mut().find(|x| x.slug == s).expect("found");
-            x.expr = text;
+            x.expr = src;
             x.title = title;
             None
         }
         None => {
-            // Dropped earlier and not compiled away yet: its `removed` line
-            // goes, and it comes back.
-            let again = files.pages.values().any(|p| p.removed.contains(&s))
-                && !files.names_besides_removed(&s);
+            // A signal dropped here and not compiled away yet: its `removed`
+            // line goes, and it comes back. Only a dropped signal's line: any
+            // other `removed` line (a deleted block) is the name taken.
+            let again = files
+                .pages
+                .values()
+                .any(|p| p.removed.contains(&s) && p.dropped.contains(&s))
+                && !files.names_with(&s, false)
+                && !ctx.lock.tombstoned(&s);
             if !again
                 && (ctx.names.contains(&s)
                     || ctx.lock.slugs.contains_key(&s)
@@ -581,6 +657,7 @@ pub fn set_signal(files: &mut Files, ctx: &Ctx, op: &Op) -> Result<Applied, Stri
             }
             for p in files.pages.values_mut() {
                 p.removed.remove(&s);
+                p.dropped.remove(&s);
             }
             let file = match files
                 .pages
@@ -599,7 +676,7 @@ pub fn set_signal(files: &mut Files, ctx: &Ctx, op: &Op) -> Result<Applied, Stri
             f.page = page_title;
             f.signals.push(SignalDef {
                 slug: s.clone(),
-                expr: text,
+                expr: src,
                 title,
             });
             Some(s.clone())
@@ -639,14 +716,21 @@ mod tests {
     fn operands_are_names_not_constants() {
         let consts: BTreeMap<String, Value> =
             [("vx_schwelle".to_string(), Value::Number("28".into()))].into();
+        let names = |t: &str| {
+            ExprSrc::parse(t)
+                .unwrap()
+                .reads(&consts)
+                .cloned()
+                .collect::<Vec<_>>()
+        };
         assert_eq!(
-            operand_names("vx_a.Q and vx_b.AQ >= vx_schwelle and not vx_c", &consts),
+            names("vx_a.Q and vx_b.AQ >= vx_schwelle and not vx_c"),
             ["vx_a", "vx_b", "vx_c"]
         );
-        assert_eq!(operand_names("vx_t.AQ / 1000 + vx_t.AQ", &consts), ["vx_t"]);
-        assert_eq!(operand_names("vx_w.Q", &consts), ["vx_w"]);
-        assert!(operand_names("(((", &consts).is_empty());
-        assert_eq!(signal_output("vx_t.AQ / 1000"), "AQ");
-        assert_eq!(signal_output("vx_t.AQ >= 1"), "Q");
+        assert_eq!(names("vx_t.AQ / 1000 + vx_t.AQ"), ["vx_t"]);
+        assert!(ExprSrc::parse("vx_w.Q").is_err());
+        assert!(ExprSrc::parse("(((").is_err());
+        assert_eq!(ExprSrc::parse("vx_t.AQ / 1000").unwrap().output(), "AQ");
+        assert_eq!(ExprSrc::parse("vx_t.AQ >= 1").unwrap().output(), "Q");
     }
 }

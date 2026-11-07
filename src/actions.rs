@@ -3261,8 +3261,10 @@ impl Actions {
         let mine = format!("{rel_dir}/");
         let constants = crate::constants::constants(&texts, &lock, |f| f.starts_with(&mine));
         // The module's expressions and named signals, their blocks and what the
-        // deployed revision had (#82). A signal of vislox's carries the op that
-        // reverts it to the deployed revision's files.
+        // deployed revision had (#82). A signal of vislox's carries the ops that
+        // revert it to the deployed revision's files: first each input it feeds
+        // that the deployed files did not feed from it (what fed it then), so a
+        // signal made here can be dropped, then the signal.
         let mut expressions =
             crate::expressions::expressions(&texts, &lock, |f| f.starts_with(&mine));
         crate::expressions::compare(
@@ -3279,12 +3281,24 @@ impl Actions {
                         .signal(&e.sink)
                         .and_then(|(f, _)| now.pages[f].uuid.clone());
                     let was_sig = was.signal(&e.sink).map(|(_, x)| x.clone());
-                    v["revert"] = json!(edit::Op::Signal {
+                    let mut ops: Vec<edit::Op> = now
+                        .claims
+                        .1
+                        .iter()
+                        .filter(|w| w.from.0 == e.sink && !was.claims.1.contains(w))
+                        .filter_map(|w| {
+                            let [uuid, port] = edit::wire_end_at(&now, &lock, &w.to)?;
+                            let value = crate::expr_edit::fed(&was, &w.to.0, &uuid, &w.to.1);
+                            Some(edit::Op::Expr { uuid, port, value })
+                        })
+                        .collect();
+                    ops.push(edit::Op::Signal {
                         slug: e.sink.clone(),
                         page: page.unwrap_or_default(),
-                        value: was_sig.as_ref().map(|x| x.expr.clone()),
+                        value: was_sig.as_ref().map(|x| x.expr.text.clone()),
                         title: was_sig.and_then(|x| x.title),
                     });
+                    v["revert"] = json!(ops);
                     v["committed"] = json!(was.signal(&e.sink).is_some());
                 }
                 v

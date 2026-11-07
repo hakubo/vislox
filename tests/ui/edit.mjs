@@ -2661,6 +2661,19 @@ try {
     assert.match(readFileSync(join(dir, "pages", "vislox", "ausdruck.loxl"), "utf8"), /^vx_pumpe_an = vx_\w+\.AQ >= 30 and vx_\w+\.AQ < 40$/m);
     await page.waitForFunction(() => S.edits?.expressions?.some((e) => e.kind === "signal" && e.sink === "vx_pumpe_an" && e.ours) &&
       !S.edits.expressions.some((e) => e.id.startsWith("vx_80000004")), null, { timeout: 10000 });
+    // Revert drops the signal made here and gives the input it feeds back what the deployed files fed it (nothing),
+    // in one request; undone, it is named again.
+    await page.waitForFunction(() => S.sel === S.edits.expressions.find((e) => e.sink === "vx_pumpe_an").blocks[0], null, { timeout: 10000 });
+    ops = await send(() => page.click(`${ex} [data-ex="revert"][data-id="vx_pumpe_an__"]`), "revert the signal");
+    assert.deepEqual(ops, [
+      { op: "expr", uuid: PUMPE, port: "I1", value: null },
+      { op: "signal", slug: "vx_pumpe_an", page: AUSDRUCK, value: null },
+    ]);
+    await page.waitForFunction(() => S.edits && !S.edits.expressions.some((e) => e.sink === "vx_pumpe_an" || e.id.startsWith("vx_80000004")), null, { timeout: 10000 });
+    assert.ok(!claims().includes(pumpe), claims());
+    await undoKey(false, () => S.edits?.expressions?.some((e) => e.sink === "vx_pumpe_an"));
+    assert.ok(claims().includes(`${pumpe}.In1 <- vx_pumpe_an.Q\n`), claims());
+    await go(await page.evaluate(() => S.edits.expressions.find((e) => e.sink === "vx_pumpe_an").blocks[0]));
     // The signal's label.
     await page.waitForFunction(() => S.sel === S.edits.expressions.find((e) => e.sink === "vx_pumpe_an").blocks[0], null, { timeout: 10000 });
     await waitText(ex, /Signal\s*vx_\w+\.AQ >= 30/);

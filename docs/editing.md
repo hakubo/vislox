@@ -418,28 +418,34 @@ the signal's top block `<signal>` itself (hand-owned). lox re-derives them on ev
 edited as blocks: the expression is.
 
 - **Read.** `GET /api/edits` sends `expressions`, read with lox's parser at the top level of each file (a template's
-  body is #83's): `id` (the blocks' prefix), `kind` (`wire`, `argument` or `signal`), `sink` (`jal.AutoShade`, or the
+  body is #83's): `id` (the blocks' prefix; a second expression on one prefix is `<prefix>#2`), `kind` (`wire`, `argument` or `signal`), `sink` (`jal.AutoShade`, or the
   signal's slug), `to` (`[object UUID, connector key]` of the input it feeds), `text` (as lox prints it), a signal's
   `title`, `file`, `line`, `ours` (in vislox's files), `top` and `top_type` (its top block: the signal's, or the last
-  one lox's post-order count names), `blocks` (the lock's expression-owned entries under the prefix, the top one
-  first), `deployed` (the block that feeds the sink in the deployed config, or the signal's by UUID, when lox makes
+  one lox's post-order count names), `blocks` (the blocks lox names for this expression, by the same count shared
+  by the expressions of one prefix, so each block is exactly one expression's; the top one first), `deployed` (the block that feeds the sink in the deployed config, or the signal's by UUID, when lox makes
   that type: its `label`, read back as `text`, and the chain's `blocks` then: those wired into it that are this
-  expression's now or gone from the pending config) and `pending` (the pending config's top block or its label
-  differs from the deployed one's). A signal of vislox's carries `revert`, the `signal` op that puts the deployed
-  revision's files back, and `committed`. Like `sources`, they are the module as it is now: newest config only.
+  expression's now or gone from the pending config), `now` (the pending config's top label read back the same way)
+  and `pending` (the chain as compiled differs: each block's type, label and attributes and what feeds each
+  connector, so a labelled signal whose expression changed is pending too). A signal of vislox's carries `revert`,
+  the ops that put the deployed revision's files back: each input it feeds that they did not feed from it gets back
+  what they fed it (`expr`), then the `signal` op; and `committed`. Like `sources`, they are the module as it is now: newest config only.
 - **The canvas** draws an expression's blocks as one block over the area they take, showing what it feeds and the
-  expression; its blocks and the wires between them are hidden. A click opens it (and selects its top block): the
+  expression; its blocks and the wires between them are hidden, and other blocks in that area stay on top of it,
+  taking their own clicks. A click opens it (and selects its top block): the
   blocks show inside a dashed frame titled with the expression, whose title folds it again. Selecting a block of a
   folded expression (the tree, Ctrl+K, the Changes list) opens it.
 - **Properties** of any block of an expression, and of the block it feeds, has an *Expression* section: the
   expression, what it feeds (or the signal's output and label), how many blocks lox made, the file and line, and
   *Not deployed* with what the deployed config has. One of the module's own files is read-only: *change it there*.
 - **The Changes list** puts every change to an expression's blocks, now or deployed, under one heading: `expression
-  on jal.AutoShade: <deployed> → <now>` (when the deployed revision is compared; `(new)` for an expression it does
-  not have), with its `file:line`. Next and previous go in that order.
+  on jal.AutoShade: <deployed> → <now>` when the deployed revision is compared and the two top labels, read back
+  alike, differ (`(new)` for an expression it does not have, `(changed)` when only the blocks below a label did),
+  with its `file:line`. Unchanged expressions show no old text. Next and previous go in that order.
 - **`expr`** (a value op) sets what vislox's files feed into one input: an expression, written `vx_<uuid>.Port <- …`
   in `edits.loxl` for a block Loxone Config drew and `Port: …` in the declaration of a block of vislox's files, or a
-  port of vislox's (`vx_warm.Q`; a bare signal name takes its output), written as a wire. `null` drops it, always
+  port of vislox's (`vx_warm.Q`; a bare signal name takes its output), written as a wire and checked as the `wire`
+  op checks one (an output into an input, of matching kinds); a signal the request just made is not compiled yet,
+  so its output is taken by its expression. `null` drops it, always
   (also when the block is gone or the module manages it now). Refused: an output, an input Loxone Config inverted or
   wired (take that wire out first), one with a constant edited here, a text input, a block the module manages (its
   file), and an operand vislox's files do not name: a block of theirs is named by its slug, one Loxone Config drew by
@@ -452,7 +458,8 @@ edited as blocks: the expression is.
   without `__`, not `vx_<uuid>`, and not taken. Changing the top operator (`and` → `or`) is refused: lox keeps a
   pinned block's type; make a new signal and drop this one. Dropping is refused while vislox's files read it (a wire
   or an expression) and once it is deployed (deleting a deployed signal is a later step); a compiled one leaves
-  `removed <slug>` for lox, which goes when it is made again or lox forgets it.
+  `removed <slug>` for lox, under the comment `# Signals dropped here`, which goes when it is made again or lox
+  forgets it. Only such a line is taken back: any other `removed` line (a deleted block) keeps its name taken.
 - **Name this expression** sends `signal` (the expression, on the page shown) and `expr` (the input fed from the
   signal) in one request; undone, the expression is back on the input and the signal dropped.
 - **Feed an input from an expression** (Properties of a block vislox edits, folded) picks an unwired input and

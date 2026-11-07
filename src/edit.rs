@@ -629,7 +629,7 @@ pub struct Claim {
     pub sets: BTreeMap<String, Value>,
     /// Port (by its Lox Logic name) → the expression vislox's file feeds it
     /// (#82), as lox prints it: `x.Port <- …`.
-    pub exprs: BTreeMap<String, String>,
+    pub exprs: BTreeMap<String, crate::expr_edit::ExprSrc>,
     /// A block adopted here (#72) names this extern: it stays while it does.
     pub pinned: bool,
 }
@@ -749,7 +749,7 @@ impl Claims {
                                     c.0.get_mut(uuid)
                                         .expect("declared")
                                         .exprs
-                                        .insert(b.port.clone(), x.to_string());
+                                        .insert(b.port.clone(), crate::expr_edit::ExprSrc::of(&x));
                                 }
                                 _ => {
                                     return Err(foreign(&format!(
@@ -771,7 +771,7 @@ impl Claims {
                     c.0.get_mut(uuid)
                         .expect("declared")
                         .exprs
-                        .insert(w.to.port, w.expr.to_string());
+                        .insert(w.to.port, crate::expr_edit::ExprSrc::of(&w.expr));
                 }
                 Item::Wire(w) if !w.from.port.is_empty() && !w.to.port.is_empty() => {
                     c.1.insert(Wire {
@@ -859,7 +859,7 @@ impl Claims {
         // What an expression names (#82): its extern stays while it does.
         for c in self.0.values() {
             for e in c.exprs.values() {
-                out.extend(crate::expr_edit::operand_names(e, &self.8));
+                out.extend(e.reads(&self.8).cloned());
             }
         }
         out
@@ -934,7 +934,10 @@ impl Claims {
             Op::Category { .. } => c.attrs.get(&Which::Category).cloned(),
             Op::Param { port, .. } => c.sets.get(port_names::name_of(ty, port)).map(plain),
             Op::Setting { name, .. } => c.sets.get(name).map(plain),
-            Op::Expr { port, .. } => c.exprs.get(port_names::name_of(ty, port)).cloned(),
+            Op::Expr { port, .. } => c
+                .exprs
+                .get(port_names::name_of(ty, port))
+                .map(|e| e.text.clone()),
             Op::AddBlock { .. }
             | Op::Signal { .. }
             | Op::RemoveBlock { .. }
@@ -990,7 +993,7 @@ impl Claims {
                 v.push(Op::Expr {
                     uuid: uuid.clone(),
                     port: port_names::key_or_raw(&c.ty, k).to_string(),
-                    value: Some(e.clone()),
+                    value: Some(e.text.clone()),
                 });
             }
         }
@@ -1768,8 +1771,8 @@ impl Files {
                 .flat_map(|b| b.exprs.iter().map(|(_, e)| e))
                 .chain(p.signals.iter().map(|x| &x.expr));
             for e in exprs {
-                for n in crate::expr_edit::operand_names(e, &self.claims.8) {
-                    out.push((n, name.clone()));
+                for n in e.reads(&self.claims.8) {
+                    out.push((n.clone(), name.clone()));
                 }
             }
         }
@@ -1815,27 +1818,19 @@ impl Files {
     /// Whether a block, removal, rename, set or constant (#81) of vislox's files is
     /// named `slug`.
     pub fn names(&self, slug: &str) -> bool {
-        self.claims.8.contains_key(slug)
-            || crate::set_claim::KINDS
-                .iter()
-                .any(|k| k.set_names(&self.claims).contains(&slug))
-            || self.pages.values().any(|p| {
-                p.removed.contains(slug)
-                    || p.moved.iter().any(|(f, t)| f == slug || t == slug)
-                    || p.blocks.iter().any(|b| b.slug == slug)
-                    || p.signals.iter().any(|x| x.slug == slug)
-            })
+        self.names_with(slug, true)
     }
 
-    /// [`Files::names`], but for a `removed` line (#82: a signal dropped and
-    /// made again before a compile).
-    pub fn names_besides_removed(&self, slug: &str) -> bool {
+    /// [`Files::names`]; a `removed` line counts only with `removed` (#82: a
+    /// signal dropped here and made again).
+    pub fn names_with(&self, slug: &str, removed: bool) -> bool {
         self.claims.8.contains_key(slug)
             || crate::set_claim::KINDS
                 .iter()
                 .any(|k| k.set_names(&self.claims).contains(&slug))
             || self.pages.values().any(|p| {
-                p.moved.iter().any(|(f, t)| f == slug || t == slug)
+                (removed && p.removed.contains(slug))
+                    || p.moved.iter().any(|(f, t)| f == slug || t == slug)
                     || p.blocks.iter().any(|b| b.slug == slug)
                     || p.signals.iter().any(|x| x.slug == slug)
             })
@@ -1849,6 +1844,8 @@ impl Files {
     pub fn tidy(&mut self, lock: &Lock) {
         for p in self.pages.values_mut() {
             p.removed.retain(|s| lock.slugs.contains_key(s));
+            let kept = p.removed.clone();
+            p.dropped.retain(|s| kept.contains(s));
             p.moved.retain(|from, _| lock.slugs.contains_key(from));
         }
     }
@@ -1902,7 +1899,7 @@ impl Files {
                     v.push(Op::Expr {
                         uuid: uuid.into(),
                         port: blocks::port_key(&b.ty, port).to_string(),
-                        value: Some(e.clone()),
+                        value: Some(e.text.clone()),
                     });
                 }
             }
@@ -4021,7 +4018,7 @@ fn wire(
 }
 
 /// Check the wire `src` → `dst` and write it into vislox's file.
-fn connect(files: &mut Files, ctx: &Ctx, src: &End, dst: &End) -> Result<(), String> {
+pub(crate) fn connect(files: &mut Files, ctx: &Ctx, src: &End, dst: &End) -> Result<(), String> {
     if src.slug.is_some() && src.slug == dst.slug {
         return Err(format!(
             "{}: a wire goes from one block's output to another block's input",
@@ -4167,7 +4164,11 @@ fn unwire(
 /// The end `(slug, port name)` of a wire of vislox's files as the page
 /// names it, `[object UUID, connector key]`; `None` when the lock does not
 /// know the block (yet).
-fn wire_end_at(files: &Files, lock: &Lock, (s, port): &(String, String)) -> Option<[String; 2]> {
+pub(crate) fn wire_end_at(
+    files: &Files,
+    lock: &Lock,
+    (s, port): &(String, String),
+) -> Option<[String; 2]> {
     let (uuid, ty) = match files.block(s) {
         Some((_, b)) => (lock.uuid_of(s)?.to_string(), b.ty.clone()),
         // A named signal (#82): its top block's type, as lox pinned it.
@@ -9648,6 +9649,15 @@ mod tests {
                 .values()
                 .any(|t| t.contains("removed vx_warm"))
         );
+        assert!(
+            files
+                .render()
+                .values()
+                .any(|t| t.contains(crate::blocks::DROPPED_LINE))
+        );
+        // Read back, it is still a dropped signal's line, which making it again takes.
+        files = Files::from_texts(&files.render()).unwrap();
+        assert!(files.pages.values().any(|p| p.dropped.contains("vx_warm")));
         apply_op(
             &mut files,
             &ctx,
@@ -9722,5 +9732,159 @@ mod tests {
         assert_eq!(a.previous, serde_json::json!(text));
         assert!(files.claims.0.values().all(|c| c.exprs.is_empty()));
         assert!(delete_refusal(&files, &ctx_of(&out, &d, &lock, None, &names), &mono).is_none());
+    }
+
+    #[test]
+    fn a_removed_line_of_a_deleted_block_is_not_taken_back_by_a_signal() {
+        let d = doc("house.Loxone");
+        let names = BTreeSet::new();
+        let mut files = Files::default();
+        let mut l = Lockfile::default();
+        let lock = lock_of(&l);
+        let ctx = ctx_of(&d, &d, &lock, None, &names);
+        apply_op(&mut files, &ctx, &add(OG, "And", None, &[], &[])).unwrap();
+        let out = compile_files(&d, &files, &mut l).unwrap();
+        let gate = l.objects["vx_and_1"].uuid.clone();
+        // Deleted (deployed: `removed vx_and_1`, the deletion lox carries out).
+        let lock = lock_of(&l);
+        let ctx = ctx_of(&out, &d, &lock, Some(&out), &names);
+        apply_op(&mut files, &ctx, &Op::RemoveBlock { uuid: gate }).unwrap();
+        assert!(
+            files
+                .render()
+                .values()
+                .any(|t| t.contains("removed vx_and_1"))
+        );
+        // A signal of that name and type would cancel it: refused, nothing changed.
+        let before = files.clone();
+        let e = apply_op(
+            &mut files,
+            &ctx,
+            &sig(
+                "vx_and_1",
+                Some(&format!("{0}.AQ > 1 and {0}.AQ < 9", slug(DIV))),
+                None,
+            ),
+        )
+        .unwrap_err();
+        assert!(e.contains("taken"), "{e}");
+        assert_eq!(files, before);
+        // The `removed` line of a dropped signal is written apart, and read back as one.
+        let page = files.pages.values().next().unwrap().render();
+        assert!(!page.contains(crate::blocks::DROPPED_LINE), "{page}");
+    }
+
+    #[test]
+    fn a_new_signal_feeds_an_input_whose_extern_was_dropped() {
+        let d = doc("house.Loxone");
+        let names = BTreeSet::new();
+        let mut files = Files::default();
+        let lock = Lock::default();
+        let ctx = ctx_of(&d, &d, &lock, None, &names);
+        apply_op(
+            &mut files,
+            &ctx,
+            &sig("vx_an", Some(&format!("{}.AQ > 1", slug(DIV))), None),
+        )
+        .unwrap();
+        apply_op(&mut files, &ctx, &expr(AND, "I2", Some("vx_an"))).unwrap();
+        // The sink's extern is declared with the wire, and the files read back.
+        assert!(
+            files.claims.0.get(AND).is_some_and(|c| c.ty == "And"),
+            "{:?}",
+            files.claims
+        );
+        Files::from_texts(&files.render()).unwrap();
+    }
+
+    #[test]
+    fn a_port_fed_into_an_input_is_checked_as_a_wire() {
+        let d = doc("house.Loxone");
+        let names = BTreeSet::new();
+        let mut files = Files::default();
+        let lock = Lock::default();
+        let ctx = ctx_of(&d, &d, &lock, None, &names);
+        let div = slug(DIV);
+        // An input is no source.
+        let e = apply_op(
+            &mut files,
+            &ctx,
+            &expr(AND, "I2", Some(&format!("{div}.Input2"))),
+        )
+        .unwrap_err();
+        assert!(e.contains("is an input"), "{e}");
+        assert_eq!(files, Files::default());
+        // An output is: written as the wire op writes it.
+        apply_op(
+            &mut files,
+            &ctx,
+            &expr(AND, "I2", Some(&format!("{div}.AQ"))),
+        )
+        .unwrap();
+        assert!(
+            files
+                .claims
+                .1
+                .iter()
+                .any(|w| w.from == (div.clone(), "AQ".into()))
+        );
+        // Fed again from the same, it is the same wire.
+        let a = apply_op(
+            &mut files,
+            &ctx,
+            &expr(AND, "I2", Some(&format!("{div}.AQ"))),
+        )
+        .unwrap();
+        assert_eq!(a.previous, serde_json::json!(format!("{div}.AQ")));
+    }
+
+    #[test]
+    fn a_labelled_signal_is_pending_when_its_expression_changes() {
+        let d = doc("house.Loxone");
+        let names = BTreeSet::new();
+        let mut files = Files::default();
+        let mut l = Lockfile::default();
+        let lock = lock_of(&l);
+        let ctx = ctx_of(&d, &d, &lock, None, &names);
+        let div = slug(DIV);
+        apply_op(
+            &mut files,
+            &ctx,
+            &sig(
+                "vx_warm",
+                Some(&format!("{div}.AQ >= 28 and {div}.AQ < 40")),
+                Some("Warm"),
+            ),
+        )
+        .unwrap();
+        let deployed = compile_files(&d, &files, &mut l).unwrap();
+        let lock = lock_of(&l);
+        let ctx = ctx_of(&deployed, &d, &lock, None, &names);
+        apply_op(
+            &mut files,
+            &ctx,
+            &sig(
+                "vx_warm",
+                Some(&format!("{div}.AQ >= 20 and {div}.AQ < 40")),
+                Some("Warm"),
+            ),
+        )
+        .unwrap();
+        let pending = compile_files(&d, &files, &mut l).unwrap();
+        let lock = lock_of(&l);
+        let texts: Vec<(String, String)> = files
+            .render()
+            .into_iter()
+            .map(|(n, t)| (format!("pages/vislox/{n}"), t))
+            .collect();
+        let mut exprs = crate::expressions::expressions(&texts, &lock, |_| true);
+        crate::expressions::compare(&mut exprs, Some(&deployed), Some(&pending));
+        let e = &exprs[0];
+        // The label is the same both sides; the chain below it is not.
+        assert_eq!(e.deployed.as_ref().unwrap().text, "Warm");
+        assert_eq!(e.now.as_deref(), Some("Warm"));
+        assert!(e.pending, "{e:?}");
+        crate::expressions::compare(&mut exprs, Some(&pending), Some(&pending));
+        assert!(!exprs[0].pending);
     }
 }

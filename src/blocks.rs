@@ -283,17 +283,17 @@ pub struct NewBlock {
     /// The expressions into its inputs (#82): port (by its source name) →
     /// the expression as lox prints it (`vx_a.Q and vx_b.AQ >= 28`). lox
     /// makes their blocks, named `<slug>_<port>__<op><n>`.
-    pub exprs: Vec<(String, String)>,
+    pub exprs: Vec<(String, crate::expr_edit::ExprSrc)>,
 }
 
 /// A named signal of a page file (#82): `vx_warm = vx_a.AQ >= 28`, the
 /// expression as lox prints it, and its label (`vx_warm.title = "…"`), none
 /// showing the expression. Its top block is `slug` itself (hand-owned), the
 /// rest `<slug>__<op><n>` (expression-owned).
-#[derive(Clone, Debug, PartialEq, Default)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct SignalDef {
     pub slug: String,
-    pub expr: String,
+    pub expr: crate::expr_edit::ExprSrc,
     pub title: Option<String>,
 }
 
@@ -368,6 +368,9 @@ pub struct PageFile {
     pub wires: Vec<FileWire>,
     /// The named signals written here (#82).
     pub signals: Vec<SignalDef>,
+    /// Of `removed`, the signals dropped here (#82): only making one again
+    /// takes its line back. Written under a comment of their own.
+    pub dropped: BTreeSet<String>,
 }
 
 /// `to <- from`: a wire of a page file, out of a block adopted there.
@@ -390,6 +393,9 @@ const UUID_LINE: &str = "page uuid:";
 /// blocks after it are adopted, not added.
 pub const ADOPTED_LINE: &str = "Adopted from Loxone Config";
 
+/// The comment above the `removed` lines of signals dropped here (#82).
+pub const DROPPED_LINE: &str = "Signals dropped here";
+
 fn foreign(what: &str) -> String {
     format!("it holds {what}, which vislox did not write; move it to another file of the module")
 }
@@ -406,6 +412,7 @@ impl PageFile {
             moved: BTreeMap::new(),
             wires: Vec::new(),
             signals: Vec::new(),
+            dropped: BTreeSet::new(),
         }
     }
 
@@ -431,6 +438,8 @@ impl PageFile {
         let mut file: Option<PageFile> = None;
         let mut uuid = None;
         let mut adopted = false;
+        // Under the comment of the signals dropped here (#82).
+        let mut dropping = false;
         for item in m.items {
             match item {
                 Item::Comment(c) if file.is_none() && c.trim().starts_with(UUID_LINE) => {
@@ -438,6 +447,10 @@ impl PageFile {
                 }
                 Item::Comment(c) if file.is_some() && c.trim().starts_with(ADOPTED_LINE) => {
                     adopted = true;
+                    dropping = false;
+                }
+                Item::Comment(c) if file.is_some() => {
+                    dropping = c.trim().starts_with(DROPPED_LINE);
                 }
                 Item::Page(p) if file.is_none() => {
                     file = Some(PageFile {
@@ -502,7 +515,7 @@ impl PageFile {
                                 port,
                                 kind: BindingKind::Expr(e),
                                 ..
-                            }) => exprs.push((port.clone(), e.to_string())),
+                            }) => exprs.push((port.clone(), crate::expr_edit::ExprSrc::of(e))),
                             ArgItem::Binding(_) => {
                                 return Err(foreign(&format!("a wire onto `{}`", b.slug)));
                             }
@@ -526,7 +539,7 @@ impl PageFile {
                         .signals
                         .push(SignalDef {
                             slug: x.slug,
-                            expr: x.expr.to_string(),
+                            expr: crate::expr_edit::ExprSrc::of(&x.expr),
                             title: None,
                         });
                 }
@@ -561,10 +574,13 @@ impl PageFile {
                         .push(FileWire { to, from });
                 }
                 Item::Removed(r) if r.slug.starts_with(SLUG_PREFIX) => {
-                    file.as_mut()
-                        .ok_or_else(|| foreign("`removed` before the page line"))?
-                        .removed
-                        .insert(r.slug);
+                    let f = file
+                        .as_mut()
+                        .ok_or_else(|| foreign("`removed` before the page line"))?;
+                    if dropping {
+                        f.dropped.insert(r.slug.clone());
+                    }
+                    f.removed.insert(r.slug);
                 }
                 Item::Moved(m)
                     if m.from.starts_with(SLUG_PREFIX) && m.to.starts_with(SLUG_PREFIX) =>
@@ -628,10 +644,20 @@ impl PageFile {
             out.push_str(&x.render());
             out.push('\n');
         }
-        if !self.removed.is_empty() {
+        let (signals, deleted): (Vec<&String>, Vec<&String>) =
+            self.removed.iter().partition(|s| self.dropped.contains(*s));
+        if !deleted.is_empty() {
             out.push_str("\n# Deleted here: lox takes them out of the config.\n");
         }
-        for s in &self.removed {
+        for s in deleted {
+            out.push_str(&format!("removed {s}\n"));
+        }
+        if !signals.is_empty() {
+            out.push_str(&format!(
+                "\n# {DROPPED_LINE}: lox takes them out of the config.\n"
+            ));
+        }
+        for s in signals {
             out.push_str(&format!("removed {s}\n"));
         }
         if !self.moved.is_empty() {
