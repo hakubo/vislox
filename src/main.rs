@@ -470,6 +470,11 @@ async fn main() -> Result<()> {
     }
 
     spawn_watcher(app.clone())?;
+    // Checks the module when it changes (#65); `GET /api/check` reads it.
+    {
+        let app = app.clone();
+        tokio::spawn(async move { app.actions.check_worker().await });
+    }
     // Fallback poll, and the only way to notice new git commits.
     {
         let app = app.clone();
@@ -665,34 +670,58 @@ fn spawn_watcher(app: Arc<App>) -> Result<()> {
     for d in &dirs {
         watcher.watch(d, RecursiveMode::NonRecursive)?;
     }
-    // The module's directory too (#65): a change there is checked with
-    // `lox logic check` at once, not at the next poll. A module that is one
-    // file is in a directory watched above, or named below.
-    let module = app.actions.module_path().filter(|m| m.is_dir());
-    if let Some(m) = module.as_deref()
-        && let Err(e) = watcher.watch(m, RecursiveMode::Recursive)
+    // The module's directory too, recursively (#65): a change there is
+    // checked with `lox logic check` at once, not at the next poll. Its
+    // parent is watched as well, so that a module directory made later (the
+    // first edit makes it) or made again is watched from then on.
+    let module = app.actions.module_path();
+    if let Some(parent) = module.as_deref().and_then(std::path::Path::parent)
+        && parent.is_dir()
+        && !dirs.iter().any(|d| d == parent)
+        && let Err(e) = watcher.watch(parent, RecursiveMode::NonRecursive)
     {
-        eprintln!("vislox: cannot watch {}: {e}", m.display());
+        eprintln!("vislox: cannot watch {}: {e}", parent.display());
     }
-    // Events name the path as the file system resolves it (/private/var on
-    // macOS for /var).
-    let module: Vec<PathBuf> = module
-        .into_iter()
-        .flat_map(|m| [m.canonicalize().ok(), Some(m)])
-        .flatten()
-        .collect();
     let names: Vec<_> = paths
         .iter()
         .filter_map(|p| p.file_name().map(|n| n.to_owned()))
         .collect();
     std::thread::spawn(move || {
-        let _watcher = watcher;
+        let mut watcher = watcher;
+        // The module as events name it: as given and as the file system
+        // resolves it (/private/var on macOS for /var); and whether its
+        // directory is watched now.
+        let mut seen: Vec<PathBuf> = module.iter().cloned().collect();
+        let mut armed = false;
+        let mut arm = |watcher: &mut notify::RecommendedWatcher, seen: &mut Vec<PathBuf>| {
+            let Some(m) = module.as_deref() else {
+                return;
+            };
+            if !m.is_dir() {
+                // Gone: its watch went with it.
+                armed = false;
+                return;
+            }
+            if armed {
+                return;
+            }
+            match watcher.watch(m, RecursiveMode::Recursive) {
+                Ok(()) => armed = true,
+                Err(e) => eprintln!("vislox: cannot watch {}: {e}", m.display()),
+            }
+            if let Ok(c) = m.canonicalize()
+                && !seen.contains(&c)
+            {
+                seen.push(c);
+            }
+        };
+        arm(&mut watcher, &mut seen);
         while let Ok(ev) = rx.recv() {
             let relevant = |ev: &notify::Result<notify::Event>| {
                 ev.as_ref().is_ok_and(|e| {
                     e.paths.iter().any(|p| {
                         p.file_name().is_some_and(|n| names.iter().any(|m| m == n))
-                            || module.iter().any(|m| p.starts_with(m))
+                            || seen.iter().any(|m| p.starts_with(m))
                     })
                 })
             };
@@ -702,6 +731,7 @@ fn spawn_watcher(app: Arc<App>) -> Result<()> {
             // Let the writer finish, then take one snapshot.
             std::thread::sleep(Duration::from_millis(300));
             while rx.try_recv().is_ok() {}
+            arm(&mut watcher, &mut seen);
             refresh(&app);
         }
     });
@@ -1527,7 +1557,7 @@ async fn api_edits(State(app): State<Arc<App>>) -> Response {
 /// errors, `lox logic fmt --check`'s hints, and whether the pending config
 /// is from before the module's latest change.
 async fn api_check(State(app): State<Arc<App>>) -> Response {
-    Json(app.actions.module_check().await).into_response()
+    Json(app.actions.check_result()).into_response()
 }
 
 /// Compile the module as it is (`lox logic compile`) into the pending
@@ -1580,6 +1610,8 @@ async fn api_block_types() -> Response {
 fn refresh_edit(app: &App) {
     let (deployed, pending) = {
         let h = app.history.lock().unwrap();
+        let (base, out) = h.on_disk();
+        app.actions.set_disk(base, out);
         let lists = h.lists();
         (
             deployed_revision(lists.history.clone()).map(|r| r.blob),

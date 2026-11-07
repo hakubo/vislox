@@ -64,10 +64,24 @@ pub struct Actions {
     /// its path from the project), and the blob id of the `out` it wrote.
     /// An edit checks the module against it by content ([`Self::uncompiled`]).
     compiled: Mutex<Option<Compiled>>,
-    /// `GET /api/check` (#65), for the [`EditState::key`] it was worked out
-    /// for; and one check at a time, so that two tabs do not compile twice.
+    /// `GET /api/check` (#65): the last complete check, and the key
+    /// ([`Self::check_key`]) it was worked out for. Only the check worker
+    /// writes it ([`Self::check_once`]); a request only reads it.
     check_cache: Mutex<Option<(String, Value)>>,
-    check_one: tokio::sync::Mutex<()>,
+    /// Counts the checks kept, for the browsers (`actions.check`).
+    check_version: std::sync::atomic::AtomicU64,
+    /// Wakes the check worker: a file changed, or an action ended.
+    check_wake: tokio::sync::Notify,
+    /// Every compile and every write of the project holds it: an edit,
+    /// Compile, Apply, Sync and Discard (after `busy`), and the check
+    /// worker's scratch compile. So two compiles never run at once, and a
+    /// check never records what an action is changing.
+    compile_lock: tokio::sync::Mutex<()>,
+    /// The base and out on disk, by blob id, as the history last read them.
+    disk: Mutex<(Option<String>, Option<String>)>,
+    /// lox.toml as last read, and what it says: parsed again only when its
+    /// bytes change.
+    project_cache: Mutex<Option<(Vec<u8>, loxone_config::Project)>>,
 }
 
 /// Whether `out` is the module compiled as it is now ([`Actions::freshness`]).
@@ -84,11 +98,20 @@ enum Fresh {
     },
 }
 
-/// The module as a compile read it, and the config it wrote.
+/// The module and base as a compile read them, and the config it wrote,
+/// each by blob id: what is compiled is known by content.
 #[derive(Clone, PartialEq)]
 struct Compiled {
     module: std::collections::BTreeMap<String, String>,
     out: String,
+    base: Option<String>,
+}
+
+/// A file's blob id, if it can be read.
+fn file_blob(path: &Path) -> Option<String> {
+    std::fs::read(path)
+        .ok()
+        .map(|b| crate::history::blob_id(&b))
 }
 
 /// The ops that undo an edit (#62), sent back as an edit of its own, into
@@ -428,7 +451,8 @@ struct Step {
 }
 
 /// Apply's steps, in order.
-const APPLY_STEPS: [(&str, &str); 8] = [
+const APPLY_STEPS: [(&str, &str); 9] = [
+    ("module", "Module compiles"),
     ("check", "Download and drift check"),
     ("upload", "Upload"),
     ("restart", "Program restarting"),
@@ -633,7 +657,11 @@ impl Actions {
             module_files: Mutex::default(),
             compiled: Mutex::new(None),
             check_cache: Mutex::new(None),
-            check_one: tokio::sync::Mutex::new(()),
+            check_version: Default::default(),
+            check_wake: tokio::sync::Notify::new(),
+            compile_lock: tokio::sync::Mutex::new(()),
+            disk: Mutex::new((None, None)),
+            project_cache: Mutex::new(None),
         };
         a.edit_state.lock().unwrap().why = a.why_not_edit_now();
         a
@@ -649,10 +677,28 @@ impl Actions {
 
     /// The project's module (a directory, or one file), to watch.
     pub fn module_path(&self) -> Option<PathBuf> {
-        let dir = self.s.project.as_deref()?;
-        loxone_config::Project::load(&dir.join("lox.toml"))
-            .ok()
-            .map(|p| p.module)
+        self.project().ok().map(|p| p.module)
+    }
+
+    /// The project's lox.toml, parsed again only when its bytes change.
+    fn project(&self) -> Result<loxone_config::Project, String> {
+        let dir = self
+            .s
+            .project
+            .as_deref()
+            .ok_or("only for a lox.toml project")?;
+        let path = dir.join("lox.toml");
+        let bytes = std::fs::read(&path).map_err(|e| format!("cannot read lox.toml: {e}"))?;
+        let mut c = self.project_cache.lock().unwrap();
+        if let Some((b, p)) = &*c
+            && *b == bytes
+        {
+            return Ok(p.clone());
+        }
+        let p = loxone_config::Project::load(&path)
+            .map_err(|e| format!("cannot read lox.toml: {e}"))?;
+        *c = Some((bytes, p.clone()));
+        Ok(p)
     }
 
     /// Apply and Sync could start now (they are on, and nothing runs), so
@@ -742,6 +788,14 @@ impl Actions {
             drop(st);
             self.changed();
         }
+        // The check worker compares its key and works only on a change.
+        self.check_wake.notify_one();
+    }
+
+    /// The base and out on disk, by blob id, as the history read them (it
+    /// reads and hashes both on every poll): part of the check's key.
+    pub fn set_disk(&self, base: Option<String>, out: Option<String>) {
+        *self.disk.lock().unwrap() = (base, out);
     }
 
     /// For `/api/history` and the `actions` event.
@@ -754,6 +808,10 @@ impl Actions {
         };
         let mut e = flag(edit.why.as_deref());
         e["key"] = json!(edit.key);
+        e["check"] = json!(
+            self.check_version
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
         json!({
             "shown": self.s.project.is_some(),
             "apply": flag(self.why_not_apply()),
@@ -828,6 +886,8 @@ impl Actions {
         if let (Err(e), Some(p)) = (res, st.progress.as_mut().filter(|_| kind == "apply")) {
             p.fail(e);
         }
+        // A check skipped while this ran is worked out now, files changed or not.
+        self.check_wake.notify_one();
         drop(st);
         self.changed();
     }
@@ -851,13 +911,30 @@ impl Actions {
             .busy
             .try_lock()
             .map_err(|_| (StatusCode::CONFLICT, "already running".to_string()))?;
-        if self.why_not_apply().is_none()
-            && let Some(why) = self.why_broken().await
-        {
-            return Err((StatusCode::CONFLICT, why));
-        }
         self.st.lock().unwrap().progress = Some(Progress::apply());
         self.begin("Apply")?;
+        let _compiling = self.compile_lock.lock().await;
+        // First, the module must compile: else lox deploys a compile of
+        // something else than the review shows (#65). Asked of lox anew,
+        // not of the check's cache, which may be a refresh old.
+        self.progress(|p| p.start("module"));
+        match self.module_errors().await {
+            None => self.progress(|p| {
+                p.finish(
+                    "module",
+                    "skip",
+                    Some("lox logic check gave no answer".into()),
+                )
+            }),
+            Some(c) => match broken_message(&c) {
+                None => self.progress(|p| p.finish("module", "ok", None)),
+                Some(why) => {
+                    // The running step, `module`, fails with it.
+                    self.end_with("apply", &Err(why.clone()), None);
+                    return Err((StatusCode::CONFLICT, why));
+                }
+            },
+        }
         let res = self.apply_steps(opts).await;
         let (res, deployed) = match res {
             Ok((m, d)) => (Ok(m), d),
@@ -965,10 +1042,16 @@ impl Actions {
             })
             .await;
             let _ = stop_tx.send(true);
+            // No restart line (a push that failed before it): the follower
+            // stops waiting for one.
+            go_tx.take();
             res
         };
         let follow = async {
-            if let (Some((probe, before)), Ok(())) = (watch_with, go_rx.await) {
+            let Some((probe, before)) = watch_with else {
+                return;
+            };
+            if go_rx.await.is_ok() {
                 restart::follow(probe, before, stop_rx, |e| {
                     self.progress(|p| p.restart_event(e))
                 })
@@ -1016,7 +1099,10 @@ impl Actions {
             .try_lock()
             .map_err(|_| (StatusCode::CONFLICT, "already running".to_string()))?;
         self.begin("Sync")?;
-        let res = self.sync_steps().await;
+        let res = {
+            let _compiling = self.compile_lock.lock().await;
+            self.sync_steps().await
+        };
         self.end("sync", &res);
         res.map_err(|e| (StatusCode::BAD_GATEWAY, e))
     }
@@ -1180,12 +1266,17 @@ impl Actions {
         }
         self.set_running(Some("Edit"));
         let _running = Running(self);
+        let _compiling = self.compile_lock.lock().await;
         self.edit_steps(req, deployed).await
     }
 
     fn set_running(&self, what: Option<&'static str>) {
         self.st.lock().unwrap().running = what;
         self.changed();
+        if what.is_none() {
+            // A check skipped while it ran is worked out now.
+            self.check_wake.notify_one();
+        }
     }
 
     async fn edit_steps(
@@ -1351,6 +1442,7 @@ impl Actions {
         let compiled = Compiled {
             module: module_blobs(&p),
             out: blob.clone(),
+            base: file_blob(&p.base),
         };
         // The UUIDs lox minted for the new blocks.
         let lock = edit::Lock::read(&p.lock);
@@ -1434,13 +1526,13 @@ impl Actions {
     /// with, no scratch directory).
     async fn freshness(&self, p: &loxone_config::Project, dir: &Path) -> Result<Fresh, String> {
         let module = module_blobs(p);
-        let out_blob = std::fs::read(&p.out)
-            .ok()
-            .map(|b| crate::history::blob_id(&b));
+        let out_blob = file_blob(&p.out);
+        let base_blob = file_blob(&p.base);
         let last = self.compiled.lock().unwrap().clone();
         if let (Some(last), Some(o)) = (&last, &out_blob)
             && last.module == module
             && &last.out == o
+            && last.base == base_blob
         {
             return Ok(Fresh::Yes);
         }
@@ -1469,6 +1561,17 @@ impl Actions {
                 v
             }
         };
+        // And the base, when out was compiled against another one.
+        let mut changed = changed;
+        if last.as_ref().is_some_and(|l| l.base != base_blob) {
+            changed.push(
+                p.base
+                    .strip_prefix(&p.root)
+                    .unwrap_or(&p.base)
+                    .display()
+                    .to_string(),
+            );
+        }
         let reference = std::fs::read(&p.out)
             .or_else(|_| std::fs::read(&p.base))
             .map_err(|e| format!("cannot read the pending config: {e}"))?;
@@ -1495,8 +1598,13 @@ impl Actions {
                 // is not known.
                 if let Some(o) = out_blob
                     && module_blobs(p) == module
+                    && file_blob(&p.base) == base_blob
                 {
-                    *self.compiled.lock().unwrap() = Some(Compiled { module, out: o });
+                    *self.compiled.lock().unwrap() = Some(Compiled {
+                        module,
+                        out: o,
+                        base: base_blob,
+                    });
                 }
                 Ok(Fresh::Yes)
             }
@@ -1522,68 +1630,107 @@ impl Actions {
         })
     }
 
-    /// Whether the module compiles, for `GET /api/check` (#65): lox's errors
-    /// with the blocks each one's line names, the files `lox logic fmt
-    /// --check` would format, and whether the pending config is from before
-    /// the latest change of the module (`stale`). Cached until
-    /// [`Self::refresh_edit`] sees a change.
-    pub async fn module_check(&self) -> Value {
-        // The module and the lock (the edit key), and out by content: out may
-        // change while nothing is pending before or after (compiled to what
-        // the Miniserver runs).
-        let out = self
-            .s
-            .project
-            .as_deref()
-            .and_then(|d| loxone_config::Project::load(&d.join("lox.toml")).ok())
-            .map(|p| p.out);
-        let key = || {
-            let o = out
-                .as_deref()
-                .and_then(|o| std::fs::read(o).ok())
-                .map(|b| crate::history::blob_id(&b));
-            format!(
-                "{}:{}",
-                self.edit_state.lock().unwrap().key,
-                o.as_deref().unwrap_or("-")
-            )
-        };
-        let cached = |k: &str| {
-            self.check_cache
-                .lock()
-                .unwrap()
-                .as_ref()
-                .filter(|(c, _)| c == k)
-                .map(|(_, v)| v.clone())
-        };
-        if let Some(v) = cached(&key()) {
-            return v;
-        }
-        // One at a time: a second tab waits, then takes the first one's.
-        let _one = self.check_one.lock().await;
-        let k = key();
-        if let Some(v) = cached(&k) {
-            return v;
-        }
-        let v = self.check_now().await;
-        // Kept only when nothing changed while lox ran: else the next
-        // request works it out again.
-        if key() == k {
-            *self.check_cache.lock().unwrap() = Some((k, v.clone()));
-        }
-        v
+    /// [`Self::check_module`] of the project.
+    async fn module_errors(&self) -> Option<check::Checked> {
+        let dir = self.s.project.as_deref()?;
+        let p = self.project().ok()?;
+        self.check_module(&p, dir).await
     }
 
+    /// What the check depends on: the module's files and the lock (the
+    /// edit key, with the deployed and pending blobs), and the base and out
+    /// on disk, all by content.
+    fn check_key(&self) -> String {
+        let (base, out) = self.disk.lock().unwrap().clone();
+        format!(
+            "{}|{}|{}",
+            self.edit_state.lock().unwrap().key,
+            base.as_deref().unwrap_or("-"),
+            out.as_deref().unwrap_or("-")
+        )
+    }
+
+    /// `GET /api/check`: the last complete check, never a new one (lox runs
+    /// in the check worker, on file changes). `current`: nothing changed
+    /// since.
+    pub fn check_result(&self) -> Value {
+        let k = self.check_key();
+        match &*self.check_cache.lock().unwrap() {
+            Some((key, v)) => {
+                let mut v = v.clone();
+                v["current"] = json!(*key == k);
+                v
+            }
+            None => json!({ "available": false, "reason": "not checked yet" }),
+        }
+    }
+
+    /// The check worker: waits for a change ([`Self::refresh_edit`], an
+    /// action's end), lets the writer finish, then checks until the key it
+    /// checked is the current one.
+    pub async fn check_worker(&self) {
+        loop {
+            self.check_wake.notified().await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            while self.check_once().await {}
+        }
+    }
+
+    /// Check the module once, if its key changed since the last check kept,
+    /// and keep it if nothing changed meanwhile. Returns whether to check
+    /// again (the key moved while lox ran). Never while an action runs: that
+    /// check would be of a project half written, so it is not kept; the
+    /// action's end wakes the worker again. It holds the compile lock, so
+    /// its scratch compile never runs beside another compile, and an action
+    /// that starts meanwhile waits for it.
+    pub async fn check_once(&self) -> bool {
+        let k = self.check_key();
+        if self
+            .check_cache
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|(c, _)| *c == k)
+        {
+            return false;
+        }
+        if self.busy.try_lock().is_err() || self.st.lock().unwrap().running.is_some() {
+            return false;
+        }
+        let Ok(_compiling) = self.compile_lock.try_lock() else {
+            return false;
+        };
+        let v = self.check_now().await;
+        if self.check_key() != k {
+            return true;
+        }
+        *self.check_cache.lock().unwrap() = Some((k, v));
+        self.check_version
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.changed();
+        false
+    }
+
+    /// Whether the module compiles (#65): lox's errors with the blocks each
+    /// one's line names, the files `lox logic fmt --check` would format, and
+    /// whether the pending config is the module compiled as it is (`stale`).
+    /// The caller holds the compile lock.
     async fn check_now(&self) -> Value {
         let off = |why: String| json!({ "available": false, "reason": why });
         let Some(dir) = self.s.project.as_deref() else {
             return off("only for a lox.toml project".into());
         };
-        let p = match loxone_config::Project::load(&dir.join("lox.toml")) {
+        let p = match self.project() {
             Ok(p) => p,
-            Err(e) => return off(format!("cannot read lox.toml: {e}")),
+            Err(e) => return off(e),
         };
-        let Some(mut checked) = self.check_module(&p, dir).await else {
+        let arg = check::module_arg(&p.root, &p.module);
+        let fmt_args = ["logic", "fmt", "--check", arg.as_str()];
+        let (checked, fmt) = tokio::join!(
+            self.check_module(&p, dir),
+            run_out(&self.s.lox, &fmt_args, dir, CHECK_TIMEOUT)
+        );
+        let Some(mut checked) = checked else {
             return off("lox logic check gave no answer vislox can read".into());
         };
         if !checked.errors.is_empty() {
@@ -1597,25 +1744,14 @@ impl Actions {
             check::locate(&mut checked.errors, &texts, &lock, &sources);
         }
         let shown = |f: &str| crate::managed::shown(&p.root, &p.module, &dir.join(f));
-        let arg = check::module_arg(&p.root, &p.module);
-        let unformatted = match run_out(
-            &self.s.lox,
-            &["logic", "fmt", "--check", &arg],
-            dir,
-            CHECK_TIMEOUT,
-        )
-        .await
-        {
-            Ok((_, o, e)) => check::unformatted(&format!("{o}{e}"), shown),
+        let unformatted = match fmt {
+            Ok((_, o, e)) => check::unformatted(&o, &e, shown),
             Err(_) => Vec::new(),
         };
         // Is the pending config the module as it is? Not asked while the
-        // module does not compile (it cannot be), nor while an edit, Apply
-        // or Discard writes it, nor when out is newer than every file of the
-        // module and the lock: then it was compiled after them. Anything
-        // else is compiled into a scratch copy and compared, by content.
-        let running = self.st.lock().unwrap().running.is_some();
-        let stale = if !checked.errors.is_empty() || running || out_is_newest(&p) {
+        // module does not compile (it cannot be). Else by content: the
+        // record of vislox's last compile, or a scratch compile.
+        let stale = if !checked.errors.is_empty() {
             Value::Null
         } else {
             match self.freshness(&p, dir).await {
@@ -1636,39 +1772,6 @@ impl Actions {
         })
     }
 
-    /// Why Apply must not run now: the module does not compile, so what lox
-    /// would deploy is not what the review shows (#65). Asked of lox anew,
-    /// not of the cache, which may be up to a refresh old.
-    async fn why_broken(&self) -> Option<String> {
-        let dir = self.s.project.as_deref()?;
-        let p = loxone_config::Project::load(&dir.join("lox.toml")).ok()?;
-        let c = self.check_module(&p, dir).await?;
-        if c.errors.is_empty() {
-            return None;
-        }
-        let n = c.errors.len() + c.truncated;
-        let list: Vec<String> = c
-            .errors
-            .iter()
-            .take(5)
-            .map(|e| {
-                let at = match (&e.file, e.line) {
-                    (Some(f), Some(l)) => format!("{f}:{l}: "),
-                    (Some(f), None) => format!("{f}: "),
-                    _ => String::new(),
-                };
-                format!("  {at}{}", e.message)
-            })
-            .collect();
-        Some(format!(
-            "The module doesn't compile ({n} error{}), so the pending config is from the last \
-             compile that worked. Fix the module, then apply.\n{}{}",
-            if n == 1 { "" } else { "s" },
-            list.join("\n"),
-            if n > 5 { "\n  …" } else { "" }
-        ))
-    }
-
     /// Compile the module as it is into the pending config
     /// (`lox logic compile`), as an edit does, without changing it: for a
     /// module changed outside vislox (#65). Never deploys.
@@ -1679,7 +1782,10 @@ impl Actions {
             .try_lock()
             .map_err(|_| (StatusCode::CONFLICT, "already running".to_string()))?;
         self.begin("Compile")?;
-        let res = self.compile_steps().await;
+        let res = {
+            let _compiling = self.compile_lock.lock().await;
+            self.compile_steps().await
+        };
         self.end("compile", &res);
         res.map_err(|e| (StatusCode::BAD_GATEWAY, e))
     }
@@ -1691,16 +1797,14 @@ impl Actions {
         // Discard puts back a lock or out the last commit does not have.
         snapshot_before_edit(dir, &p).await;
         let module = module_blobs(&p);
+        let base = file_blob(&p.base);
         run(&self.s.lox, &["logic", "compile"], dir, COMPILE_TIMEOUT)
             .await
             .map_err(|e| format!("lox logic compile failed:\n{}", last_lines(&e, 8)))?;
-        if let Ok(b) = std::fs::read(&p.out)
+        if let Some(out) = file_blob(&p.out)
             && module_blobs(&p) == module
         {
-            *self.compiled.lock().unwrap() = Some(Compiled {
-                module,
-                out: crate::history::blob_id(&b),
-            });
+            *self.compiled.lock().unwrap() = Some(Compiled { module, out, base });
         }
         Ok(
             "Compiled the module as it is: the pending revision shows it. Nothing was deployed."
@@ -1959,7 +2063,10 @@ impl Actions {
             .try_lock()
             .map_err(|_| (StatusCode::CONFLICT, "already running".to_string()))?;
         self.begin("Discard")?;
-        let res = self.discard_steps().await;
+        let res = {
+            let _compiling = self.compile_lock.lock().await;
+            self.discard_steps().await
+        };
         self.end("discard", &res);
         res.map_err(|e| (StatusCode::BAD_GATEWAY, e))
     }
@@ -2230,26 +2337,33 @@ async fn run_out(
     ))
 }
 
-/// Whether out was written after every file of the module and the lock,
-/// strictly: a time it shares with one of them tells nothing (two writes
-/// in one tick), and neither does a missing out.
-fn out_is_newest(p: &loxone_config::Project) -> bool {
-    let time = |f: &Path| std::fs::metadata(f).and_then(|m| m.modified()).ok();
-    let Some(out) = time(&p.out) else {
-        return false;
-    };
-    let mut newest = time(&p.lock);
-    if let Some(t) = time(&p.module).filter(|_| p.module.is_file())
-        && newest.is_none_or(|n| t > n)
-    {
-        newest = Some(t);
+/// Why Apply must not run: the module has errors (#65), the first five of
+/// them; `None` when it has none.
+fn broken_message(c: &check::Checked) -> Option<String> {
+    if c.errors.is_empty() {
+        return None;
     }
-    edit::module_files(&p.module, &mut |_, t| {
-        if newest.is_none_or(|n| t > n) {
-            newest = Some(t);
-        }
-    });
-    newest.is_none_or(|n| out > n)
+    let n = c.errors.len() + c.truncated;
+    let list: Vec<String> = c
+        .errors
+        .iter()
+        .take(5)
+        .map(|e| {
+            let at = match (&e.file, e.line) {
+                (Some(f), Some(l)) => format!("{f}:{l}: "),
+                (Some(f), None) => format!("{f}: "),
+                _ => String::new(),
+            };
+            format!("  {at}{}", e.message)
+        })
+        .collect();
+    Some(format!(
+        "The module doesn't compile ({n} error{}), so the pending config is from the last \
+         compile that worked. Fix the module, then apply.\n{}{}",
+        if n == 1 { "" } else { "s" },
+        list.join("\n"),
+        if n > 5 { "\n  …" } else { "" }
+    ))
 }
 
 async fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
@@ -3096,10 +3210,13 @@ sed "s/Title=\"Testhaus\"/Title=\"Testhaus $w\"/" base.Loxone > "$out"
     }
 
     /// A lox.toml project in git, and a `lox` whose `logic check` finds an
-    /// error on each line of the module that says BROKEN, whose `logic fmt
-    /// --check` finds a file with two spaces in a row not formatted, and
-    /// whose `logic compile` writes the base and the module into out. It
-    /// logs its calls, and fails on any other command.
+    /// error on each line of `pages/main.loxl` that says BROKEN, whose
+    /// `logic fmt --check` finds a file with two spaces in a row not
+    /// formatted (main.loxl's on standard output, without a last newline;
+    /// other.loxl's on standard error), whose `logic compile` writes the base
+    /// and the module's files into out (taking as many seconds as `../slow`
+    /// says, and logging CONCURRENT when another compile runs), and whose
+    /// `config push` fails. It logs its calls, and fails on anything else.
     #[cfg(unix)]
     fn project_to_check() -> (tempfile::TempDir, PathBuf, Actions) {
         use std::os::unix::fs::PermissionsExt;
@@ -3113,6 +3230,7 @@ sed "s/Title=\"Testhaus\"/Title=\"Testhaus $w\"/" base.Loxone > "$out"
         )
         .unwrap();
         std::fs::write(d.join("pages/main.loxl"), "teiler = Div(\"Teiler\")\n").unwrap();
+        std::fs::write(d.join("pages/other.loxl"), "# other\n").unwrap();
         std::fs::write(
             d.join("logic.lock.json"),
             format!(r#"{{"objects":{{"teiler":{{"uuid":"{DIV}","type":"Div"}}}}}}"#),
@@ -3137,13 +3255,19 @@ case "$1 $2 $3" in
     fi
     echo '{"counts":{"blocks":1},"ok":true,"path":"pages"}' ;;
   "logic fmt --check")
-    if grep -q '  ' pages/main.loxl; then echo 'pages/main.loxl: not canonical (run `lox logic fmt --write pages`)' >&2; exit 1; fi
-    echo 'pages/main.loxl: canonical' ;;
+    bad=
+    if grep -q '  ' pages/main.loxl; then printf 'pages/main.loxl: not canonical (run `lox logic fmt --write pages`)'; bad=1; fi
+    if grep -q '  ' pages/other.loxl 2>/dev/null; then echo 'pages/other.loxl: not canonical (run `lox logic fmt --write pages`)' >&2; bad=1; fi
+    [ -z "$bad" ] ;;
   "logic compile"*)
     grep -q BROKEN pages/main.loxl && { echo 'compile error: unknown block type BROKEN' >&2; exit 1; }
+    mkdir ../compiling 2>/dev/null || echo CONCURRENT >> ../calls.log
+    sleep $(cat ../slow 2>/dev/null || echo 0)
     out=out.Loxone; prev=
     for a in "$@"; do [ "$prev" = --out ] && out=$a; prev=$a; done
-    cat base.Loxone pages/main.loxl > "$out" ;;
+    cat base.Loxone pages/*.loxl > "$out"
+    rmdir ../compiling 2>/dev/null ;;
+  "config push"*) echo 'The Miniserver refused the upload.' >&2; exit 1 ;;
   *) echo "unexpected: $*" >&2; exit 2 ;;
 esac
 "#,
@@ -3160,24 +3284,37 @@ esac
         (tmp, d, a)
     }
 
+    /// What main.rs does on a file change, then the check worker's work:
+    /// `GET /api/check` after it.
+    async fn check_of(a: &Actions, d: &Path) -> Value {
+        a.set_disk(
+            file_blob(&d.join("base.Loxone")),
+            file_blob(&d.join("out.Loxone")),
+        );
+        a.refresh_edit(None, None);
+        while a.check_once().await {}
+        a.check_result()
+    }
+
+    fn calls_in(tmp: &tempfile::TempDir) -> String {
+        std::fs::read_to_string(tmp.path().join("calls.log")).unwrap_or_default()
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn a_module_that_does_not_compile_is_reported_and_stops_apply() {
         use axum::http::StatusCode;
         let (tmp, d, a) = project_to_check();
-        let check = || async {
-            a.refresh_edit(None, None);
-            a.module_check().await
-        };
         // Compiled as it is: nothing to say.
         a.compile().await.unwrap();
         assert_eq!(
             std::fs::read_to_string(d.join("out.Loxone")).unwrap(),
-            "base\nteiler = Div(\"Teiler\")\n"
+            "base\nteiler = Div(\"Teiler\")\n# other\n"
         );
-        let c = check().await;
+        let c = check_of(&a, &d).await;
         assert_eq!(c["available"], true, "{c}");
         assert_eq!(c["ok"], true, "{c}");
+        assert_eq!(c["current"], true, "{c}");
         assert_eq!(c["errors"], json!([]));
         assert_eq!(c["stale"], Value::Null, "{c}");
         assert_eq!(c["unformatted"], json!([]));
@@ -3188,7 +3325,7 @@ esac
             "teiler = Div(\"Teiler\")\nteiler.I1 <- BROKEN.Q\n",
         )
         .unwrap();
-        let c = check().await;
+        let c = check_of(&a, &d).await;
         assert_eq!(c["ok"], false, "{c}");
         assert_eq!(
             c["errors"],
@@ -3198,21 +3335,18 @@ esac
         // Not compiled into a scratch copy: it cannot compile.
         assert_eq!(c["stale"], Value::Null);
         let compiles = || {
-            std::fs::read_to_string(tmp.path().join("calls.log"))
-                .unwrap()
+            calls_in(&tmp)
                 .lines()
                 .filter(|l| l.starts_with("logic compile"))
                 .count()
         };
         assert_eq!(compiles(), 1, "only the Compile");
-        // Cached: asked again, lox is not run again.
-        let calls = std::fs::read_to_string(tmp.path().join("calls.log")).unwrap();
-        assert_eq!(a.module_check().await, c);
-        assert_eq!(
-            std::fs::read_to_string(tmp.path().join("calls.log")).unwrap(),
-            calls
-        );
-        // Apply is refused before it does anything, naming the error.
+        // Kept: neither a request nor the worker runs lox again for it.
+        let calls = calls_in(&tmp);
+        assert_eq!(a.check_result(), c);
+        assert!(!a.check_once().await);
+        assert_eq!(calls_in(&tmp), calls);
+        // Apply is refused at its first step, naming the error.
         let (code, msg) = a.apply(&ApplyOpts::default()).await.unwrap_err();
         assert_eq!(code, StatusCode::CONFLICT);
         assert!(
@@ -3223,7 +3357,11 @@ esac
             msg.contains("pages/main.loxl:2: unknown block type BROKEN"),
             "{msg}"
         );
-        assert!(a.info()["progress"].is_null(), "Apply did not start");
+        let progress = a.info()["progress"].clone();
+        assert_eq!(progress["steps"][0]["id"], "module", "{progress}");
+        assert_eq!(progress["steps"][0]["state"], "fail", "{progress}");
+        assert_eq!(progress["steps"][1]["state"], "wait", "{progress}");
+        assert!(!calls_in(&tmp).contains("config push"), "nothing deployed");
         // And so is Compile, with lox's message.
         let (_, msg) = a.compile().await.unwrap_err();
         assert!(msg.contains("unknown block type BROKEN"), "{msg}");
@@ -3234,42 +3372,135 @@ esac
             "teiler = Div(\"Teiler\")\n# changed\n",
         )
         .unwrap();
-        let c = check().await;
+        let c = check_of(&a, &d).await;
         assert_eq!(c["ok"], true, "{c}");
         assert_eq!(c["stale"], json!({ "files": ["pages/main.loxl"] }), "{c}");
         a.compile().await.unwrap();
-        let c = check().await;
+        let c = check_of(&a, &d).await;
         assert_eq!(c["stale"], Value::Null, "{c}");
-        assert_eq!(
-            std::fs::read_to_string(d.join("out.Loxone")).unwrap(),
-            "base\nteiler = Div(\"Teiler\")\n# changed\n"
-        );
 
-        // Not formatted: a hint, and nothing else.
+        // Not formatted: a hint, and nothing else. lox names one file on
+        // standard output without a last newline, the other on standard
+        // error: both are read.
         std::fs::write(
             d.join("pages/main.loxl"),
-            "teiler = Div(\"Teiler\")\n# changed\n\n#  spaced\n",
+            "teiler = Div(\"Teiler\")\n#  a\n",
         )
         .unwrap();
-        let c = check().await;
+        std::fs::write(d.join("pages/other.loxl"), "#  b\n").unwrap();
+        let c = check_of(&a, &d).await;
         assert_eq!(c["ok"], true, "{c}");
-        assert_eq!(c["unformatted"], json!(["pages/main.loxl"]), "{c}");
-        assert!(
-            !std::fs::read_to_string(tmp.path().join("calls.log"))
-                .unwrap()
-                .contains("config push"),
-            "nothing deployed"
+        assert_eq!(
+            c["unformatted"],
+            json!(["pages/main.loxl", "pages/other.loxl"]),
+            "{c}"
         );
+        assert!(!calls_in(&tmp).contains("config push"), "nothing deployed");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_check_comes_back_after_an_action_that_changed_nothing() {
+        let (_tmp, d, a) = project_to_check();
+        a.compile().await.unwrap();
+        std::fs::write(d.join("pages/other.loxl"), "# changed\n").unwrap();
+        let c = check_of(&a, &d).await;
+        assert_eq!(c["stale"], json!({ "files": ["pages/other.loxl"] }), "{c}");
+        // An Apply that fails and changes no file: the check stands.
+        assert!(a.apply(&ApplyOpts::default()).await.is_err());
+        let c = check_of(&a, &d).await;
+        assert_eq!(c["stale"], json!({ "files": ["pages/other.loxl"] }), "{c}");
+        assert_eq!(c["current"], true, "{c}");
+        // While an action runs, nothing is checked, and nothing kept: the old
+        // check shows, not current; once it ends, the check is worked out.
+        let one = a.busy.try_lock().unwrap();
+        std::fs::write(d.join("pages/other.loxl"), "# changed again\n").unwrap();
+        let c = check_of(&a, &d).await;
+        assert_eq!(c["current"], false, "{c}");
+        assert_eq!(c["stale"], json!({ "files": ["pages/other.loxl"] }), "{c}");
+        drop(one);
+        let c = check_of(&a, &d).await;
+        assert_eq!(c["current"], true, "{c}");
+        assert_eq!(c["stale"], json!({ "files": ["pages/other.loxl"] }), "{c}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_pending_config_is_checked_by_content_not_by_times() {
+        let (_tmp, d, a) = project_to_check();
+        a.compile().await.unwrap();
+        assert_eq!(check_of(&a, &d).await["stale"], Value::Null);
+        // A module file deleted after the compile.
+        std::fs::remove_file(d.join("pages/other.loxl")).unwrap();
+        let c = check_of(&a, &d).await;
+        assert_eq!(c["stale"], json!({ "files": ["pages/other.loxl"] }), "{c}");
+        a.compile().await.unwrap();
+        assert_eq!(check_of(&a, &d).await["stale"], Value::Null);
+        // A change written with an old modification time (cp -p, rsync -t).
+        std::fs::write(d.join("pages/other.loxl"), "# copied\n").unwrap();
+        sh(&d, "touch -t 200001010000 pages/other.loxl");
+        let c = check_of(&a, &d).await;
+        assert_eq!(c["stale"], json!({ "files": ["pages/other.loxl"] }), "{c}");
+        a.compile().await.unwrap();
+        assert_eq!(check_of(&a, &d).await["stale"], Value::Null);
+        // A new base: out was compiled against the old one.
+        std::fs::write(d.join("base.Loxone"), "base 2\n").unwrap();
+        let c = check_of(&a, &d).await;
+        assert_eq!(c["stale"], json!({ "files": ["base.Loxone"] }), "{c}");
+        a.compile().await.unwrap();
+        assert_eq!(check_of(&a, &d).await["stale"], Value::Null);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_checks_compile_never_runs_beside_another() {
+        let (tmp, d, a) = project_to_check();
+        a.compile().await.unwrap();
+        std::fs::write(tmp.path().join("slow"), "1").unwrap();
+        // A request never compiles: it reads what the worker kept.
+        std::fs::write(d.join("pages/other.loxl"), "# changed\n").unwrap();
+        a.set_disk(
+            file_blob(&d.join("base.Loxone")),
+            file_blob(&d.join("out.Loxone")),
+        );
+        a.refresh_edit(None, None);
+        let calls = calls_in(&tmp);
+        let _ = a.check_result();
+        assert_eq!(calls_in(&tmp), calls);
+        // The worker's scratch compile, and a Compile that starts while it
+        // runs: the Compile waits for it.
+        let (_, compiled) = tokio::join!(a.check_once(), async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            a.compile().await
+        });
+        compiled.unwrap();
+        // A Compile, and the worker woken while it runs: the worker leaves it.
+        std::fs::write(d.join("pages/other.loxl"), "# changed again\n").unwrap();
+        let (_, checked) = tokio::join!(a.compile(), async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            check_of(&a, &d).await
+        });
+        assert_eq!(checked["current"], false, "{checked}");
+        let calls = calls_in(&tmp);
+        assert_eq!(
+            calls
+                .lines()
+                .filter(|l| l.starts_with("logic compile"))
+                .count(),
+            4,
+            "{calls}"
+        );
+        assert!(!calls.contains("CONCURRENT"), "{calls}");
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn a_lox_that_cannot_check_refuses_nothing() {
         let (_tmp, a) = project_for_edits();
-        a.refresh_edit(None, None);
-        let c = a.module_check().await;
+        let d = _tmp.path().join("project");
+        let c = check_of(&a, &d).await;
         assert_eq!(c["available"], false, "{c}");
-        assert!(a.why_broken().await.is_none());
+        assert!(a.module_errors().await.is_none());
     }
 
     #[cfg(unix)]

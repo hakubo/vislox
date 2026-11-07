@@ -238,31 +238,43 @@ vislox shows the compiled `out.Loxone` as the pending revision. When the module 
 unknown `extern` title, a block type whose ports lox has not verified), `out` stays at the last compile that worked,
 and the review would show an older change than the one in the source. So vislox checks the module itself.
 
-- `GET /api/check` runs `lox logic check --json <module>` and `lox logic fmt --check <module>` in the project. It
-  is worked out again only when the module's files, the lockfile or `out` change (the edit key and out's blob id),
-  one request at a time; the browser asks again when the key or the pending revision changes. The module's
-  directory is watched recursively, so a saved file is checked at once rather than at the next 3 s poll.
+- **The check worker** runs `lox logic check --json <module>` and `lox logic fmt --check <module>` (at once) in the
+  project whenever something it depends on changes: the module's files and the lockfile (the edit key), and the
+  base and out by blob id (as the history reads them on every poll). A file change wakes it, after 300 ms for the
+  writer to finish; so does the end of any action. `GET /api/check` only reads the last check it kept (`current`:
+  nothing changed since); a request never runs lox. `actions.edit.check` counts the checks kept, and the browser
+  fetches again when it moves.
+- The worker never checks while an action (an edit, Compile, Apply, Sync, Discard) runs: that check would be of a
+  project half written. It keeps nothing then, and the action's end wakes it, so a check skipped during an Apply
+  that failed and changed no file comes back as it was.
+- **One compile at a time**: every action holds a compile lock while it runs (after `busy`), and the worker holds
+  it for its check. An action that starts during a check waits for it; the worker leaves a running action alone.
+- The module's directory is watched recursively, and its parent too, so a module directory made later (by the
+  first edit) or made again is watched from then on. The 3 s poll still covers the rest.
 - `errors`: each of lox's errors (at most 50; `truncated` counts the rest) with `file` (shown like `sources`:
   relative to the project), `line`, `message` (without lox's `compile error:` prefix) and `blocks`: the UUIDs
-  the line makes or names, from `sources` (#64), the lockfile's slugs and the UUIDs written on it (an `extern`'s
-  `uuid: "…"`, or vislox's `vx_<uuid>` names). A comment names nothing.
-- `stale`: the module compiles, but not to the pending config: `{ files, error? }`. By content, as an edit checks
-  it: a module and out as vislox's last compile (an edit or *Compile*) left them are compiled; anything else is
-  compiled into a scratch copy (copied lock, `--out` elsewhere) and compared with out. `files` are the files changed
-  since vislox's last compile, else those written no earlier than out (the message only). `error` is lox's
-  message when the module checks but does not compile against the base. Not asked while there are errors, while
-  an edit, Apply or Discard runs, or when out is strictly newer than every module file and the lock (then it was
-  compiled after them; a time it shares with one of them tells nothing).
-- `unformatted`: the files `lox logic fmt --check` names. A hint only.
+  the line makes or names. Those are the blocks `sources` (#64) puts on that line, and the names the line
+  declares (`slug = …`, `extern slug = …`, `removed slug`) or references (the head of `slug.Port`), by the
+  lockfile's slugs or vislox's `vx_<uuid>` names, and an extern's `uuid: "…"`. Strings, comments, types,
+  keywords, argument keys and port names name nothing.
+- `stale`: the module compiles, but not to the pending config: `{ files, error? }`. By content only: what vislox
+  last compiled (an edit or *Compile*) is kept as the blob ids of each module file, the base and the out it wrote;
+  when all match, out is the module compiled. Anything else is compiled into a scratch copy (copied lock, `--out`
+  elsewhere) and compared with out. So a deleted file, a copy that keeps an old modification time and a new base
+  are all seen. `files` are the files changed since vislox's last compile (the base among them), else those
+  written no earlier than out (the message only). `error` is lox's message when the module checks but does not
+  compile against the base; *Compile* is off then.
+- `unformatted`: the files `lox logic fmt --check` names, on standard output or error. A hint only.
 - `available: false` (with `reason`) when lox gives no answer vislox can read (an older lox, a stand-in): then
   nothing is shown and nothing is refused.
-- **Apply is refused while the module has errors**, before anything runs: the server asks `lox logic check` anew
-  (not the cache, which may be a refresh old) and answers 409 with the first five errors. The browser turns
-  Apply off with the reason. An edit is already refused then (its module check compiles the module).
+- **Apply's first step is *Module compiles***: it asks `lox logic check` anew (not the cache, which may be a
+  refresh old), shown as it runs. With errors it fails there, before anything is sent, and Apply answers 409 with
+  the first five errors. The browser turns Apply off with the reason. An edit is already refused then (its module
+  check compiles the module).
 - **Compile** (`POST /api/compile`, admin token): runs `lox logic compile` in the project, as an edit does, without
-  changing the module, and records what it compiled for the next edit's check. It snapshots the lock and out for
-  Discard first, like an edit. It never deploys. lox's message comes back when it fails (a newer Loxone Config
-  needs `--accept-version`, which Apply offers; Compile does not yet).
+  changing the module, and records what it compiled. It snapshots the lock and out for Discard first, like an
+  edit. It never deploys. lox's message comes back when it fails (a newer Loxone Config needs `--accept-version`,
+  which Apply offers; Compile does not yet).
 - When stale, Apply's confirmation says that `lox config push` compiles the module as it is, so Apply would
   deploy changes the review does not show. Apply is not refused for it.
 - Discard forgets what vislox last compiled: after it, the module and out are the last commit's.

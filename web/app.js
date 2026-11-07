@@ -2486,13 +2486,14 @@ async function loadEdits() {
 function editsChanged() {
   const key = S.hist?.actions?.edit?.key ?? null;
   if (key !== S.editsKey) { S.editsKey = key; loadEdits(); }
-  // The check also follows out (a compile to what is deployed changes no key above).
-  const ck = `${key}|${S.hist?.pending?.[0]?.blob ?? ""}|${S.hist?.history?.[0]?.blob ?? ""}`;
+  // The server checks the module when it changes and counts the checks it keeps.
+  const ck = S.hist?.actions?.edit?.check ?? null;
   if (ck !== S.checkKey) { S.checkKey = ck; loadCheck(); }
 }
 
 // ── whether the module compiles (#65) ──────────────────────────────────
-// GET /api/check runs lox logic check on the project's module whenever it changes. While it has errors,
+// The server runs lox logic check on the project's module whenever it changes; GET /api/check reads the
+// last check (`actions.edit.check` counts them). While it has errors,
 // out.Loxone stays at the last compile that worked, so the review would show an older change than the
 // source: the Deploy pane says so, lists each error with its file, line and the blocks its line names,
 // and Apply is off. A module that compiles to something else than the pending config (changed outside
@@ -2537,11 +2538,14 @@ function renderCheck() {
   } else if (stale) {
     const files = stale.files?.length ? stale.files.join(", ") : "the module";
     const a = S.hist?.actions, busy = !!a?.running;
+    // A module that does not compile against the base would only fail again.
+    const why = !a?.apply?.available ? `Cannot compile: ${a?.apply?.reason || ""}`
+      : stale.error ? "Cannot compile: the module doesn't compile against the base (see above)" : "";
     parts.push(`<div class="ck-h">${pendingChange() ? `Pending is from before the latest edit to ${esc(files)}.` : `The module changed (${esc(files)}) and is not compiled yet.`}</div>`,
       stale.error ? `<div class="ck-sub">It doesn't compile against the base:</div><pre>${esc(stale.error)}</pre>`
         : `<div class="ck-sub">Compile it to review what Apply would deploy: lox config push compiles the module as it is.</div>`,
-      `<div class="ck-row"><button type="button" id="btn-compile" class="ghost small"${!a?.apply?.available || busy ? " disabled" : ""}
-        title="${esc(a?.apply?.available ? "Compile the module into the pending revision (lox logic compile). Nothing is deployed." : `Cannot compile: ${a?.apply?.reason || ""}`)}">${a?.running === "Compile" ? "Compiling…" : "Compile"}</button></div>`);
+      `<div class="ck-row"><button type="button" id="btn-compile" class="ghost small"${why || busy ? " disabled" : ""}
+        title="${esc(why || "Compile the module into the pending revision (lox logic compile). Nothing is deployed.")}">${a?.running === "Compile" ? "Compiling…" : "Compile"}</button></div>`);
   }
   if (fmt.length) parts.push(`<div class="ck-fmt">Not formatted as lox logic fmt writes it: ${esc(fmt.join(", "))}. A hint only; lox logic fmt --write formats it.</div>`);
   box.innerHTML = parts.join("");
