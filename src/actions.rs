@@ -19,7 +19,7 @@
 //! All four need the admin token (`X-Vislox-Token`). vislox itself still
 //! writes no config: lox and git do.
 
-use crate::{edit, restart};
+use crate::{check, edit, restart};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -34,6 +34,8 @@ const GIT_TIMEOUT: Duration = Duration::from_secs(120);
 const UNVERIFIED: &str = "Not verified";
 /// `lox logic compile` reads the base and the module and writes out and the lock.
 const COMPILE_TIMEOUT: Duration = Duration::from_secs(120);
+/// `lox logic check` and `lox logic fmt --check` read only the module.
+const CHECK_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub struct Settings {
     pub token: Option<String>,
@@ -62,6 +64,24 @@ pub struct Actions {
     /// its path from the project), and the blob id of the `out` it wrote.
     /// An edit checks the module against it by content ([`Self::uncompiled`]).
     compiled: Mutex<Option<Compiled>>,
+    /// `GET /api/check` (#65), for the [`EditState::key`] it was worked out
+    /// for; and one check at a time, so that two tabs do not compile twice.
+    check_cache: Mutex<Option<(String, Value)>>,
+    check_one: tokio::sync::Mutex<()>,
+}
+
+/// Whether `out` is the module compiled as it is now ([`Actions::freshness`]).
+enum Fresh {
+    Yes,
+    /// It compiles to another config: `out` is from before `changed`.
+    Stale {
+        changed: Vec<String>,
+    },
+    /// It does not compile against the base (lox's message).
+    Broken {
+        changed: Vec<String>,
+        error: String,
+    },
 }
 
 /// The module as a compile read it, and the config it wrote.
@@ -612,6 +632,8 @@ impl Actions {
             edits_cache: Mutex::new(None),
             module_files: Mutex::default(),
             compiled: Mutex::new(None),
+            check_cache: Mutex::new(None),
+            check_one: tokio::sync::Mutex::new(()),
         };
         a.edit_state.lock().unwrap().why = a.why_not_edit_now();
         a
@@ -623,6 +645,14 @@ impl Actions {
 
     fn changed(&self) {
         let _ = self.tx.send(());
+    }
+
+    /// The project's module (a directory, or one file), to watch.
+    pub fn module_path(&self) -> Option<PathBuf> {
+        let dir = self.s.project.as_deref()?;
+        loxone_config::Project::load(&dir.join("lox.toml"))
+            .ok()
+            .map(|p| p.module)
     }
 
     /// Apply and Sync could start now (they are on, and nothing runs), so
@@ -821,6 +851,11 @@ impl Actions {
             .busy
             .try_lock()
             .map_err(|_| (StatusCode::CONFLICT, "already running".to_string()))?;
+        if self.why_not_apply().is_none()
+            && let Some(why) = self.why_broken().await
+        {
+            return Err((StatusCode::CONFLICT, why));
+        }
         self.st.lock().unwrap().progress = Some(Progress::apply());
         self.begin("Apply")?;
         let res = self.apply_steps(opts).await;
@@ -1362,14 +1397,42 @@ impl Actions {
     }
 
     /// Refuse when the module holds changes that are not compiled into the
-    /// pending config: an edit's compile would fold them in. By content,
-    /// never by modification times alone (two writes can share a timestamp):
-    /// a module and `out` exactly as vislox's last compile left them are
-    /// compiled; anything else is compiled as it is into a scratch copy and
-    /// compared with `out`, and only a different result refuses.
+    /// pending config: an edit's compile would fold them in. See
+    /// [`Self::freshness`].
     async fn uncompiled(&self, p: &loxone_config::Project, dir: &Path) -> Result<(), Refusal> {
         use axum::http::StatusCode;
         let refuse = |msg: String| (StatusCode::CONFLICT, msg);
+        let files = |changed: &[String]| {
+            if changed.is_empty() {
+                "its files".to_string()
+            } else {
+                changed.join(", ")
+            }
+        };
+        match self.freshness(p, dir).await.map_err(refuse)? {
+            Fresh::Yes => Ok(()),
+            Fresh::Broken { changed, error } => Err(refuse(format!(
+                "The module does not compile as it is ({} changed since the last compile). \
+                 Fix or discard that, then edit:\n{}",
+                files(&changed),
+                last_lines(&error, 6)
+            ))),
+            Fresh::Stale { changed } => Err(refuse(format!(
+                "The module has changes that are not compiled yet ({}). An edit compiles the \
+                 whole module and would take them along: compile them (lox logic compile) or \
+                 discard them first.",
+                files(&changed)
+            ))),
+        }
+    }
+
+    /// Whether `out` is the module compiled as it is now. By content, never
+    /// by modification times alone (two writes can share a timestamp): a
+    /// module and `out` exactly as vislox's last compile left them are
+    /// compiled; anything else is compiled as it is into a scratch copy and
+    /// compared with `out`. `Err`: it cannot be told (no config to compare
+    /// with, no scratch directory).
+    async fn freshness(&self, p: &loxone_config::Project, dir: &Path) -> Result<Fresh, String> {
         let module = module_blobs(p);
         let out_blob = std::fs::read(&p.out)
             .ok()
@@ -1379,7 +1442,7 @@ impl Actions {
             && last.module == module
             && &last.out == o
         {
-            return Ok(());
+            return Ok(Fresh::Yes);
         }
         // The files that changed: since vislox's last compile, else those
         // written no earlier than out (a guess, for the message only).
@@ -1406,49 +1469,243 @@ impl Actions {
                 v
             }
         };
-        let files = if changed.is_empty() {
-            "its files".to_string()
-        } else {
-            changed.join(", ")
-        };
         let reference = std::fs::read(&p.out)
             .or_else(|_| std::fs::read(&p.base))
-            .map_err(|e| refuse(format!("cannot read the pending config: {e}")))?;
+            .map_err(|e| format!("cannot read the pending config: {e}"))?;
         let scratch = std::env::temp_dir().join(format!(
             "vislox-check-{}-{}",
             std::process::id(),
             now_nanos()
         ));
         std::fs::create_dir_all(&scratch)
-            .map_err(|e| refuse(format!("cannot create {}: {e}", scratch.display())))?;
+            .map_err(|e| format!("cannot create {}: {e}", scratch.display()))?;
         let _gone = RemoveDir(scratch.clone());
         let (lock, out) = (scratch.join("lock.json"), scratch.join("out.Loxone"));
         if p.lock.exists() {
-            std::fs::copy(&p.lock, &lock)
-                .map_err(|e| refuse(format!("cannot copy the lock: {e}")))?;
+            std::fs::copy(&p.lock, &lock).map_err(|e| format!("cannot copy the lock: {e}"))?;
         }
         let (lock_s, out_s) = (lock.to_string_lossy(), out.to_string_lossy());
         let args = ["logic", "compile", "--lock", &lock_s, "--out", &out_s];
         match run(&self.s.lox, &args, dir, COMPILE_TIMEOUT).await {
-            Err(e) => Err(refuse(format!(
-                "The module does not compile as it is ({files} changed since the last compile). \
-                 Fix or discard that, then edit:\n{}",
-                last_lines(&e, 6)
-            ))),
+            Err(error) => Ok(Fresh::Broken { changed, error }),
             Ok(_) if std::fs::read(&out).ok().as_deref() == Some(reference.as_slice()) => {
                 // Compiled as it is: remembered, so the next edit need not
-                // compile it again.
-                if let Some(o) = out_blob {
+                // compile it again; unless the module changed meanwhile (an
+                // edit while `GET /api/check` compiled), when what compiled
+                // is not known.
+                if let Some(o) = out_blob
+                    && module_blobs(p) == module
+                {
                     *self.compiled.lock().unwrap() = Some(Compiled { module, out: o });
                 }
-                Ok(())
+                Ok(Fresh::Yes)
             }
-            Ok(_) => Err(refuse(format!(
-                "The module has changes that are not compiled yet ({files}). An edit compiles the \
-                 whole module and would take them along: compile them (lox logic compile) or \
-                 discard them first."
-            ))),
+            Ok(_) => Ok(Fresh::Stale { changed }),
         }
+    }
+
+    /// `lox logic check --json` on the module as it is now (#65): its errors,
+    /// or `None` when lox gave no answer vislox can read (an older lox, a
+    /// stand-in): then nothing is known, and nothing is refused.
+    async fn check_module(&self, p: &loxone_config::Project, dir: &Path) -> Option<check::Checked> {
+        let arg = check::module_arg(&p.root, &p.module);
+        let (_, stdout, _) = run_out(
+            &self.s.lox,
+            &["logic", "check", "--json", &arg],
+            dir,
+            CHECK_TIMEOUT,
+        )
+        .await
+        .ok()?;
+        check::parse(&stdout, |f| {
+            crate::managed::shown(&p.root, &p.module, &dir.join(f))
+        })
+    }
+
+    /// Whether the module compiles, for `GET /api/check` (#65): lox's errors
+    /// with the blocks each one's line names, the files `lox logic fmt
+    /// --check` would format, and whether the pending config is from before
+    /// the latest change of the module (`stale`). Cached until
+    /// [`Self::refresh_edit`] sees a change.
+    pub async fn module_check(&self) -> Value {
+        // The module and the lock (the edit key), and out by content: out may
+        // change while nothing is pending before or after (compiled to what
+        // the Miniserver runs).
+        let out = self
+            .s
+            .project
+            .as_deref()
+            .and_then(|d| loxone_config::Project::load(&d.join("lox.toml")).ok())
+            .map(|p| p.out);
+        let key = || {
+            let o = out
+                .as_deref()
+                .and_then(|o| std::fs::read(o).ok())
+                .map(|b| crate::history::blob_id(&b));
+            format!(
+                "{}:{}",
+                self.edit_state.lock().unwrap().key,
+                o.as_deref().unwrap_or("-")
+            )
+        };
+        let cached = |k: &str| {
+            self.check_cache
+                .lock()
+                .unwrap()
+                .as_ref()
+                .filter(|(c, _)| c == k)
+                .map(|(_, v)| v.clone())
+        };
+        if let Some(v) = cached(&key()) {
+            return v;
+        }
+        // One at a time: a second tab waits, then takes the first one's.
+        let _one = self.check_one.lock().await;
+        let k = key();
+        if let Some(v) = cached(&k) {
+            return v;
+        }
+        let v = self.check_now().await;
+        // Kept only when nothing changed while lox ran: else the next
+        // request works it out again.
+        if key() == k {
+            *self.check_cache.lock().unwrap() = Some((k, v.clone()));
+        }
+        v
+    }
+
+    async fn check_now(&self) -> Value {
+        let off = |why: String| json!({ "available": false, "reason": why });
+        let Some(dir) = self.s.project.as_deref() else {
+            return off("only for a lox.toml project".into());
+        };
+        let p = match loxone_config::Project::load(&dir.join("lox.toml")) {
+            Ok(p) => p,
+            Err(e) => return off(format!("cannot read lox.toml: {e}")),
+        };
+        let Some(mut checked) = self.check_module(&p, dir).await else {
+            return off("lox logic check gave no answer vislox can read".into());
+        };
+        if !checked.errors.is_empty() {
+            let texts = {
+                let mut m = self.module_files.lock().unwrap();
+                m.refresh(&p.root, &p.module);
+                m.texts()
+            };
+            let lock = edit::Lock::read(&p.lock);
+            let sources = crate::managed::sources(&texts, &lock.slugs);
+            check::locate(&mut checked.errors, &texts, &lock, &sources);
+        }
+        let shown = |f: &str| crate::managed::shown(&p.root, &p.module, &dir.join(f));
+        let arg = check::module_arg(&p.root, &p.module);
+        let unformatted = match run_out(
+            &self.s.lox,
+            &["logic", "fmt", "--check", &arg],
+            dir,
+            CHECK_TIMEOUT,
+        )
+        .await
+        {
+            Ok((_, o, e)) => check::unformatted(&format!("{o}{e}"), shown),
+            Err(_) => Vec::new(),
+        };
+        // Is the pending config the module as it is? Not asked while the
+        // module does not compile (it cannot be), nor while an edit, Apply
+        // or Discard writes it, nor when out is newer than every file of the
+        // module and the lock: then it was compiled after them. Anything
+        // else is compiled into a scratch copy and compared, by content.
+        let running = self.st.lock().unwrap().running.is_some();
+        let stale = if !checked.errors.is_empty() || running || out_is_newest(&p) {
+            Value::Null
+        } else {
+            match self.freshness(&p, dir).await {
+                Ok(Fresh::Yes) | Err(_) => Value::Null,
+                Ok(Fresh::Stale { changed }) => json!({ "files": changed }),
+                Ok(Fresh::Broken { changed, error }) => {
+                    json!({ "files": changed, "error": last_lines(&error, 6) })
+                }
+            }
+        };
+        json!({
+            "available": true,
+            "ok": checked.errors.is_empty(),
+            "errors": checked.errors,
+            "truncated": checked.truncated,
+            "unformatted": unformatted,
+            "stale": stale,
+        })
+    }
+
+    /// Why Apply must not run now: the module does not compile, so what lox
+    /// would deploy is not what the review shows (#65). Asked of lox anew,
+    /// not of the cache, which may be up to a refresh old.
+    async fn why_broken(&self) -> Option<String> {
+        let dir = self.s.project.as_deref()?;
+        let p = loxone_config::Project::load(&dir.join("lox.toml")).ok()?;
+        let c = self.check_module(&p, dir).await?;
+        if c.errors.is_empty() {
+            return None;
+        }
+        let n = c.errors.len() + c.truncated;
+        let list: Vec<String> = c
+            .errors
+            .iter()
+            .take(5)
+            .map(|e| {
+                let at = match (&e.file, e.line) {
+                    (Some(f), Some(l)) => format!("{f}:{l}: "),
+                    (Some(f), None) => format!("{f}: "),
+                    _ => String::new(),
+                };
+                format!("  {at}{}", e.message)
+            })
+            .collect();
+        Some(format!(
+            "The module doesn't compile ({n} error{}), so the pending config is from the last \
+             compile that worked. Fix the module, then apply.\n{}{}",
+            if n == 1 { "" } else { "s" },
+            list.join("\n"),
+            if n > 5 { "\n  …" } else { "" }
+        ))
+    }
+
+    /// Compile the module as it is into the pending config
+    /// (`lox logic compile`), as an edit does, without changing it: for a
+    /// module changed outside vislox (#65). Never deploys.
+    pub async fn compile(&self) -> Result<String, Refusal> {
+        use axum::http::StatusCode;
+        let _one = self
+            .busy
+            .try_lock()
+            .map_err(|_| (StatusCode::CONFLICT, "already running".to_string()))?;
+        self.begin("Compile")?;
+        let res = self.compile_steps().await;
+        self.end("compile", &res);
+        res.map_err(|e| (StatusCode::BAD_GATEWAY, e))
+    }
+
+    async fn compile_steps(&self) -> Result<String, String> {
+        let dir = self.s.project.as_deref().unwrap();
+        let p = loxone_config::Project::load(&dir.join("lox.toml"))
+            .map_err(|e| format!("cannot read lox.toml: {e}"))?;
+        // Discard puts back a lock or out the last commit does not have.
+        snapshot_before_edit(dir, &p).await;
+        let module = module_blobs(&p);
+        run(&self.s.lox, &["logic", "compile"], dir, COMPILE_TIMEOUT)
+            .await
+            .map_err(|e| format!("lox logic compile failed:\n{}", last_lines(&e, 8)))?;
+        if let Ok(b) = std::fs::read(&p.out)
+            && module_blobs(&p) == module
+        {
+            *self.compiled.lock().unwrap() = Some(Compiled {
+                module,
+                out: crate::history::blob_id(&b),
+            });
+        }
+        Ok(
+            "Compiled the module as it is: the pending revision shows it. Nothing was deployed."
+                .into(),
+        )
     }
 
     /// What vislox's file claims, and which of it is not deployed: the
@@ -1766,6 +2023,9 @@ impl Actions {
             return Err(format!("{e}\nNothing was discarded."));
         }
         clear_snapshot(dir).await;
+        // What vislox last compiled is not what is there now: the next check
+        // compares by content, and names the files written after out.
+        *self.compiled.lock().unwrap() = None;
         let mut msg =
             String::from("The module, lock and compiled config are back at the last commit.");
         if !kept.is_empty() {
@@ -1943,6 +2203,53 @@ async fn run_lines(
     } else {
         Err(text)
     }
+}
+
+/// Run a command to its end: whether it succeeded, its standard output and
+/// its standard error, apart. `Err` only when it did not run (or ran too
+/// long).
+async fn run_out(
+    cmd: &Path,
+    args: &[&str],
+    dir: &Path,
+    limit: Duration,
+) -> Result<(bool, String, String), String> {
+    let mut c = tokio::process::Command::new(cmd);
+    c.args(args)
+        .current_dir(dir)
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let out = tokio::time::timeout(limit, c.output())
+        .await
+        .map_err(|_| format!("took longer than {} s", limit.as_secs()))?
+        .map_err(|e| format!("cannot run {}: {e}", cmd.display()))?;
+    Ok((
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    ))
+}
+
+/// Whether out was written after every file of the module and the lock,
+/// strictly: a time it shares with one of them tells nothing (two writes
+/// in one tick), and neither does a missing out.
+fn out_is_newest(p: &loxone_config::Project) -> bool {
+    let time = |f: &Path| std::fs::metadata(f).and_then(|m| m.modified()).ok();
+    let Some(out) = time(&p.out) else {
+        return false;
+    };
+    let mut newest = time(&p.lock);
+    if let Some(t) = time(&p.module).filter(|_| p.module.is_file())
+        && newest.is_none_or(|n| t > n)
+    {
+        newest = Some(t);
+    }
+    edit::module_files(&p.module, &mut |_, t| {
+        if newest.is_none_or(|n| t > n) {
+            newest = Some(t);
+        }
+    });
+    newest.is_none_or(|n| out > n)
 }
 
 async fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
@@ -2786,6 +3093,183 @@ sed "s/Title=\"Testhaus\"/Title=\"Testhaus $w\"/" base.Loxone > "$out"
             calls.lines().all(|l| l.starts_with("logic compile")),
             "{calls}"
         );
+    }
+
+    /// A lox.toml project in git, and a `lox` whose `logic check` finds an
+    /// error on each line of the module that says BROKEN, whose `logic fmt
+    /// --check` finds a file with two spaces in a row not formatted, and
+    /// whose `logic compile` writes the base and the module into out. It
+    /// logs its calls, and fails on any other command.
+    #[cfg(unix)]
+    fn project_to_check() -> (tempfile::TempDir, PathBuf, Actions) {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("project");
+        std::fs::create_dir_all(d.join("pages")).unwrap();
+        std::fs::write(d.join("base.Loxone"), "base\n").unwrap();
+        std::fs::write(
+            d.join("lox.toml"),
+            "base = \"base.Loxone\"\nmodule = \"pages\"\nout = \"out.Loxone\"\n",
+        )
+        .unwrap();
+        std::fs::write(d.join("pages/main.loxl"), "teiler = Div(\"Teiler\")\n").unwrap();
+        std::fs::write(
+            d.join("logic.lock.json"),
+            format!(r#"{{"objects":{{"teiler":{{"uuid":"{DIV}","type":"Div"}}}}}}"#),
+        )
+        .unwrap();
+        sh(
+            &d,
+            "git init -q && git config user.email t@t && git config user.name t \
+             && git add -A && git commit -qm init",
+        );
+        let lox = tmp.path().join("lox");
+        std::fs::write(
+            &lox,
+            r#"#!/bin/sh
+echo "$*" >> ../calls.log
+case "$1 $2 $3" in
+  "logic check --json")
+    n=$(grep -n BROKEN pages/main.loxl | cut -d: -f1 | head -1)
+    if [ -n "$n" ]; then
+      echo "{\"errors\":[{\"line\":$n,\"message\":\"compile error: unknown block type BROKEN\",\"path\":\"pages/main.loxl\"}],\"ok\":false,\"path\":\"pages/main.loxl\"}"
+      exit 1
+    fi
+    echo '{"counts":{"blocks":1},"ok":true,"path":"pages"}' ;;
+  "logic fmt --check")
+    if grep -q '  ' pages/main.loxl; then echo 'pages/main.loxl: not canonical (run `lox logic fmt --write pages`)' >&2; exit 1; fi
+    echo 'pages/main.loxl: canonical' ;;
+  "logic compile"*)
+    grep -q BROKEN pages/main.loxl && { echo 'compile error: unknown block type BROKEN' >&2; exit 1; }
+    out=out.Loxone; prev=
+    for a in "$@"; do [ "$prev" = --out ] && out=$a; prev=$a; done
+    cat base.Loxone pages/main.loxl > "$out" ;;
+  *) echo "unexpected: $*" >&2; exit 2 ;;
+esac
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&lox, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let a = Actions::new(Settings {
+            token: Some("t".into()),
+            project: Some(d.clone()),
+            lox,
+            probe: None,
+            running: Arc::new(crate::running::Running::new(Err("test".into()))),
+        });
+        (tmp, d, a)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_module_that_does_not_compile_is_reported_and_stops_apply() {
+        use axum::http::StatusCode;
+        let (tmp, d, a) = project_to_check();
+        let check = || async {
+            a.refresh_edit(None, None);
+            a.module_check().await
+        };
+        // Compiled as it is: nothing to say.
+        a.compile().await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(d.join("out.Loxone")).unwrap(),
+            "base\nteiler = Div(\"Teiler\")\n"
+        );
+        let c = check().await;
+        assert_eq!(c["available"], true, "{c}");
+        assert_eq!(c["ok"], true, "{c}");
+        assert_eq!(c["errors"], json!([]));
+        assert_eq!(c["stale"], Value::Null, "{c}");
+        assert_eq!(c["unformatted"], json!([]));
+
+        // An error on line 2, which names the managed block `teiler`.
+        std::fs::write(
+            d.join("pages/main.loxl"),
+            "teiler = Div(\"Teiler\")\nteiler.I1 <- BROKEN.Q\n",
+        )
+        .unwrap();
+        let c = check().await;
+        assert_eq!(c["ok"], false, "{c}");
+        assert_eq!(
+            c["errors"],
+            json!([{ "file": "pages/main.loxl", "line": 2,
+                     "message": "unknown block type BROKEN", "blocks": [DIV] }]),
+        );
+        // Not compiled into a scratch copy: it cannot compile.
+        assert_eq!(c["stale"], Value::Null);
+        let compiles = || {
+            std::fs::read_to_string(tmp.path().join("calls.log"))
+                .unwrap()
+                .lines()
+                .filter(|l| l.starts_with("logic compile"))
+                .count()
+        };
+        assert_eq!(compiles(), 1, "only the Compile");
+        // Cached: asked again, lox is not run again.
+        let calls = std::fs::read_to_string(tmp.path().join("calls.log")).unwrap();
+        assert_eq!(a.module_check().await, c);
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("calls.log")).unwrap(),
+            calls
+        );
+        // Apply is refused before it does anything, naming the error.
+        let (code, msg) = a.apply(&ApplyOpts::default()).await.unwrap_err();
+        assert_eq!(code, StatusCode::CONFLICT);
+        assert!(
+            msg.contains("The module doesn't compile (1 error)"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("pages/main.loxl:2: unknown block type BROKEN"),
+            "{msg}"
+        );
+        assert!(a.info()["progress"].is_null(), "Apply did not start");
+        // And so is Compile, with lox's message.
+        let (_, msg) = a.compile().await.unwrap_err();
+        assert!(msg.contains("unknown block type BROKEN"), "{msg}");
+
+        // Fixed, but not compiled: the pending config is from before it.
+        std::fs::write(
+            d.join("pages/main.loxl"),
+            "teiler = Div(\"Teiler\")\n# changed\n",
+        )
+        .unwrap();
+        let c = check().await;
+        assert_eq!(c["ok"], true, "{c}");
+        assert_eq!(c["stale"], json!({ "files": ["pages/main.loxl"] }), "{c}");
+        a.compile().await.unwrap();
+        let c = check().await;
+        assert_eq!(c["stale"], Value::Null, "{c}");
+        assert_eq!(
+            std::fs::read_to_string(d.join("out.Loxone")).unwrap(),
+            "base\nteiler = Div(\"Teiler\")\n# changed\n"
+        );
+
+        // Not formatted: a hint, and nothing else.
+        std::fs::write(
+            d.join("pages/main.loxl"),
+            "teiler = Div(\"Teiler\")\n# changed\n\n#  spaced\n",
+        )
+        .unwrap();
+        let c = check().await;
+        assert_eq!(c["ok"], true, "{c}");
+        assert_eq!(c["unformatted"], json!(["pages/main.loxl"]), "{c}");
+        assert!(
+            !std::fs::read_to_string(tmp.path().join("calls.log"))
+                .unwrap()
+                .contains("config push"),
+            "nothing deployed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_lox_that_cannot_check_refuses_nothing() {
+        let (_tmp, a) = project_for_edits();
+        a.refresh_edit(None, None);
+        let c = a.module_check().await;
+        assert_eq!(c["available"], false, "{c}");
+        assert!(a.why_broken().await.is_none());
     }
 
     #[cfg(unix)]

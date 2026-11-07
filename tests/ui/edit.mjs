@@ -74,13 +74,23 @@ git("commit", "-q", "-m", "Deployed");
 
 // The stand-in lox. `logic compile` reads vislox's claims (extern …(uuid: "…"), x.title = "…",
 // x.Port = n) and writes them into a copy of the base, as lox would. It draws every block of the lock
-// where its `layout` says, and `--relayout <page>` lines that page's blocks up along the top.
+// where its `layout` says, and `--relayout <page>` lines that page's blocks up along the top. It takes
+// the title of a block the module's own files declare (`flur = And("Flur")`). `logic check --json`
+// finds an error on each line of the module's own files that says BROKEN; `logic fmt --check` finds
+// nothing to format.
 const loxDir = mkdtempSync(join(tmpdir(), "vislox-lox-"));
 const calls = join(loxDir, "calls.log");
 const fakeLox = join(loxDir, "lox");
 writeFileSync(fakeLox, `#!/usr/bin/env node
 const fs = require("fs");
 fs.appendFileSync(${JSON.stringify(calls)}, process.argv.slice(2).join(" ") + "\\n");
+const own = () => fs.readdirSync("pages").filter((f) => f.endsWith(".loxl")).map((f) => ["pages/" + f, fs.readFileSync("pages/" + f, "utf8").split("\\n")]);
+if (process.argv.slice(2, 5).join(" ") === "logic check --json") {
+  const errors = own().flatMap(([path, lines]) => lines.flatMap((l, i) => l.includes("BROKEN") ? [{ path, line: i + 1, message: "compile error: unknown block type BROKEN" }] : []));
+  console.log(JSON.stringify(errors.length ? { ok: false, path: errors[0].path, errors } : { ok: true, path: "pages", counts: {} }));
+  process.exit(errors.length ? 1 : 0);
+}
+if (process.argv.slice(2, 5).join(" ") === "logic fmt --check") process.exit(0);
 if (process.argv.slice(2, 4).join(" ") !== "logic compile") { console.error("unexpected: " + process.argv.slice(2).join(" ")); process.exit(2); }
 // VISLOX_TEST_LOX_DELAY (ms): compile as slowly as a busy CI runner does.
 for (const end = Date.now() + (+process.env.VISLOX_TEST_LOX_DELAY || 0); Date.now() < end;);
@@ -109,7 +119,9 @@ for (const line of src.split("\\n")) {
 }
 // vislox's new blocks: one file per page (page "…"), a declaration per block. Each gets a UUID in the
 // lock (kept by slug across compiles) and is drawn on its page with the constants it is given.
-const lockFile = "logic.lock.json";
+// A scratch compile (--lock, --out elsewhere) leaves the project's lock and the UUIDs minted alone.
+const lockAt = process.argv.indexOf("--lock");
+const lockFile = lockAt > 0 ? process.argv[lockAt + 1] : "logic.lock.json";
 const lock = fs.existsSync(lockFile) ? JSON.parse(fs.readFileSync(lockFile, "utf8")) : { objects: {} };
 const objects = {};
 // Like lox, a block added again gets a UUID it never had: the count of UUIDs minted is kept.
@@ -131,8 +143,13 @@ for (const f of fs.existsSync("pages/vislox") ? fs.readdirSync("pages/vislox") :
     out.splice(pageAt + 1, 0, \`\\t\\t\\t<C Type="\${ty}" V="178" U="\${uuid}" Title="\${xml(title ? JSON.parse('"' + title[1] + '"') : slug)}" Px="96" Py="96" Px2="1440" Py2="792" Nio="2">\${cos.join("")}</C>\`);
   }
 }
-// The blocks the rest of the module manages stay in the lock.
+// The blocks the rest of the module manages stay in the lock, with the titles their files give them.
 for (const [s, o] of Object.entries(lock.objects)) if (!s.startsWith("vx_")) objects[s] = o;
+for (const [, lines] of own()) for (const line of lines) {
+  const m = line.match(/^(\\w+) = \\w+\\("(.*)"\\)$/), o = m && objects[m[1]];
+  const i = o ? out.findIndex((l) => l.includes(\`U="\${o.uuid}"\`)) : -1;
+  if (i >= 0) out[i] = out[i].replace(/Title="[^"]*"/, \`Title="\${xml(m[2])}"\`);
+}
 const relayout = process.argv.flatMap((a, i) => process.argv[i - 1] === "--relayout" ? [a] : []);
 const cols = {};
 for (const o of Object.values(objects)) {
@@ -169,7 +186,7 @@ for (const line of src.split("\\n")) {
   out[to] = out[to].replace(/\\/>$/, \`><In Input="\${srcU}"/></Co>\`);
 }
 fs.writeFileSync(lockFile, JSON.stringify({ objects }));
-fs.writeFileSync(mintFile, String(n));
+if (lockAt < 0) fs.writeFileSync(mintFile, String(n));
 const to = process.argv.indexOf("--out");
 fs.writeFileSync(to > 0 ? process.argv[to + 1] : "out.Loxone", out.join("\\n"));
 `);
@@ -870,10 +887,32 @@ try {
     await page.waitForFunction(() => /Nothing pending/.test(document.querySelector("#deploy-pend")?.textContent || ""), null, { timeout: 10000 });
     assert.equal(existsSync(join(dir, "pages/vislox")), false);
   });
-  await step("nothing was deployed: lox only compiled", async () => {
+  await step("a module that does not compile is listed, error by error, and Apply is off (#65)", async () => {
+    const flur = join(dir, "pages", "flur.loxl"), was = readFileSync(flur, "utf8");
+    writeFileSync(flur, was + "flur.In1 <- BROKEN.Q\n");
+    await waitText("#deploy-check", /The module doesn't compile: 1 error/);
+    assert.match(await page.textContent("#deploy-check li"), /pages\/flur\.loxl:4unknown block type BROKEN/);
+    assert.equal(await page.evaluate(() => document.querySelector("#btn-apply").disabled), true);
+    // The error's line names `flur`: its button shows the block, and Properties says why.
+    await page.click('#deploy-check .go:has-text("Flur")');
+    await page.waitForFunction((u) => S.sel === u, FLUR);
+    await waitText("#props", /Doesn't compile \(pages\/flur\.loxl:4\): unknown block type BROKEN/);
+    // Fixed, but not compiled: the module changed since out, and Compile compiles it.
+    writeFileSync(flur, was.replace('And("Flur")', 'And("Flur oben")'));
+    await waitText("#deploy-check", /The module changed \(pages\/flur\.loxl\) and is not compiled yet/);
+    await page.click("#btn-compile");
+    await waitText("#deploy-pend", /Compiled changes are pending/);
+    await page.waitForSelector("#deploy-check.hidden", { state: "attached" });
+    assert.match(readFileSync(join(dir, "out.Loxone"), "utf8"), /Title="Flur oben"/);
+    assert.equal(await page.evaluate(() => document.querySelector("#btn-apply").disabled), false);
+    await page.click("#btn-discard");
+    await page.waitForFunction(() => /Nothing pending/.test(document.querySelector("#deploy-pend")?.textContent || ""), null, { timeout: 10000 });
+    assert.equal(readFileSync(flur, "utf8"), was);
+  });
+  await step("nothing was deployed: lox only compiled and checked", async () => {
     const ran = readFileSync(calls, "utf8").trim().split("\n");
     assert.ok(ran.length >= 2, ran.join(" | "));
-    assert.ok(ran.every((l) => l.startsWith("logic compile")), ran.join(" | "));
+    assert.ok(ran.every((l) => /^logic (compile|check --json|fmt --check)\b/.test(l)), ran.join(" | "));
   });
   await step("no errors in the browser", async () => {
     assert.deepEqual(errors, []);
@@ -883,6 +922,7 @@ try {
   console.error("FAILED:", e.message);
   if (errors.length) console.error("browser errors:", errors);
   if (page) console.error("props:", await page.textContent("#props").catch(() => "?"));
+  if (page) console.error("check:", await page.evaluate(() => JSON.stringify(S.check)).catch(() => "?"));
   if (page) console.error("add block:", await page.textContent("#ab-body").catch(() => "?"));
   if (page) console.error("wire card:", await page.textContent("#wcard").catch(() => "?"), "| deploy:", await page.textContent("#deploy-msg").catch(() => "?"));
   console.error(log);

@@ -6,6 +6,7 @@ mod appcalendar;
 mod backups;
 mod blocks;
 mod calendar;
+mod check;
 mod configdate;
 mod discover;
 mod edit;
@@ -528,6 +529,8 @@ async fn main() -> Result<()> {
         .route("/api/discard", axum::routing::post(api_discard))
         .route("/api/edit", axum::routing::post(api_edit))
         .route("/api/edits", get(api_edits))
+        .route("/api/check", get(api_check))
+        .route("/api/compile", axum::routing::post(api_compile))
         .route("/api/block-types", get(api_block_types))
         .route("/api/sync", axum::routing::post(api_sync))
         .route("/api/operate", axum::routing::post(api_operate))
@@ -662,6 +665,22 @@ fn spawn_watcher(app: Arc<App>) -> Result<()> {
     for d in &dirs {
         watcher.watch(d, RecursiveMode::NonRecursive)?;
     }
+    // The module's directory too (#65): a change there is checked with
+    // `lox logic check` at once, not at the next poll. A module that is one
+    // file is in a directory watched above, or named below.
+    let module = app.actions.module_path().filter(|m| m.is_dir());
+    if let Some(m) = module.as_deref()
+        && let Err(e) = watcher.watch(m, RecursiveMode::Recursive)
+    {
+        eprintln!("vislox: cannot watch {}: {e}", m.display());
+    }
+    // Events name the path as the file system resolves it (/private/var on
+    // macOS for /var).
+    let module: Vec<PathBuf> = module
+        .into_iter()
+        .flat_map(|m| [m.canonicalize().ok(), Some(m)])
+        .flatten()
+        .collect();
     let names: Vec<_> = paths
         .iter()
         .filter_map(|p| p.file_name().map(|n| n.to_owned()))
@@ -671,9 +690,10 @@ fn spawn_watcher(app: Arc<App>) -> Result<()> {
         while let Ok(ev) = rx.recv() {
             let relevant = |ev: &notify::Result<notify::Event>| {
                 ev.as_ref().is_ok_and(|e| {
-                    e.paths
-                        .iter()
-                        .any(|p| p.file_name().is_some_and(|n| names.iter().any(|m| m == n)))
+                    e.paths.iter().any(|p| {
+                        p.file_name().is_some_and(|n| names.iter().any(|m| m == n))
+                            || module.iter().any(|m| p.starts_with(m))
+                    })
                 })
             };
             if !relevant(&ev) {
@@ -1501,6 +1521,28 @@ async fn api_edit(
 async fn api_edits(State(app): State<Arc<App>>) -> Response {
     let (deployed, pending) = edit_revisions(&app).await;
     Json(app.actions.edits(deployed, pending).await).into_response()
+}
+
+/// Whether the project's module compiles (#65): `lox logic check`'s
+/// errors, `lox logic fmt --check`'s hints, and whether the pending config
+/// is from before the module's latest change.
+async fn api_check(State(app): State<Arc<App>>) -> Response {
+    Json(app.actions.module_check().await).into_response()
+}
+
+/// Compile the module as it is (`lox logic compile`) into the pending
+/// config. Never deploys.
+async fn api_compile(State(app): State<Arc<App>>, headers: axum::http::HeaderMap) -> Response {
+    if let Err(r) = app.actions.check(&headers) {
+        return refused(r);
+    }
+    let res = app.actions.compile().await;
+    let a = app.clone();
+    let _ = tokio::task::spawn_blocking(move || refresh(&a)).await;
+    match res {
+        Ok(m) => Json(serde_json::json!({ "message": m })).into_response(),
+        Err(r) => refused(r),
+    }
 }
 
 /// The deployed revision ([`deployed_revision`]) and the pending compile,

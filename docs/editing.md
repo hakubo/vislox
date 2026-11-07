@@ -232,6 +232,49 @@ or in Loxone Config (where an edit to a managed block is overwritten on the next
   blocks), and finds a block by its slug in Ctrl+K. Values of a managed block are still refused in *Edit values*,
   naming its `file:line`.
 
+## When the module does not compile (#65)
+
+vislox shows the compiled `out.Loxone` as the pending revision. When the module no longer compiles (a typo, an
+unknown `extern` title, a block type whose ports lox has not verified), `out` stays at the last compile that worked,
+and the review would show an older change than the one in the source. So vislox checks the module itself.
+
+- `GET /api/check` runs `lox logic check --json <module>` and `lox logic fmt --check <module>` in the project. It
+  is worked out again only when the module's files, the lockfile or `out` change (the edit key and out's blob id),
+  one request at a time; the browser asks again when the key or the pending revision changes. The module's
+  directory is watched recursively, so a saved file is checked at once rather than at the next 3 s poll.
+- `errors`: each of lox's errors (at most 50; `truncated` counts the rest) with `file` (shown like `sources`:
+  relative to the project), `line`, `message` (without lox's `compile error:` prefix) and `blocks`: the UUIDs
+  the line makes or names, from `sources` (#64), the lockfile's slugs and the UUIDs written on it (an `extern`'s
+  `uuid: "…"`, or vislox's `vx_<uuid>` names). A comment names nothing.
+- `stale`: the module compiles, but not to the pending config: `{ files, error? }`. By content, as an edit checks
+  it: a module and out as vislox's last compile (an edit or *Compile*) left them are compiled; anything else is
+  compiled into a scratch copy (copied lock, `--out` elsewhere) and compared with out. `files` are the files changed
+  since vislox's last compile, else those written no earlier than out (the message only). `error` is lox's
+  message when the module checks but does not compile against the base. Not asked while there are errors, while
+  an edit, Apply or Discard runs, or when out is strictly newer than every module file and the lock (then it was
+  compiled after them; a time it shares with one of them tells nothing).
+- `unformatted`: the files `lox logic fmt --check` names. A hint only.
+- `available: false` (with `reason`) when lox gives no answer vislox can read (an older lox, a stand-in): then
+  nothing is shown and nothing is refused.
+- **Apply is refused while the module has errors**, before anything runs: the server asks `lox logic check` anew
+  (not the cache, which may be a refresh old) and answers 409 with the first five errors. The browser turns
+  Apply off with the reason. An edit is already refused then (its module check compiles the module).
+- **Compile** (`POST /api/compile`, admin token): runs `lox logic compile` in the project, as an edit does, without
+  changing the module, and records what it compiled for the next edit's check. It snapshots the lock and out for
+  Discard first, like an edit. It never deploys. lox's message comes back when it fails (a newer Loxone Config
+  needs `--accept-version`, which Apply offers; Compile does not yet).
+- When stale, Apply's confirmation says that `lox config push` compiles the module as it is, so Apply would
+  deploy changes the review does not show. Apply is not refused for it.
+- Discard forgets what vislox last compiled: after it, the module and out are the last commit's.
+
+The Deploy pane shows it above Apply: *The module doesn't compile: N errors* with each error's `file:line`,
+message and a button per block its line names (on the newest config); *Pending is from before the latest edit to
+`pages/x.loxl`* (or, with nothing pending, *The module changed … and is not compiled yet*) with *Compile*; and the
+formatting hint. Properties shows a block's errors in its *Lox Logic* section.
+
+`lox logic lint` findings (#66) and `lox logic test` results (#67) are meant to join this: more fields of
+`GET /api/check`, worked out on the same key, shown in the same box and on the blocks `check::locate` finds.
+
 ## Undo and redo (#62)
 
 Undo is not a second way to change the module: it sends the edit's `undo` back to `POST /api/edit` as an edit of
@@ -351,7 +394,7 @@ Each of these plugs in as new op kinds on `POST /api/edit`, written into `<modul
 | #87 | Automatic Designer rules (`rule`) |
 | #88 | new pages (`page "…" (room: …)`) |
 
-Around the module: #64 (mark managed blocks, built), #65 (`lox logic check` errors), #66 (lint), #67 (`lox logic test`),
+Around the module: #64 (mark managed blocks, built), #65 (`lox logic check` errors, built), #66 (lint), #67 (`lox logic test`),
 #68 (review claimed access, recipients and schedules), #70 (removals on Apply).
 
 ## The browser

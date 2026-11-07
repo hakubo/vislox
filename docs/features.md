@@ -164,6 +164,15 @@ sends to the Miniserver see [miniserver.md](miniserver.md).
   it waits until nothing is pending. When merge refuses because the Miniserver holds custom changes no download
   carries, Sync makes a plain download the base instead (rules edited in the app are then not taken over).
 
+- **Does the module compile?** (a `lox.toml` project): vislox runs `lox logic check` on the module whenever it
+  changes. While it has errors, `out.Loxone` stays at the last compile that worked, so the Deploy pane says *The
+  module doesn't compile: N errors*, lists each one with its file, line and message, and links the blocks its line
+  names (Properties says it too). Apply is off, and the server refuses it, until the module compiles. When the
+  module compiles but to something other than the pending config (edited outside vislox and not compiled), it
+  says *Pending is from before the latest edit to `pages/x.loxl`* and offers **Compile** (`lox logic compile`, with
+  the admin token; nothing is deployed). Files `lox logic fmt --check` would format are a hint, never a blocker.
+  How: [editing.md](editing.md#when-the-module-does-not-compile-65).
+
 - **Edit values** (for a `lox.toml` project, with the admin token): Properties' *Edit values* changes a block's
   name, its room and category, the constant of an unwired input (lox checks it against the documented range) and the settings of a
   physical input or output or a device. *Save* writes them into vislox's own file of the module and runs

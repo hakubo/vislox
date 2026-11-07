@@ -533,6 +533,19 @@ rect.ghost, line.ghost { fill: #1f6fd10a; stroke: var(--moved); stroke-opacity: 
 @keyframes dep-pulse { from { opacity: .35; } to { opacity: 1; } }
 @media (prefers-reduced-motion: reduce) { .deploy-steps .st-run .ic { animation: none; } }
 /* What the last Apply changed, with its first live values */
+.deploy-check { margin-top: 6px; padding: 6px 8px; border-radius: 4px; font-size: 12px; background: var(--changed-bg); color: var(--changed); }
+.deploy-check.error { background: var(--removed-bg); color: var(--removed); }
+.deploy-check.hint { background: var(--panel-2); color: var(--muted); }
+.deploy-check .ck-h { font-weight: 600; }
+.deploy-check .ck-sub { margin-top: 2px; }
+.deploy-check ul { list-style: none; margin: 4px 0 0; padding: 0; display: flex; flex-direction: column; gap: 3px; max-height: 14em; overflow: auto; }
+.deploy-check li { overflow-wrap: anywhere; }
+.deploy-check .ck-at { font-family: ui-monospace, "DejaVu Sans Mono", monospace; font-size: 11px; font-weight: 600; margin-right: 4px; }
+.deploy-check .go { margin: 0 4px 0 0; padding: 0 6px; border: 1px solid currentColor; border-radius: 10px; background: none; color: inherit; font-size: 11px; cursor: pointer; }
+.deploy-check .ck-row { display: flex; align-items: center; gap: 8px; margin-top: 4px; }
+.deploy-check pre { margin: 4px 0 0; white-space: pre-wrap; font-size: 11px; }
+.deploy-check .ck-fmt { margin-top: 4px; color: var(--muted); font-weight: 400; }
+.ck-err { color: var(--removed); }
 .deploy-new { margin: 8px 10px 0; padding: 6px 8px; border: 1px solid var(--line-2); border-radius: 4px; background: var(--panel-2); font-size: 12px; }
 .deploy-new .h { display: flex; align-items: center; gap: 6px; font-weight: 600; margin-bottom: 4px; }
 .deploy-new .h .x { margin-left: auto; border: none; background: none; color: var(--muted); font-size: 14px; line-height: 1; padding: 0 2px; }
