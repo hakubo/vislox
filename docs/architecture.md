@@ -59,6 +59,12 @@ The binary is an `axum` server with the UI embedded (plain JS and SVG, no build 
   lets Properties edit (`view.objects[…].edit`), and vislox's file of claims in the module
   (`<module>/vislox/edits.loxl`), read and checked with lox's own parser and linter. `actions.rs` writes it and
   runs `lox logic compile` (`POST /api/edit`), and lists what is edited and not deployed (`GET /api/edits`).
+- `src/sched_edit.rs` is editing a Daytimer's switching times (#73): the `schedule` op's value (columns by
+  operating-mode UUID), checked as lox would (minutes, `24:00`, overlaps, an analog timer's values), written as
+  `schedule vx_… end` sets and `.schedule` claims in `edits.loxl` (the columns spelled as lox takes them: day
+  word, the module's slug of a mode, else its title; alike columns on one line, `daily`/`weekdays`/`weekend`), read
+  back into columns (an op's `previous`), and checked after the compile (`missed`). `edit.rs` keeps them in
+  `Claims` and dispatches the op; `GET /api/edits` sends `schedules` and `schedule_sets`.
 - `src/blocks.rs` is adding blocks (#59): the types vislox offers (`GET /api/block-types`, from lox's builtin
   table and its language server's descriptions), and vislox's file of new blocks per page
   (`<module>/vislox/<page>.loxl`). `edit.rs` applies `add_block` and `remove_block` to it.

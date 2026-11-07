@@ -848,3 +848,29 @@ rect.ghost, line.ghost { fill: #1f6fd10a; stroke: var(--moved); stroke-opacity: 
 .wcard .wc-what, .wcard .wc-note { margin-top: 4px; }
 .wcard .wc-msg.err { color: var(--removed); }
 .wcard .wc-bar { display: flex; gap: 6px; justify-content: flex-end; margin-top: 8px; }
+
+/* Switching times (#73): the editor of a DayTimer's schedule set. */
+.se { padding: 4px 10px 6px; }
+.se .sch-row { grid-template-columns: 34% 1fr; }
+.se-row.sel { background: var(--sel-soft); }
+.se-row.bad .se-mode { color: var(--removed); }
+.se-mode { text-align: left; font-weight: 600; }
+.se-cell { display: flex; align-items: center; gap: 4px; }
+.se-bar { flex: 1; height: 18px; cursor: copy; touch-action: none; }
+.se-bar .se-seg { position: absolute; top: 0; bottom: 0; background: var(--brand); color: #fff; font-size: 10px; line-height: 18px; text-align: center; border-radius: 2px; cursor: grab; overflow: hidden; }
+.se-bar .se-seg.act { background: repeating-linear-gradient(135deg, var(--brand) 0 4px, var(--brand-strong) 4px 6px); }
+.se-h { position: absolute; top: 0; bottom: 0; width: 6px; cursor: ew-resize; }
+.se-h.l { left: 0; }
+.se-h.r { right: 0; }
+.se-x { border: 0; background: none; color: var(--muted); cursor: pointer; padding: 0 2px; }
+.se-x:hover { color: var(--removed); }
+.se-detail { margin: 0 10px 4px; padding: 6px 0 0; border-top: 1px solid var(--line-2); }
+.se-dh { font-weight: 600; font-size: 12px; padding: 0 2px 4px; }
+.se-iv { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; padding: 2px; font-size: 12px; }
+.se-iv input.num { width: 5.5em; padding: 2px 4px; border: 1px solid var(--line); border-radius: var(--radius); font: inherit; font-variant-numeric: tabular-nums; }
+.se-iv input[aria-invalid="true"], .se-iv.bad input.num { border-color: var(--removed); background: var(--removed-bg); }
+.se-iv .ed-bad { flex: 1 1 100%; }
+.se-act { display: inline-flex; align-items: center; gap: 3px; color: var(--muted); }
+.se-same, .se-copy { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 4px; font-size: 12px; color: var(--muted); }
+.se-same select { max-width: 14em; padding: 2px 4px; border: 1px solid var(--line); border-radius: var(--radius); font: inherit; }
+.se-share { display: block; padding: 4px 12px; font-size: 12px; color: var(--muted); }
