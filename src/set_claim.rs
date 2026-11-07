@@ -279,7 +279,10 @@ pub fn apply<K: SetKind>(
         || uuid.to_string(),
         |e| e.attr_decoded("Title").unwrap_or_default().into_owned(),
     );
-    if let Some(e) = el {
+    // Dropping vislox's claim is always let through, whatever the block has
+    // become (another type, or managed by the module): a claim left behind
+    // would break every compile.
+    if let Some(e) = el.filter(|_| claiming) {
         if e.attr("Type") != Some(K::BLOCK) {
             return Err(K::wrong_type(&name));
         }

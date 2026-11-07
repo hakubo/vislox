@@ -314,19 +314,24 @@ fn members_info(c: &Ctx, uuid: &str) -> Option<MembersInfo> {
     let (attr, editable) = crate::member_edit::list_attr(ty)?;
     let members = crate::member_edit::of(el)
         .into_iter()
-        .map(|m| match c.el(&m) {
-            Some(_) => MemberInfo {
-                target: c.target(&m, None),
-                missing: false,
-            },
-            None => MemberInfo {
-                target: Target {
-                    title: m.clone(),
-                    uuid: m,
-                    ..Target::default()
+        .map(|m| {
+            match [m.clone(), m.to_ascii_lowercase()]
+                .into_iter()
+                .find(|k| c.el(k).is_some())
+            {
+                Some(k) => MemberInfo {
+                    target: c.target(&k, None),
+                    missing: false,
                 },
-                missing: true,
-            },
+                None => MemberInfo {
+                    target: Target {
+                        title: m.clone(),
+                        uuid: m,
+                        ..Target::default()
+                    },
+                    missing: true,
+                },
+            }
         })
         .collect();
     Some(MembersInfo {
@@ -337,11 +342,24 @@ fn members_info(c: &Ctx, uuid: &str) -> Option<MembersInfo> {
     })
 }
 
+/// A member list's UUIDs in order, lowercase, as compared.
+fn member_uuids(m: &MembersInfo) -> Vec<String> {
+    m.members
+        .iter()
+        .map(|x| x.target.uuid.to_ascii_lowercase())
+        .collect()
+}
+
 /// A member list that changed, as the change list reads it: *Alle Lichter ·
 /// member added: Küche*, *· member removed: Bad*, and a new order of the
 /// members both revisions list.
 fn members_changes(title: &str, old: &MembersInfo, new: &MembersInfo) -> Vec<String> {
-    let has = |m: &MembersInfo, u: &str| m.members.iter().any(|x| x.target.uuid == u);
+    // UUIDs compare lowercase: a save may write them either way.
+    let has = |m: &MembersInfo, u: &str| {
+        m.members
+            .iter()
+            .any(|x| x.target.uuid.eq_ignore_ascii_case(u))
+    };
     let mut out = Vec::new();
     for x in &new.members {
         if !has(old, &x.target.uuid) {
@@ -1481,15 +1499,20 @@ pub fn build(new: &LoxoneDoc, old: Option<&LoxoneDoc>, title: &str) -> View {
             let old = oc
                 .as_ref()
                 .filter(|_| d.on)
-                .and_then(|o| members_info(o, u))
-                .filter(|o| {
-                    o.members.iter().map(|m| &m.target.uuid).collect::<Vec<_>>()
-                        != mi
-                            .members
-                            .iter()
-                            .map(|m| &m.target.uuid)
-                            .collect::<Vec<_>>()
-                });
+                .and_then(|o| members_info(o, u));
+            // The same members in another case is no change at all.
+            let old = match old {
+                Some(o) if member_uuids(&o) == member_uuids(&mi) => {
+                    if let Some(ch) = d.attrs.get_mut(u) {
+                        ch.retain(|(n, ..)| n != mi.attr);
+                        if ch.is_empty() {
+                            d.attrs.remove(u);
+                        }
+                    }
+                    None
+                }
+                o => o,
+            };
             members.insert(u.clone(), (mi, old));
         }
     }
@@ -3848,6 +3871,32 @@ mod tests {
         );
         assert!(v.objects[ALLE].members_old.is_some());
         assert!(v.objects[ROLLOS].members_old.is_none());
+        // The same members written in upper case: no change, no line, no mark.
+        let upper = base_s.replace(
+            &format!("rec=\"{LICHT},{FLUR}\""),
+            &format!(
+                "rec=\"{},{}\"",
+                LICHT.to_ascii_uppercase(),
+                FLUR.to_ascii_uppercase()
+            ),
+        );
+        let v = build(&doc(&upper), Some(&base), "");
+        assert!(
+            v.changes.is_empty(),
+            "{:?}",
+            v.changes.iter().map(|c| &c.text).collect::<Vec<_>>()
+        );
+        assert_eq!(v.objects[ALLE].status, "");
+        assert!(v.objects[ALLE].members_old.is_none());
+        assert!(
+            v.objects[ALLE]
+                .members
+                .as_ref()
+                .unwrap()
+                .members
+                .iter()
+                .all(|m| !m.missing)
+        );
     }
 
     /// A circuit's kind is lox's (`Moods::prefixes`): one whose moods hold two

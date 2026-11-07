@@ -92,14 +92,20 @@ pub fn render(m: &Members) -> String {
 }
 
 /// What vislox's files give the central block `target`: its members' UUIDs
-/// in order (a slug lox has not pinned yet stays a slug), or `None` when
-/// they claim none.
+/// in order, or `None` when they claim none. A block of vislox's files that
+/// the lock has no UUID for yet stays its slug, which the op takes back as
+/// it is (so `previous` undoes it).
 pub fn current(files: &Files, lock: &Lock, target: &str) -> Option<Vec<String>> {
     files.claims.4.get(target).map(|list| {
         list.iter()
             .map(|s| set_claim::member_of(files, lock, s).unwrap_or_else(|| s.clone()))
             .collect()
     })
+}
+
+/// UUIDs as compared: lowercase (a save may write them either way).
+pub fn lower(list: &[String]) -> Vec<String> {
+    list.iter().map(|x| x.to_ascii_lowercase()).collect()
 }
 
 fn title_of(el: &Element) -> String {
@@ -124,16 +130,20 @@ pub fn apply(
         previous: json!(p),
         added: None,
     };
-    let Some(el) = edit::find(&ctx.doc.xml.root, uuid) else {
-        // A central block the pending config lost (deleted in Loxone Config):
-        // only its stale claim can go.
-        if value.is_none() && files.claims.4.contains_key(&target) {
-            files.claims.4.remove(&target);
-            files.claims.prune();
-            return Ok(done(previous));
+    // Dropping vislox's claim is always let through, whatever the block has
+    // become (deleted in Loxone Config, managed or claimed by the module): a
+    // claim left behind would break every compile, and this is how one the
+    // module makes too is mended.
+    let Some(list) = value else {
+        if !files.claims.4.contains_key(&target) && edit::find(&ctx.doc.xml.root, uuid).is_none() {
+            return Err(format!("no object {uuid} in the pending config"));
         }
-        return Err(format!("no object {uuid} in the pending config"));
+        files.claims.4.remove(&target);
+        files.claims.prune();
+        return Ok(done(previous));
     };
+    let el = edit::find(&ctx.doc.xml.root, uuid)
+        .ok_or_else(|| format!("no object {uuid} in the pending config"))?;
     let name = title_of(el);
     let ty = el.attr("Type").unwrap_or_default();
     let want = match (member_type(ty), list_attr(ty)) {
@@ -157,13 +167,6 @@ pub fn apply(
             "{name}: the module manages this block; change its members in its .loxl file"
         ));
     }
-    let Some(list) = value else {
-        // Dropping vislox's claim is always let through: it is how a block
-        // the module claims too is mended.
-        files.claims.4.remove(&target);
-        files.claims.prune();
-        return Ok(done(previous));
-    };
     if let Some(at) = ctx.members_claimed.get(&uuid.to_ascii_lowercase()) {
         return Err(format!(
             "{name}: {at} claims its members; change them there (a central block takes one \
@@ -180,6 +183,23 @@ pub fn apply(
     let mut externs: Vec<String> = Vec::new();
     for m in list {
         let m = m.trim();
+        // A block of vislox's files lox has not pinned yet (no UUID in the
+        // lock): named by its slug, as `previous` carries it.
+        if let Some((_, b)) = files.block(m).filter(|_| ctx.lock.uuid_of(m).is_none()) {
+            if b.ty != want {
+                return Err(format!(
+                    "{name}: `{m}` is a {}; the members of a {ty} are {want} blocks",
+                    b.ty
+                ));
+            }
+            if !seen.insert(m.to_string()) {
+                return Err(format!(
+                    "{name}: `{m}` is listed twice; a block is a member once"
+                ));
+            }
+            slugs.push(m.to_string());
+            continue;
+        }
         if m.eq_ignore_ascii_case(uuid) {
             return Err(format!("{name} cannot be a member of itself"));
         }
@@ -242,9 +262,7 @@ pub fn missed(files: &Files, out: &LoxoneDoc, lock: &Lock, uuids: &[String]) -> 
         let Some(el) = edit::find(&out.xml.root, u) else {
             continue;
         };
-        let got: Vec<String> = of(el).iter().map(|x| x.to_ascii_lowercase()).collect();
-        let want: Vec<String> = want.iter().map(|x| x.to_ascii_lowercase()).collect();
-        if got != want {
+        if lower(&of(el)) != lower(&want) {
             bad.push(title_of(el));
         }
     }
@@ -254,7 +272,7 @@ pub fn missed(files: &Files, out: &LoxoneDoc, lock: &Lock, uuids: &[String]) -> 
 /// Whether the block `uuid` lists other members in `a` than in `b` (or is
 /// in only one of them).
 pub fn differs(a: &LoxoneDoc, b: &LoxoneDoc, uuid: &str) -> bool {
-    let at = |d: &LoxoneDoc| edit::find(&d.xml.root, uuid).map(of);
+    let at = |d: &LoxoneDoc| edit::find(&d.xml.root, uuid).map(|e| lower(&of(e)));
     at(a) != at(b)
 }
 
@@ -302,7 +320,7 @@ pub fn edits_section(
             let stale: Vec<&String> = members
                 .iter()
                 .flatten()
-                .filter(|m| edit::find(&doc.xml.root, m).is_none())
+                .filter(|m| now.block(m).is_none() && edit::find(&doc.xml.root, m).is_none())
                 .collect();
             json!({
                 "uuid": u,
@@ -594,6 +612,96 @@ mod tests {
         let e =
             edit::apply_op(&mut files, &ctx, &Op::RemoveBlock { uuid: BAD.into() }).unwrap_err();
         assert!(e.contains(&format!("({c}.members)")), "{e}");
+    }
+
+    /// A claim vislox made before the module took the block over (or claims
+    /// its members too) can always be dropped: left behind, it would break
+    /// every compile. The same holds for moods and switching times.
+    #[test]
+    fn a_drop_is_let_through_once_the_module_manages_the_block() {
+        let (doc, lock) = ctx_parts();
+        let none = BTreeMap::new();
+        let ctx = ctx!(&doc, &lock, &none);
+        let mut files = Files::default();
+        edit::apply_op(&mut files, &ctx, &op(ALLE, Some(&[LICHT]))).unwrap();
+        let s = edit::slug(LICHT);
+        files.claims = Claims::parse(&format!(
+            "{}extern {s} = LightController2(uuid: \"{LICHT}\")\nmoods vx_a\n\t\"Viel Licht\": all on\nend\n{s}.moods = vx_a\n",
+            files.claims.render()
+        ))
+        .unwrap();
+        // The module manages both now.
+        let mut managed = lock.clone();
+        managed.slugs.insert("alle".into(), ALLE.into());
+        managed.slugs.insert("licht".into(), LICHT.into());
+        let ctx = ctx!(&doc, &managed, &none);
+        let e = edit::apply_op(&mut files, &ctx, &op(ALLE, Some(&[]))).unwrap_err();
+        assert!(e.contains("the module manages this block"), "{e}");
+        let a = edit::apply_op(&mut files, &ctx, &op(ALLE, None)).unwrap();
+        assert_eq!(a.previous, json!([LICHT]));
+        let e = edit::apply_op(
+            &mut files,
+            &ctx,
+            &Op::Moods {
+                uuid: LICHT.into(),
+                value: Some(crate::mood_edit::MoodsVal {
+                    set: Some("vx_a".into()),
+                    ..Default::default()
+                }),
+            },
+        )
+        .unwrap_err();
+        assert!(e.contains("the module manages this block"), "{e}");
+        edit::apply_op(
+            &mut files,
+            &ctx,
+            &Op::Moods {
+                uuid: LICHT.into(),
+                value: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(files.claims, Claims::default());
+    }
+
+    /// A member added here that lox has not pinned yet is carried by its slug:
+    /// `previous` names it so, the op takes it back, and `GET /api/edits`
+    /// does not call it stale.
+    #[test]
+    fn a_member_not_pinned_yet_is_carried_by_its_slug_and_undone() {
+        let (doc, lock) = ctx_parts();
+        let page = "# Blocks added in vislox on this page.\npage \"Obergeschoss\"\n\nvx_neu = LightController2(\"Neu\")\nvx_und = And(\"Und\")\n";
+        let mut files = Files::from_texts(&BTreeMap::from([(
+            "obergeschoss.loxl".to_string(),
+            page.to_string(),
+        )]))
+        .unwrap();
+        let none = BTreeMap::new();
+        let ctx = ctx!(&doc, &lock, &none);
+        edit::apply_op(&mut files, &ctx, &op(ALLE, Some(&["vx_neu", LICHT]))).unwrap();
+        let c = edit::slug(ALLE);
+        assert_eq!(
+            current(&files, &lock, &c),
+            Some(vec!["vx_neu".into(), LICHT.into()])
+        );
+        let v = edits_section(&files, &Files::default(), &lock, Some(&doc), None);
+        assert_eq!(v[0]["members"], json!(["vx_neu", LICHT]));
+        assert_eq!(v[0]["stale"], json!([]));
+        // Its previous, sent back, puts the list back: the undo works.
+        let a = edit::apply_op(&mut files, &ctx, &op(ALLE, Some(&[LICHT]))).unwrap();
+        assert_eq!(a.previous, json!(["vx_neu", LICHT]));
+        let undo = edit::undo_ops(&[op(ALLE, Some(&[LICHT]))], &[a.previous], &[]).unwrap();
+        edit::apply_op(&mut files, &ctx, &undo[0]).unwrap();
+        assert_eq!(
+            current(&files, &lock, &c),
+            Some(vec!["vx_neu".into(), LICHT.into()])
+        );
+        // Its type is checked from its declaration.
+        let e = edit::apply_op(&mut files, &ctx, &op(ALLE, Some(&["vx_und"]))).unwrap_err();
+        assert!(e.contains("`vx_und` is a And"), "{e}");
+        let e =
+            edit::apply_op(&mut files, &ctx, &op(ALLE, Some(&["vx_neu", "vx_neu"]))).unwrap_err();
+        assert!(e.contains("listed twice"), "{e}");
     }
 
     #[test]

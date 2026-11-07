@@ -1572,7 +1572,24 @@ try {
     // The member, a link to its block.
     assert.match(await page.textContent(sec), /1\s*Wohnzimmer/);
     assert.equal(await page.getAttribute(`${sec} .lnk`, "data-go"), LC_W);
+    // With the editor closed, Ctrl+K is the usual palette.
+    await page.keyboard.press("Control+k");
+    await page.waitForSelector("#palette:not(.hidden)");
+    assert.equal(await page.getAttribute("#pal-input", "placeholder"), "Go to a page or block…");
+    await page.keyboard.press("Escape");
+    await page.waitForSelector("#palette.hidden", { state: "attached" });
+    // A member the config lacks is left out of the draft, and the editor says so.
+    await page.evaluate((u) => { S.view.objects[u].members.members.push({ uuid: "10000099-0000-0990-ffff504f94000001", missing: true }); meOpen(u); }, CENTRAL);
+    assert.deepEqual(await page.evaluate(() => ME.list), [LC_W]);
+    await waitText(sec, /1 member not in this config was dropped from the draft/);
+    await page.evaluate((u) => { S.view.objects[u].members.members.pop(); meClose(); }, CENTRAL);
+    // The picker never offers a block the module manages (the server's `managed`).
     await page.click(`${sec} [data-me="open"]`);
+    await page.evaluate((u) => S.edits.managed.push(u), LC_F);
+    await page.click(`${sec} [data-me="add"]`);
+    await waitText("#pal-list", /No other lighting controller to add/);
+    await page.keyboard.press("Escape");
+    await page.evaluate((u) => S.edits.managed.splice(S.edits.managed.indexOf(u), 1), LC_F);
     // Ctrl+K picks a member: only the lighting controllers not listed yet.
     await page.keyboard.press("Control+k");
     await page.waitForSelector("#palette:not(.hidden)");
@@ -1603,6 +1620,21 @@ try {
     let ops = await undoKey(false, (u) => S.view.objects[u].members.members.length === 1 && !S.edits?.members?.length, CENTRAL);
     assert.deepEqual(ops, [{ op: "members", uuid: CENTRAL, value: null }]);
     assert.doesNotMatch(file(), /members/);
+    ops = await undoKey(true, (u) => S.view.objects[u].members.members.length === 2, CENTRAL);
+    assert.deepEqual(ops, [{ op: "members", uuid: CENTRAL, value: [LC_F, LC_W] }]);
+    // A draft made on a config an undo replaced is dropped, never saved over the newer list.
+    await page.waitForSelector(`${sec} [data-me="open"]`);
+    await page.click(`${sec} [data-me="open"]`);
+    await page.click(`${sec} [data-me="del"][data-i="0"]`);
+    ops = await undoKey(false, (u) => S.view.objects[u].members.members.length === 1, CENTRAL);
+    assert.deepEqual(ops, [{ op: "members", uuid: CENTRAL, value: null }]);
+    await waitText(sec, /The pending config changed while editing: the draft was dropped/);
+    assert.equal(await page.$(`${sec} [data-me="save"]`), null);
+    // And a save from a draft on an old blob sends nothing.
+    const n2 = edits.length;
+    await page.evaluate((u) => { meOpen(u); ME.blob = "0000000000000000000000000000000000000000"; meSave(); }, CENTRAL);
+    await waitText(sec, /the draft was dropped/);
+    assert.equal(edits.length, n2);
     ops = await undoKey(true, (u) => S.view.objects[u].members.members.length === 2, CENTRAL);
     assert.deepEqual(ops, [{ op: "members", uuid: CENTRAL, value: [LC_F, LC_W] }]);
     // Emptied: `()`, and no rec= in the pending config.

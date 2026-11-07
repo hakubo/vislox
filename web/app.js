@@ -1144,6 +1144,7 @@ function renderProps() {
   }
 }
 function renderPropsBody() {
+  meSync();
   const box = $("props");
   const o = S.sel && S.view?.objects[S.sel];
   if (!o) {
@@ -1681,10 +1682,13 @@ function renderPalette() {
   // pages and blocks, so that a short query still opens the best page or block.
   if (pal.pick) {
     const pk = pal.pick, seen = new Set();
+    // The server's rule: a block the module manages is never offered (vislox's files name only their own blocks
+    // and Loxone Config's).
+    const managed = new Set((S.edits?.managed || []).map((u) => u.toLowerCase()));
     const cands = blocks.filter((b) => {
-      const o = v.objects[b.uuid];
-      if (!o || seen.has(b.uuid) || !pk.types.includes(o.ty) || pk.exclude.has(b.uuid)) return false;
-      seen.add(b.uuid);
+      const o = v.objects[b.uuid], u = b.uuid.toLowerCase();
+      if (!o || seen.has(u) || !pk.types.includes(o.ty) || pk.exclude.has(u) || managed.has(u)) return false;
+      seen.add(u);
       return true;
     });
     const scored = q ? cands.map((it) => { const m = fuzzy(q, it.title); return m ? { ...it, score: m.score, hits: m.hits } : null; }).filter(Boolean).sort((a, b) => b.score - a.score)
@@ -1799,7 +1803,7 @@ window.addEventListener("keydown", (e) => {
   if ((e.ctrlKey || e.metaKey) && (e.key === "k" || e.key === "K")) {
     e.preventDefault();
     // With a central block's members open in the editor, Ctrl+K picks a member to add (#75).
-    if (ME.open && S.sel === ME.uuid && !ME.busy) meAdd(); else openPalette("");
+    if ($("props").querySelector('[data-me="add"]:not([disabled])')) meAdd(); else openPalette("");
     return;
   }
   if ((e.ctrlKey || e.metaKey) && e.key === "f") { e.preventDefault(); $("tree-filter").focus(); $("tree-filter").select(); return; }
@@ -4011,7 +4015,9 @@ $("props").addEventListener("keydown", (e) => {
 // to its block; the editor adds one (the Ctrl+K picker, offering only blocks of the type the central block takes),
 // removes and reorders them. Saving sends one `members` op with the whole list: compiled, never deployed, undone
 // through `undo`. An alarm's members (`Objects=`) are shown read-only: they stay with Loxone Config.
-const ME = { uuid: null, open: false, list: [], busy: false, msg: "", err: "" };
+// The draft belongs to one block and one pending config (`blob`): when either changes (another selection, an
+// undo, an edit elsewhere) it is dropped, and a save sends the blob it was made on, which the server checks.
+const ME = { uuid: null, blob: null, open: false, list: [], dropped: 0, busy: false, msg: "", err: "" };
 const ME_WHAT = { LightController2: "lighting controller", AutoJalousie: "automatic blind" };
 /** What `GET /api/edits` says of this central block's members (#75), or null. */
 function membersEdit(uuid) { return (S.edits?.members || []).find((m) => m.uuid === uuid) || null; }
@@ -4038,14 +4044,24 @@ function meWhat(mi) { return mi.takes ? ME_WHAT[mi.takes] || prettyType(mi.takes
 function meOpen(uuid) {
   const o = S.view?.objects[uuid];
   if (!o?.members?.editable) return;
-  Object.assign(ME, { uuid, open: true, list: o.members.members.map((m) => m.uuid), busy: false, msg: "", err: "" });
+  const st = meState(o);
+  if (!st) return;
+  // A member the config does not have cannot be saved (the server refuses it): the draft leaves it out, and says so.
+  const missing = o.members.members.filter((m) => m.missing).length;
+  Object.assign(ME, { uuid, blob: st.rev.blob, open: true, list: o.members.members.filter((m) => !m.missing).map((m) => m.uuid), dropped: missing, busy: false, msg: "", err: "" });
   S.closed.delete("Members");
   renderProps();
   $("props").querySelector('[data-me="add"]')?.focus();
 }
+/** Drop a draft made on another block or another pending config than the one shown now. */
+function meSync() {
+  if (!ME.open || ME.busy) return;
+  if (S.sel !== ME.uuid) Object.assign(ME, { open: false, list: [], dropped: 0, msg: "", err: "" });
+  else if (editRev()?.blob !== ME.blob) Object.assign(ME, { open: false, list: [], dropped: 0, err: "", msg: "The pending config changed while editing: the draft was dropped. Edit members again." });
+}
 function meClose() {
   if (ME.busy) return;
-  Object.assign(ME, { open: false, list: [], msg: "", err: "" });
+  Object.assign(ME, { open: false, list: [], dropped: 0, msg: "", err: "" });
   renderProps();
   $("props").querySelector('[data-me="open"]')?.focus();
 }
@@ -4059,7 +4075,7 @@ function meAdd() {
     placeholder: `Add a ${what}…`,
     none: `No other ${what} to add.`,
     types: [o.members.takes],
-    exclude: new Set([o.uuid, ...ME.list]),
+    exclude: new Set([o.uuid, ...ME.list].map((u) => u.toLowerCase())),
     onPick: (u) => { ME.list.push(u); ME.err = ""; ME.msg = ""; renderProps(); $("props").querySelector('[data-me="add"]')?.focus(); },
     back: () => $("props").querySelector('[data-me="add"]')?.focus(),
   });
@@ -4112,6 +4128,7 @@ function meRows(o, row, marks) {
       `<button type="button" class="se-x" data-me="down" data-i="${i}" aria-label="Move ${esc(name)} down"${i < ME.list.length - 1 ? "" : " disabled"}${dis}>↓</button>` +
       `<button type="button" class="se-x" data-me="del" data-i="${i}" aria-label="Remove ${esc(name)}"${dis}>✕</button></span></li>`;
   }).join("");
+  if (ME.dropped) rows.push(`<div class="sch-note warn">⚠ ${plural(ME.dropped, "member")} not in this config ${ME.dropped === 1 ? "was" : "were"} dropped from the draft: saving leaves ${ME.dropped === 1 ? "it" : "them"} out.</div>`);
   rows.push(ME.list.length ? `<ol class="me-list">${items}</ol>` : `<div class="ed-note">No members: saving empties the list.</div>`);
   rows.push(`<div class="ed-bar"><button type="button" class="ed-btn small" data-me="add"${dis} title="Pick a ${esc(what)} (Ctrl+K)">Add member…</button><span class="none-v">${esc(`${prettyType(mi.takes)} blocks, in the order the app lists them`)}</span></div>`);
   rows.push(`<div class="ed-bar"><button type="button" class="primary small" data-me="save"${dis}>${mine.busy ? "Compiling…" : "Save"}</button>` +
@@ -4119,11 +4136,11 @@ function meRows(o, row, marks) {
     `<span class="ed-msg${mine.err ? " err" : ""}" role="status" aria-live="polite">${esc(mine.err || mine.msg || "Saving claims the list in the module and compiles it; nothing is deployed.")}</span></div>`);
   return { rows, count: e?.pending ? 1 : 0 };
 }
-async function meSend(o, st, op, label) {
+async function meSend(o, base, op, label) {
   ME.uuid = o.uuid; ME.busy = true; ME.err = ""; ME.msg = ""; renderProps();
   try {
-    const res = await editAct(st.rev.blob, [op], label);
-    Object.assign(ME, { open: false, list: [], busy: false, err: "", msg: res.unchanged ? "Nothing changed." : "Saved and compiled: pending, not deployed. Review it, then Apply or Discard." });
+    const res = await editAct(base, [op], label);
+    Object.assign(ME, { open: false, list: [], dropped: 0, busy: false, err: "", msg: res.unchanged ? "Nothing changed." : "Saved and compiled: pending, not deployed. Review it, then Apply or Discard." });
     await editShowNewest(res.blob);
   } catch (err) {
     ME.busy = false; ME.err = err.message;
@@ -4133,7 +4150,13 @@ async function meSend(o, st, op, label) {
 function meSave() {
   const o = S.view?.objects[ME.uuid], st = o && meState(o);
   if (!st || ME.busy || !ME.open) return;
-  meSend(o, st, { op: "members", uuid: o.uuid, value: [...ME.list] });
+  // Never save a draft over a newer list: the draft goes against the config it was made on.
+  if (st.rev.blob !== ME.blob) {
+    Object.assign(ME, { open: false, list: [], dropped: 0, err: "The pending config changed while editing: the draft was dropped. Edit members again.", msg: "" });
+    renderProps();
+    return;
+  }
+  meSend(o, ME.blob, { op: "members", uuid: o.uuid, value: [...ME.list] });
 }
 $("props").addEventListener("click", (e) => {
   const b = e.target.closest("[data-me]");
@@ -4146,9 +4169,9 @@ $("props").addEventListener("click", (e) => {
   if (what === "save") return meSave();
   if (what === "add") return meAdd();
   const st = meState(o), ed = membersEdit(o.uuid);
-  if (what === "revert") { if (st && ed) meSend(o, st, { op: "members", uuid: o.uuid, value: ed.deployed ?? null }, `Revert the members of ${displayTitle(o)}`); return; }
-  if (what === "drop") { if (st) meSend(o, st, { op: "members", uuid: o.uuid, value: null }, `Remove vislox's claim on the members of ${displayTitle(o)}`); return; }
-  if (what === "dropstale") { if (st && ed?.members) meSend(o, st, { op: "members", uuid: o.uuid, value: ed.members.filter((u) => !ed.stale.includes(u)) }, `Drop the missing members of ${displayTitle(o)}`); return; }
+  if (what === "revert") { if (st && ed) meSend(o, st.rev.blob, { op: "members", uuid: o.uuid, value: ed.deployed ?? null }, `Revert the members of ${displayTitle(o)}`); return; }
+  if (what === "drop") { if (st) meSend(o, st.rev.blob, { op: "members", uuid: o.uuid, value: null }, `Remove vislox's claim on the members of ${displayTitle(o)}`); return; }
+  if (what === "dropstale") { if (st && ed?.members) meSend(o, st.rev.blob, { op: "members", uuid: o.uuid, value: ed.members.filter((u) => !ed.stale.includes(u)) }, `Drop the missing members of ${displayTitle(o)}`); return; }
   if (ME.busy || !ME.open) return;
   const i = +b.dataset.i;
   if (what === "del") ME.list.splice(i, 1);

@@ -757,7 +757,13 @@ vx_10000050_0000_0500_ffff504f94000001.members = (vx_10000041_0000_0410_ffff504f
   central block the rest of the module manages; a central block added or adopted here is claimed by its slug.
 - **Claimed twice** (the module's own file claims the members too, which lox refuses) is mended as for switching
   times: dropping vislox's claim is let through and compiles the module's uncompiled change along. Properties says
-  *Claimed twice* and offers *Remove vislox's claim*.
+  *Claimed twice* and offers *Remove vislox's claim*. A drop is always let through, also once the module manages
+  the block or Loxone Config deleted it: a claim left behind would break every compile (the same holds for
+  switching times and moods, `set_claim.rs`).
+- **A member added here and not pinned yet** (no UUID in the lock) is carried by its slug in `previous` and in
+  `GET /api/edits`, and the op takes the slug back as it is, so its undo works.
+- **UUIDs compare lowercase** everywhere (a save may write them either way): the same members in another case are
+  no change in Properties, the Changes list or the after-compile check.
 - **A member the config lost** (deleted in Loxone Config) leaves an extern lox cannot resolve. `GET /api/edits`
   names it (`stale`), and the browser offers *Drop the missing members*: the list without them. A central block
   the pending config lost can only have its claim dropped (the op with its UUID and no value).
@@ -777,9 +783,12 @@ vx_10000050_0000_0500_ffff504f94000001.members = (vx_10000041_0000_0410_ffff504f
 
 The browser: *Members* in Properties of a central block or an alarm, on any revision, each member a link. On the
 newest config, *Edit members* on a central block lists them with ↑ ↓ and ✕ and *Add member…*, which opens the
-Ctrl+K palette as a picker (Ctrl+K itself while the editor is open): only the blocks of the type the central block
-takes, not the central block, not one listed already, not one the module manages. *Save*, *Cancel*, *Revert*,
-and *Remove vislox's claim* when claimed twice. The Deploy pane counts the central blocks whose members are edited
+Ctrl+K palette as a picker (Ctrl+K itself while the editor is shown; otherwise Ctrl+K is the usual palette): only
+the blocks of the type the central block takes, not the central block, not one listed already, not one the module
+manages (the server's `managed`). A member the config does not have is left out of the draft, which says so. The
+draft belongs to the block and the pending config it was opened on: selecting another block, or a new pending
+config (an undo, an edit elsewhere), drops it, and *Save* sends that config's blob as `base`, which the server
+checks as for any edit. *Save*, *Cancel*, *Revert*, and *Remove vislox's claim* when claimed twice. The Deploy pane counts the central blocks whose members are edited
 and not deployed.
 
 ## Undo and redo (#62)

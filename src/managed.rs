@@ -547,13 +547,23 @@ pub struct SetClaim {
 /// The claim keywords on a block, and the set kinds they name.
 const SET_CLAIMS: &[&str] = &["access", "recipients", "schedule", "moods"];
 
-/// Every `<slug>.access|recipients|schedule = <set>` at the top level of the
-/// module's files, outside template bodies (what a template claims is made
-/// once per instance), with the block each one is on.
-pub fn set_claims<T: AsRef<str>>(files: &[(String, T)], lock: &crate::edit::Lock) -> Vec<SetClaim> {
+/// The headers of the sets a scan found: (kind, set) → where each is declared.
+type SetHeaders = BTreeMap<(&'static str, String), Vec<(String, usize)>>;
+
+/// The one scanner of the module's claims on a block: every
+/// `<slug>.<keyword> = <rhs>` at the top level of the module's files, outside
+/// template bodies (what a template claims is made once per instance), whose
+/// keyword and right-hand side `claim` takes (it names the kind), with the
+/// block each one is on. With `headers`, also the set headers of those kinds
+/// (`access bewohner`).
+fn scan_claims<T: AsRef<str>>(
+    files: &[(String, T)],
+    lock: &crate::edit::Lock,
+    claim: impl Fn(&str, &str) -> Option<&'static str>,
+    headers: &[&'static str],
+) -> (Vec<SetClaim>, SetHeaders) {
     let decls = Declarations::new(files);
-    // (kind, set) → its declarations.
-    let mut sets: BTreeMap<(&str, String), Vec<(String, usize)>> = BTreeMap::new();
+    let mut sets: SetHeaders = BTreeMap::new();
     let mut claims = Vec::new();
     for (file, text) in files {
         let lines: Vec<&str> = text.as_ref().split('\n').collect();
@@ -565,7 +575,7 @@ pub fn set_claims<T: AsRef<str>>(files: &[(String, T)], lock: &crate::edit::Lock
             let c = code(line).trim();
             // `access bewohner`: a set's header.
             if let Some((kw, name)) = c.split_once(char::is_whitespace)
-                && let Some(kind) = SET_CLAIMS.iter().find(|k| **k == kw)
+                && let Some(kind) = headers.iter().find(|k| **k == kw)
                 && is_name(name.trim())
             {
                 sets.entry((kind, name.trim().to_string()))
@@ -573,24 +583,24 @@ pub fn set_claims<T: AsRef<str>>(files: &[(String, T)], lock: &crate::edit::Lock
                     .push((file.clone(), n + 1));
                 continue;
             }
-            let Some((lhs, set)) = c.split_once('=') else {
+            let Some((lhs, rhs)) = c.split_once('=') else {
                 continue;
             };
-            let (set, lhs) = (set.trim(), lhs.trim());
+            let (rhs, lhs) = (rhs.trim(), lhs.trim());
             let Some((slug, kw)) = lhs.split_once('.') else {
                 continue;
             };
-            let (slug, kw) = (slug.trim(), kw.trim());
-            let Some(kind) = SET_CLAIMS.iter().find(|k| **k == kw) else {
-                continue;
-            };
-            if !is_name(slug) || !is_name(set) || set.starts_with('=') {
+            let slug = slug.trim();
+            if !is_name(slug) || rhs.starts_with('=') {
                 continue;
             }
+            let Some(kind) = claim(kw.trim(), rhs) else {
+                continue;
+            };
             claims.push(SetClaim {
                 kind,
                 slug: slug.to_string(),
-                set: set.to_string(),
+                set: rhs.to_string(),
                 file: file.clone(),
                 line: n + 1,
                 set_file: None,
@@ -600,10 +610,6 @@ pub fn set_claims<T: AsRef<str>>(files: &[(String, T)], lock: &crate::edit::Lock
         }
     }
     for c in &mut claims {
-        if let Some([(f, l)]) = sets.get(&(c.kind, c.set.clone())).map(Vec::as_slice) {
-            c.set_file = Some(f.clone());
-            c.set_line = Some(*l);
-        }
         let (f, l) = decls
             .at(&c.slug, None)
             .map_or((None, None), |(f, l)| (Some(f), Some(l)));
@@ -614,6 +620,31 @@ pub fn set_claims<T: AsRef<str>>(files: &[(String, T)], lock: &crate::edit::Lock
             blocks.push(u.to_ascii_lowercase());
         }
         c.blocks = blocks;
+    }
+    (claims, sets)
+}
+
+/// Every `<slug>.access|recipients|schedule|moods = <set>` at the top level
+/// of the module's files, outside template bodies, with the block each one is
+/// on and where its set is declared.
+pub fn set_claims<T: AsRef<str>>(files: &[(String, T)], lock: &crate::edit::Lock) -> Vec<SetClaim> {
+    let (mut claims, sets) = scan_claims(
+        files,
+        lock,
+        |kw, rhs| {
+            SET_CLAIMS
+                .iter()
+                .find(|k| **k == kw)
+                .copied()
+                .filter(|_| is_name(rhs))
+        },
+        SET_CLAIMS,
+    );
+    for c in &mut claims {
+        if let Some([(f, l)]) = sets.get(&(c.kind, c.set.clone())).map(Vec::as_slice) {
+            c.set_file = Some(f.clone());
+            c.set_line = Some(*l);
+        }
     }
     claims
 }
@@ -627,49 +658,13 @@ pub fn members_claims<T: AsRef<str>>(
     files: &[(String, T)],
     lock: &crate::edit::Lock,
 ) -> Vec<SetClaim> {
-    let decls = Declarations::new(files);
-    let mut claims = Vec::new();
-    for (file, text) in files {
-        let lines: Vec<&str> = text.as_ref().split('\n').collect();
-        let body = template_bodies(&lines);
-        for (n, line) in lines.iter().enumerate() {
-            if body.contains(&n) {
-                continue;
-            }
-            let c = code(line).trim();
-            let Some((lhs, list)) = c.split_once('=') else {
-                continue;
-            };
-            let (lhs, list) = (lhs.trim(), list.trim());
-            let Some((slug, kw)) = lhs.split_once('.') else {
-                continue;
-            };
-            let slug = slug.trim();
-            if kw.trim() != "members" || !is_name(slug) || !list.starts_with('(') {
-                continue;
-            }
-            let (f, l) = decls
-                .at(slug, None)
-                .map_or((None, None), |(f, l)| (Some(f), Some(l)));
-            let mut blocks = crate::check::name_blocks(slug, f.as_deref(), l, files, lock);
-            if blocks.is_empty()
-                && let Some(u) = lock.externals.get(slug)
-            {
-                blocks.push(u.to_ascii_lowercase());
-            }
-            claims.push(SetClaim {
-                kind: "members",
-                slug: slug.to_string(),
-                set: list.to_string(),
-                file: file.clone(),
-                line: n + 1,
-                set_file: None,
-                set_line: None,
-                blocks,
-            });
-        }
-    }
-    claims
+    scan_claims(
+        files,
+        lock,
+        |kw, rhs| (kw == "members" && rhs.starts_with('(')).then_some("members"),
+        &[],
+    )
+    .0
 }
 
 #[cfg(test)]
