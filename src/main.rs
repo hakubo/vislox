@@ -489,8 +489,10 @@ async fn main() -> Result<()> {
             let mut tick = tokio::time::interval(Duration::from_secs(3));
             loop {
                 tick.tick().await;
-                let app = app.clone();
-                let _ = tokio::task::spawn_blocking(move || refresh(&app)).await;
+                let a = app.clone();
+                let _ = tokio::task::spawn_blocking(move || refresh(&a)).await;
+                // A push that is behind, pushed since (#71).
+                app.actions.recheck_push().await;
             }
         });
     }

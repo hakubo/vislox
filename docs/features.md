@@ -251,11 +251,18 @@ sends to the Miniserver see [miniserver.md](miniserver.md).
   `.gitignore` misses one (a downloaded `live.Loxone`, a backup outside `backups/`), a commit takes it along. So
   before **every** git push vislox makes (Apply, Roll back, Sync, *Push to git*), Apply's step *No personal data in
   git* asks `lox logic scan --json` about what the push would send:
-  - Every commit the push remote's tracking branches do not have (`git rev-list HEAD --not --remotes=<remote>`, or
-    every remote's when the branch has no push remote; the whole repository, not only the project), and in each
-    every file it adds or changes that may hold a config: `.Loxone`, `.LoxCC`, and a Miniserver backup `.zip` (its
-    `sps0.LoxCC`). Each version: a file a commit adds and the next deletes is still pushed with it. lox reads
-    copies in a scratch directory only this user can read, removed afterwards.
+  - Where: the branch's upstream (its remote and branch there). Without one, or on no branch, vislox refuses and
+    says how to set one: it never guesses a remote. A commit counts as pushed once the upstream's tracking branch
+    has it: the scan, *Push to git* and the check on start all use that.
+  - What: exactly the objects `git push` sends for `HEAD` (`git rev-list --objects <sha> --not <the remote's
+    tracking branches>`; the whole repository, not only the project), and of those every file that may hold a
+    config: `.Loxone`, `.LoxCC`, and a Miniserver backup `.zip` (its `sps0.LoxCC`). Each version: a file a commit
+    adds and the next deletes is still sent. A version the remote has already (a merge of what it has) is not
+    sent, so not read. lox reads copies in a scratch directory made readable to this user only (mode 700, files
+    600, never widened later), removed afterwards. The whole scan has 5 minutes.
+  - Then exactly that commit is pushed: `git push --no-follow-tags <remote> <sha>:<branch>`, so no other branch or
+    tag goes along, whatever `push.default`, a push refspec or `push.followTags` say, and a commit made during the
+    scan stays for the next push (*Not pushed to git yet*).
   - lox names where personal data is: the element and attribute and the value's length, never the value. vislox
     adds the line it finds that element on and the commit, and never reads a value itself, so neither its log, the
     browser, nor an error message can show one.
@@ -269,10 +276,12 @@ sends to the Miniserver see [miniserver.md](miniserver.md).
     nothing goes to the Miniserver). lox has no allowlist: a file that must stay in git must not hold personal data
     (`lox logic scan --redact` writes a copy without it).
   - **Fail closed**: a file lox cannot read (a `.zip` that is none, a backup whose program cannot be read), a lox
-    without `logic scan` (older than 0.83), an answer vislox cannot read, a scan that takes over 2 minutes, or a
-    commit made while lox read: nothing is pushed, and the box says why. A push with no config file in it needs no
-    lox. When `git push` itself fails (credentials, the remote), the box says so too, with *Push to git*; after a
-    restart, commits the upstream does not have offer it again (*Not pushed to git yet*).
+    without `logic scan` (older than 0.83), an answer vislox cannot read, no upstream (or one not fetched), or a
+    scan over 5 minutes: nothing is pushed, and the box says why. A push with no config file in it needs no lox.
+    When `git push` itself fails (credentials, the remote), the box says so too, with *Push to git*; after a
+    restart, commits the upstream does not have offer it again (*Not pushed to git yet*). The 3 s git poll looks
+    again when `HEAD` or the upstream moves: pushed from a terminal, the box goes and Apply's steps say *Pushed to
+    git*; so they do after *Push to git*. The box lists at most 50 findings and counts the rest.
   - A project that tracks its deployed config (vislox copies the verified download over the base, below) is
     blocked as soon as that base holds personal data, which a real one does. Keep the base and `out` out of git
     too (`git rm --cached`, `.gitignore`), as lox keeps `backups/`: the commit then holds the module and lockfile.

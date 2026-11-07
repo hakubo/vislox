@@ -2173,7 +2173,8 @@ function renderPush(a) {
   const ran = a.last?.ok && ["apply", "rollback"].includes(a.last.kind) && a.last.at >= p.at - 1
     ? "The Miniserver runs the deployed config and the commit records it: only the git remote is behind. " : "";
   const items = (p.findings || []).map((f) => `<li><span class="ck-at">${esc(f.file + (f.entry ? ` › ${f.entry}` : "") + (f.line ? `:${f.line}` : ""))}</span>` +
-    `${esc(f.kind)} — ${esc(f.what)}${f.len != null ? ` (${plural(f.len, "char")})` : ""}${f.now ? "" : ` · only in commit ${esc(f.commit)}, deleted since`}</li>`);
+    `${esc(f.kind)} — ${esc(f.what)}${f.len != null ? ` (${plural(f.len, "char")})` : ""}${f.now ? "" : ` · only in ${f.commit ? `commit ${esc(f.commit)}` : "an earlier commit"}, deleted since`}</li>`);
+  if (p.total > items.length) items.push(`<li>… and ${plural(p.total - items.length, "more finding")}</li>`);
   const why = !a.apply?.available ? `Cannot push: ${a.apply?.reason || ""}` : a.running ? `${a.running} is running` : "";
   box.innerHTML = `<div class="ck-h">${esc(head)}</div><div class="ck-sub">${esc(ran + p.message)}.</div>` +
     (items.length ? `<ul class="ps-list">${items.join("")}</ul>` : "") + (p.advice ? `<pre>${esc(p.advice)}</pre>` : "") +

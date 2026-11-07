@@ -3,35 +3,47 @@
 //! and access codes, credentials and hardware serials. When a repository's
 //! `.gitignore` misses one (a downloaded `live.Loxone`, a backup outside
 //! `backups/`), a commit takes it along, and `git push` would send it to the
-//! remote. So before every push vislox makes (Apply, Roll back, Sync, and
-//! *Push to git*), [`before_push`] asks `lox logic scan` about what the push
-//! would send:
+//! remote. So every push vislox makes (Apply, Roll back, Sync, and *Push to
+//! git*) goes through `Actions::push_git`, which pushes exactly what
+//! [`before_push`] read, and only when lox found nothing:
 //!
-//! - **What the push sends**: every commit `HEAD` has that the push remote's
-//!   tracking branches do not (`git rev-list HEAD --not --remotes=<remote>`;
-//!   every remote's when the branch has no push remote), and in each, every file
-//!   it adds or changes that may hold a config: a `.Loxone`, a `.LoxCC` and a
-//!   Miniserver backup `.zip` (its `sps0.LoxCC`). Each version, not only the
-//!   last: a file added in one commit and deleted in the next is still pushed.
-//!   The whole repository, not only the project: the push sends all of it.
+//! - **Where a push goes** ([`target`]): the branch's upstream, its remote and
+//!   branch there. Without one vislox refuses: it never guesses a remote.
+//!   What the remote has is what its remote-tracking branches have, and a
+//!   commit is not pushed while the upstream's tracking branch lacks it
+//!   ([`unpushed`]): the same definition for the scan, *Push to git* and the
+//!   check on start.
+//! - **What a push sends**: exactly the objects of the scanned commit that no
+//!   remote-tracking branch of that remote has (`git rev-list --objects <sha>
+//!   --not <its tracking branches>`), as `git push` packs them. Of those, each
+//!   file that may hold a config: a `.Loxone`, a `.LoxCC` and a Miniserver
+//!   backup `.zip` (its `sps0.LoxCC`). Every version, not only the last: a file
+//!   added in one commit and deleted in the next is still sent. A version the
+//!   remote has already (a merge of what it has) is not sent, so not read.
+//!   Then `git push --no-follow-tags <remote> <sha>:<branch>`: that commit,
+//!   no other branch or tag, whatever `push.default`, a push refspec or
+//!   `push.followTags` say, and no commit made after the scan.
 //! - **lox decides** (`lox logic scan --json`): it lists where personal data
 //!   is, the element and attribute and the value's length, never the value.
 //!   vislox adds the line it finds that element and attribute on, and never
 //!   reads or keeps a value: nothing it logs, sends to the browser or says in
-//!   an error can carry one.
-//! - **Fail closed**: a file lox cannot read, a lox without `logic scan`, or an
-//!   answer vislox cannot read block the push as findings do. Only a push with
-//!   no config file in it goes ahead without lox.
+//!   an error can carry one. lox reads copies in a scratch directory only this
+//!   user can open (made so, not changed to it), removed afterwards.
+//! - **Fail closed**: a file lox cannot read, a lox without `logic scan`, an
+//!   answer vislox cannot read, no upstream, or a scan over [`SCAN_LIMIT`]
+//!   block the push as findings do. Only a push with no config file in it goes
+//!   ahead without lox.
 
-use super::removals::scratch_dir;
 use super::*;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// `lox logic scan` reads every config of a push in one run.
-const SCAN_TIMEOUT: Duration = Duration::from_secs(120);
+const LOX_TIMEOUT: Duration = Duration::from_secs(120);
+/// The whole scan: git's reads, the copies and lox.
+pub const SCAN_LIMIT: Duration = Duration::from_secs(300);
 
-/// Where a push would send personal data: lox's finding, and where vislox
-/// found its element. Never its value.
+/// Where lox found personal data in what a push would send, and where
+/// vislox found its element. Never its value.
 #[derive(Clone, Serialize, PartialEq, Debug)]
 pub struct Finding {
     /// The file, from the repository's top.
@@ -49,10 +61,13 @@ pub struct Finding {
     pub what: String,
     /// The length of the value, as lox gives it.
     pub len: Option<usize>,
-    /// The newest commit not pushed yet that has this version of the file.
-    pub commit: String,
-    /// Still the file as `HEAD` has it; else only in an earlier commit.
+    /// Still the file as the pushed commit has it; else only in an earlier
+    /// commit of the push.
     pub now: bool,
+    /// For a version deleted since: the newest commit of the push that
+    /// added or changed it to this.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
 }
 
 impl Finding {
@@ -74,10 +89,10 @@ impl Finding {
             .len
             .map(|n| format!(" ({n} char{})", if n == 1 { "" } else { "s" }))
             .unwrap_or_default();
-        let when = if self.now {
-            String::new()
-        } else {
-            format!(" [only in commit {}, deleted since]", self.commit)
+        let when = match (self.now, &self.commit) {
+            (true, _) => String::new(),
+            (false, Some(c)) => format!(" [only in commit {c}, deleted since]"),
+            (false, None) => " [only in an earlier commit, deleted since]".into(),
         };
         format!("{}: {} — {}{len}{when}", self.at(), self.kind, self.what)
     }
@@ -94,59 +109,162 @@ pub enum Verdict {
     CannotScan(String),
 }
 
+/// Where the branch checked out is pushed: its upstream.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Target {
+    /// The remote's name.
+    pub remote: String,
+    /// The branch there (`refs/heads/main`).
+    pub remote_ref: String,
+    /// Its remote-tracking branch (`refs/remotes/origin/main`).
+    pub tracking: String,
+}
+
+/// The branch's upstream, or why vislox will not push.
+pub async fn target(dir: &Path) -> Result<Target, String> {
+    let branch = git_raw(dir, &["symbolic-ref", "-q", "HEAD"])
+        .await
+        .map(|b| String::from_utf8_lossy(&b).trim().to_string())
+        .unwrap_or_default();
+    if branch.is_empty() {
+        return Err(
+            "HEAD is on no branch, so vislox does not know where to push. Check the \
+                    branch out, then push again."
+                .into(),
+        );
+    }
+    let raw = git_raw(
+        dir,
+        &[
+            "for-each-ref",
+            "--format=%(upstream:remotename)%00%(upstream:remoteref)%00%(upstream)",
+            &branch,
+        ],
+    )
+    .await?;
+    let line = String::from_utf8_lossy(&raw);
+    let f: Vec<&str> = line.trim_end_matches('\n').split('\0').collect();
+    let short = branch.trim_start_matches("refs/heads/");
+    match f[..] {
+        [remote, remote_ref, tracking]
+            if !remote.is_empty() && !remote_ref.is_empty() && !tracking.is_empty() =>
+        {
+            if remote.contains(['*', '?', '[', '\\']) {
+                return Err(format!("vislox does not push to a remote named {remote}."));
+            }
+            Ok(Target {
+                remote: remote.into(),
+                remote_ref: remote_ref.into(),
+                tracking: tracking.into(),
+            })
+        }
+        _ => Err(format!(
+            "the branch {short} has no upstream, so vislox does not know where to push. Set one \
+             once (git branch --set-upstream-to=<remote>/<branch>, or git push -u after checking \
+             what it sends), then push again."
+        )),
+    }
+}
+
+/// How many commits `HEAD` has that the upstream's tracking branch has not.
+pub async fn unpushed(dir: &Path, t: &Target) -> Result<usize, String> {
+    let has = git_raw(dir, &["rev-parse", "-q", "--verify", &t.tracking]).await;
+    if has.is_err() {
+        return Err(format!(
+            "{} is not fetched, so vislox cannot tell what the remote has. Fetch it (git fetch {}), \
+             then push again.",
+            t.tracking, t.remote
+        ));
+    }
+    let n = git_raw(dir, &["rev-list", "--count", "HEAD", "--not", &t.tracking]).await?;
+    String::from_utf8_lossy(&n)
+        .trim()
+        .parse()
+        .map_err(|_| "git rev-list gave no count".into())
+}
+
+/// The commit `HEAD` is now.
+pub async fn head(dir: &Path) -> Result<String, String> {
+    let h = git_raw(dir, &["rev-parse", "--verify", "HEAD"]).await?;
+    Ok(String::from_utf8_lossy(&h).trim().to_string())
+}
+
+/// What `git push <t.remote> <sha>:<t.remote_ref>` would send that may hold
+/// a config, scanned by lox, within [`SCAN_LIMIT`].
+pub async fn before_push(dir: &Path, lox: &Path, t: &Target, sha: &str) -> Verdict {
+    match tokio::time::timeout(SCAN_LIMIT, scan_push(dir, lox, t, sha)).await {
+        Ok(Ok(v)) => v,
+        Ok(Err(why)) => Verdict::CannotScan(why),
+        Err(_) => Verdict::CannotScan(format!(
+            "the scan took longer than {} minutes.",
+            SCAN_LIMIT.as_secs() / 60
+        )),
+    }
+}
+
 /// A config file version the push sends.
 struct Candidate {
     path: String,
     blob: String,
-    commit: String,
 }
 
-/// What `git push` would send that may hold a config, scanned by lox.
-pub async fn before_push(dir: &Path, lox: &Path) -> Verdict {
-    match scan_push(dir, lox).await {
-        Ok(v) => v,
-        Err(why) => Verdict::CannotScan(why),
-    }
-}
-
-async fn scan_push(dir: &Path, lox: &Path) -> Result<Verdict, String> {
-    let top = git(dir, &["rev-parse", "--show-toplevel"]).await?;
-    let top = PathBuf::from(top.trim());
-    let cands = candidates(&top).await?;
+async fn scan_push(dir: &Path, lox: &Path, t: &Target, sha: &str) -> Result<Verdict, String> {
+    let top = git_raw(dir, &["rev-parse", "--show-toplevel"]).await?;
+    let top = PathBuf::from(String::from_utf8_lossy(&top).trim());
+    // What the remote has: each of its remote-tracking branches.
+    let refs = git_raw(
+        &top,
+        &[
+            "for-each-ref",
+            "--format=%(objectname)",
+            &format!("refs/remotes/{}/", t.remote),
+        ],
+    )
+    .await?;
+    let has: Vec<String> = String::from_utf8_lossy(&refs)
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    let cands = candidates(&top, sha, &has).await?;
     if cands.is_empty() {
         return Ok(Verdict::Clean(
-            "no config file in the commits to push".into(),
+            "no config file in what the push sends".into(),
         ));
     }
-    let now = head_blobs(&top, &cands).await;
-    let blobs: Vec<String> = cands.iter().map(|c| c.blob.clone()).collect();
-    let bytes = git_objects(&top, &blobs).await?;
-    let scratch = scratch_dir("vislox-scan")?;
+    let now = blobs_at(&top, sha).await?;
+    let specs: Vec<String> = cands.iter().map(|c| c.blob.clone()).collect();
+    let objects = git_typed_objects(&top, &specs).await?;
+    let scratch = private_dir("vislox-scan")?;
     let _gone = RemoveDir(scratch.clone());
-    private(&scratch);
     let mut found = Vec::new();
     // Each config to scan: its name in the scratch directory, its candidate,
     // the zip entry, and its text (to find lines in).
     let mut files: Vec<(String, usize, Option<String>, Vec<u8>)> = Vec::new();
-    for (i, (c, b)) in cands.iter().zip(bytes).enumerate() {
-        let finding = |entry: Option<String>, what: &str| Finding {
+    for (i, (c, o)) in cands.iter().zip(objects).enumerate() {
+        let finding = |what: &str| Finding {
             file: c.path.clone(),
-            entry,
+            entry: None,
             line: None,
             kind: "unreadable".into(),
             what: what.into(),
             len: None,
-            commit: c.commit.clone(),
             now: now.get(&c.path) == Some(&c.blob),
+            commit: None,
         };
-        let Some(b) = b else {
-            found.push(finding(None, "git has no such object"));
-            continue;
+        let b = match o {
+            Some((kind, b)) if kind == "blob" => b,
+            // A directory named like a config: its files are listed apart.
+            Some(_) => continue,
+            None => {
+                found.push(finding("git has no such object"));
+                continue;
+            }
         };
         let lower = c.path.to_lowercase();
         let (entry, xml) = if lower.ends_with(".zip") {
             if !loxone_config::archive::is_zip(&b) {
-                found.push(finding(None, "not a zip archive: lox cannot read it"));
+                found.push(finding("not a zip archive: lox cannot read it"));
                 continue;
             }
             match loxone_config::archive::extract_and_decompress(&b) {
@@ -154,7 +272,7 @@ async fn scan_push(dir: &Path, lox: &Path) -> Result<Verdict, String> {
                 // Not a Miniserver backup: no program in it.
                 Err(e) if e.to_string().contains("does not contain sps0.LoxCC") => continue,
                 Err(_) => {
-                    found.push(finding(None, "a backup whose program cannot be read"));
+                    found.push(finding("a backup whose program cannot be read"));
                     continue;
                 }
             }
@@ -162,7 +280,7 @@ async fn scan_push(dir: &Path, lox: &Path) -> Result<Verdict, String> {
             match loxone_config::archive::decompress_loxcc(&b) {
                 Ok(x) => (None, x),
                 Err(_) => {
-                    found.push(finding(None, "a program file that cannot be read"));
+                    found.push(finding("a program file that cannot be read"));
                     continue;
                 }
             }
@@ -176,7 +294,9 @@ async fn scan_push(dir: &Path, lox: &Path) -> Result<Verdict, String> {
     if !files.is_empty() {
         let mut args = vec!["logic", "scan", "--json"];
         args.extend(files.iter().map(|f| f.0.as_str()));
-        let (code, stdout, stderr) = run_status(lox, &args, &scratch, SCAN_TIMEOUT).await?;
+        let (code, stdout, stderr) = run_status(lox, &args, &scratch, LOX_TIMEOUT)
+            .await
+            .map_err(|e| format!("lox logic scan: {e}"))?;
         let report = first_json(&stdout);
         let Some(report) = report.as_ref().and_then(Value::as_object) else {
             return Err(if check::unsupported(code, &stdout, &stderr) {
@@ -188,10 +308,7 @@ async fn scan_push(dir: &Path, lox: &Path) -> Result<Verdict, String> {
             } else {
                 format!(
                     "lox logic scan gave no answer vislox can read ({}).",
-                    match code {
-                        Some(c) => format!("exit {c}"),
-                        None => "no exit code".into(),
-                    }
+                    code.map_or("no exit code".into(), |c| format!("exit {c}"))
                 )
             });
         };
@@ -204,8 +321,8 @@ async fn scan_push(dir: &Path, lox: &Path) -> Result<Verdict, String> {
                 kind: String::new(),
                 what: String::new(),
                 len: None,
-                commit: c.commit.clone(),
                 now: now.get(&c.path) == Some(&c.blob),
+                commit: None,
             };
             let Some(list) = report.get(name).and_then(Value::as_array) else {
                 // lox says why on standard error, with the file's name; vislox
@@ -248,83 +365,62 @@ async fn scan_push(dir: &Path, lox: &Path) -> Result<Verdict, String> {
             if n == 1 { "" } else { "s" }
         )));
     }
-    found.sort_by(|a, b| {
-        (&a.file, &a.entry, a.line, &a.commit).cmp(&(&b.file, &b.entry, b.line, &b.commit))
-    });
+    // A version deleted since: the commit of the push that brought it in.
+    let mut commits: BTreeMap<String, Option<String>> = BTreeMap::new();
+    for f in found.iter().filter(|f| !f.now) {
+        let Some(c) = cands.iter().find(|c| c.path == f.file) else {
+            continue;
+        };
+        if commits.contains_key(&c.blob) {
+            continue;
+        }
+        let find = format!("--find-object={}", c.blob);
+        // The commit that brought it in, not the one that deleted it.
+        let mut args = vec![
+            "log",
+            "-1",
+            "--format=%h",
+            "--diff-filter=d",
+            &find,
+            sha,
+            "--not",
+        ];
+        args.extend(has.iter().map(String::as_str));
+        let c_of = git_raw(&top, &args)
+            .await
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o).trim().to_string())
+            .filter(|s| !s.is_empty());
+        commits.insert(c.blob.clone(), c_of);
+    }
+    for f in found.iter_mut().filter(|f| !f.now) {
+        if let Some(c) = cands.iter().find(|c| c.path == f.file) {
+            f.commit = commits.get(&c.blob).cloned().flatten();
+        }
+    }
+    found.sort_by(|a, b| (&a.file, &a.entry, a.line).cmp(&(&b.file, &b.entry, b.line)));
     Ok(Verdict::Found(found))
 }
 
-/// Each version of a file that may hold a config, in the commits `HEAD` has
-/// and no remote-tracking branch has: added, changed or copied there. The
-/// newest commit first; a version in several is named by the newest.
-async fn candidates(top: &Path) -> Result<Vec<Candidate>, String> {
-    // What the push remote has, as far as this repository knows: its
-    // remote-tracking branches; with no push remote known, every remote's.
-    let branch = git(top, &["symbolic-ref", "-q", "HEAD"])
-        .await
-        .unwrap_or_default();
-    let remote = git(
-        top,
-        &["for-each-ref", "--format=%(push:remotename)", branch.trim()],
-    )
-    .await
-    .unwrap_or_default();
-    let remote = remote.trim();
-    let has = if remote.is_empty() || remote.contains(['*', '?', '[']) {
-        "--remotes".to_string()
-    } else {
-        format!("--remotes={remote}")
-    };
-    let list = git(top, &["rev-list", "--parents", "HEAD", "--not", &has]).await?;
+/// Each object `git push` would send for `sha` that may be a config file:
+/// `git rev-list --objects <sha> --not <has>`, by its path. One version
+/// under two paths is read once.
+async fn candidates(top: &Path, sha: &str, has: &[String]) -> Result<Vec<Candidate>, String> {
+    let mut args = vec!["rev-list", "--objects", sha, "--not"];
+    args.extend(has.iter().map(String::as_str));
+    let raw = git_raw(top, &args).await?;
     let mut seen = BTreeSet::new();
     let mut out = Vec::new();
-    for line in list.lines() {
-        let mut ids = line.split_whitespace();
-        let Some(commit) = ids.next() else { continue };
-        let first_parent = ids.next();
-        // Against the first parent: a merge's own changes too (and what it
-        // brings in from a side branch, which is scanned once more).
-        let diff = match first_parent {
-            Some(p) => {
-                git_raw(
-                    top,
-                    &[
-                        "diff-tree",
-                        "-r",
-                        "-z",
-                        "--no-renames",
-                        "--no-abbrev",
-                        p,
-                        commit,
-                    ],
-                )
-                .await?
-            }
-            None => {
-                git_raw(
-                    top,
-                    &[
-                        "diff-tree",
-                        "-r",
-                        "-z",
-                        "--no-renames",
-                        "--no-abbrev",
-                        "--no-commit-id",
-                        "--root",
-                        commit,
-                    ],
-                )
-                .await?
-            }
+    for line in String::from_utf8_lossy(&raw).lines() {
+        // `<id> <path>` for trees and files; a commit has no path.
+        let Some((id, path)) = line.split_once(' ') else {
+            continue;
         };
-        for (blob, path) in changed_files(&diff) {
-            if is_config_name(&path) && seen.insert((path.clone(), blob.clone())) {
-                out.push(Candidate {
-                    path,
-                    blob,
-                    commit: commit[..10.min(commit.len())].to_string(),
-                });
-            }
+        if is_config_name(path) && seen.insert(id.to_string()) {
+            out.push(Candidate {
+                path: path.to_string(),
+                blob: id.to_string(),
+            });
         }
     }
     Ok(out)
@@ -336,48 +432,22 @@ fn is_config_name(path: &str) -> bool {
     l.ends_with(".loxone") || l.ends_with(".loxcc") || l.ends_with(".zip")
 }
 
-/// The files a `git diff-tree -r -z --no-renames` adds or changes (not
-/// deletes; not links or submodules), with their new blob id.
-fn changed_files(raw: &[u8]) -> Vec<(String, String)> {
-    let mut out = Vec::new();
-    let mut parts = raw.split(|&b| b == 0);
-    while let Some(head) = parts.next() {
-        let head = String::from_utf8_lossy(head);
-        let Some(meta) = head.trim_start_matches(['\n', '\r']).strip_prefix(':') else {
-            continue;
-        };
-        let Some(path) = parts.next() else { break };
-        let f: Vec<&str> = meta.split(' ').collect();
-        let [_, mode, _, blob, status] = f[..] else {
-            continue;
-        };
-        if status.starts_with('D') || mode == "120000" || mode == "160000" {
-            continue;
-        }
-        out.push((blob.to_string(), String::from_utf8_lossy(path).into_owned()));
-    }
-    out
-}
-
-/// The blob `HEAD` has for each candidate's path.
-async fn head_blobs(top: &Path, cands: &[Candidate]) -> BTreeMap<String, String> {
-    let paths: BTreeSet<&str> = cands.iter().map(|c| c.path.as_str()).collect();
+/// The blob `sha` has at each path.
+async fn blobs_at(top: &Path, sha: &str) -> Result<BTreeMap<String, String>, String> {
+    let raw = git_raw(top, &["ls-tree", "-r", "-z", "--full-tree", sha]).await?;
     let mut m = BTreeMap::new();
-    let Ok(raw) = git_raw(top, &["ls-tree", "-r", "-z", "--full-tree", "HEAD"]).await else {
-        return m;
-    };
     for rec in raw.split(|&b| b == 0) {
         let rec = String::from_utf8_lossy(rec);
         let Some((meta, path)) = rec.split_once('\t') else {
             continue;
         };
-        if paths.contains(path)
+        if is_config_name(path)
             && let Some(blob) = meta.split(' ').nth(2)
         {
             m.insert(path.to_string(), blob.to_string());
         }
     }
-    m
+    Ok(m)
 }
 
 /// Find the line of each finding's element in the config's text: lox lists
@@ -455,23 +525,16 @@ fn shell_quote(s: &str) -> String {
     }
 }
 
-/// The first JSON value in lox's standard output.
-fn first_json(out: &str) -> Option<Value> {
-    let i = out.find('{')?;
-    serde_json::Deserializer::from_str(&out[i..])
-        .into_iter::<Value>()
-        .next()?
-        .ok()
-}
-
-/// A git command's raw standard output (for `-z`).
-async fn git_raw(dir: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
+/// A git command's standard output only (git's warnings on standard error
+/// are never read as its answer).
+pub async fn git_raw(dir: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
     let out = tokio::time::timeout(
         GIT_TIMEOUT,
         tokio::process::Command::new("git")
             .args(args)
             .current_dir(dir)
             .stdin(std::process::Stdio::null())
+            .env("GIT_TERMINAL_PROMPT", "0")
             .kill_on_drop(true)
             .output(),
     )
@@ -489,61 +552,54 @@ async fn git_raw(dir: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
     }
 }
 
-/// Run a command: its exit code, standard output and standard error.
-async fn run_status(
-    cmd: &Path,
-    args: &[&str],
-    dir: &Path,
-    limit: Duration,
-) -> Result<(Option<i32>, String, String), String> {
-    let out = tokio::time::timeout(
-        limit,
-        tokio::process::Command::new(cmd)
-            .args(args)
-            .current_dir(dir)
-            .stdin(std::process::Stdio::null())
-            .kill_on_drop(true)
-            .output(),
-    )
-    .await
-    .map_err(|_| {
-        format!(
-            "lox logic scan took longer than {} s, so vislox cannot tell what the push would send.",
-            limit.as_secs()
-        )
-    })?
-    .map_err(|e| format!("cannot run {}: {e}", cmd.display()))?;
-    Ok((
-        out.status.code(),
-        String::from_utf8_lossy(&out.stdout).into_owned(),
-        String::from_utf8_lossy(&out.stderr).into_owned(),
-    ))
-}
-
-/// Only this user may read the scratch directory: it holds configs.
-fn private(dir: &Path) {
+/// A new scratch directory only this user can open: made with that mode
+/// (the umask can only narrow it), never one that exists. Else an error.
+fn private_dir(prefix: &str) -> Result<PathBuf, String> {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let d = std::env::temp_dir().join(format!(
+        "{prefix}-{}-{}-{n}",
+        std::process::id(),
+        now_nanos()
+    ));
+    let mut b = std::fs::DirBuilder::new();
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+        use std::os::unix::fs::DirBuilderExt;
+        b.mode(0o700);
     }
-    #[cfg(not(unix))]
-    let _ = dir;
+    b.create(&d)
+        .map_err(|e| format!("cannot create a private scratch directory: {e}"))?;
+    Ok(d)
 }
 
+/// A new file only this user can read, made so; never an existing one.
 fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    std::fs::write(path, bytes).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    use std::io::Write;
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        use std::os::unix::fs::OpenOptionsExt;
+        o.mode(0o600);
     }
-    Ok(())
+    let mut f = o
+        .open(path)
+        .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    f.write_all(bytes)
+        .map_err(|e| format!("cannot write {}: {e}", path.display()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What a push of `HEAD` to its upstream would send, scanned.
+    async fn scan(d: &Path, lox: &Path) -> Verdict {
+        let t = target(d).await.unwrap();
+        let sha = head(d).await.unwrap();
+        before_push(d, lox, &t, &sha).await
+    }
 
     fn sh(dir: &Path, cmd: &str) {
         let ok = std::process::Command::new("sh")
@@ -621,10 +677,10 @@ exit $code
             &d,
             "echo hi > notes.txt && git add -A && git commit -qm notes",
         );
-        let v = before_push(&d, &lox).await;
+        let v = scan(&d, &lox).await;
         assert_eq!(
             v,
-            Verdict::Clean("no config file in the commits to push".into())
+            Verdict::Clean("no config file in what the push sends".into())
         );
         assert_eq!(calls(&tmp), "");
     }
@@ -636,7 +692,7 @@ exit $code
         std::fs::create_dir_all(d.join("sub dir")).unwrap();
         std::fs::write(d.join("sub dir/live.Loxone"), USERS).unwrap();
         sh(&d, "git add -A && git commit -qm live");
-        let v = before_push(&d.join("sub dir"), &lox).await;
+        let v = scan(&d.join("sub dir"), &lox).await;
         let Verdict::Found(f) = v else {
             panic!("not found: {v:?}");
         };
@@ -682,30 +738,31 @@ exit $code
         std::fs::write(d.join("old.Loxone"), USERS).unwrap();
         sh(&d, "git add -A && git commit -qm old && git push -q");
         assert_eq!(
-            before_push(&d, &lox).await,
-            Verdict::Clean("no config file in the commits to push".into())
+            scan(&d, &lox).await,
+            Verdict::Clean("no config file in what the push sends".into())
         );
-        // Added in one commit and deleted in the next: still in the push.
-        std::fs::write(d.join("live.Loxone"), USERS).unwrap();
+        // Added in one commit and deleted in the next: still in the push (other
+        // bytes: the remote has old.Loxone's already, so a copy of it is not sent).
+        std::fs::write(d.join("live.Loxone"), format!("{USERS}<!-- live -->\n")).unwrap();
         sh(
             &d,
             "git add -A && git commit -qm add && git rm -q live.Loxone && git commit -qm rm",
         );
         let added = String::from_utf8(
             std::process::Command::new("git")
-                .args(["rev-parse", "--short=10", "HEAD~1"])
+                .args(["log", "-1", "--format=%h", "HEAD~1"])
                 .current_dir(&d)
                 .output()
                 .unwrap()
                 .stdout,
         )
         .unwrap();
-        let Verdict::Found(f) = before_push(&d, &lox).await else {
+        let Verdict::Found(f) = scan(&d, &lox).await else {
             panic!("not found");
         };
         assert_eq!(f.len(), 2);
         assert!(!f[0].now);
-        assert_eq!(f[0].commit, added.trim());
+        assert_eq!(f[0].commit.as_deref(), Some(added.trim()));
         assert!(
             f[0].text()
                 .ends_with(&format!("[only in commit {}, deleted since]", added.trim()))
@@ -716,7 +773,7 @@ exit $code
         std::fs::write(d.join("clean.Loxone"), "<C Type=\"Document\"/>\n").unwrap();
         sh(&d, "git add -A && git commit -qm clean");
         assert_eq!(
-            before_push(&d, &lox).await,
+            scan(&d, &lox).await,
             Verdict::Clean("1 config checked (lox logic scan)".into())
         );
     }
@@ -732,7 +789,84 @@ exit $code
             "git add -A && git commit -qm live && git remote add other ../other.git \
              && git push -q other HEAD",
         );
-        assert!(matches!(before_push(&d, &lox).await, Verdict::Found(_)));
+        assert!(matches!(scan(&d, &lox).await, Verdict::Found(_)));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_merge_of_what_the_remote_has_sends_none_of_it() {
+        let (tmp, d, lox) = repo();
+        // Someone else pushed a config with personal data (it is on the remote already).
+        sh(
+            tmp.path(),
+            "git clone -q remote.git other && cd other && git config user.email t@t \
+             && git config user.name t",
+        );
+        let other = tmp.path().join("other");
+        std::fs::write(other.join("live.Loxone"), USERS).unwrap();
+        sh(&other, "git add -A && git commit -qm theirs && git push -q");
+        // Here: a commit of ours, then a merge of theirs. Against its first parent, the
+        // merge adds live.Loxone; but the push sends none of it.
+        sh(
+            &d,
+            "echo mine > mine.txt && git add -A && git commit -qm mine && git fetch -q \
+             && git merge -q --no-edit @{u}",
+        );
+        assert_eq!(
+            scan(&d, &lox).await,
+            Verdict::Clean("no config file in what the push sends".into())
+        );
+        assert_eq!(calls(&tmp), "");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_git_warning_is_not_read_as_git_s_answer() {
+        let (_tmp, d, lox) = repo();
+        // Every git command warns about this on standard error.
+        sh(&d, "git config core.fsyncObjectFiles true");
+        std::fs::write(d.join("live.Loxone"), USERS).unwrap();
+        sh(&d, "git add -A && git commit -qm live");
+        let v = scan(&d, &lox).await;
+        let Verdict::Found(f) = v else {
+            panic!("not found: {v:?}");
+        };
+        assert_eq!(f.len(), 2);
+        assert_eq!(f[0].file, "live.Loxone");
+        assert!(f[0].now);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn without_an_upstream_nothing_is_guessed() {
+        let (_tmp, d, _) = repo();
+        sh(&d, "git checkout -q -b loose");
+        let e = target(&d).await.unwrap_err();
+        assert!(e.starts_with("the branch loose has no upstream"), "{e}");
+        sh(&d, "git checkout -q --detach");
+        let e = target(&d).await.unwrap_err();
+        assert!(e.starts_with("HEAD is on no branch"), "{e}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_scratch_copies_are_private_from_the_start() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = private_dir("vislox-scan-test").unwrap();
+        let _gone = RemoveDir(d.clone());
+        assert_eq!(
+            std::fs::metadata(&d).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let f = d.join("c0.Loxone");
+        write_private(&f, b"x").unwrap();
+        assert_eq!(
+            std::fs::metadata(&f).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        // Never into a file that is there already (someone else's).
+        assert!(write_private(&f, b"y").is_err());
+        assert_eq!(std::fs::read(&f).unwrap(), b"x");
     }
 
     #[cfg(unix)]
@@ -742,7 +876,7 @@ exit $code
         std::fs::write(d.join("a.Loxone"), "BROKEN").unwrap();
         sh(&d, "git add -A && git commit -qm a");
         // A file lox cannot read is a finding, without lox's words.
-        let Verdict::Found(f) = before_push(&d, &lox).await else {
+        let Verdict::Found(f) = scan(&d, &lox).await else {
             panic!("not found");
         };
         assert_eq!(
@@ -751,18 +885,18 @@ exit $code
         );
         // A lox without scan, and an answer that is no JSON: cannot tell.
         std::fs::write(tmp.path().join("noscan"), "").unwrap();
-        let Verdict::CannotScan(why) = before_push(&d, &lox).await else {
+        let Verdict::CannotScan(why) = scan(&d, &lox).await else {
             panic!("scanned");
         };
         assert!(why.contains("has no `lox logic scan`"), "{why}");
         std::fs::remove_file(tmp.path().join("noscan")).unwrap();
         std::fs::write(tmp.path().join("garbage"), "").unwrap();
-        let Verdict::CannotScan(why) = before_push(&d, &lox).await else {
+        let Verdict::CannotScan(why) = scan(&d, &lox).await else {
             panic!("scanned");
         };
         assert!(why.contains("no answer vislox can read (exit 0)"), "{why}");
         // No lox at all.
-        let Verdict::CannotScan(why) = before_push(&d, &tmp.path().join("none")).await else {
+        let Verdict::CannotScan(why) = scan(&d, &tmp.path().join("none")).await else {
             panic!("scanned");
         };
         assert!(why.contains("cannot run"), "{why}");
@@ -791,7 +925,7 @@ exit $code
         // A .zip that is none: cannot be read.
         std::fs::write(d.join("odd.zip"), "not a zip").unwrap();
         sh(&d, "git add -A && git commit -qm backups");
-        let Verdict::Found(f) = before_push(&d, &lox).await else {
+        let Verdict::Found(f) = scan(&d, &lox).await else {
             panic!("not found");
         };
         let at: Vec<String> = f.iter().map(|f| format!("{} {}", f.at(), f.kind)).collect();
@@ -827,7 +961,7 @@ exit $code
         )
         .unwrap();
         sh(&d, "git add -A && git commit -qm fixtures");
-        let Verdict::Found(f) = before_push(&d, lox).await else {
+        let Verdict::Found(f) = scan(&d, lox).await else {
             panic!("not found");
         };
         assert_eq!(f.len(), 6, "{f:?}");
@@ -839,18 +973,6 @@ exit $code
         assert!(
             l.contains("Type=\"LoxLIVE\"") && l.contains(" Serial=\""),
             "{l}"
-        );
-    }
-
-    #[test]
-    fn diff_tree_records() {
-        let raw = b":000000 100644 0000 aaaa A\0new.Loxone\0:100644 000000 bbbb 0000 D\0gone.Loxone\0:120000 120000 c d M\0link.Loxone\0:100644 100644 e ffff M\0a b.zip\0";
-        assert_eq!(
-            changed_files(raw),
-            [
-                ("aaaa".to_string(), "new.Loxone".to_string()),
-                ("ffff".to_string(), "a b.zip".to_string())
-            ]
         );
     }
 }
