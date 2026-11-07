@@ -32,6 +32,16 @@ const lagerAt = (i) => { const px = 960 + 1920 * (i % 15), py = 960 + 960 * Math
 // An NFC Code Touch on a page of its own (Zugang), for the users lox logic lint says it opens for none of (#66).
 const ZUGANG = "40000000-0000-0000-ffff504f94000001", TOUCH = "40000001-0000-0000-ffff504f94000001";
 const KITCHEN = "30000a01-0000-0000-ffff504f94000001", BATH = "30000a02-0000-0000-ffff504f94000001";
+// Two analog Daytimers on the upper floor (#73): Uhr, on Mondays 06:30–08:00 and in the Party mode 18:00–23:00,
+// and Heizung, with no switching times.
+const UHR = "10000020-0000-0200-ffff504f94000001", HEIZ = "10000021-0000-0210-ffff504f94000001";
+const PARTY = "10000011-0000-0110-ffff504f94000001", MON = "00000000-0000-0004-1500000000000000";
+const dayU = (n) => `00000000-0000-${n.toString(16).padStart(4, "0")}-1500000000000000`;
+const timerXml = (u, title, y, modes, entries) => `\t\t\t<C Type="DayTimer" V="178" U="${u}" Title="${title}" Px="960" Py="${y}" Px2="3648" Py2="${y + 888}" Nio="2" WF="16384" Analog="true" DefValue="18"${modes ? ` Modes="${modes}"` : ""}>
+\t\t\t\t<Co K="Mode" U="${u.slice(0, 19)}1-00ff504f94000001"/>
+\t\t\t\t<Co K="AQ" U="${u.slice(0, 19)}2-01ff504f94000001"/>
+${entries.map((e) => `\t\t\t\t${e}\n`).join("")}\t\t\t</C>
+`;
 const root = mkdtempSync(join(tmpdir(), "vislox-edit-"));
 const dir = join(root, "project");
 mkdirSync(join(dir, "pages"), { recursive: true });
@@ -49,6 +59,8 @@ const base = readFileSync(fixture, "utf8").replace('<Co K="Q" U="10000009-0000-0
 \t\t\t\t<Co K="I2" U="1000000b-0000-00b2-01ff504f94000001"/>
 \t\t\t\t<Co K="Q" U="1000000b-0000-00b3-02ff504f94000001"/>
 \t\t\t</C>`)
+  .replace(`\t\t\t<C Type="And" V="178" U="${FLUR}"`, timerXml(UHR, "Uhr", 4800, `${MON},${PARTY}`, ['<Entry From="390" To="480" V="21"/>', '<Entry From="1080" To="1380" Ix="1" V="22.5"/>']) +
+    timerXml(HEIZ, "Heizung", 6720, "", []) + `\t\t\t<C Type="And" V="178" U="${FLUR}"`)
   // Two rooms; the Divide block is shown in the app, in the kitchen.
   .replace('\t\t<C Type="Page" V="178" U="10000002', `\t\t<C Type="Place" V="178" U="${KITCHEN}" Title="Küche"/>
 \t\t<C Type="Place" V="178" U="${BATH}" Title="Bad"/>
@@ -173,10 +185,12 @@ const slugs = {};
 const KEYS = { In1: "Input1", In2: "Input2", Trigger: "InputTrigger" };
 const unq = (v) => v.startsWith('"') ? JSON.parse(v) : v;
 const xml = (v) => v.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
+const claimed = [];
 for (const line of src.split("\\n")) {
   let m;
   if ((m = line.match(/^extern (\\w+) = \\w+\\(uuid: "([^"]+)"\\)/))) { slugs[m[1]] = m[2]; continue; }
   if (!(m = line.match(/^(\\w+)\\.(\\w+) = (.*)$/))) continue;
+  if (m[2] === "schedule") { claimed.push([slugs[m[1]], m[3]]); continue; }
   const uuid = slugs[m[1]], i = out.findIndex((l) => l.includes(\`U="\${uuid}"\`));
   if (m[2] === "title") { out[i] = out[i].replace(/Title="[^"]*"/, \`Title="\${xml(unq(m[3]))}"\`); continue; }
   if (m[2] === "room") {
@@ -188,6 +202,44 @@ for (const line of src.split("\\n")) {
   const key = KEYS[m[2]] || m[2];
   const j = out.findIndex((l, n) => n > i && l.includes(\`<Co K="\${key}"\`));
   out[j] = out[j].replace(/ Def="[^"]*"/, "").replace(\`<Co K="\${key}"\`, \`<Co K="\${key}" Def="\${unq(m[3])}"\`);
+}
+// Switching times (#73): each \`schedule\` set of vislox's file, written onto the timers its claims name as lox
+// writes them: a column per mode the set names and the seven weekdays, in \`Mode=\` order, an <Entry> per interval.
+const sets = {};
+{
+  let cur = null;
+  for (const line of src.split("\\n")) {
+    const m = line.match(/^schedule (\\w+)$/);
+    if (m) cur = sets[m[1]] = [];
+    else if (line === "end") cur = null;
+    else if (cur && line.trim()) cur.push(line.trim());
+  }
+}
+const DAYW = { holiday: [1], vacation: [2], dayoff: [3], mon: [4], tue: [5], wed: [6], thu: [7], fri: [8], sat: [9], sun: [10], weekdays: [4, 5, 6, 7, 8], weekend: [9, 10], daily: [4, 5, 6, 7, 8, 9, 10] };
+const modeU = (n) => \`00000000-0000-\${n.toString(16).padStart(4, "0")}-1500000000000000\`;
+for (const [uuid, name] of claimed) {
+  const cols = new Map([4, 5, 6, 7, 8, 9, 10].map((n) => [modeU(n), { n: n - 1, ivs: [] }]));
+  for (const l of sets[name]) {
+    const [, days, rest] = l.match(/^(.*?) (off|\\d\\d:\\d\\d-.*)$/);
+    const ivs = rest === "off" ? [] : rest.split(", ").map((x) => {
+      const m = x.match(/^(\\d\\d):(\\d\\d)-(\\d\\d):(\\d\\d)(?: = (-?[\\d.]+))?( activate)?$/);
+      return { from: +m[1] * 60 + +m[2], to: +m[3] * 60 + +m[4], v: m[5] ?? "1", act: !!m[6] };
+    });
+    for (const d of days.match(/"[^"]*"|\\w+/g)) {
+      const us = d.startsWith('"')
+        ? [out.find((x) => x.includes('Type="Mode"') && x.includes(\`Title="\${JSON.parse(d)}"\`))].map((x) => [x.match(/U="([^"]+)"/)[1], +(x.match(/ Mode="(-?\\d+)"/)?.[1] ?? 0)])
+        : DAYW[d].map((n) => [modeU(n), n - 1]);
+      for (const [u, n] of us) { if (!cols.has(u)) cols.set(u, { n, ivs: [] }); cols.get(u).ivs.push(...ivs); }
+    }
+  }
+  const order = [...cols].sort((a, b) => a[1].n - b[1].n);
+  const entries = order.flatMap(([, c], ix) => c.ivs.sort((a, b) => a.from - b.from).map((iv) =>
+    \`\\t\\t\\t\\t<Entry\${iv.from ? \` From="\${iv.from}"\` : ""} To="\${iv.to}"\${ix ? \` Ix="\${ix}"\` : ""}\${iv.act ? ' NeedActivate="true"' : ""} V="\${iv.v}"/>\`));
+  const i = out.findIndex((l) => l.includes(\`U="\${uuid}"\`) && l.includes("<C "));
+  const j = out.findIndex((l, n) => n > i && l.trim() === "</C>");
+  const kept = out.slice(i + 1, j).filter((l) => !l.includes("<Entry"));
+  const head = out[i].replace(/ Modes="[^"]*"/, "").replace(/ N="\\d+"/, "").replace(/>$/, \` N="\${entries.length}" Modes="\${order.map(([u]) => u).join(",")}">\`);
+  out.splice(i, j - i, head, ...kept, ...entries);
 }
 // vislox's new blocks: one file per page (page "…"), a declaration per block. Each gets a UUID in the
 // lock (kept by slug across compiles) and is drawn on its page with the constants it is given.
@@ -1178,6 +1230,92 @@ try {
     writeFileSync(flur, was);
     await page.waitForSelector("#deploy-check.hidden", { state: "attached", timeout: 15000 });
     await page.click(".hrev.k-git >> nth=0");
+  });
+  await step("a Daytimer's switching times are edited as a schedule set, undone, shared and reverted (#73)", async () => {
+    await page.waitForFunction(() => /Nothing pending/.test(document.querySelector("#deploy-pend")?.textContent || ""), null, { timeout: 10000 });
+    await page.evaluate(() => editGoNewest());
+    await settled();
+    await page.evaluate((u) => { gotoPage(S.objPage.get(u), { focus: u }); select(u); }, UHR);
+    await page.waitForSelector('#props [data-body="Switching times"] [data-se="open"]');
+    await page.click('#props [data-se="open"]');
+    // A row per weekday, then the timer's Party column; Monday is selected, with its interval.
+    const modes = await page.$$eval("#props .se-row .se-mode", (n) => n.map((x) => x.textContent));
+    assert.deepEqual(modes, ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday", "Party"]);
+    const sel = "#props .se-detail";
+    assert.deepEqual(await page.$$eval(`${sel} input.se-t`, (n) => n.map((x) => x.value)), ["06:30", "08:00"]);
+    // Typed: until 09:00. Then a click on the empty bar at 18:00 adds an hour there, dragged out to 21:00.
+    await page.fill(`${sel} [data-sch-field="${MON}|0|to"]`, "09:00");
+    const bar = await page.$(`#props [data-se-bar="${MON}"]`);
+    const box = await bar.boundingBox();
+    const x = (min) => box.x + (box.width * min) / 1440;
+    await page.mouse.move(x(1080), box.y + box.height / 2);
+    await page.mouse.down();
+    await page.mouse.move(x(1200), box.y + box.height / 2, { steps: 4 });
+    await page.mouse.move(x(1260), box.y + box.height / 2, { steps: 4 });
+    await page.mouse.up();
+    await page.waitForFunction((s) => document.querySelectorAll(`${s} .se-iv`).length === 2, sel);
+    assert.deepEqual(await page.$$eval(`${sel} input.se-t`, (n) => n.map((x) => x.value)), ["06:30", "09:00", "18:00", "21:00"]);
+    await page.fill(`${sel} [data-sch-field="${MON}|1|value"]`, "22.5");
+    await page.check(`${sel} [data-se="act"][data-i="1"]`);
+    await page.click(`${sel} [data-se="copy"][data-to="weekdays"]`);
+    // Saturday: one past midnight is refused in the browser, and nothing is sent.
+    await page.click(`#props .se-mode:has-text("Saturday")`);
+    await page.click(`${sel} [data-se="add"]`);
+    await page.fill(`${sel} [data-sch-field="${dayU(9)}|0|from"]`, "22:00");
+    await page.fill(`${sel} [data-sch-field="${dayU(9)}|0|to"]`, "02:00");
+    const n = edits.length;
+    await page.click('#props [data-se="save"]');
+    await waitText('[data-body="Switching times"]', /Fix the marked intervals/);
+    assert.match(await page.textContent(sel), /split an interval across midnight into two/);
+    assert.equal(edits.length, n);
+    await page.click(`${sel} [data-se="del"][data-i="0"]`);
+    await page.click('#props [data-se="save"]');
+    await until(() => edits.length > n && statuses[n] !== undefined, "the schedule request");
+    assert.equal(statuses[n], 200);
+    const [op] = edits[n].ops;
+    assert.equal(op.op, "schedule");
+    assert.equal(op.uuid, UHR);
+    const wk = [{ from: 390, to: 540, value: "21" }, { from: 1080, to: 1260, value: "22.5", activate: true }];
+    for (const d of [4, 5, 6, 7, 8]) assert.deepEqual(op.value.modes[dayU(d)], wk);
+    assert.deepEqual(op.value.modes[dayU(9)], []);
+    assert.deepEqual(op.value.modes[PARTY.toLowerCase()], [{ from: 1080, to: 1380, value: "22.5" }]);
+    await settled();
+    await page.waitForFunction((u) => S.edits?.schedules?.some((s) => s.uuid === u && s.pending), UHR, { timeout: 10000 });
+    const file = readFileSync(join(dir, "pages", "vislox", "edits.loxl"), "utf8");
+    assert.match(file, /^schedule vx_uhr_schedule\n\tweekdays 06:30-09:00 = 21, 18:00-21:00 = 22\.5 activate\n\tweekend off\n\t"Party" 18:00-23:00 = 22\.5\nend$/m);
+    assert.match(file, /^vx_10000020_0000_0200_ffff504f94000001\.schedule = vx_uhr_schedule$/m);
+    // Compiled: the pending config has the new switching times, marked not deployed, and the Deploy pane counts them.
+    await waitText('[data-body="Switching times"]', /edited here[\s\S]*not deployed[\s\S]*Revert/);
+    assert.match(await page.textContent('[data-body="Switching times"]'), /Written by vislox as vx_uhr_schedule/);
+    await page.waitForFunction((u) => S.view.objects[u].schedule.entries.filter((e) => e.from === 1080 && e.to === 1260 && e.activate).length === 5, UHR);
+    await waitText("#deploy-pend", /switching times of 1 timer edited here/);
+    // Undone and redone through the reply's undo.
+    let ops = await undoKey(false, (u) => S.view.objects[u].schedule.entries.length === 2, UHR);
+    assert.deepEqual(ops, [{ op: "schedule", uuid: UHR, value: null }]);
+    assert.doesNotMatch(readFileSync(join(dir, "pages", "vislox", "edits.loxl"), "utf8"), /schedule/);
+    ops = await undoKey(true, (u) => S.view.objects[u].schedule.entries.length === 11, UHR);
+    assert.equal(ops[0].op, "schedule");
+    assert.deepEqual(ops[0].value.modes[dayU(4)], wk);
+    // Heizung takes the same times: one set, two claims.
+    await page.evaluate((u) => { gotoPage(S.objPage.get(u), { focus: u }); select(u); }, HEIZ);
+    await page.waitForSelector('#props [data-se="same"]');
+    const m = edits.length;
+    await page.selectOption('#props [data-se="same"]', "vx_uhr_schedule");
+    await until(() => edits.length > m && statuses[m] !== undefined, "the shared schedule request");
+    assert.equal(statuses[m], 200);
+    assert.deepEqual(edits[m].ops, [{ op: "schedule", uuid: HEIZ, value: { set: "vx_uhr_schedule" } }]);
+    await settled();
+    await page.waitForFunction((u) => S.view.objects[u].schedule.entries.length === 11, HEIZ);
+    assert.match(readFileSync(join(dir, "pages", "vislox", "edits.loxl"), "utf8"), /^vx_10000021_0000_0210_ffff504f94000001\.schedule = vx_uhr_schedule$/m);
+    await waitText('[data-body="Switching times"]', /shared with Uhr/);
+    // Reverted: back to Loxone Config's (no claim); the set stays for Uhr.
+    await page.click('#props [data-se="revert"]');
+    await page.waitForFunction((u) => S.view.objects[u].schedule.entries.length === 0 && !S.edits?.schedules?.some((s) => s.uuid === u), HEIZ, { timeout: 15000 });
+    await settled();
+    assert.doesNotMatch(readFileSync(join(dir, "pages", "vislox", "edits.loxl"), "utf8"), /0210_ffff504f94000001\.schedule/);
+    // Discarded: nothing pending again.
+    await page.click("#btn-discard");
+    await page.waitForFunction(() => /Nothing pending/.test(document.querySelector("#deploy-pend")?.textContent || ""), null, { timeout: 10000 });
   });
   await step("nothing was deployed: lox only compiled, checked, linted and tested", async () => {
     const ran = readFileSync(calls, "utf8").trim().split("\n");

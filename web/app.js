@@ -1134,11 +1134,12 @@ function calTip(cal) {
 const propRow = (k, v, cls, tip) => `<div class="pr ${cls || ""}"><div class="k${tip ? " hinted" : ""}"${tip ? ` title="${esc(tip)}"` : ""}>${esc(k)}</div><div class="v">${v}</div></div>`;
 function renderProps() {
   // Live values re-render Properties often: keep the edit field being typed in.
-  const f = document.activeElement?.closest?.("#props [data-ed-field]");
-  const keep = f && { field: f.dataset.edField, a: f.selectionStart, b: f.selectionEnd };
+  const f = document.activeElement?.closest?.("#props [data-ed-field], #props [data-sch-field]");
+  const attr = f?.dataset.edField != null ? "data-ed-field" : "data-sch-field";
+  const keep = f && { field: f.getAttribute(attr), a: f.selectionStart, b: f.selectionEnd };
   renderPropsBody();
   if (keep) {
-    const g = $("props").querySelector(`[data-ed-field="${CSS.escape(keep.field)}"]`);
+    const g = $("props").querySelector(`[${attr}="${CSS.escape(keep.field)}"]`);
     if (g) { g.focus(); try { g.setSelectionRange(keep.a, keep.b); } catch { /* not a text field */ } }
   }
 }
@@ -1160,6 +1161,8 @@ function renderPropsBody() {
 
   const ed = editRows(o, row);
   if (ed) section("Edit", ed.rows, ed.count);
+  const se = seRows(o, row);
+  if (se) section("Switching times", se.rows, se.count);
   const ms = managedSrc(o.uuid);
   // The errors of lox logic check whose line names this block (#65): on the newest config only.
   const ce = S.rev === editRev()?.id ? checkErrors(o.uuid) : [];
@@ -2100,6 +2103,7 @@ function editsHere() {
   if (editsPending().length) parts.push(`${plural(editsPending().length, "value")} edited here`);
   if (editsAdded().length) parts.push(`${plural(editsAdded().length, "block")} added here`);
   if (editsMoved().length) parts.push(`${plural(editsMoved().length, "block")} moved here`);
+  if (schedsPending().length) parts.push(`switching times of ${plural(schedsPending().length, "timer")} edited here`);
   const drawn = editsWires().filter((w) => w.now).length, out = editsWires().length - drawn;
   if (drawn) parts.push(`${plural(drawn, "wire")} drawn here`);
   if (out) parts.push(`${plural(out, "wire")} taken out here`);
@@ -3275,6 +3279,319 @@ async function editRevert(key) {
   const op = EDIT_ATTR[c.op] ? { op: c.op, uuid: c.uuid } : c.op === "param" ? { op: "param", uuid: c.uuid, port: c.port } : { op: "setting", uuid: c.uuid, name: c.name };
   await editSend(c.uuid, st.rev, [{ ...op, value: c.deployed }], `Revert ${editLabel(o, c)} of ${displayTitle(o)}`);
 }
+// ── switching times (#73) ──────────────────────────────────────────────
+// A DayTimer's switching times are a Lox Logic `schedule` set and the timer's `.schedule` claim, written into
+// vislox's file of claims. The editor shows one bar per operating mode, as the Schedule section does: drag an
+// interval to move it, its ends to resize it, click the empty bar to add one; the selected mode's intervals
+// below take exact times, a value on an analog timer, and *activate*. Saving sends one `schedule` op: every
+// column, by its mode's UUID. It is an edit like any other: compiled, never deployed, undone through `undo`.
+const SE = { uuid: null, open: false, cols: [], sel: null, shareAll: true, busy: false, msg: "", err: "", bad: {} };
+/** The built-in operating modes: the `N` of their fixed UUID → name and day word. */
+const SE_BUILTIN = {
+  4: ["Monday", "mon"], 5: ["Tuesday", "tue"], 6: ["Wednesday", "wed"], 7: ["Thursday", "thu"], 8: ["Friday", "fri"],
+  9: ["Saturday", "sat"], 10: ["Sunday", "sun"], 1: ["Holiday", "holiday"], 2: ["Vacation", "vacation"], 3: ["Day off", "dayoff"],
+  11: ["Heating period", "heating"], 12: ["Cooling period", "cooling"],
+};
+const seUuid = (n) => `00000000-0000-${n.toString(16).padStart(4, "0")}-1500000000000000`;
+const SE_WEEK = [4, 5, 6, 7, 8, 9, 10].map(seUuid);
+const SE_GROUPS = { weekdays: [4, 5, 6, 7, 8].map(seUuid), weekend: [9, 10].map(seUuid), daily: SE_WEEK };
+/** The built-in mode number of `uuid`, or null. */
+function seBuiltin(uuid) { const m = /^00000000-0000-([0-9a-f]{4})-1500000000000000$/i.exec(uuid || ""); const n = m && parseInt(m[1], 16); return n && SE_BUILTIN[n] ? n : null; }
+/** A column's name: the config's title of its mode, else the built-in name; and the word lox writes. */
+function seName(uuid) {
+  const n = seBuiltin(uuid), o = S.view?.objects[uuid];
+  if (n) return { title: o?.title && o.title !== SE_BUILTIN[n][0] ? `${SE_BUILTIN[n][0]} (${o.title})` : SE_BUILTIN[n][0], word: SE_BUILTIN[n][1] };
+  return { title: o?.title || uuid, word: o ? `"${o.title}"` : uuid };
+}
+/** The operating modes a column can be added for: the other built-in modes (heating and cooling only when the
+ *  config has them, as lox requires), then the config's own modes. */
+function seModes() {
+  const out = [1, 2, 3].map(seUuid);
+  for (const n of [11, 12]) if (S.view?.objects[seUuid(n)]) out.push(seUuid(n));
+  const own = Object.values(S.view?.objects || {}).filter((o) => o.ty === "Mode" && !seBuiltin(o.uuid) && o.status !== "removed");
+  own.sort((a, b) => a.title.localeCompare(b.title));
+  return [...out, ...own.map((o) => o.uuid)];
+}
+/** What `GET /api/edits` says of this timer's switching times (#73), or null. */
+function schedEdit(uuid) { return (S.edits?.schedules || []).find((s) => s.uuid === uuid) || null; }
+/** The timers whose switching times were edited here and are not deployed. */
+function schedsPending() { return (S.edits?.schedules || []).filter((s) => s.pending); }
+/** The minutes of `hh:mm` (`24:00` is 1440), or null. */
+function seMin(t) {
+  const m = /^(\d{1,2}):(\d{2})$/.exec((t || "").trim());
+  if (!m) return null;
+  const v = +m[1] * 60 + +m[2];
+  return +m[2] < 60 && v <= 1440 ? v : null;
+}
+/** The draft from the schedule the config shown has: the seven weekdays always (a weekday without a column is
+ *  off all day once claimed), then the timer's other columns. */
+function seDraft(si, from) {
+  const cols = [...SE_WEEK];
+  for (const c of si.cols) if (!cols.includes(c.col.toLowerCase()) && !c.col.startsWith("#")) cols.push(c.col.toLowerCase());
+  return cols.map((uuid) => ({
+    uuid,
+    spans: (from || si).entries.filter((e) => e.col.toLowerCase() === uuid).sort(byTime)
+      .map((e) => ({ from: e.from, to: e.to, value: si.analog ? String(e.value) : undefined, activate: !!e.activate })),
+  }));
+}
+/** Whether this timer's switching times can be edited here now: `{ ok, rev }`, or null (nothing to show). */
+function seState(o) {
+  if (o.ty !== "DayTimer" || !o.schedule) return null;
+  const st = editState(o);
+  return st?.ok ? st : null;
+}
+function seOpen(uuid) {
+  const o = S.view?.objects[uuid];
+  if (!o?.schedule) return;
+  Object.assign(SE, { uuid, open: true, cols: seDraft(o.schedule), sel: SE_WEEK[0], shareAll: true, busy: false, msg: "", err: "", bad: {} });
+  S.closed.delete("Switching times");
+  renderProps();
+  $("props").querySelector(".se-row.sel .se-mode")?.focus();
+}
+function seClose() {
+  if (SE.busy) return;
+  Object.assign(SE, { open: false, cols: [], msg: "", err: "", bad: {} });
+  renderProps();
+  $("props").querySelector('[data-se="open"]')?.focus();
+}
+const seCol = (uuid) => SE.cols.find((c) => c.uuid === uuid);
+/** One column's bar: each interval a segment with a handle at either end. */
+function seBar(c, analog) {
+  return c.spans.map((s, i) => {
+    const l = (s.from / 1440) * 100, w = Math.max(((s.to - s.from) / 1440) * 100, 0.6);
+    const tip = `${hhmm(s.from)}–${hhmm(s.to)}${analog ? ` · ${s.value ?? "?"}` : ""}${s.activate ? " · needs activation" : ""}`;
+    return `<span class="se-seg${s.activate ? " act" : ""}" data-col="${esc(c.uuid)}" data-i="${i}" style="left:${l.toFixed(2)}%;width:${w.toFixed(2)}%" title="${esc(tip)}"><i class="se-h l" data-end="from"></i>${analog && w > 9 ? esc(s.value ?? "") : ""}<i class="se-h r" data-end="to"></i></span>`;
+  }).join("");
+}
+function seRefreshBars(analog) {
+  for (const el of $("props").querySelectorAll("[data-se-bar]")) {
+    const c = seCol(el.dataset.seBar);
+    if (c) el.innerHTML = seBar(c, analog);
+  }
+}
+/** The rows of the *Switching times* section. */
+function seRows(o, row) {
+  const st = seState(o);
+  if (!st) return null;
+  // The rest of the module claims them: changed there (a timer takes one schedule).
+  const other = claimsOf(o.uuid).find((c) => c.kind === "schedule" && !c.file.startsWith(`${S.edits?.dir}/`));
+  if (other) return { rows: [`<div class="ed-note">${esc(`${other.file}:${other.line}`)} claims its switching times: change them there.</div>`] };
+  const si = o.schedule, e = schedEdit(o.uuid), mine = SE.uuid === o.uuid ? SE : null, rows = [];
+  const live = liveStreaming() ? liveSchedule(si) : undefined, cmp = live ? schedCompare(si, live) : null;
+  const title = (u) => { const x = S.view?.objects[u]; return x ? displayTitle(x) : u; };
+  if (e?.set) {
+    rows.push(`<div class="ed-note">Written by vislox as <span class="mono">${esc(e.set)}</span> in ${esc(S.edits?.file || "")}${e.shared?.length ? `, shared with ${esc(e.shared.map(title).join(", "))}` : ""}.</div>`);
+  }
+  if (e?.pending) {
+    const back = e.deployed ? "Back to the switching times deployed" : "Back to Loxone Config's switching times";
+    rows.push(row("Switching times", `<span class="ed-v">edited here</span><span class="ed-tag" title="Saved into the module and compiled, not on the Miniserver yet: Apply deploys it, Discard drops it">not deployed</span>` +
+      `<button type="button" class="ed-btn small" data-se="revert" title="${esc(back)}">Revert</button>`, "pr-chg"));
+  }
+  // The Miniserver runs other switching times: edited in the app, or not applied yet. A save, once applied, replaces them.
+  if (cmp && !cmp.same) rows.push(`<div class="sch-note warn">⚠ The Miniserver runs other switching times (${esc(cmp.what)}), maybe changed in the app. Saving here and applying replaces them.</div>`);
+  if (!mine?.open) {
+    const sets = (S.edits?.schedule_sets || []).filter((x) => x.name !== e?.set && x.timers.length && !x.timers.includes(o.uuid));
+    rows.push(`<div class="ed-bar"><button type="button" class="ed-btn small" data-se="open">Edit switching times</button>` +
+      (sets.length ? `<label class="se-same">Use the same times as <select data-se="same"${mine?.busy ? " disabled" : ""}><option value="">…</option>${sets.map((x) => `<option value="${esc(x.name)}">${esc(x.timers.map(title).join(", "))}</option>`).join("")}</select></label>` : "") +
+      (mine?.msg || mine?.err ? `<span class="ed-msg${mine.err ? " err" : ""}" role="status">${esc(mine.err || mine.msg)}</span>` : "") + "</div>");
+    return { rows, count: e?.pending ? 1 : 0 };
+  }
+  const analog = si.analog, dis = mine.busy ? " disabled" : "";
+  const used = new Set(SE.cols.map((c) => c.uuid));
+  rows.push(`<div class="se" data-analog="${analog}"><div class="sch-axis"><span></span><span class="sch-hours"><i>0</i><i>6</i><i>12</i><i>18</i><i>24 h</i></span></div>` +
+    SE.cols.map((c) => {
+      const n = seName(c.uuid), week = SE_WEEK.includes(c.uuid);
+      return `<div class="se-row sch-row${SE.sel === c.uuid ? " sel" : ""}${mine.bad[c.uuid] ? " bad" : ""}"><button type="button" class="se-mode sch-mode lnk" data-se="pick" data-col="${esc(c.uuid)}" title="${esc(`${n.title} (${n.word} in Lox Logic)`)}" aria-pressed="${SE.sel === c.uuid}">${esc(n.title)}</button>` +
+        `<div class="se-cell"><div class="se-bar sch-bar" data-se-bar="${esc(c.uuid)}" title="Click to add an interval; drag one to move it, its ends to resize it">${seBar(c, analog)}</div>` +
+        (week ? "" : `<button type="button" class="se-x" data-se="dropcol" data-col="${esc(c.uuid)}" title="No column for this mode: on such a day the timer follows the weekday"${dis}>✕</button>`) + `</div></div>`;
+    }).join("") + `</div>`);
+  const extra = seModes().filter((u) => !used.has(u));
+  if (extra.length) rows.push(`<div class="ed-bar"><label class="se-same">Add a column for <select data-se="addcol"${dis}><option value="">…</option>${extra.map((u) => `<option value="${esc(u)}">${esc(seName(u).title)}</option>`).join("")}</select></label></div>`);
+  const c = seCol(SE.sel);
+  if (c) {
+    const n = seName(c.uuid);
+    const spans = c.spans.map((s, i) => {
+      const k = `${c.uuid}|${i}`;
+      const f = (end) => `<input class="num se-t" data-sch-field="${esc(k)}|${end}" value="${esc(hhmm(s[end]))}" aria-label="${end === "from" ? "From" : "To"}" placeholder="HH:MM" inputmode="numeric" autocomplete="off"${dis}>`;
+      return `<div class="se-iv${mine.bad[k] ? " bad" : ""}">${f("from")}<span>–</span>${f("to")}` +
+        (analog ? `<input class="num se-v" data-sch-field="${esc(k)}|value" value="${esc(s.value ?? "")}" aria-label="Value" placeholder="value" inputmode="decimal" autocomplete="off"${dis}>` : "") +
+        `<label class="se-act" title="It switches on only after a pulse on the timer's activation input (Loxone Config's 'Activation required')"><input type="checkbox" data-se="act" data-col="${esc(c.uuid)}" data-i="${i}"${s.activate ? " checked" : ""}${dis}> activate</label>` +
+        `<button type="button" class="ed-btn small" data-se="del" data-col="${esc(c.uuid)}" data-i="${i}" aria-label="Delete ${esc(hhmm(s.from))}–${esc(hhmm(s.to))}"${dis}>Delete</button>` +
+        (mine.bad[k] ? `<div class="ed-bad">${esc(mine.bad[k])}</div>` : "") + `</div>`;
+    }).join("");
+    const copy = Object.keys(SE_GROUPS).map((g) => `<button type="button" class="ed-btn small" data-se="copy" data-to="${g}"${dis}>${g === "daily" ? "Every day" : g === "weekdays" ? "Weekdays" : "Weekend"}</button>`).join("");
+    rows.push(`<div class="se-detail"><div class="se-dh">${esc(n.title)} <span class="none-v">${c.spans.length ? "" : "off all day"}</span></div>${spans}` +
+      `<div class="ed-bar"><button type="button" class="ed-btn small" data-se="add"${dis}>Add interval</button><span class="se-copy">Copy to ${copy}</span></div></div>`);
+  }
+  const others = Object.values(S.view?.objects || {}).filter((x) => x.ty === "DayTimer" && x.uuid !== o.uuid && x.schedule && x.schedule.analog === analog && x.status !== "removed");
+  if (others.length) rows.push(`<div class="ed-bar"><label class="se-same">Start from the times of <select data-se="copyfrom"${dis}><option value="">…</option>${others.map((x) => `<option value="${esc(x.uuid)}">${esc(displayTitle(x))}</option>`).join("")}</select></label></div>`);
+  if (e?.shared?.length) rows.push(`<label class="se-share"><input type="checkbox" data-se="shareall"${SE.shareAll ? " checked" : ""}${dis}> Change ${esc(e.shared.map(title).join(", "))} too: ${e.shared.length === 1 ? "it shares" : "they share"} these switching times (${esc(e.set)}). Off: this timer gets a set of its own.</label>`);
+  rows.push(`<div class="ed-bar"><button type="button" class="primary small" data-se="save"${dis}>${mine.busy ? "Compiling…" : "Save"}</button>` +
+    `<button type="button" class="ed-btn small" data-se="cancel"${dis}>Cancel</button>` +
+    `<span class="ed-msg${mine.err ? " err" : ""}" role="status" aria-live="polite">${esc(mine.err || mine.msg || "Saving writes a schedule set into the module and compiles it; nothing is deployed. The claim replaces the timer's whole schedule.")}</span></div>`);
+  return { rows, count: e?.pending ? 1 : 0 };
+}
+/** Check the draft as lox would: times, order, overlaps, values. Marks what is wrong; true when all is well. */
+function seCheck(analog) {
+  const bad = {};
+  for (const c of SE.cols) {
+    c.spans.forEach((s, i) => {
+      const k = `${c.uuid}|${i}`;
+      if (s.from == null || s.to == null) bad[k] = "A time of day, like 06:30 (24:00 ends the day).";
+      else if (s.from >= s.to) bad[k] = "It ends before it starts: split an interval across midnight into two.";
+      else if (analog && !EDIT_NUMBER.test((s.value ?? "").trim())) bad[k] = /,/.test(s.value || "") ? "Write a decimal point, not a comma." : "An analog timer needs a value, like 21.5.";
+    });
+    const v = c.spans.map((s, i) => [s, i]).filter(([s]) => s.from != null && s.to != null).sort((a, b) => a[0].from - b[0].from);
+    for (let j = 1; j < v.length; j++) if (v[j][0].from < v[j - 1][0].to) bad[`${c.uuid}|${v[j][1]}`] ??= `Overlaps ${hhmm(v[j - 1][0].from)}–${hhmm(v[j - 1][0].to)}.`;
+    if (Object.keys(bad).some((k) => k.startsWith(c.uuid + "|"))) bad[c.uuid] = true;
+  }
+  SE.bad = bad;
+  return !Object.keys(bad).length;
+}
+async function seSave() {
+  const o = S.view?.objects[SE.uuid], st = o && seState(o);
+  if (!st || SE.busy || !SE.open) return;
+  const analog = o.schedule.analog;
+  if (!seCheck(analog)) {
+    SE.err = "Fix the marked intervals.";
+    const bad = Object.keys(SE.bad).find((k) => k.includes("|"));
+    if (bad) SE.sel = bad.split("|")[0];
+    renderProps();
+    $("props").querySelector(".se-iv.bad input")?.focus();
+    return;
+  }
+  const modes = {};
+  for (const c of SE.cols) modes[c.uuid] = [...c.spans].sort((a, b) => a.from - b.from)
+    .map((s) => ({ from: s.from, to: s.to, ...(analog ? { value: s.value.trim() } : {}), ...(s.activate ? { activate: true } : {}) }));
+  const e = schedEdit(o.uuid);
+  const value = { modes, ...(e?.set && e.shared?.length && SE.shareAll ? { set: e.set } : {}) };
+  await seSend(o, st, { op: "schedule", uuid: o.uuid, value });
+}
+async function seSend(o, st, op, label) {
+  SE.uuid = o.uuid; SE.busy = true; SE.err = ""; SE.msg = ""; renderProps();
+  try {
+    const res = await editAct(st.rev.blob, [op], label);
+    Object.assign(SE, { open: false, cols: [], busy: false, bad: {}, err: "", msg: res.unchanged ? "Nothing changed." : "Saved and compiled: pending, not deployed. Review it, then Apply or Discard." });
+    await editShowNewest(res.blob);
+  } catch (err) {
+    SE.busy = false; SE.err = err.message;
+  }
+  renderProps();
+}
+/** Back to the deployed switching times: the set the deployed revision claimed, or no claim. */
+async function seRevert(uuid) {
+  const o = S.view?.objects[uuid], st = o && seState(o), e = schedEdit(uuid);
+  if (!st || !e) return;
+  await seSend(o, st, { op: "schedule", uuid, value: e.deployed ?? null }, `Revert the switching times of ${displayTitle(o)}`);
+}
+async function seSame(uuid, set) {
+  const o = S.view?.objects[uuid], st = o && seState(o);
+  if (!st || !set) return;
+  await seSend(o, st, { op: "schedule", uuid, value: { set } });
+}
+/** A free hour (or what is left of it) at minute `at` of column `c`, or null when `at` is inside an interval. */
+function seFree(c, at) {
+  if (c.spans.some((s) => s.from <= at && at < s.to)) return null;
+  const from = Math.min(at, 1380);
+  const next = Math.min(...c.spans.filter((s) => s.from >= from).map((s) => s.from), 1440);
+  const prev = Math.max(...c.spans.filter((s) => s.to <= from).map((s) => s.to), 0);
+  const f = Math.max(from, prev), t = Math.min(f + 60, next);
+  return t > f ? { from: f, to: t } : null;
+}
+function seAdd(c, at, analog) {
+  const free = seFree(c, at) ?? (() => { for (let m = 0; m < 1440; m += 60) { const f = seFree(c, m); if (f) return f; } return null; })();
+  if (!free) { SE.err = "This day has no free hour left."; return null; }
+  const last = c.spans.find((s) => s.value != null)?.value;
+  const s = { ...free, value: analog ? (last ?? "") : undefined, activate: false };
+  c.spans.push(s);
+  c.spans.sort((a, b) => a.from - b.from);
+  return s;
+}
+$("props").addEventListener("click", (e) => {
+  const b = e.target.closest("[data-se]");
+  if (!b || b.tagName === "SELECT" || b.type === "checkbox") return;
+  e.stopPropagation();
+  const o = S.view?.objects[S.sel], analog = !!o?.schedule?.analog, what = b.dataset.se;
+  if (what === "open") return seOpen(S.sel);
+  if (what === "cancel") return seClose();
+  if (what === "save") return seSave();
+  if (what === "revert") return seRevert(S.sel);
+  if (SE.busy || !SE.open) return;
+  const c = b.dataset.col ? seCol(b.dataset.col) : seCol(SE.sel);
+  if (what === "pick") SE.sel = b.dataset.col;
+  else if (what === "dropcol") { SE.cols = SE.cols.filter((x) => x.uuid !== b.dataset.col); if (SE.sel === b.dataset.col) SE.sel = SE_WEEK[0]; }
+  else if (what === "del" && c) c.spans.splice(+b.dataset.i, 1);
+  else if (what === "add" && c) seAdd(c, 360, analog);
+  else if (what === "copy" && c) for (const u of SE_GROUPS[b.dataset.to]) { const t = seCol(u); if (t && t !== c) t.spans = c.spans.map((s) => ({ ...s })); }
+  SE.bad = {}; SE.err = "";
+  renderProps();
+}, true);
+$("props").addEventListener("change", (e) => {
+  const t = e.target, what = t.dataset?.se;
+  if (!what) return;
+  const o = S.view?.objects[S.sel];
+  if (what === "same") return seSame(S.sel, t.value);
+  if (SE.busy || !SE.open || !o) return;
+  if (what === "act") { const c = seCol(t.dataset.col); if (c?.spans[+t.dataset.i]) c.spans[+t.dataset.i].activate = t.checked; }
+  else if (what === "shareall") SE.shareAll = t.checked;
+  else if (what === "addcol" && t.value) { SE.cols.push({ uuid: t.value, spans: [] }); SE.sel = t.value; }
+  else if (what === "copyfrom" && t.value) {
+    // Only timers of the same kind are offered: an analog one's values, or a digital one's on.
+    const from = S.view.objects[t.value]?.schedule;
+    if (from) { SE.cols = seDraft(from); if (!seCol(SE.sel)) SE.sel = SE_WEEK[0]; }
+  }
+  renderProps();
+});
+$("props").addEventListener("input", (e) => {
+  const f = e.target.closest?.("[data-sch-field]");
+  if (!f || !SE.open || SE.busy) return;
+  const [uuid, i, end] = f.dataset.schField.split("|");
+  const s = seCol(uuid)?.spans[+i];
+  if (!s) return;
+  if (end === "value") s.value = f.value;
+  else s[end] = seMin(f.value);
+  const ok = end === "value" || s[end] != null;
+  f.setAttribute("aria-invalid", ok ? "false" : "true");
+  seRefreshBars(!!S.view?.objects[SE.uuid]?.schedule?.analog);
+});
+$("props").addEventListener("keydown", (e) => {
+  if (!e.target.closest?.("[data-sch-field]")) return;
+  if (e.key === "Enter") { e.preventDefault(); e.stopPropagation(); seSave(); }
+  else if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); seClose(); }
+}, true);
+// Dragging on a bar: a segment moves, a handle resizes, the empty bar adds an hour there. Snapped to 15 minutes
+// (Alt: to the minute), never past the day or into the next interval.
+$("props").addEventListener("pointerdown", (e) => {
+  const bar = e.target.closest?.("[data-se-bar]");
+  if (!bar || !SE.open || SE.busy || e.button !== 0) return;
+  const c = seCol(bar.dataset.seBar), analog = !!S.view?.objects[SE.uuid]?.schedule?.analog;
+  if (!c) return;
+  e.preventDefault();
+  const rect = bar.getBoundingClientRect();
+  const at = (x, alt) => { const m = Math.round(((x - rect.left) / rect.width) * 1440); const q = alt ? 1 : 15; return Math.max(0, Math.min(1440, Math.round(m / q) * q)); };
+  const seg = e.target.closest(".se-seg");
+  let s, mode;
+  if (seg) { s = c.spans[+seg.dataset.i]; mode = e.target.closest(".se-h")?.dataset.end || "move"; }
+  else { s = seAdd(c, Math.min(at(e.clientX, e.altKey), 1439), analog); mode = "new"; if (!s) { renderProps(); return; } }
+  SE.sel = c.uuid;
+  const start = at(e.clientX, e.altKey), orig = { from: s.from, to: s.to };
+  const others = c.spans.filter((x) => x !== s);
+  const lo = Math.max(0, ...others.filter((x) => x.to <= orig.from).map((x) => x.to));
+  const hi = Math.min(1440, ...others.filter((x) => x.from >= orig.to).map((x) => x.from));
+  const move = (ev) => {
+    const d = at(ev.clientX, ev.altKey) - start;
+    if (mode === "move") { const len = orig.to - orig.from; s.from = Math.max(lo, Math.min(hi - len, orig.from + d)); s.to = s.from + len; }
+    else if (mode === "from") s.from = Math.max(lo, Math.min(s.to - 1, orig.from + d));
+    // A new interval ends where the pointer is, once it moved.
+    else if (mode === "new") { if (d) s.to = Math.min(hi, Math.max(s.from + 1, at(ev.clientX, ev.altKey))); }
+    else s.to = Math.min(hi, Math.max(s.from + 1, orig.to + d));
+    seRefreshBars(analog);
+  };
+  const up = () => { window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", up); SE.bad = {}; renderProps(); };
+  window.addEventListener("pointermove", move);
+  window.addEventListener("pointerup", up);
+});
+
 // ── adopting blocks (#72) ──────────────────────────────────────────────
 // `lox logic adopt` puts a block Loxone Config drew under the module: its declaration goes into vislox's
 // file of the page, it keeps its UUIDs, and the config stays exactly as it is (the server checks). It is
@@ -3445,6 +3762,7 @@ function undoLabel(ops) {
   if (ops.length === 1 && op.op === "adopt") return op.blocks.length === 1 ? `Adopt ${obj(op.blocks[0].uuid)}` : `Adopt ${plural(op.blocks.length, "block")}`;
   if (ops.length === 1 && op.op === "adopt_page") return `Adopt the blocks of ${S.pageOf?.get(op.page)?.title || "the page"}`;
   if (ops.length === 1 && op.op === "unadopt") return op.uuids.length === 1 ? `Hand ${obj(op.uuids[0])} back to Loxone Config` : `Hand ${plural(op.uuids.length, "block")} back to Loxone Config`;
+  if (ops.length === 1 && op.op === "schedule") return `Switching times of ${obj(op.uuid)}${op.value == null ? ": Loxone Config's" : op.value.modes ? "" : ": shared set"}`;
   if (ops.length === 1 && op.op === "wire") return `Wire ${wire(op)}`;
   if (ops.length === 1 && op.op === "unwire") return `Delete wire ${wire(op)}`;
   if (ops.length === 2 && op.op === "unwire" && ops[1].op === "wire") return `Reconnect ${wire(op)} to ${end(sameEnd(op.from, ops[1].from) ? ops[1].to : ops[1].from)}`;

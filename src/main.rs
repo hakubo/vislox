@@ -29,6 +29,7 @@ mod rights;
 mod rollback;
 mod route;
 mod running;
+mod sched_edit;
 mod schedule;
 mod session;
 mod source;

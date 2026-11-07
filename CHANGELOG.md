@@ -72,6 +72,18 @@ published under the same version (see [docker/README.md](docker/README.md)).
   read, a lox without `logic scan`, an answer vislox cannot read, or a branch without an upstream push nothing. A failed `git push` offers *Push
   to git* too, and so do commits not pushed when vislox starts. A project that tracks a real base config is
   blocked until the base is git-ignored.
+- Edit a Daytimer's switching times (#73): *Switching times* in Properties of a DayTimer opens an editor with a
+  day bar per operating mode (the seven weekdays, and the holiday, vacation, day off, heating, cooling and the
+  config's own modes it adds): click the bar to add an interval, drag it to move it, its ends to resize it (15
+  minutes, Alt: one), and type exact times, a value on an analog timer and *activate* below; *Copy to* weekdays,
+  weekend or every day. *Save* sends the new op `schedule` (columns by their mode's UUID), which writes a Lox
+  Logic `schedule vx_… end` set and the timer's `.schedule` claim into `<module>/vislox/edits.loxl`, grouped into
+  `daily`, `weekdays` and `weekend` lines, and compiles; the compile must write exactly those switching times onto
+  the timer. Several timers share a set (*Use the same times as …*, and *Change … too* when editing one of them);
+  Revert, Undo and Discard drop the claim. Checked before lox sees it: whole minutes, `24:00` ends a day, no
+  overlap, no wrap past midnight, a value on each interval of an analog timer and none on a digital one, one
+  schedule per timer (a claim of the module's own file is named instead). A Miniserver that runs other switching
+  times (changed in the app) is named in the editor: the save, once applied, replaces them. Never deploys.
 - Fixed: Discard failed when the last commit had no lockfile (the first compile writes one), or one was staged
   but not committed. Discard now reads the last commit, never deletes a lock vislox did not write (one not in git
   goes back to how it was before vislox's first edit), and puts everything back when a step fails.

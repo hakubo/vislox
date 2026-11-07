@@ -360,6 +360,21 @@ sends to the Miniserver see [miniserver.md](miniserver.md).
   here, an extern of the module's own files), and *Hand back* why it is off. How:
   [editing.md](editing.md#adopting-blocks-72).
 
+- **Switching times** (the same project and token, #73): Properties of a DayTimer has *Switching times* with *Edit
+  switching times*: a day bar per operating mode, the seven weekdays first, then the timer's other modes (*Add a
+  column for* holiday, vacation, day off, heating or cooling period, or one of the config's own modes; ✕ takes one
+  out). Click an empty bar to add an hour there and drag to its end; drag an interval to move it, an end to resize
+  it (snapped to 15 minutes; Alt: to the minute). Below, the selected mode's intervals take exact times
+  (`24:00` ends the day), a value on an analog timer, *activate* (the output switches on only after a pulse on the
+  timer's activation input) and *Delete*; *Copy to* puts them on the weekdays, the weekend or every day, and
+  *Start from the times of* another timer fills the editor with its. *Save* writes a Lox Logic `schedule` set and
+  the timer's claim into vislox's file of the module and compiles: the claim replaces the timer's whole schedule,
+  so a weekday left empty is off all day. *Use the same times as …* lets several timers share one set; editing one
+  of them asks whether the others change too. While live values come in, a Miniserver that runs other switching
+  times (changed in the app) is named before you save: Apply would replace them. Saved and not deployed, the
+  section says so, with *Revert*. A timer the module's own file claims is changed there. How:
+  [editing.md](editing.md#switching-times-73).
+
 For a `lox.toml` project:
 
 ```bash

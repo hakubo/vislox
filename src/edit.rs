@@ -124,6 +124,14 @@ pub enum Op {
     /// entries go, and Loxone Config owns them again, as the base has them.
     /// Its `previous` is the `adopt` with the same slugs.
     Unadopt { uuids: Vec<String> },
+    /// The switching times of the DayTimer `uuid` (#73): a `schedule` set
+    /// and the timer's `.schedule` claim in [`FILE`] ([`crate::sched_edit`]).
+    /// `None` drops vislox's claim: the timer is as the base has it. Its
+    /// `previous` is the `schedule` op with what the timer claimed before.
+    Schedule {
+        uuid: String,
+        value: Option<crate::sched_edit::Sched>,
+    },
 }
 
 /// Where a `place` puts one block: its top left corner, as `move` takes it.
@@ -144,7 +152,8 @@ impl Op {
             | Op::Param { uuid, .. }
             | Op::Setting { uuid, .. }
             | Op::RemoveBlock { uuid }
-            | Op::Move { uuid, .. } => Some(uuid),
+            | Op::Move { uuid, .. }
+            | Op::Schedule { uuid, .. } => Some(uuid),
             Op::AddBlock { .. }
             | Op::Relayout { .. }
             | Op::Place { .. }
@@ -173,7 +182,8 @@ impl Op {
             | Op::Unwire { .. }
             | Op::Adopt { .. }
             | Op::AdoptPage { .. }
-            | Op::Unadopt { .. } => None,
+            | Op::Unadopt { .. }
+            | Op::Schedule { .. } => None,
         }
     }
 
@@ -195,7 +205,8 @@ impl Op {
             | Op::Unwire { .. }
             | Op::Adopt { .. }
             | Op::AdoptPage { .. }
-            | Op::Unadopt { .. } => {}
+            | Op::Unadopt { .. }
+            | Op::Schedule { .. } => {}
         }
         op
     }
@@ -420,7 +431,12 @@ pub fn caps(el: &Element) -> Option<Caps> {
 
 /// What [`FILE`] claims, by object UUID, and the wires it draws (#61).
 #[derive(Default, Clone, PartialEq, Debug)]
-pub struct Claims(pub BTreeMap<String, Claim>, pub BTreeSet<Wire>);
+pub struct Claims(
+    pub BTreeMap<String, Claim>,
+    pub BTreeSet<Wire>,
+    /// The switching times it writes (#73).
+    pub crate::sched_edit::Scheds,
+);
 
 /// A wire vislox draws: `to.port <- from.port`, each end a slug (an
 /// extern of [`FILE`] or a block vislox added) and a Lox Logic port name.
@@ -572,8 +588,30 @@ impl Claims {
                         .attrs
                         .insert(which, plain(&a.value));
                 }
+                Item::Schedule(s) if s.name.starts_with(SLUG_PREFIX) => {
+                    if c.2.sets.contains_key(&s.name) {
+                        return Err(foreign(&format!("a second `schedule {}`", s.name)));
+                    }
+                    c.2.sets
+                        .insert(s.name.clone(), s.lines().cloned().collect());
+                }
+                Item::ScheduleClaim(sc) if sc.slug.starts_with(SLUG_PREFIX) => {
+                    if c.2
+                        .claims
+                        .insert(sc.slug.clone(), sc.schedule.clone())
+                        .is_some()
+                    {
+                        return Err(foreign(&format!("a second `{}.schedule`", sc.slug)));
+                    }
+                }
                 Item::Gap | Item::FragmentEnd | Item::Comment(_) => {}
                 _ => return Err(foreign("a statement")),
+            }
+        }
+        // A claim names one of the file's sets.
+        for (t, set) in &c.2.claims {
+            if !c.2.sets.contains_key(set) {
+                return Err(foreign(&format!("`{t}.schedule = {set}` without its set")));
             }
         }
         // A wire's ends are vislox's: its externs, or the blocks it added.
@@ -592,11 +630,20 @@ impl Claims {
         self.1.iter().any(|w| w.touches(slug))
     }
 
-    /// Drop the externs that claim nothing and no wire ends at.
-    fn prune(&mut self) {
-        let wires = self.1.clone();
-        self.0
-            .retain(|u, c| !c.is_empty() || wires.iter().any(|w| w.touches(&slug(u))));
+    /// Whether a wire ends at `slug`, or a schedule claim (#73) names it.
+    fn named(&self, slug: &str) -> bool {
+        self.wired(slug) || self.2.claims.contains_key(slug)
+    }
+
+    /// Drop the externs that claim nothing and no wire or schedule claim names.
+    pub(crate) fn prune(&mut self) {
+        let keep: BTreeSet<String> = self
+            .0
+            .keys()
+            .filter(|u| self.named(&slug(u)))
+            .cloned()
+            .collect();
+        self.0.retain(|u, c| !c.is_empty() || keep.contains(u));
     }
 
     /// The file's text: a header, then each object's extern and its values.
@@ -607,7 +654,7 @@ impl Claims {
         );
         for (uuid, c) in &self.0 {
             let s = slug(uuid);
-            if c.is_empty() && !self.wired(&s) {
+            if c.is_empty() && !self.named(&s) {
                 continue;
             }
             out.push_str(&format!(
@@ -622,6 +669,7 @@ impl Claims {
                 out.push_str(&format!("{s}.{k} = {v}\n"));
             }
         }
+        out.push_str(&self.2.render());
         if !self.1.is_empty() {
             out.push_str("\n# Wires drawn in vislox. Deleting a line takes the wire out again.\n");
         }
@@ -650,7 +698,8 @@ impl Claims {
             | Op::Unwire { .. }
             | Op::Adopt { .. }
             | Op::AdoptPage { .. }
-            | Op::Unadopt { .. } => None,
+            | Op::Unadopt { .. }
+            | Op::Schedule { .. } => None,
         }
     }
 
@@ -707,7 +756,7 @@ fn titled(el: &Element, ty: &str, title: &str) -> usize {
 
 /// Whether `s` is a plain decimal number (`-2.5`), the only spelling lox
 /// writes into `Def=` unchanged.
-fn number(s: &str) -> Result<String, String> {
+pub(crate) fn number(s: &str) -> Result<String, String> {
     let n = s.trim();
     let digits = |p: &str| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit());
     let body = n.strip_prefix('-').unwrap_or(n);
@@ -750,7 +799,12 @@ pub fn apply(
 ) -> Result<Option<String>, String> {
     let uuid = op
         .uuid()
-        .filter(|_| !matches!(op, Op::RemoveBlock { .. } | Op::Move { .. }))
+        .filter(|_| {
+            !matches!(
+                op,
+                Op::RemoveBlock { .. } | Op::Move { .. } | Op::Schedule { .. }
+            )
+        })
         .ok_or_else(|| "not a value".to_string())?;
     let el = find(&doc.xml.root, uuid)
         .ok_or_else(|| format!("no object {uuid} in the pending config"))?;
@@ -846,7 +900,8 @@ pub fn apply(
         | Op::Unwire { .. }
         | Op::Adopt { .. }
         | Op::AdoptPage { .. }
-        | Op::Unadopt { .. } => {
+        | Op::Unadopt { .. }
+        | Op::Schedule { .. } => {
             unreachable!("not a value")
         }
     };
@@ -1043,6 +1098,16 @@ impl Files {
                 }
             }
         }
+        // A schedule claim (#73) names an extern of the claims file or a
+        // block of vislox's files.
+        for t in f.claims.2.claims.keys() {
+            if !f.claims.0.keys().any(|u| slug(u) == *t) && f.block(t).is_none() {
+                return Err(format!(
+                    "{CLAIMS}: `{t}.schedule` names `{t}`, which is neither an extern of this file \
+                     nor a block vislox added; put its line back or delete the claim"
+                ));
+            }
+        }
         // Every end of a wire is an extern of the claims file or a block
         // vislox added; anything else would break every compile.
         for w in &f.claims.1 {
@@ -1085,6 +1150,7 @@ impl Files {
         let mut out = BTreeMap::new();
         if !self.claims.0.values().all(Claim::is_empty)
             || !self.claims.1.is_empty()
+            || !self.claims.2.is_empty()
             || self.present.contains(CLAIMS)
         {
             out.insert(CLAIMS.to_string(), self.claims.render());
@@ -1276,6 +1342,9 @@ pub struct Ctx<'a> {
     pub adoptions: &'a BTreeMap<String, crate::adopt::Adoption>,
     /// For each `adopt_page`, the blocks it adopts, by page UUID.
     pub page_adoptions: &'a BTreeMap<String, Vec<String>>,
+    /// The timers whose switching times the rest of the module claims
+    /// (#73): UUID (lowercase) → the claim's `file:line`.
+    pub sched_claimed: &'a BTreeMap<String, String>,
 }
 
 /// What [`apply_op`] did: the value or op that undoes it (`previous`),
@@ -1313,6 +1382,7 @@ pub fn apply_op(files: &mut Files, ctx: &Ctx, op: &Op) -> Result<Applied, String
             adopt(files, ctx, uuids)
         }
         Op::Unadopt { uuids } => unadopt(files, ctx, uuids),
+        Op::Schedule { uuid, value } => crate::sched_edit::apply(files, ctx, uuid, value.as_ref()),
         _ => {
             let uuid = op.uuid().unwrap_or_default();
             match ctx.lock.slug_of(uuid) {
@@ -1373,6 +1443,10 @@ pub fn undo_ops(
             | Op::Adopt { .. }
             | Op::AdoptPage { .. }
             | Op::Unadopt { .. } => undo.push(serde_json::from_value(prev).map_err(bad)?),
+            Op::Schedule { uuid, .. } => undo.push(Op::Schedule {
+                uuid: uuid.clone(),
+                value: serde_json::from_value(prev).map_err(bad)?,
+            }),
             _ => undo.push(op.with_value(serde_json::from_value(prev).map_err(bad)?)),
         }
     }
@@ -1562,6 +1636,12 @@ fn remove_block(files: &mut Files, ctx: &Ctx, uuid: &str) -> Result<Applied, Str
         }
         None => return Err(format!("{name}: only a block added here can be taken out")),
     };
+    if files.claims.2.claims.contains_key(&slug) {
+        return Err(format!(
+            "{name}: vislox's file claims its switching times; take them out first (Revert them, \
+             or undo the edit)"
+        ));
+    }
     if ctx
         .deployed
         .is_some_and(|d| find(&d.xml.root, uuid).is_some())
@@ -1743,6 +1823,13 @@ fn unadopt(files: &mut Files, ctx: &Ctx, uuids: &[String]) -> Result<Applied, St
             return Err(format!(
                 "{} has changes here that the base does not have (values, wires or its place): \
                  revert them first, then hand it back to Loxone Config",
+                name(u)
+            ));
+        }
+        if files.claims.2.claims.contains_key(s) {
+            return Err(format!(
+                "{}: vislox's file claims its switching times; revert them first, then hand it \
+                 back to Loxone Config",
                 name(u)
             ));
         }
@@ -2783,6 +2870,11 @@ pub fn module_decls(module: &Path) -> (BTreeSet<String>, BTreeSet<String>) {
             Item::Block(b) | Item::Instance(b) => names.insert(b.slug.clone()),
             Item::Extern(e) => names.insert(e.slug.clone()),
             Item::Signal(s) => names.insert(s.slug.clone()),
+            // The sets share the namespace (#73 picks a set's name).
+            Item::Schedule(s) => names.insert(s.name.clone()),
+            Item::Tiles(s) => names.insert(s.name.clone()),
+            Item::Moods(s) => names.insert(s.name.clone()),
+            Item::Access(s) => names.insert(s.name.clone()),
             Item::Let(l) => {
                 lets.insert(l.name.clone());
                 names.insert(l.name.clone())
@@ -2854,7 +2946,8 @@ pub fn current(doc: &LoxoneDoc, op: &Op) -> Option<String> {
         | Op::Unwire { .. }
         | Op::Adopt { .. }
         | Op::AdoptPage { .. }
-        | Op::Unadopt { .. } => None,
+        | Op::Unadopt { .. }
+        | Op::Schedule { .. } => None,
     }
 }
 
@@ -3340,6 +3433,7 @@ mod tests {
                 drawn: &Default::default(),
                 adoptions: &Default::default(),
                 page_adoptions: &Default::default(),
+                sched_claimed: &Default::default(),
             };
             apply_op(&mut files, &ctx, &add(EG, t, None, &[], &[])).unwrap();
             let mut l = Lockfile::default();
@@ -3372,6 +3466,7 @@ mod tests {
             drawn: &Default::default(),
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
+            sched_claimed: &Default::default(),
         };
         let a = apply_op(
             &mut files,
@@ -3440,6 +3535,7 @@ mod tests {
             drawn: &Default::default(),
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
+            sched_claimed: &Default::default(),
         };
         let title = Op::Title {
             uuid: mono.clone(),
@@ -3502,6 +3598,7 @@ mod tests {
             drawn: &Default::default(),
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
+            sched_claimed: &Default::default(),
         };
         let r = apply_op(&mut files, &ctx, &Op::RemoveBlock { uuid: mono.clone() }).unwrap();
         // It names the block it adds again (#62): lox mints new UUIDs for it.
@@ -3528,6 +3625,7 @@ mod tests {
             drawn: &Default::default(),
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
+            sched_claimed: &Default::default(),
         };
         let e = apply_op(&mut files, &ctx, &Op::RemoveBlock { uuid: pulse }).unwrap_err();
         assert!(e.contains("is deployed"), "{e}");
@@ -3551,6 +3649,7 @@ mod tests {
             drawn: &Default::default(),
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
+            sched_claimed: &Default::default(),
         };
         apply_op(&mut files, &ctx, &add(OG, "And", Some("Licht"), &[], &[])).unwrap();
         let text = files.render()["obergeschoss.loxl"].clone();
@@ -3582,6 +3681,7 @@ mod tests {
             drawn: &Default::default(),
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
+            sched_claimed: &Default::default(),
         };
         apply_op(&mut files, &ctx, &add(OG, "Or", None, &[], &[])).unwrap();
         let r = files.render();
@@ -3615,6 +3715,7 @@ mod tests {
             drawn: &Default::default(),
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
+            sched_claimed: &Default::default(),
         };
         for s in ["vx_and_1", "vx_or_1"] {
             let uuid = l.objects[s].uuid.clone();
@@ -3640,6 +3741,7 @@ mod tests {
             drawn: &Default::default(),
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
+            sched_claimed: &Default::default(),
         };
         let mut files = Files::default();
         let err = |op: Op| apply_op(&mut files.clone(), &ctx, &op).unwrap_err();
@@ -3674,6 +3776,7 @@ mod tests {
             drawn: &Default::default(),
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
+            sched_claimed: &Default::default(),
         };
         let e = apply_op(&mut Files::default(), &ctx, &add(OG, "And", None, &[], &[])).unwrap_err();
         assert!(e.contains("2 pages are titled"), "{e}");
@@ -3723,6 +3826,7 @@ mod tests {
             drawn: &Default::default(),
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
+            sched_claimed: &Default::default(),
         };
         apply_op(&mut files, &ctx, &add(OG, "And", Some("Licht"), &[], &[])).unwrap();
         // Deployed: the base draws it where lox placed it.
@@ -3740,6 +3844,7 @@ mod tests {
             drawn: &Default::default(),
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
+            sched_claimed: &Default::default(),
         };
         // Snapped to the grid, the size kept; `previous` moves it back.
         let mut files = Files::from_texts(&files.render()).unwrap();
@@ -3822,6 +3927,7 @@ mod tests {
             drawn: &Default::default(),
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
+            sched_claimed: &Default::default(),
         };
         apply_op(&mut files, &ctx, &add(OG, "And", None, &[], &[])).unwrap();
         apply_op(&mut files, &ctx, &add(OG, "Or", None, &[], &[])).unwrap();
@@ -3836,6 +3942,7 @@ mod tests {
             drawn: &Default::default(),
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
+            sched_claimed: &Default::default(),
         };
         let err = |op: Op| apply_op(&mut files.clone(), &ctx, &op).unwrap_err();
         // Drawn in Loxone Config: lox does not move it.
@@ -3942,6 +4049,7 @@ mod tests {
             drawn: &Default::default(),
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
+            sched_claimed: &Default::default(),
         };
         apply_op(&mut files, &ctx, &add(OG, "And", None, &[], &[])).unwrap();
         let out = compile_files(&d, &files, &mut l).unwrap();
@@ -3966,6 +4074,7 @@ mod tests {
                 drawn: &Default::default(),
                 adoptions: &Default::default(),
                 page_adoptions: &Default::default(),
+                sched_claimed: &Default::default(),
             };
             files.layout = Placement::default();
             apply_op(
@@ -4036,6 +4145,7 @@ mod tests {
             drawn: &Default::default(),
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
+            sched_claimed: &Default::default(),
         };
         apply_op(&mut files, &ctx, &add(OG, "And", None, &[], &[])).unwrap();
         apply_op(&mut files, &ctx, &add(EG, "Or", None, &[], &[])).unwrap();
@@ -4089,6 +4199,7 @@ mod tests {
             drawn: &Default::default(),
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
+            sched_claimed: &Default::default(),
         };
         apply_op(&mut files, &ctx, &add(OG, "And", None, &[], &[])).unwrap();
         let out = compile_files(&d, &files, &mut l).unwrap();
@@ -4177,6 +4288,7 @@ mod tests {
             drawn: &Default::default(),
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
+            sched_claimed: &Default::default(),
         };
         // The Divide block's output onto the upper floor's OR: another page.
         let w = wire_op((DIV, "AQ"), (OR, "I2"));
@@ -4222,6 +4334,7 @@ mod tests {
             drawn: &drawn,
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
+            sched_claimed: &Default::default(),
         };
         // One request may take a wire out and draw it again (an undo and a
         // redo, a reconnect to the same port): the ops see each other.
@@ -4259,6 +4372,7 @@ mod tests {
             drawn: &Default::default(),
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
+            sched_claimed: &Default::default(),
         };
         let err = |op: Op| apply_op(&mut Files::default(), &ctx, &op).unwrap_err();
         assert!(err(wire_op((DIV, "Input2"), (OR, "I2"))).contains("is an input"));
@@ -4307,6 +4421,7 @@ mod tests {
             drawn: &Default::default(),
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
+            sched_claimed: &Default::default(),
         };
         let e = apply_op(
             &mut Files::default(),
@@ -4342,6 +4457,7 @@ mod tests {
             drawn: &Default::default(),
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
+            sched_claimed: &Default::default(),
         };
         let e = apply_op(
             &mut Files::default(),
@@ -4380,6 +4496,7 @@ mod tests {
             drawn: &Default::default(),
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
+            sched_claimed: &Default::default(),
         };
         apply_op(&mut files, &ctx, &add(OG, "And", None, &[("I2", "1")], &[])).unwrap();
         let out = compile_files(&d, &files, &mut l).unwrap();
@@ -4394,6 +4511,7 @@ mod tests {
             drawn: &Default::default(),
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
+            sched_claimed: &Default::default(),
         };
         // Its input with a constant takes no wire; the other does.
         let e = apply_op(&mut files, &ctx, &wire_op((DIV, "AQ"), (&new, "I2"))).unwrap_err();
@@ -4429,6 +4547,7 @@ mod tests {
             drawn: &Default::default(),
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
+            sched_claimed: &Default::default(),
         };
         let undo = apply_op(&mut files, &ctx, &Op::RemoveBlock { uuid: new.clone() })
             .unwrap()
@@ -4466,6 +4585,7 @@ mod tests {
             drawn: &Default::default(),
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
+            sched_claimed: &Default::default(),
         };
         let a = apply_op(&mut files, &ctx, &undo).unwrap();
         let slug2 = a.added.unwrap();
@@ -4556,6 +4676,7 @@ mod tests {
             drawn: &Default::default(),
             adoptions: &adoptions,
             page_adoptions: &pages,
+            sched_claimed: &Default::default(),
         };
         let back = |f: &mut Files, u: &str| {
             apply_op(
@@ -4601,5 +4722,322 @@ mod tests {
         assert!(!out["eg.loxl"].contains("vx_b"), "{out:?}");
         // Everything the files say still reads back.
         Files::from_texts(&out).unwrap();
+    }
+
+    /// An interval in a test: from, to, value.
+    type Sp = (u32, u32, Option<&'static str>);
+
+    const UHR: &str = "10000020-0000-0200-ffff504f94000001";
+    const HEIZ: &str = "10000021-0000-0210-ffff504f94000001";
+    const LICHT: &str = "10000022-0000-0220-ffff504f94000001";
+    const PARTY: &str = "10000011-0000-0110-ffff504f94000001";
+
+    /// The fixture with three Daytimers on the upper floor: Uhr and Heizung
+    /// (analog; Uhr with a Monday and a Party column), Licht (digital).
+    fn timers() -> LoxoneDoc {
+        let p = format!("{}/tests/fixtures/house.Loxone", env!("CARGO_MANIFEST_DIR"));
+        let mut s = std::fs::read_to_string(p).unwrap();
+        let timer = |u: &str, n: u32, title: &str, analog: bool, modes: &str, body: &str| {
+            format!(
+                "\t\t\t<C Type=\"DayTimer\" V=\"178\" U=\"{u}\" Title=\"{title}\" Px=\"960\" Py=\"{}\" \
+                 Px2=\"3648\" Py2=\"{}\" Nio=\"2\" WF=\"16384\"{}{}>\
+                 <Co K=\"Mode\" U=\"{}\"/><Co K=\"AQ\" U=\"{}\"/>{body}</C>\n",
+                4800 + 960 * n,
+                5600 + 960 * n,
+                if analog {
+                    " Analog=\"true\" DefValue=\"18\""
+                } else {
+                    ""
+                },
+                if modes.is_empty() {
+                    String::new()
+                } else {
+                    format!(" Modes=\"{modes}\"")
+                },
+                u.replacen("0-ffff", "1-00ff", 1),
+                u.replacen("0-ffff", "2-01ff", 1),
+            )
+        };
+        let all = timer(
+            UHR,
+            0,
+            "Uhr",
+            true,
+            &format!("00000000-0000-0004-1500000000000000,{PARTY}"),
+            "<Entry From=\"390\" To=\"480\" V=\"21\"/><Entry From=\"1080\" To=\"1380\" Ix=\"1\" V=\"22.5\"/>",
+        ) + &timer(HEIZ, 1, "Heizung", true, "", "")
+            + &timer(LICHT, 2, "Licht", false, "", "");
+        let end = "\n\t\t</C>\n\t</C>\n</ControlList>";
+        let at = s.rfind(end).expect("end of the upper floor");
+        s.insert_str(at + 1, &all);
+        LoxoneDoc::parse(s.as_bytes()).unwrap()
+    }
+
+    fn sched(set: Option<&str>, cols: &[(&str, &[Sp])]) -> Option<crate::sched_edit::Sched> {
+        Some(crate::sched_edit::Sched {
+            set: set.map(Into::into),
+            modes: (!cols.is_empty()).then(|| {
+                cols.iter()
+                    .map(|(u, spans)| {
+                        let v = spans
+                            .iter()
+                            .map(|(from, to, value)| crate::sched_edit::Span {
+                                from: *from,
+                                to: *to,
+                                value: value.map(Into::into),
+                                activate: false,
+                            })
+                            .collect();
+                        (u.to_string(), v)
+                    })
+                    .collect()
+            }),
+        })
+    }
+
+    fn entries(doc: &LoxoneDoc, uuid: &str) -> Vec<(u32, u32, f64)> {
+        let t = crate::schedule::read(find(&doc.xml.root, uuid).unwrap(), uuid, |_| None).unwrap();
+        let mut v: Vec<_> = t.entries.iter().map(|e| (e.from, e.to, e.value)).collect();
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        v
+    }
+
+    #[test]
+    fn switching_times_are_a_schedule_set_lox_writes_onto_the_timer() {
+        use crate::sched_edit::builtin_uuid;
+        let d = timers();
+        let names = BTreeSet::new();
+        let mut files = Files::default();
+        let mut l = Lockfile::default();
+        let lock = lock_of(&l);
+        let claimed = BTreeMap::new();
+        let ctx = Ctx {
+            doc: &d,
+            lock: &lock,
+            base: &d,
+            deployed: None,
+            names: &names,
+            drawn: &Default::default(),
+            adoptions: &Default::default(),
+            page_adoptions: &Default::default(),
+            sched_claimed: &claimed,
+        };
+        let (mon, sat, hol) = (builtin_uuid(4), builtin_uuid(9), builtin_uuid(1));
+        let wk: Vec<(String, Vec<Sp>)> = (4..=8)
+            .map(|n| {
+                (
+                    builtin_uuid(n),
+                    vec![(360, 480, Some("21.5")), (1020, 1350, Some("21.5"))],
+                )
+            })
+            .collect();
+        let mut cols: Vec<(&str, &[Sp])> =
+            wk.iter().map(|(u, v)| (u.as_str(), v.as_slice())).collect();
+        let we = [(480, 1380, Some("20"))];
+        cols.push((&sat, &we));
+        let sun = builtin_uuid(10);
+        cols.push((&sun, &we));
+        cols.push((&hol, &[]));
+        let party = [(1080, 1440, Some("23"))];
+        cols.push((PARTY, &party));
+        let op = Op::Schedule {
+            uuid: UHR.into(),
+            value: sched(None, &cols),
+        };
+        let a = apply_op(&mut files, &ctx, &op).unwrap();
+        assert_eq!(a.previous, serde_json::Value::Null);
+        let text = &files.render()["edits.loxl"];
+        let s = slug(UHR);
+        for want in [
+            format!("extern {s} = DayTimer(uuid: \"{UHR}\")\n"),
+            "schedule vx_uhr_schedule\n\tweekdays 06:00-08:00 = 21.5, 17:00-22:30 = 21.5\n\
+             \tweekend 08:00-23:00 = 20\n\tholiday off\n\t\"Party\" 18:00-24:00 = 23\nend\n"
+                .to_string(),
+            format!("{s}.schedule = vx_uhr_schedule\n"),
+        ] {
+            assert!(text.contains(&want), "{want} in\n{text}");
+        }
+        // Read back as written.
+        assert_eq!(
+            Files::from_texts(&files.render()).unwrap().claims,
+            files.claims
+        );
+        let out = compile_files(&d, &files, &mut l).unwrap();
+        let e = entries(&out, UHR);
+        assert!(
+            e.contains(&(360, 480, 21.5)) && e.contains(&(1080, 1440, 23.0)),
+            "{e:?}"
+        );
+        assert_eq!(e.len(), 5 * 2 + 2 + 1);
+        assert!(crate::sched_edit::missed(&files, &out, &lock, &[UHR.into()]).is_empty());
+        assert!(crate::sched_edit::differs(&out, &d, UHR));
+
+        // Changed again: its own set is rewritten, and the previous is what it claimed.
+        let ctx2 = Ctx { doc: &out, ..ctx };
+        let op2 = Op::Schedule {
+            uuid: UHR.into(),
+            value: sched(None, &[(&mon, &[(0, 60, Some("5"))])]),
+        };
+        let a2 = apply_op(&mut files, &ctx2, &op2).unwrap();
+        let prev: Option<crate::sched_edit::Sched> =
+            serde_json::from_value(a2.previous.clone()).unwrap();
+        let prev = prev.unwrap();
+        assert_eq!(prev.set.as_deref(), Some("vx_uhr_schedule"));
+        assert_eq!(prev.modes.as_ref().unwrap()[&mon].len(), 2);
+        assert_eq!(prev.modes.as_ref().unwrap()[PARTY][0].to, 1440);
+        assert_eq!(files.claims.2.sets.len(), 1);
+        let undo = undo_ops(std::slice::from_ref(&op2), &[a2.previous], &[]).unwrap();
+        assert_eq!(
+            undo,
+            [Op::Schedule {
+                uuid: UHR.into(),
+                value: Some(prev)
+            }]
+        );
+
+        // Heizung shares Uhr's set (Use the same times as …); Licht is digital and may not.
+        let share = Op::Schedule {
+            uuid: HEIZ.into(),
+            value: sched(Some("vx_uhr_schedule"), &[]),
+        };
+        apply_op(&mut files, &ctx2, &share).unwrap();
+        let e = apply_op(
+            &mut files.clone(),
+            &ctx2,
+            &Op::Schedule {
+                uuid: LICHT.into(),
+                value: sched(Some("vx_uhr_schedule"), &[]),
+            },
+        )
+        .unwrap_err();
+        assert!(e.contains("Licht is digital"), "{e}");
+        // Heizung on its own: a new set, Uhr's stays.
+        apply_op(
+            &mut files,
+            &ctx2,
+            &Op::Schedule {
+                uuid: HEIZ.into(),
+                value: sched(None, &[(&mon, &[(60, 120, Some("19"))])]),
+            },
+        )
+        .unwrap();
+        assert_eq!(files.claims.2.sets.len(), 2);
+        assert_eq!(files.claims.2.claims[&slug(HEIZ)], "vx_heizung_schedule");
+        // Both on Uhr's set, rewritten for both.
+        apply_op(&mut files, &ctx2, &share).unwrap();
+        assert_eq!(
+            files.claims.2.sets.len(),
+            1,
+            "Heizung's own set went with its last claim"
+        );
+        apply_op(
+            &mut files,
+            &ctx2,
+            &Op::Schedule {
+                uuid: HEIZ.into(),
+                value: sched(Some("vx_uhr_schedule"), &[(&sat, &[(0, 1440, Some("16"))])]),
+            },
+        )
+        .unwrap();
+        let mut l2 = l.clone();
+        let out2 = compile_files(&d, &files, &mut l2).unwrap();
+        assert_eq!(entries(&out2, UHR), entries(&out2, HEIZ));
+        assert_eq!(entries(&out2, UHR), [(0, 1440, 16.0)]);
+        assert!(crate::sched_edit::missed(&files, &out2, &lock, &[HEIZ.into()]).is_empty());
+
+        // A digital timer: no values.
+        let e = apply_op(
+            &mut files.clone(),
+            &ctx2,
+            &Op::Schedule {
+                uuid: LICHT.into(),
+                value: sched(None, &[(&mon, &[(60, 120, Some("3"))])]),
+            },
+        )
+        .unwrap_err();
+        assert!(e.contains("digital"), "{e}");
+        apply_op(
+            &mut files,
+            &ctx2,
+            &Op::Schedule {
+                uuid: LICHT.into(),
+                value: sched(None, &[(&mon, &[(60, 120, None)])]),
+            },
+        )
+        .unwrap();
+        assert!(files.render()["edits.loxl"].contains("\tmon 01:00-02:00\n"));
+
+        // Dropped: the timer is as the base has it, and the set and extern go.
+        for u in [UHR, HEIZ, LICHT] {
+            apply_op(
+                &mut files,
+                &ctx2,
+                &Op::Schedule {
+                    uuid: u.into(),
+                    value: None,
+                },
+            )
+            .unwrap();
+        }
+        assert!(files.claims.2.is_empty() && files.claims.0.is_empty());
+        let out3 = compile_files(&d, &files, &mut l2).unwrap();
+        assert_eq!(entries(&out3, UHR), entries(&d, UHR));
+
+        // Not a DayTimer, a timer the module claims elsewhere, a mode the config lacks.
+        assert!(
+            apply_op(
+                &mut files,
+                &ctx,
+                &Op::Schedule {
+                    uuid: DIV.into(),
+                    value: sched(None, &[(&mon, &[])])
+                }
+            )
+            .unwrap_err()
+            .contains("only a DayTimer")
+        );
+        let elsewhere = BTreeMap::from([(UHR.to_string(), "pages/uhr.loxl:4".to_string())]);
+        let e = apply_op(
+            &mut files,
+            &Ctx {
+                sched_claimed: &elsewhere,
+                ..ctx
+            },
+            &op,
+        )
+        .unwrap_err();
+        assert!(e.contains("pages/uhr.loxl:4 claims"), "{e}");
+        let e = apply_op(
+            &mut files,
+            &ctx,
+            &Op::Schedule {
+                uuid: UHR.into(),
+                value: sched(None, &[("00000000-0000-0000-0000-000000000000", &[])]),
+            },
+        )
+        .unwrap_err();
+        assert!(e.contains("no operating mode"), "{e}");
+    }
+
+    #[test]
+    fn a_schedule_claim_vislox_did_not_write_is_refused() {
+        let s = slug(UHR);
+        let ext = format!("extern {s} = DayTimer(uuid: \"{UHR}\")\n");
+        let set = "schedule vx_a\n\tmon 01:00-02:00\nend\n";
+        let read = |t: String| Files::from_texts(&BTreeMap::from([("edits.loxl".to_string(), t)]));
+        assert!(read(format!("{ext}{set}{s}.schedule = vx_a\n")).is_ok());
+        // A set of the module's own name, a claim without its set or its extern.
+        assert!(
+            read(format!(
+                "{ext}schedule abend\n\tmon 01:00-02:00\nend\n{s}.schedule = abend\n"
+            ))
+            .is_err()
+        );
+        assert!(read(format!("{ext}{s}.schedule = vx_b\n")).is_err());
+        assert!(
+            read(format!("{set}{s}.schedule = vx_a\n"))
+                .unwrap_err()
+                .contains("neither an extern")
+        );
     }
 }

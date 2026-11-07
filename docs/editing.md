@@ -1,8 +1,9 @@
 # Editing in vislox
 
 vislox becomes an editor in steps: edit values (#58), add blocks (#59), move blocks, inputs and outputs (#60),
-make and change connections (#61), undo and redo (#62), and adopt the blocks Loxone Config drew (#72). This page
-is the design they share. #58 to #62 and #72 are built; the rest says where each step plugs in.
+make and change connections (#61), undo and redo (#62), adopt the blocks Loxone Config drew (#72), and edit a
+Daytimer's switching times (#73). This page is the design they share. #58 to #62, #72 and #73 are built; the rest
+says where each step plugs in.
 
 ## The rules
 
@@ -44,7 +45,9 @@ POST /api/edit
            { "op": "unwire", "from": ["<uuid>", "Q"],  "to": ["<uuid>", "I1"] },
            { "op": "adopt", "blocks": [ { "uuid": "…", "slug": "vx_licht" } ] },
            { "op": "adopt_page", "page": "<page uuid>" },
-           { "op": "unadopt", "uuids": [ "…" ] } ] }
+           { "op": "unadopt", "uuids": [ "…" ] },
+           { "op": "schedule", "uuid": "…", "value": { "modes": { "<mode uuid>": [
+               { "from": 390, "to": 480, "value": "21.5", "activate": true } ] } } } ] }
 ```
 
 `adopt`, `adopt_page` and `unadopt` go in a request of their own (#72).
@@ -60,7 +63,9 @@ POST /api/edit
   where the block was; for `relayout`, the `place` that puts each block back (one op however many
   blocks the page has; `place` moves several managed blocks as `move` does), and for `place`, the `place` back. For `wire` it is the
   `unwire` of the same ends, and for `unwire` the `wire`. For `adopt` and `adopt_page` it is the `unadopt` of
-  the blocks adopted, and for `unadopt` the `adopt` with the same slugs: a block keeps its UUIDs both ways.
+  the blocks adopted, and for `unadopt` the `adopt` with the same slugs: a block keeps its UUIDs both ways. For
+  `schedule` it is the `schedule` of what the timer claimed before: its set and that set's switching times, or
+  `value: null` (no claim).
   A reconnected wire is one request, `unwire` then `wire`:
   undone, the reverse list. The ops of one request see each other: `unwire` then `wire` of the same wire is
   accepted (and changes nothing). `remove_block`'s `add_block` carries the wires the removal took out
@@ -468,7 +473,8 @@ Later: the same simulator could drive an offline Liveview (simulated values on t
 A Lox Logic module can claim more than blocks and wires: `haustuer.access = bewohner` owns who may open an NFC
 Code Touch (and when), `frost.recipients = familie` who gets a push notification, and `uhr.schedule = abend` a
 Daytimer's switching times. None of these is on a logic page, and whoever a set leaves out loses the right on the
-next push, so the review shows them on their own. vislox reviews them; it does not edit them (#73, #76 and #77 do).
+next push, so the review shows them on their own. vislox reviews them, and edits switching times (#73, below);
+access and recipients are #76 and #77.
 
 - **From the compiled config, not the source.** `rights.rs` reads, with lox's own `AccessModel`, the `<PRM>`
   lists of every user and group: a `TIM=` on an `NfcCodeTouch` is an access right under that access schedule,
@@ -517,9 +523,74 @@ Whoever the set leaves out loses access on the next push.*), who holds the right
 revision, *Opens for* or *Sent to* (in effect), and who loses or gains it here. A Daytimer's *Schedule* section
 names its claim the same way.
 
-Hooks for the editing issues: #73 (switching times), #76 (access) and #77 (recipients) add ops to `POST /api/edit`
-that write these claims into `<module>/vislox/`; the review, `set_claims` and Apply's warning need nothing more,
-since they read the compiled config and the module's files.
+Hooks for the editing issues: #73 (switching times, built) adds the `schedule` op; #76 (access) and #77
+(recipients) add ops to `POST /api/edit` that write their claims into `<module>/vislox/` the same way (a set and
+claims in `edits.loxl`, kept like `sched_edit::Scheds`); the review, `set_claims` and Apply's warning need nothing
+more, since they read the compiled config and the module's files.
+
+## Switching times (#73)
+
+A DayTimer's switching times are a named `schedule` set and the timer's claim. vislox writes both into
+`edits.loxl`, after the externs:
+
+```text
+extern vx_10000020_0000_0200_ffff504f94000001 = DayTimer(uuid: "10000020-0000-0200-ffff504f94000001")
+
+# Switching times edited in vislox. A claim replaces the timer's whole schedule;
+# deleting it leaves the timer as the deployed config has it.
+schedule vx_uhr_schedule
+	weekdays 06:30-09:00 = 21, 18:00-21:00 = 22.5 activate
+	weekend off
+	"Party" 18:00-23:00 = 22.5
+end
+
+vx_10000020_0000_0200_ffff504f94000001.schedule = vx_uhr_schedule
+```
+
+- **The op** is `{ "op": "schedule", "uuid": <timer>, "value": … }`. `value.modes` gives each column by its
+  operating mode's UUID (the `Modes=` UUIDs Properties shows; the built-in modes have fixed ones), each a list of
+  `{ from, to, value?, activate? }` in minutes of the day. `value.set` names the set: vislox's set of that name is
+  rewritten (for every timer that claims it) and claimed, or with no `modes` claimed as it is (*Use the same times
+  as …*). Without `set`, the times go into the set the timer claims when no other timer claims it, else into a new
+  one (`vx_<name>_schedule`, a name the module, the lockfile and vislox's files do not have). `value: null` drops
+  the claim; a set no claim names goes, and so does an extern nothing else needs.
+- **Checked before lox sees it**, with lox's rules: a DayTimer only (lox writes switching times onto nothing
+  else); whole minutes up to `24:00`, the start before the end (an interval across midnight is two), no overlap in
+  a column; a value (a decimal number) on every interval of an analog timer, none on a digital one (`1` is taken as
+  on); every timer sharing the set the same kind; at most 48 intervals a column. One schedule per timer: a timer
+  whose schedule the rest of the module claims is refused, naming that `file:line` (`set_claims`), and so is a
+  block the rest of the module manages. A Daytimer added or adopted here is claimed by its slug.
+- **Written as lox takes it.** Every column is spelled the one way lox accepts: a built-in mode by its day word, a
+  mode the module declares or externs by its slug (the lockfile's), any other by its quoted title (which must be
+  unique). All seven weekdays are written, `off` where the timer is off (the claim leaves a weekday it does not
+  name off all day anyway); another mode gets a column only when the op names it. Columns with the same intervals
+  share a line, in weekday order, then holiday, vacation, day off, heating, cooling and the config's own modes;
+  seven weekdays alike are `daily`, Monday to Friday `weekdays`, Saturday and Sunday `weekend`.
+- **Checked after the compile.** The pending config must have, on each timer the request changed and every timer
+  sharing its set, exactly the set's switching times (columns, intervals, values on an analog timer, activation);
+  otherwise the edit is refused and the files, lock and out are put back.
+- **Read back.** vislox reads the sets and claims of `edits.loxl` with lox's parser; a set or claim not named
+  `vx_…`, a claim without its set, or one on a slug that is neither an extern of the file nor a block of vislox's
+  files is refused, as for any statement vislox did not write. Removing a block added here, adopting a block, and
+  handing one back are refused while vislox claims its switching times.
+- **Not deployed and Revert.** `GET /api/edits` sends `schedules`: per timer vislox's files claim now or claimed in
+  the deployed revision, `set`, its switching times (`modes`), the other timers on the set (`shared`), what the
+  deployed revision claimed (`deployed`: the value a Revert sends) and `pending` (the pending config switches it
+  otherwise than the deployed one); and `schedule_sets`, each set with its timers. Dropping a claim after Apply
+  leaves the timer as deployed (lox keeps no lock state for it); before Apply, as Loxone Config had it.
+- **What the app changed.** The Miniserver sends a Daytimer's schedule with the live values (#15). While they come
+  in and differ from the config shown, the editor names the modes that differ: an edit made in the app is replaced
+  on the next Apply, as Apply's confirmation also says (#68).
+
+The browser: *Switching times* in Properties of a DayTimer, on the newest config, with *Edit switching times*:
+a day bar per column (the seven weekdays, then the timer's other modes; *Add a column for* the other built-in modes
+and the config's own, ✕ to take one out). A click on an empty bar adds an hour and a drag sets its end; dragging an
+interval moves it and an end resizes it, snapped to 15 minutes (Alt: one), never past the day or into a neighbour.
+The selected column's intervals below take exact times, a value, *activate* and *Delete*; *Copy to* the weekdays,
+the weekend or every day; *Start from the times of* another timer of the same kind. Times are checked in the
+browser first (nothing is sent while one is marked). When the timer shares its set, *Change … too* (on) rewrites
+the set, off gives it a set of its own. *Use the same times as …* claims another timer's set. The Deploy pane counts
+the timers whose switching times are edited and not deployed.
 
 ## Undo and redo (#62)
 
@@ -575,6 +646,7 @@ cannot express is left out, not worked around.
 | #60 arrange | `lox logic compile --relayout <page>` | Lays out the page's managed blocks afresh. |
 | #61 wire | `x.Port <- y.Q` in `edits.loxl` | Adds a wire between objects Loxone Config drew and blocks added here, and removes one vislox drew. A wire Loxone Config drew cannot be removed. |
 | #72 adopt | `lox logic adopt` on a copy; its declaration in `<module>/vislox/<page>.loxl` | The block keeps its UUIDs, the config stays as it is; then edited like a block added here. |
+| #73 switching times | `schedule vx_… end`, `x.schedule = vx_…` in `edits.loxl` | A DayTimer, extern or added/adopted here; several timers may share a set. |
 
 Blocks the module already manages (they are in the lockfile) are refused: they are edited in their own `.loxl`.
 The blocks vislox added or adopted (#72) are the exception: their `.loxl` is vislox's.
@@ -624,7 +696,7 @@ Each of these plugs in as new op kinds on `POST /api/edit`, written into `<modul
 | #61 (built) | wires (`<-`) |
 | #62 (built) | undo and redo (the edits' own `undo`, sent back as an edit) |
 | #72 (built) | adopt a block into the module (`lox logic adopt`) |
-| #73 | Daytimer switching times (`schedule`, `.schedule`) |
+| #73 (built) | Daytimer switching times (`schedule`, `.schedule`) |
 | #74 | lighting moods and circuits (`moods`, `.moods`) |
 | #75 | members of a central block (`.members`) |
 | #76 | NFC Code Touch access (`access`, `.access`) |
