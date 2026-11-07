@@ -112,6 +112,18 @@ pub enum Op {
     /// wires its source draws; one Loxone Config drew is refused. Its
     /// `previous` is the `wire` that draws it again.
     Unwire { from: [String; 2], to: [String; 2] },
+    /// Put blocks Loxone Config drew under the module (#72, `lox logic
+    /// adopt`): each declared in vislox's file of its page, with its UUIDs.
+    /// The config stays exactly as it is. Its `previous` is the `unadopt`.
+    Adopt { blocks: Vec<crate::adopt::Pick> },
+    /// Adopt every block of the page with UUID `page` that lox can rebuild
+    /// exactly; the reply names those it skipped, and why. Its `previous`
+    /// is the `unadopt` of those it adopted.
+    AdoptPage { page: String },
+    /// Stop managing blocks adopted here: their declarations and lockfile
+    /// entries go, and Loxone Config owns them again, as the base has them.
+    /// Its `previous` is the `adopt` with the same slugs.
+    Unadopt { uuids: Vec<String> },
 }
 
 /// Where a `place` puts one block: its top left corner, as `move` takes it.
@@ -137,7 +149,10 @@ impl Op {
             | Op::Relayout { .. }
             | Op::Place { .. }
             | Op::Wire { .. }
-            | Op::Unwire { .. } => None,
+            | Op::Unwire { .. }
+            | Op::Adopt { .. }
+            | Op::AdoptPage { .. }
+            | Op::Unadopt { .. } => None,
         }
     }
 
@@ -155,7 +170,10 @@ impl Op {
             | Op::Relayout { .. }
             | Op::Place { .. }
             | Op::Wire { .. }
-            | Op::Unwire { .. } => None,
+            | Op::Unwire { .. }
+            | Op::Adopt { .. }
+            | Op::AdoptPage { .. }
+            | Op::Unadopt { .. } => None,
         }
     }
 
@@ -174,7 +192,10 @@ impl Op {
             | Op::Relayout { .. }
             | Op::Place { .. }
             | Op::Wire { .. }
-            | Op::Unwire { .. } => {}
+            | Op::Unwire { .. }
+            | Op::Adopt { .. }
+            | Op::AdoptPage { .. }
+            | Op::Unadopt { .. } => {}
         }
         op
     }
@@ -430,11 +451,18 @@ pub struct Claim {
     pub attrs: BTreeMap<Which, String>,
     /// Port (by its Lox Logic name) or setting → value.
     pub sets: BTreeMap<String, Value>,
+    /// A block adopted here (#72) names this extern: it stays while it does.
+    pub pinned: bool,
 }
 
 impl Claim {
     fn is_empty(&self) -> bool {
-        self.attrs.is_empty() && self.sets.is_empty()
+        self.attrs.is_empty() && self.sets.is_empty() && !self.pinned
+    }
+
+    /// It claims a value (not only an extern something names).
+    pub fn claims(&self) -> bool {
+        !self.attrs.is_empty() || !self.sets.is_empty()
     }
 }
 
@@ -619,7 +647,10 @@ impl Claims {
             | Op::Relayout { .. }
             | Op::Place { .. }
             | Op::Wire { .. }
-            | Op::Unwire { .. } => None,
+            | Op::Unwire { .. }
+            | Op::Adopt { .. }
+            | Op::AdoptPage { .. }
+            | Op::Unadopt { .. } => None,
         }
     }
 
@@ -812,7 +843,10 @@ pub fn apply(
         | Op::Relayout { .. }
         | Op::Place { .. }
         | Op::Wire { .. }
-        | Op::Unwire { .. } => {
+        | Op::Unwire { .. }
+        | Op::Adopt { .. }
+        | Op::AdoptPage { .. }
+        | Op::Unadopt { .. } => {
             unreachable!("not a value")
         }
     };
@@ -956,6 +990,8 @@ pub struct Files {
     /// What an edit moves (#60). Not a file of vislox's: lox keeps a managed
     /// block's position in the lockfile, so it is written there.
     pub layout: Placement,
+    /// What adopting a block (#72) or its undo changes in the lockfile.
+    pub lock_edits: crate::adopt::LockEdits,
 }
 
 /// The positions an edit gives managed blocks, and the pages it lays out
@@ -989,6 +1025,22 @@ impl Files {
                     name.clone(),
                     PageFile::parse(text).map_err(|e| format!("{name}: {e}"))?,
                 );
+            }
+        }
+        // A block adopted here names externs of the claims file, or blocks of
+        // vislox's files; those externs stay while it does.
+        for (s, file) in f.adopted_names() {
+            if f.block(&s).is_some() {
+                continue;
+            }
+            match f.claims.0.iter_mut().find(|(u, _)| slug(u) == s) {
+                Some((_, c)) => c.pinned = true,
+                None => {
+                    return Err(format!(
+                        "{file}: a block adopted there names `{s}`, which is neither an extern of \
+                         {CLAIMS} nor a block of vislox's files; put its line back"
+                    ));
+                }
             }
         }
         // Every end of a wire is an extern of the claims file or a block
@@ -1075,6 +1127,33 @@ impl Files {
         }
     }
 
+    /// The names the blocks adopted here use for the objects they are wired
+    /// to (not themselves), with the file that names them.
+    pub fn adopted_names(&self) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        for (name, p) in &self.pages {
+            for b in p.blocks.iter().filter(|b| b.adopted) {
+                for (_, src) in &b.wires {
+                    out.push((src.slug.clone(), name.clone()));
+                }
+            }
+            for w in &p.wires {
+                out.push((w.to.slug.clone(), name.clone()));
+            }
+        }
+        out
+    }
+
+    /// Mark the externs the blocks adopted here name, and drop the externs
+    /// nothing claims, wires or names any more.
+    fn repin(&mut self) {
+        let names: BTreeSet<String> = self.adopted_names().into_iter().map(|(s, _)| s).collect();
+        for (u, c) in self.claims.0.iter_mut() {
+            c.pinned = names.contains(&slug(u));
+        }
+        self.claims.prune();
+    }
+
     /// The block vislox added as `slug`: its file and declaration.
     pub fn block(&self, slug: &str) -> Option<(&str, &NewBlock)> {
         self.pages.iter().find_map(|(n, p)| {
@@ -1092,7 +1171,7 @@ impl Files {
     }
 
     /// Whether a block or removal of vislox's files is named `slug`.
-    fn names(&self, slug: &str) -> bool {
+    pub fn names(&self, slug: &str) -> bool {
         self.pages
             .values()
             .any(|p| p.removed.contains(slug) || p.blocks.iter().any(|b| b.slug == slug))
@@ -1192,6 +1271,11 @@ pub struct Ctx<'a> {
     /// pending config has and an earlier op of the request took out is not
     /// wired any more (#61).
     pub drawn: &'a BTreeSet<Wire>,
+    /// What `lox logic adopt` made of the blocks the request adopts (#72),
+    /// by UUID, worked out on a scratch copy before the ops are applied.
+    pub adoptions: &'a BTreeMap<String, crate::adopt::Adoption>,
+    /// For each `adopt_page`, the blocks it adopts, by page UUID.
+    pub page_adoptions: &'a BTreeMap<String, Vec<String>>,
 }
 
 /// What [`apply_op`] did: the value or op that undoes it (`previous`),
@@ -1216,6 +1300,19 @@ pub fn apply_op(files: &mut Files, ctx: &Ctx, op: &Op) -> Result<Applied, String
         Op::Place { moves } => place(files, ctx, moves),
         Op::Wire { from, to } => wire(files, ctx, from, to),
         Op::Unwire { from, to } => unwire(files, ctx, from, to),
+        Op::Adopt { blocks } => {
+            let uuids: Vec<String> = blocks.iter().map(|b| b.uuid.clone()).collect();
+            adopt(files, ctx, &uuids)
+        }
+        Op::AdoptPage { page } => {
+            let uuids = ctx
+                .page_adoptions
+                .get(page)
+                .filter(|u| !u.is_empty())
+                .ok_or_else(|| "lox can adopt no block of this page".to_string())?;
+            adopt(files, ctx, uuids)
+        }
+        Op::Unadopt { uuids } => unadopt(files, ctx, uuids),
         _ => {
             let uuid = op.uuid().unwrap_or_default();
             match ctx.lock.slug_of(uuid) {
@@ -1272,7 +1369,10 @@ pub fn undo_ops(
             | Op::Relayout { .. }
             | Op::Place { .. }
             | Op::Wire { .. }
-            | Op::Unwire { .. } => undo.push(serde_json::from_value(prev).map_err(bad)?),
+            | Op::Unwire { .. }
+            | Op::Adopt { .. }
+            | Op::AdoptPage { .. }
+            | Op::Unadopt { .. } => undo.push(serde_json::from_value(prev).map_err(bad)?),
             _ => undo.push(op.with_value(serde_json::from_value(prev).map_err(bad)?)),
         }
     }
@@ -1421,6 +1521,7 @@ fn add_block(files: &mut Files, ctx: &Ctx, op: &Op) -> Result<Applied, String> {
         ty: ty.clone(),
         title,
         args,
+        ..Default::default()
     };
     f.blocks.push(b.clone());
     // Its wires (an undone removal's): an empty UUID is this block.
@@ -1447,6 +1548,12 @@ fn remove_block(files: &mut Files, ctx: &Ctx, uuid: &str) -> Result<Applied, Str
         .ok_or_else(|| format!("no object {uuid} in the pending config"))?;
     let name = el.attr_decoded("Title").unwrap_or_default().into_owned();
     let slug = match ctx.lock.slug_of(uuid) {
+        Some(s) if files.block(s).is_some_and(|(_, b)| b.adopted) => {
+            return Err(format!(
+                "{name} was adopted from Loxone Config, so it is deployed: vislox takes out only a \
+                 block added here and not applied yet. Undo the adoption to hand it back to Loxone Config"
+            ));
+        }
         Some(s) if files.block(s).is_some() => s.to_string(),
         Some(_) => {
             return Err(format!(
@@ -1519,6 +1626,171 @@ fn remove_block(files: &mut Files, ctx: &Ctx, uuid: &str) -> Result<Applied, Str
     p.removed.insert(slug);
     Ok(Applied {
         previous: op_value(&again),
+        added: None,
+    })
+}
+
+// ── adopting blocks (#72) ───────────────────────────────────────────────
+
+/// Declare the blocks `uuids` in vislox's files, as [`crate::adopt`] worked
+/// them out on the scratch copy: each in the file of its page, its externs in
+/// [`FILE`], its lockfile entry and tracked wires for the lock.
+fn adopt(files: &mut Files, ctx: &Ctx, uuids: &[String]) -> Result<Applied, String> {
+    for u in uuids {
+        let a = ctx
+            .adoptions
+            .get(u)
+            .ok_or_else(|| format!("{u} was not adopted on the scratch copy"))?;
+        if files.block(&a.slug).is_some() {
+            return Err(format!("`{}` is a block of vislox's files already", a.slug));
+        }
+        // `page "…"` names a page by its title, and lox builds on the first.
+        let mut same = Vec::new();
+        pages_titled(&ctx.base.xml.root, &a.page_title, &mut same);
+        if same.first().and_then(|e| e.attr("U")) != Some(a.page.as_str()) {
+            return Err(format!(
+                "{} pages are titled \"{}\", and lox puts a page's blocks on the first; rename one \
+                 in Loxone Config to adopt blocks there",
+                same.len(),
+                a.page_title
+            ));
+        }
+        let file = match files
+            .pages
+            .iter()
+            .find(|(_, p)| p.uuid.as_deref() == Some(a.page.as_str()))
+        {
+            Some((n, _)) => n.clone(),
+            None => blocks::file_name(&a.page_title, &|n| {
+                n == CLAIMS || files.pages.contains_key(n)
+            }),
+        };
+        let f = files.pages.entry(file).or_insert_with(|| PageFile {
+            uuid: Some(a.page.clone()),
+            ..PageFile::new(&a.page_title)
+        });
+        f.page = a.page_title.clone();
+        f.blocks.push(a.block.clone());
+        f.wires.extend(a.wires.iter().cloned());
+        for (eu, ty) in &a.externs {
+            let c = files.claims.0.entry(eu.clone()).or_default();
+            if c.ty.is_empty() {
+                c.ty = ty.clone();
+            }
+            c.pinned = true;
+        }
+        let le = &mut files.lock_edits;
+        le.drop.remove(&a.slug);
+        le.add.insert(a.slug.clone(), a.object.clone());
+        le.wires.extend(a.extern_wires.iter().cloned());
+    }
+    Ok(Applied {
+        previous: op_value(&Op::Unadopt {
+            uuids: uuids.to_vec(),
+        }),
+        added: None,
+    })
+}
+
+/// Stop managing blocks adopted here: their declarations and wires leave
+/// vislox's file, their lockfile entries and the wires lox tracks for them
+/// leave the lock, and Loxone Config owns them again. Only a block whose
+/// pending state is the base's: what was changed here goes first.
+fn unadopt(files: &mut Files, ctx: &Ctx, uuids: &[String]) -> Result<Applied, String> {
+    let name = |u: &str| {
+        find(&ctx.doc.xml.root, u)
+            .and_then(|e| e.attr_decoded("Title").map(|t| t.into_owned()))
+            .filter(|t| !t.trim().is_empty())
+            .unwrap_or_else(|| u.to_string())
+    };
+    let mut picks = Vec::new();
+    let mut slugs: BTreeSet<String> = BTreeSet::new();
+    for u in uuids {
+        let s = ctx
+            .lock
+            .slug_of(u)
+            .ok_or_else(|| format!("{}: the module does not manage it", name(u)))?;
+        match files.block(s) {
+            Some((_, b)) if b.adopted => {}
+            Some(_) => {
+                return Err(format!(
+                    "{} was added here, not adopted: Remove takes it out",
+                    name(u)
+                ));
+            }
+            None => {
+                return Err(format!(
+                    "{}: the module manages it in its own .loxl file; vislox hands back only a \
+                     block it adopted",
+                    name(u)
+                ));
+            }
+        }
+        if !crate::adopt::same_block(ctx.base, ctx.doc, u) {
+            return Err(format!(
+                "{} has changes here that the base does not have (values, wires or its place): \
+                 revert them first, then hand it back to Loxone Config",
+                name(u)
+            ));
+        }
+        slugs.insert(s.to_string());
+        picks.push(crate::adopt::Pick {
+            uuid: u.clone(),
+            slug: Some(s.to_string()),
+        });
+    }
+    // Nothing else of vislox's may name them: its lines would break.
+    let by = |s: &str| {
+        ctx.lock
+            .uuid_of(s)
+            .map(name)
+            .unwrap_or_else(|| s.to_string())
+    };
+    if let Some(w) = files
+        .claims
+        .1
+        .iter()
+        .find(|w| slugs.contains(&w.to.0) || slugs.contains(&w.from.0))
+    {
+        let s = if slugs.contains(&w.to.0) {
+            &w.to.0
+        } else {
+            &w.from.0
+        };
+        return Err(format!(
+            "{}: a wire drawn here ends at it ({}); take it out first",
+            by(s),
+            w.render()
+        ));
+    }
+    for p in files.pages.values() {
+        for b in p.blocks.iter().filter(|b| !slugs.contains(&b.slug)) {
+            if let Some((_, src)) = b.wires.iter().find(|(_, src)| slugs.contains(&src.slug)) {
+                return Err(format!(
+                    "{}: {} is wired from it in its declaration; hand that one back too",
+                    by(&src.slug),
+                    by(&b.slug)
+                ));
+            }
+        }
+    }
+    for s in &slugs {
+        for p in files.pages.values_mut() {
+            p.blocks.retain(|b| &b.slug != s);
+            p.wires.retain(|w| &w.from.slug != s);
+        }
+        let le = &mut files.lock_edits;
+        if let Some(o) = le.add.remove(s) {
+            let ports = crate::adopt::ports_of(&o);
+            le.wires
+                .retain(|w| !ports.contains(w.get("from").and_then(|f| f.as_str()).unwrap_or("")));
+        } else {
+            le.drop.insert(s.clone());
+        }
+    }
+    files.repin();
+    Ok(Applied {
+        previous: op_value(&Op::Adopt { blocks: picks }),
         added: None,
     })
 }
@@ -1899,6 +2171,9 @@ pub enum Owner {
     Module,
     /// Loxone Config.
     LoxoneConfig,
+    /// The declaration of a block adopted here (#72): drawn in Loxone Config
+    /// before, and brought along by the adoption.
+    Adopted,
 }
 
 impl Owner {
@@ -1910,6 +2185,10 @@ impl Owner {
                 "Drawn in Loxone Config. lox removes only the wires its source draws: remove it in \
                  Loxone Config."
             }
+            Owner::Adopted => {
+                "Drawn in Loxone Config and brought along when the block was adopted: the block's \
+                 declaration in vislox's file draws it now. vislox does not take such a wire out yet."
+            }
         }
     }
 }
@@ -1917,21 +2196,31 @@ impl Owner {
 /// Who draws the wire from the connector `from` into `to` (connector UUIDs),
 /// into the object `sink`, that vislox's file does not draw. One rule for
 /// `unwire` and the page (`module_wires` in `GET /api/edits`).
-fn owner(lock: &Lock, files: &Files, from: &str, to: &str, sink: &str) -> Owner {
+fn owner(lock: &Lock, files: &Files, from: &str, to: &str, source: &str, sink: &str) -> Owner {
+    let adopted = |u: &str| {
+        lock.slug_of(u)
+            .and_then(|s| files.block(s))
+            .is_some_and(|(_, b)| b.adopted)
+    };
+    let tracked = lock.wires.contains(&(from.to_string(), to.to_string()));
+    if adopted(sink) || (tracked && adopted(source)) {
+        return Owner::Adopted;
+    }
     let module_block = lock.slug_of(sink).is_some_and(|s| files.block(s).is_none());
-    if module_block || lock.wires.contains(&(from.to_string(), to.to_string())) {
+    if module_block || tracked {
         Owner::Module
     } else {
         Owner::LoxoneConfig
     }
 }
 
-/// The wires of `doc` the rest of the module draws, by their ends as the
-/// page names them.
+/// The wires of `doc` that `who` draws, by their ends as the page names
+/// them.
 pub fn module_wires(
     doc: &LoxoneDoc,
     lock: &Lock,
     files: &Files,
+    who: Owner,
 ) -> Vec<([String; 2], [String; 2])> {
     fn walk<'a>(el: &'a Element, out: &mut HashMap<&'a str, (&'a str, &'a str)>) {
         if let Some(u) = el.attr("U") {
@@ -1952,7 +2241,7 @@ pub fn module_wires(
         .iter()
         .filter_map(|w| {
             let (f, t) = (end(&w.from_port)?, end(&w.to_port)?);
-            (owner(lock, files, &w.from_port, &w.to_port, &t[0]) == Owner::Module).then_some((f, t))
+            (owner(lock, files, &w.from_port, &w.to_port, &f[0], &t[0]) == who).then_some((f, t))
         })
         .collect()
 }
@@ -2267,7 +2556,14 @@ fn unwire(
                 .unwrap_or_default()
                 .to_string()
         };
-        let who = owner(ctx.lock, files, &port(&src), &port(&dst), &dst.uuid);
+        let who = owner(
+            ctx.lock,
+            files,
+            &port(&src),
+            &port(&dst),
+            &src.uuid,
+            &dst.uuid,
+        );
         return Err(format!("{} → {}: {}", src.label(), dst.label(), who.why()));
     };
     files.claims.1.remove(&w);
@@ -2459,7 +2755,10 @@ pub fn current(doc: &LoxoneDoc, op: &Op) -> Option<String> {
         | Op::Relayout { .. }
         | Op::Place { .. }
         | Op::Wire { .. }
-        | Op::Unwire { .. } => None,
+        | Op::Unwire { .. }
+        | Op::Adopt { .. }
+        | Op::AdoptPage { .. }
+        | Op::Unadopt { .. } => None,
     }
 }
 
@@ -2943,6 +3242,8 @@ mod tests {
                 deployed: None,
                 names: &names,
                 drawn: &Default::default(),
+                adoptions: &Default::default(),
+                page_adoptions: &Default::default(),
             };
             apply_op(&mut files, &ctx, &add(EG, t, None, &[], &[])).unwrap();
             let mut l = Lockfile::default();
@@ -2973,6 +3274,8 @@ mod tests {
             deployed: None,
             names: &names,
             drawn: &Default::default(),
+            adoptions: &Default::default(),
+            page_adoptions: &Default::default(),
         };
         let a = apply_op(
             &mut files,
@@ -3039,6 +3342,8 @@ mod tests {
             deployed: Some(&d),
             names: &names,
             drawn: &Default::default(),
+            adoptions: &Default::default(),
+            page_adoptions: &Default::default(),
         };
         let title = Op::Title {
             uuid: mono.clone(),
@@ -3099,6 +3404,8 @@ mod tests {
             deployed: Some(&d),
             names: &names,
             drawn: &Default::default(),
+            adoptions: &Default::default(),
+            page_adoptions: &Default::default(),
         };
         let r = apply_op(&mut files, &ctx, &Op::RemoveBlock { uuid: mono.clone() }).unwrap();
         // It names the block it adds again (#62): lox mints new UUIDs for it.
@@ -3123,6 +3430,8 @@ mod tests {
             deployed: Some(&out),
             names: &names,
             drawn: &Default::default(),
+            adoptions: &Default::default(),
+            page_adoptions: &Default::default(),
         };
         let e = apply_op(&mut files, &ctx, &Op::RemoveBlock { uuid: pulse }).unwrap_err();
         assert!(e.contains("is deployed"), "{e}");
@@ -3144,6 +3453,8 @@ mod tests {
             deployed: None,
             names: &names,
             drawn: &Default::default(),
+            adoptions: &Default::default(),
+            page_adoptions: &Default::default(),
         };
         apply_op(&mut files, &ctx, &add(OG, "And", Some("Licht"), &[], &[])).unwrap();
         let text = files.render()["obergeschoss.loxl"].clone();
@@ -3173,6 +3484,8 @@ mod tests {
             deployed: None,
             names: &names,
             drawn: &Default::default(),
+            adoptions: &Default::default(),
+            page_adoptions: &Default::default(),
         };
         apply_op(&mut files, &ctx, &add(OG, "Or", None, &[], &[])).unwrap();
         let r = files.render();
@@ -3204,6 +3517,8 @@ mod tests {
             deployed: Some(&renamed),
             names: &names,
             drawn: &Default::default(),
+            adoptions: &Default::default(),
+            page_adoptions: &Default::default(),
         };
         for s in ["vx_and_1", "vx_or_1"] {
             let uuid = l.objects[s].uuid.clone();
@@ -3227,6 +3542,8 @@ mod tests {
             deployed: None,
             names: &names,
             drawn: &Default::default(),
+            adoptions: &Default::default(),
+            page_adoptions: &Default::default(),
         };
         let mut files = Files::default();
         let err = |op: Op| apply_op(&mut files.clone(), &ctx, &op).unwrap_err();
@@ -3259,6 +3576,8 @@ mod tests {
             deployed: None,
             names: &names,
             drawn: &Default::default(),
+            adoptions: &Default::default(),
+            page_adoptions: &Default::default(),
         };
         let e = apply_op(&mut Files::default(), &ctx, &add(OG, "And", None, &[], &[])).unwrap_err();
         assert!(e.contains("2 pages are titled"), "{e}");
@@ -3306,6 +3625,8 @@ mod tests {
             deployed: None,
             names: &names,
             drawn: &Default::default(),
+            adoptions: &Default::default(),
+            page_adoptions: &Default::default(),
         };
         apply_op(&mut files, &ctx, &add(OG, "And", Some("Licht"), &[], &[])).unwrap();
         // Deployed: the base draws it where lox placed it.
@@ -3321,6 +3642,8 @@ mod tests {
             deployed: Some(&base),
             names: &names,
             drawn: &Default::default(),
+            adoptions: &Default::default(),
+            page_adoptions: &Default::default(),
         };
         // Snapped to the grid, the size kept; `previous` moves it back.
         let mut files = Files::from_texts(&files.render()).unwrap();
@@ -3401,6 +3724,8 @@ mod tests {
             deployed: None,
             names: &names,
             drawn: &Default::default(),
+            adoptions: &Default::default(),
+            page_adoptions: &Default::default(),
         };
         apply_op(&mut files, &ctx, &add(OG, "And", None, &[], &[])).unwrap();
         apply_op(&mut files, &ctx, &add(OG, "Or", None, &[], &[])).unwrap();
@@ -3413,6 +3738,8 @@ mod tests {
             deployed: None,
             names: &names,
             drawn: &Default::default(),
+            adoptions: &Default::default(),
+            page_adoptions: &Default::default(),
         };
         let err = |op: Op| apply_op(&mut files.clone(), &ctx, &op).unwrap_err();
         // Drawn in Loxone Config: lox does not move it.
@@ -3517,6 +3844,8 @@ mod tests {
             deployed: None,
             names: &names,
             drawn: &Default::default(),
+            adoptions: &Default::default(),
+            page_adoptions: &Default::default(),
         };
         apply_op(&mut files, &ctx, &add(OG, "And", None, &[], &[])).unwrap();
         let out = compile_files(&d, &files, &mut l).unwrap();
@@ -3539,6 +3868,8 @@ mod tests {
                 deployed: Some(&base),
                 names: &names,
                 drawn: &Default::default(),
+                adoptions: &Default::default(),
+                page_adoptions: &Default::default(),
             };
             files.layout = Placement::default();
             apply_op(
@@ -3607,6 +3938,8 @@ mod tests {
             deployed: None,
             names: &names,
             drawn: &Default::default(),
+            adoptions: &Default::default(),
+            page_adoptions: &Default::default(),
         };
         apply_op(&mut files, &ctx, &add(OG, "And", None, &[], &[])).unwrap();
         apply_op(&mut files, &ctx, &add(EG, "Or", None, &[], &[])).unwrap();
@@ -3658,6 +3991,8 @@ mod tests {
             deployed: None,
             names: &names,
             drawn: &Default::default(),
+            adoptions: &Default::default(),
+            page_adoptions: &Default::default(),
         };
         apply_op(&mut files, &ctx, &add(OG, "And", None, &[], &[])).unwrap();
         let out = compile_files(&d, &files, &mut l).unwrap();
@@ -3744,6 +4079,8 @@ mod tests {
             deployed: None,
             names: &names,
             drawn: &Default::default(),
+            adoptions: &Default::default(),
+            page_adoptions: &Default::default(),
         };
         // The Divide block's output onto the upper floor's OR: another page.
         let w = wire_op((DIV, "AQ"), (OR, "I2"));
@@ -3787,6 +4124,8 @@ mod tests {
             deployed: None,
             names: &names,
             drawn: &drawn,
+            adoptions: &Default::default(),
+            page_adoptions: &Default::default(),
         };
         // One request may take a wire out and draw it again (an undo and a
         // redo, a reconnect to the same port): the ops see each other.
@@ -3822,6 +4161,8 @@ mod tests {
             deployed: None,
             names: &names,
             drawn: &Default::default(),
+            adoptions: &Default::default(),
+            page_adoptions: &Default::default(),
         };
         let err = |op: Op| apply_op(&mut Files::default(), &ctx, &op).unwrap_err();
         assert!(err(wire_op((DIV, "Input2"), (OR, "I2"))).contains("is an input"));
@@ -3868,6 +4209,8 @@ mod tests {
             deployed: None,
             names: &names,
             drawn: &Default::default(),
+            adoptions: &Default::default(),
+            page_adoptions: &Default::default(),
         };
         let e = apply_op(
             &mut Files::default(),
@@ -3901,6 +4244,8 @@ mod tests {
             deployed: None,
             names: &names,
             drawn: &Default::default(),
+            adoptions: &Default::default(),
+            page_adoptions: &Default::default(),
         };
         let e = apply_op(
             &mut Files::default(),
@@ -3937,6 +4282,8 @@ mod tests {
             deployed: None,
             names: &names,
             drawn: &Default::default(),
+            adoptions: &Default::default(),
+            page_adoptions: &Default::default(),
         };
         apply_op(&mut files, &ctx, &add(OG, "And", None, &[("I2", "1")], &[])).unwrap();
         let out = compile_files(&d, &files, &mut l).unwrap();
@@ -3949,6 +4296,8 @@ mod tests {
             deployed: None,
             names: &names,
             drawn: &Default::default(),
+            adoptions: &Default::default(),
+            page_adoptions: &Default::default(),
         };
         // Its input with a constant takes no wire; the other does.
         let e = apply_op(&mut files, &ctx, &wire_op((DIV, "AQ"), (&new, "I2"))).unwrap_err();
@@ -3982,6 +4331,8 @@ mod tests {
             deployed: None,
             names: &names,
             drawn: &Default::default(),
+            adoptions: &Default::default(),
+            page_adoptions: &Default::default(),
         };
         let undo = apply_op(&mut files, &ctx, &Op::RemoveBlock { uuid: new.clone() })
             .unwrap()
@@ -4017,6 +4368,8 @@ mod tests {
             deployed: None,
             names: &names,
             drawn: &Default::default(),
+            adoptions: &Default::default(),
+            page_adoptions: &Default::default(),
         };
         let a = apply_op(&mut files, &ctx, &undo).unwrap();
         let slug2 = a.added.unwrap();

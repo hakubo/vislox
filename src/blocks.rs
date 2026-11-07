@@ -13,9 +13,16 @@
 //! declaration goes, and a `removed <slug>` line tells lox that is meant
 //! (without it lox refuses a lockfile entry the source lost). The line is
 //! dropped once the lockfile no longer has the block.
+//!
+//! A block Loxone Config drew can be adopted into the same file (#72,
+//! [`crate::adopt`]): its declaration as `lox logic adopt` writes it, under
+//! the file's *adopted* comment, with the wires it brings along (bound in its
+//! arguments, or `<-` onto an extern of `edits.loxl`). It keeps its UUIDs.
 
 use loxone_config::connectors::{self, PortDir};
-use loxone_config::logic::{ArgItem, Binding, BindingKind, Item, Module, PageDecl, Value};
+use loxone_config::logic::{
+    ArgItem, Binding, BindingKind, Item, Module, PageDecl, PortRef, Value, WireDecl,
+};
 use loxone_config::port_names;
 use serde::Serialize;
 use serde_json::{Value as Json, json};
@@ -204,8 +211,9 @@ pub fn palette() -> Json {
 
 // ── the files ───────────────────────────────────────────────────────────
 
-/// One block vislox added: `slug = Type("Title", Port: value, …)`.
-#[derive(Clone, Debug, PartialEq)]
+/// One block vislox added: `slug = Type("Title", Port: value, …)`, or one
+/// it adopted from Loxone Config (#72), which may also bind wires.
+#[derive(Clone, Debug, PartialEq, Default)]
 pub struct NewBlock {
     pub slug: String,
     pub ty: String,
@@ -213,6 +221,14 @@ pub struct NewBlock {
     pub title: Option<String>,
     /// Port (by its source name) or setting → value, in the order written.
     pub args: Vec<(String, Value)>,
+    /// Adopted from Loxone Config (#72): it was deployed before vislox
+    /// managed it, and keeps its UUIDs.
+    pub adopted: bool,
+    /// The wires into its inputs its declaration binds (`In1: vx_….AQ`, or
+    /// a bare name for the source's default output): port → source. Only an
+    /// adopted block has them; a block added here is wired by `<-` in
+    /// `edits.loxl` (#61).
+    pub wires: Vec<(String, PortRef)>,
 }
 
 impl NewBlock {
@@ -237,6 +253,9 @@ impl NewBlock {
         for (k, v) in &self.args {
             parts.push(format!("{k}: {v}"));
         }
+        for (k, src) in &self.wires {
+            parts.push(format!("{k}: {src}"));
+        }
         format!("{} = {}({})", self.slug, self.ty, parts.join(", "))
     }
 }
@@ -254,10 +273,32 @@ pub struct PageFile {
     pub category: Option<String>,
     pub blocks: Vec<NewBlock>,
     pub removed: BTreeSet<String>,
+    /// The wires out of the blocks adopted here onto objects Loxone Config
+    /// drew (#72): `vx_<uuid>.Port <- slug` (an extern of `edits.loxl`), as
+    /// `lox logic adopt` writes them. lox tracks them in the lockfile
+    /// (`extern_wires`).
+    pub wires: Vec<FileWire>,
+}
+
+/// `to <- from`: a wire of a page file, out of a block adopted there.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FileWire {
+    pub to: PortRef,
+    pub from: PortRef,
+}
+
+impl FileWire {
+    fn render(&self) -> String {
+        format!("{} <- {}", self.to, self.from)
+    }
 }
 
 /// The comment that ties a file to its page: `# page uuid: …`.
 const UUID_LINE: &str = "page uuid:";
+
+/// The comment above the blocks adopted from Loxone Config (#72): the
+/// blocks after it are adopted, not added.
+const ADOPTED_LINE: &str = "Adopted from Loxone Config";
 
 fn foreign(what: &str) -> String {
     format!("it holds {what}, which vislox did not write; move it to another file of the module")
@@ -272,6 +313,7 @@ impl PageFile {
             category: None,
             blocks: Vec::new(),
             removed: BTreeSet::new(),
+            wires: Vec::new(),
         }
     }
 
@@ -282,13 +324,18 @@ impl PageFile {
     /// Read a file vislox wrote. Only what vislox writes is accepted, so
     /// that a rewrite never drops a statement someone added by hand.
     pub fn parse(text: &str) -> Result<PageFile, String> {
-        let m = Module::parse(text).map_err(|e| e.to_string())?;
+        // A fragment: an adopted block names the externs of `edits.loxl`.
+        let m = Module::parse_fragment(text).map_err(|e| e.to_string())?;
         let mut file: Option<PageFile> = None;
         let mut uuid = None;
+        let mut adopted = false;
         for item in m.items {
             match item {
                 Item::Comment(c) if file.is_none() && c.trim().starts_with(UUID_LINE) => {
                     uuid = Some(c.trim()[UUID_LINE.len()..].trim().to_string());
+                }
+                Item::Comment(c) if file.is_some() && c.trim().starts_with(ADOPTED_LINE) => {
+                    adopted = true;
                 }
                 Item::Page(p) if file.is_none() => {
                     file = Some(PageFile {
@@ -306,13 +353,32 @@ impl PageFile {
                         return Err(foreign(&format!("`{}`", b.slug)));
                     }
                     let mut args = Vec::new();
+                    let mut wires = Vec::new();
                     for a in &b.args {
                         match a {
+                            // A bare name on an adopted block: the default
+                            // output of the object it names.
+                            ArgItem::Binding(Binding {
+                                port,
+                                kind: BindingKind::Param(Value::Ref(src)),
+                                ..
+                            }) if adopted => wires.push((
+                                port.clone(),
+                                PortRef {
+                                    slug: src.clone(),
+                                    port: String::new(),
+                                },
+                            )),
                             ArgItem::Binding(Binding {
                                 port,
                                 kind: BindingKind::Param(v),
                                 ..
                             }) => args.push((port.clone(), v.clone())),
+                            ArgItem::Binding(Binding {
+                                port,
+                                kind: BindingKind::Wire(src),
+                                ..
+                            }) if adopted => wires.push((port.clone(), src.clone())),
                             ArgItem::Binding(_) => {
                                 return Err(foreign(&format!("a wire onto `{}`", b.slug)));
                             }
@@ -324,7 +390,22 @@ impl PageFile {
                         ty: b.block_type,
                         title: b.title,
                         args,
+                        adopted,
+                        wires,
                     });
+                }
+                // A wire out of a block adopted here (#72).
+                Item::Wire(WireDecl { to, from, .. })
+                    if adopted
+                        && !to.port.is_empty()
+                        && file.as_ref().is_some_and(|f| {
+                            f.blocks.iter().any(|b| b.adopted && b.slug == from.slug)
+                        }) =>
+                {
+                    file.as_mut()
+                        .expect("checked")
+                        .wires
+                        .push(FileWire { to, from });
                 }
                 Item::Removed(r) if r.slug.starts_with(SLUG_PREFIX) => {
                     file.as_mut()
@@ -355,12 +436,27 @@ impl PageFile {
         }
         out.push_str(&render_page(&page));
         out.push('\n');
-        if !self.blocks.is_empty() {
+        let (adopted, added): (Vec<&NewBlock>, Vec<&NewBlock>) =
+            self.blocks.iter().partition(|b| b.adopted);
+        if !added.is_empty() {
             out.push('\n');
         }
-        for b in &self.blocks {
+        for b in added {
             out.push_str(&b.render());
             out.push('\n');
+        }
+        if !adopted.is_empty() {
+            out.push_str(&format!(
+                "\n# {ADOPTED_LINE}: drawn there, managed here since; they keep their UUIDs.\n"
+            ));
+        }
+        for b in adopted {
+            out.push_str(&b.render());
+            out.push('\n');
+            for w in self.wires.iter().filter(|w| w.from.slug == b.slug) {
+                out.push_str(&w.render());
+                out.push('\n');
+            }
         }
         if !self.removed.is_empty() {
             out.push_str("\n# Added here and taken out again before Apply.\n");
@@ -510,12 +606,14 @@ mod tests {
             ty: "And".into(),
             title: Some("Licht an".into()),
             args: vec![("In2".into(), Value::Number("1".into()))],
+            ..Default::default()
         });
         f.blocks.push(NewBlock {
             slug: "vx_or_1".into(),
             ty: "Or".into(),
             title: None,
             args: vec![],
+            ..Default::default()
         });
         f.removed.insert("vx_not_1".into());
         let text = f.render();
@@ -531,6 +629,65 @@ mod tests {
         assert!(text.contains("vx_or_1 = Or()\n"), "{text}");
         assert!(text.contains("removed vx_not_1\n"), "{text}");
         assert_eq!(PageFile::parse(&text).unwrap(), f);
+    }
+
+    #[test]
+    fn an_adopted_block_round_trips_with_its_wires() {
+        let mut f = PageFile::new("Erdgeschoss");
+        f.uuid = Some("10000002-0000-0020-ffff504f94000001".into());
+        f.blocks.push(NewBlock {
+            slug: "vx_and_1".into(),
+            ty: "And".into(),
+            ..Default::default()
+        });
+        let ext = |s: &str, p: &str| PortRef {
+            slug: s.into(),
+            port: p.into(),
+        };
+        f.blocks.push(NewBlock {
+            slug: "vx_gate".into(),
+            ty: "And".into(),
+            title: Some("O1001".into()),
+            args: vec![("In2".into(), Value::Number("1".into()))],
+            adopted: true,
+            wires: vec![
+                (
+                    "In1".into(),
+                    ext("vx_10000001_0000_0010_ffff504f94000001", ""),
+                ),
+                (
+                    "In3".into(),
+                    ext("vx_10000006_0000_0060_ffff504f94000001", "AQ"),
+                ),
+            ],
+        });
+        f.wires.push(FileWire {
+            to: ext("vx_10000005_0000_0050_ffff504f94000001", "Power"),
+            from: ext("vx_gate", ""),
+        });
+        let text = f.render();
+        assert!(
+            text.contains(
+                "vx_gate = And(\"O1001\", In2: 1, In1: vx_10000001_0000_0010_ffff504f94000001, \
+                 In3: vx_10000006_0000_0060_ffff504f94000001.AQ)\n\
+                 vx_10000005_0000_0050_ffff504f94000001.Power <- vx_gate\n"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("# Adopted from Loxone Config"), "{text}");
+        assert_eq!(PageFile::parse(&text).unwrap(), f);
+        // Before the adopted comment, a block with a wire is not vislox's.
+        assert!(
+            PageFile::parse("page \"A\"\nvx_and_1 = And(In1: x.Q)\n")
+                .unwrap_err()
+                .contains("did not write")
+        );
+        // A wire out of a block that is not adopted here is not either.
+        assert!(
+            PageFile::parse("page \"A\"\n# Adopted from Loxone Config\nvx_b.In1 <- vx_c\n")
+                .unwrap_err()
+                .contains("did not write")
+        );
     }
 
     #[test]

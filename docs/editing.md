@@ -1,8 +1,8 @@
 # Editing in vislox
 
 vislox becomes an editor in steps: edit values (#58), add blocks (#59), move blocks, inputs and outputs (#60),
-make and change connections (#61), and undo and redo (#62). This page is the design they share. #58 to #62 are
-built; the rest says where each step plugs in.
+make and change connections (#61), undo and redo (#62), and adopt the blocks Loxone Config drew (#72). This page
+is the design they share. #58 to #62 and #72 are built; the rest says where each step plugs in.
 
 ## The rules
 
@@ -15,8 +15,9 @@ built; the rest says where each step plugs in.
   the values it claims and the wires it draws, and one file per page for the blocks it adds
   (`<module>/vislox/obergeschoss.loxl`).
   The rest of the module is never touched. A module that is one file cannot be edited from vislox.
-  The one exception is a move (#60): lox keeps a managed block's position in the lockfile, not in the source,
-  so vislox writes it there, the way lox's own `--relayout` does (see *Moving blocks*).
+  The exceptions are the lockfile: a move (#60), since lox keeps a managed block's position there, not in the
+  source, so vislox writes it there the way lox's own `--relayout` does (see *Moving blocks*); and an adopted
+  block's entry (#72), which `lox logic adopt` writes on a copy and vislox copies over (see *Adopting blocks*).
 - **Every edit is compiled with `lox logic compile`** and shows as the *Pending* revision. Change review, Apply,
   Discard and Sync work on it as on any other compile.
 - **Editing never deploys.** It runs `lox logic compile` and nothing else, and sends nothing to the Miniserver.
@@ -40,8 +41,13 @@ POST /api/edit
            { "op": "relayout", "page": "<page uuid>" },
            { "op": "place", "moves": [ { "uuid": "…", "x": 1920, "y": 960 } ] },
            { "op": "wire",   "from": ["<uuid>", "AQ"], "to": ["<uuid>", "I2"] },
-           { "op": "unwire", "from": ["<uuid>", "Q"],  "to": ["<uuid>", "I1"] } ] }
+           { "op": "unwire", "from": ["<uuid>", "Q"],  "to": ["<uuid>", "I1"] },
+           { "op": "adopt", "blocks": [ { "uuid": "…", "slug": "vx_licht" } ] },
+           { "op": "adopt_page", "page": "<page uuid>" },
+           { "op": "unadopt", "uuids": [ "…" ] } ] }
 ```
+
+`adopt`, `adopt_page` and `unadopt` go in a request of their own (#72).
 
 - `base` is the git blob id of what the browser showed: the newest compile, or the deployed config when nothing
   is pending. When the file on disk is another one (someone compiled, applied or discarded), the edit is refused
@@ -53,7 +59,9 @@ POST /api/edit
   `add_block` it is null, and `remove_block` with the new UUID undoes it. For `move` it is the `move` back to
   where the block was; for `relayout`, the `place` that puts each block back (one op however many
   blocks the page has; `place` moves several managed blocks as `move` does), and for `place`, the `place` back. For `wire` it is the
-  `unwire` of the same ends, and for `unwire` the `wire`. A reconnected wire is one request, `unwire` then `wire`:
+  `unwire` of the same ends, and for `unwire` the `wire`. For `adopt` and `adopt_page` it is the `unadopt` of
+  the blocks adopted, and for `unadopt` the `adopt` with the same slugs: a block keeps its UUIDs both ways.
+  A reconnected wire is one request, `unwire` then `wire`:
   undone, the reverse list. The ops of one request see each other: `unwire` then `wire` of the same wire is
   accepted (and changes nothing). `remove_block`'s `add_block` carries the wires the removal took out
   (`wires`, an empty UUID for the block itself), since lox mints new UUIDs when it is added again, and names the
@@ -122,6 +130,66 @@ vx_pulseat_1 = PulseAt(At: 07:05, Pulse: "time")
   (never committed, or ignored by git) goes back to how it was before vislox's first edit since that commit,
   which vislox keeps in the git directory; one vislox never edited stays as it is, since a lost lock re-mints
   every managed block. Discard is all or nothing: when a step fails, it puts back what the others did.
+
+## Adopting blocks (#72)
+
+A block drawn in Loxone Config is edited from source only once the module manages it, and lox refuses some of
+its values on a block it does not manage (a Formula's text, a Daytimer's On/Off, a memory flag's type, `Desc` on
+logic blocks). `lox logic adopt <base> --uuid <uuid> --as <slug> --module … --lock …` puts it under the module:
+the block's declaration, externs for its wired neighbours and `<-` wires onto them, appended to the module's file
+of its page, and its UUIDs, layout and page pinned in the lockfile, written only once lox has rebuilt the config
+unchanged in memory. lox has no structured edit command, so vislox works on what adopt writes:
+
+- **On a copy.** vislox copies the module and the lockfile into a scratch directory and runs `lox logic adopt`
+  there, from the project, against the project's base (lox adopts from the config it compiles against, so the
+  block must be in the base). It never runs it on the project: lox would write the module's own files.
+- **Into vislox's files.** What lox appended (the statements after each file's old ones; a new file's `page` line
+  aside) is moved into vislox's file of the page (`<module>/vislox/<page>.loxl`, the same file blocks added there
+  live in), under a `# Adopted from Loxone Config` comment: the declaration, then its wires. Every extern lox
+  pinned (by title or iname) becomes vislox's extern of that object, `vx_<uuid>` pinned by UUID in `edits.loxl`,
+  and every reference is renamed to it, so vislox's files never name the module's own slugs; such an extern stays
+  while an adopted block names it. A neighbour the rest of the module manages is refused (vislox's files would
+  name its slug); a neighbour of vislox's files is named by its slug.
+- **The lockfile** gains the block's entry (`objects.<slug>`, as lox wrote it on the copy, keyed by vislox's slug)
+  and the `extern_wires` lox recorded for its wires onto externs; lox's own extern entries stay on the copy (the
+  compile pins vislox's by UUID). Then `lox logic compile` runs as for any edit.
+- **Checked.** After the compile, the pending config must be what it was (`loxone_config::diff`: no block, value,
+  place or wire changed) and each adopted block exactly as the base has it: its element (UUIDs, connectors and
+  their wires, parameters, place; attribute order and whitespace aside) and the wires out of it. Anything else
+  refuses the edit, and the files, lock and out are put back.
+- **The slug** is `vx_` and lowercase letters, digits and `_` (vislox's files hold only `vx_` names), not taken by
+  the module, its lockfile (tombstones too) or vislox's files; left empty, vislox makes one from the block's name
+  (`Licht Küche` → `vx_licht_kueche`), else its type.
+- **Not offered** (`adopt` in `GET /api/edits`: UUID → null, or why): a block not on a logic page (devices and
+  the object tree are #84 and #85), of a type lox has no table for (notes, …), not in the base, on another page
+  than in the base, with values or wires vislox's edits claim (revert them first: lox would move those lines into
+  the declaration), an extern of the module's own files (lox adopts it only under that name and rewrites those
+  files), or wired to a block adopted earlier (lox would rewrite that block's lines: adopt them together, or hand
+  that one back first). lox's own refusals (a block version or attribute its rebuild does not know, a wire into a
+  managed block its declaration does not bind) come back as lox says them; so does any warning, and the block
+  stays Loxone Config's. A block whose program lox would write into a file of its own (`Code: file(…)`) is
+  refused too.
+- **`adopt_page`** adopts every block of the page that is offered, in the order that feeds lox the sources before
+  the blocks they feed (lox adopts a block wired into a managed one only when that one's declaration binds the
+  wire, and binds it when it adopts the sink second; a block an earlier adoption of the request pinned as an
+  extern is adopted under that extern's name, and renamed after). The reply's `skipped` names each block it left
+  to Loxone Config and why; `adopted` names the slugs.
+- **Managed then.** The block is in `blocks` (`adopted: true`, and `committed` once the deployed revision's commit
+  has it) and is a block of vislox's files: its name, unwired inputs' constants and settings change its
+  declaration, it is moved (#60), and wired (#61) like a block added here (lox ORs a second wire into a bound
+  input). The wires its declaration brought along are its declaration's now (`adopted_wires`, `wire_why.adopted`):
+  vislox does not take them out yet. Remove refuses it (it is deployed); deleting a managed block is #80.
+- **`unadopt`** (the undo, and *Hand back* in Properties) takes the declaration and its wires out of vislox's file,
+  the entry out of the lockfile with every `extern_wires` entry of its ports (without its line lox would take
+  those wires out of the config: they are Loxone Config's again), and drops the externs nothing else names. Only
+  a block whose pending state is the base's (what was changed here is reverted first), that no wire drawn here or
+  other adopted block names. It is checked like an adoption.
+- **Nothing pending.** Adopting changes nothing the Miniserver runs, so `out` stays as it was and nothing is
+  pending: Apply has nothing to deploy. The Deploy pane says how many blocks adopted here are not committed yet;
+  they go into git with the next Apply. Undo hands them back; Discard (with something pending) drops them too.
+
+Later: #79 edits the settings lox takes only on a managed block, #80 deletes and renames adopted blocks, and
+taking out a wire an adopted declaration brought along is left to a later step.
 
 ## Moving blocks (#60)
 
@@ -498,16 +566,17 @@ cannot express is left out, not worked around.
 | #60 move | none: `layout` in the lockfile | Only a block the module manages; snapped to the grid. |
 | #60 arrange | `lox logic compile --relayout <page>` | Lays out the page's managed blocks afresh. |
 | #61 wire | `x.Port <- y.Q` in `edits.loxl` | Adds a wire between objects Loxone Config drew and blocks added here, and removes one vislox drew. A wire Loxone Config drew cannot be removed. |
+| #72 adopt | `lox logic adopt` on a copy; its declaration in `<module>/vislox/<page>.loxl` | The block keeps its UUIDs, the config stays as it is; then edited like a block added here. |
 
 Blocks the module already manages (they are in the lockfile) are refused: they are edited in their own `.loxl`.
-The blocks vislox added are the exception: their `.loxl` is vislox's.
+The blocks vislox added or adopted (#72) are the exception: their `.loxl` is vislox's.
 
 ## What lox cannot do, so vislox does not offer it
 
 - Parameters stored on the block element of a block the module does not manage: a Formula's text, a Daytimer's
   On/Off labels, a memory flag's type, a virtual input's Analog, MinVal, MaxVal and DefVal, and `Desc` on logic
-  blocks. lox takes them only in the declaration of a block it manages: adopt the block first (#72), then edit
-  it as a managed block (#79).
+  blocks. lox takes them only in the declaration of a block it manages: adopt the block first (#72, built), then
+  edit it as a managed block (#79).
 - A room or category on an object that has none.
 - Handing a value back after Apply: deleting a claim makes lox restore the value from before the claim, which
   undoes the applied change. So once applied, the module owns the value, and a later change in Loxone Config is
@@ -546,7 +615,7 @@ Each of these plugs in as new op kinds on `POST /api/edit`, written into `<modul
 | #60 (built) | positions of managed blocks (the lockfile's `layout`), `--relayout` |
 | #61 (built) | wires (`<-`) |
 | #62 (built) | undo and redo (the edits' own `undo`, sent back as an edit) |
-| #72 | adopt a block into the module |
+| #72 (built) | adopt a block into the module (`lox logic adopt`) |
 | #73 | Daytimer switching times (`schedule`, `.schedule`) |
 | #74 | lighting moods and circuits (`moods`, `.moods`) |
 | #75 | members of a central block (`.members`) |
@@ -605,7 +674,8 @@ lost is deleted only with consent to exactly that list, see [features.md](featur
   those the pending config draws elsewhere than the deployed one (`moves`: UUID, position, deployed position),
   for each page with such a block whether *Arrange* can lay it out (`arrange`: page UUID → null, or why not), and
   the wires vislox's files draw now or drew in the deployed revision (`wires`: `from`, `to`, `now`, `deployed`), the
-  wires the rest of the module draws (`module_wires`), and why vislox leaves those and Loxone Config's alone
-  (`wire_why`). It
+  wires the rest of the module draws (`module_wires`) and those an adopted block brought along
+  (`adopted_wires`), why vislox leaves those and Loxone Config's alone (`wire_why`), and which blocks can be
+  adopted (`adopt`, #72). It
   is worked out again only when vislox's files, the lockfile, the deployed or
   the pending config changes (`actions.edit.key`); the browser fetches it only then.

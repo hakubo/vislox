@@ -31,6 +31,14 @@ published under the same version (see [docker/README.md](docker/README.md)).
   deploys. The history is cleared, saying why, when the pending config changes outside the page (another edit, a
   compile, Discard, Apply, Sync). It is the tab's own, kept for the config it was made on, so it survives a reload.
   A relayout is undone by one new op, `place`, however many blocks the page has.
+- Adopt blocks Loxone Config drew into the module (#72): *Manage with Lox Logic* in Properties (with the slug it
+  gets) and *Adopt all* on a page run `lox logic adopt` on a copy of the module and lockfile; vislox moves the
+  declaration into its file of the page (its neighbours as externs pinned by UUID), adds the block to the
+  lockfile, compiles, and refuses unless the config is exactly what it was, each block exactly the base's (same
+  UUIDs, connectors, wires, parameters and place). An adopted block is then moved, renamed, given constants and
+  settings, and wired like a block added here. *Adopt all* says why each block it skips stays Loxone Config's.
+  The ops are `adopt`, `adopt_page` and `unadopt` (the undo, also *Hand back*). Never deploys; nothing is pending
+  after it, and it goes into git with the next Apply.
 - Roll back an Apply (#69): in the History, the deployed Apply has *Roll back to before this* when its push left
   the download from before it in `backups/`. vislox shows what that deploys (the module and lockfile from before
   the Apply, compiled onto that download, which must give it back) as a revision compared with what runs now,

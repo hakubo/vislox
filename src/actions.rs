@@ -21,6 +21,7 @@
 
 use crate::{check, edit, restart};
 
+mod adopt;
 mod removals;
 mod rollback;
 mod scan;
@@ -2030,6 +2031,31 @@ impl Actions {
             Default::default()
         };
         let drawn = files.claims.1.clone();
+        // Adopting (#72) is worked out on a scratch copy first: lox writes
+        // there, and the ops move what it wrote into vislox's files.
+        let adopt_op = |o: &edit::Op| {
+            matches!(
+                o,
+                edit::Op::Adopt { .. } | edit::Op::AdoptPage { .. } | edit::Op::Unadopt { .. }
+            )
+        };
+        let adopting = req.ops.iter().any(adopt_op);
+        if adopting && !req.ops.iter().all(adopt_op) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "adopt, adopt_page and unadopt go in a request of their own".into(),
+            ));
+        }
+        let prepared = if req
+            .ops
+            .iter()
+            .any(|o| matches!(o, edit::Op::Adopt { .. } | edit::Op::AdoptPage { .. }))
+        {
+            self.adopt_prepare(&p, &files, &lock, &base, &doc, &req.ops)
+                .await?
+        } else {
+            adopt::Prepared::default()
+        };
         let ctx = edit::Ctx {
             doc: &doc,
             base: &base,
@@ -2037,6 +2063,8 @@ impl Actions {
             deployed: deployed.as_ref(),
             names: &names,
             drawn: &drawn,
+            adoptions: &prepared.adoptions,
+            page_adoptions: &prepared.pages,
         };
         // `removed` lines lox needs no more go first: their slugs are free.
         files.tidy(&lock);
@@ -2101,6 +2129,15 @@ impl Actions {
             std::fs::write(&p.lock, moved)
                 .map_err(|e| fail(format!("cannot write {shown_lock}: {e}")))?;
         }
+        // An adopted block's lockfile entry (#72), or its undo's.
+        if !files.lock_edits.is_empty() {
+            let shown_lock = p.lock.strip_prefix(&p.root).unwrap_or(&p.lock).display();
+            let bytes = std::fs::read(&p.lock)
+                .map_err(|e| fail(format!("cannot read {shown_lock}: {e}")))?;
+            let edited = crate::adopt::write_lock(&bytes, &files.lock_edits).map_err(bad)?;
+            std::fs::write(&p.lock, edited)
+                .map_err(|e| fail(format!("cannot write {shown_lock}: {e}")))?;
+        }
         let mut args = vec!["logic", "compile"];
         for title in place.relayout.values() {
             args.extend(["--relayout", title.as_str()]);
@@ -2146,6 +2183,34 @@ impl Actions {
                 )));
             }
         }
+        // Adopting changes who owns a block, never what the Miniserver runs:
+        // the pending config is what it was, each block exactly the base's.
+        let mut adopted = Vec::new();
+        if adopting {
+            let out = std::fs::read(&p.out)
+                .map_err(|e| fail(e.to_string()))
+                .and_then(|b| edit::parse_doc(&b).map_err(fail))?;
+            let mut uuids: Vec<String> = Vec::new();
+            for op in &req.ops {
+                match op {
+                    edit::Op::Adopt { blocks } => {
+                        uuids.extend(blocks.iter().map(|b| b.uuid.clone()))
+                    }
+                    edit::Op::AdoptPage { page } => {
+                        uuids.extend(prepared.pages.get(page).cloned().unwrap_or_default())
+                    }
+                    edit::Op::Unadopt { uuids: u } => uuids.extend(u.iter().cloned()),
+                    _ => {}
+                }
+            }
+            crate::adopt::verify(&base, &doc, &out, &uuids)
+                .map_err(|e| bad(format!("{e}. Nothing was adopted or handed back.")))?;
+            for u in &uuids {
+                if let Some(a) = prepared.adoptions.get(u) {
+                    adopted.push(json!({ "uuid": u, "slug": a.slug }));
+                }
+            }
+        }
         let minted: Vec<Option<String>> = slugs
             .iter()
             .map(|s| s.as_deref().and_then(|s| lock.uuid_of(s)).map(String::from))
@@ -2170,6 +2235,10 @@ impl Actions {
         undo.keep();
         *self.compiled.lock().unwrap() = Some(compiled);
         let mut r = json!({ "previous": previous, "blob": blob, "added": added });
+        if adopting {
+            r["adopted"] = json!(adopted);
+            r["skipped"] = json!(prepared.skipped);
+        }
         undo_into(&mut r, edit::undo_ops(&req.ops, &previous, &minted));
         Ok(r)
     }
@@ -2946,6 +3015,9 @@ impl Actions {
                     "page": f.page,
                     "file": format!("{rel_dir}/{name}"),
                     "settings": edit::new_block_settings(b),
+                    "adopted": b.adopted,
+                    // In vislox's files as the deployed revision's commit has them.
+                    "committed": was.block(&b.slug).is_some(),
                     "deployed": uuid.is_some_and(|u| deployed_doc
                         .as_ref()
                         .is_some_and(|d| edit::find(&d.xml.root, u).is_some())),
@@ -2978,11 +3050,38 @@ impl Actions {
         // why vislox leaves them and Loxone Config's alone: one rule with
         // `unwire`'s.
         let module_wires: Vec<Value> = shown
-            .map(|d| edit::module_wires(d, &lock, &now))
+            .map(|d| edit::module_wires(d, &lock, &now, edit::Owner::Module))
             .unwrap_or_default()
             .into_iter()
             .map(|(f, t)| json!({ "from": f, "to": t }))
             .collect();
+        // The wires a block adopted here brought along (#72).
+        let adopted_wires: Vec<Value> = shown
+            .map(|d| edit::module_wires(d, &lock, &now, edit::Owner::Adopted))
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(f, t)| json!({ "from": f, "to": t }))
+            .collect();
+        // Which blocks Properties offers to adopt (#72), on the config shown:
+        // UUID → null, or why not. Only blocks drawn on a page, of a type lox
+        // has a table for, that the module does not manage yet.
+        let mut adopt = serde_json::Map::new();
+        let base_doc = std::fs::read(&p.base)
+            .ok()
+            .and_then(|b| edit::parse_doc(&b).ok());
+        if let (Some(doc), Some(base_doc)) = (shown, base_doc.as_ref())
+            && state.why.is_none()
+        {
+            for page in crate::adopt::pages(doc) {
+                for (u, ..) in crate::adopt::on_page(doc, &page) {
+                    if lock.slug_of(&u).is_some() {
+                        continue;
+                    }
+                    let why = adopt::why_not(&u, base_doc, doc, &lock, &now);
+                    adopt.insert(u, json!(why));
+                }
+            }
+        }
         json!({
             "available": state.why.is_none(),
             "reason": state.why,
@@ -2999,9 +3098,12 @@ impl Actions {
             "arrange": arrange,
             "wires": wires,
             "module_wires": module_wires,
+            "adopted_wires": adopted_wires,
+            "adopt": adopt,
             "wire_why": {
                 "module": edit::Owner::Module.why(),
                 "loxone_config": edit::Owner::LoxoneConfig.why(),
+                "adopted": edit::Owner::Adopted.why(),
             },
         })
     }
@@ -5248,6 +5350,453 @@ esac
                 .ends_with("--relayout Erdgeschoss"),
             "{calls}"
         );
+    }
+
+    /// A stand-in lox for adopting (#72): `logic adopt` declares the Divide
+    /// block on the ground floor as lox would (refusing the meter), and
+    /// `logic compile` copies the base, or renames the block when `../break`
+    /// exists (a compile that changes the config).
+    #[cfg(unix)]
+    fn lox_that_adopts(tmp: &Path) {
+        std::fs::write(
+            tmp.join("lox"),
+            r#"#!/bin/sh
+echo "$*" >> ../calls.log
+case "$1 $2" in
+"logic adopt")
+  u=$5; s=$7; m=$9; l=${11}
+  { [ "$u" = "10000005-0000-0050-ffff504f94000001" ] || [ -f ../refuse-all ]; } && { echo "error: compile error: cannot adopt MeterAbsUni \"Zähler\": its outputs are hidden" >&2; exit 1; }
+  printf 'page "Erdgeschoss"\n\nextern temperatur = VirtualIn(iname: "VI1")\n\n%s = Div("O1002", In2: 1000, In1: temperatur)\n' "$s" > "$m/erdgeschoss.loxl"
+  printf '{"objects":{"%s":{"uuid":"%s","type":"Div","ports":{"AQ":"10000006-0000-0063-02ff504f94000001"},"page_uuid":"10000002-0000-0020-ffff504f94000001"}},"externals":{"temperatur":{"uuid":"10000001-0000-0010-ffff504f94000001","matched_by":"iname"}},"extern_wires":[]}\n' "$s" "$u" > "$l"
+  echo "adopted uuid $u as \`$s\` on page \"Erdgeschoss\""
+  ;;
+"logic compile")
+  out=out.Loxone; prev=
+  for a in "$@"; do [ "$prev" = --out ] && out=$a; prev=$a; done
+  if [ -f ../break ] && [ -d pages/vislox ]; then sed 's/Title="O1002"/Title="X"/' base.Loxone > "$out"; else cp base.Loxone "$out"; fi
+  ;;
+*) echo "unexpected: $*" >&2; exit 2 ;;
+esac
+"#,
+        )
+        .unwrap();
+    }
+
+    /// Adopting with a stand-in lox (#72): what lox writes on the scratch copy
+    /// moves into vislox's files and the lock, the config stays as it is, the
+    /// undo hands it back, and a compile that changes the config, a block lox
+    /// refuses, one vislox claims or a mixed request change nothing.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_block_is_adopted_without_changing_the_config() {
+        use axum::http::StatusCode;
+        let (tmp, a) = project_for_edits();
+        lox_that_adopts(tmp.path());
+        let d = tmp.path().join("project");
+        std::fs::write(d.join("pages/own.loxl"), "page \"Obergeschoss\"\n").unwrap();
+        std::fs::write(d.join("logic.lock.json"), "{\"objects\":{}}\n").unwrap();
+        sh(&d, "git add -A && git commit -qm module");
+        let base = std::fs::read(d.join("base.Loxone")).unwrap();
+        let adopt = |uuid: &str, slug: Option<&str>| edit::Request {
+            base: blob(&d, "out.Loxone"),
+            ops: vec![edit::Op::Adopt {
+                blocks: vec![crate::adopt::Pick {
+                    uuid: uuid.into(),
+                    slug: slug.map(Into::into),
+                }],
+            }],
+        };
+        // lox refuses the meter: its message, and nothing written.
+        let e = a
+            .edit(
+                &adopt("10000005-0000-0050-ffff504f94000001", None),
+                deployed(&d),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(e.0, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            e.1.contains("lox cannot adopt Zähler: cannot adopt MeterAbsUni"),
+            "{e:?}"
+        );
+        assert!(!d.join("pages/vislox").exists());
+        // A slug that is not vislox's.
+        let e = a
+            .edit(&adopt(DIV, Some("teiler")), deployed(&d))
+            .await
+            .unwrap_err();
+        assert!(e.1.contains("vx_"), "{e:?}");
+        // A compile that changes the config: refused, and everything put back.
+        std::fs::write(tmp.path().join("break"), "").unwrap();
+        let lock = std::fs::read(d.join("logic.lock.json")).unwrap();
+        let e = a.edit(&adopt(DIV, None), deployed(&d)).await.unwrap_err();
+        assert!(
+            e.1.contains("does not rebuild O1002 exactly as the base has it"),
+            "{e:?}"
+        );
+        assert!(!d.join("pages/vislox/erdgeschoss.loxl").exists());
+        assert_eq!(std::fs::read(d.join("logic.lock.json")).unwrap(), lock);
+        assert_eq!(std::fs::read(d.join("out.Loxone")).unwrap(), base);
+        std::fs::remove_file(tmp.path().join("break")).unwrap();
+        // Adopted: its declaration with vislox's extern, its lock entry.
+        let r = a.edit(&adopt(DIV, None), deployed(&d)).await.unwrap();
+        assert_eq!(
+            r["adopted"],
+            json!([{ "uuid": DIV, "slug": "vx_o1002" }]),
+            "{r}"
+        );
+        let file = std::fs::read_to_string(d.join("pages/vislox/erdgeschoss.loxl")).unwrap();
+        assert!(
+            file.contains(
+                "vx_o1002 = Div(\"O1002\", In2: 1000, In1: vx_10000001_0000_0010_ffff504f94000001)"
+            ),
+            "{file}"
+        );
+        let claims = std::fs::read_to_string(d.join("pages/vislox/edits.loxl")).unwrap();
+        assert!(
+            claims.contains("extern vx_10000001_0000_0010_ffff504f94000001 = VirtualIn(uuid: "),
+            "{claims}"
+        );
+        let l: Value =
+            serde_json::from_slice(&std::fs::read(d.join("logic.lock.json")).unwrap()).unwrap();
+        assert_eq!(l["objects"]["vx_o1002"]["uuid"], DIV, "{l}");
+        assert!(
+            l["externals"].get("temperatur").is_none(),
+            "lox's extern stays on the scratch copy: {l}"
+        );
+        assert_eq!(std::fs::read(d.join("out.Loxone")).unwrap(), base);
+        let calls = std::fs::read_to_string(tmp.path().join("calls.log")).unwrap();
+        assert!(
+            calls
+                .lines()
+                .all(|l| l.starts_with("logic adopt") || l.starts_with("logic compile")),
+            "{calls}"
+        );
+        assert!(
+            calls
+                .lines()
+                .filter(|l| l.starts_with("logic adopt"))
+                .all(|l| !l.contains(&d.join("logic.lock.json").display().to_string())),
+            "lox adopts on a copy of the lock: {calls}"
+        );
+        // Not offered again; adopted, deployed.
+        let e = edits_of(&a, &d).await;
+        assert!(e["adopt"].get(DIV).is_none(), "{}", e["adopt"]);
+        assert_eq!(
+            e["adopt"]["10000004-0000-0040-ffff504f94000001"],
+            Value::Null,
+            "{}",
+            e["adopt"]
+        );
+        let b = &e["blocks"][0];
+        assert_eq!(
+            (b["uuid"].as_str(), b["adopted"].as_bool()),
+            (Some(DIV), Some(true)),
+            "{e}"
+        );
+        let e = a.edit(&adopt(DIV, None), deployed(&d)).await.unwrap_err();
+        assert!(e.1.contains("managed by the module already"), "{e:?}");
+        // Remove is not how it goes back; the undo is.
+        let rm = edit::Request {
+            base: blob(&d, "out.Loxone"),
+            ops: vec![edit::Op::RemoveBlock { uuid: DIV.into() }],
+        };
+        let e = a.edit(&rm, deployed(&d)).await.unwrap_err();
+        assert!(e.1.contains("Undo the adoption"), "{e:?}");
+        // Adopt and other ops do not share a request.
+        let mixed = edit::Request {
+            base: blob(&d, "out.Loxone"),
+            ops: vec![
+                edit::Op::Unadopt {
+                    uuids: vec![DIV.into()],
+                },
+                edit::Op::Title {
+                    uuid: DIV.into(),
+                    value: Some("x".into()),
+                },
+            ],
+        };
+        assert_eq!(
+            a.edit(&mixed, deployed(&d)).await.unwrap_err().0,
+            StatusCode::BAD_REQUEST
+        );
+        let undo: Vec<edit::Op> = serde_json::from_value(r["undo"].clone()).unwrap();
+        let back = a
+            .edit(
+                &edit::Request {
+                    base: blob(&d, "out.Loxone"),
+                    ops: undo,
+                },
+                deployed(&d),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            back["undo"],
+            json!([{ "op": "adopt", "blocks": [{ "uuid": DIV, "slug": "vx_o1002" }] }]),
+            "{back}"
+        );
+        assert!(!d.join("pages/vislox/erdgeschoss.loxl").exists());
+        let l: Value =
+            serde_json::from_slice(&std::fs::read(d.join("logic.lock.json")).unwrap()).unwrap();
+        assert!(l["objects"].as_object().unwrap().is_empty(), "{l}");
+        // A block vislox claims a value on is not adopted until that goes.
+        a.edit(&title(blob(&d, "out.Loxone"), Some("Teiler")), deployed(&d))
+            .await
+            .unwrap();
+        let e = a.edit(&adopt(DIV, None), deployed(&d)).await.unwrap_err();
+        assert!(e.1.contains("revert them first, then adopt it"), "{e:?}");
+        // Nor by its page: why, and nothing adopted when no block is left.
+        let page = edit::Request {
+            base: blob(&d, "out.Loxone"),
+            ops: vec![edit::Op::AdoptPage {
+                page: "10000002-0000-0020-ffff504f94000001".into(),
+            }],
+        };
+        std::fs::write(tmp.path().join("refuse-all"), "").unwrap();
+        let e = a.edit(&page, deployed(&d)).await.unwrap_err();
+        assert_eq!(e.0, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            e.1.contains("lox can adopt no block of this page")
+                && e.1.contains("revert them first"),
+            "{e:?}"
+        );
+    }
+
+    /// A project of the fixture compiled by `lox` (the real one), with a
+    /// module of its own on the upper floor.
+    #[cfg(unix)]
+    fn project_with_lox(lox: &Path) -> (tempfile::TempDir, Actions) {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("project");
+        std::fs::create_dir_all(d.join("pages")).unwrap();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/house.Loxone");
+        std::fs::copy(&fixture, d.join("base.Loxone")).unwrap();
+        std::fs::write(
+            d.join("lox.toml"),
+            "base = \"base.Loxone\"\nmodule = \"pages\"\nout = \"out.Loxone\"\nserial = \"504F94000001\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            d.join("pages/own.loxl"),
+            "# The module's own.\npage \"Obergeschoss\"\n",
+        )
+        .unwrap();
+        sh(&d, &format!("{} logic compile >/dev/null", lox.display()));
+        sh(
+            &d,
+            "git init -q && git config user.email t@t && git config user.name t \
+             && git add -A && git commit -qm init",
+        );
+        let a = Actions::new(Settings {
+            token: Some("t".into()),
+            project: Some(d),
+            lox: lox.to_path_buf(),
+            probe: None,
+            running: Arc::new(crate::running::Running::new(Err("test".into()))),
+        });
+        (tmp, a)
+    }
+
+    /// Adopting with the real lox (#72): set `VISLOX_TEST_LOX` to a lox
+    /// binary (v0.83.0) to run it; it never talks to a Miniserver. The block
+    /// and its neighbours' wires move into vislox's files, the pending config
+    /// stays byte for byte the base, its name is then edited in its
+    /// declaration, and the undo hands it back exactly.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn adopting_with_lox_changes_nothing_the_miniserver_runs() {
+        let Some(lox) = std::env::var_os("VISLOX_TEST_LOX") else {
+            eprintln!("VISLOX_TEST_LOX is not set: skipped");
+            return;
+        };
+        let (tmp, a) = project_with_lox(Path::new(&lox));
+        let d = tmp.path().join("project");
+        const GATE: &str = "10000004-0000-0040-ffff504f94000001";
+        let lock_was = std::fs::read(d.join("logic.lock.json")).unwrap();
+        let base = std::fs::read(d.join("base.Loxone")).unwrap();
+        let r = a
+            .edit(
+                &edit::Request {
+                    base: blob(&d, "out.Loxone"),
+                    ops: vec![edit::Op::Adopt {
+                        blocks: vec![crate::adopt::Pick {
+                            uuid: GATE.into(),
+                            slug: Some("vx_tor".into()),
+                        }],
+                    }],
+                },
+                deployed(&d),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            r["adopted"],
+            json!([{ "uuid": GATE, "slug": "vx_tor" }]),
+            "{r}"
+        );
+        assert_eq!(
+            r["undo"],
+            json!([{ "op": "unadopt", "uuids": [GATE] }]),
+            "{r}"
+        );
+        let page = std::fs::read_to_string(d.join("pages/vislox/erdgeschoss.loxl")).unwrap();
+        assert!(
+            page.contains("vx_tor = And(\"O1001\", In1: vx_10000001_0000_0010_ffff504f94000001)"),
+            "{page}"
+        );
+        assert!(
+            page.contains("vx_10000005_0000_0050_ffff504f94000001.Power <- vx_tor"),
+            "{page}"
+        );
+        let claims = std::fs::read_to_string(d.join("pages/vislox/edits.loxl")).unwrap();
+        assert!(
+            claims.contains("extern vx_10000009_0000_0090_ffff504f94000001 = Or(uuid:"),
+            "{claims}"
+        );
+        assert_eq!(
+            std::fs::read(d.join("out.Loxone")).unwrap(),
+            base,
+            "the config is unchanged"
+        );
+        let lock: Value =
+            serde_json::from_slice(&std::fs::read(d.join("logic.lock.json")).unwrap()).unwrap();
+        assert_eq!(lock["objects"]["vx_tor"]["uuid"], GATE);
+        // Managed by vislox's file now: in `blocks`, adopted, not offered again.
+        let e = edits_of(&a, &d).await;
+        let b = e["blocks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|b| b["uuid"] == GATE)
+            .unwrap()
+            .clone();
+        assert_eq!(
+            (b["adopted"].clone(), b["deployed"].clone()),
+            (json!(true), json!(true)),
+            "{b}"
+        );
+        assert!(e["adopt"].get(GATE).is_none(), "{}", e["adopt"]);
+        assert!(
+            e["adopt"]["10000006-0000-0060-ffff504f94000001"].is_null(),
+            "{}",
+            e["adopt"]
+        );
+        assert_eq!(
+            e["adopted_wires"].as_array().unwrap().len(),
+            3,
+            "{}",
+            e["adopted_wires"]
+        );
+        // Its name is edited in its declaration, like a block added here.
+        let renamed = a
+            .edit(
+                &edit::Request {
+                    base: blob(&d, "out.Loxone"),
+                    ops: vec![edit::Op::Title {
+                        uuid: GATE.into(),
+                        value: Some("Tor".into()),
+                    }],
+                },
+                deployed(&d),
+            )
+            .await
+            .unwrap();
+        assert!(
+            std::fs::read_to_string(d.join("out.Loxone"))
+                .unwrap()
+                .contains("Title=\"Tor\"")
+        );
+        assert!(
+            std::fs::read_to_string(d.join("pages/vislox/erdgeschoss.loxl"))
+                .unwrap()
+                .contains("vx_tor = And(\"Tor\""),
+        );
+        // Handing it back with its name edited is refused; after the undo, it goes.
+        let refused = a
+            .edit(
+                &edit::Request {
+                    base: blob(&d, "out.Loxone"),
+                    ops: vec![edit::Op::Unadopt {
+                        uuids: vec![GATE.into()],
+                    }],
+                },
+                deployed(&d),
+            )
+            .await
+            .unwrap_err();
+        assert!(refused.1.contains("revert them first"), "{refused:?}");
+        let undo: Vec<edit::Op> = serde_json::from_value(renamed["undo"].clone()).unwrap();
+        a.edit(
+            &edit::Request {
+                base: blob(&d, "out.Loxone"),
+                ops: undo,
+            },
+            deployed(&d),
+        )
+        .await
+        .unwrap();
+        let undo: Vec<edit::Op> = serde_json::from_value(r["undo"].clone()).unwrap();
+        let back = a
+            .edit(
+                &edit::Request {
+                    base: blob(&d, "out.Loxone"),
+                    ops: undo,
+                },
+                deployed(&d),
+            )
+            .await
+            .unwrap();
+        assert_eq!(back["undo"][0]["op"], "adopt", "{back}");
+        assert_eq!(std::fs::read(d.join("out.Loxone")).unwrap(), base);
+        assert!(!d.join("pages/vislox/erdgeschoss.loxl").exists());
+        let lock: Value =
+            serde_json::from_slice(&std::fs::read(d.join("logic.lock.json")).unwrap()).unwrap();
+        let was: Value = serde_json::from_slice(&lock_was).unwrap();
+        assert_eq!(lock["objects"], was["objects"]);
+        assert_eq!(lock["extern_wires"], was["extern_wires"]);
+        // The whole page: what lox can rebuild, sources before what they feed.
+        let page = a
+            .edit(
+                &edit::Request {
+                    base: blob(&d, "out.Loxone"),
+                    ops: vec![edit::Op::AdoptPage {
+                        page: "10000002-0000-0020-ffff504f94000001".into(),
+                    }],
+                },
+                deployed(&d),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page["adopted"].as_array().unwrap().len(), 3, "{page}");
+        // The input reference stays Loxone Config's, with lox's reason.
+        assert_eq!(page["skipped"][0]["title"], "Temperatur", "{page}");
+        assert!(
+            page["skipped"][0]["why"]
+                .as_str()
+                .unwrap()
+                .starts_with("cannot adopt"),
+            "{page}"
+        );
+        // The meter is fed by the gate: adopted after it, its wire bound in its declaration.
+        let file = std::fs::read_to_string(d.join("pages/vislox/erdgeschoss.loxl")).unwrap();
+        assert!(
+            file.contains("vx_zaehler = MeterAbsUni(\"Zähler\", Power: vx_o1001)"),
+            "{file}"
+        );
+        assert_eq!(std::fs::read(d.join("out.Loxone")).unwrap(), base);
+        let undo: Vec<edit::Op> = serde_json::from_value(page["undo"].clone()).unwrap();
+        a.edit(
+            &edit::Request {
+                base: blob(&d, "out.Loxone"),
+                ops: undo,
+            },
+            deployed(&d),
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read(d.join("out.Loxone")).unwrap(), base);
+        assert!(!d.join("pages/vislox/erdgeschoss.loxl").exists());
     }
 
     /// Undo and redo (#62) as the browser does them: each reply's `undo`

@@ -1,0 +1,873 @@
+//! Adopting a block Loxone Config drew into the Lox Logic module (#72). The
+//! design is in `docs/editing.md` (*Adopting blocks*).
+//!
+//! `lox logic adopt <base> --uuid <uuid> --as <slug> --module … --lock …`
+//! writes a block's declaration (with externs for its wired neighbours and
+//! `<-` wires onto them) into the module's file for its page, and pins its
+//! UUIDs in the lockfile, once it has checked that compiling the pair
+//! rebuilds the config unchanged. vislox writes only its own files, so it
+//! runs lox on a scratch copy of the module and lock, and moves what lox
+//! wrote into them ([`extract`]):
+//!
+//! - the declaration goes into vislox's file of the page, under its
+//!   *adopted* comment, with the wires out of it ([`crate::blocks`]);
+//! - each extern lox pinned becomes vislox's extern of that object
+//!   (`vx_<uuid>`, pinned by UUID, in `edits.loxl`), and every reference is
+//!   renamed to it, so that vislox's files never name the module's own slugs;
+//! - the lockfile gains the block's entry (its UUIDs, layout and page) and the
+//!   wires lox tracks onto the externs ([`LockEdits`]).
+//!
+//! Then the project is compiled like any edit, and [`verify`] checks that the
+//! pending config is what it was, the block exactly as the base has it: same
+//! UUIDs, connectors, wires, parameters and place. Anything else is refused
+//! and put back. Adopting changes nothing the Miniserver runs: only who owns
+//! the block. Nothing here talks to the Miniserver.
+
+use crate::blocks::{FileWire, NewBlock};
+use crate::edit::{find, slug as vx};
+use loxone_config::LoxoneDoc;
+use loxone_config::connectors;
+use loxone_config::logic::{ArgItem, BindingKind, Item, MatchSpec, Module, PortRef, Value};
+use loxone_config::xml::{Element, Node};
+use serde::{Deserialize, Serialize};
+use serde_json::Value as Json;
+use std::collections::{BTreeMap, BTreeSet};
+
+/// One block of an `adopt` op: its UUID, and the slug to give it (else
+/// vislox picks one from its name).
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq)]
+pub struct Pick {
+    pub uuid: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slug: Option<String>,
+}
+
+/// A block adopted on the scratch copy, as vislox writes it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Adoption {
+    pub uuid: String,
+    pub slug: String,
+    /// The page it is drawn on: UUID and title.
+    pub page: String,
+    pub page_title: String,
+    /// Its declaration, renamed to vislox's externs (`adopted`).
+    pub block: NewBlock,
+    /// The wires out of it onto externs, `vx_<uuid>.Port <- slug`.
+    pub wires: Vec<FileWire>,
+    /// The externs it names: object UUID → its type.
+    pub externs: BTreeMap<String, String>,
+    /// Its lockfile entry (`objects.<slug>`).
+    pub object: Json,
+    /// The `extern_wires` entries lox recorded for its wires.
+    pub extern_wires: Vec<Json>,
+}
+
+/// What an adoption (or its undo) changes in the lockfile, written before
+/// the compile like a move ([`write_lock`]).
+#[derive(Default, Clone, Debug, PartialEq)]
+pub struct LockEdits {
+    /// Slug → the entry to put under `objects`.
+    pub add: BTreeMap<String, Json>,
+    /// `extern_wires` entries to add.
+    pub wires: Vec<Json>,
+    /// Slugs to take out of `objects`, with every `extern_wires` entry from
+    /// or to one of their ports: without the source line, lox would take
+    /// those wires out of the config (they were Loxone Config's).
+    pub drop: BTreeSet<String>,
+}
+
+impl LockEdits {
+    pub fn is_empty(&self) -> bool {
+        self.add.is_empty() && self.wires.is_empty() && self.drop.is_empty()
+    }
+}
+
+/// The lockfile `lock` with `edits` made. Every other field is kept as lox
+/// wrote it.
+pub fn write_lock(lock: &[u8], edits: &LockEdits) -> Result<Vec<u8>, String> {
+    let mut v: Json =
+        serde_json::from_slice(lock).map_err(|e| format!("cannot read the lock: {e}"))?;
+    let root = v
+        .as_object_mut()
+        .ok_or_else(|| "the lock is not a JSON object".to_string())?;
+    let objects = root
+        .entry("objects")
+        .or_insert_with(|| Json::Object(Default::default()))
+        .as_object_mut()
+        .ok_or_else(|| "the lock's objects are not a JSON object".to_string())?;
+    let mut gone_ports: BTreeSet<String> = BTreeSet::new();
+    for slug in &edits.drop {
+        if let Some(o) = objects.remove(slug) {
+            gone_ports.extend(
+                o.get("ports")
+                    .and_then(|p| p.as_object())
+                    .into_iter()
+                    .flat_map(|p| p.values())
+                    .filter_map(|u| u.as_str().map(String::from)),
+            );
+            if let Some(u) = o.get("uuid").and_then(|u| u.as_str()) {
+                gone_ports.insert(u.to_string());
+            }
+        }
+    }
+    for (slug, o) in &edits.add {
+        objects.insert(slug.clone(), o.clone());
+    }
+    let wires = root
+        .entry("extern_wires")
+        .or_insert_with(|| Json::Array(Vec::new()))
+        .as_array_mut()
+        .ok_or_else(|| "the lock's extern_wires are not a list".to_string())?;
+    let end = |w: &Json, k: &str| w.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+    wires.retain(|w| !gone_ports.contains(&end(w, "from")) && !gone_ports.contains(&end(w, "to")));
+    for w in &edits.wires {
+        if !wires.contains(w) {
+            wires.push(w.clone());
+        }
+    }
+    let mut out = serde_json::to_vec_pretty(&v).map_err(|e| e.to_string())?;
+    out.push(b'\n');
+    Ok(out)
+}
+
+// ── what can be adopted ─────────────────────────────────────────────────
+
+/// The page `uuid` is drawn on (its nearest `Page` ancestor): UUID, title.
+pub fn page_of(doc: &LoxoneDoc, uuid: &str) -> Option<(String, String)> {
+    fn walk(el: &Element, uuid: &str, page: Option<&Element>) -> Option<(String, String)> {
+        let page = if el.attr("Type") == Some("Page") {
+            Some(el)
+        } else {
+            page
+        };
+        for c in el.child_elements() {
+            if c.attr("U") == Some(uuid) {
+                let p = page?;
+                return Some((
+                    p.attr("U")?.to_string(),
+                    p.attr_decoded("Title").unwrap_or_default().into_owned(),
+                ));
+            }
+            if let Some(r) = walk(c, uuid, page) {
+                return Some(r);
+            }
+        }
+        None
+    }
+    walk(&doc.xml.root, uuid, None)
+}
+
+/// The UUIDs of the logic pages of `doc`, in document order.
+pub fn pages(doc: &LoxoneDoc) -> Vec<String> {
+    fn walk(el: &Element, out: &mut Vec<String>) {
+        if el.attr("Type") == Some("Page")
+            && let Some(u) = el.attr("U")
+        {
+            out.push(u.to_string());
+        }
+        for c in el.child_elements() {
+            walk(c, out);
+        }
+    }
+    let mut out = Vec::new();
+    walk(&doc.xml.root, &mut out);
+    out
+}
+
+/// The blocks drawn right on page `page` that lox has a type for (its
+/// builtin port table: lox refuses any other type): UUID, type, title.
+pub fn on_page(doc: &LoxoneDoc, page: &str) -> Vec<(String, String, String)> {
+    let Some(pg) = find(&doc.xml.root, page).filter(|e| e.attr("Type") == Some("Page")) else {
+        return Vec::new();
+    };
+    pg.child_elements()
+        .filter(|c| c.name == "C")
+        .filter_map(|c| {
+            let ty = c.attr("Type")?;
+            connectors::builtin(ty)?;
+            Some((
+                c.attr("U")?.to_string(),
+                ty.to_string(),
+                c.attr_decoded("Title").unwrap_or_default().into_owned(),
+            ))
+        })
+        .collect()
+}
+
+/// Whether `s` is a slug vislox may give an adopted block: `vx_` and then
+/// lowercase letters, digits and `_`, as lox's slugs are, and not the name
+/// vislox gives an extern (`vx_<uuid>`).
+pub fn check_slug(s: &str) -> Result<(), String> {
+    let rest = s.strip_prefix(crate::blocks::SLUG_PREFIX).unwrap_or("");
+    if rest.is_empty()
+        || !rest
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+    {
+        return Err(format!(
+            "`{s}`: a slug of vislox's files is vx_ and then lowercase letters, digits and _"
+        ));
+    }
+    let parts: Vec<&str> = rest.split('_').collect();
+    let uuid_like = parts.iter().map(|p| p.len()).collect::<Vec<_>>() == [8, 4, 4, 16]
+        && parts
+            .iter()
+            .all(|p| p.bytes().all(|b| b.is_ascii_hexdigit()));
+    if uuid_like {
+        return Err(format!(
+            "`{s}` is how vislox names an extern; pick another slug"
+        ));
+    }
+    Ok(())
+}
+
+/// A slug for the block `title` of `ty`: `vx_` and its name in plain
+/// letters (`Licht Küche` → `vx_licht_kueche`), else its type; with `_2`,
+/// `_3`, … when `taken`.
+pub fn default_slug(title: &str, ty: &str, taken: &dyn Fn(&str) -> bool) -> String {
+    let word = |t: &str| {
+        let mut s = String::new();
+        for c in t.chars().flat_map(char::to_lowercase) {
+            match c {
+                'ä' => s.push_str("ae"),
+                'ö' => s.push_str("oe"),
+                'ü' => s.push_str("ue"),
+                'ß' => s.push_str("ss"),
+                c if c.is_ascii_alphanumeric() => s.push(c),
+                _ if !s.ends_with('_') => s.push('_'),
+                _ => {}
+            }
+        }
+        let s: String = s.trim_matches('_').chars().take(32).collect();
+        s.trim_end_matches('_').to_string()
+    };
+    let mut stem = word(title);
+    if stem.is_empty() {
+        stem = word(ty);
+    }
+    let first = format!("{}{stem}", crate::blocks::SLUG_PREFIX);
+    let ok = |s: &str| !taken(s) && check_slug(s).is_ok();
+    if ok(&first) {
+        return first;
+    }
+    (2..)
+        .map(|n| format!("{first}_{n}"))
+        .find(|s| ok(s))
+        .expect("an unused slug")
+}
+
+// ── what lox wrote ──────────────────────────────────────────────────────
+
+/// The statements of a file, without blank lines and comments.
+fn statements(text: &str) -> Result<Vec<Item>, String> {
+    if text.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(Module::parse_fragment(text)
+        .map_err(|e| e.to_string())?
+        .items
+        .into_iter()
+        .filter(|i| !matches!(i, Item::Gap | Item::Comment(_) | Item::FragmentEnd))
+        .collect())
+}
+
+/// The slug → entry map of a lockfile's `field` (`objects`, `externals`).
+fn entries<'a>(lock: &'a Json, field: &str) -> BTreeMap<&'a str, &'a Json> {
+    lock.get(field)
+        .and_then(|o| o.as_object())
+        .map(|o| o.iter().map(|(k, v)| (k.as_str(), v)).collect())
+        .unwrap_or_default()
+}
+
+fn uuid_in(entry: &Json) -> Option<&str> {
+    entry.get("uuid").and_then(|u| u.as_str())
+}
+
+/// What `lox logic adopt` wrote into the scratch copy, as vislox writes it.
+///
+/// `before`/`after` are the module's files (path → text) before the first
+/// adoption and after the last, `lock_before`/`lock_after` the lockfiles.
+/// `picked` is the slug vislox chose for each UUID lox adopted (lox may
+/// have used another: a block an earlier adoption of the same request
+/// pinned as an extern keeps that extern's name). `own` says whether a slug
+/// is a block of vislox's files, which an adopted block may name.
+pub fn extract(
+    before: &BTreeMap<String, String>,
+    after: &BTreeMap<String, String>,
+    lock_before: &Json,
+    lock_after: &Json,
+    picked: &BTreeMap<String, String>,
+    own: &dyn Fn(&str) -> bool,
+    base: &LoxoneDoc,
+) -> Result<Vec<Adoption>, String> {
+    // The new statements: lox appends to a page's file, and a new file
+    // opens with its `page` line. The rest of each file must be as it was.
+    let mut new: Vec<Item> = Vec::new();
+    for (path, text) in after {
+        let was = before.get(path).map(String::as_str).unwrap_or("");
+        if was == text {
+            continue;
+        }
+        let (old, now) = (
+            statements(was).map_err(|e| format!("{path}: {e}"))?,
+            statements(text).map_err(|e| format!("{path}: {e}"))?,
+        );
+        if now.len() < old.len() || now[..old.len()] != old[..] {
+            return Err(format!(
+                "lox logic adopt changed {path} beyond adding the block; vislox writes only its own files"
+            ));
+        }
+        let mut added = now[old.len()..].to_vec();
+        if old.is_empty() && matches!(added.first(), Some(Item::Page(_))) {
+            added.remove(0);
+        }
+        new.extend(added);
+    }
+    if let Some(gone) = before.keys().find(|p| !after.contains_key(*p)) {
+        return Err(format!("lox logic adopt removed {gone}"));
+    }
+    let (objects_before, objects_after) = (
+        entries(lock_before, "objects"),
+        entries(lock_after, "objects"),
+    );
+    let externals = entries(lock_after, "externals");
+    // lox's slug of each adopted block → vislox's.
+    let mut rename: BTreeMap<String, String> = BTreeMap::new();
+    for (s, o) in &objects_after {
+        if objects_before.contains_key(s) {
+            continue;
+        }
+        let u = uuid_in(o).ok_or_else(|| format!("the lock has no UUID for {s}"))?;
+        let mine = picked
+            .get(u)
+            .ok_or_else(|| format!("lox logic adopt pinned {s} ({u}), which was not asked for"))?;
+        rename.insert(s.to_string(), mine.clone());
+    }
+    // An extern's object, and its type.
+    let mut externs: BTreeMap<String, String> = BTreeMap::new();
+    for i in &new {
+        if let Item::Extern(e) = i {
+            if !e.args.is_empty() {
+                return Err(format!(
+                    "lox logic adopt wrote `extern {}` with statements vislox does not write",
+                    e.slug
+                ));
+            }
+            let u = externals
+                .get(e.slug.as_str())
+                .and_then(|x| uuid_in(x))
+                .or(match &e.match_spec {
+                    MatchSpec::Uuid(u) => Some(u.as_str()),
+                    _ => None,
+                })
+                .ok_or_else(|| {
+                    format!("the lock does not say which object extern {} is", e.slug)
+                })?;
+            externs.insert(u.to_string(), e.block_type.clone());
+        }
+    }
+    // A name an adopted block's statements use, as vislox's files name it.
+    let mut needs: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+    let mut name = |owner: &str, s: &str| -> Result<String, String> {
+        if let Some(m) = rename.get(s) {
+            return Ok(m.clone());
+        }
+        if let Some(u) = externals.get(s).and_then(|x| uuid_in(x)) {
+            if objects_after.values().any(|o| uuid_in(o) == Some(u)) {
+                return Err(format!("{s} is managed and an extern at once"));
+            }
+            let ty = match externs.get(u) {
+                Some(t) => t.clone(),
+                None => find(&base.xml.root, u)
+                    .and_then(|e| e.attr("Type"))
+                    .ok_or_else(|| format!("{s} ({u}) is not in the project's base config"))?
+                    .to_string(),
+            };
+            needs
+                .entry(owner.to_string())
+                .or_default()
+                .insert(u.to_string(), ty);
+            return Ok(vx(u));
+        }
+        if objects_after.contains_key(s) && own(s) {
+            return Ok(s.to_string());
+        }
+        if objects_after.contains_key(s) {
+            return Err(format!(
+                "it is wired to `{s}`, which the module manages in its own .loxl file; vislox's \
+                 files name only their own blocks and Loxone Config's (adopt it with lox, or wire \
+                 it in that file)"
+            ));
+        }
+        Err(format!(
+            "its declaration names `{s}`, which vislox cannot pin"
+        ))
+    };
+    let mut out: BTreeMap<String, Adoption> = BTreeMap::new();
+    let mut wires: Vec<(String, FileWire)> = Vec::new();
+    for i in &new {
+        match i {
+            Item::Extern(_) => {}
+            Item::Block(b) => {
+                let slug = rename.get(&b.slug).cloned().ok_or_else(|| {
+                    format!(
+                        "lox logic adopt declared `{}`, which it did not pin",
+                        b.slug
+                    )
+                })?;
+                let entry = objects_after[b.slug.as_str()];
+                let uuid = uuid_in(entry).unwrap_or_default().to_string();
+                let mut nb = NewBlock {
+                    slug: slug.clone(),
+                    ty: b.block_type.clone(),
+                    title: b.title.clone(),
+                    adopted: true,
+                    ..Default::default()
+                };
+                for a in &b.args {
+                    let ArgItem::Binding(x) = a else { continue };
+                    match &x.kind {
+                        BindingKind::Param(Value::Ref(s)) => nb.wires.push((
+                            x.port.clone(),
+                            PortRef {
+                                slug: name(&slug, s)?,
+                                port: String::new(),
+                            },
+                        )),
+                        BindingKind::Param(Value::File { .. }) => {
+                            return Err(format!(
+                                "{slug}: its {} is in a file of its own; vislox does not write those",
+                                x.port
+                            ));
+                        }
+                        BindingKind::Param(v) => nb.args.push((x.port.clone(), v.clone())),
+                        BindingKind::Wire(r) => nb.wires.push((
+                            x.port.clone(),
+                            PortRef {
+                                slug: name(&slug, &r.slug)?,
+                                port: r.port.clone(),
+                            },
+                        )),
+                        BindingKind::Expr(_) => {
+                            return Err(format!(
+                                "{slug}: lox wrote an expression into {}; vislox does not write those",
+                                x.port
+                            ));
+                        }
+                    }
+                }
+                let (page, page_title) = page_of(base, &uuid)
+                    .ok_or_else(|| format!("{slug} is not drawn on a page of the base config"))?;
+                // Keyed by its slug in the lock; nothing in the entry names it.
+                let object = entry.clone();
+                out.insert(
+                    uuid.clone(),
+                    Adoption {
+                        uuid,
+                        slug,
+                        page,
+                        page_title,
+                        block: nb,
+                        wires: Vec::new(),
+                        externs: BTreeMap::new(),
+                        object,
+                        extern_wires: Vec::new(),
+                    },
+                );
+            }
+            Item::Wire(w) => {
+                let from = rename.get(&w.from.slug).cloned().ok_or_else(|| {
+                    format!(
+                        "lox logic adopt wrote the wire `{} <- {}`, which leaves no block it adopted",
+                        w.to, w.from
+                    )
+                })?;
+                let to = name(&from, &w.to.slug)?;
+                wires.push((
+                    from.clone(),
+                    FileWire {
+                        to: PortRef {
+                            slug: to,
+                            port: w.to.port.clone(),
+                        },
+                        from: PortRef {
+                            slug: from,
+                            port: w.from.port.clone(),
+                        },
+                    },
+                ));
+            }
+            other => {
+                return Err(format!(
+                    "lox logic adopt wrote a statement vislox does not write: {}",
+                    Module {
+                        items: vec![other.clone()]
+                    }
+                    .to_text()
+                    .trim()
+                ));
+            }
+        }
+    }
+    for (owner, w) in wires {
+        let a = out
+            .values_mut()
+            .find(|a| a.slug == owner)
+            .ok_or_else(|| format!("no declaration of {owner}"))?;
+        a.wires.push(w);
+    }
+    for a in out.values_mut() {
+        a.externs = needs.remove(&a.slug).unwrap_or_default();
+    }
+    // The wires lox tracks onto externs, by the adopted block whose port is
+    // their source.
+    let wires_before: BTreeSet<String> = lock_before
+        .get("extern_wires")
+        .and_then(|w| w.as_array())
+        .into_iter()
+        .flatten()
+        .map(|w| w.to_string())
+        .collect();
+    for w in lock_after
+        .get("extern_wires")
+        .and_then(|w| w.as_array())
+        .into_iter()
+        .flatten()
+        .filter(|w| !wires_before.contains(&w.to_string()))
+    {
+        let from = w.get("from").and_then(|f| f.as_str()).unwrap_or("");
+        let a = out
+            .values_mut()
+            .find(|a| ports_of(&a.object).contains(from))
+            .ok_or_else(|| {
+                format!("lox logic adopt tracks a wire from {from}, which no adopted block has")
+            })?;
+        a.extern_wires.push(w.clone());
+    }
+    for u in picked.keys() {
+        if !out.contains_key(u) {
+            return Err(format!("lox logic adopt wrote no declaration for {u}"));
+        }
+    }
+    Ok(out.into_values().collect())
+}
+
+/// The UUIDs a lockfile entry pins: the block's and its ports'.
+pub fn ports_of(entry: &Json) -> BTreeSet<String> {
+    let mut s: BTreeSet<String> = entry
+        .get("ports")
+        .and_then(|p| p.as_object())
+        .into_iter()
+        .flat_map(|p| p.values())
+        .filter_map(|u| u.as_str().map(String::from))
+        .collect();
+    if let Some(u) = uuid_in(entry) {
+        s.insert(u.to_string());
+    }
+    s
+}
+
+// ── checking the compile ────────────────────────────────────────────────
+
+/// `el` without the whitespace between its elements, attributes in order:
+/// what two saves of the same block share.
+fn normal(el: &Element) -> Element {
+    let mut attrs = el.attrs.clone();
+    attrs.sort_by(|a, b| a.name.cmp(&b.name));
+    Element {
+        name: el.name.clone(),
+        attrs,
+        children: el
+            .children
+            .iter()
+            .filter_map(|c| match c {
+                Node::Element(e) => Some(Node::Element(normal(e))),
+                Node::Text(t) if t.trim().is_empty() => None,
+                Node::Text(t) => Some(Node::Text(t.clone())),
+            })
+            .collect(),
+        self_closing: el.self_closing,
+    }
+}
+
+/// Whether `a` and `b` have the object `uuid` alike: its element (UUIDs,
+/// connectors, wires into it, parameters, place) and the wires out of it.
+pub fn same_block(a: &LoxoneDoc, b: &LoxoneDoc, uuid: &str) -> bool {
+    let (Some(x), Some(y)) = (find(&a.xml.root, uuid), find(&b.xml.root, uuid)) else {
+        return false;
+    };
+    if normal(x) != normal(y) {
+        return false;
+    }
+    let ports: BTreeSet<&str> = x
+        .child_elements()
+        .filter(|c| c.name == "Co")
+        .filter_map(|c| c.attr("U"))
+        .collect();
+    let out = |d: &LoxoneDoc| -> BTreeSet<(String, String)> {
+        d.wires()
+            .into_iter()
+            .filter(|w| ports.contains(w.from_port.as_str()))
+            .map(|w| (w.from_port, w.to_port))
+            .collect()
+    };
+    out(a) == out(b)
+}
+
+/// After the compile of an adoption (or its undo): the pending config is
+/// what it was (`old`), and each block of `uuids` is in `new` exactly as
+/// the base has it. `Err` says what differs.
+pub fn verify(
+    base: &LoxoneDoc,
+    old: &LoxoneDoc,
+    new: &LoxoneDoc,
+    uuids: &[String],
+) -> Result<(), String> {
+    let name = |u: &str| {
+        find(&base.xml.root, u)
+            .and_then(|e| e.attr_decoded("Title").map(|t| t.into_owned()))
+            .filter(|t| !t.trim().is_empty())
+            .unwrap_or_else(|| u.to_string())
+    };
+    for u in uuids {
+        if !same_block(base, new, u) {
+            return Err(format!(
+                "lox logic compile does not rebuild {} exactly as the base has it",
+                name(u)
+            ));
+        }
+    }
+    let d = loxone_config::diff::diff(old, new);
+    if !d.logic_is_empty() {
+        return Err(format!(
+            "lox logic compile changed what the Miniserver would run ({} added, {} removed, {} \
+             renamed, {} values, {} moved, {} wires added, {} wires removed)",
+            d.added.len(),
+            d.removed.len(),
+            d.renamed.len(),
+            d.param_changes.len(),
+            d.placements.len(),
+            d.wires_added.len(),
+            d.wires_removed.len()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn base() -> LoxoneDoc {
+        let xml = std::fs::read_to_string("tests/fixtures/house.Loxone").unwrap();
+        LoxoneDoc::parse(xml.as_bytes()).unwrap()
+    }
+
+    const GATE: &str = "10000004-0000-0040-ffff504f94000001";
+
+    /// What lox v0.83.0 writes for the fixture's AND gate (checked by hand
+    /// with `lox logic adopt tests/fixtures/house.Loxone --uuid … --as gate`).
+    fn lox_wrote() -> (BTreeMap<String, String>, Json, Json) {
+        let mut after = BTreeMap::new();
+        after.insert(
+            "erdgeschoss.loxl".to_string(),
+            "page \"Erdgeschoss\"\n\nextern temperatur = VirtualIn(iname: \"VI1\")\n\
+             extern zaehler = MeterAbsUni(title: \"Zähler\")\nextern licht_og = Or(title: \"Licht OG\")\n\n\
+             gate = And(\"O1001\", In1: temperatur)\n\nzaehler.Power <- gate\nlicht_og.In1 <- gate\n"
+                .to_string(),
+        );
+        let lock_before =
+            json!({ "lockfile_version": 8, "objects": {}, "externals": {}, "extern_wires": [] });
+        let lock_after = json!({
+            "lockfile_version": 8,
+            "objects": { "gate": { "uuid": GATE, "type": "And",
+                "ports": { "I1": "10000004-0000-0041-00ff504f94000001", "I2": "10000004-0000-0042-01ff504f94000001", "Q": "10000004-0000-0043-02ff504f94000001" },
+                "layout": { "px": 4032, "py": 768, "px2": 5376, "py2": 1464 },
+                "page_uuid": "10000002-0000-0020-ffff504f94000001" } },
+            "externals": {
+                "licht_og": { "uuid": "10000009-0000-0090-ffff504f94000001", "matched_by": "title" },
+                "temperatur": { "uuid": "10000001-0000-0010-ffff504f94000001", "matched_by": "iname" },
+                "zaehler": { "uuid": "10000005-0000-0050-ffff504f94000001", "matched_by": "title" } },
+            "extern_wires": [
+                { "from": "10000004-0000-0043-02ff504f94000001", "to": "10000005-0000-0051-00ff504f94000001" },
+                { "from": "10000004-0000-0043-02ff504f94000001", "to": "10000009-0000-0091-00ff504f94000001" } ]
+        });
+        (after, lock_before, lock_after)
+    }
+
+    #[test]
+    fn what_lox_adopts_is_moved_into_vislox_s_names() {
+        let (after, l0, l1) = lox_wrote();
+        let picked = BTreeMap::from([(GATE.to_string(), "gate".to_string())]);
+        let a = extract(
+            &BTreeMap::new(),
+            &after,
+            &l0,
+            &l1,
+            &picked,
+            &|_| false,
+            &base(),
+        )
+        .unwrap();
+        assert_eq!(a.len(), 1);
+        let a = &a[0];
+        assert_eq!(
+            (a.slug.as_str(), a.page_title.as_str()),
+            ("gate", "Erdgeschoss")
+        );
+        assert_eq!(a.block.title.as_deref(), Some("O1001"));
+        assert_eq!(
+            a.block.wires,
+            vec![(
+                "In1".to_string(),
+                PortRef {
+                    slug: "vx_10000001_0000_0010_ffff504f94000001".into(),
+                    port: String::new()
+                }
+            )]
+        );
+        assert_eq!(a.wires.len(), 2);
+        assert_eq!(a.wires[0].to.slug, "vx_10000005_0000_0050_ffff504f94000001");
+        assert_eq!(a.wires[0].to.port, "Power");
+        // Externs pinned by UUID, with the types lox declared.
+        assert_eq!(a.externs.len(), 3);
+        assert_eq!(
+            a.externs["10000005-0000-0050-ffff504f94000001"],
+            "MeterAbsUni"
+        );
+        assert_eq!(a.extern_wires.len(), 2);
+        assert_eq!(a.object["uuid"], GATE);
+    }
+
+    #[test]
+    fn a_block_lox_pinned_under_another_name_gets_vislox_s() {
+        let (after, l0, l1) = lox_wrote();
+        let picked = BTreeMap::from([(GATE.to_string(), "vx_tor".to_string())]);
+        let a = extract(
+            &BTreeMap::new(),
+            &after,
+            &l0,
+            &l1,
+            &picked,
+            &|_| false,
+            &base(),
+        )
+        .unwrap();
+        assert_eq!(a[0].slug, "vx_tor");
+        assert_eq!(a[0].wires[1].from.slug, "vx_tor");
+    }
+
+    #[test]
+    fn what_vislox_does_not_write_is_refused() {
+        let (mut after, l0, l1) = lox_wrote();
+        let picked = BTreeMap::from([(GATE.to_string(), "gate".to_string())]);
+        // A file of the module's own, changed.
+        let before =
+            BTreeMap::from([("a.loxl".to_string(), "page \"A\"\nx = And()\n".to_string())]);
+        after.insert("a.loxl".into(), "page \"A\"\ny = And()\n".into());
+        let e = extract(&before, &after, &l0, &l1, &picked, &|_| false, &base()).unwrap_err();
+        assert!(e.contains("beyond adding"), "{e}");
+        // A wire from a block the rest of the module manages.
+        let (mut after, l0, mut l1) = lox_wrote();
+        after.insert(
+            "erdgeschoss.loxl".into(),
+            "page \"Erdgeschoss\"\ngate = And(\"O1001\", In1: flur)\n".into(),
+        );
+        l1["objects"]["flur"] = json!({ "uuid": "1000000b-0000-00b0-ffff504f94000001" });
+        let l0 = {
+            let mut l = l0;
+            l["objects"]["flur"] = json!({ "uuid": "1000000b-0000-00b0-ffff504f94000001" });
+            l
+        };
+        l1["extern_wires"] = json!([]);
+        let e = extract(
+            &BTreeMap::new(),
+            &after,
+            &l0,
+            &l1,
+            &picked,
+            &|_| false,
+            &base(),
+        )
+        .unwrap_err();
+        assert!(e.contains("manages in its own .loxl"), "{e}");
+        // vislox's own block is fine.
+        let a = extract(
+            &BTreeMap::new(),
+            &after,
+            &l0,
+            &l1,
+            &picked,
+            &|s| s == "flur",
+            &base(),
+        )
+        .unwrap();
+        assert_eq!(a[0].block.wires[0].1.slug, "flur");
+    }
+
+    #[test]
+    fn the_lock_gains_and_loses_the_block_and_its_wires() {
+        let (_, l0, l1) = lox_wrote();
+        let bytes = serde_json::to_vec(&json!({ "lockfile_version": 8, "objects": {}, "extern_wires": [{ "from": "a", "to": "b" }] })).unwrap();
+        let mut e = LockEdits::default();
+        e.add
+            .insert("vx_gate".into(), l1["objects"]["gate"].clone());
+        e.wires
+            .extend(l1["extern_wires"].as_array().unwrap().iter().cloned());
+        let added: Json = serde_json::from_slice(&write_lock(&bytes, &e).unwrap()).unwrap();
+        assert_eq!(added["objects"]["vx_gate"]["uuid"], GATE);
+        assert_eq!(added["extern_wires"].as_array().unwrap().len(), 3);
+        let mut back = LockEdits::default();
+        back.drop.insert("vx_gate".into());
+        let gone: Json = serde_json::from_slice(
+            &write_lock(&serde_json::to_vec(&added).unwrap(), &back).unwrap(),
+        )
+        .unwrap();
+        assert!(gone["objects"].as_object().unwrap().is_empty());
+        assert_eq!(gone["extern_wires"], json!([{ "from": "a", "to": "b" }]));
+        let _ = l0;
+    }
+
+    #[test]
+    fn slugs_are_vislox_s_and_plain() {
+        let none = |_: &str| false;
+        assert_eq!(default_slug("Licht Küche", "And", &none), "vx_licht_kueche");
+        assert_eq!(default_slug("  ", "MeterAbsUni", &none), "vx_meterabsuni");
+        let taken = |s: &str| s == "vx_o1001";
+        assert_eq!(default_slug("O1001", "And", &taken), "vx_o1001_2");
+        assert!(check_slug("vx_tor").is_ok());
+        assert!(check_slug("tor").is_err());
+        assert!(check_slug("vx_Tor").is_err());
+        assert!(check_slug(&vx(GATE)).is_err());
+    }
+
+    #[test]
+    fn a_block_rebuilt_as_the_base_has_it_passes() {
+        let b = base();
+        assert!(same_block(&b, &b, GATE));
+        assert!(verify(&b, &b, &b, &[GATE.to_string()]).is_ok());
+        // Another title is another block.
+        let xml = std::fs::read_to_string("tests/fixtures/house.Loxone")
+            .unwrap()
+            .replace("Title=\"O1001\"", "Title=\"O1003\"");
+        let other = LoxoneDoc::parse(xml.as_bytes()).unwrap();
+        assert!(!same_block(&b, &other, GATE));
+        let e = verify(&b, &b, &other, &[GATE.to_string()]).unwrap_err();
+        assert!(e.contains("exactly as the base"), "{e}");
+        // A wire out of it taken away, too.
+        let xml = std::fs::read_to_string("tests/fixtures/house.Loxone").unwrap();
+        let q = "10000004-0000-0043-02ff504f94000001";
+        assert!(xml.contains(q));
+        let cut = xml.replacen(&format!("<In Input=\"{q}\"/>"), "", 1);
+        assert_ne!(cut, xml, "the gate feeds something");
+        let cut = LoxoneDoc::parse(cut.as_bytes()).unwrap();
+        assert!(!same_block(&b, &cut, GATE));
+        assert_eq!(page_of(&b, GATE).unwrap().1, "Erdgeschoss");
+        assert!(
+            on_page(&b, "10000002-0000-0020-ffff504f94000001")
+                .iter()
+                .any(|(u, ..)| u == GATE)
+        );
+    }
+}
