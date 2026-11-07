@@ -2145,7 +2145,7 @@ impl Actions {
         deployed: Option<DeployedRev>,
         pending: Option<Arc<Vec<u8>>>,
     ) -> Value {
-        let off = || json!({ "available": false, "reason": state.why, "claims": [], "managed": [], "sources": {} });
+        let off = || json!({ "available": false, "reason": state.why, "claims": [], "managed": [], "sources": {}, "set_claims": [] });
         let Some(dir) = self.s.project.as_deref() else {
             return off();
         };
@@ -2251,6 +2251,9 @@ impl Actions {
             m.texts()
         };
         let sources = crate::managed::sources(&texts, &lock.slugs);
+        // The module's claims on a block's access rights, recipients or
+        // switching times (#68), and the block each is on.
+        let set_claims = crate::managed::set_claims(&texts, &lock);
         // The blocks lox can move (#60): those it manages that are drawn on a
         // page, and of them those the pending config draws elsewhere than the
         // deployed one, on the same page.
@@ -2348,6 +2351,7 @@ impl Actions {
             "blocks": blocks,
             "managed": managed,
             "sources": sources,
+            "set_claims": set_claims,
             "movable": movable,
             "moves": moves,
             "arrange": arrange,
@@ -4424,6 +4428,21 @@ esac
         let e = edits_of(&a, &d).await;
         assert_ne!(a.edit_state.lock().unwrap().key(), key);
         assert_eq!(e["sources"][DIV]["line"], 4, "{e}");
+        assert_eq!(e["set_claims"], json!([]), "{e}");
+        // A claim on a block's switching times (#68), on the extern the lock
+        // resolved by title: its line, its set's line and the block.
+        std::fs::write(
+            d.join("pages/zeit.loxl"),
+            "extern temp = DayTimer(title: \"Uhr\")\nschedule abend\n\tweekdays 17:00-22:00\nend\ntemp.schedule = abend\n",
+        )
+        .unwrap();
+        let e = edits_of(&a, &d).await;
+        assert_eq!(
+            e["set_claims"],
+            json!([{ "kind": "schedule", "slug": "temp", "set": "abend", "file": "pages/zeit.loxl", "line": 5,
+                     "set_file": "pages/zeit.loxl", "set_line": 2, "blocks": [AND] }]),
+            "{e}"
+        );
     }
 
     #[cfg(unix)]

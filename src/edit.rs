@@ -852,6 +852,10 @@ pub struct Lock {
     /// The wires lox draws onto the ports of externs (`extern_wires`):
     /// (source connector UUID, sink connector UUID).
     pub wires: BTreeSet<(String, String)>,
+    /// The objects the module's externs resolved to (`externals`): slug →
+    /// UUID. Loxone Config's, not managed; an extern by title (`Notification(
+    /// title: "Frost")`) names its object only here (#68).
+    pub externals: BTreeMap<String, String>,
 }
 
 impl Lock {
@@ -910,11 +914,21 @@ impl Lock {
                     .collect()
             })
             .unwrap_or_default();
+        let externals = v
+            .get("externals")
+            .and_then(|o| o.as_object())
+            .map(|o| {
+                o.iter()
+                    .filter_map(|(s, x)| Some((s.clone(), x.get("uuid")?.as_str()?.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default();
         Lock {
             slugs,
             tombstones,
             placed,
             wires,
+            externals,
         }
     }
 
@@ -2811,6 +2825,11 @@ mod tests {
                 .extern_wires
                 .iter()
                 .map(|w| (w.from.clone(), w.to.clone()))
+                .collect(),
+            externals: l
+                .externals
+                .iter()
+                .map(|(s, e)| (s.clone(), e.uuid.clone()))
                 .collect(),
         }
     }

@@ -517,6 +517,107 @@ fn bindings(lines: &[&str], start: usize) -> Vec<(String, usize)> {
     out
 }
 
+/// A claim of the module on a block's whole set of rights or switching
+/// times (#68): `haustuer.access = bewohner`, `frost.recipients = familie`,
+/// `uhr.schedule = abendlicht`. Whoever an `access` or `recipients` set
+/// leaves out loses the right on the next push; a `schedule` replaces the
+/// Daytimer's switching times, edits made in the app among them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SetClaim {
+    /// `access`, `recipients` or `schedule`.
+    pub kind: &'static str,
+    /// The block, as the module names it.
+    pub slug: String,
+    /// The set it claims.
+    pub set: String,
+    /// The claim's line (file shown as [`Source::file`]; 1-based).
+    pub file: String,
+    pub line: usize,
+    /// Where the set is declared (`access bewohner` … `end`): its one
+    /// top-level declaration of that kind, when there is one.
+    pub set_file: Option<String>,
+    pub set_line: Option<usize>,
+    /// The block the slug names: the lockfile's managed block, the object an
+    /// extern resolved to (`externals`, or its `uuid: "…"`), or the UUID
+    /// vislox names an extern after. Empty when none is known (an extern lox
+    /// has not resolved yet).
+    pub blocks: Vec<String>,
+}
+
+/// The claim keywords on a block, and the set kinds they name.
+const SET_CLAIMS: &[&str] = &["access", "recipients", "schedule"];
+
+/// Every `<slug>.access|recipients|schedule = <set>` at the top level of the
+/// module's files, outside template bodies (what a template claims is made
+/// once per instance), with the block each one is on.
+pub fn set_claims<T: AsRef<str>>(files: &[(String, T)], lock: &crate::edit::Lock) -> Vec<SetClaim> {
+    let decls = Declarations::new(files);
+    // (kind, set) → its declarations.
+    let mut sets: BTreeMap<(&str, String), Vec<(String, usize)>> = BTreeMap::new();
+    let mut claims = Vec::new();
+    for (file, text) in files {
+        let lines: Vec<&str> = text.as_ref().split('\n').collect();
+        let body = template_bodies(&lines);
+        for (n, line) in lines.iter().enumerate() {
+            if body.contains(&n) {
+                continue;
+            }
+            let c = code(line).trim();
+            // `access bewohner`: a set's header.
+            if let Some((kw, name)) = c.split_once(char::is_whitespace)
+                && let Some(kind) = SET_CLAIMS.iter().find(|k| **k == kw)
+                && is_name(name.trim())
+            {
+                sets.entry((kind, name.trim().to_string()))
+                    .or_default()
+                    .push((file.clone(), n + 1));
+                continue;
+            }
+            let Some((lhs, set)) = c.split_once('=') else {
+                continue;
+            };
+            let (set, lhs) = (set.trim(), lhs.trim());
+            let Some((slug, kw)) = lhs.split_once('.') else {
+                continue;
+            };
+            let (slug, kw) = (slug.trim(), kw.trim());
+            let Some(kind) = SET_CLAIMS.iter().find(|k| **k == kw) else {
+                continue;
+            };
+            if !is_name(slug) || !is_name(set) || set.starts_with('=') {
+                continue;
+            }
+            claims.push(SetClaim {
+                kind,
+                slug: slug.to_string(),
+                set: set.to_string(),
+                file: file.clone(),
+                line: n + 1,
+                set_file: None,
+                set_line: None,
+                blocks: Vec::new(),
+            });
+        }
+    }
+    for c in &mut claims {
+        if let Some([(f, l)]) = sets.get(&(c.kind, c.set.clone())).map(Vec::as_slice) {
+            c.set_file = Some(f.clone());
+            c.set_line = Some(*l);
+        }
+        let (f, l) = decls
+            .at(&c.slug, None)
+            .map_or((None, None), |(f, l)| (Some(f), Some(l)));
+        let mut blocks = crate::check::name_blocks(&c.slug, f.as_deref(), l, files, lock);
+        if blocks.is_empty()
+            && let Some(u) = lock.externals.get(&c.slug)
+        {
+            blocks.push(u.to_ascii_lowercase());
+        }
+        c.blocks = blocks;
+    }
+    claims
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -771,5 +872,103 @@ mod tests {
         set(now);
         m.refresh(root, &root.join("pages"));
         assert_eq!(&*m.texts()[0].1, "d = Or()\n");
+    }
+
+    #[test]
+    fn claims_on_rights_and_schedules_point_at_their_line_their_set_and_their_block() {
+        let files = vec![
+            (
+                "pages/access.loxl".to_string(),
+                "extern haustuer = NfcCodeTouch(uuid: \"40000001-0000-0000-ffff504f94000001\")\n\
+                 extern frost = Notification(title: \"Frost\")\n\
+                 \n\
+                 access bewohner  # wer öffnen darf\n\
+                 \tuser \"alice\": \"Always\"\n\
+                 end\n\
+                 recipients familie\n\
+                 \tuser \"bob\"\n\
+                 end\n\
+                 haustuer.access = bewohner\n\
+                 frost.recipients = familie # wer es bekommt\n\
+                 # haustuer.access = alle\n\
+                 template T(x: NfcCodeTouch)\n\
+                 \tx.access = bewohner\n\
+                 end\n"
+                    .to_string(),
+            ),
+            (
+                "pages/zeit.loxl".to_string(),
+                "schedule abend\n\tweekdays 17:00-22:00\nend\n\
+                 uhr = DayTimer(\"Uhr\")\n\
+                 uhr.schedule = abend\n\
+                 vx_10000030_0000_0300_ffff504f94000001.schedule = abend\n"
+                    .to_string(),
+            ),
+        ];
+        let lock = crate::edit::Lock {
+            slugs: [(
+                "uhr".to_string(),
+                "10000031-0000-0310-ffff504f94000001".to_string(),
+            )]
+            .into(),
+            externals: [(
+                "frost".to_string(),
+                "60000001-0000-0010-ffff504f94000001".to_string(),
+            )]
+            .into(),
+            ..Default::default()
+        };
+        let c = set_claims(&files, &lock);
+        let got: Vec<_> = c
+            .iter()
+            .map(|c| {
+                (
+                    c.kind,
+                    c.slug.as_str(),
+                    c.set.as_str(),
+                    format!("{}:{}", c.file, c.line),
+                    c.set_line,
+                    c.blocks.join(","),
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (
+                    "access",
+                    "haustuer",
+                    "bewohner",
+                    "pages/access.loxl:10".to_string(),
+                    Some(4),
+                    "40000001-0000-0000-ffff504f94000001".to_string()
+                ),
+                (
+                    "recipients",
+                    "frost",
+                    "familie",
+                    "pages/access.loxl:11".to_string(),
+                    Some(7),
+                    "60000001-0000-0010-ffff504f94000001".to_string()
+                ),
+                (
+                    "schedule",
+                    "uhr",
+                    "abend",
+                    "pages/zeit.loxl:5".to_string(),
+                    Some(1),
+                    "10000031-0000-0310-ffff504f94000001".to_string()
+                ),
+                (
+                    "schedule",
+                    "vx_10000030_0000_0300_ffff504f94000001",
+                    "abend",
+                    "pages/zeit.loxl:6".to_string(),
+                    Some(1),
+                    "10000030-0000-0300-ffff504f94000001".to_string()
+                ),
+            ]
+        );
+        assert_eq!(c[2].set_file.as_deref(), Some("pages/zeit.loxl"));
     }
 }

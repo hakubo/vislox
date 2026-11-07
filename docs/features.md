@@ -191,6 +191,18 @@ sends to the Miniserver see [miniserver.md](miniserver.md).
   fails**, and Apply's *Tests pass* step runs the tests of the exact config it would deploy and stops there,
   before anything is sent. How: [editing.md](editing.md#tests-67).
 
+- **Rights and schedules** (#68): who may open an NFC Code Touch, who gets a push notification and a Daytimer's
+  switching times are on no logic page, yet a Lox Logic claim owns them (`haustuer.access = bewohner`,
+  `frost.recipients = familie`, `uhr.schedule = abend`). While a change is compared, *Rights and schedules* above
+  the change list shows per block the users and groups added, removed (red) or given another access schedule,
+  who loses or gains the right in effect (through groups too), and for a Daytimer the old and new week side by
+  side; each with the `file:line` of the module's claim. The change list has them under *rights*. Properties of a
+  Code Touch (*Access*) or a notification (*Recipients*) lists who holds it, who it opens for or is sent to, and
+  *Managed by `pages/access.loxl:12`*; a Daytimer's *Schedule* names its claim too. Apply's confirmation warns
+  first: *⚠ alice loses access to Haustür (pages/access.loxl:12)*, and names the claim of a schedule the
+  Miniserver runs differently. Names show only in the review: never in a URL, the page title or the log. How:
+  [editing.md](editing.md#rights-and-schedules-a-change-claims-68).
+
 - **Edit values** (for a `lox.toml` project, with the admin token): Properties' *Edit values* changes a block's
   name, its room and category, the constant of an unwired input (lox checks it against the documented range) and the settings of a
   physical input or output or a device. *Save* writes them into vislox's own file of the module and runs

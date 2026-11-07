@@ -387,6 +387,58 @@ run fails (its tooltip says how many); while the tests run again it is on, since
 Later: the same simulator could drive an offline Liveview (simulated values on the wires without a Miniserver,
 #21). `Actions::run_logic(Second::Test)` and the parsed `tests` are where a separate issue would start.
 
+## Rights and schedules a change claims (#68)
+
+A Lox Logic module can claim more than blocks and wires: `haustuer.access = bewohner` owns who may open an NFC
+Code Touch (and when), `frost.recipients = familie` who gets a push notification, and `uhr.schedule = abend` a
+Daytimer's switching times. None of these is on a logic page, and whoever a set leaves out loses the right on the
+next push, so the review shows them on their own. vislox reviews them; it does not edit them (#73, #76 and #77 do).
+
+- **From the compiled config, not the source.** `rights.rs` reads, with lox's own `AccessModel`, the `<PRM>`
+  lists of every user and group: a `TIM=` on an `NfcCodeTouch` is an access right under that access schedule,
+  an `ACT=` on a `Notification` makes it a recipient. Per block: who holds the right directly (users, then
+  groups, a group with its direct members) and who holds it in effect: directly, through a group (nested groups
+  too), or, for a notification, as a member of *Full access*, who always get it. Comparing two configs gives, per
+  block, the users and groups added, removed and given another schedule, and the users who gain or lose the
+  right in effect. So a change made in Loxone Config shows the same way as one a claim makes, and removing
+  someone from a set while their group still opens the door is not a loss.
+- `view.rights` lists the blocks whose rights changed, and the Daytimers whose switching times changed (from the
+  schedule comparison of #15), in document order: `{ uuid, kind, title, new_block, added, removed, rescheduled,
+  lose, gain }`, `kind` being `access`, `recipients` or `schedule`. Such a block is marked changed, and the change
+  list has a line per entry (`Haustür · access: alice removed (Always)`) under its own filter, *rights*.
+  `objects[…].rights` is each Code Touch's and notification's right, and `rights_old` the compared revision's,
+  when it differs.
+- **The claims.** `GET /api/edits` sends `set_claims`: each `<slug>.access|recipients|schedule = <set>` at the top
+  level of the module's files (not in a template body), with its `file:line`, the line of its set's one
+  declaration (`set_file`, `set_line`), and `blocks`: the block the slug names, resolved like a lint finding's
+  name (the lockfile's managed blocks, `vx_<uuid>` names, an extern's `uuid: "…"`), or else the object the
+  lockfile's `externals` resolved an extern by title to. Like `sources`, it is today's module, shown on the
+  newest config only.
+- **Apply's confirmation** asks `GET /api/rights/changes?rev=<pending>&base=<deployed>` (the same comparison,
+  without the view) and warns first: *⚠ alice loses access to Haustür (pages/access.loxl:12)*, *⚠ alice stops
+  getting Frostwarnung*, then who gains a right. A schedule the Miniserver runs differently (live values, as
+  before) names the claim that replaces it: *Uhr: Feiertag (claimed by pages/access.loxl:14)*. The Miniserver
+  does not say when its switching times were changed in the app, so the warning has no date. Neither refuses
+  Apply.
+- **Who may see it.** Names of users and groups are served with the rest of the review (the view and its
+  endpoints) and nowhere else: not in a URL (the address names a block by its UUID), not in the page title,
+  and never in vislox's log. Credentials (tags, codes, passwords, even hashed) never leave `rights.rs`, and no
+  other attribute of a user does either.
+
+The browser: *Rights and schedules* above the change list, while a comparison is shown, open by default and
+counting the users who lose a right. Per block: its name (a button that shows it), the kind and `λ file:line` of
+each claim on it; for a right, who loses it (red), the users and groups removed (red, struck through), added
+(green) and given another schedule, a group's members on hover, and who gains it; for a Daytimer, each changed
+mode's week before next to the week after, as bars. Properties of an NFC Code Touch has *Access*, and of a push
+notification *Recipients*: the claim (*Managed by `pages/access.loxl:12` (access bewohner, pages/access.loxl:4).
+Whoever the set leaves out loses access on the next push.*), who holds the right, marked against the compared
+revision, *Opens for* or *Sent to* (in effect), and who loses or gains it here. A Daytimer's *Schedule* section
+names its claim the same way.
+
+Hooks for the editing issues: #73 (switching times), #76 (access) and #77 (recipients) add ops to `POST /api/edit`
+that write these claims into `<module>/vislox/`; the review, `set_claims` and Apply's warning need nothing more,
+since they read the compiled config and the module's files.
+
 ## Undo and redo (#62)
 
 Undo is not a second way to change the module: it sends the edit's `undo` back to `POST /api/edit` as an edit of
@@ -507,7 +559,7 @@ Each of these plugs in as new op kinds on `POST /api/edit`, written into `<modul
 | #88 | new pages (`page "…" (room: …)`) |
 
 Around the module: #64 (mark managed blocks, built), #65 (`lox logic check` errors, built), #66 (lint, built), #67 (`lox logic test`, built),
-#68 (review claimed access, recipients and schedules), #70 (removals on Apply).
+#68 (review claimed access, recipients and schedules, built), #70 (removals on Apply).
 
 ## The browser
 

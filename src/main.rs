@@ -24,6 +24,7 @@ mod pull;
 mod query;
 mod reason;
 mod restart;
+mod rights;
 mod route;
 mod running;
 mod schedule;
@@ -520,6 +521,7 @@ async fn main() -> Result<()> {
         .route("/api/log", get(api_log))
         .route("/api/hardware", get(api_hardware))
         .route("/api/hardware/changes", get(api_hardware_changes))
+        .route("/api/rights/changes", get(api_rights_changes))
         .route("/api/app", get(api_app))
         .route("/api/app/load", axum::routing::post(api_app_load))
         .route("/api/app/icon", get(api_app_icon))
@@ -804,6 +806,32 @@ async fn api_schedules(State(app): State<Arc<App>>, Query(q): Query<RevQuery>) -
     .and_then(|r| r);
     match res {
         Ok(list) => Json(list).into_response(),
+        Err(e) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({ "error": e })),
+        )
+            .into_response(),
+    }
+}
+
+/// What `rev` does to access rights and push notification recipients
+/// compared with `base` (#68): Apply's confirmation warns about who loses
+/// them. Served like the view: titles of users and groups are part of the
+/// review, and nothing of it is logged.
+async fn api_rights_changes(State(app): State<Arc<App>>, Query(q): Query<ViewQuery>) -> Response {
+    let res = tokio::task::spawn_blocking(move || {
+        let base = q.base.as_deref().filter(|b| !b.is_empty());
+        let (_, new) = load(&app, &q.rev)?;
+        match base {
+            Some(b) => Ok(model::rights_changes(&new, &load(&app, b)?.1)),
+            None => Ok(Vec::new()),
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())
+    .and_then(|r: Result<_, String>| r);
+    match res {
+        Ok(changes) => Json(serde_json::json!({ "changes": changes })).into_response(),
         Err(e) => (
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(serde_json::json!({ "error": e })),

@@ -1171,6 +1171,10 @@ function renderPropsBody() {
       `<div class="ed-note">Change it in the module: an edit made in Loxone Config is overwritten on the next push.</div>`);
     section("Lox Logic", rows, ce.length + lf.length + access.length + tf.length || undefined);
   }
+  if (o.rights) {
+    const rr = rightsRows(o, marks);
+    section(o.rights.kind === "access" ? "Access" : "Recipients", rr.rows, rr.count);
+  }
   const opT = opTarget(o);
   if (opT) section("Operate", [opControls(opT)]);
   if (liveHere()) {
@@ -1504,11 +1508,12 @@ $("tree").addEventListener("focus", () => {
 $("tree-filter").addEventListener("input", renderTree);
 
 // ── changes ────────────────────────────────────────────────────────────
-const KIND = { added: ["+", "added"], removed: ["−", "removed"], renamed: ["~", "renamed"], param: ["~", "parameters"], attr: ["~", "settings"], "wire+": ["+", "wires added"], "wire-": ["−", "wires removed"], moved: ["↔", "moved"] };
+const KIND = { added: ["+", "added"], removed: ["−", "removed"], renamed: ["~", "renamed"], param: ["~", "parameters"], attr: ["~", "settings"], rights: ["~", "rights"], "wire+": ["+", "wires added"], "wire-": ["−", "wires removed"], moved: ["↔", "moved"] };
 function shownChanges() { return (S.view?.changes || []).filter((c) => !S.chgOff.has(c.kind) && (!S.chgHw || c.hw)); }
 function renderChanges() {
   const v = S.view, box = $("changes"), filt = $("chg-filter");
   box.innerHTML = ""; filt.innerHTML = "";
+  renderRights();
   const compact = !v.compared || !v.changes.length;
   $("right").classList.toggle("compact", compact);
   $("chg-nav").classList.toggle("hidden", !v.compared || !v.changes.length);
@@ -2448,11 +2453,11 @@ async function apply() {
   // calendar entries edited in the app.
   const [, calNow, hw] = await Promise.all([loadMs(true), loadCal(true), pendingHardware(pend)]);
   const stale = staleText();
-  const sched = await pendingScheduleText(pend);
+  const [sched, rights] = await Promise.all([pendingScheduleText(pend), pendingRightsText(pend)]);
   const src = S.check?.available && S.check.ok && S.check.stale;
   const srcText = src ? `⚠ The pending revision is from before the latest edit to ${src.files?.length ? src.files.join(", ") : "the module"}. ` +
     "lox config push compiles the module as it is, so Apply deploys changes this review does not show. Compile first to review them.\n\n" : "";
-  if (!window.confirm((stale ? `⚠ ${stale} Applying overwrites what changed there since.\n\n` : "") + srcText + sched +
+  if (!window.confirm((stale ? `⚠ ${stale} Applying overwrites what changed there since.\n\n` : "") + srcText + rights + sched +
     calApplyWarning(calNow) + hwApplyText(hw) +
     "Deploy the pending changes to the Miniserver?\n\nFirst the module must compile and its tests pass (lox logic test). Then lox config push uploads the config and restarts the Miniserver's program (a few seconds), " +
     "checks that it runs exactly the compiled config, then vislox commits and pushes to git.")) return;
@@ -2492,6 +2497,120 @@ $("btn-discard").onclick = async () => {
   deployMsg("");
   try { const j = await act("/api/discard"); deployMsg(j.message); } catch (err) { deployMsg(err.message, true); }
 };
+
+// ── access rights, recipients and switching times (#68) ────────────────
+// Who may open an NFC Code Touch, who gets a push notification and a Daytimer's switching times are on no logic
+// page, yet a Lox Logic claim (`haustuer.access = bewohner`, `frost.recipients = familie`, `uhr.schedule = abend`)
+// owns them: whoever a set leaves out loses the right on the next push, and a schedule replaces what the app
+// changed. The view compares them (`view.rights`: per block, who was added, removed or rescheduled, and the users
+// who gain or lose the right in effect, through groups too); GET /api/edits says which the module claims
+// (`set_claims`). Names stay on the page: never in a URL, the title or a log.
+/** The module's claims on block `uuid` (today's module: shown on the newest config only, like `sources`). */
+function setClaims(uuid) { return managedShown() ? claimsOf(uuid) : []; }
+/** The same, whatever revision is shown: for Apply's confirmation, which is about the newest config. */
+function claimsOf(uuid) { return (S.edits?.set_claims || []).filter((c) => c.blocks?.includes(uuid)); }
+function claimAt(c) { return `${c.file}:${c.line}`; }
+function claimNote(c) {
+  const what = c.kind === "schedule" ? "The push replaces these switching times, edits made in the app among them"
+    : c.kind === "access" ? "Whoever the set leaves out loses access on the next push"
+    : "Whoever the set leaves out stops getting it on the next push";
+  return `<div class="ed-note rt-claim">Managed by <span class="mono">${esc(claimAt(c))}</span> <span class="none-v">(${esc(c.kind)} ${esc(c.set)}${c.set_line ? `, ${esc(`${c.set_file}:${c.set_line}`)}` : ""})</span>. ${what}.</div>`;
+}
+const RIGHT_KIND = { access: "access", recipients: "recipients", schedule: "switching times" };
+function whoText(p) { return `${p.kind === "group" ? "group " : ""}${p.title}`; }
+function whoTip(p) { return p.members?.length ? `Members: ${p.members.join(", ")}` : ""; }
+/** One holder of a right as a line: `+ group Bewohner (Workdays)`. */
+function holderLi(p, cls, sign, extra) {
+  const tip = whoTip(p);
+  return `<li class="${cls}"${tip ? ` title="${esc(tip)}"` : ""}><span class="rt-s">${sign}</span>${esc(whoText(p))}${p.schedule ? ` <span class="none-v">(${esc(p.schedule)})</span>` : ""}${extra || ""}</li>`;
+}
+function lossText(c, users) {
+  const names = users.map((u) => u.title).join(", ");
+  return c.kind === "access" ? `${names} ${users.length === 1 ? "loses" : "lose"} access` : `${names} ${users.length === 1 ? "stops" : "stop"} getting it`;
+}
+function gainText(c, users) {
+  const names = users.map((u) => u.title).join(", ");
+  return c.kind === "access" ? `${names} ${users.length === 1 ? "gains" : "gain"} access` : `${names} now ${users.length === 1 ? "gets" : "get"} it`;
+}
+/** A Daytimer's changed modes, the compared revision's week next to this one's. */
+function scheduleSideBySide(o) {
+  const si = o?.schedule;
+  if (!si) return "";
+  const rows = schedRows(si, null).filter((r) => r.changed);
+  if (!rows.length) return "";
+  return `<div class="rt-sch"><div class="rt-sch-h"><span></span><span>before</span><span>after</span></div>` + rows.map((r) =>
+    `<div class="rt-sch-r"><span class="sch-mode" title="${esc(r.title)}">${esc(r.title)}</span><div title="${esc(schedLine(r.old || [], si.analog))}">${schedBar(r.old || [], si, "was")}</div><div title="${esc(schedLine(r.mine, si.analog))}">${schedBar(r.mine, si, "cfg")}</div></div>`).join("") + "</div>";
+}
+function renderRights() {
+  const box = $("rights-box"), v = S.view;
+  const list = v?.compared ? v.rights || [] : [];
+  box.classList.toggle("hidden", !list.length);
+  if (!list.length) { box.innerHTML = ""; return; }
+  const open = box.querySelector("details")?.open ?? true;
+  const lost = new Set(list.flatMap((c) => (c.lose || []).map((u) => u.uuid))).size;
+  const items = list.map((c) => {
+    const o = v.objects[c.uuid];
+    const claims = setClaims(c.uuid);
+    const head = `<div class="rt-head"><button type="button" class="lnk" data-go="${esc(c.uuid)}">${esc(c.title)}</button> <span class="rt-kind">${esc(RIGHT_KIND[c.kind] || c.kind)}</span>` +
+      claims.map((x) => ` <span class="rt-src" title="${esc(claimNote(x).replace(/<[^>]+>/g, ""))}">λ <span class="mono">${esc(claimAt(x))}</span></span>`).join("") + "</div>";
+    if (c.kind === "schedule") return `<li class="rt-item">${head}${scheduleSideBySide(o)}</li>`;
+    const lines = [
+      ...(c.lose?.length ? [`<li class="rt-lose">⚠ ${esc(lossText(c, c.lose))}</li>`] : []),
+      ...c.removed.map((p) => holderLi(p, "rt-rem", "−")),
+      ...c.added.map((p) => holderLi(p, "rt-add", "+")),
+      ...c.rescheduled.map((r) => holderLi(r.principal, "rt-chg", "~", ` <span class="none-v">was ${esc(r.from || "—")}</span>`)),
+      ...(c.gain?.length ? [`<li class="rt-gain">${esc(gainText(c, c.gain))}</li>`] : []),
+    ];
+    return `<li class="rt-item">${head}${c.new_block ? '<div class="none-v">A new block.</div>' : ""}<ul class="rt-lines">${lines.join("")}</ul></li>`;
+  });
+  box.innerHTML = `<details${open ? " open" : ""}><summary><span class="rt-h">Rights and schedules</span> ${list.length}${lost ? ` <span class="rt-lose">· ${plural(lost, "user")} lose${lost === 1 ? "s" : ""} a right</span>` : ""}</summary><ul class="rt-list">${items.join("")}</ul></details>`;
+}
+$("rights-box").addEventListener("click", goClicked);
+/** Properties of an NFC Code Touch or a push notification: who holds the right, marked against the compared
+ *  revision, who holds it in effect, and the module's claim on it. */
+function rightsRows(o, marks) {
+  const r = o.rights;
+  const old = marks ? o.rights_old : null;
+  const rows = setClaims(o.uuid).map(claimNote);
+  const by = (l, u) => l?.find((p) => p.uuid === u);
+  const items = r.list.map((p) => {
+    const was = old && by(old.list, p.uuid);
+    if (old && !was) return holderLi(p, "rt-add", "+");
+    if (was && was.schedule !== p.schedule) return holderLi(p, "rt-chg", "~", ` <span class="none-v">was ${esc(was.schedule || "—")}</span>`);
+    return holderLi(p, "", "");
+  });
+  if (old) for (const p of old.list) if (!by(r.list, p.uuid)) items.push(holderLi(p, "rt-rem", "−"));
+  rows.push(items.length ? `<ul class="rt-lines rt-props">${items.join("")}</ul>`
+    : `<div class="empty">${r.kind === "access" ? "No user or group may open it." : "No user or group is a recipient."}</div>`);
+  const users = r.users.map((u) => u.title);
+  const label = r.kind === "access" ? "Opens for" : "Sent to";
+  rows.push(propRow(label, users.length ? esc(users.join(", ")) : '<span class="none-v">nobody</span>', "",
+    r.kind === "access" ? "The users who may open it: directly, or through a group" : "The users who get it: directly, through a group, or as members of Full access"));
+  if (old) {
+    const ids = (l) => new Set(l.map((u) => u.uuid));
+    const now = ids(r.users), then = ids(old.users);
+    const lose = old.users.filter((u) => !now.has(u.uuid)), gain = r.users.filter((u) => !then.has(u.uuid));
+    if (lose.length) rows.push(`<div class="ed-note ck-err">⚠ ${esc(lossText({ kind: r.kind }, lose))} here.</div>`);
+    if (gain.length) rows.push(`<div class="ed-note">${esc(gainText({ kind: r.kind }, gain))} here.</div>`);
+  }
+  return { rows, count: r.list.length };
+}
+/** For Apply's confirmation: who loses or gains a right the pending config changes, against the deployed one. */
+async function pendingRightsText(pend) {
+  const base = deployedRev()?.id || pend.base || "";
+  let ch;
+  try { ch = (await api(`/api/rights/changes?rev=${encodeURIComponent(pend.id)}&base=${encodeURIComponent(base)}`)).changes || []; } catch (e) {
+    return `⚠ Could not check whose access rights or notifications this changes (${e.message}).\n\n`;
+  }
+  const lose = [], gain = [];
+  for (const c of ch) {
+    const by = claimsOf(c.uuid).map(claimAt);
+    const src = by.length ? ` (${by.join(", ")})` : "";
+    for (const u of c.lose || []) lose.push(c.kind === "access" ? `${u.title} loses access to ${c.title}${src}` : `${u.title} stops getting ${c.title}${src}`);
+    for (const u of c.gain || []) gain.push(c.kind === "access" ? `${u.title} gains access to ${c.title}` : `${u.title} starts getting ${c.title}`);
+  }
+  return (lose.length ? `⚠ ${lose.join("\n⚠ ")}\n\n` : "") + (gain.length ? `${gain.join("\n")}\n\n` : "");
+}
 
 // ── editing values (Properties) ────────────────────────────────────────
 // A block's name, its unwired inputs' constants and the settings of a physical input or output are
@@ -4389,7 +4508,7 @@ function scheduleRows(o, row, marks) {
   const cmp = live ? schedCompare(si, live) : null;
   const rows = schedRows(si, live);
   const r = revById(S.rev);
-  const out = [];
+  const out = setClaims(o.uuid).map(claimNote);
   // What the comparison means on this revision.
   let note;
   if (!S.live.on) note = `<div class="sch-note">Turn on live values to compare with the switching times the Miniserver runs.</div>`;
@@ -4419,7 +4538,8 @@ function scheduleConflicts(blocks) {
     const live = liveSchedule(b.schedule);
     if (!live) continue;
     const cmp = schedCompare(b.schedule, live);
-    if (!cmp.same) out.push(`${autoTitle(b.title) ? prettyType(b.ty) : b.title}: ${cmp.what}`);
+    const by = claimsOf(b.uuid).map(claimAt);
+    if (!cmp.same) out.push(`${autoTitle(b.title) ? prettyType(b.ty) : b.title}: ${cmp.what}${by.length ? ` (claimed by ${by.join(", ")})` : ""}`);
   }
   return out;
 }
