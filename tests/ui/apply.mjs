@@ -31,6 +31,8 @@ mkdirSync(join(dir, "pages"), { recursive: true });
 const git = (...a) => execFileSync("git", ["-C", dir, "-c", "user.name=t", "-c", "user.email=t@example.com", ...a]);
 // The deployed config shows the Divide block in the app.
 const DIV = "10000006-0000-0060-ffff504f94000001";
+// A user's mail address in a stray config (#71): it must never show, nor reach the remote.
+const CAROL = "carol@example.com";
 // It has a Touch Tree on a Tree Extension.
 const TOUCH = "20000003-0000-0030-ffff504f94000001";
 const hardware = `\t\t<C Type="LoxLIVE" V="178" U="20000001-0000-0010-ffff504f94000001" Title="Miniserver" Serial="504F94000001">
@@ -133,6 +135,14 @@ const refusal = "compile error: managed block \\`teiler\\` is in the lockfile bu
 writeFileSync(fakeLox, `#!/bin/sh
 case "$1 $2" in
   "logic diff") echo "Rename Licht OG to Licht oben" ;;
+  "logic scan")
+    # Before the git push (#71), as lox answers: a user's mail address in a config with Ema="…", where and how
+    # long, never the value; exit 1 when it found any.
+    shift 3; code=0; printf '{'; sep=
+    for f in "$@"; do printf '%s"%s": [' "$sep" "$f"; sep=,
+      if grep -q 'Ema="' "$f"; then printf '{"rule":"mail","object":"User #1","attr":"Ema","len":17}'; code=1; fi
+      printf ']'; done
+    echo '}'; exit $code ;;
   "logic test")
     # The module's test (#67): it fails while ${loxDir}/failtest exists.
     if [ -f "${loxDir}/failtest" ]; then
@@ -393,6 +403,8 @@ try {
     dialogs = 0; applies = 0; asked.length = 0;
   });
   await step("Apply shows its steps as they happen", async () => {
+    // A downloaded config no .gitignore keeps out: Apply's commit takes it along (#71).
+    writeFileSync(join(dir, "live.Loxone"), `<C Type="Document">\n\t<C Type="User" Title="carol" Ema="${CAROL}"/>\n</C>\n`);
     // With live values on, the confirmation names the schedule the Miniserver runs differently.
     await page.click("#sw-live .track");
     await page.waitForFunction(() => document.querySelector("#chk-live").checked);
@@ -435,9 +447,46 @@ try {
     const i = errors.findIndex((e) => /status of 409/.test(e));
     assert.ok(i >= 0, "the 409 was logged: " + errors.join(" | "));
     errors.splice(i, 1);
-    for (const l of ["Download and drift check", "Upload", "Program restarting", "Back online", "New config loaded", "Verified", "Committed", "Pushed to git"]) {
+    for (const l of ["Download and drift check", "Upload", "Program restarting", "Back online", "New config loaded", "Verified", "Committed"]) {
       assert.equal(await state(l), "ok", l);
     }
+    // Deployed and committed, but lox logic scan found the stray config's personal data: not pushed (#71).
+    assert.equal(await state("No personal data in git"), "fail");
+    assert.equal(await state("Pushed to git"), "skip");
+    assert.match(await page.textContent("#deploy-msg"), /^Applied, but (not verified and )?not pushed to git\./);
+  });
+  await step("the blocked push lists where the personal data is, never the value, and Push to git retries (#71)", async () => {
+    await page.waitForSelector("#deploy-push:not(.hidden)");
+    const text = await page.textContent("#deploy-push");
+    assert.match(text, /^Not pushed to git: personal data/, text);
+    assert.match(text, /The Miniserver runs the deployed config and the commit records it: only the git remote is behind\./, text);
+    assert.match(text, /live\.Loxone:2mail — User #1 Ema \(17 chars\)/, text);
+    assert.match(text, /git rm --cached -- live\.Loxone/, text);
+    assert.match(await page.textContent("#deploy-msg"), /live\.Loxone:2: mail — User #1 Ema \(17 chars\)/);
+    assert.ok(!(await page.content()).includes(CAROL));
+    const remote = () => execFileSync("git", ["-C", join(root, "remote.git"), "log", "-1", "--format=%s"]).toString().trim();
+    assert.equal(remote(), "Deployed");
+    // Push to git scans again: still there, so still not pushed (409).
+    await page.click("#btn-push");
+    await page.waitForFunction(() => /Not pushed: lox logic scan found personal data/.test(document.querySelector("#deploy-msg")?.textContent || ""), null, { timeout: 20000 });
+    let i = -1;
+    for (const end = Date.now() + 10000; (i = errors.findIndex((e) => /status of 409/.test(e))) < 0 && Date.now() < end;) {
+      await new Promise((ok) => setTimeout(ok, 50));
+    }
+    assert.ok(i >= 0, "the 409 was logged: " + errors.join(" | "));
+    errors.splice(i, 1);
+    assert.equal(remote(), "Deployed");
+    // Kept out of git as the box says: Push to git pushes.
+    git("rm", "-q", "--cached", "--", "live.Loxone");
+    writeFileSync(join(dir, ".gitignore"), "/live.Loxone\n");
+    git("add", ".gitignore");
+    git("commit", "-q", "--amend", "--no-edit");
+    await page.waitForSelector("#btn-push:not([disabled])");
+    await page.click("#btn-push");
+    await page.waitForSelector("#deploy-push.hidden", { state: "attached", timeout: 20000 });
+    await page.waitForFunction(() => /Pushed to git\./.test(document.querySelector("#deploy-msg")?.textContent || ""));
+    assert.match(remote(), /Rename Licht OG/);
+    assert.doesNotMatch(execFileSync("git", ["-C", join(root, "remote.git"), "ls-tree", "--name-only", "HEAD"]).toString(), /live\.Loxone/);
   });
   await step("the deployed revision shows, compared with the one it replaced, with live values", async () => {
     await page.waitForSelector("#deploy-new:not(.hidden)");
@@ -512,7 +561,7 @@ try {
     assert.deepEqual(errors, []);
   });
   await step("no user's name in vislox's log (#68)", async () => {
-    assert.ok(!/alice|Bewohner/.test(log), log);
+    assert.ok(!/alice|Bewohner|carol/.test(log), log);
   });
 } catch (e) {
   failed = true;

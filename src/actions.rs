@@ -23,6 +23,7 @@ use crate::{check, edit, restart};
 
 mod removals;
 mod rollback;
+mod scan;
 pub use removals::{NEEDS_CONSENT, RemovalConsent, plan_id as removal_plan_id, refused_slug};
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -36,6 +37,8 @@ const PUSH_TIMEOUT: Duration = Duration::from_secs(600);
 const GIT_TIMEOUT: Duration = Duration::from_secs(120);
 /// Starts an Apply message whose upload the Miniserver may not run.
 const UNVERIFIED: &str = "Not verified";
+/// Says what an action committed is not on the git remote (#71).
+const NOT_PUSHED: &str = "not pushed to git";
 /// `lox logic compile` reads the base and the module and writes out and the lock;
 /// `lox logic lint` compiles them too, in memory.
 const COMPILE_TIMEOUT: Duration = Duration::from_secs(120);
@@ -97,6 +100,9 @@ pub struct Actions {
     pushes: crate::rollback::Pushes,
     /// The last removal plan worked out (#70), for Apply's consent to name.
     removals: Mutex<Option<removals::RemovalPlan>>,
+    /// `HEAD` and the upstream's tracking branch when a push that is behind
+    /// was last looked at again ([`Actions::recheck_push`]).
+    push_key: Mutex<String>,
     /// Tests: what `/prog` says of an upload waiting ([`Actions::upload_waiting`]).
     #[cfg(test)]
     waiting: Mutex<Option<Result<Option<String>, String>>>,
@@ -435,6 +441,20 @@ impl Rollback {
 /// Read objects (`<commit>:<path>`) with one `git cat-file --batch`: each
 /// one's bytes, or `None` where git has none.
 async fn git_objects(dir: &Path, specs: &[String]) -> Result<Vec<Option<Vec<u8>>>, String> {
+    Ok(git_typed_objects(dir, specs)
+        .await?
+        .into_iter()
+        .map(|o| o.map(|(_, b)| b))
+        .collect())
+}
+
+/// [`git_objects`] with each object's type (`blob`, `tree`, …). The ids are
+/// written while git's answer is read, so neither pipe fills up and stalls
+/// the other; the time limit covers both.
+async fn git_typed_objects(
+    dir: &Path,
+    specs: &[String],
+) -> Result<Vec<Option<(String, Vec<u8>)>>, String> {
     use tokio::io::AsyncWriteExt;
     if specs.is_empty() {
         return Ok(Vec::new());
@@ -451,15 +471,19 @@ async fn git_objects(dir: &Path, specs: &[String]) -> Result<Vec<Option<Vec<u8>>
     let mut input = specs.join("\n");
     input.push('\n');
     let mut stdin = child.stdin.take().expect("piped");
-    stdin
-        .write_all(input.as_bytes())
-        .await
-        .map_err(|e| format!("git cat-file: {e}"))?;
-    drop(stdin);
-    let out = tokio::time::timeout(GIT_TIMEOUT, child.wait_with_output())
-        .await
-        .map_err(|_| "git cat-file took too long".to_string())?
-        .map_err(|e| format!("git cat-file: {e}"))?;
+    let write = async move {
+        stdin.write_all(input.as_bytes()).await?;
+        // Closed: git ends after the last object.
+        drop(stdin);
+        Ok::<(), std::io::Error>(())
+    };
+    let (written, out) = tokio::time::timeout(GIT_TIMEOUT, async {
+        tokio::join!(write, child.wait_with_output())
+    })
+    .await
+    .map_err(|_| "git cat-file took too long".to_string())?;
+    written.map_err(|e| format!("git cat-file: {e}"))?;
+    let out = out.map_err(|e| format!("git cat-file: {e}"))?;
     let (mut rest, mut objects) = (&out.stdout[..], Vec::new());
     for _ in specs {
         let nl = rest
@@ -472,16 +496,27 @@ async fn git_objects(dir: &Path, specs: &[String]) -> Result<Vec<Option<Vec<u8>>
             objects.push(None);
             continue;
         }
-        let size: usize = header
-            .rsplit(' ')
+        let mut f = header.split(' ');
+        let kind = f.nth(1).unwrap_or_default().to_string();
+        let size: usize = f
             .next()
             .and_then(|n| n.parse().ok())
             .ok_or_else(|| format!("git cat-file: {header}"))?;
         let body = rest.get(..size).ok_or("git cat-file: short output")?;
-        objects.push(Some(body.to_vec()));
+        objects.push(Some((kind, body.to_vec())));
         rest = rest.get(size + 1..).unwrap_or_default();
     }
     Ok(objects)
+}
+
+/// The first JSON value in a command's output: lox may print progress
+/// messages after it.
+fn first_json(out: &str) -> Option<Value> {
+    let i = out.find('{')?;
+    serde_json::Deserializer::from_str(&out[i..])
+        .into_iter::<Value>()
+        .next()?
+        .ok()
 }
 
 /// Removes a scratch directory when dropped.
@@ -507,6 +542,43 @@ struct St {
     last: Option<Outcome>,
     /// The steps of the running or last Apply.
     progress: Option<Progress>,
+    /// Commits the remote does not have, and why (#71): a push the scan
+    /// blocked or git refused, for *Push to git*.
+    push: Option<PushState>,
+}
+
+/// Why the git remote is behind (#71).
+#[derive(Clone, Serialize)]
+struct PushState {
+    /// `found`: personal data in what the push would send; `unscanned`:
+    /// vislox could not find out; `failed`: git push failed; `behind`:
+    /// commits not pushed (found on start, or made during a push).
+    state: &'static str,
+    message: String,
+    /// Where lox found personal data (never a value): the first
+    /// [`SHOWN_FINDINGS`], so every event stays small.
+    findings: Vec<scan::Finding>,
+    /// How many there are in all.
+    total: usize,
+    /// What to do.
+    advice: Option<String>,
+    at: i64,
+}
+
+/// The findings `actions.push` carries; the rest are counted.
+const SHOWN_FINDINGS: usize = 50;
+
+impl PushState {
+    fn new(state: &'static str, message: String, advice: Option<String>) -> PushState {
+        PushState {
+            state,
+            message,
+            findings: Vec::new(),
+            total: 0,
+            advice,
+            at: now(),
+        }
+    }
 }
 
 /// An Apply, step by step.
@@ -531,7 +603,7 @@ struct Step {
 }
 
 /// Apply's steps, in order.
-const APPLY_STEPS: [(&str, &str); 11] = [
+const APPLY_STEPS: [(&str, &str); 12] = [
     ("module", "Module compiles"),
     ("removals", "Removals you confirmed"),
     ("tests", "Tests pass"),
@@ -542,11 +614,12 @@ const APPLY_STEPS: [(&str, &str); 11] = [
     ("loaded", "New config loaded"),
     ("verify", "Verified"),
     ("commit", "Committed"),
+    ("scan", "No personal data in git"),
     ("push", "Pushed to git"),
 ];
 /// A Roll back's steps (#69): Apply's, from the backup and the module
 /// before the Apply.
-const ROLLBACK_STEPS: [(&str, &str); 12] = [
+const ROLLBACK_STEPS: [(&str, &str); 13] = [
     ("backup", "Backup checked"),
     ("module", "Module before the Apply compiles to it"),
     ("tests", "Tests pass"),
@@ -558,6 +631,7 @@ const ROLLBACK_STEPS: [(&str, &str); 12] = [
     ("loaded", "Config loaded"),
     ("verify", "Verified"),
     ("commit", "Committed"),
+    ("scan", "No personal data in git"),
     ("push", "Pushed to git"),
 ];
 const LOG_LINES: usize = 12;
@@ -720,6 +794,9 @@ struct Outcome {
     /// Done, but not verified: the Miniserver may not run it (`message`
     /// says why).
     warn: bool,
+    /// Done, but the git remote does not have it (#71): `actions.push` says
+    /// why.
+    unpushed: bool,
     message: String,
     at: i64,
     /// After an Apply: the git blob ids of the base before and after, so the
@@ -772,6 +849,7 @@ impl Actions {
             project_cache: Mutex::new(None),
             pushes: Default::default(),
             removals: Mutex::new(None),
+            push_key: Mutex::new(String::new()),
             #[cfg(test)]
             waiting: Mutex::new(None),
         };
@@ -932,6 +1010,8 @@ impl Actions {
             "running": st.running,
             "last": st.last,
             "progress": st.progress,
+            // The commits the git remote does not have, and why (#71).
+            "push": st.push,
             // The removal plan the server keeps (#70): a tab's own preview
             // goes when it is another.
             "removals": self.removal_plan_id(),
@@ -994,6 +1074,7 @@ impl Actions {
             kind,
             ok: res.is_ok(),
             warn: res.as_ref().is_ok_and(|m| m.contains(UNVERIFIED)),
+            unpushed: res.as_ref().is_ok_and(|m| m.contains(NOT_PUSHED)),
             message: match res {
                 Ok(m) | Err(m) => m.clone(),
             },
@@ -1290,21 +1371,259 @@ impl Actions {
         } else {
             self.progress(|p| p.finish("commit", "skip", Some("nothing to commit".into())));
         }
-        self.progress(|p| p.start("push"));
-        match git(dir, &["push", "-q"]).await {
-            Ok(_) => {
-                report.push("Pushed to git.".into());
-                self.progress(|p| p.finish("push", "ok", None));
-            }
-            Err(e) => {
-                report.push(format!(
-                    "Deployed and committed, but git push failed: {}",
-                    last_lines(&e, 3)
-                ));
-                self.progress(|p| p.finish("push", "fail", Some(last_lines(&e, 1))));
-            }
+        // Only what holds no personal data goes to the remote (#71). The
+        // Miniserver runs the new config either way: only git is behind.
+        match self.push_git(dir, true).await {
+            Ok(m) => report.push(m),
+            Err(e) => report.push(format!(
+                "Deployed and committed, but {NOT_PUSHED}: {e}\nThe Miniserver runs the new \
+                 config and the commit records it; only the git remote is behind. Push to git \
+                 (Deploy pane) pushes once it is fixed."
+            )),
         }
         Ok((report.join("\n"), deployed))
+    }
+
+    /// `git push`, only after `lox logic scan` found no personal data in
+    /// what it would send (#71): every push vislox makes goes through here.
+    /// It pushes exactly the commit it scanned, to the branch's upstream:
+    /// `git push --no-follow-tags <remote> <sha>:<branch>`, so no other
+    /// branch or tag goes along, whatever git's configuration says, and no
+    /// commit made after the scan. With `steps`, as Apply's *No personal data
+    /// in git* and *Pushed to git*. `Err` says why nothing was pushed;
+    /// `actions.push` keeps it for *Push to git*, until a push goes through.
+    async fn push_git(&self, dir: &Path, steps: bool) -> Result<String, String> {
+        let step = |f: &dyn Fn(&mut Progress)| {
+            if steps {
+                self.progress(f);
+            }
+        };
+        step(&|p| p.start("scan"));
+        let ready = async {
+            let t = scan::target(dir).await?;
+            let sha = scan::head(dir).await?;
+            Ok::<_, String>((t, sha))
+        }
+        .await;
+        let (verdict, aim) = match ready {
+            Err(why) => (scan::Verdict::CannotScan(why), None),
+            Ok((t, sha)) => (
+                scan::before_push(dir, &self.s.lox, &t, &sha).await,
+                Some((t, sha)),
+            ),
+        };
+        let blocked = match verdict {
+            scan::Verdict::Clean(detail) => {
+                step(&|p| p.finish("scan", "ok", Some(detail.clone())));
+                None
+            }
+            scan::Verdict::Found(found) => {
+                let files: std::collections::BTreeSet<&str> =
+                    found.iter().map(|f| f.file.as_str()).collect();
+                let unread = found.iter().all(|f| f.kind == "unreadable");
+                let message = if unread {
+                    format!(
+                        "lox logic scan could not read {} in the commits to push, so it may hold \
+                         personal data",
+                        plural(files.len(), "file")
+                    )
+                } else {
+                    format!(
+                        "lox logic scan found personal data in the commits to push: {} in {}",
+                        plural(found.len(), "finding"),
+                        plural(files.len(), "file")
+                    )
+                };
+                let mut b = PushState::new("found", message, Some(scan::advice(&found)));
+                b.total = found.len();
+                b.findings = found;
+                Some(b)
+            }
+            scan::Verdict::CannotScan(why) => Some(PushState::new(
+                "unscanned",
+                format!("vislox could not check the push for personal data: {why}"),
+                Some(
+                    "vislox never pushes what it could not check. Once it can, push again (Push \
+                     to git). Or check the commits yourself and push them from a terminal."
+                        .into(),
+                ),
+            )),
+        };
+        if let Some(mut b) = blocked {
+            let short = if b.state == "found" {
+                format!("{}: not pushed", plural(b.total, "finding"))
+            } else {
+                "couldn't check: not pushed".to_string()
+            };
+            step(&|p| {
+                p.finish("scan", "fail", Some(short.clone()));
+                p.finish(
+                    "push",
+                    "skip",
+                    Some("blocked: see Not pushed to git".into()),
+                );
+            });
+            let mut text = b.message.clone();
+            const IN_MESSAGE: usize = 20;
+            for f in b.findings.iter().take(IN_MESSAGE) {
+                text.push_str(&format!("\n  {}", f.text()));
+            }
+            if b.total > IN_MESSAGE {
+                text.push_str(&format!("\n  … and {} more", b.total - IN_MESSAGE));
+            }
+            if let Some(a) = &b.advice {
+                text.push_str(&format!("\n{a}"));
+            }
+            b.findings.truncate(SHOWN_FINDINGS);
+            self.st.lock().unwrap().push = Some(b);
+            self.changed();
+            return Err(text);
+        }
+        let (t, sha) = aim.expect("scanned a target");
+        step(&|p| p.start("push"));
+        let refspec = format!("{sha}:{}", t.remote_ref);
+        match git(
+            dir,
+            &["push", "-q", "--no-follow-tags", &t.remote, &refspec],
+        )
+        .await
+        {
+            Ok(_) => {
+                // A commit made while this ran was not pushed: say so.
+                let left = scan::unpushed(dir, &t).await.unwrap_or(0);
+                self.st.lock().unwrap().push = (left > 0).then(|| {
+                    PushState::new(
+                        "behind",
+                        format!(
+                            "{} made during the push not pushed to git yet",
+                            plural(left, "commit")
+                        ),
+                        None,
+                    )
+                });
+                step(&|p| p.finish("push", "ok", None));
+                self.changed();
+                Ok("Pushed to git.".into())
+            }
+            Err(e) => {
+                let why = format!("git push failed: {}", last_lines(&e, 3));
+                self.st.lock().unwrap().push = Some(PushState::new(
+                    "failed",
+                    why.clone(),
+                    Some("Fix what git says (credentials, the remote), then push again.".into()),
+                ));
+                step(&|p| p.finish("push", "fail", Some(last_lines(&e, 1))));
+                self.changed();
+                Err(why)
+            }
+        }
+    }
+
+    /// The last Apply's or Roll back's steps, once its commits are on the
+    /// remote after all (#71): *Pushed to git*, and how.
+    fn pushed_later(&self, how: &str) {
+        let mut st = self.st.lock().unwrap();
+        if let Some(p) = st.progress.as_mut()
+            && p.steps.iter().any(|s| s.id == "push")
+            && matches!(p.get("push").state, "skip" | "fail")
+        {
+            if p.get("scan").state == "fail" {
+                p.finish("scan", "ok", Some("checked again".into()));
+            }
+            p.finish("push", "ok", Some(how.to_string()));
+        }
+    }
+
+    /// *Push to git* (#71): push the commits the upstream does not have,
+    /// after the same scan as every push. Changes nothing in the project.
+    pub async fn push(&self) -> Result<String, Refusal> {
+        use axum::http::StatusCode;
+        let _one = self
+            .busy
+            .try_lock()
+            .map_err(|_| (StatusCode::CONFLICT, "already running".to_string()))?;
+        self.begin("Push")?;
+        let dir = self.s.project.as_deref().unwrap();
+        let left = match scan::target(dir).await {
+            Ok(t) => scan::unpushed(dir, &t).await.ok(),
+            Err(_) => None,
+        };
+        let res = if left == Some(0) {
+            self.st.lock().unwrap().push = None;
+            self.pushed_later("the remote has it");
+            Ok("Nothing to push: the upstream has every commit.".to_string())
+        } else {
+            let r = self.push_git(dir, false).await;
+            if r.is_ok() {
+                self.pushed_later("pushed later (Push to git)");
+            }
+            r
+        };
+        self.end("push", &res);
+        res.map_err(|e| (StatusCode::CONFLICT, format!("Not pushed: {e}")))
+    }
+
+    /// On start: commits the upstream does not have yet (a push blocked or
+    /// failed before vislox restarted) offer *Push to git* (#71).
+    pub async fn find_unpushed(&self) {
+        if self.why_not_apply().is_some() {
+            return;
+        }
+        let dir = self.s.project.as_deref().unwrap();
+        let Ok(t) = scan::target(dir).await else {
+            return;
+        };
+        let n = scan::unpushed(dir, &t).await.unwrap_or(0);
+        if n == 0 {
+            return;
+        }
+        let mut st = self.st.lock().unwrap();
+        if st.push.is_none() {
+            st.push = Some(PushState::new(
+                "behind",
+                format!("{} not pushed to git yet", plural(n, "commit")),
+                None,
+            ));
+        }
+        drop(st);
+        self.changed();
+    }
+
+    /// With the git poll: a push that is behind is looked at again when
+    /// `HEAD` or the upstream's tracking branch moved, and forgotten once the
+    /// upstream has every commit (pushed from a terminal, say) (#71).
+    pub async fn recheck_push(&self) {
+        if self.st.lock().unwrap().push.is_none() || self.running().is_some() {
+            return;
+        }
+        let dir = self.s.project.as_deref().unwrap();
+        let Ok(t) = scan::target(dir).await else {
+            return;
+        };
+        let key = format!(
+            "{}:{}",
+            scan::head(dir).await.unwrap_or_default(),
+            git(dir, &["rev-parse", "-q", "--verify", &t.tracking])
+                .await
+                .unwrap_or_default()
+                .trim()
+        );
+        {
+            let mut k = self.push_key.lock().unwrap();
+            if *k == key {
+                return;
+            }
+            *k = key;
+        }
+        if scan::unpushed(dir, &t).await == Ok(0) {
+            let mut st = self.st.lock().unwrap();
+            // Not while an action started meanwhile: it sets its own.
+            if st.running.is_none() && st.push.take().is_some() {
+                drop(st);
+                self.pushed_later("pushed outside vislox");
+                self.changed();
+            }
+        }
     }
 
     /// `lox config push`, its progress lines shown as they come. From the
@@ -1501,16 +1820,7 @@ impl Actions {
         .await
         {
             Ok(out) => {
-                let report: Value = out
-                    .find('{')
-                    // The first JSON value; lox's progress messages may follow it.
-                    .and_then(|i| {
-                        serde_json::Deserializer::from_str(&out[i..])
-                            .into_iter::<Value>()
-                            .next()?
-                            .ok()
-                    })
-                    .unwrap_or(Value::Null);
+                let report: Value = first_json(&out).unwrap_or(Value::Null);
                 report["rules_updated"].as_array().map_or(0, Vec::len)
                     + report["rules_removed"].as_array().map_or(0, Vec::len)
             }
@@ -1551,11 +1861,11 @@ impl Actions {
             report.push(format!("Took over {rules} rule(s) edited in the app."));
         }
         report.extend(notes);
-        match git(dir, &["push", "-q"]).await {
+        match self.push_git(dir, false).await {
             Ok(_) => report.push("Committed and pushed to git.".into()),
             Err(e) => report.push(format!(
-                "Committed, but git push failed: {}",
-                last_lines(&e, 3)
+                "Committed, but {NOT_PUSHED}: {e}\nPush to git (Deploy pane) pushes once it is \
+                 fixed."
             )),
         }
         Ok(report.join("\n"))
@@ -2859,8 +3169,9 @@ pub fn apply_hints(msg: &str) -> Value {
 
 /// After a verified push, lox points `base` in lox.toml at its download in
 /// `backups/`, which is git-ignored (configs carry personal data). This
-/// project keeps its deployed config in git instead: copy that download to
-/// where the base was and point lox.toml back at it.
+/// project keeps its deployed config as its base instead (in git when the
+/// project tracks it; the push scan, #71, stops one with personal data):
+/// copy that download to where the base was and point lox.toml back at it.
 fn keep_base(dir: &Path, old_base: &Path) -> Result<Option<String>, String> {
     let toml = dir.join("lox.toml");
     let p =
@@ -3319,6 +3630,10 @@ mod tests {
         assert_eq!(p.get("commit").state, "wait");
     }
 
+    /// A stand-in lox's `logic scan --json` (#71): no personal data in any
+    /// file it is given.
+    const CLEAN_SCAN: &str = "  'logic scan')\n    shift 3; printf '{'; sep=; for f in \"$@\"; do printf '%s\"%s\": []' \"$sep\" \"$f\"; sep=,; done; echo '}' ;;\n";
+
     fn sh(dir: &Path, cmd: &str) {
         let ok = std::process::Command::new("sh")
             .args(["-c", cmd])
@@ -3363,7 +3678,7 @@ mod tests {
         std::fs::write(
             &lox,
             format!(
-                "#!/bin/sh\ncase \"$1 $2\" in\n  'logic diff') echo 'Add a hallway light' ;;\n  'logic test') echo 'no tests in pages' ;;\n  'config push')\n    echo 'Downloading the live config...' >&2\n    echo 'Uploading as sps_new.zip...' >&2\n    echo 'Restarting the program...' >&2\n    sleep 2\n    {push} ;;\nesac\n"
+                "#!/bin/sh\ncase \"$1 $2\" in\n{CLEAN_SCAN}  'logic diff') echo 'Add a hallway light' ;;\n  'logic test') echo 'no tests in pages' ;;\n  'config push')\n    echo 'Downloading the live config...' >&2\n    echo 'Uploading as sps_new.zip...' >&2\n    echo 'Restarting the program...' >&2\n    sleep 2\n    {push} ;;\nesac\n"
             ),
         )
         .unwrap();
@@ -5324,7 +5639,7 @@ esac
             )
         };
         for id in [
-            "check", "upload", "restart", "online", "loaded", "verify", "commit", "push",
+            "check", "upload", "restart", "online", "loaded", "verify", "commit", "scan", "push",
         ] {
             assert_eq!(st(id).0, "ok", "{id}: {steps:?}");
         }
@@ -5334,6 +5649,309 @@ esac
         let dep = &info["last"]["deployed"];
         assert_eq!(dep["before"], crate::history::blob_id(b"old"));
         assert_eq!(dep["after"], crate::history::blob_id(b"new"));
+    }
+
+    /// [`project_with_fake_lox`] whose lox finds a user's mail address in a
+    /// config with `Ema="…"` (#71), and a `live.Loxone` with one that no
+    /// `.gitignore` keeps out of git.
+    #[cfg(unix)]
+    fn project_with_personal_data() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let (tmp, lox) = project_with_fake_lox(true);
+        let d = tmp.path().join("project");
+        let finds = "  'logic scan')\n    shift 3; code=0; printf '{'; sep=\n    for f in \"$@\"; do printf '%s\"%s\": [' \"$sep\" \"$f\"; sep=,\n      if grep -q 'Ema=' \"$f\"; then printf '{\"rule\":\"mail\",\"object\":\"User #1\",\"attr\":\"Ema\",\"len\":17}'; code=1; fi\n      printf ']'; done; echo '}'; exit $code ;;\n  'config merge') echo '{}'; echo synced > base.Loxone ;;\n";
+        let script = std::fs::read_to_string(&lox)
+            .unwrap()
+            .replace(CLEAN_SCAN, finds);
+        std::fs::write(&lox, script).unwrap();
+        std::fs::write(
+            d.join("live.Loxone"),
+            "<C Type=\"Document\">\n\t<C Type=\"User\" Title=\"alice\" Ema=\"alice@example.com\"/>\n</C>\n",
+        )
+        .unwrap();
+        (tmp, d, lox)
+    }
+
+    fn actions_for(d: &Path, lox: PathBuf) -> Actions {
+        Actions::new(Settings {
+            token: Some("t".into()),
+            project: Some(d.to_path_buf()),
+            lox,
+            probe: None,
+            running: Arc::new(crate::running::Running::new(Err("test".into()))),
+        })
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn personal_data_stops_the_push_not_the_deploy_and_push_to_git_retries() {
+        let (tmp, d, lox) = project_with_personal_data();
+        let a = actions_for(&d, lox.clone());
+        let remote = |t: &Path| git_out(t, &["--git-dir=remote.git", "log", "-1", "--format=%s"]);
+        // Deployed and committed: the Miniserver runs it, the commit records it.
+        let msg = a.apply(&ApplyOpts::default()).await.unwrap();
+        assert!(msg.contains("Deployed and committed, but not pushed to git: lox logic scan found personal data in the commits to push: 1 finding in 1 file"), "{msg}");
+        assert!(
+            msg.contains("\n  live.Loxone:2: mail — User #1 Ema (17 chars)"),
+            "{msg}"
+        );
+        assert!(msg.contains("git rm --cached -- live.Loxone"), "{msg}");
+        assert!(msg.contains("only the git remote is behind"), "{msg}");
+        assert_eq!(
+            git_out(&d, &["log", "-1", "--format=%s"]),
+            "Add a hallway light"
+        );
+        assert_eq!(remote(tmp.path()), "init");
+        let info = a.info();
+        let steps = step_states(&a);
+        assert_eq!(
+            [
+                &steps["verify"],
+                &steps["commit"],
+                &steps["scan"],
+                &steps["push"]
+            ],
+            ["ok", "ok", "fail", "skip"]
+        );
+        assert_eq!(info["last"]["ok"], true);
+        assert_eq!(info["last"]["unpushed"], true);
+        assert_eq!(info["push"]["state"], "found");
+        assert_eq!(info["push"]["findings"][0]["file"], "live.Loxone");
+        assert_eq!(info["push"]["findings"][0]["line"], 2);
+        // Never the value: not in the message, the state or the steps.
+        assert!(!(msg + &info.to_string()).contains("alice@example.com"));
+        // Push to git scans again: still there, still not pushed.
+        let (_, e) = a.push().await.unwrap_err();
+        assert!(
+            e.starts_with("Not pushed: lox logic scan found personal data"),
+            "{e}"
+        );
+        assert_eq!(remote(tmp.path()), "init");
+        // After a restart, the commits not pushed still offer it.
+        let b = actions_for(&d, lox.clone());
+        b.find_unpushed().await;
+        assert_eq!(b.info()["push"]["state"], "behind");
+        assert_eq!(
+            b.info()["push"]["message"],
+            "1 commit not pushed to git yet"
+        );
+        // Kept out of git as the advice says: pushed.
+        sh(
+            &d,
+            "git rm -q --cached -- live.Loxone && echo /live.Loxone > .gitignore \
+                && git add .gitignore && git commit -q --amend --no-edit",
+        );
+        assert_eq!(a.push().await.unwrap(), "Pushed to git.");
+        assert_eq!(remote(tmp.path()), "Add a hallway light");
+        // Apply's steps say so now.
+        let steps = step_states(&a);
+        assert_eq!([&steps["scan"], &steps["push"]], ["ok", "ok"]);
+        assert_eq!(
+            git_out(
+                tmp.path(),
+                &["--git-dir=remote.git", "ls-tree", "--name-only", "HEAD"]
+            ),
+            ".gitignore\nbase.Loxone\nlox.toml\nout.Loxone"
+        );
+        assert!(a.info()["push"].is_null());
+        assert_eq!(
+            a.push().await.unwrap(),
+            "Nothing to push: the upstream has every commit."
+        );
+    }
+
+    fn branch(d: &Path) -> String {
+        git_out(d, &["symbolic-ref", "--short", "HEAD"])
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn only_the_scanned_commit_goes_to_the_upstream_branch() {
+        let (tmp, lox) = project_with_fake_lox(true);
+        let d = tmp.path().join("project");
+        let a = actions_for(&d, lox.clone());
+        let main = branch(&d);
+        // git would push every branch and the tags along with these.
+        sh(
+            &d,
+            "git config push.default matching && git config push.followTags true \
+             && git config remote.origin.push 'refs/heads/*:refs/heads/*' \
+             && git checkout -q -b other && echo o > o.txt && git add -A && git commit -qm other",
+        );
+        sh(&d, &format!("git checkout -q {main}"));
+        std::fs::write(d.join("clean.Loxone"), "<C Type=\"Document\"/>\n").unwrap();
+        sh(
+            &d,
+            "git add -A && git commit -qm clean && git tag -a v1 -m v1",
+        );
+        // The scan commits once more while lox reads (as someone in a terminal could).
+        let late = format!(
+            "  'logic scan')\n    [ -e {late} ] || {{ touch {late}; git -C {d} commit -q --allow-empty -m late; }}\n",
+            late = tmp.path().join("late").display(),
+            d = d.display()
+        );
+        let script = std::fs::read_to_string(&lox)
+            .unwrap()
+            .replace("  'logic scan')\n", &late);
+        std::fs::write(&lox, script).unwrap();
+        let scanned = git_out(&d, &["rev-parse", "HEAD"]);
+        assert_eq!(a.push().await.unwrap(), "Pushed to git.");
+        let remote = |args: &[&str]| {
+            let mut v = vec!["--git-dir=remote.git"];
+            v.extend(args);
+            git_out(tmp.path(), &v)
+        };
+        assert_eq!(
+            remote(&["for-each-ref", "--format=%(refname)"]),
+            format!("refs/heads/{main}")
+        );
+        assert_eq!(remote(&["rev-parse", &main]), scanned);
+        assert_eq!(git_out(&d, &["log", "-1", "--format=%s"]), "late");
+        // The late commit is left for the next push.
+        assert_eq!(a.info()["push"]["state"], "behind");
+        assert_eq!(
+            a.info()["push"]["message"],
+            "1 commit made during the push not pushed to git yet"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn what_another_remote_has_is_not_on_the_upstream() {
+        let (tmp, lox) = project_with_fake_lox(true);
+        let d = tmp.path().join("project");
+        let a = actions_for(&d, lox);
+        let main = branch(&d);
+        sh(tmp.path(), "git init -q --bare backup.git");
+        sh(
+            &d,
+            &format!(
+                "echo x > x.txt && git add -A && git commit -qm x && git remote add backup ../backup.git \
+                 && git push -q backup {main}"
+            ),
+        );
+        a.find_unpushed().await;
+        assert_eq!(
+            a.info()["push"]["message"],
+            "1 commit not pushed to git yet"
+        );
+        // Not "nothing to push": the upstream lacks it, whatever backup has.
+        assert_eq!(a.push().await.unwrap(), "Pushed to git.");
+        assert_eq!(
+            git_out(
+                tmp.path(),
+                &["--git-dir=remote.git", "log", "-1", "--format=%s"]
+            ),
+            "x"
+        );
+        assert!(a.info()["push"].is_null());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_push_from_a_terminal_clears_the_blocked_state() {
+        let (tmp, d, lox) = project_with_personal_data();
+        let a = actions_for(&d, lox);
+        a.apply(&ApplyOpts::default()).await.unwrap();
+        assert_eq!(a.info()["push"]["state"], "found");
+        assert_eq!(a.info()["push"]["total"], 1);
+        sh(&d, "git push -q");
+        a.recheck_push().await;
+        assert!(a.info()["push"].is_null());
+        let steps = step_states(&a);
+        assert_eq!(steps["push"], "ok");
+        let _ = tmp;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_findings_kept_are_capped() {
+        let (tmp, d, lox) = project_with_personal_data();
+        let a = actions_for(&d, lox);
+        for i in 0..59 {
+            std::fs::write(
+                d.join(format!("p{i}.Loxone")),
+                format!("<C Type=\"User\" Ema=\"x{i}\"/>\n"),
+            )
+            .unwrap();
+        }
+        sh(&d, "git add -A && git commit -qm many");
+        let (_, e) = a.push().await.unwrap_err();
+        assert!(
+            e.contains("60 findings in 60 files") && e.contains("… and 40 more"),
+            "{e}"
+        );
+        let info = a.info();
+        assert_eq!(info["push"]["total"], 60);
+        assert_eq!(
+            info["push"]["findings"].as_array().unwrap().len(),
+            SHOWN_FINDINGS
+        );
+        let _ = tmp;
+    }
+
+    #[tokio::test]
+    async fn many_objects_are_read_without_a_stall() {
+        let tmp = tempfile::tempdir().unwrap();
+        sh(
+            tmp.path(),
+            "git init -q && printf '%0200d' 0 > f && git add f",
+        );
+        let id = git_out(tmp.path(), &["rev-parse", ":f"]);
+        // More ids than a pipe holds, and far more answer than that.
+        let specs = vec![id; 5000];
+        let got = tokio::time::timeout(Duration::from_secs(30), git_objects(tmp.path(), &specs))
+            .await
+            .expect("no stall")
+            .unwrap();
+        assert_eq!(got.len(), 5000);
+        assert!(
+            got.iter()
+                .all(|o| o.as_ref().is_some_and(|b| b.len() == 200))
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sync_and_a_lox_without_scan_never_push_unchecked() {
+        let (tmp, d, lox) = project_with_personal_data();
+        let a = actions_for(&d, lox.clone());
+        let remote = || {
+            git_out(
+                tmp.path(),
+                &["--git-dir=remote.git", "log", "-1", "--format=%s"],
+            )
+        };
+        // A commit of the stray config made by hand, not pushed: Sync's push would send it too.
+        sh(&d, "git add live.Loxone && git commit -qm stray");
+        let msg = a.sync().await.unwrap();
+        assert_eq!(
+            git_out(&d, &["log", "-1", "--format=%s"]),
+            "Sync with the Miniserver's running config"
+        );
+        assert!(
+            msg.contains("Committed, but not pushed to git: lox logic scan found personal data"),
+            "{msg}"
+        );
+        assert_eq!(remote(), "init");
+        assert_eq!(a.info()["last"]["unpushed"], true);
+        // A lox without scan: vislox cannot tell, and does not push.
+        let script = std::fs::read_to_string(&lox).unwrap().replace(
+            "  'logic scan')",
+            "  'logic scan') echo 'unknown command `scan`. Run `lox logic help`.' >&2; exit 2 ;;\n  'logic scan-old')",
+        );
+        std::fs::write(&lox, script).unwrap();
+        let (_, e) = a.push().await.unwrap_err();
+        assert!(
+            e.contains("vislox could not check the push for personal data: this lox"),
+            "{e}"
+        );
+        assert!(
+            e.contains("has no `lox logic scan`")
+                && e.contains("vislox never pushes what it could not check"),
+            "{e}"
+        );
+        assert_eq!(a.info()["push"]["state"], "unscanned");
+        assert_eq!(remote(), "init");
     }
 
     #[cfg(unix)]
@@ -5418,7 +6036,7 @@ esac
                 r#"#!/bin/sh
 base() {{ sed -n 's/^base *= *"\(.*\)"/\1/p' lox.toml; }}
 case "$1 $2" in
-  'logic test')
+{CLEAN_SCAN}  'logic test')
     if [ -f '{t_s}/test-fails' ]; then
       echo 'test "Licht" ... FAILED'; echo '    step 1: expect licht.Q == 1 — actual 0'
       echo '1 tests: 0 passed, 1 failed'; exit 1
@@ -5692,7 +6310,8 @@ esac
         );
         let steps = step_states(&a);
         for id in [
-            "backup", "module", "stage", "check", "upload", "restart", "verify", "commit", "push",
+            "backup", "module", "stage", "check", "upload", "restart", "verify", "commit", "scan",
+            "push",
         ] {
             assert_eq!(steps[id], "ok", "{id}: {steps:?}");
         }

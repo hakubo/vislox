@@ -153,7 +153,8 @@ sends to the Miniserver see [miniserver.md](miniserver.md).
   (see [agent-workflow.md](agent-workflow.md)). The compile shows as the pending revision, so you
   review it like any other change. **Apply** first checks that the module compiles and its tests pass, then
   deploys it with `lox config push --force` (download, drift check,
-  upload, program restart, verify), then commits the project and pushes it to its git remote. Each step shows
+  upload, program restart, verify), then commits the project and, once `lox logic scan` finds no personal data in
+  what the push would send (#71, below), pushes it to its git remote. Each step shows
   as it happens, with how long it took. vislox follows the program restart itself: the Miniserver going out of
   service, back online after N s, and the new config loaded (its structure version changed). When Apply
   finishes, Apply also checks **by load**: `sps_new.zip` must be gone from `/prog`, and `def.log` must show a
@@ -245,6 +246,48 @@ sends to the Miniserver see [miniserver.md](miniserver.md).
   - Without consent, the step refuses, with the blocks or lox's words, before the tests: also for a tombstone
     already in the project's lockfile. With nothing to remove it is skipped. A Roll back never takes a consent.
 
+- **No personal data in git** (#71; the same project and token): a real config holds the installation's address,
+  its users' names, mail addresses, phone numbers and access codes, credentials and hardware serials. When a
+  `.gitignore` misses one (a downloaded `live.Loxone`, a backup outside `backups/`), a commit takes it along. So
+  before **every** git push vislox makes (Apply, Roll back, Sync, *Push to git*), Apply's step *No personal data in
+  git* asks `lox logic scan --json` about what the push would send:
+  - Where: the branch's upstream (its remote and branch there). Without one, or on no branch, vislox refuses and
+    says how to set one: it never guesses a remote. A commit counts as pushed once the upstream's tracking branch
+    has it: the scan, *Push to git* and the check on start all use that.
+  - What: exactly the objects `git push` sends for `HEAD` (`git rev-list --objects <sha> --not <the remote's
+    tracking branches>`; the whole repository, not only the project), and of those every file that may hold a
+    config: `.Loxone`, `.LoxCC`, and a Miniserver backup `.zip` (its `sps0.LoxCC`). Each version: a file a commit
+    adds and the next deletes is still sent. A version the remote has already (a merge of what it has) is not
+    sent, so not read. lox reads copies in a scratch directory made readable to this user only (mode 700, files
+    600, never widened later), removed afterwards. The whole scan has 5 minutes.
+  - Then exactly that commit is pushed: `git push --no-follow-tags <remote> <sha>:<branch>`, so no other branch or
+    tag goes along, whatever `push.default`, a push refspec or `push.followTags` say, and a commit made during the
+    scan stays for the next push (*Not pushed to git yet*).
+  - lox names where personal data is: the element and attribute and the value's length, never the value. vislox
+    adds the line it finds that element on and the commit, and never reads a value itself, so neither its log, the
+    browser, nor an error message can show one.
+  - A finding blocks the push: *No personal data in git* fails, *Pushed to git* is skipped, and nothing is pushed.
+    The commit stays local: after an Apply or a Roll back the Miniserver runs the new config and the commit records
+    it, so the History, Discard and Roll back still match it; **only the git remote is behind**, and Apply says so
+    (*Applied, but not pushed to git*). The Deploy pane's *Not pushed to git* lists each finding as `file:line: kind —
+    element attribute (N chars)` (and the commit, for a version deleted since) and what to do: take the file out of
+    git (`git rm --cached`, a line in `.gitignore`, `git commit --amend` for the last commit, `git rebase -i` for
+    an earlier one), then **Push to git**, which scans again and pushes (`POST /api/push`, with the admin token;
+    nothing goes to the Miniserver). lox has no allowlist: a file that must stay in git must not hold personal data
+    (`lox logic scan --redact` writes a copy without it).
+  - **Fail closed**: a file lox cannot read (a `.zip` that is none, a backup whose program cannot be read), a lox
+    without `logic scan` (older than 0.83), an answer vislox cannot read, no upstream (or one not fetched), or a
+    scan over 5 minutes: nothing is pushed, and the box says why. A push with no config file in it needs no lox.
+    When `git push` itself fails (credentials, the remote), the box says so too, with *Push to git*; after a
+    restart, commits the upstream does not have offer it again (*Not pushed to git yet*). The 3 s git poll looks
+    again when `HEAD` or the upstream moves: pushed from a terminal, the box goes and Apply's steps say *Pushed to
+    git*; so they do after *Push to git*. The box lists at most 50 findings and counts the rest.
+  - A project that tracks its deployed config (vislox copies the verified download over the base, below) is
+    blocked as soon as that base holds personal data, which a real one does. Keep the base and `out` out of git
+    too (`git rm --cached`, `.gitignore`), as lox keeps `backups/`: the commit then holds the module and lockfile.
+  - `lox config pull` (Pull from Miniserver) commits the full config by design and pushes nothing: it is not
+    scanned.
+
 - **Does the module compile?** (a `lox.toml` project): vislox runs `lox logic check` on the module whenever it
   changes. While it has errors, `out.Loxone` stays at the last compile that worked, so the Deploy pane says *The
   module doesn't compile: N errors*, lists each one with its file, line and message, and links the blocks its line
@@ -312,10 +355,11 @@ vislox ~/loxone-config/project --admin-token-file ~/.config/vislox/admin-token
 
 - `--admin-token-file`: a file holding a passphrase. Apply, Sync and Discard ask for it once per browser
   (`X-Vislox-Token`). Without it they are off; viewing needs no token.
-- Apply commits with the change summary as the subject (`lox logic diff --summary`), then runs `git push`, which
-  needs credentials for the project's remote. A verified push makes lox point `base` at its download in
-  `backups/` (git-ignored); Apply copies that download over the project's base file and points lox.toml back at
-  it, so the deployed config stays in git.
+- Apply commits with the change summary as the subject (`lox logic diff --summary`), then runs `git push` (after
+  the personal-data scan, #71), which needs credentials for the project's remote. A verified push makes lox point
+  `base` at its download in `backups/` (git-ignored); Apply copies that download over the project's base file and
+  points lox.toml back at it, so the deployed config stays the project's base (and in git, when the project tracks
+  it and it holds no personal data).
 ## Miniserver checks
 
 - **Miniserver status and preflight**: a chip in the toolbar names the Miniserver lox talks to (serial and

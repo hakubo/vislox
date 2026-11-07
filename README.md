@@ -50,6 +50,9 @@ Then open <http://127.0.0.1:7878>. Started without a path or `--ctx` in a direct
   (Apply is off until it does), and *Compile* when the pending config is from before the module's latest change.
 - For a `lox.toml` project: `lox logic lint` findings (unused names, blocks whose outputs feed nothing, users whose
   tag opens no Code Touch, …) as a warning badge on each block and a *Lint* list in the Deploy pane. Hints only.
+- For a `lox.toml` project: no personal data reaches the git remote: before every push (Apply, Roll back, Sync)
+  `lox logic scan` checks what it would send, and a finding (file and line, never the value) stops the push, with
+  what to do and *Push to git* to retry. The deploy itself is not undone.
 - For a `lox.toml` project: *Roll back* an Apply from the History, onto the download `lox config push` kept from
   before it, through Apply's own steps and checks.
 - For a `lox.toml` project: when the module no longer has a block it manages, the removal is reviewed before Apply
@@ -127,6 +130,7 @@ Opt-ins:
 | Apply | `--admin-token-file`, then the token in the browser | `lox config push --force`: upload and program restart |
 | Roll back | `--admin-token-file`, then the token | `lox config push --force --patched-from …`: upload and program restart, as Apply |
 | Sync, Discard | `--admin-token-file`, then the token | nothing; they change the project and its git repository |
+| Push to git | `--admin-token-file`, then the token | nothing; it pushes the commits git's remote lacks, after `lox logic scan` finds no personal data in them |
 | Compile (a module changed outside vislox) | `--admin-token-file`, then the token | nothing; it runs `lox logic compile` |
 | Edit values, add and move blocks, draw wires | `--admin-token-file`, then the token | nothing; vislox writes its files in the module (and positions in the lockfile) and runs `lox logic compile` |
 | Operate virtual inputs | `--operate` with `--admin-token-file` | `jdev/sps/io/<uuid>/<cmd>`, only to `VirtualIn` objects, each confirmed |

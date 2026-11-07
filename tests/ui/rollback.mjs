@@ -101,6 +101,8 @@ writeFileSync(fakeLox, `#!/bin/sh
 slow() { sleep "$(awk "BEGIN { print \${VISLOX_TEST_LOX_DELAY:-0} / 1000 }")"; }
 base() { sed -n 's/^base *= *"\\(.*\\)"/\\1/p' lox.toml; }
 case "$1 $2" in
+  # Before the git push (#71): no personal data in any config it is given.
+  "logic scan") shift 3; printf '{'; sep=; for f in "$@"; do printf '%s"%s": []' "$sep" "$f"; sep=,; done; echo '}' ;;
   "logic test") slow; echo 'test "Licht" ... ok'; echo '1 tests: 1 passed, 0 failed' ;;
   "logic compile")
     slow
@@ -243,7 +245,7 @@ try {
     assert.equal(asked.length, 1, "one confirmation");
     assert.equal(rollbacks, 1);
     for (const l of ["Backup checked", "Module before the Apply compiles to it", "Tests pass", "Upload is what you reviewed", "Download and drift check", "Upload",
-      "Program restarting", "Back online", "Config loaded", "Verified", "Committed", "Pushed to git"]) {
+      "Program restarting", "Back online", "Config loaded", "Verified", "Committed", "No personal data in git", "Pushed to git"]) {
       assert.equal(await state(l), "ok", l);
     }
     assert.match(await page.textContent("#deploy-steps"), /Backup checked.*backups\/20261107-091500-pre-push\.zip/);
