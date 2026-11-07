@@ -1146,6 +1146,7 @@ function renderProps() {
 function renderPropsBody() {
   meSync();
   acSync();
+  tiSync();
   const box = $("props");
   const o = S.sel && S.view?.objects[S.sel];
   if (!o) {
@@ -1169,6 +1170,10 @@ function renderPropsBody() {
   if (mo) section("Moods", mo.rows, mo.count);
   const me = meRows(o, row, marks);
   if (me) section("Members", me.rows, me.count);
+  const ti = tiRows(o, row, marks);
+  if (ti) section("Tiles", ti.rows, ti.count);
+  const tl = tiLinkedRows(o, row);
+  if (tl) section("Touch Pure Flex", tl);
   const ms = managedSrc(o.uuid);
   // The errors of lox logic check whose line names this block (#65): on the newest config only.
   const ce = S.rev === editRev()?.id ? checkErrors(o.uuid) : [];
@@ -2170,6 +2175,7 @@ function editsHere() {
   if (membersPending().length) parts.push(`members of ${plural(membersPending().length, "central block")} edited here`);
   if (accessPending().length) parts.push(`access to ${accessPending().length} NFC Code Touch${accessPending().length === 1 ? "" : "es"} edited here`);
   if (accessPending("recipients").length) parts.push(`recipients of ${plural(accessPending("recipients").length, "push notification")} edited here`);
+  if (tilesPending().length) parts.push(`tiles of ${tilesPending().length === 1 ? "1 Touch Pure Flex" : `${tilesPending().length} Touch Pure Flex devices`} edited here`);
   const drawn = editsWires().filter((w) => w.now).length, out = editsWires().length - drawn;
   if (drawn) parts.push(`${plural(drawn, "wire")} drawn here`);
   if (out) parts.push(`${plural(out, "wire")} taken out here`);
@@ -2812,6 +2818,7 @@ function claimsOf(uuid) { return (S.edits?.set_claims || []).filter((c) => c.blo
 function claimAt(c) { return `${c.file}:${c.line}`; }
 function claimWhat(c) {
   return c.kind === "schedule" ? "The push replaces these switching times, edits made in the app among them"
+    : c.kind === "tiles" ? "The push writes the set's tile programs onto the device"
     : c.kind === "access" ? "Whoever the set leaves out loses access on the next push"
     : "Whoever the set leaves out stops getting it on the next push";
 }
@@ -4524,6 +4531,238 @@ $("props").addEventListener("change", (e) => {
   renderProps();
   $("props").querySelector(t.dataset.acP != null ? `[data-ac-p="${t.dataset.acP}"]` : t.dataset.acS != null ? `[data-ac-s="${t.dataset.acS}"]` : '[data-ac="shareall"]')?.focus();
 });
+
+// ── tiles of a Touch Pure Flex (#78) ────────────────────────────────────
+// A Touch Pure Flex's tiles are a Lox Logic `tiles` set and the device's `.tiles` claim, written into vislox's file
+// of claims. Properties' *Tiles* lists the blocks linked to its API connector (the only blocks a command reaches)
+// and each tile by index: what its click and its arrows up and down do (the command), the status text and the
+// blocks the command addresses (`ctrls=`), marked against the compared revision, with lox logic lint's
+// `tile-broadcast` and `tile-dead-command` findings on the tile. *Edit tiles* edits each function's command, text
+// and targets, picked from the linked blocks; the layout (which tiles exist) stays with Loxone Config. Saving sends
+// one `tiles` op with every tile vislox's set has or the draft changes: compiled, never deployed, undone through
+// `undo`. The draft belongs to one device and one pending config (`blob`): when either changes, it is dropped, and a
+// save sends the blob it was made on, which the server checks.
+const TI = { uuid: null, blob: null, open: false, rows: [], busy: false, msg: "", err: "", shareAll: true };
+const TI_FN = { click: "Click", up: "Arrow up", down: "Arrow down" };
+/** What `GET /api/edits` says of this device's tiles, or null. */
+function tilesEdit(uuid) { return (S.edits?.tiles || []).find((m) => m.uuid === uuid) || null; }
+/** The devices whose tiles were edited here and are not deployed. */
+function tilesPending() { return (S.edits?.tiles || []).filter((m) => m.pending); }
+/** Whether this device's tiles can be edited here now: `{ ok, rev }`, or null. */
+function tiState(o) {
+  if (o?.ty !== "TreeDevice" || !o.tiles) return null;
+  const st = editState({ ...o, edit: o.edit || {} });
+  return st?.ok ? st : null;
+}
+/** The module's own claim on its tiles (a file other than vislox's), if any. */
+function tiOther(o) { return claimsOf(o.uuid).find((c) => c.kind === "tiles" && !c.file.startsWith(`${S.edits?.dir}/`)) || null; }
+function tiReset(extra) { Object.assign(TI, { open: false, rows: [], msg: "", err: "" }, extra || {}); }
+/** Drop a draft made on another device or another pending config than the one shown now. */
+function tiSync() {
+  if (TI.busy) return;
+  if (S.sel !== TI.uuid) { if (TI.open || TI.msg || TI.err) tiReset(); }
+  else if (TI.open && editRev()?.blob !== TI.blob) tiReset({ msg: "The pending config changed while editing: the draft was dropped. Edit tiles again." });
+}
+/** A tile's functions as the draft holds them: command, text, targets (lowercase UUIDs). */
+function tiDraftOf(t) { return { index: t.index, fns: t.functions.map((f) => ({ key: f.key, api: f.api || "", text: f.text || "", to: f.to.map((x) => x.uuid.toLowerCase()) })) }; }
+/** The lint findings on tile `i` of the device (#66). */
+function tiLint(uuid, i) { return lintFindings(uuid).filter((f) => f.kind.startsWith("tile-") && new RegExp(`\\btile ${i}\\b`).test(f.message)); }
+function tiOpen(uuid) {
+  const o = S.view?.objects[uuid], st = o && tiState(o);
+  if (!st || TI.busy) return;
+  Object.assign(TI, { uuid, blob: st.rev.blob, open: true, rows: o.tiles.tiles.map(tiDraftOf), msg: "", err: "", shareAll: true });
+  S.closed.delete("Tiles");
+  renderProps();
+  $("props").querySelector('[data-ti-api="0|0"]')?.focus();
+}
+/** One function, shown: `SET(As;Tg;pulse)` · text · → targets, old → new under marks. */
+function tiFnView(f, was) {
+  const tgt = (l) => l.length ? l.map((x) => x.missing ? `<span class="none-v" title="No such object in this config">${esc(x.uuid)}</span>` : linkTarget(x)).join(" ") : "";
+  const ids = (l) => l.map((x) => x.uuid.toLowerCase()).join(",");
+  const part = (now, then, fmt) => (was && now !== then ? `<span class="old">${then ? fmt(then) : "—"}</span><span class="new">${now ? fmt(now) : "—"}</span>` : now ? fmt(now) : "");
+  const api = part(f.api, was?.api, (v) => `<span class="mono">${esc(v)}</span>`) || '<span class="none-v">does nothing</span>';
+  const text = part(f.text, was?.text, (v) => `<span class="ti-text" title="Status text">${esc(v)}</span>`);
+  const to = was && ids(f.to) !== ids(was.to) ? `<span class="old">${tgt(was.to) || "—"}</span><span class="new">${tgt(f.to) || "—"}</span>` : tgt(f.to);
+  return `${api}${text ? ` <span class="none-v">·</span> ${text}` : ""}${to ? `<div class="ti-to"><span class="arr">→</span>${to}</div>` : ""}`;
+}
+/** The rows of the *Tiles* section. */
+function tiRows(o, row, marks) {
+  const ti = o.tiles;
+  if (o.ty !== "TreeDevice" || !ti) return null;
+  const rows = [], st = tiState(o), e = tilesEdit(o.uuid), mine = TI.uuid === o.uuid ? TI : null;
+  const title = (u) => { const x = S.view?.objects[u]; return x ? displayTitle(x) : u; };
+  rows.push(row("API-linked", ti.linked.length ? ti.linked.map((t) => `<div class="conn">${linkTarget(t)} <span class="mo-kind">${esc(prettyType(t.ty))}</span></div>`).join("")
+    : '<span class="none-v">no block: a command reaches nothing</span>', "", "The blocks whose OutputAPI is wired to the device's API connector, directly or through an OutputRef of it: the only blocks a tile's command reaches"));
+  const other = tiOther(o);
+  if (other && st) {
+    const at = claimAt(other);
+    if (e?.set) {
+      rows.push(`<div class="sch-note warn">⚠ Claimed twice: ${esc(at)} and vislox's ${esc(S.edits?.file || "")} both claim its tiles, and lox compiles neither until one goes.</div>`,
+        `<div class="ed-bar"><button type="button" class="ed-btn small" data-ti="drop"${mine?.busy ? " disabled" : ""} title="Take vislox's claim out and compile: ${esc(at)} keeps the device">Remove vislox's claim</button>` +
+        (mine?.msg || mine?.err ? `<span class="ed-msg${mine.err ? " err" : ""}" role="status">${esc(mine.err || mine.msg)}</span>` : "") + "</div>");
+    } else rows.push(claimNote(other));
+  } else if (e?.set && st) {
+    rows.push(`<div class="ed-note">Written by vislox as <span class="mono">${esc(e.set)}</span> in ${esc(S.edits?.file || "")}${e.shared?.length ? `, shared with ${esc(e.shared.map(title).join(", "))}` : ""}.</div>`);
+    rows.push(...staleRows((S.edits?.tile_sets || []).find((x) => x.name === e.set), "ti", mine));
+  }
+  if (e?.pending && st && !other) {
+    const back = e.deployed ? "Back to the tiles deployed" : "Drop vislox's claim: the tiles keep the programs last written";
+    rows.push(row("Tiles", `<span class="ed-v">edited here</span><span class="ed-tag" title="Saved into the module and compiled, not on the Miniserver yet: Apply deploys it, Discard drops it">not deployed</span>` +
+      `<button type="button" class="ed-btn small" data-ti="revert" title="${esc(back)}">Revert</button>`, "pr-chg"));
+  }
+  let lintN = 0;
+  if (!mine?.open || !st || other) {
+    const old = marks ? o.tiles_old : null;
+    for (const t of ti.tiles) {
+      const was = old?.tiles.find((x) => x.index === t.index);
+      const lint = tiLint(o.uuid, t.index);
+      lintN += lint.length;
+      rows.push(`<div class="mo-sub ti-h" data-tile="${t.index}">Tile ${t.index}${old && !was ? ' <span class="mo-tag">added</span>' : ""}</div>`);
+      t.functions.forEach((f, j) => {
+        const w = was?.functions[j];
+        const changed = !!w && (w.api !== f.api || w.text !== f.text || w.to.map((x) => x.uuid.toLowerCase()).join() !== f.to.map((x) => x.uuid.toLowerCase()).join());
+        rows.push(row(TI_FN[f.key], tiFnView(f, changed ? w : null), changed ? "pr-chg" : ""));
+      });
+      rows.push(...lint.map((f) => `<div class="ed-note lt-note">⚠ Lint (${esc(f.kind)}${f.file ? `, ${esc(checkAt(f))}` : ""}): ${esc(f.message)}</div>`));
+    }
+    for (const t of old?.tiles || []) if (!ti.tiles.some((x) => x.index === t.index)) rows.push(`<div class="mo-sub">Tile ${t.index} <span class="mo-tag">removed</span></div>`);
+    if (!ti.tiles.length) rows.push('<div class="empty">No tiles: lay them out in Loxone Config.</div>');
+    if (st && !other && ti.tiles.length) {
+      const sets = (S.edits?.tile_sets || []).filter((x) => x.name !== e?.set && x.devices.length && !x.devices.includes(o.uuid));
+      rows.push(`<div class="ed-bar"><button type="button" class="ed-btn small" data-ti="open">Edit tiles</button>` +
+        (sets.length ? `<label class="se-same">Use the same tiles as <select data-ti="same"${mine?.busy ? " disabled" : ""}><option value="">…</option>${sets.map((x) => `<option value="${esc(x.name)}">${esc(x.devices.map(title).join(", "))}</option>`).join("")}</select></label>` : "") +
+        (mine?.msg || mine?.err ? `<span class="ed-msg${mine.err ? " err" : ""}" role="status">${esc(mine.err || mine.msg)}</span>` : "") + "</div>");
+    }
+    return { rows, count: (e?.pending ? 1 : 0) + lintN || undefined };
+  }
+  // The editor: per tile, per function, the command, the text and the targets (the linked blocks, and any the
+  // config names that are not linked, so they can be taken out).
+  const dis = mine.busy ? " disabled" : "";
+  const known = new Map(ti.linked.map((t) => [t.uuid.toLowerCase(), { t, linked: true }]));
+  for (const t of ti.tiles) for (const f of t.functions) for (const x of f.to) if (!known.has(x.uuid.toLowerCase())) known.set(x.uuid.toLowerCase(), { t: x, linked: false });
+  mine.rows.forEach((r, i) => {
+    rows.push(`<div class="mo-sub ti-h">Tile ${r.index} <button type="button" class="ed-btn small" data-ti="clear" data-i="${i}"${dis} title="Clear every function: the tile does nothing">Clear</button></div>`);
+    r.fns.forEach((f, j) => {
+      const k = `${i}|${j}`;
+      const opts = [...known].map(([u, { t, linked }]) => `<label class="ti-pick${linked ? "" : " bad"}"${linked ? "" : ' title="Not API-linked to this device: lox refuses it. Untick it, or link the block in Loxone Config."'}><input type="checkbox" data-ti-to="${esc(k)}" value="${esc(u)}"${f.to.includes(u) ? " checked" : ""}${dis}> ${esc(t.title)}${linked ? "" : " ⚠"}</label>`).join("");
+      rows.push(`<div class="ti-fn"><div class="ti-k">${esc(TI_FN[f.key])}</div>` +
+        `<input class="ti-api mono" data-ti-api="${esc(k)}" value="${esc(f.api)}" placeholder="command, e.g. SET(As;Tg;pulse)" aria-label="${esc(`Tile ${r.index} ${TI_FN[f.key]}: command`)}" autocomplete="off"${dis}>` +
+        `<input class="ti-txt" data-ti-text="${esc(k)}" value="${esc(f.text)}" placeholder="status text, e.g. =ECHO(As)" aria-label="${esc(`Tile ${r.index} ${TI_FN[f.key]}: status text`)}" autocomplete="off"${dis}>` +
+        (opts ? `<div class="ti-picks" role="group" aria-label="${esc(`Tile ${r.index} ${TI_FN[f.key]}: targets`)}">${opts}</div>` : "") + "</div>");
+    });
+  });
+  rows.push('<div class="ed-note">No target: the command reaches every linked block of its type. A function without a command does nothing, and its text and targets go.</div>');
+  if (e?.shared?.length) rows.push(`<label class="se-share"><input type="checkbox" data-ti="shareall"${TI.shareAll ? " checked" : ""}${dis}> Change ${esc(e.shared.map(title).join(", "))} too: ${e.shared.length === 1 ? "it shares" : "they share"} these tiles (${esc(e.set)}). Off: this device gets a set of its own.</label>`);
+  rows.push(`<div class="ed-bar"><button type="button" class="primary small" data-ti="save"${dis}>${mine.busy ? "Compiling…" : "Save"}</button>` +
+    `<button type="button" class="ed-btn small" data-ti="cancel"${dis}>Cancel</button>` +
+    `<span class="ed-msg${mine.err ? " err" : ""}" role="status" aria-live="polite">${esc(mine.err || mine.msg || "Saving writes a tiles set into the module and compiles it; nothing is deployed. The layout stays with Loxone Config.")}</span></div>`);
+  return { rows, count: e?.pending ? 1 : 0 };
+}
+/** On a block linked to a Touch Pure Flex's API connector: the device, and the tiles whose commands name it. */
+function tiLinkedRows(o, row) {
+  if (!o.api_linked?.length) return null;
+  const u = o.uuid.toLowerCase();
+  return o.api_linked.map((d) => {
+    const used = (S.view?.objects[d.uuid]?.tiles?.tiles || []).flatMap((t) => t.functions.filter((f) => f.to.some((x) => x.uuid.toLowerCase() === u)).map((f) => `tile ${t.index} ${TI_FN[f.key].toLowerCase()}`));
+    return row("API-linked to", `${linkTarget(d)}${used.length ? `<div class="none-v">Addressed by ${esc(used.join(", "))}</div>` : ""}`, "",
+      "Its OutputAPI is wired to the device's API connector: the device's tiles can send it commands");
+  });
+}
+/** The draft's tiles for the op: every tile vislox's set lists, and every tile the draft changes. */
+function tiValue(o) {
+  const e = tilesEdit(o.uuid), inSet = new Set((e?.tiles || []).map((t) => t.index));
+  const fnOf = (f) => f.api.trim() ? { api: f.api, ...(f.text ? { text: f.text } : {}), to: f.to } : null;
+  const key = (fns) => JSON.stringify(fns.map(fnOf));
+  const tiles = [];
+  for (const r of TI.rows) {
+    const cfg = o.tiles.tiles.find((t) => t.index === r.index);
+    if (!inSet.has(r.index) && cfg && key(r.fns) === key(tiDraftOf(cfg).fns)) continue;
+    const t = { index: r.index };
+    r.fns.forEach((f) => { const v = fnOf(f); if (v) t[f.key] = v; });
+    tiles.push(t);
+  }
+  return tiles;
+}
+async function tiSend(o, base, op, label) {
+  TI.uuid = o.uuid; TI.busy = true; TI.err = ""; TI.msg = ""; renderProps();
+  try {
+    const res = await editAct(base, [op], label);
+    TI.busy = false;
+    tiReset({ msg: res.unchanged ? "Nothing changed." : "Saved and compiled: pending, not deployed. Review it, then Apply or Discard." });
+    await editShowNewest(res.blob);
+  } catch (err) {
+    TI.busy = false; TI.err = err.message;
+  }
+  renderProps();
+}
+async function tiSave() {
+  const o = S.view?.objects[TI.uuid], st = o && tiState(o);
+  if (!st || TI.busy || !TI.open) return;
+  // Never save a draft over a newer config: the draft goes against the config it was made on.
+  if (st.rev.blob !== TI.blob) { tiReset({ err: "The pending config changed while editing: the draft was dropped. Edit tiles again." }); renderProps(); return; }
+  const tiles = tiValue(o);
+  if (!tiles.length) { tiReset({ msg: "Nothing changed." }); renderProps(); return; }
+  const e = tilesEdit(o.uuid);
+  const value = { tiles, ...(e?.set && e.shared?.length && TI.shareAll ? { set: e.set } : {}) };
+  await tiSend(o, TI.blob, { op: "tiles", uuid: o.uuid, value }, `Tiles of ${displayTitle(o)}`);
+}
+$("props").addEventListener("click", (e) => {
+  const b = e.target.closest("[data-ti]");
+  if (!b || b.tagName === "SELECT" || b.type === "checkbox") return;
+  e.stopPropagation();
+  const o = S.view?.objects[S.sel], what = b.dataset.ti;
+  if (!o) return;
+  if (what === "open") return tiOpen(S.sel);
+  if (what === "cancel") { if (!TI.busy) { tiReset(); renderProps(); $("props").querySelector('[data-ti="open"]')?.focus(); } return; }
+  if (what === "save") return tiSave();
+  const st = tiState(o);
+  if (what === "revert") {
+    const ed = tilesEdit(o.uuid);
+    if (!st || !ed) return;
+    const r = setRevertValue("tiles", ed, S.edits?.tile_sets || [], o.uuid);
+    if (r.why) { TI.uuid = o.uuid; TI.err = r.why; TI.msg = ""; renderProps(); return; }
+    return tiSend(o, st.rev.blob, { op: "tiles", uuid: o.uuid, value: r.value }, `Revert the tiles of ${displayTitle(o)}`);
+  }
+  if (what === "drop") { if (st) tiSend(o, st.rev.blob, { op: "tiles", uuid: o.uuid, value: null }, `Remove vislox's claim on the tiles of ${displayTitle(o)}`); return; }
+  if (what === "dropstale") { if (st) tiSend(o, st.rev.blob, { op: "tiles", uuid: b.dataset.u, value: null }, "Drop a stale claim on tiles"); return; }
+  if (TI.busy || !TI.open) return;
+  if (what === "clear") {
+    const r = TI.rows[+b.dataset.i];
+    if (r) for (const f of r.fns) Object.assign(f, { api: "", text: "", to: [] });
+    TI.err = "";
+    renderProps();
+    $("props").querySelector(`[data-ti-api="${+b.dataset.i}|0"]`)?.focus();
+  }
+}, true);
+$("props").addEventListener("change", (e) => {
+  const t = e.target;
+  if (t.dataset?.ti === "same") {
+    const o = S.view?.objects[S.sel], st = o && tiState(o), x = (S.edits?.tile_sets || []).find((s) => s.name === t.value);
+    if (st && x && !TI.busy) tiSend(o, st.rev.blob, { op: "tiles", uuid: o.uuid, value: { set: x.name } }, `Same tiles as ${x.devices.map((u) => { const y = S.view?.objects[u]; return y ? displayTitle(y) : u; }).join(", ")} for ${displayTitle(o)}`);
+    return;
+  }
+  if (TI.busy || !TI.open) return;
+  if (t.dataset?.ti === "shareall") { TI.shareAll = t.checked; return; }
+  if (t.dataset?.tiTo != null) {
+    const [i, j] = t.dataset.tiTo.split("|").map(Number), f = TI.rows[i]?.fns[j];
+    if (!f) return;
+    f.to = t.checked ? [...f.to.filter((u) => u !== t.value), t.value] : f.to.filter((u) => u !== t.value);
+    TI.err = "";
+  }
+});
+$("props").addEventListener("input", (e) => {
+  if (!TI.open || TI.busy) return;
+  const f = e.target.closest?.("[data-ti-api], [data-ti-text]");
+  if (!f) return;
+  const [i, j] = (f.dataset.tiApi ?? f.dataset.tiText).split("|").map(Number), fn = TI.rows[i]?.fns[j];
+  if (!fn) return;
+  if (f.dataset.tiApi != null) fn.api = f.value; else fn.text = f.value;
+});
+$("props").addEventListener("keydown", (e) => {
+  if (!e.target.closest?.("[data-ti-api], [data-ti-text]")) return;
+  if (e.key === "Enter") { e.preventDefault(); e.stopPropagation(); tiSave(); }
+  else if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); if (!TI.busy) { tiReset(); renderProps(); } }
+}, true);
 
 // ── adopting blocks (#72) ──────────────────────────────────────────────
 // `lox logic adopt` puts a block Loxone Config drew under the module: its declaration goes into vislox's

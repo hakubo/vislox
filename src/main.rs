@@ -39,6 +39,8 @@ mod session;
 mod set_claim;
 mod source;
 mod structure;
+mod tiles;
+mod tiles_edit;
 mod tls;
 
 use anyhow::{Context, Result};

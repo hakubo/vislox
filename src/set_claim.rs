@@ -1,7 +1,8 @@
 //! Claims on a block's whole set, shared by several blocks: a DayTimer's
 //! switching times (`schedule`, #73), a lighting controller's moods (`moods`,
 //! #74), who may open an NFC Code Touch (`access`, #76) and who gets a push
-//! notification (`recipients`, #77), and the next one (#78 tiles).
+//! notification (`recipients`, #77) and the tiles of a Touch Pure Flex
+//! (`tiles`, #78).
 //!
 //! Lox Logic writes each as a named set and a claim per block
 //! (`<slug>.<keyword> = <set>`). Several blocks may claim one set; a block
@@ -44,6 +45,8 @@ pub enum SetItem<L> {
     Set(String, Vec<L>),
     /// `<slug>.<keyword> = <set>`.
     Claim(String, String),
+    /// A statement of this kind that vislox cannot read: why.
+    Bad(String),
 }
 
 /// Every kind of claim vislox writes on a block's whole content, in the
@@ -56,6 +59,7 @@ pub static KINDS: &[&dyn ClaimKind] = &[
     &Reg::<crate::mood_edit::MoodKind>(PhantomData),
     &Reg::<crate::access_edit::AccessKind>(PhantomData),
     &Reg::<crate::recipients_edit::RecipientsKind>(PhantomData),
+    &Reg::<crate::tiles_edit::TilesKind>(PhantomData),
     &crate::member_edit::MemberKind,
 ];
 
@@ -79,6 +83,9 @@ pub trait ClaimKind: Sync {
     /// What the file claims on the block `slug`, said after "vislox's file
     /// claims ", and the pronoun for it (`them`, `it`).
     fn on(&self, c: &Claims, slug: &str) -> Option<(String, &'static str)>;
+    /// Every slug its claims and sets name (the blocks they are on, and the
+    /// blocks they name), for keeping externs: read once per prune or render.
+    fn mentions(&self, c: &Claims) -> Vec<String>;
     /// The names of its sets (one namespace for every kind).
     fn set_names<'a>(&self, c: &'a Claims) -> Vec<&'a str>;
     /// Read a statement of the file into `c`; `None`: not this kind's.
@@ -153,10 +160,23 @@ impl<K: SetKind> ClaimKind for Reg<K> {
         K::store(c).render()
     }
     fn on(&self, c: &Claims, slug: &str) -> Option<(String, &'static str)> {
-        K::store(c)
-            .claims
-            .contains_key(slug)
-            .then(|| (format!("its {}", K::WHAT), "them"))
+        let s = K::store(c);
+        if s.claims.contains_key(slug) {
+            return Some((format!("its {}", K::WHAT), "them"));
+        }
+        // A block a set names (a tile's target, #78).
+        s.sets
+            .iter()
+            .find(|(_, lines)| K::named(lines).iter().any(|n| n == slug))
+            .map(|(set, _)| (format!("it in its {} set `{set}`", K::KEYWORD), "it"))
+    }
+    fn mentions(&self, c: &Claims) -> Vec<String> {
+        let s = K::store(c);
+        let mut out: Vec<String> = s.claims.keys().cloned().collect();
+        for lines in s.sets.values() {
+            out.extend(K::named(lines));
+        }
+        out
     }
     fn set_names<'a>(&self, c: &'a Claims) -> Vec<&'a str> {
         K::store(c).sets.keys().map(String::as_str).collect()
@@ -178,6 +198,7 @@ impl<K: SetKind> ClaimKind for Reg<K> {
                     Ok(())
                 }
             }
+            SetItem::Bad(why) => Err(why),
         })
     }
     fn check_read(&self, c: &Claims) -> Result<(), String> {
@@ -187,14 +208,29 @@ impl<K: SetKind> ClaimKind for Reg<K> {
                 return Err(format!("`{t}.{} = {set}` without its set", K::KEYWORD));
             }
         }
+        // A set names vislox's blocks only: its externs, or the blocks it added.
+        for (set, lines) in &s.sets {
+            for n in K::named(lines) {
+                if !n.starts_with(crate::blocks::SLUG_PREFIX) {
+                    return Err(format!("`{} {set}` naming `{n}`", K::KEYWORD));
+                }
+            }
+        }
         Ok(())
     }
     fn names(&self, c: &Claims) -> Vec<(String, String)> {
-        K::store(c)
+        let s = K::store(c);
+        let mut out: Vec<(String, String)> = s
             .claims
             .keys()
             .map(|t| (format!("{t}.{}", K::KEYWORD), t.clone()))
-            .collect()
+            .collect();
+        for (set, lines) in &s.sets {
+            for n in K::named(lines) {
+                out.push((format!("{} {set}", K::KEYWORD), n));
+            }
+        }
+        out
     }
     fn missed(
         &self,
@@ -270,6 +306,12 @@ pub trait SetKind: Clone + Debug + Default + PartialEq + 'static {
         restore: BTreeMap<String, Self::Content>,
     ) -> Self::Val;
     fn index<'a>(doc: &'a LoxoneDoc, lock: &'a Lock) -> Self::Index<'a>;
+    /// [`SetKind::index`] for a config that vislox's `files` edit: a kind
+    /// whose lines name vislox's own blocks (a tile's targets, #78) learns
+    /// those lox has not pinned yet. The default is `index`.
+    fn index_in<'a>(doc: &'a LoxoneDoc, lock: &'a Lock, _files: &Files) -> Self::Index<'a> {
+        Self::index(doc, lock)
+    }
     /// A set's lines as an op carries them; `None` when they cannot be read
     /// against the config `idx` was made of.
     fn content_of(lines: &[Self::Line], idx: &Self::Index<'_>) -> Option<Self::Content>;
@@ -297,6 +339,26 @@ pub trait SetKind: Clone + Debug + Default + PartialEq + 'static {
         idx: &Self::Index<'_>,
         members: &[(String, &Element)],
     ) -> Result<Vec<Self::Line>, String>;
+    /// [`SetKind::lines_of`] for a kind whose lines name other blocks (a
+    /// tile's targets, #78): the lines, and the externs of vislox's file they
+    /// need (UUID as the config writes it, type), each checked against what
+    /// `files` already declare. The default names none.
+    #[allow(clippy::type_complexity)]
+    fn lines_with(
+        content: &Self::Content,
+        _files: &Files,
+        ctx: &Ctx,
+        idx: &Self::Index<'_>,
+        members: &[(String, &Element)],
+    ) -> Result<(Vec<Self::Line>, Vec<(String, String)>), String> {
+        Ok((Self::lines_of(content, ctx, idx, members)?, Vec::new()))
+    }
+    /// The slugs of blocks a set's lines name (besides the blocks claiming
+    /// it): they are vislox's (externs of its file, or its blocks), kept
+    /// while named. The default names none.
+    fn named(_lines: &[Self::Line]) -> Vec<String> {
+        Vec::new()
+    }
     /// Check a set's lines for every block that claims it.
     fn check(
         lines: &[Self::Line],
@@ -457,7 +519,17 @@ fn write_set<K: SetKind>(
         }
     }
     if let Some(c) = content {
-        let lines = K::lines_of(c, ctx, idx, &members)?;
+        let (lines, externs) = K::lines_with(c, files, ctx, idx, &members)?;
+        for (u, ty) in externs {
+            let c = files
+                .claims
+                .0
+                .entry(edit::extern_key(files, &u))
+                .or_default();
+            if c.ty.is_empty() {
+                c.ty = ty;
+            }
+        }
         K::store_mut(&mut files.claims)
             .sets
             .insert(set.to_string(), lines);
@@ -515,7 +587,7 @@ pub fn apply<K: SetKind>(
         }
     }
     let before = K::store(&files.claims).clone();
-    let idx = K::index(ctx.doc, ctx.lock);
+    let idx = K::index_in(ctx.doc, ctx.lock, files);
     let mut previous = current::<K>(files, &target, &idx);
     // Sets of vislox's written back first (an undo's).
     if let Some(v) = value {
@@ -581,7 +653,8 @@ pub fn apply<K: SetKind>(
                 .insert(target.clone(), set);
             // An extern of the file names a block Loxone Config drew.
             if target == edit::slug(uuid) {
-                let c = files.claims.0.entry(uuid.to_string()).or_default();
+                let key = edit::extern_key(files, uuid);
+                let c = files.claims.0.entry(key).or_default();
                 c.ty = K::BLOCK.into();
             }
         }

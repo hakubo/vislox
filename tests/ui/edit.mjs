@@ -95,12 +95,59 @@ const lcXml = (u, title, y, button) => {
 const CENTRAL = "10000050-0000-0500-ffff504f94000001", ALARM = "10000053-0000-0530-ffff504f94000001";
 const centralXml = `\t\t\t<C Type="CentralLight" V="178" U="${CENTRAL}" Title="Alle Lichter" Px="17280" Py="4800" Px2="18624" Py2="5760" Nio="0" rec="${LC_W}" SpStates="0"/>\n` +
   `\t\t\t<C Type="Alarm" V="178" U="${ALARM}" Title="Alarmanlage" Px="17280" Py="7680" Px2="18624" Py2="8640" Nio="0" Entries="40" CentralOut="1" Objects="${LC_F}"/>\n`;
+// A Touch Pure Flex, Flex Küche (#78), with tiles 2, 3 and 5: tile 3's click toggles Nord, tile 5's click toggles every
+// linked shade (lox logic lint says so: tile-broadcast). On the page Beschattung, Nord's OutputAPI is wired to the
+// device's API connector, Süd's through an OutputRef of it; Ost is linked to nothing.
+const FLEX = "70000001-0000-0000-ffff504f94000001", FLEX_API = "70000002-0000-0000-ffff504f94000001", FLEX_I = "70000002-0000-0001-ffff504f94000001";
+const BESCH = "70000010-0000-0000-ffff504f94000001", NORD = "70000011-0000-0000-ffff504f94000001", SUED = "70000012-0000-0000-ffff504f94000001";
+const OST = "70000013-0000-0000-ffff504f94000001", API_REF = "70000014-0000-0000-ffff504f94000001";
+const coU = (u, n) => `${u.slice(0, 14)}000${n}-${u.slice(19)}`;
+const flexXml = `\t\t<C Type="LoxCaption" V="178" U="70000000-0000-0000-ffff504f94000001" Title="Tree" CaptionType="2">
+\t\t\t<C Type="TreeDevice" TId="TpfTree" V="178" U="${FLEX}" Title="Flex Küche" WF="16384" Serial="B0500001" SubType="32799" TreeType="32799" cfgId="1">
+\t\t\t\t<C Type="ApiActor" V="178" U="${FLEX_API}" Title="API Connector">
+\t\t\t\t\t<Co K="I" U="${FLEX_I}">
+\t\t\t\t\t\t<In Input="${coU(API_REF, 2)}"/>
+\t\t\t\t\t</Co>
+\t\t\t\t</C>
+\t\t\t\t<btns>
+\t\t\t\t\t<btn i="2" x="6" y="7" h="13" w="15">
+\t\t\t\t\t\t<f1></f1>
+\t\t\t\t\t\t<f2 bT="1"/>
+\t\t\t\t\t\t<f3 bT="2"/>
+\t\t\t\t\t</btn>
+\t\t\t\t\t<btn ci="1" i="3" x="37" y="7" h="13" w="15">
+\t\t\t\t\t\t<f1 api="SET(As;Tg;pulse)" cT="=ECHO(As)" ctrls="${NORD}"/>
+\t\t\t\t\t\t<f2 bT="1"/>
+\t\t\t\t\t\t<f3 bT="2"/>
+\t\t\t\t\t</btn>
+\t\t\t\t\t<btn ci="2" i="5" x="6" y="37" h="13" w="15">
+\t\t\t\t\t\t<f1 api="SET(As;Tg;pulse)"/>
+\t\t\t\t\t\t<f2 bT="1"/>
+\t\t\t\t\t\t<f3 bT="2"/>
+\t\t\t\t\t</btn>
+\t\t\t\t</btns>
+\t\t\t</C>
+\t\t</C>
+`;
+const jalXml = (u, title, y, input) => `\t\t\t<C Type="AutoJalousie" V="178" U="${u}" Title="${title}" Px="960" Py="${y}" Px2="2304" Py2="${y + 696}" Cl="141,255,112" Nio="1" WF="16384">
+\t\t\t\t<Co K="OutputAPI" U="${coU(u, 1)}"${input ? `>\n\t\t\t\t\t<In Input="${input}"/>\n\t\t\t\t</Co>` : "/>"}
+\t\t\t</C>
+`;
+const beschXml = `\t\t<C Type="Page" V="178" U="${BESCH}" Title="Beschattung" WF="16384">
+${jalXml(NORD, "Nord", 960, FLEX_I)}${jalXml(SUED, "Süd", 2880, null)}${jalXml(OST, "Ost", 4800, null)}\t\t\t<C Type="OutputRef" V="178" U="${API_REF}" Title="API Connector" Px="9600" Py="960" Px2="10944" Py2="1656" Cl="0,0,0" Nio="2" Ref="${FLEX_API}">
+\t\t\t\t<Co K="AI" U="${coU(API_REF, 1)}">
+\t\t\t\t\t<In Input="${coU(SUED, 1)}"/>
+\t\t\t\t</Co>
+\t\t\t\t<Co K="AQ" U="${coU(API_REF, 2)}"/>
+\t\t\t</C>
+\t\t</C>
+`;
 const root = mkdtempSync(join(tmpdir(), "vislox-edit-"));
 const dir = join(root, "project");
 mkdirSync(join(dir, "pages"), { recursive: true });
 const git = (...a) => execFileSync("git", ["-C", dir, "-c", "user.name=t", "-c", "user.email=t@example.com", ...a]);
 // The deployed config, with a Monoflop on the upper floor (its Time has a documented range: 0 or more).
-const base = readFileSync(fixture, "utf8").replace('<Co K="Q" U="10000009-0000-0093-02ff504f94000001"/>\n\t\t\t</C>', `<Co K="Q" U="10000009-0000-0093-02ff504f94000001"/>
+const base0 = readFileSync(fixture, "utf8").replace('<Co K="Q" U="10000009-0000-0093-02ff504f94000001"/>\n\t\t\t</C>', `<Co K="Q" U="10000009-0000-0093-02ff504f94000001"/>
 \t\t\t</C>
 \t\t\t<C Type="Monoflop" V="178" U="${MONO}" Title="Treppe" Px="960" Py="2880" Px2="2304" Py2="3576" Cl="141,255,112" Nio="4" WF="16384">
 \t\t\t\t<Co K="InputTrigger" U="1000000a-0000-00a1-00ff504f94000001"/>
@@ -130,6 +177,9 @@ const base = readFileSync(fixture, "utf8").replace('<Co K="Q" U="10000009-0000-0
     `\t\t<C Type="Page" V="178" U="${MELDUNGEN}" Title="Meldungen" WF="16384">\n` +
     `\t\t\t<C Type="OutputRefLM" V="178" U="${WARN}" Title="Frostwarnung" Px="960" Py="960" Px2="2304" Py2="1656" Cl="0,0,0" Nio="2" Ref="${FROST}"><Co K="AI" U="40000031-0000-0001-ffff504f94000001"/><Co K="AQ" U="40000031-0000-0002-ffff504f94000001"/><LoggerMailer RefNotification="${FROST}" On="Frost im Garten" MinimumTime="43200000" NL="1"/></C>\n` +
     "\t\t</C>\n\t</C>\n</ControlList>");
+const base = base0.replace(`\t\t<C Type="Place" V="178" U="${KITCHEN}"`, `${flexXml}\t\t<C Type="Place" V="178" U="${KITCHEN}"`)
+  .replace(`\t\t<C Type="Page" V="178" U="${MELDUNGEN}"`, `${beschXml}\t\t<C Type="Page" V="178" U="${MELDUNGEN}"`);
+assert.ok(base.includes(FLEX) && base.includes(OST), "the Touch Pure Flex is in the base");
 assert.ok(base.includes(lagerUuid(LAGER_N - 1)), "the Lager page is in the base");
 writeFileSync(join(dir, "base.Loxone"), base);
 writeFileSync(join(dir, "out.Loxone"), base);
@@ -188,7 +238,13 @@ if (process.argv.slice(2, 5).join(" ") === "logic lint .") {
       if (!head.includes(\` NameAI\${n - 1}=\`)) noAct.push(\`  pages/vislox/edits.loxl: \\\`\${slug}\\\` — AQ\${n} has no actuator, so the Miniserver switches it: "\${name}" \${pct}% turns it on, not dimmed. Assign the actuator in Loxone Config's mood editor, or write \\\`on\\\`\`);
   }
   if (noAct.length) console.log(\`no-actuator (\${noAct.length})\\n\${noAct.join("\\n")}\`);
-  const n = dead.length + access.length + noAct.length;
+  // tile-broadcast (#78): Flex Küche's tile 5 clicks every linked shade while its click names no target (only while
+  // the project has a file TILELINT, so that the other steps' lint stays as it was).
+  const outNow = fs.existsSync("out.Loxone") ? fs.readFileSync("out.Loxone", "utf8") : "";
+  const bcast = fs.existsSync("TILELINT") && /<btn [^>]*i="5"[^>]*>\\s*<f1 api="SET\\(As;Tg;pulse\\)"\\/>/.test(outNow)
+    ? ["  \`Flex Küche\` — tile 5 click: \`SET(As;Tg;pulse)\` names no target, so all 2 API-linked AutoJalousie blocks act on it (AutoJalousie \\"Nord\\", AutoJalousie \\"Süd\\"). List the intended ones with \`to:\`."] : [];
+  if (bcast.length) console.log(\`tile-broadcast (1)\\n\${bcast[0]}\`);
+  const n = dead.length + access.length + noAct.length + bcast.length;
   console.log(n ? \`lint: \${n} finding\${n === 1 ? "" : "s"}\` : "lint: clean");
   process.exit(n ? 1 : 0);
 }
@@ -261,7 +317,7 @@ for (const line of src.split("\\n")) {
   if ((m = line.match(/^extern (\\w+) = \\w+\\(uuid: "([^"]+)"\\)/))) { slugs[m[1]] = m[2]; continue; }
   if (!(m = line.match(/^(\\w+)\\.(\\w+) = (.*)$/))) continue;
   if (m[2] === "schedule") { claimed.push([slugs[m[1]], m[3]]); continue; }
-  if (m[2] === "moods" || m[2] === "members" || m[2] === "access" || m[2] === "recipients") continue; // below (#74–#77)
+  if (m[2] === "moods" || m[2] === "members" || m[2] === "access" || m[2] === "recipients" || m[2] === "tiles") continue; // below (#74–#78)
   const uuid = slugs[m[1]], i = out.findIndex((l) => l.includes(\`U="\${uuid}"\`));
   if (m[2] === "title") { out[i] = out[i].replace(/Title="[^"]*"/, \`Title="\${xml(unq(m[3]))}"\`); continue; }
   if (m[2] === "room") {
@@ -514,6 +570,50 @@ for (const [, slug, list] of src.matchAll(/^(\\w+)\\.members = \\(([^)]*)\\)$/gm
       const i = out.findIndex((l) => l.includes(\` U="\${who}"\`) && l.includes("<C "));
       const j = out.findIndex((l, k) => k > i && l.includes("</PH>"));
       out.splice(j, 0, \`\\t\\t\\t\\t\\t<PRM REF="\${n}" ACT="3"/>\`);
+    }
+  }
+}
+// Tiles (#78): each \`tiles\` set of vislox's file (as lox's formatter writes it: a \`tile\` on one line, or over several
+// up to its \`)\`), written onto the devices its claims name as lox writes them: per function \`api\`, \`cT\`, \`bT\` and
+// \`ctrls\` (the targets' UUIDs), an empty function without them; a tile the set leaves out stays.
+{
+  const tsets = {};
+  let cur = null, buf = null;
+  for (const line of src.split("\\n")) {
+    const m = line.match(/^tiles (\\w+)$/);
+    if (m) { cur = tsets[m[1]] = []; continue; }
+    if (line === "end") { cur = null; continue; }
+    if (!cur) continue;
+    const t = line.trim();
+    if (buf != null) { buf += " " + t; if (t === ")") { cur.push(buf); buf = null; } continue; }
+    if (/^tile \\d+\\(.*\\)$/.test(t)) cur.push(t);
+    else if (/^tile \\d+\\($/.test(t)) buf = t;
+  }
+  const FN = ["click", "up", "down"];
+  for (const [, slug, set] of src.matchAll(/^(\\w+)\\.tiles = (\\w+)$/gm)) {
+    const dev = slugs[slug];
+    for (const t of tsets[set]) {
+      const index = t.match(/^tile (\\d+)\\(/)[1];
+      const cmd = {}, text = {}, to = {}, toAll = [];
+      let textAll = null;
+      for (const [, k, v] of t.matchAll(/(\\w+): ("(?:[^"\\\\]|\\\\.)*"|\\w+)/g)) {
+        const val = v.startsWith('"') ? JSON.parse(v) : v;
+        if (FN.includes(k)) cmd[k] = val;
+        else if (k === "text") textAll = val;
+        else if (k === "to") toAll.push(val);
+        else if (k.endsWith("_text")) text[k.slice(0, -5)] = val;
+        else if (k.endsWith("_to")) (to[k.slice(0, -3)] ||= []).push(val);
+      }
+      const i = out.findIndex((l) => l.includes(\`U="\${dev}"\`) && l.includes("<C "));
+      const b = out.findIndex((l, n) => n > i && l.includes("<btn ") && l.includes(\` i="\${index}"\`));
+      if (b < 0) { console.error(\`error: compile error: tile \${index}: the device has no such tile\`); process.exit(1); }
+      FN.forEach((f, n) => {
+        const j = out.findIndex((l, x) => x > b && l.trim().startsWith(\`<f\${n + 1}\`));
+        const ind = out[j].match(/^\\s*/)[0], bt = n ? \` bT="\${n}"\` : "";
+        if (!cmd[f]) { out[j] = n ? \`\${ind}<f\${n + 1}\${bt}/>\` : \`\${ind}<f1></f1>\`; return; }
+        const tx = text[f] ?? textAll, ts = to[f] ?? toAll;
+        out[j] = \`\${ind}<f\${n + 1} api="\${xml(cmd[f])}"\${tx ? \` cT="\${xml(tx)}"\` : ""}\${bt}\${ts.length ? \` ctrls="\${ts.map((x) => slugs[x]).join(",")}"\` : ""}/>\`;
+      });
     }
   }
 }
@@ -1999,6 +2099,74 @@ try {
     await page.waitForFunction(() => /Nothing pending/.test(document.querySelector("#deploy-pend")?.textContent || ""), null, { timeout: 15000 });
     await settled();
     assert.doesNotMatch(existsSync(join(dir, "pages", "vislox", "edits.loxl")) ? file() : "", /40000022/);
+  });
+  await step("a Touch Pure Flex's tiles are shown with lint, edited as a tiles set, reviewed and undone (#78)", async () => {
+    await page.waitForFunction(() => /Nothing pending/.test(document.querySelector("#deploy-pend")?.textContent || ""), null, { timeout: 15000 });
+    await page.evaluate(() => editGoNewest());
+    await settled();
+    const sec = '#props [data-body="Tiles"]';
+    await page.evaluate((u) => select(u), FLEX);
+    await page.waitForFunction((u) => S.sel === u && document.querySelector('#props [data-body="Tiles"] [data-ti="open"]'), FLEX, { timeout: 15000 });
+    // The blocks linked to its API connector: Nord directly, Süd through the OutputRef; Ost is not.
+    await waitText(sec, /API-linked\s*Nord[\s\S]*Süd/);
+    assert.doesNotMatch(await page.textContent(`${sec} .pr-row:first-child, ${sec} > div:first-child`).catch(() => ""), /Ost/);
+    // Tile 3's click toggles Nord, with its text; tile 5's click every linked shade, which lint says on the tile.
+    await waitText(sec, /Tile 3[\s\S]*Click\s*SET\(As;Tg;pulse\)\s*·\s*=ECHO\(As\)\s*→\s*Nord/);
+    // lox logic lint runs again on the next compile, and then says that tile 5's click names no target.
+    writeFileSync(join(dir, "TILELINT"), "");
+    // A draft belongs to its device: selecting another block drops it.
+    await page.click(`${sec} [data-ti="open"]`);
+    await page.waitForSelector(`${sec} [data-ti-api="1|0"]`);
+    await page.fill(`${sec} [data-ti-api="1|0"]`, "dropped");
+    await page.evaluate((u) => select(u), NORD);
+    await page.waitForFunction((u) => S.sel === u, NORD);
+    // Nord says which device it is linked to, and which tile addresses it.
+    await waitText('#props [data-body="Touch Pure Flex"]', /API-linked to\s*Flex Küche[\s\S]*Addressed by tile 3 click/);
+    await page.evaluate((u) => select(u), FLEX);
+    await page.waitForFunction((u) => S.sel === u && !TI.open && document.querySelector('#props [data-body="Tiles"] [data-ti="open"]'), FLEX);
+    // Tile 3's click closes Süd instead of Nord, and its arrow up opens Süd. The targets offered are the linked blocks.
+    await page.click(`${sec} [data-ti="open"]`);
+    await page.waitForSelector(`${sec} [data-ti-api="1|0"]`);
+    assert.equal(await page.inputValue(`${sec} [data-ti-api="1|0"]`), "SET(As;Tg;pulse)");
+    assert.deepEqual(await page.$$eval(`${sec} [data-ti-to="1|0"]`, (n) => n.map((x) => x.parentElement.textContent.trim())), ["Nord", "Süd"]);
+    await page.fill(`${sec} [data-ti-api="1|0"]`, "SET(As;Cc;pulse)");
+    await page.uncheck(`${sec} [data-ti-to="1|0"][value="${NORD}"]`);
+    await page.check(`${sec} [data-ti-to="1|0"][value="${SUED}"]`);
+    await page.fill(`${sec} [data-ti-api="1|1"]`, "SET(As;Co;pulse)");
+    await page.check(`${sec} [data-ti-to="1|1"][value="${SUED}"]`);
+    const n0 = edits.length;
+    await page.click(`${sec} [data-ti="save"]`);
+    await until(() => edits.length > n0 && statuses[n0] !== undefined, "the tiles request");
+    assert.equal(statuses[n0], 200);
+    // Only the tile the draft changed: the others keep their programs.
+    assert.deepEqual(edits[n0].ops, [{ op: "tiles", uuid: FLEX, value: { tiles: [{ index: 3, click: { api: "SET(As;Cc;pulse)", text: "=ECHO(As)", to: [SUED] }, up: { api: "SET(As;Co;pulse)", to: [SUED] } }] } }]);
+    assert.equal(edits[n0].base, await page.evaluate(() => TI.blob ?? editRev()?.blob) ?? edits[n0].base);
+    await settled();
+    const file = () => readFileSync(join(dir, "pages", "vislox", "edits.loxl"), "utf8");
+    const sued = "vx_70000012_0000_0000_ffff504f94000001";
+    assert.match(file(), /^extern vx_70000001_0000_0000_ffff504f94000001 = TreeDevice\(uuid: "70000001-0000-0000-ffff504f94000001"\)$/m);
+    assert.match(file(), new RegExp(`^extern ${sued} = AutoJalousie\\(uuid: "${SUED}"\\)$`, "m"));
+    assert.match(file(), /^tiles vx_flex_kueche_tiles\n\ttile 3\($/m);
+    for (const l of ['\t\tclick: "SET(As;Cc;pulse)",', '\t\tup: "SET(As;Co;pulse)",', `\t\tto: ${sued},`, '\t\tclick_text: "=ECHO(As)",']) assert.ok(file().includes(`${l}\n`), `${l} in\n${file()}`);
+    assert.match(file(), /^vx_70000001_0000_0000_ffff504f94000001\.tiles = vx_flex_kueche_tiles$/m);
+    assert.doesNotMatch(file(), /70000011/);
+    // Compiled: the pending config has the new tile, reviewed per function.
+    await page.waitForFunction((u) => S.view.objects[u].tiles.tiles[1].functions[0].api === "SET(As;Cc;pulse)", FLEX, { timeout: 10000 });
+    await waitText(sec, /edited here[\s\S]*not deployed[\s\S]*Revert/);
+    await waitText(sec, /Written by vislox as vx_flex_kueche_tiles/);
+    await page.waitForFunction(() => S.check?.lint?.findings?.some((f) => f.kind === "tile-broadcast"), null, { timeout: 15000 });
+    await waitText(sec, /Tile 5[\s\S]*⚠ Lint \(tile-broadcast\): tile 5 click: `SET\(As;Tg;pulse\)` names no target/);
+    assert.doesNotMatch(await page.textContent(sec), /Tile 3[^⚠]*⚠ Lint[\s\S]*Tile 5/);
+    rmSync(join(dir, "TILELINT"));
+    await waitText("#deploy-pend", /tiles of 1 Touch Pure Flex edited here/);
+    const changes = await page.evaluate(() => S.view.changes.map((c) => c.text));
+    for (const c of ['Flex Küche · tile 3 click: "SET(As;Tg;pulse)" → "SET(As;Cc;pulse)"', "Flex Küche · tile 3 click targets: Nord → Süd", 'Flex Küche · tile 3 up: — → "SET(As;Co;pulse)"', "Flex Küche · tile 3 up targets: — → Süd"])
+      assert.ok(changes.includes(c), changes.join(" | "));
+    // Undone through the reply's undo: the claim goes, and tile 3 is as Loxone Config has it.
+    const ops = await undoKey(false, (u) => S.view.objects[u].tiles.tiles[1].functions[0].api === "SET(As;Tg;pulse)" && !S.edits?.tiles?.length, FLEX);
+    assert.deepEqual(ops, [{ op: "tiles", uuid: FLEX, value: null }]);
+    assert.doesNotMatch(existsSync(join(dir, "pages", "vislox", "edits.loxl")) ? file() : "", /tiles|70000012/);
+    await page.waitForFunction(() => /Nothing pending/.test(document.querySelector("#deploy-pend")?.textContent || ""), null, { timeout: 15000 });
   });
   await step("nothing was deployed: lox only compiled, checked, linted and tested", async () => {
     const ran = readFileSync(calls, "utf8").trim().split("\n");

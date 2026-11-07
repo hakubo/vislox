@@ -266,6 +266,17 @@ pub struct ObjInfo {
     /// The compared revision's, when it differs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message_old: Option<MessageInfo>,
+    /// The tiles of a Touch Pure Flex, and the blocks linked to its API
+    /// connector (#78).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tiles: Option<TilesInfo>,
+    /// The compared revision's, when they differ.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tiles_old: Option<TilesInfo>,
+    /// The Touch Pure Flex devices whose API connector this block is linked
+    /// to (#78): those whose tiles can address it.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub api_linked: Vec<Target>,
     /// The device this object is, or belongs to (an input or output).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub device: Option<DeviceInfo>,
@@ -314,32 +325,166 @@ pub struct MemberInfo {
     pub missing: bool,
 }
 
+/// The tiles of a Touch Pure Flex (#78), as the viewed config stores them,
+/// and the blocks API-linked to it (those a tile may address).
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct TilesInfo {
+    pub tiles: Vec<TileInfo>,
+    /// The blocks linked to the device's API connector, in UUID order.
+    pub linked: Vec<Target>,
+}
+
+/// One tile: its index and its functions (click, up, down).
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct TileInfo {
+    pub index: u32,
+    pub functions: Vec<TileFnInfo>,
+}
+
+/// One function of a tile: its command, status text and the blocks it
+/// addresses (`ctrls=`), each a link, or its UUID when the config has no such
+/// object (`missing`).
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct TileFnInfo {
+    /// `click`, `up` or `down`.
+    pub key: &'static str,
+    pub api: Option<String>,
+    pub text: Option<String>,
+    pub to: Vec<MemberInfo>,
+    /// The function as stored: what [`crate::tiles`] compares.
+    #[serde(skip)]
+    pub raw: crate::tiles::Function,
+}
+
+/// The block `m` names, as a link: by its UUID in either case, else the
+/// UUID itself (`missing`).
+fn member_info(c: &Ctx, m: &str) -> MemberInfo {
+    match [m.to_string(), m.to_ascii_lowercase()]
+        .into_iter()
+        .find(|k| c.el(k).is_some())
+    {
+        Some(k) => MemberInfo {
+            target: c.target(&k, None),
+            missing: false,
+        },
+        None => MemberInfo {
+            target: Target {
+                title: m.to_string(),
+                uuid: m.to_string(),
+                ..Target::default()
+            },
+            missing: true,
+        },
+    }
+}
+
+/// The tiles of the device `uuid`, if it is a Touch Pure Flex.
+fn tiles_info(c: &Ctx, links: &crate::tiles::Links, uuid: &str) -> Option<TilesInfo> {
+    let raw = crate::tiles::tiles_of(c.el(uuid)?)?;
+    let tiles = raw
+        .into_iter()
+        .map(|t| TileInfo {
+            index: t.index,
+            functions: crate::tiles::FUNCTIONS
+                .iter()
+                .zip(t.functions)
+                .map(|((key, _), f)| TileFnInfo {
+                    key,
+                    to: f.ctrls.iter().map(|m| member_info(c, m)).collect(),
+                    api: f.api.clone(),
+                    text: f.text.clone(),
+                    raw: f,
+                })
+                .collect(),
+        })
+        .collect();
+    let linked = links
+        .of(uuid)
+        .iter()
+        .map(|(u, _)| member_info(c, u).target)
+        .collect();
+    Some(TilesInfo { tiles, linked })
+}
+
+/// Whether two readings of a device's tiles program them alike:
+/// [`crate::tiles::Tile::same`], as the pending flag compares them.
+fn same_tiles(a: &TilesInfo, b: &TilesInfo) -> bool {
+    a.tiles.len() == b.tiles.len()
+        && a.tiles
+            .iter()
+            .zip(&b.tiles)
+            .all(|(x, y)| x.raw().same(&y.raw()))
+}
+
+impl TileInfo {
+    /// The tile as stored.
+    fn raw(&self) -> crate::tiles::Tile {
+        crate::tiles::Tile {
+            index: self.index,
+            functions: std::array::from_fn(|i| {
+                self.functions
+                    .get(i)
+                    .map(|f| f.raw.clone())
+                    .unwrap_or_default()
+            }),
+        }
+    }
+}
+
+/// The tiles of a device that changed, as the change list reads them, per
+/// function: *Flex Küche · tile 3 click: "SET(As;Tg;pulse)" → "SET(As;Cc;pulse)"*,
+/// its status text and its targets, and a tile the layout added or removed.
+fn tiles_changes(title: &str, old: &TilesInfo, new: &TilesInfo) -> Vec<String> {
+    let q = |v: &Option<String>| v.as_ref().map_or("—".to_string(), |t| format!("{t:?}"));
+    let names = |f: &TileFnInfo| {
+        if f.to.is_empty() {
+            "—".to_string()
+        } else {
+            f.to.iter()
+                .map(|x| x.target.title.clone())
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    };
+    let mut out = Vec::new();
+    for t in &new.tiles {
+        let Some(o) = old.tiles.iter().find(|x| x.index == t.index) else {
+            out.push(format!("{title} · tile {} added", t.index));
+            continue;
+        };
+        for (f, g) in t.functions.iter().zip(&o.functions) {
+            // Only what the stored programs' one comparison calls changed.
+            if f.raw.same(&g.raw) {
+                continue;
+            }
+            let at = format!("{title} · tile {} {}", t.index, f.key);
+            if f.api != g.api {
+                out.push(format!("{at}: {} → {}", q(&g.api), q(&f.api)));
+            }
+            if f.text != g.text {
+                out.push(format!("{at} text: {} → {}", q(&g.text), q(&f.text)));
+            }
+            if crate::member_edit::lower(&f.raw.ctrls) != crate::member_edit::lower(&g.raw.ctrls) {
+                out.push(format!("{at} targets: {} → {}", names(g), names(f)));
+            }
+        }
+    }
+    for t in &old.tiles {
+        if !new.tiles.iter().any(|x| x.index == t.index) {
+            out.push(format!("{title} · tile {} removed", t.index));
+        }
+    }
+    out
+}
+
 /// The members `uuid` lists, if it is a block that lists any.
 fn members_info(c: &Ctx, uuid: &str) -> Option<MembersInfo> {
     let el = c.el(uuid)?;
     let ty = el.attr("Type")?;
     let (attr, editable) = crate::member_edit::list_attr(ty)?;
     let members = crate::member_edit::of(el)
-        .into_iter()
-        .map(|m| {
-            match [m.clone(), m.to_ascii_lowercase()]
-                .into_iter()
-                .find(|k| c.el(k).is_some())
-            {
-                Some(k) => MemberInfo {
-                    target: c.target(&k, None),
-                    missing: false,
-                },
-                None => MemberInfo {
-                    target: Target {
-                        title: m.clone(),
-                        uuid: m,
-                        ..Target::default()
-                    },
-                    missing: true,
-                },
-            }
-        })
+        .iter()
+        .map(|m| member_info(c, m))
         .collect();
     Some(MembersInfo {
         attr,
@@ -1369,6 +1514,9 @@ struct Delta {
     /// Push notifications on a page (`OutputRefLM`) whose message changed
     /// (#77): its `<LoggerMailer>` child, which no attribute shows.
     messages: HashSet<String>,
+    /// Touch Pure Flex devices whose tiles changed (#78): their `<btns>`,
+    /// which no attribute shows.
+    tiles: HashSet<String>,
     /// Objects whose app settings changed: shown or not, room, category.
     in_app: HashSet<String>,
     /// Devices the change reconfigures → how ([`HwDevice::how`]).
@@ -1393,6 +1541,7 @@ impl Delta {
             || self.moods.contains(uuid)
             || self.rights.contains(uuid)
             || self.messages.contains(uuid)
+            || self.tiles.contains(uuid)
             || self.in_app.contains(uuid)
             || self.params.keys().any(|(o, _)| o == uuid)
         {
@@ -1647,6 +1796,45 @@ pub fn build(new: &LoxoneDoc, old: Option<&LoxoneDoc>, title: &str) -> View {
         }
     }
 
+    // The tiles of a Touch Pure Flex (#78): changed ones mark the device
+    // changed. The API links read once per config.
+    let mut tiles: HashMap<String, (TilesInfo, Option<TilesInfo>)> = HashMap::new();
+    // Block → the devices it is API-linked to.
+    let mut api_linked: HashMap<String, Vec<Target>> = HashMap::new();
+    {
+        let nl = crate::tiles::Links::read(new);
+        for u in &nc.order {
+            for (b, _) in nl.of(u) {
+                api_linked
+                    .entry(b.clone())
+                    .or_default()
+                    .push(nc.target(u, None));
+            }
+        }
+        let ol = old.filter(|_| d.on).map(crate::tiles::Links::read);
+        for u in &nc.order {
+            if let Some(ti) = tiles_info(&nc, &nl, u) {
+                let was = oc
+                    .as_ref()
+                    .zip(ol.as_ref())
+                    .and_then(|(o, l)| tiles_info(o, l, u))
+                    .filter(|o| !same_tiles(o, &ti));
+                if was.is_some() {
+                    d.tiles.insert(u.clone());
+                }
+                tiles.insert(u.clone(), (ti, was));
+            }
+        }
+        if let Some(oc) = &oc {
+            let ol = ol.unwrap_or_else(|| crate::tiles::Links::read(oc.doc));
+            for u in oc.order.iter().filter(|u| !nc.els.contains_key(*u)) {
+                if let Some(ti) = tiles_info(oc, &ol, u) {
+                    tiles.insert(u.clone(), (ti, None));
+                }
+            }
+        }
+    }
+
     // Access rights and recipients (#68): a changed one marks its block
     // changed.
     let mut new_rights = rights::read(new);
@@ -1725,6 +1913,11 @@ pub fn build(new: &LoxoneDoc, old: Option<&LoxoneDoc>, title: &str) -> View {
             o.message = Some(m);
             o.message_old = old;
         }
+        if let Some((t, old)) = tiles.remove(u) {
+            o.tiles = Some(t);
+            o.tiles_old = old;
+        }
+        o.api_linked = api_linked.remove(u).unwrap_or_default();
         view.objects.insert(u.clone(), o);
     }
     if let Some(oc) = &oc {
@@ -1737,6 +1930,7 @@ pub fn build(new: &LoxoneDoc, old: Option<&LoxoneDoc>, title: &str) -> View {
                 o.members = members.remove(u).map(|(m, _)| m);
                 o.rights = old_rights.remove(u);
                 o.message = messages.remove(u).map(|(m, _)| m);
+                o.tiles = tiles.remove(u).map(|(t, _)| t);
                 view.objects.insert(u.clone(), o);
             }
         }
@@ -2300,6 +2494,9 @@ fn obj_info(
         rights_old: None,
         message: None,
         message_old: None,
+        tiles: None,
+        tiles_old: None,
+        api_linked: Vec::new(),
         device,
         edit: if gone { None } else { crate::edit::caps(el) },
         uuid: uuid.to_string(),
@@ -2539,6 +2736,20 @@ fn changes(view: &mut View, nc: &Ctx, oc: &Ctx, d: &Delta) {
             && let (Some(new), Some(old)) = (&o.moods, &o.moods_old)
         {
             for text in moods_changes(&nc.title(&u), old, new) {
+                v.push(Change {
+                    kind: "attr",
+                    text,
+                    page: page_for(&u),
+                    obj: Some(u.clone()),
+                    hw: None,
+                    how: None,
+                });
+            }
+        }
+        if let Some(o) = view.objects.get(&u)
+            && let (Some(new), Some(old)) = (&o.tiles, &o.tiles_old)
+        {
+            for text in tiles_changes(&nc.title(&u), old, new) {
                 v.push(Change {
                     kind: "attr",
                     text,
@@ -4693,5 +4904,75 @@ mod tests {
         assert!(same.objects[WARN].message_old.is_none());
         assert_eq!(duration_text(5000), "5s");
         assert_eq!(duration_text(1500), "1500ms");
+    }
+
+    /// A Touch Pure Flex shows its tiles and the blocks linked to it (#78),
+    /// and a changed function reads old → new, per function.
+    #[test]
+    fn tiles_are_shown_and_their_change_reads_per_function() {
+        use crate::tiles::fixture::*;
+        let base = doc(&house());
+        let v = build(&base, None, "");
+        let t = v.objects[FLEX].tiles.as_ref().expect("its tiles");
+        assert_eq!(
+            t.tiles.iter().map(|x| x.index).collect::<Vec<_>>(),
+            [2, 3, 5]
+        );
+        let click = &t.tiles[1].functions[0];
+        assert_eq!(
+            (click.key, click.api.as_deref()),
+            ("click", Some("SET(As;Tg;pulse)"))
+        );
+        assert_eq!(click.to[0].target.title, "Nord");
+        assert_eq!(
+            t.linked
+                .iter()
+                .map(|x| x.title.as_str())
+                .collect::<Vec<_>>(),
+            ["Nord", "Süd", "Licht"]
+        );
+        assert!(v.objects[TOUCH].tiles.is_none());
+        // A linked block names the device it is linked to; Ost is linked to none.
+        assert_eq!(v.objects[SUED].api_linked[0].title, "Flex Küche");
+        assert!(v.objects[OST].api_linked.is_empty());
+        // Tile 3's click now closes Süd, its arrow up drops its text.
+        let new = doc(&house()
+            .replace(
+                &format!("<f1 api=\"SET(As;Tg;pulse)\" cT=\"=ECHO(As)\" ctrls=\"{NORD}\"/>"),
+                &format!(
+                    "<f1 api=\"SET(As;Cc;pulse)\" cT=\"=ECHO(As)\" ctrls=\"{}\"/>",
+                    SUED.to_ascii_uppercase()
+                ),
+            )
+            .replace(
+                "<f2 api=\"SET(As;Co;pulse)\" cT=\"=ECHO(As)\"",
+                "<f2 api=\"SET(As;Co;pulse)\"",
+            ));
+        let v = build(&new, Some(&base), "");
+        let o = &v.objects[FLEX];
+        assert_eq!(o.status, "changed");
+        assert!(o.tiles_old.is_some());
+        let lines: Vec<&str> = v
+            .changes
+            .iter()
+            .filter(|c| c.obj.as_deref() == Some(FLEX))
+            .map(|c| c.text.as_str())
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "Flex Küche · tile 3 click: \"SET(As;Tg;pulse)\" → \"SET(As;Cc;pulse)\"",
+                "Flex Küche · tile 3 click targets: Nord → Süd",
+                "Flex Küche · tile 3 up text: \"=ECHO(As)\" → —",
+            ]
+        );
+        // The same tiles, a target's UUID in another case among them, are no change.
+        let case = doc(&house().replace(
+            &format!("ctrls=\"{NORD}\""),
+            &format!("ctrls=\"{}\"", NORD.to_ascii_uppercase()),
+        ));
+        let same = build(&case, Some(&base), "");
+        assert!(same.objects[FLEX].tiles_old.is_none());
+        assert_eq!(same.objects[FLEX].status, "");
     }
 }

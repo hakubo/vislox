@@ -2733,6 +2733,16 @@ impl Actions {
             Second::Lint => check::parse_lint(&o, shown).map(|mut findings| {
                 if !findings.is_empty() {
                     check::locate_findings(&mut findings, &texts(), &edit::Lock::read(&p.lock));
+                    // A Touch Pure Flex no extern names is named by its title (#78).
+                    if findings
+                        .iter()
+                        .any(|f| f.kind.starts_with("tile-") && f.blocks.is_empty())
+                        && let Ok(d) = std::fs::read(&p.out)
+                            .map_err(|e| e.to_string())
+                            .and_then(|b| edit::parse_doc(&b))
+                    {
+                        check::pin_tile_findings(&mut findings, &d);
+                    }
                 }
                 json!({ "available": true, "findings": findings })
             }),
@@ -8539,5 +8549,164 @@ esac
             .unwrap_err();
         assert_eq!(code, axum::http::StatusCode::UNPROCESSABLE_ENTITY, "{msg}");
         assert!(msg.contains("pages/own.loxl:5 claims its members"), "{msg}");
+    }
+
+    // ── tiles of a Touch Pure Flex (#78) ──────────────────────────────
+
+    fn tiles_val(api: &str, to: &[&str]) -> Option<crate::tiles_edit::TilesVal> {
+        Some(crate::tiles_edit::TilesVal {
+            tiles: Some(vec![crate::tiles_edit::TileVal {
+                index: 3,
+                click: Some(crate::tiles_edit::FnVal {
+                    api: api.into(),
+                    text: Some("=ECHO(As)".into()),
+                    to: to.iter().map(|x| x.to_string()).collect(),
+                }),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        })
+    }
+
+    /// `GET /api/edits` lists a claimed device and its tiles, targets by UUID.
+    #[test]
+    fn tiles_are_listed_by_uuid_and_pending() {
+        use crate::tiles::fixture::{FLEX, NORD, house};
+        let doc = edit::parse_doc(house().as_bytes()).unwrap();
+        let (s, n) = (edit::slug(FLEX), edit::slug(NORD));
+        let files = edit::Files::from_texts(&std::collections::BTreeMap::from([(
+            "edits.loxl".to_string(),
+            format!(
+                "extern {s} = TreeDevice(uuid: \"{FLEX}\")\nextern {n} = AutoJalousie(uuid: \"{NORD}\")\n\
+                 tiles vx_t\n\ttile 3(click: \"SET(As;Tg;pulse)\", to: {n})\nend\n{s}.tiles = vx_t\n"
+            ),
+        )]))
+        .unwrap();
+        let lock = edit::Lock::default();
+        let none = edit::Files::default();
+        let (v, sets) = crate::set_claim::edits_section::<crate::tiles_edit::TilesKind>(
+            &files,
+            &none,
+            &lock,
+            Some(&doc),
+            None,
+        );
+        assert_eq!(v[0]["uuid"], FLEX);
+        assert_eq!(v[0]["set"], "vx_t");
+        assert_eq!(v[0]["pending"], true);
+        assert_eq!(
+            v[0]["tiles"],
+            json!([{ "index": 3, "click": { "api": "SET(As;Tg;pulse)", "to": [NORD] } }])
+        );
+        assert_eq!(sets[0]["devices"][0], FLEX);
+        assert!(needs_module_names(&[edit::Op::Tiles {
+            uuid: FLEX.into(),
+            value: tiles_val("SET(As;Tg;pulse)", &[]),
+        }]));
+    }
+
+    /// A compile that does not write the tiles onto their device is refused,
+    /// and the module, lock and out are put back; nothing is deployed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tiles_lox_did_not_write_are_refused_and_put_back() {
+        use crate::tiles::fixture::{FLEX, NORD, house};
+        let (tmp, a) = project_for_edits();
+        let d = tmp.path().join("project");
+        std::fs::write(d.join("base.Loxone"), house()).unwrap();
+        std::fs::write(d.join("out.Loxone"), house()).unwrap();
+        sh(&d, "git add -A && git commit -qm flex");
+        std::fs::write(
+            tmp.path().join("lox"),
+            "#!/bin/sh\necho \"$*\" >> ../calls.log\n[ \"$1 $2\" = \"logic compile\" ] || exit 2\n\
+             out=out.Loxone; prev=\nfor a in \"$@\"; do [ \"$prev\" = --out ] && out=$a; prev=$a; done\n\
+             cp base.Loxone \"$out\"\n",
+        )
+        .unwrap();
+        let req = edit::Request {
+            base: blob(&d, "out.Loxone"),
+            ops: vec![edit::Op::Tiles {
+                uuid: FLEX.into(),
+                value: tiles_val("SET(As;Co;pulse)", &[NORD]),
+            }],
+        };
+        let out_was = std::fs::read(d.join("out.Loxone")).unwrap();
+        let (code, msg) = a.edit(&req, None).await.unwrap_err();
+        assert_eq!(code, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            msg.contains("did not write the tiles of Flex Küche"),
+            "{msg}"
+        );
+        assert!(!d.join("pages/vislox/edits.loxl").exists());
+        assert_eq!(std::fs::read(d.join("out.Loxone")).unwrap(), out_was);
+        let calls = std::fs::read_to_string(tmp.path().join("calls.log")).unwrap();
+        assert!(
+            calls.lines().all(|l| l.starts_with("logic compile")),
+            "{calls}"
+        );
+    }
+
+    /// Tiles with the real lox (#78): set `VISLOX_TEST_LOX` to a lox binary
+    /// (v0.83.0) to run it; it never talks to a Miniserver. The set and claim
+    /// are compiled onto the device, `GET /api/edits` lists them, and the
+    /// undo puts the tile back.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tiles_are_compiled_by_lox() {
+        use crate::tiles::fixture::{FLEX, SUED, house};
+        let Some(lox) = std::env::var_os("VISLOX_TEST_LOX") else {
+            eprintln!("VISLOX_TEST_LOX is not set: skipped");
+            return;
+        };
+        let (tmp, a) = project_with_lox_base(Path::new(&lox), house().as_bytes());
+        let d = tmp.path().join("project");
+        let tile3 = || {
+            let doc = edit::parse_doc(&std::fs::read(d.join("out.Loxone")).unwrap()).unwrap();
+            crate::tiles::tiles_of(crate::tiles::find_ci(&doc.xml.root, FLEX).unwrap())
+                .unwrap()
+                .into_iter()
+                .find(|t| t.index == 3)
+                .unwrap()
+        };
+        let r = a
+            .edit(
+                &edit::Request {
+                    base: blob(&d, "out.Loxone"),
+                    ops: vec![edit::Op::Tiles {
+                        uuid: FLEX.into(),
+                        value: tiles_val("SET(As;Cc;pulse)", &[SUED]),
+                    }],
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(r["undo"][0]["op"], "tiles");
+        assert_eq!(r["undo"][0]["value"], Value::Null);
+        let t = tile3();
+        assert_eq!(t.functions[0].api.as_deref(), Some("SET(As;Cc;pulse)"));
+        assert_eq!(crate::member_edit::lower(&t.functions[0].ctrls), [SUED]);
+        assert_eq!(t.functions[1], Default::default());
+        let e = edits_of(&a, &d).await;
+        assert_eq!(e["tiles"][0]["uuid"], FLEX);
+        assert_eq!(e["tiles"][0]["pending"], true);
+        assert_eq!(e["tile_sets"][0]["devices"][0], FLEX);
+        assert_eq!(e["set_kinds"]["tiles"]["content"], "tiles");
+        // The undo drops the claim: lox keeps the programs last written.
+        let undo: Vec<edit::Op> = serde_json::from_value(r["undo"].clone()).unwrap();
+        a.edit(
+            &edit::Request {
+                base: blob(&d, "out.Loxone"),
+                ops: undo,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !std::fs::read_to_string(d.join("pages").join(edit::FILE))
+                .unwrap_or_default()
+                .contains("tiles")
+        );
     }
 }

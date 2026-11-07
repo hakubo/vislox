@@ -3,8 +3,9 @@
 vislox becomes an editor in steps: edit values (#58), add blocks (#59), move blocks, inputs and outputs (#60),
 make and change connections (#61), undo and redo (#62), adopt the blocks Loxone Config drew (#72), edit a
 Daytimer's switching times (#73), a lighting controller's moods (#74), a central block's members (#75), who may
-open an NFC Code Touch (#76) and push notifications: who gets them and what they say (#77). This page is the design
-they share. #58 to #62, #72 to #77 are built; the rest says where each step plugs in.
+open an NFC Code Touch (#76), push notifications: who gets them and what they say (#77), and the tiles of a Touch
+Pure Flex (#78). This page is the design they share. #58 to #62, #72 to #78 are built; the rest says where each step
+plugs in.
 
 ## The rules
 
@@ -79,7 +80,7 @@ POST /api/edit
   no claim; when the op rewrote a set other timers still claim, it also carries that set's old switching times
   (`restore`), so the undo gives them back too. `moods` is the same for a controller's moods (#74). For
   `members` it is the list vislox claimed before, or null (#75). `access` is as `moods`, for a Code Touch's
-  rights (#76), and `recipients` for a notification's recipients (#77).
+  rights (#76), `recipients` for a notification's recipients (#77), and `tiles` for a Touch Pure Flex's tiles (#78).
   A reconnected wire is one request, `unwire` then `wire`:
   undone, the reverse list. The ops of one request see each other: `unwire` then `wire` of the same wire is
   accepted (and changes nothing). `remove_block`'s `add_block` carries the wires the removal took out
@@ -615,7 +616,7 @@ the timers whose switching times are edited and not deployed.
 
 ## Shared sets (#73, #74)
 
-Switching times, moods, access (#76) and recipients (#77), and the claims #78 (tiles) will add, share one
+Switching times, moods, access (#76), recipients (#77) and tiles (#78) share one
 shape: a named set, claims on blocks, several blocks per set, one set per block. `set_claim.rs` does what is the
 same for every kind, parameterised by a `SetKind` (its keyword, block type, content as an op carries it, how
 content becomes lines and how lines are checked for each block): resolve the block, choose the set (named, the
@@ -632,8 +633,11 @@ Every kind of claim on a block's whole content, members too, is one entry of `se
 reading and rendering vislox's file, the names a new set must not take (the module's names are loaded for any op
 of a kind that makes sets), the blocks the rest of the module claims (`Ctx::claimed`, by kind), the refusals of
 Remove and Hand back, mending a claim made twice, the check after the compile, and `GET /api/edits` go through it.
-A new kind (#78) is a `SetKind`, its slot in `Claims`, its `Op` variant, and one line in `KINDS`; #77's
-`recipients` was built so.
+A new kind is a `SetKind`, its slot in `Claims`, its `Op` variant, and one line in `KINDS`; #77's
+`recipients` and #78's `tiles` were built so. A kind whose lines name other blocks (a tile's targets) gives
+`SetKind::lines_with` (the lines and the externs they need, keyed case-insensitively, never retyping another
+claim's extern) and `SetKind::named` (the slugs its sets name: kept while named, refused on read unless vislox's,
+and named in the refusals of Remove and Hand back).
 A central block's members (#75) are no such set: each claim holds its own list, and a block is in as many lists
 as name it. `member_edit.rs` takes only `set_claim.rs`'s naming of vislox's blocks (`member_of`, `target_of`).
 
@@ -964,6 +968,85 @@ every notification anyway*); *Save* names who stops getting it first (*Save anyw
 notification (a choice of the config's), *On*, *Off* and *Minimum time*. Its *Edit values* edits the message. The
 Deploy pane counts the notifications whose recipients are edited and not deployed.
 
+## Tiles of a Touch Pure Flex (#78)
+
+A Touch Pure Flex is a Tree device (`TreeDevice`) with a tile layout (`<btns>`): each tile, by its index, has three
+functions, the click and the arrows up and down, each a command (`api=`, the app's command language:
+`SET(As;Co;pulse)`), a status text (`cT=`) and the blocks the command addresses (`ctrls=`). A command reaches only
+the blocks *API-linked* to the device: a block whose `OutputAPI` is wired to the device's API connector
+(`ApiActor.I`), directly or through an `OutputRef` of the connector whose `AQ` feeds it (API wires are recorded in
+reverse, so either direction counts; `tiles.rs` reads it as lox does). Without targets, a command reaches every
+linked block of its type. Lox Logic writes the functions of tiles the layout has:
+
+```text
+extern vx_70000001_0000_0000_ffff504f94000001 = TreeDevice(uuid: "70000001-0000-0000-ffff504f94000001")
+
+extern vx_70000012_0000_0000_ffff504f94000001 = AutoJalousie(uuid: "70000012-0000-0000-ffff504f94000001")
+
+# Touch Pure Flex tiles edited in vislox. A claim writes each tile the set lists (its click, up
+# and down commands, texts and targets); the others stay. Deleting it leaves the tiles as last written.
+tiles vx_flex_kueche_tiles
+	tile 2()
+	tile 3(
+		click: "SET(As;Cc;pulse)",
+		up: "SET(As;Co;pulse)",
+		to: vx_70000012_0000_0000_ffff504f94000001,
+		click_text: "=ECHO(As)",
+	)
+end
+
+vx_70000001_0000_0000_ffff504f94000001.tiles = vx_flex_kueche_tiles
+```
+
+- **Shown from the compiled config.** `objects[…].tiles` (`model.rs`) is a Touch Pure Flex's `tiles` (each `index`
+  and its `functions`: `key` `click`, `up` or `down`, `api`, `text`, and `to`, the targets as links, `missing` for
+  a UUID the config lacks) and `linked`, the blocks linked to its API connector. `tiles_old` is the compared
+  revision's when it differs, and such a device is marked changed (the tiles are child elements, which no
+  attribute change shows). The Changes list says it per function: `Flex Küche · tile 3 click: "SET(As;Tg;pulse)" →
+  "SET(As;Cc;pulse)"`, `… tile 3 up text: "=ECHO(As)" → —`, `… tile 3 click targets: Nord → Süd`, and a tile the
+  layout added or removed. Targets compare by UUID, case aside. A block linked to a device lists the device (`api_linked`).
+- **Lint on the tile.** `lox logic lint`'s `tile-broadcast` (a command without targets that two or more linked
+  blocks of its type receive) and `tile-dead-command` (one no linked block receives) name the device by its extern,
+  or by its title when no extern names it; such a finding is pinned to the Touch Pure Flex of the compiled config
+  with that title (`check::pin_tile_findings`), and Properties shows it on each tile its text names (`tile 5`).
+- **The `tiles` op** is `{ "op": "tiles", "uuid": <TreeDevice>, "value": … }`. `value.tiles` lists tiles, each
+  `{ index, click?, up?, down? }`, a function `{ api, text?, to: [UUID…] }`; a function left out does nothing
+  (`tile 3()` clears all three), a tile left out keeps its programs. `value.set`, `value: null` and `value.restore`
+  are as for the other set kinds: write vislox's set of that name and claim it, or with no `tiles` claim it as it is
+  (*Use the same tiles as …*); drop the claim; write sets back first (an undo's). A new set is
+  `vx_<name>_tiles`. `previous` carries the targets by UUID. A target Loxone Config drew gets an extern of vislox's
+  file (`vx_<uuid>`, its type), kept while a set names it; a block added or adopted here is named by its slug,
+  resolved through the lockfile once lox pins it. One lox has not pinned yet (added in the same request, or carried
+  by an undo) is not in the pending config: its type is checked here, its link by lox and after the compile. A
+  `tile` is written as lox's formatter writes it (`Module::to_text`), `text:`/`to:` once when every function with a
+  command shares them, else per function (`click_text:`, `up_to:`), so `lox logic fmt --check` finds nothing.
+- **Checked before lox sees it**, with lox's rules: a `TreeDevice` with a tile layout, for every device on the set;
+  each tile index once and one the device's layout has (*it has 2, 3, 5*); a command (one line, at most 500
+  characters) on every function given; each target a block of the pending config, once per function, API-linked
+  to every device on the set, and of the type a command lox knows the abbreviation of addresses (`As`:
+  `AutoJalousie`, `Lico`: `LightController2`; other abbreviations are not checked); at most 64 tiles and 32
+  targets a function. A block the module manages is refused as a target (vislox's files name only their own blocks
+  and Loxone Config's). One set per device: one the rest of the module claims is refused, naming that `file:line`
+  (`set_claims`, which now lists `tiles` claims too). Dropping vislox's claim is always let through.
+- **Checked after the compile.** The pending config must have, on each device the request changed and every device
+  sharing its set, each tile the set lists exactly as it says (command, text, targets by UUID; an empty function
+  for one without a command).
+- **What stays with Loxone Config.** The layout (which tiles exist, their place, size and icon), pairing the
+  device, and the API link itself: wire a block's `OutputAPI` to the device's API connector in Loxone Config. Dropping
+  the claim before Apply leaves the tiles as Loxone Config has them; after Apply, as last written (lox keeps no lock
+  state for it).
+
+The browser: *Tiles* in Properties of a Touch Pure Flex (select it in the tree), on any revision: *API-linked*, the
+blocks a command can reach (and a linked block's *Touch Pure Flex* section names the device and the tiles that
+address it), then each tile with *Click*, *Arrow up* and *Arrow down* (the command, `·` the status
+text, `→` the targets), old → new against the compared revision, and the lint findings on the tile. On the newest
+config, *Edit tiles* gives each function a command field, a status text field and a checkbox per linked block (a
+target the config names that is not linked is listed in red, to take out), and *Clear* per tile. *Save* sends every
+tile vislox's set lists and every tile the draft changes, against the pending config the draft was made on; the
+draft is dropped when another block is selected or the pending config changes. *Use the same tiles as …*, *Change
+… too*, *Revert*, *Remove vislox's claim* (claimed twice) and *Drop its claim* (stale) are as for the other sets.
+The Deploy pane counts the devices whose tiles are edited and not deployed.
+
 ## Undo and redo (#62)
 
 Undo is not a second way to change the module: it sends the edit's `undo` back to `POST /api/edit` as an edit of
@@ -1024,6 +1107,7 @@ cannot express is left out, not worked around.
 | #76 access | `access vx_… end`, `x.access = vx_…` in `edits.loxl` | An NfcCodeTouch; users, groups and access schedules by a title that names exactly one; several Code Touches may share a set. |
 | #77 recipients | `recipients vx_… end`, `x.recipients = vx_…` in `edits.loxl` | A Notification (an extern); users and groups by a title that names exactly one; Full access is never listed. |
 | #77 notification on a page | `slug = OutputRefLM(mirrors: vx_…, On: "…", Off: "…", MinimumTime: 12h)` | Mirrors a Notification Loxone Config made; no name, no constant; its `AI` wired with #61. |
+| #78 tiles | `tiles vx_… end`, `x.tiles = vx_…` in `edits.loxl` | A Touch Pure Flex (an extern `TreeDevice` with a tile layout); only the indices the layout has; targets API-linked externs or blocks added/adopted here; several devices may share a set. |
 
 Blocks the module already manages (they are in the lockfile) are refused: they are edited in their own `.loxl`.
 The blocks vislox added or adopted (#72) are the exception: their `.loxl` is vislox's.
@@ -1064,6 +1148,10 @@ The blocks vislox added or adopted (#72) are the exception: their `.loxl` is vis
 - A block on a page whose title an earlier page has, and a new page (#88).
 - A push notification itself (lox never writes into *Messages*), and adopting a notification's block Loxone Config
   drew (`lox logic adopt` of an `OutputRefLM` fails in lox 0.83): its message is changed in Loxone Config (#77).
+- A Touch Pure Flex's layout (adding, moving or removing a tile, its icon) and its API link: lox writes only the
+  functions of tiles that exist, and a target must already be linked (#78). A block the module manages as a tile's
+  target: vislox's files name only their own blocks and Loxone Config's, so such a tile is programmed in the
+  module's own file.
 
 ## The rest of the language
 
@@ -1081,7 +1169,7 @@ Each of these plugs in as new op kinds on `POST /api/edit`, written into `<modul
 | #75 (built) | members of a central block (`.members`) |
 | #76 (built) | NFC Code Touch access (`access`, `.access`) |
 | #77 (built) | notification recipients and messages (`recipients`, `OutputRefLM`) |
-| #78 | Touch Pure Flex tiles (`tiles`, `.tiles`) |
+| #78 (built) | Touch Pure Flex tiles (`tiles`, `.tiles`) |
 | #79 | a managed block's label and settings (`Desc:`, `Type:`, `Formula:`, `Code: file(…)`, …) |
 | #80 | delete and rename managed blocks (`removed`, `moved`) |
 | #81 | `let` and `defaults` |

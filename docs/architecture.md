@@ -65,8 +65,8 @@ The binary is an `axum` server with the UI embedded (plain JS and SVG, no build 
   word, the module's slug of a mode, else its title; alike columns on one line, `daily`/`weekdays`/`weekend`), read
   back into columns (an op's `previous`), and checked after the compile (`missed`). `edit.rs` keeps them in
   `Claims` and dispatches the op; `GET /api/edits` sends `schedules` and `schedule_sets`.
-- `src/set_claim.rs` is what every shared-set claim (switching times, moods, and later access, recipients and
-  tiles) has in common: the op's resolve, choose-and-check, claim, prune and whole-inverse undo (`apply`), and
+- `src/set_claim.rs` is what every shared-set claim (switching times, moods, access, recipients and tiles) has in
+  common: the op's resolve, choose-and-check, claim, prune and whole-inverse undo (`apply`), and
   `GET /api/edits`' section (`edits_section`), parameterised by a `SetKind`. `sched_edit.rs` and `mood_edit.rs`
   implement it.
 - `src/mood_edit.rs` is editing a lighting controller's moods (#74): the `moods` op's value (each mood's name and
@@ -99,8 +99,16 @@ The binary is an `axum` server with the UI embedded (plain JS and SVG, no build 
   on a page (`OutputRefLM`) is `model.rs`' `message`/`message_old` (its `<LoggerMailer>`), and is added with
   `add_block` (`mirrors:` an extern of the `Notification`, `blocks::MESSAGE_REF`) and edited as a block of
   vislox's files (`On`, `Off`, `MinimumTime` as settings).
+- `src/tiles.rs` reads a Touch Pure Flex's tiles (`<btns>`: each tile's click, up and down, with command, status
+  text and `ctrls=`) and the blocks API-linked to each device (`Links`, lox's own reading: `OutputAPI` wired to the
+  device's `ApiActor.I`, directly or through an `OutputRef` of it, either direction), for `model.rs` (`tiles`,
+  `tiles_old`, the Changes list) and the editor. `src/tiles_edit.rs` is editing them (#78): the `tiles` op, a
+  `SetKind` of `set_claim.rs` written as `tiles vx_… end` sets (in lox's own format, `Module::to_text`) and `.tiles`
+  claims, its targets externs of vislox's file (`SetKind::lines_with`, `SetKind::named`), checked against the
+  device's layout, its API links and the types lox knows (`As`, `Lico`), and after the compile (`missed`).
+  `check::pin_tile_findings` pins lint's tile findings to a device named by its title.
 - `src/set_claim.rs`' `KINDS` lists every kind of claim on a block's whole content (switching times, moods,
-  access, recipients, members) as a `ClaimKind`; `edit.rs` and `actions.rs` loop over it instead of naming each kind.
+  access, recipients, tiles, members) as a `ClaimKind`; `edit.rs` and `actions.rs` loop over it instead of naming each kind.
 - `src/blocks.rs` is adding blocks (#59): the types vislox offers (`GET /api/block-types`, from lox's builtin
   table and its language server's descriptions), and vislox's file of new blocks per page
   (`<module>/vislox/<page>.loxl`). `edit.rs` applies `add_block` and `remove_block` to it.

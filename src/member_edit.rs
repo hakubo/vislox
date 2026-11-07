@@ -108,7 +108,7 @@ pub fn lower(list: &[String]) -> Vec<String> {
     list.iter().map(|x| x.to_ascii_lowercase()).collect()
 }
 
-fn title_of(el: &Element) -> String {
+pub(crate) fn title_of(el: &Element) -> String {
     el.attr_decoded("Title")
         .filter(|t| !t.trim().is_empty())
         .map(|t| t.into_owned())
@@ -379,6 +379,9 @@ impl set_claim::ClaimKind for MemberKind {
                 "it",
             )
         })
+    }
+    fn mentions(&self, c: &crate::edit::Claims) -> Vec<String> {
+        names(&c.4).map(|(_, m)| m.clone()).collect()
     }
     fn set_names<'a>(&self, _: &'a crate::edit::Claims) -> Vec<&'a str> {
         Vec::new()
