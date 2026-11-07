@@ -93,7 +93,10 @@ sends to the Miniserver see [miniserver.md](miniserver.md).
   one a template instance made, at the instance. The blocks of one expression are drawn as one block showing the
   expression (`markise.In2 ← licht.Q and teiler.AQ >= 28`); a click opens the group (a dashed frame titled with the
   expression, whose title folds it again), and Properties of any of its blocks has an *Expression* section: the
-  expression, what it feeds (or the named signal and its label), and its file and line (#82). The legend's *Show managed blocks only* fades the rest, and
+  expression, what it feeds (or the named signal and its label), and its file and line (#82). A template instance's
+  blocks are framed together, headed by the call (`sued: Fassade "Süd"`, its arguments and outputs; a nested
+  instance inside its parent's frame), and Properties of any of them has a *Template* section: the block as source
+  spells it (`sued.hoch`), the instance, the template with its file and line, the arguments and outputs (#83). The legend's *Show managed blocks only* fades the rest, and
   Ctrl+K finds a block by its slug as well as its name. The lines follow the module's files as they are on disk,
   compiled or not, and are shown on the newest config only (the lockfile is today's). See [editing.md](editing.md#blocks-the-module-manages-64).
 - **Navigation**: Ctrl+K finds any page or block (a managed one by its slug too). There is a minimap, a "Changed pages only" filter, and links
@@ -360,6 +363,15 @@ sends to the Miniserver see [miniserver.md](miniserver.md).
   what it refuses. The Changes list reads an edited expression as its old → new text, not as blocks added and
   removed. The module's own expressions are changed in its files. How:
   [editing.md](editing.md#expressions-and-named-signals-82).
+
+- **Template instances** (the same project and token, #83): *Add block* lists the module's templates and lox's
+  template library next to the block types; picking one asks for the instance's name, label and arguments, and
+  writes the call into vislox's page file (a library template is copied into vislox's directory while an instance
+  calls it). Properties' *Template* section edits an instance of vislox's: its arguments, Revert, and *Remove
+  instance* while it was never committed. The arguments are checked as `lox logic check` checks a call. Comparing the
+  deployed revision, the Changes list puts the changes a template's body caused under the template (`Waechter: 2
+  instances changed`), and those of one call under its instance (`sued: Fassade (call changed)`). The module's own
+  instances and templates are changed in its files. How: [editing.md](editing.md#template-instances-83).
 
 - **Delete and rename managed blocks** (the same project and token, #80): Properties of a block added or adopted
   here shows its slug with *Rename* and, once deployed or adopted, *Delete*. *Rename* rewrites the slug in vislox's

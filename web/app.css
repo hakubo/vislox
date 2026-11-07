@@ -959,3 +959,13 @@ rect.ghost, line.ghost { fill: #1f6fd10a; stroke: var(--moved); stroke-opacity: 
 .ex-new .ex-form { padding: 4px 0 0; }
 .chg-expr .old { text-decoration: line-through; color: var(--removed); }
 .chg-expr .new { color: var(--added); }
+/* Template instances (#83): a frame around an instance's blocks, headed by `sued: Fassade` and its arguments. */
+.tpl-frame { fill: rgba(120, 90, 180, .035); stroke: #7a5cb4; stroke-width: 12px; stroke-dasharray: 90 50; }
+.tpl-grp.nested .tpl-frame { fill: rgba(120, 90, 180, .03); stroke-dasharray: 40 30; }
+.tpl-grp.pending .tpl-frame { stroke: var(--pending); }
+.tpl-head { cursor: pointer; }
+.tpl-t { fill: #5b3f96; font-size: 120px; font-weight: 700; font-family: ui-monospace, "DejaVu Sans Mono", monospace; }
+.tpl-a { fill: var(--muted); font-size: 100px; font-family: ui-monospace, "DejaVu Sans Mono", monospace; }
+.lod-far .tpl-a { display: none; }
+.chg-tpl .mono { color: #5b3f96; }
+.tp-form .tm { font-size: 11px; }

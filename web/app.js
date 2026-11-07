@@ -632,6 +632,7 @@ function renderPage() {
       el("line", { class: "ghost-line ghost", x1: x + w / 2, y1: y + h / 2, x2: o.rect[0] + o.rect[2] / 2, y2: o.rect[1] + o.rect[3] / 2 }, L.ghost);
     }
   }
+  drawInstances(p);
   drawExprs(p);
   wrDraw(p);
   L.live = liveBuild(p);
@@ -1138,8 +1139,8 @@ function calTip(cal) {
 const propRow = (k, v, cls, tip) => `<div class="pr ${cls || ""}"><div class="k${tip ? " hinted" : ""}"${tip ? ` title="${esc(tip)}"` : ""}>${esc(k)}</div><div class="v">${v}</div></div>`;
 function renderProps() {
   // Live values re-render Properties often: keep the edit field being typed in.
-  const f = document.activeElement?.closest?.("#props [data-ed-field], #props [data-sch-field], #props [data-mo-field], #props [data-mo-name], #props [data-ex-field]");
-  const attr = ["data-ed-field", "data-sch-field", "data-mo-field", "data-mo-name", "data-ex-field"].find((a) => f?.hasAttribute(a));
+  const f = document.activeElement?.closest?.("#props [data-ed-field], #props [data-sch-field], #props [data-mo-field], #props [data-mo-name], #props [data-ex-field], #props [data-tp-field]");
+  const attr = ["data-ed-field", "data-sch-field", "data-mo-field", "data-mo-name", "data-ex-field", "data-tp-field"].find((a) => f?.hasAttribute(a));
   const keep = f && { field: f.getAttribute(attr), a: f.selectionStart, b: f.selectionEnd };
   renderPropsBody();
   if (keep) {
@@ -1180,6 +1181,8 @@ function renderPropsBody() {
   if (tl) section("Touch Pure Flex", tl);
   const ex = exRows(o, row, marks);
   if (ex) section("Expression", ex.rows, ex.count);
+  const tp = tpRows(o, row, marks);
+  if (tp) section("Template", tp.rows, tp.count);
   const ms = managedSrc(o.uuid);
   // The errors of lox logic check whose line names this block (#65): on the newest config only.
   const ce = S.rev === editRev()?.id ? checkErrors(o.uuid) : [];
@@ -1592,9 +1595,10 @@ function chgExpr(c) {
   return e ? `expr ${e.id}` : null;
 }
 /** What groups a change: an expression (even one change: it reads as the expression), else a `let` or `defaults`. */
-function chgKey(c) { return chgExpr(c) || chgConst(c); }
-/** Whether the changes of key `k` (`n` of them) go under a heading. */
-function chgGrouped(k, n) { return !!k && (n > 1 || k.startsWith("expr ")); }
+function chgKey(c) { return chgTpl(c) || chgExpr(c) || chgConst(c); }
+/** Whether the changes of key `k` (`n` of them) go under a heading: an expression's and a template's or
+ *  instance's even alone (#82, #83). */
+function chgGrouped(k, n) { return !!k && (n > 1 || /^(expr|tpl|inst) /.test(k)); }
 /** The changes listed: those the filters let through, and the changes one expression causes, and the parameter
  *  changes one `let` or `defaults` causes (two or more), together where the first of them is. Next and previous go
  *  in this order. */
@@ -1686,7 +1690,7 @@ function renderChanges() {
   let inGroup = null;
   list.forEach((c, i) => {
     const k = chgKey(c), grouped = chgGrouped(k, groups.get(k));
-    if (grouped && k !== inGroup) box.insertAdjacentHTML("beforeend", k.startsWith("expr ") ? chgExprHead(k, groups.get(k)) : chgConstHead(k, groups.get(k)));
+    if (grouped && k !== inGroup) box.insertAdjacentHTML("beforeend", k.startsWith("expr ") ? chgExprHead(k, groups.get(k)) : /^(tpl|inst) /.test(k) ? chgTplHead(k, groups.get(k), list) : chgConstHead(k, groups.get(k)));
     inGroup = grouped ? k : null;
     const d = document.createElement("button");
     d.type = "button";
@@ -3162,15 +3166,16 @@ S.edits = null; // GET /api/edits: what vislox's file claims, and which of it is
 S.edit = { uuid: null, open: false, draft: {}, bad: {}, busy: false, msg: "", err: "" };
 S.editsKey = null; // the server's key of what /api/edits says (vislox's file, deployed and pending config)
 async function loadEdits() {
-  const was = managedSet(), consts = JSON.stringify(S.edits?.constants || null), exprs = JSON.stringify(S.edits?.expressions || null);
+  const was = managedSet(), consts = JSON.stringify(S.edits?.constants || null), exprs = JSON.stringify([S.edits?.expressions || null, S.edits?.templates?.instances || null, S.edits?.templates?.templates || null]);
   if (!S.hist?.actions?.shown) { S.edits = null; managedRefresh(was); return; }
   try { S.edits = await api("/api/edits"); } catch { S.edits = null; S.editsKey = null; }
   // The managed blocks' badges and the legend follow the lockfile and the module (#64); the expressions'
   // groups follow the module too (#82).
-  if (S.view && managedSet() === was && JSON.stringify(S.edits?.expressions || null) !== exprs) renderPage();
+  const exprsNow = JSON.stringify([S.edits?.expressions || null, S.edits?.templates?.instances || null, S.edits?.templates?.templates || null]);
+  if (S.view && managedSet() === was && exprsNow !== exprs) renderPage();
   managedRefresh(was);
   // The claims' λ file:line in Rights and schedules too (#68); the changes a constant causes, grouped (#81).
-  if (S.view) S.view.compared && (JSON.stringify(S.edits?.constants || null) !== consts || JSON.stringify(S.edits?.expressions || null) !== exprs) ? renderChanges() : renderRights();
+  if (S.view) S.view.compared && (JSON.stringify(S.edits?.constants || null) !== consts || exprsNow !== exprs) ? renderChanges() : renderRights();
   renderActions();
   if (S.sel && S.view) renderProps();
 }
@@ -3637,6 +3642,239 @@ async function exAct(what, id) {
     if (top && S.view?.objects[top]) select(top, { noReveal: true });
     else if (top) { const t = Object.keys(S.view?.objects || {}).find((u) => ciEq(u, top)); if (t) select(t, { noReveal: true }); }
   }
+}
+
+// ── template instances (#83) ──────────────────────────────────────────
+// A `template` is a block type made of blocks; each instance (`sued = Fassade(…)`) stamps out a copy whose lockfile
+// keys are `sued_hoch`, which source spells `sued.hoch`. GET /api/edits' `templates` lists the module's templates
+// (parameters, outputs, file and line), every instance (nested ones by their path, `sued.hitze`) with its arguments
+// as written and the blocks it made, and lox's library. The canvas frames an instance's blocks, titled `sued:
+// Fassade` with its arguments and outputs (nested instances inside); Properties names a block's instance, template
+// and body name, and edits an instance of vislox's own files (the `instance` op); the Changes list puts the changes
+// a template's body caused under the template, and those of one call under its instance.
+S.tp = { key: null, draft: {}, err: "", busy: false }; // the Template section's draft, for one block of one pending config
+function tplData() { return managedShown() ? S.edits.templates || null : null; }
+function tplInstances() { return tplData()?.instances || []; }
+function tplTemplate(name) { return (tplData()?.templates || []).find((t) => t.name === name) || null; }
+/** The instances by path. */
+function tplByPath(path) { return tplInstances().find((x) => x.path === path) || null; }
+let TPL_IX = { of: null, map: new Map() };
+/** The instance (innermost) and block of `uuid`: { inst, block }, or null. */
+function instOf(uuid) {
+  const d = tplData();
+  if (!uuid || !d) return null;
+  if (TPL_IX.of !== d) {
+    TPL_IX = { of: d, map: new Map() };
+    for (const inst of d.instances) for (const b of inst.blocks) TPL_IX.map.set(b.uuid.toLowerCase(), { inst, block: b });
+  }
+  return TPL_IX.map.get(uuid.toLowerCase()) || null;
+}
+/** An instance, its parent, … up to the top-level one. */
+function instChain(inst) {
+  const out = [];
+  for (let x = inst; x && out.length < 10; x = x.parent ? tplByPath(x.parent) : null) out.push(x);
+  return out;
+}
+/** `sued: Fassade`, and the arguments as written. */
+function instTitle(x) { return `${x.path}: ${x.template}${x.label ? ` "${x.label}"` : ""}`; }
+function instArgs(x) { return x.args.map(([k, v]) => `${k}: ${v}`).join(" · "); }
+function instOuts(x) { return x.outputs.length ? `→ ${x.outputs.map((o) => o.name).join(", ")}` : ""; }
+/** Each instance with a block on page `p`: a dashed frame around its blocks and its nested instances' frames,
+ *  headed by `sued: Fassade` and its arguments and outputs. Behind the blocks; the header takes clicks. */
+function drawInstances(p) {
+  const list = tplInstances();
+  if (!list.length) return;
+  const objs = new Map(p.objects.filter((o) => o.shape !== "tag" && !o.moved_to).map((o) => [o.uuid.toLowerCase(), o]));
+  const H = 380, pad = 140, frames = new Map();
+  // Bottom up: a frame takes its own blocks and its children's frames.
+  const frame = (x, depth) => {
+    if (frames.has(x.path) || depth > 10) return frames.get(x.path) || null;
+    const rs = x.blocks.map((b) => objs.get(b.uuid.toLowerCase())?.rect).filter(Boolean);
+    for (const c of list.filter((y) => y.parent === x.path)) { const f = frame(c, depth + 1); if (f) rs.push(f); }
+    if (!rs.length) { frames.set(x.path, null); return null; }
+    const x1 = Math.min(...rs.map((r) => r[0])) - pad, y1 = Math.min(...rs.map((r) => r[1])) - pad - H;
+    const x2 = Math.max(...rs.map((r) => r[0] + r[2])) + pad, y2 = Math.max(...rs.map((r) => r[1] + r[3])) + pad;
+    const f = [x1, y1, x2 - x1, y2 - y1];
+    frames.set(x.path, f);
+    return f;
+  };
+  for (const x of list) frame(x, 0);
+  for (const x of list) {
+    const f = frames.get(x.path);
+    if (!f) continue;
+    const [x1, y1, w, h] = f;
+    const t = tplTemplate(x.template);
+    const pending = !!(x.change || (t && t.changed));
+    const g = el("g", { class: "tpl-grp" + (pending ? " pending" : "") + (x.parent ? " nested" : ""), "data-inst": x.path }, L.ghost);
+    el("rect", { class: "tpl-frame", x: x1, y: y1, width: w, height: h, rx: 60 }, g);
+    const per = Math.max(10, Math.floor((w - 120) / 62));
+    const head = el("g", { class: "tpl-head", "data-inst": x.path, role: "button", "aria-label": instTitle(x) }, L.badges);
+    el("text", { class: "tpl-t", x: x1 + 60, y: y1 + 150 }, head, clip(instTitle(x), per));
+    const sub = [instArgs(x), instOuts(x)].filter(Boolean).join("  ");
+    if (sub) el("text", { class: "tpl-a", x: x1 + 60, y: y1 + 290 }, head, clip(sub, Math.floor(per * 1.15)));
+    const first = x.blocks.find((b) => objs.has(b.uuid.toLowerCase()) && !b.expression) || x.blocks[0];
+    hoverTip(head, () => `<b>${esc(instTitle(x))}</b><br>Instance of the template <span class="mono">${esc(x.template)}</span>${t?.file ? ` (${esc(constAt(t.file, t.line))})` : ""}` +
+      `${x.args.length ? `<br><span class="mono">${esc(instArgs(x))}</span>` : ""}<br><span class="tm">${plural(x.blocks.length, "block")} of its own · ${esc(constAt(x.file, x.line))}${x.change === "new" ? " · new since the deployed config" : x.change === "call" ? " · its call changed since the deployed config" : t?.changed ? " · its template changed since the deployed config" : ""}</span>` +
+      (first ? '<br><span class="tm">Click to select its first block.</span>' : ""));
+    head.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      if (drag?.moved || !first) return;
+      const u = Object.keys(S.view?.objects || {}).find((k) => ciEq(k, first.uuid));
+      if (u) select(u);
+    });
+  }
+}
+/** The Template section's draft follows the selected block and the pending config. */
+function tpSync() {
+  const key = `${S.sel}|${editRev()?.blob || ""}`;
+  if (S.tp.key !== key) S.tp = { key, draft: {}, err: "", busy: false };
+}
+/** A parameter's hint: its kind, what it takes, its default. */
+function tpParamHint(p) {
+  const what = p.kind === "object" ? `an object${p.type && p.type !== "any" ? ` (${p.type})` : ""}: vx_ and its UUID, or a block of vislox's`
+    : p.kind === "input" ? "a source: a port, a block, or an expression; open when not given"
+    : p.kind === "set" ? `a ${p.type} set of vislox's, by its name`
+    : p.type === "string" ? "a text" : p.type === "duration" ? "a duration, like 3min" : p.type === "bool" ? "on or off" : "a number";
+  return `${what}${p.default != null ? `; default ${p.default}` : p.required ? "; required" : ""}`;
+}
+/** The fields of a call of template `t`: its label (when it takes one), then each parameter. */
+function tpFields(t, call, prefix) {
+  const d = S.tp.draft;
+  const rows = [];
+  const lp = t.params.find((p) => p.name === "label");
+  if (lp) rows.push(`<label class="ed-l">Label <input type="text" class="ed-in" data-tp-field="${prefix}label" value="${esc(d[`${prefix}label`] ?? call?.label ?? "")}" placeholder="${esc(lp.default ?? "required")}" aria-label="Label"></label>`);
+  for (const p of t.params.filter((q) => q.name !== "label")) {
+    const v = d[`${prefix}a:${p.name}`] ?? call?.args?.[p.name] ?? "";
+    rows.push(`<label class="ed-l">${esc(p.name)} <span class="tm">${esc(p.kind === "value" ? p.type : p.kind)}</span><input type="text" class="ed-in mono" data-tp-field="${prefix}a:${esc(p.name)}" value="${esc(v)}" placeholder="${esc(p.default ?? (p.required ? "required" : "open"))}" spellcheck="false" title="${esc(tpParamHint(p))}" aria-label="${esc(p.name)}"></label>`);
+  }
+  return rows.join("");
+}
+/** The call a draft makes (`prefix`: the fields' prefix). */
+function tpCall(t, call, prefix) {
+  const d = S.tp.draft, args = {};
+  for (const p of t.params.filter((q) => q.name !== "label")) {
+    const v = (d[`${prefix}a:${p.name}`] ?? call?.args?.[p.name] ?? "").trim();
+    if (v) args[p.name] = v;
+  }
+  const label = (d[`${prefix}label`] ?? call?.label ?? "").trim();
+  return { template: t.name, ...(label ? { label } : {}), args };
+}
+function tpRows(o, row, marks) {
+  tpSync();
+  const hit = instOf(o.uuid);
+  if (!hit) return null;
+  const { inst, block } = hit, chain = instChain(inst), top = chain[chain.length - 1];
+  const t = tplTemplate(inst.template);
+  const rows = [];
+  rows.push(row("Block", `<span class="mono">${esc(block.name)}</span>${block.expression ? ' <span class="tm">(lox made it for an expression)</span>' : ""}`, "", "How source names this block: the instance, then the name in the template's body."));
+  rows.push(row("Instance", `<span class="mono">${esc(inst.path)}</span>${inst.label ? ` “${esc(inst.label)}”` : ""}`));
+  rows.push(row("Template", `<span class="mono">${esc(inst.template)}</span>${t?.file ? ` <span class="tm">${esc(constAt(t.file, t.line))}</span>` : ""}${t?.library ? ' <span class="tm">(lox\'s library)</span>' : ""}`, marks && t?.changed ? "pr-chg" : "", t?.description || ""));
+  if (chain.length > 1) rows.push(row("Inside", chain.slice(1).map((x) => `<span class="mono">${esc(x.path)}: ${esc(x.template)}</span>`).join(" ⊂ ")));
+  for (const [k, v] of inst.args) rows.push(row(k, `<span class="mono">${esc(v)}</span>`, "", t?.params.find((p) => p.name === k) ? tpParamHint(t.params.find((p) => p.name === k)) : ""));
+  for (const p of (t?.params || []).filter((q) => q.name !== "label" && !inst.args.some(([k]) => k === q.name))) rows.push(row(p.name, `<span class="none-v">${esc(p.default ?? "open")}</span>`, "", tpParamHint(p)));
+  if (inst.outputs.length) rows.push(row("Outputs", inst.outputs.map((x) => {
+    const u = x.uuid && Object.keys(S.view.objects).find((k) => ciEq(k, x.uuid));
+    return u ? `<button type="button" class="lnk" data-go="${esc(u)}">${esc(inst.path)}.${esc(x.name)}</button>` : `<span class="mono">${esc(inst.path)}.${esc(x.name)}</span>`;
+  }).join(" ")));
+  const path = constAt(top.file, top.line);
+  if (path) rows.push(row("Source", `<span class="mono src-path">${esc(path)}</span><button type="button" class="copy" data-copy="${esc(path)}" data-label="Copy path" title="Copy the file and line">Copy path</button>${inst.body_line ? `<div class="src-how">Called in ${esc(chain[1]?.template || "")}'s body, line ${inst.body_line}.</div>` : ""}`));
+  let count = 0;
+  if (t?.changed && t.deployed) { count++; rows.push(`<div class="ed-note tp-pending">Not deployed: the template ${esc(t.name)} changed since the deployed config, so every instance of it did.</div>`); }
+  if (top.change === "new") { count++; rows.push(`<div class="ed-note tp-pending">Not deployed: ${esc(top.path)} is new since the deployed config.</div>`); }
+  else if (top.change === "call") { count++; rows.push(`<div class="ed-note tp-pending">Not deployed: ${esc(top.path)}'s call changed since the deployed config.</div>`); }
+  if (!top.ours) {
+    rows.push(`<div class="ed-note">Written in the module's own file: change it there (vislox writes only its own files).</div>`);
+    return { rows, count: count || undefined };
+  }
+  const st = exState();
+  if (!st) return { rows, count: count || undefined };
+  if (!st.ok) { rows.push(`<div class="ed-note">${esc(st.why)}</div>`); return { rows, count: count || undefined }; }
+  const tt = tplTemplate(top.template);
+  if (!tt) { rows.push(`<div class="ed-note">The template ${esc(top.template)} is not in the module.</div>`); return { rows, count: count || undefined }; }
+  const busy = S.tp.busy ? " disabled" : "";
+  const revert = top.revert && JSON.stringify(top.revert.value) !== JSON.stringify(top.edit);
+  rows.push(`<div class="tp-form" data-inst="${esc(top.path)}"><div class="tm">${esc(top.path)}: its arguments</div>${tpFields(tt, top.edit, "e:")}` +
+    `<div class="ed-bar"><button type="button" class="ed-btn" data-tp="save"${busy}>Save</button>` +
+    (revert && top.committed ? `<button type="button" class="ed-btn" data-tp="revert"${busy} title="Back to what the deployed revision has">Revert</button>` : "") +
+    (!top.committed ? `<button type="button" class="ed-btn" data-tp="drop"${busy} title="Take this instance out again: it is not deployed">Remove instance</button>` : "") + `</div></div>`);
+  if (S.tp.err) rows.push(`<div class="ed-msg err tp-err" role="alert">${esc(S.tp.err)}</div>`);
+  return { rows, count: count || undefined };
+}
+/** A button of the Template section: `save`, `revert` or `drop`. */
+async function tpAct(what) {
+  tpSync();
+  const st = exState(), hit = instOf(S.sel);
+  if (!st?.ok || !hit || S.tp.busy) return;
+  const top = instChain(hit.inst).pop();
+  const t = tplTemplate(top.template);
+  const page = top.revert?.page || top.page || S.page;
+  let ops;
+  if (what === "save") ops = [{ op: "instance", slug: top.path, page, value: tpCall(t, top.edit, "e:") }];
+  else if (what === "revert") ops = [top.revert];
+  else if (what === "drop") ops = [{ op: "instance", slug: top.path, page, value: null }];
+  else return;
+  S.tp.err = "";
+  const uuid = S.sel;
+  const r = await editSend(uuid, st.rev, ops);
+  if (r === "failed") { S.tp.err = S.edit.err; S.edit.err = ""; renderProps(); return; }
+  if (what !== "drop") {
+    await S.editsLoad;
+    const x = tplByPath(top.path), b = x?.blocks.find((y) => !y.expression) || x?.blocks[0];
+    const u = b && Object.keys(S.view?.objects || {}).find((k) => ciEq(k, b.uuid));
+    if (u) select(u, { noReveal: true });
+  }
+}
+$("props").addEventListener("input", (e) => {
+  if (e.target.dataset.tpField) { tpSync(); S.tp.draft[e.target.dataset.tpField] = e.target.value; }
+});
+$("props").addEventListener("click", (e) => {
+  const b = e.target.closest("[data-tp]");
+  if (b) { e.stopPropagation(); tpAct(b.dataset.tp); }
+});
+$("props").addEventListener("keydown", (e) => {
+  if (e.target.dataset?.tpField && e.key === "Enter") { e.preventDefault(); tpAct("save"); }
+});
+/** The template group a change goes under (#83), on the newest config: `tpl <Template>` when the change is to a
+ *  block of an instance whose template (or an enclosing one) changed since the deployed config, which is what is
+ *  compared; else `inst <path>`, the top-level instance. */
+function chgTpl(c) {
+  if (!c.obj) return null;
+  const hit = instOf(c.obj);
+  if (!hit) return null;
+  const chain = instChain(hit.inst);
+  if (S.base && S.base === deployedRev()?.id) {
+    const changed = chain.find((x) => tplTemplate(x.template)?.changed && tplTemplate(x.template)?.deployed);
+    if (changed) return `tpl ${changed.template}`;
+  }
+  return `inst ${chain[chain.length - 1].path}`;
+}
+/** The heading over the changes of one template's body (how many instances they are in), or of one call. */
+function chgTplHead(k, count, list) {
+  const [kind, name] = k.split(" ");
+  if (kind === "tpl") {
+    const t = tplTemplate(name);
+    const inst = new Set(list.filter((c) => chgKey(c) === k).map((c) => instChain(instOf(c.obj).inst).pop().path));
+    return `<div class="chg-grp chg-tpl" role="listitem" data-tpl="${esc(name)}"><span class="mono">${esc(name)}: ${plural(inst.size, "instance")} changed</span> · ${plural(count, "change")}${t?.file ? `<span class="p">${esc(constAt(t.file, t.line))}</span>` : ""}</div>`;
+  }
+  const x = tplByPath(name);
+  if (!x) return "";
+  const vsDeployed = S.base && S.base === deployedRev()?.id;
+  const what = vsDeployed && x.change === "new" ? " (new)" : vsDeployed && x.change === "call" ? " (call changed)" : "";
+  return `<div class="chg-grp chg-tpl" role="listitem" data-inst="${esc(x.path)}"><span class="mono">${esc(x.path)}: ${esc(x.template)}${what}</span> · ${plural(count, "change")}${x.file ? `<span class="p">${esc(constAt(x.file, x.line))}</span>` : ""}</div>`;
+}
+/** The templates the Add dialog offers (#83): the module's, then lox's library's it does not have. */
+function tplOffered() {
+  const d = tplData();
+  if (!d) return [];
+  const mine = d.templates.map((t) => ({ ...t, from: t.library ? `lox's library (${t.library}.loxl)` : constAt(t.file, t.line) }));
+  const lib = d.library.filter((l) => !d.templates.some((t) => t.name === l.name)).map((l) => ({ ...l, from: `lox's library (${l.file}.loxl)`, lib: true }));
+  return [...mine, ...lib];
+}
+/** A free name for a new instance of `t`: vx_ and the template's name, numbered. */
+function tplNewSlug(t) {
+  const stem = `vx_${t.name.replace(/([a-z0-9])([A-Z])/g, "$1_$2").toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "")}`;
+  const taken = (s) => tplInstances().some((x) => x.path === s) || Object.values(S.edits?.sources || {}).some((m) => m.slug === s || m.slug.startsWith(s + "_"));
+  for (let i = 1; ; i++) if (!taken(`${stem}_${i}`)) return `${stem}_${i}`;
 }
 
 // ── let constants and defaults (#81) ──────────────────────────────────
@@ -5495,6 +5733,8 @@ function undoLabel(ops) {
   if (ops.length === 1 && op.op === "signal") return op.value == null ? `Drop the signal ${op.slug}` : `Signal ${op.slug} = ${op.value}${op.title ? ` (${op.title})` : ""}`;
   if (ops.length === 2 && op.op === "signal" && ops[1].op === "expr" && op.value != null) return `Name the expression ${op.slug}`;
   if (ops.length === 2 && op.op === "expr" && ops[1].op === "signal" && ops[1].value == null) return `Inline the signal ${ops[1].slug}`;
+  // Template instances (#83).
+  if (ops.length === 1 && op.op === "instance") return op.value == null ? `Remove the instance ${op.slug}` : `Instance ${op.slug}: ${op.value.template}`;
   if (ops.length === 1 && op.op === "tidy") return "Drop lines lox needs no more";
   if (kinds.size === 1 && op.op === "move") return ops.length === 1 ? `Move ${obj(op.uuid)}` : `Move ${plural(ops.length, "block")}`;
   if (ops.length === 1 && op.op === "relayout") return `Arrange ${S.pageOf?.get(op.page)?.title || "the page"}`;
@@ -6268,7 +6508,9 @@ function abPick(q) {
 }
 function abList() {
   const q = $("ab-q").value.trim().toLowerCase();
-  const all = S.types.map((t) => ({ t, name: prettyType(t.type) }));
+  // The module's templates and lox's library's (#83): an instance of one.
+  const tpls = tplOffered().map((x) => ({ t: { type: x.name, summary: `Template · ${x.description || x.from}`, template: x }, name: x.name }));
+  const all = [...S.types.map((t) => ({ t, name: prettyType(t.type) })), ...tpls];
   AB.items = !q ? all.sort((a, b) => a.name.localeCompare(b.name)) : all.map((it) => {
     const m = fuzzy(q, it.name) || fuzzy(q, it.t.type);
     const inSum = (it.t.summary || "").toLowerCase().includes(q);
@@ -6290,7 +6532,7 @@ function abMove(d) {
 function abChoose(i) {
   const it = AB.items[i];
   if (!it) return;
-  Object.assign(AB, { ty: it.t, draft: {}, bad: {}, err: "" });
+  Object.assign(AB, { ty: it.t, draft: it.t.template ? { slug: tplNewSlug(it.t.template) } : {}, bad: {}, err: "" });
   abForm();
   $("ab-body").querySelector("[data-ab-field]")?.focus();
 }
@@ -6314,6 +6556,7 @@ const AB_DURATION = /^\d+(\.\d+)?(ms|s|min|h)?$/;
 /** Step two: its name, settings and values. */
 function abForm() {
   const t = AB.ty;
+  if (t.template) { tplAbForm(t.template); return; }
   const field = ([field, label, kind, unit, def, , choices]) => {
     const v = AB.draft[field] ?? "", bad = AB.bad[field];
     const id = `ab-${field.replace(/[^\w-]/g, "_")}`;
@@ -6360,6 +6603,7 @@ const AB_TIME = /^\d{1,2}:\d{2}(:\d{2})?$/;
 async function abAdd() {
   const st = addState(), t = AB.ty;
   if (!st?.ok || !t || AB.busy) return;
+  if (t.template) { tplAbAdd(st, t.template); return; }
   const op = { op: "add_block", page: st.page.uuid, type: t.type, params: {}, settings: {} }, bad = {};
   for (const [field, , kind, , , , choices] of abFields(t)) {
     const raw = AB.draft[field] ?? "", v = kind === "text" || kind === "program" ? raw : raw.trim();
@@ -6389,6 +6633,52 @@ async function abAdd() {
       gotoPage(st.page.uuid, { focus: uuid });
       select(uuid);
     }
+  } catch (err) {
+    AB.busy = false; AB.err = err.message;
+    if (AB.open) abForm();
+  }
+}
+/** Step two for a template (#83): the instance's name, its label and its arguments. */
+function tplAbForm(x) {
+  const field = (f, label, hint, ph, mono) => {
+    const id = `ab-${f.replace(/[^\w-]/g, "_")}`, bad = AB.bad[f];
+    return `<div class="pr ed-row"><label class="k" for="${id}">${esc(label)}</label><div class="v"><input id="${id}" data-ab-field="${esc(f)}" value="${esc(AB.draft[f] ?? "")}" placeholder="${esc(ph)}"${mono ? ' class="mono"' : ""} title="${esc(hint)}" autocomplete="off" spellcheck="false"${bad ? ` aria-invalid="true" aria-describedby="${id}-e"` : ""}${AB.busy ? " disabled" : ""}>${bad ? `<div class="ed-bad" id="${id}-e">${esc(bad)}</div>` : ""}</div></div>`;
+  };
+  const lp = x.params.find((p) => p.name === "label");
+  $("ab-body").innerHTML = `<div class="ab-form">
+    <div class="ab-sum"><b>${esc(x.name)}</b> <span class="mono">template</span> · ${esc(x.description || "")} <span class="tm">${esc(x.from)}</span>${x.outputs.length ? ` · outputs ${esc(x.outputs.map((o) => o.name).join(", "))}` : ""}</div>
+    ${field("slug", "Instance name", "vx_ and lowercase letters, digits and _: its blocks are named after it", "vx_name", true)}
+    ${lp ? field("label", "Label", "Binds the template's label parameter", lp.default ?? "required") : ""}
+    ${x.params.filter((p) => p.name !== "label").map((p) => field(`a:${p.name}`, `${p.name} (${p.kind === "value" ? p.type : p.kind})`, tpParamHint(p), p.default ?? (p.required ? "required" : "open"), true)).join("")}
+    <div class="ed-bar"><button type="button" class="primary small" data-ab="add"${AB.busy ? " disabled" : ""}>${AB.busy ? "Compiling…" : "Add"}</button>
+      <button type="button" class="ed-btn small" data-ab="back"${AB.busy ? " disabled" : ""}>Other type</button>
+      <span class="ed-msg${AB.err ? " err" : ""}" role="status" aria-live="polite">${esc(AB.err || `Names: an object Loxone Config drew as vx_ and its UUID (- as _), a block of vislox's by its slug. ${x.lib ? "vislox copies the template into its directory. " : ""}Adding compiles the module; nothing is deployed.`)}</span></div>
+  </div>`;
+}
+async function tplAbAdd(st, x) {
+  const slug = (AB.draft.slug || "").trim(), args = {};
+  AB.bad = {};
+  if (!/^vx_[a-z0-9_]+$/.test(slug)) AB.bad.slug = "vx_ and then lowercase letters, digits and _.";
+  for (const p of x.params.filter((q) => q.name !== "label")) {
+    const v = (AB.draft[`a:${p.name}`] || "").trim();
+    if (v) args[p.name] = v;
+    else if (p.required) AB.bad[`a:${p.name}`] = "Required.";
+  }
+  const label = (AB.draft.label || "").trim();
+  const lp = x.params.find((p) => p.name === "label");
+  if (lp && lp.required && !label) AB.bad.label = "Required.";
+  AB.err = "";
+  if (Object.keys(AB.bad).length) { AB.err = "Fix the marked values."; abForm(); $("ab-body").querySelector('[aria-invalid="true"]')?.focus(); return; }
+  AB.busy = true; abForm();
+  try {
+    const res = await editAct(st.rev.blob, [{ op: "instance", slug, page: st.page.uuid, value: { template: x.name, ...(label ? { label } : {}), args } }]);
+    AB.busy = false;
+    abClose();
+    await editShowNewest(res.blob);
+    await S.editsLoad;
+    const inst = tplByPath(slug), b = inst?.blocks.find((y) => !y.expression) || inst?.blocks[0];
+    const u = b && Object.keys(S.view?.objects || {}).find((k) => ciEq(k, b.uuid));
+    if (u) { gotoPage(st.page.uuid, { focus: u }); select(u); }
   } catch (err) {
     AB.busy = false; AB.err = err.message;
     if (AB.open) abForm();

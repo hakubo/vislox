@@ -42,6 +42,8 @@ mod session;
 mod set_claim;
 mod source;
 mod structure;
+mod template_edit;
+mod templates;
 mod tiles;
 mod tiles_edit;
 mod tls;
