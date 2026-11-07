@@ -110,6 +110,30 @@ if (process.argv.slice(2, 5).join(" ") === "logic lint .") {
   console.log(n ? \`lint: \${n} finding\${n === 1 ? "" : "s"}\` : "lint: clean");
   process.exit(n ? 1 : 0);
 }
+// \`logic test .\` (#67): runs each \`test "…" … end\` of the module's own files; an \`expect\` on a line that says
+// FAILTEST reads 0, the others hold. Printed as lox prints it.
+if (process.argv.slice(2, 5).join(" ") === "logic test .") {
+  for (const end = Date.now() + (+process.env.VISLOX_TEST_LOX_DELAY || 0); Date.now() < end;);
+  const out = [];
+  let failed = 0, n = 0;
+  for (const [, lines] of own()) for (let i = 0; i < lines.length; i++) {
+    const m = lines[i].match(/^test "(.*)"/);
+    if (!m) continue;
+    n++;
+    const bad = [];
+    let step = 0;
+    for (let j = i + 1; j < lines.length && lines[j].trim() !== "end"; j++) {
+      const l = lines[j].trim();
+      if (/^(tick|step) /.test(l)) step++;
+      if (l.startsWith("expect ") && l.includes("FAILTEST")) bad.push(\`    step \${step}: \${l.split("#")[0].trim()} — actual 0\`);
+    }
+    if (bad.length) failed++;
+    out.push(\`test "\${m[1]}" ... \${bad.length ? "FAILED" : "ok"}\`, ...bad);
+  }
+  if (!n) { console.log("no tests in pages"); process.exit(0); }
+  console.log(out.join("\\n") + \`\\n\${n} tests: \${n - failed} passed, \${failed} failed\`);
+  process.exit(failed ? 1 : 0);
+}
 if (process.argv.slice(2, 4).join(" ") !== "logic compile") { console.error("unexpected: " + process.argv.slice(2).join(" ")); process.exit(2); }
 // VISLOX_TEST_LOX_DELAY (ms): compile as slowly as a busy CI runner does.
 for (const end = Date.now() + (+process.env.VISLOX_TEST_LOX_DELAY || 0); Date.now() < end;);
@@ -956,10 +980,45 @@ try {
     assert.equal(await page.$(`.blk[data-uuid="${FLUR}"] .lbadge`), null);
     await page.waitForSelector("#deploy-check.hidden", { state: "attached" });
   });
-  await step("nothing was deployed: lox only compiled, checked and linted", async () => {
+  await step("a failing test is listed with expected and actual, marked on its block, and Apply is off (#67)", async () => {
+    const flur = join(dir, "pages", "flur.loxl"), was = readFileSync(flur, "utf8");
+    // A test of `flur`, and a rename, so that Compile makes something pending.
+    const withTest = (mark) => was.replace('And("Flur")', 'And("Flur getestet")') +
+      `\ntest "Flur schaltet"\n\tflur.In1 = 1\n\tflur.In2 = 1\n\ttick 1s\n\texpect flur.Q == 1 # ${mark}\nend\n`;
+    writeFileSync(flur, withTest("FAILTEST"));
+    await waitText("#deploy-check", /The module changed \(pages\/flur\.loxl\) and is not compiled yet/);
+    await page.click("#btn-compile");
+    await waitText("#deploy-pend", /Compiled changes are pending/);
+    // The final state: the tests of these files ran, and failed.
+    await page.waitForFunction(() => S.check?.current && S.check.test?.available && !S.check.test.running && S.check.test.failed === 1, null, { timeout: 15000 });
+    await waitText("#deploy-tests", /Tests: 0 of 1 passed, 1 failed/);
+    // Open while it fails: the test with its file and line, the expect with expected and actual, and its block.
+    assert.match(await page.textContent("#deploy-tests"), /pages\/flur\.loxl:5Flur schaltet[\s\S]*pages\/flur\.loxl:9step 1: expect flur\.Q == 1 — expected 1, actual 0/);
+    assert.match(await page.textContent("#deploy-tests"), /A pass covers only what the simulator models/);
+    assert.equal(await page.evaluate(() => document.querySelector("#btn-apply").disabled), true);
+    assert.match(await page.getAttribute("#btn-apply", "title"), /Cannot apply: 1 test of lox logic test fails/);
+    await page.click('#deploy-tests .go:has-text("Flur getestet")');
+    await page.waitForFunction((u) => S.sel === u, FLUR);
+    await page.waitForSelector(`.blk.test-failed[data-uuid="${FLUR}"] .tbadge`);
+    assert.match(await page.textContent(`.blk[data-uuid="${FLUR}"] .tbadge title`), /Test "Flur schaltet" \(pages\/flur\.loxl:5\) fails: step 1: expect flur\.Q == 1/);
+    await waitText('[data-body="Lox Logic"]', /✕ Test "Flur schaltet" \(pages\/flur\.loxl:5\) fails/);
+    // Fixed: it passes, the badge goes, and Apply is on again (the module changed since the compile, which
+    // Apply only warns about).
+    writeFileSync(flur, withTest("fixed"));
+    await page.waitForFunction(() => S.check?.current && S.check.test?.available && !S.check.test.running && S.check.test.passed === 1, null, { timeout: 15000 });
+    await waitText("#deploy-tests", /Tests: 1 of 1 passed/);
+    await page.waitForFunction((u) => !document.querySelector(`.blk[data-uuid="${u}"] .tbadge`), FLUR);
+    assert.equal(await page.evaluate(() => document.querySelector("#btn-apply").disabled), false);
+    await page.click("#btn-discard");
+    await page.waitForFunction(() => /Nothing pending/.test(document.querySelector("#deploy-pend")?.textContent || ""), null, { timeout: 10000 });
+    assert.equal(readFileSync(flur, "utf8"), was);
+    // No tests: the box goes.
+    await page.waitForSelector("#deploy-tests.hidden", { state: "attached", timeout: 15000 });
+  });
+  await step("nothing was deployed: lox only compiled, checked, linted and tested", async () => {
     const ran = readFileSync(calls, "utf8").trim().split("\n");
     assert.ok(ran.length >= 2, ran.join(" | "));
-    assert.ok(ran.every((l) => /^logic (compile|check --json|fmt --check|lint \.)( |$)/.test(l)), ran.join(" | "));
+    assert.ok(ran.every((l) => /^logic (compile|check --json|fmt --check|lint \.|test \.)( |$)/.test(l)), ran.join(" | "));
   });
   await step("no errors in the browser", async () => {
     assert.deepEqual(errors, []);

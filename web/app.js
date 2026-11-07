@@ -890,6 +890,16 @@ function drawBlock(parent, o) {
   if (m) { g.classList.add("managed"); drawManagedBadge(g, x, y, m); }
   const lf = !o.moved_to ? lintFindings(o.uuid) : [];
   if (lf.length) { g.classList.add("linted"); drawLintBadge(g, x + w, y, lf); }
+  // A test that fails on it (#67): left of the lint badge.
+  const tf = !o.moved_to ? testFindings(o.uuid) : [];
+  if (tf.length) { g.classList.add("test-failed"); drawTestBadge(g, x + w - (lf.length ? 280 : 0), y, tf); }
+}
+/** A red badge at the block's upper right: a test of lox logic test that checks it fails (#67). Apply is off then. */
+function drawTestBadge(g, x, y, list) {
+  const b = el("g", { class: "tbadge" }, g);
+  el("title", {}, b, list.map((t) => testLine(t)).join("\n"));
+  el("circle", { cx: x, cy: y, r: 105 }, b);
+  el("text", { x, y: y + 45, "text-anchor": "middle" }, b, "✕");
 }
 /** A warning badge at the block's upper right: lox logic lint has findings on it (#66). Never blocks Apply. */
 function drawLintBadge(g, x, y, list) {
@@ -1145,9 +1155,12 @@ function renderPropsBody() {
   // lox logic lint's findings on it (#66); on an NFC Code Touch also the users whose tag or code opens none.
   const lf = lintFindings(o.uuid);
   const access = o.ty === "NfcCodeTouch" && S.rev === editRev()?.id ? lintAll().filter((f) => f.kind === "no-access-right") : [];
-  if (ms || ce.length || lf.length || access.length) {
+  // The tests of lox logic test that fail on it, or could not run for it (#67).
+  const tf = testFindings(o.uuid);
+  if (ms || ce.length || lf.length || access.length || tf.length) {
     const path = srcPath(ms);
     const rows = ce.map((e) => `<div class="ed-note ck-err">⚠ Doesn't compile${e.file ? ` (${esc(checkAt(e))})` : ""}: ${esc(e.message)}</div>`);
+    rows.push(...tf.map((t) => `<div class="ed-note ck-err tf-note">✕ ${esc(testLine(t, o.uuid))}</div>`));
     rows.push(...lf.map((f) => `<div class="ed-note lt-note">⚠ Lint (${esc(f.kind)}${f.file ? `, ${esc(checkAt(f))}` : ""}): ${esc(f.message)}</div>`));
     rows.push(...access.map((f) => `<div class="ed-note lt-note">⚠ Lint (${esc(f.kind)}): ${esc(f.name)}, ${esc(f.message)}</div>`));
     if (ms) rows.push(
@@ -1156,7 +1169,7 @@ function renderPropsBody() {
         ? `<span class="mono src-path">${esc(path)}</span><button type="button" class="copy" data-copy="${esc(path)}" data-label="Copy path" title="Copy the file and line, for an editor or a prompt">Copy path</button><div class="src-how">${esc(srcHow(ms))}</div>`
         : `<span class="none-v">${esc(srcHow(ms))}</span>`),
       `<div class="ed-note">Change it in the module: an edit made in Loxone Config is overwritten on the next push.</div>`);
-    section("Lox Logic", rows, ce.length + lf.length + access.length || undefined);
+    section("Lox Logic", rows, ce.length + lf.length + access.length + tf.length || undefined);
   }
   const opT = opTarget(o);
   if (opT) section("Operate", [opControls(opT)]);
@@ -1691,7 +1704,7 @@ $("sel-base").onchange = (e) => { S.base = e.target.value || null; S.follow = fa
 $("chk-changes").onchange = (e) => {
   S.marks = e.target.checked;
   if (!S.view) return;
-  renderLegend(); renderTabs(); renderTree(); renderPage(); renderProps(); applyFocus(); renderModes(); renderLint();
+  renderLegend(); renderTabs(); renderTree(); renderPage(); renderProps(); applyFocus(); renderModes(); renderTests(); renderLint();
 };
 $("chk-live").onchange = (e) => setLive(e.target.checked);
 $("chk-live-dim").checked = S.live.dim;
@@ -2096,7 +2109,7 @@ function renderActions() {
     : !a.apply.available ? `Apply is off: ${a.apply.reason}.`
     : `Nothing pending. ${a.edit?.available ? "Edit values in Properties, add blocks to a page, or edit" : "Edit"} the project's module and compile it (lox logic …); the result shows here for review.`;
   $("deploy-row").classList.toggle("hidden", !pend && !a.running);
-  $("btn-apply").disabled = !a.apply.available || busy || !pend || applyAsking || checkBroken();
+  $("btn-apply").disabled = !a.apply.available || busy || !pend || applyAsking || checkBroken() || !!testsFailing();
   const sync = $("btn-sync");
   sync.disabled = !a.apply.available || busy || !!pend;
   sync.classList.toggle("busy", a.running === "Sync");
@@ -2107,6 +2120,7 @@ function renderActions() {
   $("btn-discard").disabled = !a.apply.available || busy || !pend;
   $("btn-apply").title = !a.apply.available ? `Cannot apply: ${a.apply.reason}`
     : checkBroken() ? "Cannot apply: the module doesn't compile (see above)"
+    : testsFailing() ? `Cannot apply: ${testsFailing()} (see Tests above)`
     : "Deploy to the Miniserver with lox config push, then commit and push to git" + msWarn("apply");
   renderSteps(a);
   const last = a.last;
@@ -2440,7 +2454,7 @@ async function apply() {
     "lox config push compiles the module as it is, so Apply deploys changes this review does not show. Compile first to review them.\n\n" : "";
   if (!window.confirm((stale ? `⚠ ${stale} Applying overwrites what changed there since.\n\n` : "") + srcText + sched +
     calApplyWarning(calNow) + hwApplyText(hw) +
-    "Deploy the pending changes to the Miniserver?\n\nlox config push uploads the config and restarts the Miniserver's program (a few seconds), " +
+    "Deploy the pending changes to the Miniserver?\n\nFirst the module must compile and its tests pass (lox logic test). Then lox config push uploads the config and restarts the Miniserver's program (a few seconds), " +
     "checks that it runs exactly the compiled config, then vislox commits and pushes to git.")) return;
   deployMsg("");
   $("deploy-new").classList.add("hidden");
@@ -2518,9 +2532,9 @@ S.checkSeq = 0;
 async function loadCheck() {
   const seq = ++S.checkSeq;
   if (!S.hist?.actions?.shown) {
-    const was = lintSet();
+    const was = marksSet();
     S.check = null;
-    if (S.view && lintSet() !== was) { renderPage(); applyFocus(); }
+    if (S.view && marksSet() !== was) { renderPage(); applyFocus(); }
     renderActions();
     return;
   }
@@ -2528,10 +2542,10 @@ async function loadCheck() {
   try { c = await api("/api/check"); } catch { c = null; }
   // An older request answering late does not overwrite a newer one.
   if (seq !== S.checkSeq) return;
-  const was = lintSet();
+  const was = marksSet();
   S.check = c;
   // The lint badges follow the findings (#66).
-  if (S.view && lintSet() !== was) { renderPage(); applyFocus(); }
+  if (S.view && marksSet() !== was) { renderPage(); applyFocus(); }
   renderActions();
   if (S.sel && S.view) renderProps();
 }
@@ -2539,8 +2553,12 @@ async function loadCheck() {
 function lintAll() { return S.check?.available && S.check.lint?.available ? S.check.lint.findings || [] : []; }
 /** The findings about block `uuid`, shown on the newest config only (as the check's errors are). */
 function lintFindings(uuid) { return S.rev === editRev()?.id ? lintAll().filter((f) => f.blocks?.includes(uuid)) : []; }
-/** The findings on blocks, to redraw the page (badges and their tooltips) only when they change. */
-function lintSet() { return S.rev === editRev()?.id ? JSON.stringify(lintAll().filter((f) => f.blocks?.length).map((f) => [f.blocks, f.kind, f.message])) : ""; }
+/** The findings and failed tests on blocks, to redraw the page (badges and their tooltips) only when they change. */
+function marksSet() {
+  if (S.rev !== editRev()?.id) return "";
+  return JSON.stringify([lintAll().filter((f) => f.blocks?.length).map((f) => [f.blocks, f.kind, f.message]),
+    testsBad().map((t) => [t.name, testBlocks(t), t.failures, t.error])]);
+}
 /** The module does not compile (lox logic check found errors). */
 function checkBroken() { return !!(S.check?.available && S.check.ok === false); }
 /** `pages/a.loxl:5`, or the file alone. */
@@ -2575,6 +2593,7 @@ function renderCheck() {
   }
   if (fmt.length) parts.push(`<div class="ck-fmt">Not formatted as lox logic fmt writes it: ${esc(fmt.join(", "))}. A hint only; lox logic fmt --write formats it.</div>`);
   box.innerHTML = parts.join("");
+  renderTests();
   renderLint();
 }
 /** The block buttons of an error or finding: each shows its block, on its page. */
@@ -2582,6 +2601,82 @@ function goButtons(uuids) {
   return (uuids || []).filter((u) => S.view?.objects[u]).map((u) =>
     `<button type="button" class="go" data-go="${esc(u)}" title="Show this block">${esc(displayTitle(S.view.objects[u]))}</button>`).join("");
 }
+// ── lox logic test (#67) ──────────────────────────────────────────────
+// The same check runs the module's tests (test "…" … end) in lox's simulator when the module compiles, beside
+// lint. The Tests box above Apply lists each test with pass, fail or couldn't run, the expect that did not hold
+// (expected and actual) and the blocks it checks; a block a failing test checks gets a red badge, and the test
+// in Properties. Apply is off while a test fails, and the server refuses it at its Tests pass step.
+// While the tests run again, the last results stay up; a lox without lox logic test says so once, quietly.
+/** lox logic test's tests (#67), when the last check has them; else none. */
+function testAll() { return S.check?.available && S.check.test?.available ? S.check.test.tests || [] : []; }
+/** The tests that failed or could not run. */
+function testsBad() { return testAll().filter((t) => t.status !== "pass"); }
+/** The blocks a test that did not pass is about: those of the expects that did not hold (else all it checks),
+ *  and those the simulator could not model. */
+function testBlocks(t) {
+  const f = (t.failures || []).flatMap((x) => x.blocks || []);
+  return [...new Set([...(f.length ? f : t.blocks || []), ...(t.unmodeled || []).map((u) => u.uuid)])];
+}
+/** The tests that failed on block `uuid`, on the newest config only (as lint's findings). */
+function testFindings(uuid) { return S.rev === editRev()?.id ? testsBad().filter((t) => testBlocks(t).includes(uuid)) : []; }
+/** Why Apply is off for the tests: some fail, by the run of the files as they are (not one still running). */
+function testsFailing() {
+  const t = S.check?.available && !checkBroken() && S.check.current !== false ? S.check.test : null;
+  if (!t?.available || t.running) return "";
+  const n = testsBad().length;
+  return n ? `${plural(n, "test")} of lox logic test ${n === 1 ? "fails" : "fail"}` : "";
+}
+/** A failed expect: `step 1: expect both.Q == 1 — expected 1, actual 0`. */
+function expectLine(f) {
+  return `${f.step ? `step ${f.step}: ` : ""}${f.expect}${f.expected != null ? ` — expected ${f.cmp && f.cmp !== "==" ? f.cmp + " " : ""}${f.expected}, actual ${f.actual}` : ` — actual ${f.actual}`}`;
+}
+/** One test that did not pass, in a line (about block `uuid`, when given: only its expects). */
+function testLine(t, uuid) {
+  const fs = (t.failures || []).filter((f) => !uuid || !f.blocks?.length || f.blocks.includes(uuid));
+  const um = (t.unmodeled || []).filter((u) => !uuid || u.uuid === uuid);
+  const why = t.status === "error"
+    ? (um.length ? `couldn't run: the simulator has no model for ${um.map((u) => `${u.type} "${u.title}"`).join(", ")}` : `couldn't run: ${t.error || ""}`)
+    : `fails: ${fs.map(expectLine).join("; ")}`;
+  return `Test "${t.name}"${t.file ? ` (${checkAt(t)})` : ""} ${why}`;
+}
+function renderTests() {
+  const box = $("deploy-tests"), c = S.check;
+  const t = c?.available && !checkBroken() && S.rev === editRev()?.id ? c.test : null;
+  const list = t?.available ? t.tests || [] : [];
+  box.classList.toggle("hidden", !t || (t.available && !list.length && !t.running));
+  box.classList.toggle("quiet", !!t?.unsupported);
+  const bad = list.filter((x) => x.status !== "pass");
+  box.classList.toggle("error", !!bad.length);
+  box.classList.toggle("hint", !bad.length);
+  if (!t) { box.innerHTML = ""; return; }
+  if (t.unsupported) { box.innerHTML = `<div class="ck-sub">No tests run: ${esc(t.reason || "this lox has no lox logic test")}.</div>`; return; }
+  if (!t.available) { box.innerHTML = `<div class="ck-h">Tests didn't run</div><div class="ck-sub">${esc(t.reason || "")}</div>`; return; }
+  if (!list.length) { box.innerHTML = `<div class="ck-sub">Running the module's tests…</div>`; return; }
+  const was = box.querySelector("details");
+  // Open while a test fails, unless the user folded it.
+  const open = was ? was.open || (bad.length && !was.dataset.bad) : !!bad.length;
+  const icon = { pass: "✓", fail: "✕", error: "!" };
+  const items = list.map((x) => {
+    const lines = [];
+    for (const f of x.failures || []) lines.push(`<li>${f.line ? `<span class="ck-at">${esc(checkAt({ file: x.file, line: f.line }))}</span>` : ""}${esc(expectLine(f))} ${goButtons(f.blocks)}</li>`);
+    if (x.status === "error") {
+      lines.push(`<li>${esc(x.error || "")}</li>`);
+      if (x.unmodeled?.length) lines.push(`<li>Not simulated: ${x.unmodeled.map((u) => `${esc(u.type)} "${esc(u.title)}"`).join(", ")} ${goButtons(x.unmodeled.map((u) => u.uuid))}</li>`);
+    }
+    const checks = x.status === "pass" ? "" : goButtons(x.blocks);
+    return `<li class="ts-${esc(x.status)}"><span class="ts-ic" aria-label="${esc(x.status)}">${icon[x.status] || "·"}</span>` +
+      `${x.file ? `<span class="ck-at">${esc(checkAt(x))}</span>` : ""}<span class="ts-n">${esc(x.name)}</span>` +
+      `${x.status === "error" ? " couldn't run" : ""} ${checks}${lines.length ? `<ul>${lines.join("")}</ul>` : ""}</li>`;
+  });
+  const n = list.length, failed = list.filter((x) => x.status === "fail").length, errs = list.filter((x) => x.status === "error").length;
+  const head = `Tests: ${list.length - bad.length} of ${n} passed` + (failed ? `, ${failed} failed` : "") + (errs ? `, ${errs} couldn't run` : "");
+  const sub = t.running ? " · testing the latest change…"
+    : bad.length ? " · Apply is off until they pass" : " · lox logic test, in lox's simulator";
+  box.innerHTML = `<details${open ? " open" : ""}${bad.length ? ' data-bad="1"' : ""}><summary><span class="ck-h">${esc(head)}</span>${esc(sub)}</summary><ul class="ts-list">${items.join("")}</ul>` +
+    `<div class="ck-sub ts-cover">A pass covers only what the simulator models: a test that needs another block says so and names it.</div></details>`;
+}
+$("deploy-tests").addEventListener("click", goClicked);
+
 // ── lox logic lint (#66) ──────────────────────────────────────────────
 // The same check runs lox logic lint on the project when the module compiles: unused names, blocks whose
 // outputs feed nothing, users whose tag opens no Code Touch, and more. The Deploy pane lists every finding

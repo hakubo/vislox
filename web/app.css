@@ -551,6 +551,15 @@ rect.ghost, line.ghost { fill: #1f6fd10a; stroke: var(--moved); stroke-opacity: 
 .deploy-lint .lt-kind > ul { margin-top: 2px; padding-left: 10px; }
 .deploy-lint .lt-k { font-family: ui-monospace, "DejaVu Sans Mono", monospace; font-weight: 600; }
 .lt-note { color: var(--changed); }
+.deploy-tests summary { cursor: pointer; }
+.deploy-tests.quiet { background: none; padding: 2px 0; font-size: 11px; }
+.deploy-tests .ts-list > li > ul { margin-top: 2px; padding-left: 16px; }
+.deploy-tests .ts-ic { display: inline-block; width: 1.2em; font-weight: 700; }
+.deploy-tests .ts-pass .ts-ic { color: var(--added, #2e7d32); }
+.deploy-tests .ts-n { font-weight: 600; margin-right: 4px; }
+.deploy-tests .ts-cover { margin-top: 4px; color: var(--muted); }
+.tbadge circle { fill: var(--removed); stroke: #fff; stroke-width: 1.5px; vector-effect: non-scaling-stroke; }
+.tbadge text { fill: #fff; font-size: 130px; font-weight: 800; }
 .deploy-new { margin: 8px 10px 0; padding: 6px 8px; border: 1px solid var(--line-2); border-radius: 4px; background: var(--panel-2); font-size: 12px; }
 .deploy-new .h { display: flex; align-items: center; gap: 6px; font-weight: 600; margin-bottom: 4px; }
 .deploy-new .h .x { margin-left: auto; border: none; background: none; color: var(--muted); font-size: 14px; line-height: 1; padding: 0 2px; }
