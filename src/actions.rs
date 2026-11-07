@@ -3484,7 +3484,9 @@ impl Actions {
                     "slug": b.slug,
                     "uuid": uuid,
                     "type": b.ty,
-                    "page": f.page,
+                    // An object of the object tree (#84) is on no page.
+                    "page": (!f.periphery).then_some(&f.page),
+                    "periphery": f.periphery,
                     "file": format!("{rel_dir}/{name}"),
                     "settings": edit::new_block_settings(b),
                     "adopted": b.adopted,

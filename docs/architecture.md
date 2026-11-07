@@ -140,6 +140,11 @@ The binary is an `axum` server with the UI embedded (plain JS and SVG, no build 
   file's *Template instances* comment), checked against the template's parameters, its library template copied into
   `<module>/vislox/templates.loxl` (`Files::templates`) while it is called, `removed` lines for a dropped compiled
   one. The module's own templates reach the op as `Ctx::templates` (`edit::module_decls`).
+- `src/periphery.rs` is the objects of the object tree vislox adds (#84): its table of lox's periphery types (where
+  each lives, the settings a new one needs, which take text; a test holds it to lox's public tables), where a new
+  one goes (`parent`: its folder, or a device of vislox's or Loxone Config's), and the palette's `periphery`. They are
+  declared in `<module>/vislox/_periphery.loxl`, a `PageFile` with `periphery` set and no page line; `edit.rs`'
+  `add_block` hands them to `add_object`, and `remove_block`, `restore_block` and `edit_new_block` take them as blocks.
 - `src/set_claim.rs`' `KINDS` lists every kind of claim on a block's whole content (switching times, moods,
   access, recipients, tiles, members) as a `ClaimKind`; `edit.rs` and `actions.rs` loop over it instead of naming each kind.
 - `src/blocks.rs` is adding blocks (#59): the types vislox offers (`GET /api/block-types`, from lox's builtin

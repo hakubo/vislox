@@ -93,6 +93,18 @@ pub enum Kind {
 /// How `param`, a setting of `ty`, is written; `None` for one vislox does
 /// not offer.
 pub fn setting_kind(ty: &str, param: &str) -> Option<Kind> {
+    // An object of the object tree (#84): an address, a command or a check
+    // pattern is text, a box on or off, the rest a number (in the unit lox
+    // documents for it, if any).
+    if crate::periphery::of(ty).is_some() {
+        return Some(if crate::periphery::text_setting(ty, param) {
+            Kind::Text
+        } else if connectors::bool_params(ty).contains(&param) {
+            Kind::OnOff
+        } else {
+            Kind::Number
+        });
+    }
     // A push notification's message (#77): its texts, and the least time
     // between two messages.
     if connectors::message_params(ty).contains(&param) {
@@ -233,7 +245,10 @@ pub fn palette() -> Json {
         .collect();
     let mut types = types;
     types.push(message_ref_type());
-    json!({ "types": types })
+    // The objects of the object tree (#84): added from the project tree, in
+    // a folder or below a device, never on a page.
+    let periphery = crate::periphery::palette(&|ty| type_doc(ty).summary);
+    json!({ "types": types, "periphery": periphery })
 }
 
 /// The palette's push notification (#77): an `OutputRefLM` that mirrors a
@@ -347,6 +362,10 @@ impl NewBlock {
 /// the removals of blocks added here that lox has not forgotten yet.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PageFile {
+    /// vislox's file of the objects of the object tree (#84,
+    /// [`crate::periphery::FILE`]): no page line, and its blocks are of
+    /// those types only.
+    pub periphery: bool,
     /// The page's UUID, from a `# page uuid: …` line: the file follows its
     /// page when Loxone Config renames it (`page "…"` names it by title).
     pub uuid: Option<String>,
@@ -486,6 +505,7 @@ fn foreign(what: &str) -> String {
 impl PageFile {
     pub fn new(page: &str) -> PageFile {
         PageFile {
+            periphery: false,
             uuid: None,
             page: page.to_string(),
             room: None,
@@ -519,9 +539,26 @@ impl PageFile {
     /// [`PageFile::parse`], knowing vislox's constants (#81): a bare name of
     /// one on an adopted block is its value, not a wire from an object.
     pub fn parse_with(text: &str, consts: &BTreeSet<String>) -> Result<PageFile, String> {
+        PageFile::parse_file(text, consts, false)
+    }
+
+    /// vislox's file of the objects of the object tree (#84): as a page
+    /// file, with no page line, and only blocks of those types.
+    pub fn parse_periphery(text: &str, consts: &BTreeSet<String>) -> Result<PageFile, String> {
+        PageFile::parse_file(text, consts, true)
+    }
+
+    fn parse_file(
+        text: &str,
+        consts: &BTreeSet<String>,
+        periphery: bool,
+    ) -> Result<PageFile, String> {
         // A fragment: an adopted block names the externs of `edits.loxl`.
         let m = Module::parse_fragment(text).map_err(|e| e.to_string())?;
-        let mut file: Option<PageFile> = None;
+        let mut file: Option<PageFile> = periphery.then(|| PageFile {
+            periphery: true,
+            ..PageFile::new("")
+        });
         let mut uuid = None;
         let mut adopted = false;
         // Under the comment of the signals dropped here (#82).
@@ -577,6 +614,11 @@ impl PageFile {
                     if !b.slug.starts_with(SLUG_PREFIX) {
                         return Err(foreign(&format!("`{}`", b.slug)));
                     }
+                    // Objects of the object tree in their own file (#84), and
+                    // only there.
+                    if periphery != crate::periphery::of(&b.block_type).is_some() {
+                        return Err(foreign(&format!("`{}` ({})", b.slug, b.block_type)));
+                    }
                     let mut args = Vec::new();
                     let mut wires = Vec::new();
                     let mut exprs = Vec::new();
@@ -589,7 +631,9 @@ impl PageFile {
                                 port,
                                 kind: BindingKind::Param(v @ Value::Ref(_)),
                                 ..
-                            }) if port == MIRRORS => args.push((port.clone(), v.clone())),
+                            }) if port == MIRRORS || port == crate::periphery::DEVICE => {
+                                args.push((port.clone(), v.clone()))
+                            }
                             // A bare name of vislox's on an adopted block: the
                             // default output of the object it names, unless it
                             // is one of vislox's constants (#81). Any other bare
@@ -717,15 +761,25 @@ impl PageFile {
             category: self.category.clone(),
             comment: None,
         };
-        let mut out = String::from(
-            "# Blocks added in vislox on this page. vislox rewrites this file on every edit;\n\
-             # see docs/editing.md in vislox.\n",
-        );
-        if let Some(u) = &self.uuid {
-            out.push_str(&format!("# {UUID_LINE} {u}\n"));
+        let mut out = String::new();
+        if self.periphery {
+            // No page: lox puts each object into its folder or device (#84).
+            out.push_str(
+                "# Virtual inputs and outputs and Modbus devices added in vislox: lox puts each\n\
+                 # into its folder or below its device. vislox rewrites this file on every edit;\n\
+                 # see docs/editing.md in vislox.\n",
+            );
+        } else {
+            out.push_str(
+                "# Blocks added in vislox on this page. vislox rewrites this file on every edit;\n\
+                 # see docs/editing.md in vislox.\n",
+            );
+            if let Some(u) = &self.uuid {
+                out.push_str(&format!("# {UUID_LINE} {u}\n"));
+            }
+            out.push_str(&render_page(&page));
+            out.push('\n');
         }
-        out.push_str(&render_page(&page));
-        out.push('\n');
         let (adopted, added): (Vec<&NewBlock>, Vec<&NewBlock>) =
             self.blocks.iter().partition(|b| b.adopted);
         if !added.is_empty() {
@@ -849,7 +903,8 @@ pub fn file_name(title: &str, taken: &dyn Fn(&str) -> bool) -> String {
     let mut stem: String = s.trim_matches('-').chars().take(40).collect();
     stem = stem.trim_end_matches('-').to_string();
     // `edits.loxl` is the file of #58's claims, `templates.loxl` that of the
-    // library templates vislox copies in (#83).
+    // library templates vislox copies in (#83). `_periphery.loxl`, that of the
+    // objects of the object tree (#84), starts with `_`, which no stem does.
     if stem.is_empty() || stem == "edits" || stem == "templates" {
         stem = format!("page-{stem}").trim_end_matches('-').to_string();
     }

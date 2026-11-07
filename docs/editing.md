@@ -5,9 +5,9 @@ make and change connections (#61), undo and redo (#62), adopt the blocks Loxone 
 Daytimer's switching times (#73), a lighting controller's moods (#74), a central block's members (#75), who may
 open an NFC Code Touch (#76), push notifications: who gets them and what they say (#77), the tiles of a Touch
 Pure Flex (#78), a managed block's label and settings, its program among them (#79), deleting and renaming a
-managed block (#80), `let` constants and `defaults` (#81), expressions and named signals (#82), and template
-instances (#83). This page is the design they share. #58 to #62, #72 to #83 are built (#81, #82 and #83 in part: see
-their sections); the rest says where each step plugs in.
+managed block (#80), `let` constants and `defaults` (#81), expressions and named signals (#82), template
+instances (#83), and virtual inputs, virtual and Modbus devices (#84). This page is the design they share. #58 to #62,
+#72 to #84 are built (#81 to #84 in part: see their sections); the rest says where each step plugs in.
 
 ## The rules
 
@@ -18,7 +18,8 @@ their sections); the rest says where each step plugs in.
   Miniserver runs.
 - **vislox writes one place: its own files under the module directory**, `<module>/vislox/`: `edits.loxl` for
   the values it claims, the wires it draws and the constants it makes (#81), and one file per page for the blocks it adds
-  (`<module>/vislox/obergeschoss.loxl`), and a file per program a block of them runs (`vx_code16_1.c`, #79).
+  (`<module>/vislox/obergeschoss.loxl`), `_periphery.loxl` for the virtual inputs and devices it adds (#84), and a
+  file per program a block of them runs (`vx_code16_1.c`, #79).
   The rest of the module is never touched. A module that is one file cannot be edited from vislox.
   The exceptions are the lockfile: a move (#60), since lox keeps a managed block's position there, not in the
   source, so vislox writes it there the way lox's own `--relayout` does (see *Moving blocks*); and an adopted
@@ -70,7 +71,9 @@ POST /api/edit
            { "op": "signal", "slug": "vx_warm", "page": "<page uuid>", "value": "vx_….AQ >= 28",
              "title": "Warm" },
            { "op": "instance", "slug": "vx_ost", "page": "<page uuid>",
-             "value": { "template": "Treppenlicht", "args": { "taster": "vx_…", "dauer": "5min" } } } ] }
+             "value": { "template": "Treppenlicht", "args": { "taster": "vx_…", "dauer": "5min" } } },
+           { "op": "add_block", "page": "<folder or device uuid>", "type": "VirtualHttpIn", "title": "Zähler",
+             "settings": { "Address": "http://192.0.2.10/status", "Poll": "1min" } } ] }
 ```
 
 `adopt`, `adopt_page` and `unadopt` go in a request of their own (#72), and so does `rename` (#80). `restore_block`
@@ -560,6 +563,57 @@ vx_ost = Fassade("Ost", sonne: vx_10000006_0000_0060_ffff504f94000001.AQ, pos: 5
 - Not offered: editing an instance or a template of the module's own files (vislox writes only its own, as for
   `let`, #81, and expressions, #82); renaming an instance (`moved` per expanded block); deleting a deployed
   instance; and wiring an instance's output from vislox's `wire` op (feed an input parameter instead).
+
+## Virtual inputs, virtual and Modbus devices (#84)
+
+The objects of the object tree that lox creates are managed blocks with no page and no position: virtual inputs
+(`VirtualIn`), virtual HTTP, UDP and text inputs (`VirtualHttpIn`, `VirtualUdpIn`, `VirtualTextIn`) and their commands
+(`VirtualHttpInCmd`, `VirtualUdpInCmd`), virtual outputs (`VirtualOut`) and their commands (`VirtualOutCmd`), Modbus
+servers (`ModbusServer`), their devices (`ModbusDev`) and those devices' sensors and actuators (`ModbusASensor`,
+`ModbusSensor`, `ModbusAActor`). lox appends a device to the base's one folder of its type (*Virtual Inputs*,
+*Virtual Outputs*, *Netzwerkperipherie*: `VirtualInCaption`, `VirtualOutCaption`, `WeatherCaption`) and an I/O to
+the device its `device:` names, and mints its `IName=` (`VI4`, `VHI1`, `VCI3`, `AMQ12`) once. vislox declares them in
+a file of its own, with no `page` line:
+
+```text
+# Virtual inputs and outputs and Modbus devices added in vislox: lox puts each       # <module>/vislox/_periphery.loxl
+# into its folder or below its device. vislox rewrites this file on every edit;
+# see docs/editing.md in vislox.
+
+vx_virtualhttpin_1 = VirtualHttpIn("Zähler", Address: "http://192.0.2.10/status", Poll: 1min)
+vx_virtualhttpincmd_1 = VirtualHttpInCmd("Leistung", device: vx_virtualhttpin_1, Check: "\"power\":\\v")
+vx_modbusdev_1 = ModbusDev("Regler", device: vx_7e000002_0000_0000_ffff504f94000001)
+```
+
+- **Added** with `add_block`, its `page` the folder it goes into or the device it hangs below (`src/periphery.rs`).
+  A device of vislox's files is named by its slug; one Loxone Config made by vislox's extern of it (`vx_<uuid>` in
+  `edits.loxl`, kept while an I/O names it). It must be in the project's base (lox resolves an extern there); a
+  device the module's own files manage is refused (vislox's files name only their own blocks and Loxone Config's).
+  The reply's `added` names it with the UUID lox minted, as for a block.
+- **Its settings** are lox's attribute parameters of the type (`lox logic types VirtualHttpIn`): text (an address, a
+  command, a check pattern, a text input's value, `Desc`), `on`/`off`, or numbers, which take the unit lox documents
+  for them (`Poll: 1min` is 60 s, `MaxTime: 46s` is 46000 ms; a plain number is in the saved unit). Strings are
+  written escaped (`\` as `\\`, so Loxone's `\v` is `"\\v"`). `IName` and the rest of the element (its
+  `<IoData>`, `<Display>`) stay lox's and Loxone Config's: not offered.
+- **Checked before lox sees it**: the settings a new one cannot do without (`Address` and `Poll` of an HTTP input,
+  `Port` of a UDP input, `Check` of a command, `Address` of a virtual output and of a Modbus server, `ModbusAddress`
+  of a Modbus sensor or actuator), where it may go (a command only below its kind of device), no constants and no
+  wires when it is added (draw them once it is in the config), and a value a Loxone Config save would rewrite
+  (lox's `save_rewrite`: `Poll` is whole seconds from 10 to 604800, a digital virtual input reads 0 to 1, so a
+  `MaxVal: 30` needs `Analog: on`). lox's own refusals come back as lox says them.
+- **Edited** in Properties as a block of vislox's files is (#79): its name and its settings; a setting lox needs
+  cannot be emptied. `Files::ops` lists each (never `device:`, which is where it is), so each is not deployed with
+  Revert. Renamed and deleted as #80 says: what hangs below a device follows its rename (lox's `rename_slug`), and a
+  device is not taken out or deleted while an object of vislox's files hangs below it (`blocks[].delete`). A
+  deleted one comes back with `restore_block`, whose `page` is its folder or device, checked against what its
+  declaration says; its lockfile entry has no layout.
+- **Reviewed** like any change: the Changes list and the tree mark it added, with each I/O of a device added with it
+  listed too, and a changed setting reads old → new (`Poll: 60 → 120`). Apply deploys it, Discard drops it. Editing
+  sends nothing to the device: no test connection, no poll.
+- **Not yet**: adopting a virtual input or device Loxone Config made (lox's `adopt --uuid` takes a device with all
+  its I/O, under slugs lox picks, `<device slug>_<title>`, into a file per folder; vislox's adoption (#72) moves
+  only page blocks into its page files). Until then its settings are Loxone Config's (Properties shows them
+  read-only). Operating modes and calendar entries, of the same lox table, are #86's.
 
 ## Moving blocks (#60)
 
@@ -1480,7 +1534,8 @@ The blocks vislox added or adopted (#72) are the exception: their `.loxl` is vis
 - New blocks of some types. vislox offers the page blocks of lox's verified builtin table (`loxl types`) that
   lox creates and that work as placed; a test compiles each one with lox. Not offered:
   - virtual inputs, virtual HTTP, UDP and text inputs, virtual outputs and their commands, Modbus servers,
-    devices and their I/O, and operating modes: objects of the object tree, not of a page (#84);
+    devices and their I/O: objects of the object tree, added from the project tree instead (#84, see *Virtual
+    inputs, virtual and Modbus devices*); operating modes (#86);
   - the NFC Code Touch, Intercom and Touch Pure Flex controller blocks, which exist because Loxone Config paired
     the device (lox adopts them, never creates them);
   - blocks lox creates but that do nothing until they are set up in Loxone Config: the burglar and smoke alarms,
@@ -1523,7 +1578,7 @@ Each of these plugs in as new op kinds on `POST /api/edit`, written into `<modul
 | #81 (built in part) | `let` constants made and changed in vislox's file, ports bound to them; the module's `let` and `defaults` shown |
 | #82 (built in part) | expressions (`<-`, `Port: …`) and named signals (`slug = …`, `.title`) of vislox's files; the module's shown |
 | #83 (built in part) | `template` instances of vislox's files (the `instance` op, lox's library copied in); the module's shown, grouped and reviewed |
-| #84 | virtual inputs, virtual and Modbus devices |
+| #84 (built in part) | virtual inputs, virtual and Modbus devices added and edited in `_periphery.loxl` (`device:`); adopting Loxone Config's is left |
 | #85 | Tree and Air hardware (`Statistics:`, new Tree devices) |
 | #86 | operating modes and calendar entries |
 | #87 | Automatic Designer rules (`rule`) |
@@ -1537,6 +1592,10 @@ lost is deleted only with consent to exactly that list, see [features.md](featur
 
 - Properties has an *Edit* section on the newest revision: *Edit values* opens a form for the name, the
   room and category, the unwired inputs and the settings. Numbers are checked in the browser; lox checks ranges and the rest.
+- *Add* on a folder of the project tree (*Virtual Inputs*, *Virtual Outputs*, *Netzwerkperipherie*) or on a virtual
+  or Modbus device opens the same dialog for the types that go there (`GET /api/block-types`' `periphery`: each type's
+  `folder` or `devices`, and its settings with their unit and whether a new one needs them), the settings lox needs
+  first; it is off, with the reason, where an edit would be refused (#84). The new object is selected in the tree.
 - *Add block* (top left of the page, on the newest revision) lists the types vislox offers (`GET /api/block-types`:
   each type's purpose and link to Loxone's documentation, its ports with their units, canvas labels and the value
   Loxone Config places them with, and its settings), searched by name, type and purpose. The form asks for the
