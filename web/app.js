@@ -1134,8 +1134,8 @@ function calTip(cal) {
 const propRow = (k, v, cls, tip) => `<div class="pr ${cls || ""}"><div class="k${tip ? " hinted" : ""}"${tip ? ` title="${esc(tip)}"` : ""}>${esc(k)}</div><div class="v">${v}</div></div>`;
 function renderProps() {
   // Live values re-render Properties often: keep the edit field being typed in.
-  const f = document.activeElement?.closest?.("#props [data-ed-field], #props [data-sch-field]");
-  const attr = f?.dataset.edField != null ? "data-ed-field" : "data-sch-field";
+  const f = document.activeElement?.closest?.("#props [data-ed-field], #props [data-sch-field], #props [data-mo-field], #props [data-mo-name]");
+  const attr = ["data-ed-field", "data-sch-field", "data-mo-field", "data-mo-name"].find((a) => f?.hasAttribute(a));
   const keep = f && { field: f.getAttribute(attr), a: f.selectionStart, b: f.selectionEnd };
   renderPropsBody();
   if (keep) {
@@ -1163,6 +1163,8 @@ function renderPropsBody() {
   if (ed) section("Edit", ed.rows, ed.count);
   const se = seRows(o, row);
   if (se) section("Switching times", se.rows, se.count);
+  const mo = moRows(o, row, marks);
+  if (mo) section("Moods", mo.rows, mo.count);
   const ms = managedSrc(o.uuid);
   // The errors of lox logic check whose line names this block (#65): on the newest config only.
   const ce = S.rev === editRev()?.id ? checkErrors(o.uuid) : [];
@@ -2104,6 +2106,7 @@ function editsHere() {
   if (editsAdded().length) parts.push(`${plural(editsAdded().length, "block")} added here`);
   if (editsMoved().length) parts.push(`${plural(editsMoved().length, "block")} moved here`);
   if (schedsPending().length) parts.push(`switching times of ${plural(schedsPending().length, "timer")} edited here`);
+  if (moodsPending().length) parts.push(`moods of ${plural(moodsPending().length, "lighting controller")} edited here`);
   const drawn = editsWires().filter((w) => w.now).length, out = editsWires().length - drawn;
   if (drawn) parts.push(`${plural(drawn, "wire")} drawn here`);
   if (out) parts.push(`${plural(out, "wire")} taken out here`);
@@ -3624,6 +3627,315 @@ $("props").addEventListener("pointerdown", (e) => {
   window.addEventListener("pointerup", up);
 });
 
+// ── lighting moods (#74) ───────────────────────────────────────────────
+// A lighting controller's moods are a Lox Logic `moods` set and the controller's `.moods` claim, written into
+// vislox's file of claims. Properties shows the circuits (AQ1 … AQ18, each of one kind: switch, dimmer, colour or
+// tunable white) and the moods in order; the editor adds, renames, reorders and deletes moods and sets each
+// circuit's value, offering only the values its kind takes. Saving sends one `moods` op: every mood but the off
+// mood, in order, its values in the language's terms. It is an edit like any other: compiled, never deployed,
+// undone through `undo`.
+const MO = { uuid: null, open: false, rows: [], busy: false, msg: "", err: "", bad: {}, shareAll: true, all: false, extra: new Set(), warned: "" };
+/** What each kind of circuit is called, and the values it takes. */
+const MO_KIND = { switch: "switch", dimmer: "dimmer", rgb: "colour (RGB)", colour: "colour (RGB or tunable white)", white: "tunable white", raw: "a kind Lox Logic does not name" };
+const MO_TAKES = { switch: ["off", "on", "pct"], dimmer: ["off", "pct"], rgb: ["off", "rgb"], colour: ["off", "rgb", "temp"], white: ["off", "temp", "rgb"], raw: ["raw"] };
+const MO_T = { off: "off", on: "on", pct: "%", rgb: "rgb", temp: "white", raw: "as stored" };
+const MO_HINT = { pct: "0 to 100", rgb: "red, green, blue: 0 to 100 each", temp: "brightness %, Kelvin", raw: "the stored number" };
+/** What `GET /api/edits` says of this controller's moods (#74), or null. */
+function moodsEdit(uuid) { return (S.edits?.moods || []).find((m) => m.uuid === uuid) || null; }
+/** The controllers whose moods were edited here and are not deployed. */
+function moodsPending() { return (S.edits?.moods || []).filter((m) => m.pending); }
+/** A circuit value in the language's terms, split for the editor: its kind of value and its numbers. */
+function moParse(v) {
+  let m;
+  if (v === "off" || v === "on") return { t: v, a: "" };
+  if ((m = /^(\d+)%$/.exec(v))) return { t: "pct", a: m[1] };
+  if ((m = /^rgb\((\d+), (\d+), (\d+)\)$/.exec(v))) return { t: "rgb", a: `${m[1]}, ${m[2]}, ${m[3]}` };
+  if ((m = /^temp\((\d+)%, (\d+)K\)$/.exec(v))) return { t: "temp", a: `${m[1]}, ${m[2]}` };
+  return { t: "raw", a: v };
+}
+/** A cell back in the language's terms, or null when its numbers are not ones the circuit takes. */
+function moValue(c) {
+  const nums = (s, n) => { const p = (s || "").split(",").map((x) => x.trim()); return p.length === n && p.every((x) => /^\d+$/.test(x)) ? p.map(Number) : null; };
+  const pct = (x) => x >= 0 && x <= 100;
+  if (c.t === "off" || c.t === "on") return c.t;
+  if (c.t === "pct") { const n = nums(c.a.replace(/%$/, ""), 1); return n && pct(n[0]) ? `${n[0]}%` : null; }
+  if (c.t === "rgb") { const n = nums(c.a, 3); return n && n.every(pct) ? `rgb(${n.join(", ")})` : null; }
+  if (c.t === "temp") { const n = nums(c.a.replace(/[%K]/g, ""), 2); return n && pct(n[0]) && n[1] > 0 && n[1] < 10000 ? `temp(${n[0]}%, ${n[1]}K)` : null; }
+  return /^\d+$/.test(c.a.trim()) ? c.a.trim() : null;
+}
+/** Whether this controller's moods can be edited here now: `{ ok, rev }`, or null (nothing to edit). */
+function moState(o) {
+  if (o.ty !== "LightController2" || !o.moods) return null;
+  const st = editState(o);
+  return st?.ok ? st : null;
+}
+/** The circuits the section shows: those named, and those a mood other than "Viel Licht" (which switches every
+ *  circuit on) uses; in the editor also those added to it; all of them with *Show all circuits*. A circuit not
+ *  shown keeps its values. */
+function moCircuits(o) {
+  const mine = MO.open && MO.uuid === o.uuid;
+  return o.moods.circuits.filter((c) => MO.all || c.name || c.used || (mine && MO.extra.has(c.n)));
+}
+/** The T5 input that selects mood `m` (scene id n: `Sel<n>`), or null. */
+function moButton(mi, sid) { return sid && mi.selected.includes(+sid) ? `T5/${sid}` : null; }
+function moOpen(uuid) {
+  const o = S.view?.objects[uuid];
+  if (!o?.moods) return;
+  const rows = o.moods.moods.filter((m) => !m.off).map((m) => ({ orig: m.name, name: m.name, sid: m.sid, required: m.required, cells: m.values.map(moParse) }));
+  Object.assign(MO, { uuid, open: true, rows, busy: false, msg: "", err: "", bad: {}, shareAll: true, extra: new Set(), warned: "" });
+  S.closed.delete("Moods");
+  renderProps();
+  $("props").querySelector('[data-mo-name="0"]')?.focus();
+}
+function moClose() {
+  if (MO.busy) return;
+  Object.assign(MO, { open: false, rows: [], msg: "", err: "", bad: {}, warned: "" });
+  renderProps();
+  $("props").querySelector('[data-mo="open"]')?.focus();
+}
+/** The lint findings on circuit `n` of the controller: `no-actuator` (#66), a percentage on a circuit without
+ *  an actuator, which the Miniserver only switches. */
+function moLint(uuid, n) { return lintFindings(uuid).filter((f) => f.kind === "no-actuator" && new RegExp(`\\bAQ${n}\\b`).test(f.message)); }
+/** The rows of the *Moods* section. */
+function moRows(o, row, marks) {
+  const mi = o.moods;
+  if (o.ty !== "LightController2" || !mi) return null;
+  const rows = [], st = moState(o), e = moodsEdit(o.uuid), mine = MO.uuid === o.uuid ? MO : null;
+  const title = (u) => { const x = S.view?.objects[u]; return x ? displayTitle(x) : u; };
+  const circuits = moCircuits(o);
+  const managed = editsBlock(o.uuid) && st;
+  const circ = circuits.map((c) => {
+    const lint = moLint(o.uuid, c.n);
+    // A controller added or adopted here declares its switch and dimmer circuits (Circuit1 … Circuit5); colour
+    // circuits and the rest stay with Loxone Config.
+    const decl = managed && c.n <= 5 && (c.kind === "switch" || c.kind === "dimmer")
+      ? ` <select class="mo-decl" data-mo="circuit" data-n="${c.n}" aria-label="AQ${c.n} is a" title="Declares Circuit${c.n} in the block's declaration; changing it clears the circuit's values, as Loxone Config's mood editor does"${S.edit.busy ? " disabled" : ""}>${["switch", "dimmer"].map((k) => `<option${k === c.kind ? " selected" : ""}>${k}</option>`).join("")}</select>`
+      : "";
+    return row(`AQ${c.n}`, `${c.name ? esc(c.name) : '<span class="none-v">no actuator</span>'} <span class="mo-kind">${esc(MO_KIND[c.kind])}</span>${decl}` +
+      lint.map((f) => `<div class="ed-note lt-note">⚠ Lint (no-actuator${f.file ? `, ${esc(checkAt(f))}` : ""}): ${esc(f.message)}</div>`).join(""), lint.length ? "pr-chg" : "");
+  });
+  rows.push(`<div class="mo-sub">Circuits</div>`, ...circ);
+  if (circuits.length < mi.circuits.length) rows.push(`<div class="ed-bar"><button type="button" class="ed-btn small" data-mo="all">${MO.all ? "Show the circuits in use" : `Show all ${mi.circuits.length} circuits`}</button></div>`);
+  // The claim: vislox's set, or the rest of the module's.
+  const other = claimsOf(o.uuid).find((c) => c.kind === "moods" && !c.file.startsWith(`${S.edits?.dir}/`));
+  if (other && st) {
+    const at = claimAt(other);
+    if (e?.set) {
+      rows.push(`<div class="sch-note warn">⚠ Claimed twice: ${esc(at)} and vislox's ${esc(S.edits?.file || "")} both claim its moods, and lox compiles neither until one goes.</div>`,
+        `<div class="ed-bar"><button type="button" class="ed-btn small" data-mo="drop"${mine?.busy ? " disabled" : ""} title="Take vislox's claim out and compile: ${esc(at)} keeps the controller">Remove vislox's claim</button>` +
+        (mine?.msg || mine?.err ? `<span class="ed-msg${mine.err ? " err" : ""}" role="status">${esc(mine.err || mine.msg)}</span>` : "") + "</div>");
+    } else rows.push(`<div class="ed-note">${esc(at)} claims its moods: change them there.</div>`);
+  } else if (e?.set && st) {
+    rows.push(`<div class="ed-note">Written by vislox as <span class="mono">${esc(e.set)}</span> in ${esc(S.edits?.file || "")}${e.shared?.length ? `, shared with ${esc(e.shared.map(title).join(", "))}` : ""}.</div>`);
+  }
+  if (e?.pending && st && !other) {
+    const back = e.deployed ? "Back to the moods deployed" : "Back to Loxone Config's moods";
+    rows.push(row("Moods", `<span class="ed-v">edited here</span><span class="ed-tag" title="Saved into the module and compiled, not on the Miniserver yet: Apply deploys it, Discard drops it">not deployed</span>` +
+      `<button type="button" class="ed-btn small" data-mo="revert" title="${esc(back)}">Revert</button>`, "pr-chg"));
+  }
+  if (!mine?.open || !st || other) {
+    // The moods as the config shown has them, marked against the compared revision.
+    const old = marks ? o.moods_old : null;
+    const oldOf = (n) => old?.moods.find((m) => m.name === n);
+    rows.push(`<div class="mo-sub">Moods</div>`);
+    for (const m of mi.moods) {
+      const was = oldOf(m.name), btn = moButton(mi, m.sid);
+      const tags = [m.off ? "off mood" : "", m.required ? (m.sid === "777" ? "motion" : m.required === "a built-in mood" ? "built-in" : "motion settings") : "", btn ? `${btn} selects it` : ""].filter(Boolean);
+      const v = m.off ? '<span class="none-v">every circuit off, always there</span>' : old && !was ? `<span class="new">${esc(m.text)}</span>` : was && was.text !== m.text ? `<span class="old">${esc(was.text)}</span><span class="new">${esc(m.text)}</span>` : esc(m.text);
+      rows.push(row(m.name, `${v}${tags.map((t) => ` <span class="mo-tag">${esc(t)}</span>`).join("")}`, old && (!was || was.text !== m.text) ? "pr-chg" : ""));
+    }
+    for (const m of old?.moods || []) if (!mi.moods.some((x) => x.name === m.name)) rows.push(row(m.name, `<span class="old">${esc(m.text)}</span> <span class="mo-tag">removed</span>`, "pr-chg"));
+    if (old) {
+      const order = (a, b) => a.moods.filter((m) => b.moods.some((x) => x.name === m.name)).map((m) => m.name).join(" · ");
+      if (order(old, mi) !== order(mi, old)) rows.push(`<div class="ed-note">Order: <span class="old">${esc(order(old, mi))}</span> <span class="new">${esc(order(mi, old))}</span></div>`);
+    }
+    if (st && !other) {
+      const sets = (S.edits?.mood_sets || []).filter((x) => x.name !== e?.set && x.controllers.length && !x.controllers.includes(o.uuid));
+      rows.push(`<div class="ed-bar"><button type="button" class="ed-btn small" data-mo="open">Edit moods</button>` +
+        (sets.length ? `<label class="se-same">Use the same moods as <select data-mo="same"${mine?.busy ? " disabled" : ""}><option value="">…</option>${sets.map((x) => `<option value="${esc(x.name)}">${esc(x.controllers.map(title).join(", "))}</option>`).join("")}</select></label>` : "") +
+        (mine?.msg || mine?.err ? `<span class="ed-msg${mine.err ? " err" : ""}" role="status">${esc(mine.err || mine.msg)}</span>` : "") + "</div>");
+    }
+    return { rows, count: (e?.pending ? 1 : 0) + mi.circuits.filter((c) => moLint(o.uuid, c.n).length).length || undefined };
+  }
+  // The editor: a row per mood, a cell per circuit shown.
+  const dis = mine.busy ? " disabled" : "";
+  const off = mi.moods.find((m) => m.off);
+  const cell = (r, i, c) => {
+    const v = r.cells[c.n - 1], k = `${i}|${c.n}`, takes = MO_TAKES[c.kind];
+    const opts = (takes.includes(v.t) ? takes : [v.t, ...takes]).map((t) => `<option value="${t}"${t === v.t ? " selected" : ""}>${esc(MO_T[t])}</option>`).join("");
+    const arg = v.t === "off" || v.t === "on" ? "" : `<input class="num mo-a" data-mo-field="${esc(k)}" value="${esc(v.a)}" placeholder="${esc(MO_HINT[v.t])}" title="${esc(MO_HINT[v.t])}" aria-label="AQ${c.n} ${esc(MO_T[v.t])}" autocomplete="off"${dis}>`;
+    return `<td class="${mine.bad[k] ? "bad" : ""}" title="${esc(mine.bad[k] || `AQ${c.n}: ${MO_KIND[c.kind]}`)}"><select data-mo="t" data-k="${esc(k)}" aria-label="${esc(`${r.name || "new mood"}, AQ${c.n}`)}"${dis}>${opts}</select>${arg}</td>`;
+  };
+  const head = `<tr><th>Mood</th>${circuits.map((c) => `<th title="${esc(`${c.name || "no actuator"}: ${MO_KIND[c.kind]}`)}">AQ${c.n}</th>`).join("")}<th></th></tr>`;
+  const body = MO.rows.map((r, i) => {
+    const btn = moButton(mi, r.sid);
+    const lock = r.required ? ` title="${esc(`${r.required}: it stays in the set, and keeps its name`)}" readonly` : "";
+    return `<tr class="${mine.bad[`n${i}`] ? "bad" : ""}"><td class="mo-name"><input data-mo-name="${i}" value="${esc(r.name)}" aria-label="Mood name" placeholder="name" autocomplete="off"${lock}${dis}>` +
+      `${btn && r.orig ? ` <span class="mo-tag" title="A button on ${esc(btn)} selects this mood by its scene id">${esc(btn)}</span>` : ""}${mine.bad[`n${i}`] ? `<div class="ed-bad">${esc(mine.bad[`n${i}`])}</div>` : ""}</td>` +
+      circuits.map((c) => cell(r, i, c)).join("") +
+      `<td class="mo-ops"><button type="button" class="se-x" data-mo="up" data-i="${i}" aria-label="Move ${esc(r.name)} up"${i ? "" : " disabled"}${dis}>↑</button>` +
+      `<button type="button" class="se-x" data-mo="down" data-i="${i}" aria-label="Move ${esc(r.name)} down"${i < MO.rows.length - 1 ? "" : " disabled"}${dis}>↓</button>` +
+      `<button type="button" class="se-x" data-mo="del" data-i="${i}" aria-label="Delete ${esc(r.name)}"${r.required ? ` disabled title="${esc(r.required)}: it stays in the set"` : ""}${dis}>✕</button></td></tr>`;
+  }).join("");
+  rows.push(`<div class="mo-wrap"><table class="mo-grid">${head}${body}</table></div>`);
+  if (off) rows.push(`<div class="ed-note">"${esc(off.name)}", the off mood, is always there and keeps its place.</div>`);
+  const extra = mi.circuits.filter((c) => !circuits.includes(c));
+  rows.push(`<div class="ed-bar"><button type="button" class="ed-btn small" data-mo="add"${dis}>Add mood</button>` +
+    (extra.length ? `<label class="se-same">Add a circuit <select data-mo="addc"${dis}><option value="">…</option>${extra.map((c) => `<option value="${c.n}">AQ${c.n} (${esc(MO_KIND[c.kind])})</option>`).join("")}</select></label>` : "") + "</div>");
+  if (e?.shared?.length) rows.push(`<label class="se-share"><input type="checkbox" data-mo="shareall"${MO.shareAll ? " checked" : ""}${dis}> Change ${esc(e.shared.map(title).join(", "))} too: ${e.shared.length === 1 ? "it shares" : "they share"} these moods (${esc(e.set)}). Off: this controller gets a set of its own.</label>`);
+  if (mine.warned) rows.push(`<div class="sch-note warn" role="alert">⚠ ${esc(mine.warned)}</div>`);
+  rows.push(`<div class="ed-bar"><button type="button" class="primary small" data-mo="save"${dis}>${mine.busy ? "Compiling…" : mine.warned ? "Save anyway" : "Save"}</button>` +
+    `<button type="button" class="ed-btn small" data-mo="cancel"${dis}>Cancel</button>` +
+    `<span class="ed-msg${mine.err ? " err" : ""}" role="status" aria-live="polite">${esc(mine.err || mine.msg || "Saving writes a moods set into the module and compiles it; nothing is deployed. A mood is known by its name: renaming one is a delete and an add.")}</span></div>`);
+  return { rows, count: e?.pending ? 1 : 0 };
+}
+/** Check the draft as lox would: names, values each circuit takes. Marks what is wrong; true when all is well. */
+function moCheck(o) {
+  const bad = {}, seen = new Map(), offName = o.moods.moods.find((m) => m.off)?.name;
+  MO.rows.forEach((r, i) => {
+    const n = r.name.trim();
+    if (!n) bad[`n${i}`] = "A mood needs a name.";
+    else if (n === offName) bad[`n${i}`] = `"${n}" is the off mood, which is always there.`;
+    else if (seen.has(n)) bad[`n${i}`] = `Two moods are named "${n}": a mood is known by its name.`;
+    seen.set(n, i);
+    r.cells.forEach((c, j) => { if (c.t !== "off" && moValue(c) == null) bad[`${i}|${j + 1}`] = `AQ${j + 1}: ${MO_HINT[c.t] || "a value"}.`; });
+  });
+  for (const m of o.moods.moods.filter((x) => x.required)) if (!MO.rows.some((r) => r.name.trim() === m.name)) bad.req = `"${m.name}" is ${m.required}: it stays in the set.`;
+  MO.bad = bad;
+  return !Object.keys(bad).length;
+}
+/** The moods a button selects that the draft deletes or renames: their names and T5 inputs. */
+function moButtonsLost(o) {
+  const mi = o.moods, lost = [];
+  for (const m of mi.moods.filter((x) => !x.off)) {
+    const btn = moButton(mi, m.sid);
+    if (!btn) continue;
+    const r = MO.rows.find((x) => x.orig === m.name);
+    if (!r) lost.push(`${btn} selects "${m.name}", which this deletes`);
+    else if (r.name.trim() !== m.name) lost.push(`${btn} selects "${m.name}", which this renames to "${r.name.trim()}": a new mood with a new scene id`);
+  }
+  return lost;
+}
+async function moSave() {
+  const o = S.view?.objects[MO.uuid], st = o && moState(o);
+  if (!st || MO.busy || !MO.open) return;
+  if (!moCheck(o)) {
+    MO.err = MO.bad.req || "Fix the marked moods and values.";
+    renderProps();
+    $("props").querySelector(".mo-grid .bad input, .mo-grid .bad select")?.focus();
+    return;
+  }
+  // Warned once: deleting or renaming a mood a button selects leaves that button selecting nothing, or a new
+  // mood that takes its scene id. A second click saves anyway.
+  const lost = moButtonsLost(o);
+  if (lost.length && !MO.warned) {
+    MO.warned = `${lost.join("; ")}. The button then selects nothing, or a new mood that takes the freed scene id.`;
+    renderProps();
+    return;
+  }
+  const moods = MO.rows.map((r) => ({
+    name: r.name.trim(),
+    values: r.cells.map((c, j) => (c.t === "off" ? null : `AQ${j + 1} ${moValue(c)}`)).filter(Boolean).join(", "),
+  }));
+  const e = moodsEdit(o.uuid);
+  const value = { moods, ...(e?.set && e.shared?.length && MO.shareAll ? { set: e.set } : {}) };
+  await moSend(o, st, { op: "moods", uuid: o.uuid, value });
+}
+async function moSend(o, st, op, label) {
+  MO.uuid = o.uuid; MO.busy = true; MO.err = ""; MO.msg = ""; renderProps();
+  try {
+    const res = await editAct(st.rev.blob, [op], label);
+    Object.assign(MO, { open: false, rows: [], busy: false, bad: {}, err: "", warned: "", msg: res.unchanged ? "Nothing changed." : "Saved and compiled: pending, not deployed. Review it, then Apply or Discard." });
+    await editShowNewest(res.blob);
+  } catch (err) {
+    MO.busy = false; MO.err = err.message; MO.warned = "";
+  }
+  renderProps();
+}
+/** What Revert sends for controller `uuid` (`e`: its `moods` entry; `sets`: `mood_sets`): `{ value }`, or
+ *  `{ why }`. Back to the deployed moods, for this controller only: the deployed set, or no claim. When other
+ *  controllers claim that set now, rewriting it would change them too, so this one gets the deployed moods in a
+ *  set of its own (`moods` without `set`) instead. */
+function moRevertValue(e, sets, uuid) {
+  const d = e?.deployed ?? null;
+  if (!d) return { value: null };
+  const others = (sets.find((x) => x.name === d.set)?.controllers || []).filter((u) => u !== uuid);
+  if (!others.length) return { value: d };
+  if (!d.moods) {
+    const names = others.map((u) => { const x = S.view?.objects[u]; return x ? displayTitle(x) : u; });
+    return { why: `The deployed moods (${d.set}) cannot be read, and ${names.join(", ")} ${others.length === 1 ? "claims" : "claim"} that set now: revert in the module, or Discard.` };
+  }
+  return { value: { moods: d.moods } };
+}
+async function moRevert(uuid) {
+  const o = S.view?.objects[uuid], st = o && moState(o), e = moodsEdit(uuid);
+  if (!st || !e) return;
+  const r = moRevertValue(e, S.edits?.mood_sets || [], uuid);
+  if (r.why) { MO.uuid = uuid; MO.err = r.why; MO.msg = ""; renderProps(); return; }
+  await moSend(o, st, { op: "moods", uuid, value: r.value }, `Revert the moods of ${displayTitle(o)}`);
+}
+$("props").addEventListener("click", (e) => {
+  const b = e.target.closest("[data-mo]");
+  if (!b || b.tagName === "SELECT" || b.type === "checkbox") return;
+  e.stopPropagation();
+  const o = S.view?.objects[S.sel], what = b.dataset.mo;
+  if (!o) return;
+  if (what === "all") { MO.all = !MO.all; return renderProps(); }
+  if (what === "open") return moOpen(S.sel);
+  if (what === "cancel") return moClose();
+  if (what === "save") return moSave();
+  if (what === "revert") return moRevert(S.sel);
+  if (what === "drop") { const st = moState(o); if (st) moSend(o, st, { op: "moods", uuid: o.uuid, value: null }, `Remove vislox's claim on the moods of ${displayTitle(o)}`); return; }
+  if (MO.busy || !MO.open) return;
+  const i = +b.dataset.i;
+  if (what === "add") {
+    let n = 1;
+    while (MO.rows.some((r) => r.name === `Mood ${n}`)) n++;
+    MO.rows.push({ orig: null, name: `Mood ${n}`, sid: null, required: null, cells: o.moods.circuits.map(() => ({ t: "off", a: "" })) });
+  } else if (what === "del" && MO.rows[i] && !MO.rows[i].required) MO.rows.splice(i, 1);
+  else if (what === "up" && i > 0) MO.rows.splice(i - 1, 0, MO.rows.splice(i, 1)[0]);
+  else if (what === "down" && i < MO.rows.length - 1) MO.rows.splice(i + 1, 0, MO.rows.splice(i, 1)[0]);
+  MO.bad = {}; MO.err = ""; MO.warned = "";
+  renderProps();
+  if (what === "add") $("props").querySelector(`[data-mo-name="${MO.rows.length - 1}"]`)?.select();
+}, true);
+$("props").addEventListener("change", (e) => {
+  const t = e.target, what = t.dataset?.mo;
+  if (!what) return;
+  const o = S.view?.objects[S.sel];
+  if (!o) return;
+  if (what === "same") { const st = moState(o); if (st && t.value) moSend(o, st, { op: "moods", uuid: o.uuid, value: { set: t.value } }); return; }
+  if (what === "circuit") {
+    const st = editState(o);
+    if (st?.ok) editSend(o.uuid, st.rev, [{ op: "setting", uuid: o.uuid, name: `Circuit${t.dataset.n}`, value: t.value }], `AQ${t.dataset.n} of ${displayTitle(o)}: ${t.value}`);
+    return;
+  }
+  if (MO.busy || !MO.open) return;
+  if (what === "t") {
+    const [i, n] = t.dataset.k.split("|").map(Number), c = MO.rows[i]?.cells[n - 1];
+    if (c) { c.t = t.value; c.a = t.value === "pct" ? "100" : t.value === "rgb" ? "100, 100, 100" : t.value === "temp" ? "100, 2700" : ""; }
+  } else if (what === "shareall") MO.shareAll = t.checked;
+  else if (what === "addc" && t.value) MO.extra.add(+t.value);
+  MO.bad = {}; MO.err = ""; MO.warned = "";
+  renderProps();
+});
+$("props").addEventListener("input", (e) => {
+  if (!MO.open || MO.busy) return;
+  const f = e.target.closest?.("[data-mo-field], [data-mo-name]");
+  if (!f) return;
+  if (f.dataset.moName != null) { const r = MO.rows[+f.dataset.moName]; if (r) r.name = f.value; }
+  else {
+    const [i, n] = f.dataset.moField.split("|").map(Number), c = MO.rows[i]?.cells[n - 1];
+    if (c) { c.a = f.value; f.setAttribute("aria-invalid", moValue(c) == null ? "true" : "false"); }
+  }
+  MO.warned = "";
+});
+$("props").addEventListener("keydown", (e) => {
+  if (!e.target.closest?.("[data-mo-field], [data-mo-name]")) return;
+  if (e.key === "Enter") { e.preventDefault(); e.stopPropagation(); moSave(); }
+  else if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); moClose(); }
+}, true);
+
 // ── adopting blocks (#72) ──────────────────────────────────────────────
 // `lox logic adopt` puts a block Loxone Config drew under the module: its declaration goes into vislox's
 // file of the page, it keeps its UUIDs, and the config stays exactly as it is (the server checks). It is
@@ -3794,6 +4106,7 @@ function undoLabel(ops) {
   if (ops.length === 1 && op.op === "adopt") return op.blocks.length === 1 ? `Adopt ${obj(op.blocks[0].uuid)}` : `Adopt ${plural(op.blocks.length, "block")}`;
   if (ops.length === 1 && op.op === "adopt_page") return `Adopt the blocks of ${S.pageOf?.get(op.page)?.title || "the page"}`;
   if (ops.length === 1 && op.op === "unadopt") return op.uuids.length === 1 ? `Hand ${obj(op.uuids[0])} back to Loxone Config` : `Hand ${plural(op.uuids.length, "block")} back to Loxone Config`;
+  if (ops.length === 1 && op.op === "moods") return `Moods of ${obj(op.uuid)}${op.value == null ? ": Loxone Config's" : op.value.moods ? "" : ": shared set"}`;
   if (ops.length === 1 && op.op === "schedule") return `Switching times of ${obj(op.uuid)}${op.value == null ? ": Loxone Config's" : op.value.modes ? "" : ": shared set"}`;
   if (ops.length === 1 && op.op === "wire") return `Wire ${wire(op)}`;
   if (ops.length === 1 && op.op === "unwire") return `Delete wire ${wire(op)}`;

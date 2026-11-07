@@ -524,7 +524,7 @@ fn bindings(lines: &[&str], start: usize) -> Vec<(String, usize)> {
 /// Daytimer's switching times, edits made in the app among them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SetClaim {
-    /// `access`, `recipients` or `schedule`.
+    /// `access`, `recipients`, `schedule` or `moods` (#74).
     pub kind: &'static str,
     /// The block, as the module names it.
     pub slug: String,
@@ -545,7 +545,7 @@ pub struct SetClaim {
 }
 
 /// The claim keywords on a block, and the set kinds they name.
-const SET_CLAIMS: &[&str] = &["access", "recipients", "schedule"];
+const SET_CLAIMS: &[&str] = &["access", "recipients", "schedule", "moods"];
 
 /// Every `<slug>.access|recipients|schedule = <set>` at the top level of the
 /// module's files, outside template bodies (what a template claims is made

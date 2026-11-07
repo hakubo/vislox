@@ -132,6 +132,14 @@ pub enum Op {
         uuid: String,
         value: Option<crate::sched_edit::Sched>,
     },
+    /// The moods of the lighting controller `uuid` (#74): a `moods` set and
+    /// the controller's `.moods` claim in [`FILE`] ([`crate::mood_edit`]).
+    /// `None` drops vislox's claim: the moods are as the base has them. Its
+    /// `previous` is the `moods` op with what the controller claimed before.
+    Moods {
+        uuid: String,
+        value: Option<crate::mood_edit::MoodsVal>,
+    },
 }
 
 /// Where a `place` puts one block: its top left corner, as `move` takes it.
@@ -153,7 +161,8 @@ impl Op {
             | Op::Setting { uuid, .. }
             | Op::RemoveBlock { uuid }
             | Op::Move { uuid, .. }
-            | Op::Schedule { uuid, .. } => Some(uuid),
+            | Op::Schedule { uuid, .. }
+            | Op::Moods { uuid, .. } => Some(uuid),
             Op::AddBlock { .. }
             | Op::Relayout { .. }
             | Op::Place { .. }
@@ -183,7 +192,8 @@ impl Op {
             | Op::Adopt { .. }
             | Op::AdoptPage { .. }
             | Op::Unadopt { .. }
-            | Op::Schedule { .. } => None,
+            | Op::Schedule { .. }
+            | Op::Moods { .. } => None,
         }
     }
 
@@ -206,7 +216,8 @@ impl Op {
             | Op::Adopt { .. }
             | Op::AdoptPage { .. }
             | Op::Unadopt { .. }
-            | Op::Schedule { .. } => {}
+            | Op::Schedule { .. }
+            | Op::Moods { .. } => {}
         }
         op
     }
@@ -436,6 +447,8 @@ pub struct Claims(
     pub BTreeSet<Wire>,
     /// The switching times it writes (#73).
     pub crate::sched_edit::Scheds,
+    /// The lighting moods it writes (#74).
+    pub crate::mood_edit::MoodSets,
 );
 
 /// A wire vislox draws: `to.port <- from.port`, each end a slug (an
@@ -604,6 +617,22 @@ impl Claims {
                         return Err(foreign(&format!("a second `{}.schedule`", sc.slug)));
                     }
                 }
+                Item::Moods(m) if m.name.starts_with(SLUG_PREFIX) => {
+                    if c.3.sets.contains_key(&m.name) {
+                        return Err(foreign(&format!("a second `moods {}`", m.name)));
+                    }
+                    c.3.sets
+                        .insert(m.name.clone(), m.moods().cloned().collect());
+                }
+                Item::MoodsClaim(mc) if mc.slug.starts_with(SLUG_PREFIX) => {
+                    if c.3
+                        .claims
+                        .insert(mc.slug.clone(), mc.moods.clone())
+                        .is_some()
+                    {
+                        return Err(foreign(&format!("a second `{}.moods`", mc.slug)));
+                    }
+                }
                 Item::Gap | Item::FragmentEnd | Item::Comment(_) => {}
                 _ => return Err(foreign("a statement")),
             }
@@ -612,6 +641,11 @@ impl Claims {
         for (t, set) in &c.2.claims {
             if !c.2.sets.contains_key(set) {
                 return Err(foreign(&format!("`{t}.schedule = {set}` without its set")));
+            }
+        }
+        for (t, set) in &c.3.claims {
+            if !c.3.sets.contains_key(set) {
+                return Err(foreign(&format!("`{t}.moods = {set}` without its set")));
             }
         }
         // A wire's ends are vislox's: its externs, or the blocks it added.
@@ -630,12 +664,18 @@ impl Claims {
         self.1.iter().any(|w| w.touches(slug))
     }
 
-    /// Whether a wire ends at `slug`, or a schedule claim (#73) names it.
+    /// Whether a wire ends at `slug`, or a schedule (#73) or moods (#74)
+    /// claim names it.
     fn named(&self, slug: &str) -> bool {
-        self.wired(slug) || self.2.claims.contains_key(slug)
+        self.wired(slug) || self.2.claims.contains_key(slug) || self.3.claims.contains_key(slug)
     }
 
-    /// Drop the externs that claim nothing and no wire or schedule claim names.
+    /// Whether a set claim of the file (switching times, moods) names `slug`.
+    pub fn set_claimed(&self, slug: &str) -> bool {
+        self.2.claims.contains_key(slug) || self.3.claims.contains_key(slug)
+    }
+
+    /// Drop the externs that claim nothing and no wire or set claim names.
     pub(crate) fn prune(&mut self) {
         let keep: BTreeSet<String> = self
             .0
@@ -670,6 +710,7 @@ impl Claims {
             }
         }
         out.push_str(&self.2.render());
+        out.push_str(&self.3.render());
         if !self.1.is_empty() {
             out.push_str("\n# Wires drawn in vislox. Deleting a line takes the wire out again.\n");
         }
@@ -699,7 +740,8 @@ impl Claims {
             | Op::Adopt { .. }
             | Op::AdoptPage { .. }
             | Op::Unadopt { .. }
-            | Op::Schedule { .. } => None,
+            | Op::Schedule { .. }
+            | Op::Moods { .. } => None,
         }
     }
 
@@ -802,7 +844,7 @@ pub fn apply(
         .filter(|_| {
             !matches!(
                 op,
-                Op::RemoveBlock { .. } | Op::Move { .. } | Op::Schedule { .. }
+                Op::RemoveBlock { .. } | Op::Move { .. } | Op::Schedule { .. } | Op::Moods { .. }
             )
         })
         .ok_or_else(|| "not a value".to_string())?;
@@ -901,7 +943,8 @@ pub fn apply(
         | Op::Adopt { .. }
         | Op::AdoptPage { .. }
         | Op::Unadopt { .. }
-        | Op::Schedule { .. } => {
+        | Op::Schedule { .. }
+        | Op::Moods { .. } => {
             unreachable!("not a value")
         }
     };
@@ -1098,12 +1141,19 @@ impl Files {
                 }
             }
         }
-        // A schedule claim (#73) names an extern of the claims file or a
-        // block of vislox's files.
-        for t in f.claims.2.claims.keys() {
+        // A schedule (#73) or moods (#74) claim names an extern of the
+        // claims file or a block of vislox's files.
+        for (t, what) in f
+            .claims
+            .2
+            .claims
+            .keys()
+            .map(|t| (t, "schedule"))
+            .chain(f.claims.3.claims.keys().map(|t| (t, "moods")))
+        {
             if !f.claims.0.keys().any(|u| slug(u) == *t) && f.block(t).is_none() {
                 return Err(format!(
-                    "{CLAIMS}: `{t}.schedule` names `{t}`, which is neither an extern of this file \
+                    "{CLAIMS}: `{t}.{what}` names `{t}`, which is neither an extern of this file \
                      nor a block vislox added; put its line back or delete the claim"
                 ));
             }
@@ -1151,6 +1201,7 @@ impl Files {
         if !self.claims.0.values().all(Claim::is_empty)
             || !self.claims.1.is_empty()
             || !self.claims.2.is_empty()
+            || !self.claims.3.is_empty()
             || self.present.contains(CLAIMS)
         {
             out.insert(CLAIMS.to_string(), self.claims.render());
@@ -1345,6 +1396,9 @@ pub struct Ctx<'a> {
     /// The timers whose switching times the rest of the module claims
     /// (#73): UUID (lowercase) → the claim's `file:line`.
     pub sched_claimed: &'a BTreeMap<String, String>,
+    /// The lighting controllers whose moods the rest of the module claims
+    /// (#74): UUID (lowercase) → the claim's `file:line`.
+    pub moods_claimed: &'a BTreeMap<String, String>,
 }
 
 /// What [`apply_op`] did: the value or op that undoes it (`previous`),
@@ -1383,6 +1437,7 @@ pub fn apply_op(files: &mut Files, ctx: &Ctx, op: &Op) -> Result<Applied, String
         }
         Op::Unadopt { uuids } => unadopt(files, ctx, uuids),
         Op::Schedule { uuid, value } => crate::sched_edit::apply(files, ctx, uuid, value.as_ref()),
+        Op::Moods { uuid, value } => crate::mood_edit::apply(files, ctx, uuid, value.as_ref()),
         _ => {
             let uuid = op.uuid().unwrap_or_default();
             match ctx.lock.slug_of(uuid) {
@@ -1443,6 +1498,10 @@ pub fn undo_ops(
             | Op::Adopt { .. }
             | Op::AdoptPage { .. }
             | Op::Unadopt { .. } => undo.push(serde_json::from_value(prev).map_err(bad)?),
+            Op::Moods { uuid, .. } => undo.push(Op::Moods {
+                uuid: uuid.clone(),
+                value: serde_json::from_value(prev).map_err(bad)?,
+            }),
             Op::Schedule { uuid, .. } => undo.push(Op::Schedule {
                 uuid: uuid.clone(),
                 value: serde_json::from_value(prev).map_err(bad)?,
@@ -1642,6 +1701,12 @@ fn remove_block(files: &mut Files, ctx: &Ctx, uuid: &str) -> Result<Applied, Str
              or undo the edit)"
         ));
     }
+    if files.claims.3.claims.contains_key(&slug) {
+        return Err(format!(
+            "{name}: vislox's file claims its moods; take them out first (Revert them, or undo the \
+             edit)"
+        ));
+    }
     if ctx
         .deployed
         .is_some_and(|d| find(&d.xml.root, uuid).is_some())
@@ -1830,6 +1895,13 @@ fn unadopt(files: &mut Files, ctx: &Ctx, uuids: &[String]) -> Result<Applied, St
             return Err(format!(
                 "{}: vislox's file claims its switching times; revert them first, then hand it \
                  back to Loxone Config",
+                name(u)
+            ));
+        }
+        if files.claims.3.claims.contains_key(s) {
+            return Err(format!(
+                "{}: vislox's file claims its moods; revert them first, then hand it back to \
+                 Loxone Config",
                 name(u)
             ));
         }
@@ -2827,6 +2899,21 @@ fn edit_new_block(
             value,
             ..
         } => {
+            // A lighting controller's circuit (#74): `Circuit<n>: "dimmer"`,
+            // which lox's table of settings does not list.
+            if connectors::circuit_param(&b.ty, setting).is_some() {
+                let previous = b.get(setting).map(plain);
+                let v = match value.as_deref().map(str::trim) {
+                    Some(v) => {
+                        crate::mood_edit::circuit_setting(el, setting, v)
+                            .map_err(|e| format!("{name}: {e}"))?;
+                        Some(Value::Str(v.to_string()))
+                    }
+                    None => None,
+                };
+                b.set(setting, v);
+                return Ok(previous);
+            }
             let kind = blocks::settings(&b.ty)
                 .into_iter()
                 .find(|(n, _)| n == setting)
@@ -2947,7 +3034,8 @@ pub fn current(doc: &LoxoneDoc, op: &Op) -> Option<String> {
         | Op::Adopt { .. }
         | Op::AdoptPage { .. }
         | Op::Unadopt { .. }
-        | Op::Schedule { .. } => None,
+        | Op::Schedule { .. }
+        | Op::Moods { .. } => None,
     }
 }
 
@@ -3434,6 +3522,7 @@ mod tests {
                 adoptions: &Default::default(),
                 page_adoptions: &Default::default(),
                 sched_claimed: &Default::default(),
+                moods_claimed: &Default::default(),
             };
             apply_op(&mut files, &ctx, &add(EG, t, None, &[], &[])).unwrap();
             let mut l = Lockfile::default();
@@ -3467,6 +3556,7 @@ mod tests {
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
             sched_claimed: &Default::default(),
+            moods_claimed: &Default::default(),
         };
         let a = apply_op(
             &mut files,
@@ -3536,6 +3626,7 @@ mod tests {
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
             sched_claimed: &Default::default(),
+            moods_claimed: &Default::default(),
         };
         let title = Op::Title {
             uuid: mono.clone(),
@@ -3599,6 +3690,7 @@ mod tests {
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
             sched_claimed: &Default::default(),
+            moods_claimed: &Default::default(),
         };
         let r = apply_op(&mut files, &ctx, &Op::RemoveBlock { uuid: mono.clone() }).unwrap();
         // It names the block it adds again (#62): lox mints new UUIDs for it.
@@ -3626,6 +3718,7 @@ mod tests {
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
             sched_claimed: &Default::default(),
+            moods_claimed: &Default::default(),
         };
         let e = apply_op(&mut files, &ctx, &Op::RemoveBlock { uuid: pulse }).unwrap_err();
         assert!(e.contains("is deployed"), "{e}");
@@ -3650,6 +3743,7 @@ mod tests {
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
             sched_claimed: &Default::default(),
+            moods_claimed: &Default::default(),
         };
         apply_op(&mut files, &ctx, &add(OG, "And", Some("Licht"), &[], &[])).unwrap();
         let text = files.render()["obergeschoss.loxl"].clone();
@@ -3682,6 +3776,7 @@ mod tests {
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
             sched_claimed: &Default::default(),
+            moods_claimed: &Default::default(),
         };
         apply_op(&mut files, &ctx, &add(OG, "Or", None, &[], &[])).unwrap();
         let r = files.render();
@@ -3716,6 +3811,7 @@ mod tests {
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
             sched_claimed: &Default::default(),
+            moods_claimed: &Default::default(),
         };
         for s in ["vx_and_1", "vx_or_1"] {
             let uuid = l.objects[s].uuid.clone();
@@ -3742,6 +3838,7 @@ mod tests {
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
             sched_claimed: &Default::default(),
+            moods_claimed: &Default::default(),
         };
         let mut files = Files::default();
         let err = |op: Op| apply_op(&mut files.clone(), &ctx, &op).unwrap_err();
@@ -3777,6 +3874,7 @@ mod tests {
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
             sched_claimed: &Default::default(),
+            moods_claimed: &Default::default(),
         };
         let e = apply_op(&mut Files::default(), &ctx, &add(OG, "And", None, &[], &[])).unwrap_err();
         assert!(e.contains("2 pages are titled"), "{e}");
@@ -3827,6 +3925,7 @@ mod tests {
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
             sched_claimed: &Default::default(),
+            moods_claimed: &Default::default(),
         };
         apply_op(&mut files, &ctx, &add(OG, "And", Some("Licht"), &[], &[])).unwrap();
         // Deployed: the base draws it where lox placed it.
@@ -3845,6 +3944,7 @@ mod tests {
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
             sched_claimed: &Default::default(),
+            moods_claimed: &Default::default(),
         };
         // Snapped to the grid, the size kept; `previous` moves it back.
         let mut files = Files::from_texts(&files.render()).unwrap();
@@ -3928,6 +4028,7 @@ mod tests {
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
             sched_claimed: &Default::default(),
+            moods_claimed: &Default::default(),
         };
         apply_op(&mut files, &ctx, &add(OG, "And", None, &[], &[])).unwrap();
         apply_op(&mut files, &ctx, &add(OG, "Or", None, &[], &[])).unwrap();
@@ -3943,6 +4044,7 @@ mod tests {
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
             sched_claimed: &Default::default(),
+            moods_claimed: &Default::default(),
         };
         let err = |op: Op| apply_op(&mut files.clone(), &ctx, &op).unwrap_err();
         // Drawn in Loxone Config: lox does not move it.
@@ -4050,6 +4152,7 @@ mod tests {
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
             sched_claimed: &Default::default(),
+            moods_claimed: &Default::default(),
         };
         apply_op(&mut files, &ctx, &add(OG, "And", None, &[], &[])).unwrap();
         let out = compile_files(&d, &files, &mut l).unwrap();
@@ -4075,6 +4178,7 @@ mod tests {
                 adoptions: &Default::default(),
                 page_adoptions: &Default::default(),
                 sched_claimed: &Default::default(),
+                moods_claimed: &Default::default(),
             };
             files.layout = Placement::default();
             apply_op(
@@ -4146,6 +4250,7 @@ mod tests {
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
             sched_claimed: &Default::default(),
+            moods_claimed: &Default::default(),
         };
         apply_op(&mut files, &ctx, &add(OG, "And", None, &[], &[])).unwrap();
         apply_op(&mut files, &ctx, &add(EG, "Or", None, &[], &[])).unwrap();
@@ -4200,6 +4305,7 @@ mod tests {
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
             sched_claimed: &Default::default(),
+            moods_claimed: &Default::default(),
         };
         apply_op(&mut files, &ctx, &add(OG, "And", None, &[], &[])).unwrap();
         let out = compile_files(&d, &files, &mut l).unwrap();
@@ -4289,6 +4395,7 @@ mod tests {
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
             sched_claimed: &Default::default(),
+            moods_claimed: &Default::default(),
         };
         // The Divide block's output onto the upper floor's OR: another page.
         let w = wire_op((DIV, "AQ"), (OR, "I2"));
@@ -4335,6 +4442,7 @@ mod tests {
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
             sched_claimed: &Default::default(),
+            moods_claimed: &Default::default(),
         };
         // One request may take a wire out and draw it again (an undo and a
         // redo, a reconnect to the same port): the ops see each other.
@@ -4373,6 +4481,7 @@ mod tests {
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
             sched_claimed: &Default::default(),
+            moods_claimed: &Default::default(),
         };
         let err = |op: Op| apply_op(&mut Files::default(), &ctx, &op).unwrap_err();
         assert!(err(wire_op((DIV, "Input2"), (OR, "I2"))).contains("is an input"));
@@ -4422,6 +4531,7 @@ mod tests {
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
             sched_claimed: &Default::default(),
+            moods_claimed: &Default::default(),
         };
         let e = apply_op(
             &mut Files::default(),
@@ -4458,6 +4568,7 @@ mod tests {
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
             sched_claimed: &Default::default(),
+            moods_claimed: &Default::default(),
         };
         let e = apply_op(
             &mut Files::default(),
@@ -4497,6 +4608,7 @@ mod tests {
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
             sched_claimed: &Default::default(),
+            moods_claimed: &Default::default(),
         };
         apply_op(&mut files, &ctx, &add(OG, "And", None, &[("I2", "1")], &[])).unwrap();
         let out = compile_files(&d, &files, &mut l).unwrap();
@@ -4512,6 +4624,7 @@ mod tests {
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
             sched_claimed: &Default::default(),
+            moods_claimed: &Default::default(),
         };
         // Its input with a constant takes no wire; the other does.
         let e = apply_op(&mut files, &ctx, &wire_op((DIV, "AQ"), (&new, "I2"))).unwrap_err();
@@ -4548,6 +4661,7 @@ mod tests {
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
             sched_claimed: &Default::default(),
+            moods_claimed: &Default::default(),
         };
         let undo = apply_op(&mut files, &ctx, &Op::RemoveBlock { uuid: new.clone() })
             .unwrap()
@@ -4586,6 +4700,7 @@ mod tests {
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
             sched_claimed: &Default::default(),
+            moods_claimed: &Default::default(),
         };
         let a = apply_op(&mut files, &ctx, &undo).unwrap();
         let slug2 = a.added.unwrap();
@@ -4677,6 +4792,7 @@ mod tests {
             adoptions: &adoptions,
             page_adoptions: &pages,
             sched_claimed: &Default::default(),
+            moods_claimed: &Default::default(),
         };
         let back = |f: &mut Files, u: &str| {
             apply_op(
@@ -4822,6 +4938,7 @@ mod tests {
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
             sched_claimed: &claimed,
+            moods_claimed: &Default::default(),
         };
         let (mon, sat, hol) = (builtin_uuid(4), builtin_uuid(9), builtin_uuid(1));
         let wk: Vec<(String, Vec<Sp>)> = (4..=8)
@@ -5039,6 +5156,7 @@ mod tests {
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
             sched_claimed: &Default::default(),
+            moods_claimed: &Default::default(),
         };
         let mon = builtin_uuid(4);
         let mut files = Files::default();
@@ -5145,6 +5263,7 @@ mod tests {
             adoptions: &Default::default(),
             page_adoptions: &Default::default(),
             sched_claimed: &Default::default(),
+            moods_claimed: &Default::default(),
         };
         let mut files = Files::default();
         let mon = builtin_uuid(4);
@@ -5201,5 +5320,396 @@ mod tests {
                 .unwrap_err()
                 .contains("neither an extern")
         );
+    }
+
+    // ── lighting moods (#74) ───────────────────────────────────────────
+
+    fn mrow(name: &str, values: &str) -> crate::mood_edit::MoodRow {
+        crate::mood_edit::MoodRow {
+            name: name.into(),
+            values: values.into(),
+        }
+    }
+
+    fn moods_op(uuid: &str, set: Option<&str>, rows: &[(&str, &str)]) -> Op {
+        Op::Moods {
+            uuid: uuid.into(),
+            value: Some(crate::mood_edit::MoodsVal {
+                set: set.map(Into::into),
+                moods: (!rows.is_empty()).then(|| rows.iter().map(|(n, v)| mrow(n, v)).collect()),
+                ..Default::default()
+            }),
+        }
+    }
+
+    /// A controller's moods in `doc`: (name, SID, rendered values), off mood included.
+    fn moods_in(doc: &LoxoneDoc, uuid: &str) -> Vec<(String, String, String)> {
+        let m = loxone_config::moods::Moods::read(find(&doc.xml.root, uuid).unwrap()).unwrap();
+        m.moods
+            .iter()
+            .map(|x| {
+                (
+                    x.name.clone(),
+                    x.sid.clone().unwrap_or_default(),
+                    loxone_config::moods::render(&x.qs),
+                )
+            })
+            .collect()
+    }
+
+    fn mood_ctx<'a>(
+        d: &'a LoxoneDoc,
+        lock: &'a Lock,
+        names: &'a BTreeSet<String>,
+        claimed: &'a BTreeMap<String, String>,
+    ) -> Ctx<'a> {
+        Ctx {
+            doc: d,
+            lock,
+            base: d,
+            deployed: None,
+            names,
+            drawn: &EMPTY_WIRES,
+            adoptions: &EMPTY_ADOPT,
+            page_adoptions: &EMPTY_PAGES,
+            sched_claimed: &EMPTY_CLAIMS,
+            moods_claimed: claimed,
+        }
+    }
+
+    static EMPTY_WIRES: BTreeSet<Wire> = BTreeSet::new();
+    static EMPTY_ADOPT: BTreeMap<String, crate::adopt::Adoption> = BTreeMap::new();
+    static EMPTY_PAGES: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    static EMPTY_CLAIMS: BTreeMap<String, String> = BTreeMap::new();
+
+    #[test]
+    fn moods_are_a_set_lox_writes_onto_the_controller() {
+        use crate::mood_edit::fixture::{FLUR, LICHT};
+        let d = LoxoneDoc::parse(crate::mood_edit::fixture::house().as_bytes()).unwrap();
+        let (names, claimed) = (BTreeSet::new(), BTreeMap::new());
+        let mut l = Lockfile::default();
+        let lock = lock_of(&l);
+        let ctx = mood_ctx(&d, &lock, &names, &claimed);
+        let mut files = Files::default();
+        // "Kino" deleted, "Neu" added, "Lesen" first.
+        let op = moods_op(
+            LICHT,
+            None,
+            &[
+                ("Lesen", "AQ1 on, AQ2 50%"),
+                ("Viel Licht", "all on"),
+                ("Neu", "AQ3 temp(80%, 3000K)"),
+            ],
+        );
+        let a = apply_op(&mut files, &ctx, &op).unwrap();
+        assert_eq!(a.previous, serde_json::Value::Null);
+        let text = &files.render()["edits.loxl"];
+        let s = slug(LICHT);
+        for want in [
+            format!("extern {s} = LightController2(uuid: \"{LICHT}\")\n"),
+            "moods vx_licht_moods\n\t\"Lesen\": AQ1 on, AQ2 50%\n\t\"Viel Licht\": all on\n\t\"Neu\": AQ3 temp(80%, 3000K)\nend\n"
+                .to_string(),
+            format!("{s}.moods = vx_licht_moods\n"),
+        ] {
+            assert!(text.contains(&want), "{want} in\n{text}");
+        }
+        assert_eq!(
+            Files::from_texts(&files.render()).unwrap().claims,
+            files.claims
+        );
+        let out = compile_files(&d, &files, &mut l).unwrap();
+        let got = moods_in(&out, LICHT);
+        // The off mood stays last; Lesen keeps its scene id, and Neu takes the
+        // lowest free one: Kino's, which a button on Sel2 would now select.
+        assert_eq!(
+            got.iter()
+                .map(|m| (m.0.as_str(), m.1.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("Lesen", "1"),
+                ("Viel Licht", "777"),
+                ("Neu", "2"),
+                ("Aus", "778")
+            ]
+        );
+        assert_eq!(got[0].2, "AQ1 on, AQ2 50%");
+        // `all on` fits switches only: the dimmer and the white circuit stay off.
+        assert_eq!(got[1].2, "all on, AQ2 off, AQ3 off");
+        assert!(crate::mood_edit::missed(&files, &out, &lock, &[LICHT.into()], &[]).is_empty());
+        assert!(crate::mood_edit::missed(&files, &d, &lock, &[LICHT.into()], &[]) == ["Licht"]);
+        assert!(crate::mood_edit::differs(&out, &d, LICHT));
+        assert!(!crate::mood_edit::differs(&out, &d, FLUR));
+
+        // Changed again: its own set is rewritten; previous is what it claimed.
+        let ctx2 = Ctx { doc: &out, ..ctx };
+        let op2 = moods_op(LICHT, None, &[("Viel Licht", "all off")]);
+        let a2 = apply_op(&mut files, &ctx2, &op2).unwrap();
+        let prev: crate::mood_edit::MoodsVal =
+            serde_json::from_value::<Option<_>>(a2.previous.clone())
+                .unwrap()
+                .unwrap();
+        assert_eq!(prev.set.as_deref(), Some("vx_licht_moods"));
+        assert_eq!(prev.moods.as_ref().unwrap().len(), 3);
+        assert_eq!(files.claims.3.sets.len(), 1);
+        let undo = undo_ops(std::slice::from_ref(&op2), &[a2.previous], &[]).unwrap();
+        assert_eq!(
+            undo,
+            [Op::Moods {
+                uuid: LICHT.into(),
+                value: Some(prev)
+            }]
+        );
+        // Dropped: the controller is as the base has it; the set and extern go.
+        apply_op(
+            &mut files,
+            &ctx2,
+            &Op::Moods {
+                uuid: LICHT.into(),
+                value: None,
+            },
+        )
+        .unwrap();
+        assert!(files.claims.3.is_empty() && files.claims.0.is_empty());
+        let out3 = compile_files(&d, &files, &mut l).unwrap();
+        assert_eq!(moods_in(&out3, LICHT), moods_in(&d, LICHT));
+    }
+
+    #[test]
+    fn moods_lox_would_refuse_are_refused_first() {
+        use crate::mood_edit::fixture::{BAD, LICHT};
+        let d = LoxoneDoc::parse(crate::mood_edit::fixture::house().as_bytes()).unwrap();
+        let (names, claimed) = (BTreeSet::new(), BTreeMap::new());
+        let lock = Lock::default();
+        let ctx = mood_ctx(&d, &lock, &names, &claimed);
+        let err = |op: Op| apply_op(&mut Files::default(), &ctx, &op).unwrap_err();
+        // "Viel Licht" is built in: it stays (a rename is a delete).
+        let e = err(moods_op(LICHT, None, &[("Lesen", "all on")]));
+        assert!(e.contains("\"Viel Licht\" is a built-in mood"), "{e}");
+        let e = err(moods_op(
+            LICHT,
+            None,
+            &[("Bright", "all on"), ("Lesen", "")],
+        ));
+        assert!(e.contains("cannot be deleted or renamed"), "{e}");
+        // The off mood is never in the set.
+        let e = err(moods_op(
+            LICHT,
+            None,
+            &[("Viel Licht", "all on"), ("Aus", "")],
+        ));
+        assert!(e.contains("off mood"), "{e}");
+        // A value the circuit cannot take: a colour on a switch, on on a dimmer.
+        let e = err(moods_op(LICHT, None, &[("Viel Licht", "AQ1 rgb(1, 2, 3)")]));
+        assert!(
+            e.contains("AQ1 is") && e.contains("switch or dimmer"),
+            "{e}"
+        );
+        let e = err(moods_op(BAD, None, &[("Viel Licht", "AQ1 on")]));
+        assert!(
+            e.starts_with("Bad: ") && e.contains("dimmer circuit"),
+            "{e}"
+        );
+        let e = err(moods_op(LICHT, None, &[("Viel Licht", "AQ19 on")]));
+        assert!(e.contains("18 circuits"), "{e}");
+        let e = err(moods_op(LICHT, None, &[("Viel Licht", "AQ1 bright")]));
+        assert!(e.contains("mood \"Viel Licht\""), "{e}");
+        // `all on` sets only the circuits it fits: fine on a dimmer.
+        apply_op(
+            &mut Files::default(),
+            &ctx,
+            &moods_op(BAD, None, &[("Viel Licht", "all on")]),
+        )
+        .unwrap();
+        // Not a controller; one the module claims.
+        assert!(err(moods_op(DIV, None, &[("A", "")])).contains("only a lighting controller"));
+        let elsewhere = BTreeMap::from([(LICHT.to_string(), "pages/licht.loxl:4".to_string())]);
+        let e = apply_op(
+            &mut Files::default(),
+            &mood_ctx(&d, &lock, &names, &elsewhere),
+            &moods_op(LICHT, None, &[("Viel Licht", "all on")]),
+        )
+        .unwrap_err();
+        assert!(e.contains("pages/licht.loxl:4 claims its moods"), "{e}");
+        // Dropping vislox's claim on it is always let through.
+        apply_op(
+            &mut Files::default(),
+            &mood_ctx(&d, &lock, &names, &elsewhere),
+            &Op::Moods {
+                uuid: LICHT.into(),
+                value: None,
+            },
+        )
+        .unwrap();
+    }
+
+    /// Rewriting a set other controllers share is undone whole, and a
+    /// controller whose circuits do not take the set is refused (#74).
+    #[test]
+    fn a_shared_mood_set_is_undone_whole_and_checked_for_every_controller() {
+        use crate::mood_edit::fixture::{BAD, FLUR, LICHT};
+        let d = LoxoneDoc::parse(crate::mood_edit::fixture::house().as_bytes()).unwrap();
+        let (names, claimed) = (BTreeSet::new(), BTreeMap::new());
+        let mut l = Lockfile::default();
+        let lock = lock_of(&l);
+        let ctx = mood_ctx(&d, &lock, &names, &claimed);
+        let mut files = Files::default();
+        apply_op(
+            &mut files,
+            &ctx,
+            &moods_op(
+                LICHT,
+                None,
+                &[("Viel Licht", "all on"), ("Lesen", "AQ1 on")],
+            ),
+        )
+        .unwrap();
+        // Flur takes the same set; Bad cannot (AQ1 on does not fit its dimmer).
+        apply_op(
+            &mut files,
+            &ctx,
+            &moods_op(FLUR, Some("vx_licht_moods"), &[]),
+        )
+        .unwrap();
+        let e = apply_op(
+            &mut files.clone(),
+            &ctx,
+            &moods_op(BAD, Some("vx_licht_moods"), &[]),
+        )
+        .unwrap_err();
+        assert!(e.contains("Bad") && e.contains("dimmer circuit"), "{e}");
+        let was = files.clone();
+        let licht_before = moods_in(&compile_files(&d, &files, &mut l.clone()).unwrap(), LICHT);
+        // Flur rewrites the shared set: both change; the undo gives Licht its moods back.
+        let op = moods_op(FLUR, Some("vx_licht_moods"), &[("Viel Licht", "AQ2 40%")]);
+        let a = apply_op(&mut files, &ctx, &op).unwrap();
+        let out = compile_files(&d, &files, &mut l).unwrap();
+        assert_eq!(moods_in(&out, LICHT)[0].2, "AQ2 40%");
+        assert_eq!(moods_in(&out, FLUR)[0].2, "AQ2 40%");
+        let undo = undo_ops(
+            std::slice::from_ref(&op),
+            std::slice::from_ref(&a.previous),
+            &[],
+        )
+        .unwrap();
+        let Op::Moods { value: Some(v), .. } = &undo[0] else {
+            panic!("{undo:?}")
+        };
+        assert_eq!(v.set.as_deref(), Some("vx_licht_moods"));
+        let b = apply_op(&mut files, &ctx, &undo[0]).unwrap();
+        assert_eq!(files.claims, was.claims);
+        let out = compile_files(&d, &files, &mut l).unwrap();
+        assert_eq!(moods_in(&out, LICHT), licht_before);
+        // Flur on a set of its own: Licht's stays; and the redo rewrites it whole again.
+        let redo = undo_ops(std::slice::from_ref(&undo[0]), &[b.previous], &[]).unwrap();
+        apply_op(&mut files, &ctx, &redo[0]).unwrap();
+        let out = compile_files(&d, &files, &mut l).unwrap();
+        assert_eq!(moods_in(&out, LICHT)[0].2, "AQ2 40%");
+        apply_op(
+            &mut files,
+            &ctx,
+            &moods_op(FLUR, None, &[("Viel Licht", "all off")]),
+        )
+        .unwrap();
+        assert_eq!(files.claims.3.sets.len(), 2);
+        assert_eq!(files.claims.3.claims[&slug(FLUR)], "vx_flur_moods");
+        // A mood set and a schedule set share one namespace.
+        assert!(crate::sched_edit::taken(&files, &ctx, "vx_flur_moods"));
+    }
+
+    #[test]
+    fn a_moods_claim_vislox_did_not_write_is_refused() {
+        use crate::mood_edit::fixture::LICHT;
+        let s = slug(LICHT);
+        let ext = format!("extern {s} = LightController2(uuid: \"{LICHT}\")\n");
+        let set = "moods vx_a\n\t\"Viel Licht\": all on\nend\n";
+        let read = |t: String| Files::from_texts(&BTreeMap::from([("edits.loxl".to_string(), t)]));
+        assert!(read(format!("{ext}{set}{s}.moods = vx_a\n")).is_ok());
+        assert!(
+            read(format!(
+                "{ext}moods wohnen\n\t\"A\": all on\nend\n{s}.moods = wohnen\n"
+            ))
+            .is_err()
+        );
+        assert!(read(format!("{ext}{s}.moods = vx_b\n")).is_err());
+        assert!(
+            read(format!("{set}{s}.moods = vx_a\n"))
+                .unwrap_err()
+                .contains("neither an extern")
+        );
+    }
+
+    /// `Circuit<n>:` on a controller vislox added: switch or dimmer, never on
+    /// a colour circuit (#74).
+    #[test]
+    fn a_circuit_is_declared_as_switch_or_dimmer_on_a_managed_controller() {
+        use crate::mood_edit::{circuit_setting, fixture::LICHT};
+        let d = LoxoneDoc::parse(crate::mood_edit::fixture::house().as_bytes()).unwrap();
+        let el = find(&d.xml.root, LICHT).unwrap();
+        assert!(circuit_setting(el, "Circuit2", "dimmer").is_ok());
+        assert!(
+            circuit_setting(el, "Circuit3", "dimmer")
+                .unwrap_err()
+                .contains("colour circuit")
+        );
+        assert!(
+            circuit_setting(el, "Circuit1", "rgb")
+                .unwrap_err()
+                .contains("\"switch\" or \"dimmer\"")
+        );
+        assert!(circuit_setting(el, "Circuit6", "switch").is_err());
+        // Written into the declaration of a controller added here.
+        let mut files = Files::default();
+        let mut l = Lockfile::default();
+        let (names, claimed) = (BTreeSet::new(), BTreeMap::new());
+        let lock0 = lock_of(&l);
+        let ctx = mood_ctx(&d, &lock0, &names, &claimed);
+        apply_op(
+            &mut files,
+            &ctx,
+            &add(OG, "LightController2", Some("Neu"), &[], &[]),
+        )
+        .unwrap();
+        let out = compile_files(&d, &files, &mut l).unwrap();
+        let lock = lock_of(&l);
+        let (slug_new, uuid) = l
+            .objects
+            .iter()
+            .find(|(s, _)| s.starts_with("vx_lightcontroller2"))
+            .map(|(s, o)| (s.clone(), o.uuid.clone()))
+            .unwrap();
+        let ctx = Ctx {
+            doc: &out,
+            ..mood_ctx(&d, &lock, &names, &claimed)
+        };
+        let op = Op::Setting {
+            uuid: uuid.clone(),
+            name: "Circuit1".into(),
+            value: Some("dimmer".into()),
+        };
+        let a = apply_op(&mut files, &ctx, &op).unwrap();
+        assert_eq!(a.previous, serde_json::Value::Null);
+        let text = files
+            .render()
+            .into_iter()
+            .find(|(k, _)| k != "edits.loxl")
+            .unwrap()
+            .1;
+        assert!(
+            text.contains(&format!(
+                "{slug_new} = LightController2(\"Neu\", Circuit1: \"dimmer\")"
+            )),
+            "{text}"
+        );
+        let e = apply_op(
+            &mut files.clone(),
+            &ctx,
+            &Op::Setting {
+                uuid,
+                name: "Circuit1".into(),
+                value: Some("rgb".into()),
+            },
+        )
+        .unwrap_err();
+        assert!(e.contains("\"switch\" or \"dimmer\""), "{e}");
     }
 }

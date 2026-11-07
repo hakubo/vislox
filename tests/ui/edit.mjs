@@ -42,6 +42,23 @@ const timerXml = (u, title, y, modes, entries, analog = true) => `\t\t\t<C Type=
 \t\t\t\t<Co K="AQ" U="${u.slice(0, 19)}2-01ff504f94000001"/>
 ${entries.map((e) => `\t\t\t\t${e}\n`).join("")}\t\t\t</C>
 `;
+// Two lighting controllers on the upper floor (#74): Wohnzimmer, whose T5/1 (Sel1) a button wires to "Lesen", and
+// Diele. AQ1 is a switch (Deckenlicht), AQ2 a dimmer without an actuator, AQ3 tunable white, the rest switches; the
+// moods are "Viel Licht" (777), "Lesen" (1), "Kino" (2) and the off mood "Aus" (778), last.
+const LC_W = "10000040-0000-0400-ffff504f94000001", LC_F = "10000041-0000-0410-ffff504f94000001";
+const TW = (b, k) => 6 * 2 ** 28 + 200000000 + 10000 * b + k;
+const lcXml = (u, title, y, button) => {
+  const mood = (name, sid, cid, flag, q, rest) => `\t\t\t\t\t<LightsceneC Name="${name}" UUID="${u.slice(0, 33)}${cid}"${flag} Outputs="18" SID="${sid}" CID="${cid}" ${[...q, ...Array(15).fill(rest)].map((v, i) => `Q${i + 1}="${v}"`).join(" ")}/>\n`;
+  const co = (k, n, from) => `\t\t\t\t<Co K="${k}" U="${u.slice(0, 17)}${n}-00ff504f94000001"${from ? `>\n\t\t\t\t\t<In Input="${from}"/>\n\t\t\t\t</Co>` : "/>"}\n`;
+  return `\t\t\t<C Type="LightController2" V="178" U="${u}" Title="${title}" Px="12480" Py="${y}" Px2="15168" Py2="${y + 2232}" Nio="5" NameAI0="Deckenlicht" PresM0="65535">\n` +
+    co("Sel1", 1, button ? "10000004-0000-0043-02ff504f94000001" : null) + co("Sel2", 2) + co("AQ1", 3) + co("AQ2", 4) + co("AQ3", 5) +
+    `\t\t\t\t<LightscenesC FC="0040FFFF" Outputs="18" Num="4">\n` +
+    mood("Viel Licht", 777, 22, ' Move="true"', [1, 2 ** 28 + 100, TW(100, 2700)], 1) +
+    mood("Lesen", 1, 12, "", [1, 2 ** 28 + 80, 6 * 2 ** 28], 0) +
+    mood("Kino", 2, 13, "", [0, 2 ** 28, TW(20, 2700)], 0) +
+    mood("Aus", 778, 11, ' ReadOnly="true"', [0, 2 ** 28, 6 * 2 ** 28], 0) +
+    `\t\t\t\t</LightscenesC>\n\t\t\t\t<LSConfig OpM="778" ScMv="777" ScAc="1"/>\n\t\t\t</C>\n`;
+};
 const root = mkdtempSync(join(tmpdir(), "vislox-edit-"));
 const dir = join(root, "project");
 mkdirSync(join(dir, "pages"), { recursive: true });
@@ -60,7 +77,8 @@ const base = readFileSync(fixture, "utf8").replace('<Co K="Q" U="10000009-0000-0
 \t\t\t\t<Co K="Q" U="1000000b-0000-00b3-02ff504f94000001"/>
 \t\t\t</C>`)
   .replace(`\t\t\t<C Type="And" V="178" U="${FLUR}"`, timerXml(UHR, "Uhr", 4800, `${MON},${PARTY}`, ['<Entry From="390" To="480" V="21"/>', '<Entry From="1080" To="1380" Ix="1" V="22.5"/>']) +
-    timerXml(HEIZ, "Heizung", 6720, "", []) + timerXml(LICHT, "Licht", 8640, "", [], false) + `\t\t\t<C Type="And" V="178" U="${FLUR}"`)
+    timerXml(HEIZ, "Heizung", 6720, "", []) + timerXml(LICHT, "Licht", 8640, "", [], false) +
+    lcXml(LC_W, "Wohnzimmer", 4800, true) + lcXml(LC_F, "Diele", 7680, false) + `\t\t\t<C Type="And" V="178" U="${FLUR}"`)
   // Two rooms; the Divide block is shown in the app, in the kitchen.
   .replace('\t\t<C Type="Page" V="178" U="10000002', `\t\t<C Type="Place" V="178" U="${KITCHEN}" Title="Küche"/>
 \t\t<C Type="Place" V="178" U="${BATH}" Title="Bad"/>
@@ -118,7 +136,19 @@ if (process.argv.slice(2, 5).join(" ") === "logic lint .") {
     ? ["  \\\`Anna\\\` — user with an NFC tag has no access right on any NFC Code Touch, so the tag or code opens nothing."] : [];
   if (dead.length) console.log(\`dead-outputs (\${dead.length})\\n\${dead.join("\\n")}\`);
   if (access.length) console.log(\`no-access-right (1)\\n\${access[0]}\`);
-  const n = dead.length + access.length;
+  // no-actuator (#74): a percentage on a circuit of a claimed controller that has no actuator (no NameAI).
+  const ed = fs.existsSync("pages/vislox/edits.loxl") ? fs.readFileSync("pages/vislox/edits.loxl", "utf8") : "";
+  const base = fs.readFileSync("base.Loxone", "utf8");
+  const noAct = [];
+  for (const [, slug, set] of ed.matchAll(/^(\\w+)\\.moods = (\\w+)$/gm)) {
+    const uuid = ed.match(new RegExp(\`^extern \${slug} = \\\\w+\\\\(uuid: "([^"]+)"\\\\)\`, "m"))?.[1];
+    const head = base.split("\\n").find((l) => l.includes(\`U="\${uuid}"\`) && l.includes("<C ")) || "";
+    const body = ed.split(\`moods \${set}\\n\`)[1]?.split("\\nend")[0] || "";
+    for (const [, name, n, pct] of body.matchAll(/"([^"]*)":[^\\n]*?\\bAQ(\\d+) (\\d+)%/g))
+      if (!head.includes(\` NameAI\${n - 1}=\`)) noAct.push(\`  pages/vislox/edits.loxl: \\\`\${slug}\\\` — AQ\${n} has no actuator, so the Miniserver switches it: "\${name}" \${pct}% turns it on, not dimmed. Assign the actuator in Loxone Config's mood editor, or write \\\`on\\\`\`);
+  }
+  if (noAct.length) console.log(\`no-actuator (\${noAct.length})\\n\${noAct.join("\\n")}\`);
+  const n = dead.length + access.length + noAct.length;
   console.log(n ? \`lint: \${n} finding\${n === 1 ? "" : "s"}\` : "lint: clean");
   process.exit(n ? 1 : 0);
 }
@@ -191,6 +221,7 @@ for (const line of src.split("\\n")) {
   if ((m = line.match(/^extern (\\w+) = \\w+\\(uuid: "([^"]+)"\\)/))) { slugs[m[1]] = m[2]; continue; }
   if (!(m = line.match(/^(\\w+)\\.(\\w+) = (.*)$/))) continue;
   if (m[2] === "schedule") { claimed.push([slugs[m[1]], m[3]]); continue; }
+  if (m[2] === "moods") continue; // below (#74)
   const uuid = slugs[m[1]], i = out.findIndex((l) => l.includes(\`U="\${uuid}"\`));
   if (m[2] === "title") { out[i] = out[i].replace(/Title="[^"]*"/, \`Title="\${xml(unq(m[3]))}"\`); continue; }
   if (m[2] === "room") {
@@ -240,6 +271,56 @@ for (const [uuid, name] of claimed) {
   const kept = out.slice(i + 1, j).filter((l) => !l.includes("<Entry"));
   const head = out[i].replace(/ Modes="[^"]*"/, "").replace(/ N="\\d+"/, "").replace(/>$/, \` N="\${entries.length}" Modes="\${order.map(([u]) => u).join(",")}">\`);
   out.splice(i, j - i, head, ...kept, ...entries);
+}
+// Lighting moods (#74): each \`moods\` set of vislox's file, written onto the controllers its claims name as lox
+// writes them: a mood the controller has keeps its scene id, a new one takes the lowest free one, a mood left out
+// goes, and the off mood stays where it is. Each circuit's value follows its kind (the Q's top four bits).
+{
+  const msets = {};
+  let cur = null;
+  for (const line of src.split("\\n")) {
+    const m = line.match(/^moods (\\w+)$/);
+    if (m) cur = msets[m[1]] = [];
+    else if (line === "end") cur = null;
+    else if (cur && line.trim()) { const x = line.trim().match(/^"((?:[^"\\\\]|\\\\.)*)": (.*)$/); cur.push([JSON.parse('"' + x[1] + '"'), x[2]]); }
+  }
+  const P = 2 ** 28;
+  const enc = (prefix, v) => {
+    let m;
+    if (v === "off") return prefix * P;
+    if (v === "on") return prefix === 0 ? 1 : null;
+    if ((m = v.match(/^(\\d+)%$/))) return prefix <= 1 ? prefix * P + +m[1] : null;
+    if ((m = v.match(/^rgb\\((\\d+), (\\d+), (\\d+)\\)$/))) return prefix >= 4 ? prefix * P + +m[1] + 1000 * +m[2] + 1000000 * +m[3] : null;
+    if ((m = v.match(/^temp\\((\\d+)%, (\\d+)K\\)$/))) return prefix >= 5 ? prefix * P + 200000000 + 10000 * +m[1] + +m[2] : null;
+    return null;
+  };
+  for (const [, slug, set] of src.matchAll(/^(\\w+)\\.moods = (\\w+)$/gm)) {
+    const uuid = slugs[slug];
+    const i = out.findIndex((l) => l.includes(\`U="\${uuid}"\`) && l.includes("<C "));
+    const a = out.findIndex((l, n) => n > i && l.includes("<LightscenesC")), b = out.findIndex((l, n) => n > a && l.includes("</LightscenesC>"));
+    const old = out.slice(a + 1, b);
+    const attr = (l, k) => l.match(new RegExp(\` \${k}="([^"]*)"\`))?.[1];
+    const prefixes = Array.from({ length: 18 }, (_, n) => Math.floor(+attr(old[0], \`Q\${n + 1}\`) / P));
+    const offAt = old.findIndex((l) => attr(l, "SID") === "778");
+    const keep = (l) => msets[set].some(([nm]) => nm === attr(l, "Name"));
+    const sids = new Set([776, 777, 778, ...old.filter(keep).map((l) => +attr(l, "SID"))]);
+    const moods = msets[set].map(([name, settings]) => {
+      const parts = settings.match(/(all|AQ\\d+) (rgb\\([^)]*\\)|temp\\([^)]*\\)|[^,]+)/g);
+      const all = parts.find((p) => p.startsWith("all "))?.slice(4) ?? "off";
+      const qs = prefixes.map((pf, n) => { const own = parts.find((p) => p.startsWith(\`AQ\${n + 1} \`)); return own ? enc(pf, own.slice(own.indexOf(" ") + 1)) : enc(pf, all) ?? pf * P; });
+      let l = old.find((x) => attr(x, "Name") === name && attr(x, "SID") !== "778");
+      if (!l) {
+        let sid = 1;
+        while (sids.has(sid)) sid++;
+        sids.add(sid);
+        l = \`\\t\\t\\t\\t\\t<LightsceneC Name="\${xml(name)}" UUID="cccccc\${String(sid).padStart(2, "0")}-0000-0000-ffff504f94000001" Outputs="18" SID="\${sid}" CID="\${30 + sid}" \${qs.map((_, n) => \`Q\${n + 1}="0"\`).join(" ")}/>\`;
+      }
+      return qs.reduce((x, q, n) => x.replace(new RegExp(\` Q\${n + 1}="[^"]*"\`), \` Q\${n + 1}="\${q}"\`), l);
+    });
+    if (offAt >= 0) moods.splice(offAt === old.length - 1 ? moods.length : Math.min(offAt, moods.length), 0, old[offAt]);
+    out.splice(a + 1, b - a - 1, ...moods);
+    out[a] = out[a].replace(/Num="\\d+"/, \`Num="\${moods.length}"\`);
+  }
 }
 // vislox's new blocks: one file per page (page "…"), a declaration per block. Each gets a UUID in the
 // lock (kept by slug across compiles) and is drawn on its page with the constants it is given.
@@ -1357,6 +1438,112 @@ try {
     assert.deepEqual(await rv({ deployed: { set: "vx_a", modes: M } }, [{ name: "vx_a", timers: [UHR, HEIZ] }]), { value: { modes: M } });
     assert.deepEqual(await rv({ deployed: { set: "vx_a", modes: M } }, [{ name: "vx_a", timers: [HEIZ] }]), { value: { modes: M } });
     assert.match((await rv({ deployed: { set: "vx_a", modes: null } }, [{ name: "vx_a", timers: [HEIZ] }])).why, /Heizung claims that set now/);
+  });
+  await step("a lighting controller's moods are shown, edited as a moods set, undone, shared and reverted (#74)", async () => {
+    await page.waitForFunction(() => /Nothing pending/.test(document.querySelector("#deploy-pend")?.textContent || ""), null, { timeout: 10000 });
+    await page.evaluate(() => editGoNewest());
+    await settled();
+    await page.evaluate((u) => { gotoPage(S.objPage.get(u), { focus: u }); select(u); }, LC_W);
+    const sec = '#props [data-body="Moods"]';
+    await page.waitForSelector(`${sec} [data-mo="open"]`);
+    // The circuits in use, each with its kind; the moods in order, the off mood marked, Lesen selected by T5/1.
+    const body = await page.textContent(sec);
+    assert.match(body, /AQ1\s*Deckenlicht switch/);
+    assert.match(body, /AQ2\s*no actuator dimmer/);
+    assert.match(body, /AQ3\s*no actuator tunable white/);
+    assert.match(body, /Lesen\s*AQ1 on, AQ2 80%\s*T5\/1 selects it/);
+    assert.match(body, /Aus\s*every circuit off, always there\s*off mood/);
+    assert.match(body, /Viel Licht\s*all on, AQ2 100%, AQ3 temp\(100%, 2700K\)\s*motion/);
+    await page.click(`${sec} [data-mo="open"]`);
+    assert.deepEqual(await page.$$eval("[data-mo-name]", (n) => n.map((x) => x.value)), ["Viel Licht", "Lesen", "Kino"]);
+    // "Viel Licht" is built in: no Delete, and its name stays.
+    assert.equal(await page.$eval('[data-mo="del"][data-i="0"]', (b) => b.disabled), true);
+    assert.equal(await page.$eval('[data-mo-name="0"]', (b) => b.readOnly), true);
+    // Only the values a circuit takes: a dimmer has no "on", tunable white no "%".
+    assert.deepEqual(await page.$$eval('[data-mo="t"][data-k="1|2"] option', (n) => n.map((x) => x.value)), ["off", "pct"]);
+    assert.deepEqual(await page.$$eval('[data-mo="t"][data-k="1|3"] option', (n) => n.map((x) => x.value)), ["off", "temp", "rgb"]);
+    // Lesen dims to 40% (first a value the dimmer cannot take: refused in the browser, nothing sent).
+    await page.fill('[data-mo-field="1|2"]', "140");
+    const n0 = edits.length;
+    await page.click(`${sec} [data-mo="save"]`);
+    await waitText(sec, /Fix the marked moods and values/);
+    assert.equal(edits.length, n0);
+    await page.fill('[data-mo-field="1|2"]', "40");
+    // Kino becomes Film; a new mood, Abend, in tunable white, moved before Film.
+    await page.fill('[data-mo-name="2"]', "Film");
+    await page.click(`${sec} [data-mo="add"]`);
+    await page.fill('[data-mo-name="3"]', "Abend");
+    await page.selectOption('[data-mo="t"][data-k="3|3"]', "temp");
+    await page.fill('[data-mo-field="3|3"]', "30, 2700");
+    await page.click('[data-mo="up"][data-i="3"]');
+    // Renaming Lesen, which a button selects, is warned about first; named back, it saves at once.
+    await page.fill('[data-mo-name="1"]', "Lesen 2");
+    await page.click(`${sec} [data-mo="save"]`);
+    await waitText(sec, /T5\/1 selects "Lesen", which this renames to "Lesen 2"/);
+    assert.equal(await page.textContent(`${sec} [data-mo="save"]`), "Save anyway");
+    assert.equal(edits.length, n0);
+    await page.fill('[data-mo-name="1"]', "Lesen");
+    await page.click(`${sec} [data-mo="save"]`);
+    await until(() => edits.length > n0 && statuses[n0] !== undefined, "the moods request");
+    assert.equal(statuses[n0], 200);
+    const [op] = edits[n0].ops;
+    assert.equal(op.op, "moods");
+    assert.equal(op.uuid, LC_W);
+    assert.deepEqual(op.value.moods.map((m) => m.name), ["Viel Licht", "Lesen", "Abend", "Film"]);
+    assert.deepEqual(op.value.moods.slice(1).map((m) => m.values), ["AQ1 on, AQ2 40%", "AQ3 temp(30%, 2700K)", "AQ3 temp(20%, 2700K)"]);
+    await settled();
+    const file = readFileSync(join(dir, "pages", "vislox", "edits.loxl"), "utf8");
+    assert.match(file, /^moods vx_wohnzimmer_moods\n\t"Viel Licht": AQ1 on, AQ2 100%, AQ3 temp\(100%, 2700K\), AQ4 on, [^\n]*\n\t"Lesen": AQ1 on, AQ2 40%\n\t"Abend": AQ3 temp\(30%, 2700K\)\n\t"Film": AQ3 temp\(20%, 2700K\)\nend$/m);
+    assert.match(file, /^vx_10000040_0000_0400_ffff504f94000001\.moods = vx_wohnzimmer_moods$/m);
+    // Compiled: the pending config has the new moods (Film a new mood: Kino's scene id went to the first new
+    // mood, Abend), marked not deployed; the change list says it in the language's terms.
+    await page.waitForFunction((u) => S.view.objects[u].moods.moods.map((m) => `${m.name}:${m.sid}`).join() === "Viel Licht:777,Lesen:1,Abend:2,Film:3,Aus:778", LC_W, { timeout: 10000 });
+    await waitText(sec, /edited here[\s\S]*not deployed[\s\S]*Revert/);
+    assert.match(await page.textContent(sec), /Written by vislox as vx_wohnzimmer_moods/);
+    await waitText("#deploy-pend", /moods of 1 lighting controller edited here/);
+    const changes = await page.evaluate(() => S.view.changes.map((c) => c.text));
+    assert.ok(changes.includes('Wohnzimmer · mood "Lesen": AQ1 on, AQ2 80% → AQ1 on, AQ2 40%'), changes.join(" | "));
+    assert.ok(changes.includes('Wohnzimmer · mood "Kino" removed (was AQ3 temp(20%, 2700K))'), changes.join(" | "));
+    assert.ok(changes.includes('Wohnzimmer · mood "Film" added: AQ3 temp(20%, 2700K)'), changes.join(" | "));
+    // lox logic lint: a percentage on AQ2, which has no actuator, only switches it; said on the circuit.
+    await waitText(sec, /AQ2[\s\S]*⚠ Lint \(no-actuator[\s\S]*AQ2 has no actuator/);
+    // Undone and redone through the reply's undo.
+    let ops = await undoKey(false, (u) => S.view.objects[u].moods.moods.map((m) => m.name).join() === "Viel Licht,Lesen,Kino,Aus", LC_W);
+    assert.deepEqual(ops, [{ op: "moods", uuid: LC_W, value: null }]);
+    assert.doesNotMatch(readFileSync(join(dir, "pages", "vislox", "edits.loxl"), "utf8"), /moods/);
+    ops = await undoKey(true, (u) => S.view.objects[u].moods.moods.length === 5, LC_W);
+    assert.equal(ops[0].op, "moods");
+    assert.equal(ops[0].value.moods[2].name, "Abend");
+    // Diele takes the same moods: one set, two claims.
+    await page.evaluate((u) => { gotoPage(S.objPage.get(u), { focus: u }); select(u); }, LC_F);
+    await page.waitForSelector('#props [data-mo="same"]');
+    const m = edits.length;
+    await page.selectOption('#props [data-mo="same"]', "vx_wohnzimmer_moods");
+    await until(() => edits.length > m && statuses[m] !== undefined, "the shared moods request");
+    assert.equal(statuses[m], 200);
+    assert.deepEqual(edits[m].ops, [{ op: "moods", uuid: LC_F, value: { set: "vx_wohnzimmer_moods" } }]);
+    await settled();
+    await page.waitForFunction((u) => S.view.objects[u].moods.moods.length === 5, LC_F);
+    await waitText(sec, /shared with Wohnzimmer/);
+    // Reverted: Diele's claim goes; Wohnzimmer keeps the set.
+    await page.click(`${sec} [data-mo="revert"]`);
+    await page.waitForFunction((u) => S.view.objects[u].moods.moods.length === 4 && !S.edits?.moods?.some((x) => x.uuid === u), LC_F, { timeout: 15000 });
+    await settled();
+    assert.match(readFileSync(join(dir, "pages", "vislox", "edits.loxl"), "utf8"), /^vx_10000040_0000_0400_ffff504f94000001\.moods = vx_wohnzimmer_moods$/m);
+    assert.doesNotMatch(readFileSync(join(dir, "pages", "vislox", "edits.loxl"), "utf8"), /0410_ffff504f94000001\.moods/);
+    await page.evaluate((u) => { gotoPage(S.objPage.get(u), { focus: u }); select(u); }, LC_W);
+    await page.waitForSelector(`${sec} [data-mo="revert"]`);
+    await page.click(`${sec} [data-mo="revert"]`);
+    await page.waitForFunction((u) => S.view.objects[u].moods.moods.length === 4 && !S.edits?.moods?.length, LC_W, { timeout: 15000 });
+    await page.waitForFunction(() => /Nothing pending/.test(document.querySelector("#deploy-pend")?.textContent || ""), null, { timeout: 10000 });
+    // moRevertValue: the deployed set while only this controller claims it; else the deployed moods in a set of
+    // its own, never a rewrite of the others'.
+    const M = [{ name: "Viel Licht", values: "all on" }];
+    const rv = (e, sets) => page.evaluate(([e, sets, u]) => moRevertValue(e, sets, u), [e, sets, LC_W]);
+    assert.deepEqual(await rv({ deployed: null }, []), { value: null });
+    assert.deepEqual(await rv({ deployed: { set: "vx_a", moods: M } }, [{ name: "vx_a", controllers: [LC_W] }]), { value: { set: "vx_a", moods: M } });
+    assert.deepEqual(await rv({ deployed: { set: "vx_a", moods: M } }, [{ name: "vx_a", controllers: [LC_W, LC_F] }]), { value: { moods: M } });
+    assert.match((await rv({ deployed: { set: "vx_a", moods: null } }, [{ name: "vx_a", controllers: [LC_F] }])).why, /Diele claims that set now/);
   });
   await step("nothing was deployed: lox only compiled, checked, linted and tested", async () => {
     const ran = readFileSync(calls, "utf8").trim().split("\n");

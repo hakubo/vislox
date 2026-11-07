@@ -65,6 +65,13 @@ The binary is an `axum` server with the UI embedded (plain JS and SVG, no build 
   word, the module's slug of a mode, else its title; alike columns on one line, `daily`/`weekdays`/`weekend`), read
   back into columns (an op's `previous`), and checked after the compile (`missed`). `edit.rs` keeps them in
   `Claims` and dispatches the op; `GET /api/edits` sends `schedules` and `schedule_sets`.
+- `src/mood_edit.rs` is editing a lighting controller's moods (#74): the `moods` op's value (each mood's name and
+  its values in Lox Logic's terms, read with lox's parser), checked against every controller on the set as lox
+  would (the off mood, the built-in and motion moods, the values each circuit's kind takes, with lox's `moods`
+  codec), written as `moods vx_… end` sets and `.moods` claims in `edits.loxl`, and checked after the compile
+  (`missed`); also the `Circuit<n>:` setting of a controller added or adopted here. `model.rs` reads a controller's
+  circuits and moods for Properties (`moods`, `moods_old`) and the Changes list; `GET /api/edits` sends `moods` and
+  `mood_sets`.
 - `src/blocks.rs` is adding blocks (#59): the types vislox offers (`GET /api/block-types`, from lox's builtin
   table and its language server's descriptions), and vislox's file of new blocks per page
   (`<module>/vislox/<page>.loxl`). `edit.rs` applies `add_block` and `remove_block` to it.

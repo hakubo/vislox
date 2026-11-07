@@ -667,14 +667,16 @@ pub fn apply(
 }
 
 /// Whether a new set may not be named `s`: a name of the module, of the
-/// lockfile (its tombstones too) or of vislox's files.
-fn taken(files: &Files, ctx: &Ctx, s: &str) -> bool {
+/// lockfile (its tombstones too) or of vislox's files (its mood sets, #74,
+/// among them: the sets share one namespace).
+pub(crate) fn taken(files: &Files, ctx: &Ctx, s: &str) -> bool {
     ctx.names.contains(s)
         || ctx.lock.slugs.contains_key(s)
         || ctx.lock.tombstones.contains(s)
         || ctx.lock.externals.contains_key(s)
         || files.names(s)
         || files.claims.2.sets.contains_key(s)
+        || files.claims.3.sets.contains_key(s)
         || files.claims.0.keys().any(|u| edit::slug(u) == s)
 }
 

@@ -375,6 +375,24 @@ sends to the Miniserver see [miniserver.md](miniserver.md).
   section says so, with *Revert*. A timer the module's own file claims is changed there. How:
   [editing.md](editing.md#switching-times-73).
 
+- **Lighting moods** (#74): Properties of a lighting controller (LightController2) has *Moods*. *Circuits* lists the
+  circuits in use (the named ones and those a mood other than "Viel Licht" sets; *Show all 18 circuits* for the
+  rest), each with its actuator's name or *no actuator*, and its kind: switch, dimmer, colour (RGB) or tunable
+  white, read off the moods. `lox logic lint`'s `no-actuator` finding shows on its circuit: a percentage on a
+  circuit without an actuator only switches it. *Moods* lists them in the app's order with their values as Lox
+  Logic writes them (`AQ1 on, AQ2 80%, AQ3 temp(60%, 2700K)`), the off mood ("Aus", always there), the built-in and
+  motion moods, and *T5/n selects it* where a button on the controller's `Sel<n>` input selects the mood. Compared
+  with another revision, changed values are marked and the Changes list has a line per mood changed, added or
+  removed, and the new order. *Edit moods* (the same project and token) shows a row per mood and a column per
+  circuit: rename, add, delete (not the built-in and motion moods) and reorder (↑ ↓) moods, and pick each circuit's
+  value from those its kind takes (off, on, a percentage, `rgb`, white), with the numbers beside it. *Save*
+  writes a Lox Logic `moods` set and the controller's claim into vislox's file of the module and compiles. A mood
+  is known by its name: renaming one, or deleting one a button selects, is warned about first (the button then
+  selects nothing, or a new mood that takes its scene id). *Use the same moods as …* lets several controllers
+  share one set. Saved and not deployed, the section says so, with *Revert*. On a controller added or adopted
+  here, each switch or dimmer circuit `AQ1` … `AQ5` can be declared the other kind. How:
+  [editing.md](editing.md#lighting-moods-74).
+
 For a `lox.toml` project:
 
 ```bash

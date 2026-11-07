@@ -230,6 +230,82 @@ fn edit_schedules(
     (json!(schedules), json!(sets))
 }
 
+/// `GET /api/edits`' `moods` and `mood_sets` (#74). Per lighting controller
+/// that vislox's file claims the moods of now or claimed in the deployed
+/// revision: the set and its moods now (`set`, `moods`) and then (`deployed`,
+/// the value a Revert sends), the other controllers sharing its set
+/// (`shared`), and whether the pending config has other moods on it than the
+/// deployed one (`pending`). And vislox's sets, each with its controllers.
+fn edit_moods(
+    now: &edit::Files,
+    was: &edit::Files,
+    lock: &edit::Lock,
+    pending: Option<&loxone_config::LoxoneDoc>,
+    deployed: Option<&loxone_config::LoxoneDoc>,
+) -> (Value, Value) {
+    use crate::mood_edit as me;
+    use crate::sched_edit::timer_of;
+    if pending.or(deployed).is_none() {
+        return (json!([]), json!([]));
+    }
+    // Controller UUID → its slug in vislox's files now, and in the deployed ones.
+    let mut lcs: std::collections::BTreeMap<String, (Option<&str>, Option<&str>)> =
+        Default::default();
+    for (files, now_side) in [(now, true), (was, false)] {
+        for t in files.claims.3.claims.keys() {
+            if let Some(u) = timer_of(files, lock, t) {
+                let slot = lcs.entry(u).or_default();
+                if now_side {
+                    slot.0 = Some(t)
+                } else {
+                    slot.1 = Some(t)
+                }
+            }
+        }
+    }
+    let uuids_of = |set: &str, but: Option<&str>| -> Vec<String> {
+        now.claims
+            .3
+            .claimants(set)
+            .into_iter()
+            .filter(|t| Some(*t) != but)
+            .filter_map(|t| timer_of(now, lock, t))
+            .collect()
+    };
+    let list: Vec<Value> = lcs
+        .into_iter()
+        .map(|(u, (tn, tw))| {
+            let cur = tn.and_then(|t| me::current(now, t));
+            let dep = tw.and_then(|t| me::current(was, t));
+            let set = cur.as_ref().and_then(|c| c.set.clone());
+            json!({
+                "uuid": u,
+                "set": set,
+                "moods": cur.and_then(|c| c.moods),
+                "deployed": dep,
+                "shared": set.as_deref().map(|s| uuids_of(s, tn)).unwrap_or_default(),
+                // As for a value: with something pending, a revision that
+                // was never deployed differs from it.
+                "pending": match (pending, deployed) {
+                    (Some(p), Some(d)) => me::differs(p, d, &u),
+                    (Some(_), None) => true,
+                    (None, _) => false,
+                },
+            })
+        })
+        .collect();
+    let sets: Vec<Value> = now
+        .claims
+        .3
+        .sets
+        .iter()
+        .map(|(name, lines)| {
+            json!({ "name": name, "controllers": uuids_of(name, None), "moods": me::rows_of(lines) })
+        })
+        .collect();
+    (json!(list), json!(sets))
+}
+
 /// The ops that undo an edit (#62), sent back as an edit of its own, into
 /// the reply as `undo`; or, when they cannot be built, `undo: null` and why
 /// (`undo_error`). The edit itself stands either way.
@@ -2102,7 +2178,9 @@ impl Actions {
             .ops
             .iter()
             .any(|o| matches!(o, edit::Op::Schedule { .. }));
+        let mooding = req.ops.iter().any(|o| matches!(o, edit::Op::Moods { .. }));
         let names = if scheduling
+            || mooding
             || req
                 .ops
                 .iter()
@@ -2115,7 +2193,9 @@ impl Actions {
         // The timers whose switching times the rest of the module claims
         // (#73): a timer takes one schedule.
         let mut sched_claimed = std::collections::BTreeMap::new();
-        if scheduling {
+        // And the lighting controllers whose moods it claims (#74).
+        let mut moods_claimed = std::collections::BTreeMap::new();
+        if scheduling || mooding {
             let texts = {
                 let mut m = self.module_files.lock().unwrap();
                 m.refresh(&p.root, &p.module);
@@ -2123,10 +2203,14 @@ impl Actions {
             };
             let mine = format!("{shown}/");
             for c in crate::managed::set_claims(&texts, &lock) {
-                if c.kind == "schedule" && !c.file.starts_with(&mine) {
+                let into = match c.kind {
+                    "schedule" => &mut sched_claimed,
+                    "moods" => &mut moods_claimed,
+                    _ => continue,
+                };
+                if !c.file.starts_with(&mine) {
                     for b in &c.blocks {
-                        sched_claimed
-                            .insert(b.to_ascii_lowercase(), format!("{}:{}", c.file, c.line));
+                        into.insert(b.to_ascii_lowercase(), format!("{}:{}", c.file, c.line));
                     }
                 }
             }
@@ -2169,6 +2253,7 @@ impl Actions {
             adoptions: &prepared.adoptions,
             page_adoptions: &prepared.pages,
             sched_claimed: &sched_claimed,
+            moods_claimed: &moods_claimed,
         };
         // `removed` lines lox needs no more go first: their slugs are free.
         files.tidy(&lock);
@@ -2201,11 +2286,17 @@ impl Actions {
         }
         // An edit compiles the whole module: it must not take along changes
         // someone else made to it and has not compiled. Except dropping
-        // vislox's claim on switching times the module claims too (#73):
-        // lox compiles neither claim, and the module's is what it is for.
-        let mending = req.ops.iter().all(|o| {
-            matches!(o, edit::Op::Schedule { uuid, value: None }
-                if sched_claimed.contains_key(&uuid.to_ascii_lowercase()))
+        // vislox's claim on switching times (#73) or moods (#74) the module
+        // claims too: lox compiles neither claim, and the module's is what
+        // it is for.
+        let mending = req.ops.iter().all(|o| match o {
+            edit::Op::Schedule { uuid, value: None } => {
+                sched_claimed.contains_key(&uuid.to_ascii_lowercase())
+            }
+            edit::Op::Moods { uuid, value: None } => {
+                moods_claimed.contains_key(&uuid.to_ascii_lowercase())
+            }
+            _ => false,
         });
         if !mending {
             self.uncompiled(&p).await?;
@@ -2285,18 +2376,31 @@ impl Actions {
         // set, and the sets it writes back for others.
         let mut timed: Vec<String> = Vec::new();
         let mut restored: Vec<String> = Vec::new();
+        // The same for moods (#74): the controllers, the sets written back.
+        let mut lit: Vec<String> = Vec::new();
+        let mut lit_restored: Vec<String> = Vec::new();
         for o in &req.ops {
-            if let edit::Op::Schedule {
-                uuid,
-                value: Some(v),
-            } = o
-            {
-                timed.push(uuid.clone());
-                restored.extend(v.restore.keys().cloned());
+            match o {
+                edit::Op::Schedule {
+                    uuid,
+                    value: Some(v),
+                } => {
+                    timed.push(uuid.clone());
+                    restored.extend(v.restore.keys().cloned());
+                }
+                edit::Op::Moods {
+                    uuid,
+                    value: Some(v),
+                } => {
+                    lit.push(uuid.clone());
+                    lit_restored.extend(v.restore.keys().cloned());
+                }
+                _ => {}
             }
         }
         // The compiled config, read once for the checks below.
-        let out_doc = if !place.moves.is_empty() || !timed.is_empty() || adopting {
+        let out_doc = if !place.moves.is_empty() || !timed.is_empty() || !lit.is_empty() || adopting
+        {
             Some(
                 std::fs::read(&p.out)
                     .map_err(|e| fail(e.to_string()))
@@ -2323,6 +2427,16 @@ impl Actions {
             if !missed.is_empty() {
                 return Err(fail(format!(
                     "lox logic compile did not write the switching times of {}",
+                    missed.join(", ")
+                )));
+            }
+        }
+        // Nor a moods claim lox did not write onto its controller (#74).
+        if let (false, Some(out)) = (lit.is_empty(), &out_doc) {
+            let missed = crate::mood_edit::missed(&files, out, &lock, &lit, &lit_restored);
+            if !missed.is_empty() {
+                return Err(fail(format!(
+                    "lox logic compile did not write the moods of {}",
                     missed.join(", ")
                 )));
             }
@@ -2997,7 +3111,7 @@ impl Actions {
         deployed: Option<DeployedRev>,
         pending: Option<Arc<Vec<u8>>>,
     ) -> Value {
-        let off = || json!({ "available": false, "reason": state.why, "claims": [], "managed": [], "sources": {}, "set_claims": [], "schedules": [], "schedule_sets": [] });
+        let off = || json!({ "available": false, "reason": state.why, "claims": [], "managed": [], "sources": {}, "set_claims": [], "schedules": [], "schedule_sets": [], "moods": [], "mood_sets": [] });
         let Some(dir) = self.s.project.as_deref() else {
             return off();
         };
@@ -3109,6 +3223,14 @@ impl Actions {
         // The switching times vislox's file claims now or claimed in the
         // deployed revision (#73), per timer, and its sets.
         let (schedules, schedule_sets) = edit_schedules(
+            &now,
+            &was,
+            &lock,
+            pending_doc.as_ref(),
+            deployed_doc.as_ref(),
+        );
+        // And the lighting moods (#74), per controller, and its sets.
+        let (moods, mood_sets) = edit_moods(
             &now,
             &was,
             &lock,
@@ -3243,6 +3365,7 @@ impl Actions {
                 adoptions: &none_a,
                 page_adoptions: &none_p,
                 sched_claimed: &Default::default(),
+                moods_claimed: &Default::default(),
             };
             for b in blocks.iter_mut().filter(|b| b["adopted"] == true) {
                 let Some(u) = b["uuid"].as_str().map(String::from) else {
@@ -3266,6 +3389,8 @@ impl Actions {
             "set_claims": set_claims,
             "schedules": schedules,
             "schedule_sets": schedule_sets,
+            "moods": moods,
+            "mood_sets": mood_sets,
             "movable": movable,
             "moves": moves,
             "arrange": arrange,
@@ -7677,5 +7802,190 @@ esac
                 .unwrap()
                 .contains(".schedule")
         );
+    }
+
+    // ── lighting moods (#74) ───────────────────────────────────────────
+
+    fn moods_val(rows: &[(&str, &str)]) -> Option<crate::mood_edit::MoodsVal> {
+        Some(crate::mood_edit::MoodsVal {
+            moods: Some(
+                rows.iter()
+                    .map(|(n, v)| crate::mood_edit::MoodRow {
+                        name: n.to_string(),
+                        values: v.to_string(),
+                    })
+                    .collect(),
+            ),
+            ..Default::default()
+        })
+    }
+
+    /// With something pending and no deployed revision, a claimed controller
+    /// counts as not deployed, as a value does.
+    #[test]
+    fn moods_with_no_deployed_revision_are_pending() {
+        use crate::mood_edit::fixture::{LICHT, house};
+        let doc = edit::parse_doc(house().as_bytes()).unwrap();
+        let s = edit::slug(LICHT);
+        let files = edit::Files::from_texts(&std::collections::BTreeMap::from([(
+            "edits.loxl".to_string(),
+            format!(
+                "extern {s} = LightController2(uuid: \"{LICHT}\")\nmoods vx_a\n\t\"Viel Licht\": all on\nend\n{s}.moods = vx_a\n"
+            ),
+        )]))
+        .unwrap();
+        let lock = edit::Lock::default();
+        let none = edit::Files::default();
+        let (v, sets) = edit_moods(&files, &none, &lock, Some(&doc), None);
+        assert_eq!(v[0]["uuid"], LICHT);
+        assert_eq!(v[0]["pending"], true);
+        assert_eq!(v[0]["moods"][0]["values"], "all on");
+        assert_eq!(sets[0]["name"], "vx_a");
+        assert_eq!(sets[0]["controllers"][0], LICHT);
+        let (v, _) = edit_moods(&files, &none, &lock, None, Some(&doc));
+        assert_eq!(v[0]["pending"], false);
+        let (v, _) = edit_moods(&files, &files, &lock, Some(&doc), Some(&doc));
+        assert_eq!(v[0]["pending"], false);
+        assert_eq!(v[0]["deployed"]["set"], "vx_a");
+    }
+
+    /// A compile that does not write the claim onto its controller is
+    /// refused, and the module, lock and out are put back; nothing is deployed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn moods_lox_did_not_write_are_refused_and_put_back() {
+        use crate::mood_edit::fixture::{LICHT, house};
+        let (tmp, a) = project_for_edits();
+        let d = tmp.path().join("project");
+        std::fs::write(d.join("base.Loxone"), house()).unwrap();
+        std::fs::write(d.join("out.Loxone"), house()).unwrap();
+        sh(&d, "git add -A && git commit -qm lights");
+        std::fs::write(
+            tmp.path().join("lox"),
+            "#!/bin/sh\necho \"$*\" >> ../calls.log\n[ \"$1 $2\" = \"logic compile\" ] || exit 2\n\
+             out=out.Loxone; prev=\nfor a in \"$@\"; do [ \"$prev\" = --out ] && out=$a; prev=$a; done\n\
+             cp base.Loxone \"$out\"\n",
+        )
+        .unwrap();
+        let req = edit::Request {
+            base: blob(&d, "out.Loxone"),
+            ops: vec![edit::Op::Moods {
+                uuid: LICHT.into(),
+                value: moods_val(&[("Viel Licht", "all on"), ("Lesen", "AQ1 on")]),
+            }],
+        };
+        let out_was = std::fs::read(d.join("out.Loxone")).unwrap();
+        let (code, msg) = a.edit(&req, None).await.unwrap_err();
+        assert_eq!(code, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(msg.contains("did not write the moods of Licht"), "{msg}");
+        assert!(!d.join("pages/vislox/edits.loxl").exists());
+        assert_eq!(std::fs::read(d.join("out.Loxone")).unwrap(), out_was);
+        let calls = std::fs::read_to_string(tmp.path().join("calls.log")).unwrap();
+        assert!(
+            calls.lines().all(|l| l.starts_with("logic compile")),
+            "{calls}"
+        );
+    }
+
+    /// Moods with the real lox (#74): set `VISLOX_TEST_LOX` to a lox binary
+    /// (v0.83.0) to run it; it never talks to a Miniserver. The set and claim
+    /// are compiled onto the controller, `GET /api/edits` lists it as not
+    /// deployed, the reply's undo puts the base's moods back, and a
+    /// controller the module's own file claims is refused, its drop let through.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn moods_are_compiled_by_lox_and_undone() {
+        use crate::mood_edit::fixture::{LICHT, house};
+        let Some(lox) = std::env::var_os("VISLOX_TEST_LOX") else {
+            eprintln!("VISLOX_TEST_LOX is not set: skipped");
+            return;
+        };
+        let (tmp, a) = project_with_lox_base(Path::new(&lox), house().as_bytes());
+        let d = tmp.path().join("project");
+        let moods = |p: &str| {
+            let doc = edit::parse_doc(&std::fs::read(d.join(p)).unwrap()).unwrap();
+            let el = edit::find(&doc.xml.root, LICHT).unwrap().clone();
+            loxone_config::moods::Moods::read(&el)
+                .unwrap()
+                .moods
+                .iter()
+                .map(|m| format!("{}={}", m.name, loxone_config::moods::render(&m.qs)))
+                .collect::<Vec<_>>()
+        };
+        let before = moods("out.Loxone");
+        let r = a
+            .edit(
+                &edit::Request {
+                    base: blob(&d, "out.Loxone"),
+                    ops: vec![edit::Op::Moods {
+                        uuid: LICHT.into(),
+                        value: moods_val(&[
+                            ("Viel Licht", "all on"),
+                            ("Lesen", "AQ1 on, AQ2 40%"),
+                            ("Abend", "AQ3 temp(30%, 2700K)"),
+                        ]),
+                    }],
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(r["undo"][0]["op"], "moods");
+        assert_eq!(r["undo"][0]["value"], Value::Null);
+        let file = std::fs::read_to_string(d.join("pages").join(edit::FILE)).unwrap();
+        assert!(file.contains("moods vx_licht_moods\n"), "{file}");
+        assert_eq!(
+            moods("out.Loxone"),
+            [
+                "Viel Licht=all on, AQ2 off, AQ3 off",
+                "Lesen=AQ1 on, AQ2 40%",
+                "Abend=AQ3 temp(30%, 2700K)",
+                "Aus=all off"
+            ]
+        );
+        let e = edits_of(&a, &d).await;
+        assert_eq!(e["moods"][0]["uuid"], LICHT);
+        assert_eq!(e["moods"][0]["pending"], true);
+        assert_eq!(e["mood_sets"][0]["controllers"][0], LICHT);
+        // Undone: the base's moods again.
+        let undo: Vec<edit::Op> = serde_json::from_value(r["undo"].clone()).unwrap();
+        a.edit(
+            &edit::Request {
+                base: blob(&d, "out.Loxone"),
+                ops: undo,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(moods("out.Loxone"), before);
+        // The module's own file claims it: refused, naming that line.
+        std::fs::write(
+            d.join("pages/own.loxl"),
+            format!(
+                "# The module's own.\npage \"Obergeschoss\"\nextern licht = LightController2(uuid: \"{LICHT}\")\n\
+                 moods wohnen\n\t\"Viel Licht\": all on\n\t\"Lesen\": AQ1 on\nend\nlicht.moods = wohnen\n"
+            ),
+        )
+        .unwrap();
+        sh(
+            &d,
+            &format!("{} logic compile >/dev/null", Path::new(&lox).display()),
+        );
+        let (code, msg) = a
+            .edit(
+                &edit::Request {
+                    base: blob(&d, "out.Loxone"),
+                    ops: vec![edit::Op::Moods {
+                        uuid: LICHT.into(),
+                        value: moods_val(&[("Viel Licht", "all off")]),
+                    }],
+                },
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(code, axum::http::StatusCode::UNPROCESSABLE_ENTITY, "{msg}");
+        assert!(msg.contains("pages/own.loxl:8 claims its moods"), "{msg}");
     }
 }

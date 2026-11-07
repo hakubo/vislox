@@ -874,3 +874,20 @@ rect.ghost, line.ghost { fill: #1f6fd10a; stroke: var(--moved); stroke-opacity: 
 .se-same, .se-copy { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 4px; font-size: 12px; color: var(--muted); }
 .se-same select { max-width: 14em; padding: 2px 4px; border: 1px solid var(--line); border-radius: var(--radius); font: inherit; }
 .se-share { display: block; padding: 4px 12px; font-size: 12px; color: var(--muted); }
+
+/* Lighting moods (#74): circuits, and the editor of a controller's moods set. */
+.mo-sub { padding: 6px 12px 2px; font-size: 11px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+.mo-kind { color: var(--muted); font-size: 11px; }
+.mo-tag { margin-left: 4px; padding: 0 5px; border-radius: 8px; font-size: 10px; color: var(--muted); background: var(--line-2); white-space: nowrap; }
+.mo-decl { margin-left: 4px; padding: 0 2px; border: 1px solid var(--line); border-radius: var(--radius); font: inherit; font-size: 11px; }
+.mo-wrap { margin: 2px 10px 4px; overflow-x: auto; }
+.mo-grid { border-collapse: collapse; font-size: 12px; }
+.mo-grid th { padding: 2px 4px; color: var(--muted); font-weight: 600; text-align: left; white-space: nowrap; }
+.mo-grid td { padding: 2px 3px; vertical-align: top; white-space: nowrap; }
+.mo-grid td.bad select, .mo-grid td.bad input, .mo-grid tr.bad .mo-name input { border-color: var(--removed); background: var(--removed-bg); }
+.mo-grid select, .mo-grid input { padding: 1px 3px; border: 1px solid var(--line); border-radius: var(--radius); font: inherit; }
+.mo-grid .mo-name input { width: 9em; }
+.mo-grid input.mo-a { width: 6.5em; margin-left: 2px; font-variant-numeric: tabular-nums; }
+.mo-grid input[aria-invalid="true"] { border-color: var(--removed); background: var(--removed-bg); }
+.mo-grid .ed-bad { white-space: normal; max-width: 12em; }
+.mo-ops { white-space: nowrap; }

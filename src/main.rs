@@ -20,6 +20,7 @@ mod miniserver;
 mod model;
 mod monframe;
 mod monitor;
+mod mood_edit;
 mod operate;
 mod pull;
 mod query;

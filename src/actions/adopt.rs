@@ -164,11 +164,11 @@ pub(super) fn why_not(
     let s = edit::slug(u);
     if files.claims.0.get(u).is_some_and(|c| c.claims())
         || files.claims.1.iter().any(|w| w.to.0 == s || w.from.0 == s)
-        || files.claims.2.claims.contains_key(&s)
+        || files.claims.set_claimed(&s)
     {
         return Some(format!(
-            "{name}: vislox's edits claim values, wires or switching times on it ({}); revert \
-             them first, then adopt it",
+            "{name}: vislox's edits claim values, wires, switching times or moods on it ({}); \
+             revert them first, then adopt it",
             edit::FILE
         ));
     }

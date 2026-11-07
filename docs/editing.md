@@ -1,9 +1,9 @@
 # Editing in vislox
 
 vislox becomes an editor in steps: edit values (#58), add blocks (#59), move blocks, inputs and outputs (#60),
-make and change connections (#61), undo and redo (#62), adopt the blocks Loxone Config drew (#72), and edit a
-Daytimer's switching times (#73). This page is the design they share. #58 to #62, #72 and #73 are built; the rest
-says where each step plugs in.
+make and change connections (#61), undo and redo (#62), adopt the blocks Loxone Config drew (#72), edit a
+Daytimer's switching times (#73) and a lighting controller's moods (#74). This page is the design they share. #58
+to #62, #72 to #74 are built; the rest says where each step plugs in.
 
 ## The rules
 
@@ -47,7 +47,10 @@ POST /api/edit
            { "op": "adopt_page", "page": "<page uuid>" },
            { "op": "unadopt", "uuids": [ "…" ] },
            { "op": "schedule", "uuid": "…", "value": { "modes": { "<mode uuid>": [
-               { "from": 390, "to": 480, "value": "21.5", "activate": true } ] } } } ] }
+               { "from": 390, "to": 480, "value": "21.5", "activate": true } ] } } },
+           { "op": "moods", "uuid": "…", "value": { "moods": [
+               { "name": "Viel Licht", "values": "all on" },
+               { "name": "Lesen", "values": "AQ1 on, AQ2 40%" } ] } } ] }
 ```
 
 `adopt`, `adopt_page` and `unadopt` go in a request of their own (#72).
@@ -66,7 +69,7 @@ POST /api/edit
   the blocks adopted, and for `unadopt` the `adopt` with the same slugs: a block keeps its UUIDs both ways. For
   `schedule` it is the `schedule` of what the timer claimed before: its set and that set's switching times, or
   no claim; when the op rewrote a set other timers still claim, it also carries that set's old switching times
-  (`restore`), so the undo gives them back too.
+  (`restore`), so the undo gives them back too. `moods` is the same for a controller's moods (#74).
   A reconnected wire is one request, `unwire` then `wire`:
   undone, the reverse list. The ops of one request see each other: `unwire` then `wire` of the same wire is
   accepted (and changes nothing). `remove_block`'s `add_block` carries the wires the removal took out
@@ -601,6 +604,95 @@ the set, off gives it a set of its own. *Use the same times as …* claims anoth
 same kind: analog or digital). The Deploy pane counts
 the timers whose switching times are edited and not deployed.
 
+## Lighting moods (#74)
+
+A LightController2's moods are a named `moods` set and the controller's claim. vislox writes both into
+`edits.loxl`, after the externs (and after any `schedule` sets):
+
+```text
+extern vx_10000040_0000_0400_ffff504f94000001 = LightController2(uuid: "10000040-0000-0400-ffff504f94000001")
+
+# Lighting moods edited in vislox. A claim makes the set the controller's whole mood
+# list (its off mood aside); deleting it leaves the moods as last written.
+moods vx_wohnzimmer_moods
+	"Viel Licht": AQ1 on, AQ2 100%, AQ3 temp(100%, 2700K), AQ4 on
+	"Lesen": AQ1 on, AQ2 40%
+	"Abend": AQ3 temp(30%, 2700K)
+end
+
+vx_10000040_0000_0400_ffff504f94000001.moods = vx_wohnzimmer_moods
+```
+
+- **Shown from the compiled config.** `objects[…].moods` (`model.rs`, with lox's `moods` codec) has, per
+  controller, its circuits (`n`, `kind`, `name`, `used`) and its moods in order (`name`, `sid`, `off`,
+  `required`, each circuit's value and the line's `text`), and `selected`: the scene ids its T5 inputs
+  (`Sel1`…`Sel8`) are wired to select. A circuit's kind is the top four bits of its values, one kind per circuit:
+  `switch` (0: on, off, a percentage), `dimmer` (1: off, a percentage), `rgb` (4), and `colour` or `white` (5, 6:
+  RGB or tunable white; `white` once a mood holds a `temp(…)`); any other is `raw`, kept as stored. `moods_old` is
+  the compared revision's, when the moods differ, and the Changes list has a line per mood in the language's
+  terms (`Wohnzimmer · mood "Lesen": AQ1 on, AQ2 80% → AQ1 on, AQ2 40%`, `… added: …`, `… removed (was …)`) and
+  one for a new order of the moods both have (the off mood among them). A changed mood list marks its
+  controller changed. Like lox's `loxl diff`, so a mood edited in Loxone Config or the app reads the same way.
+- **The op** is `{ "op": "moods", "uuid": <controller>, "value": … }`. `value.moods` is the mood list in order,
+  each `{ name, values }`: its values as a `moods` line writes them (`AQ1 on, AQ2 40%`; empty is `all off`), read
+  with lox's own parser. `value.set` names the set, as for switching times: vislox's set of that name is rewritten
+  (for every controller that claims it) and claimed, or with no `moods` claimed as it is (*Use the same moods
+  as …*). Without `set`, the moods go into the set the controller claims when no other controller claims it, else
+  into a new one (`vx_<name>_moods`, a name the module, the lockfile and vislox's files, its schedule sets among
+  them, do not have). `value: null` drops the claim; a set no claim names goes, and so does an extern nothing else
+  needs. `value.restore` (set → moods) writes vislox's sets back first: what `previous` carries when the op
+  rewrote a set other controllers claim, so an undo gives them their moods back too.
+- **Checked before lox sees it**, with lox's rules, for every controller on the set: a LightController2 only; a
+  name per mood, once, one line, never the off mood ("Aus", which every controller keeps and source never lists);
+  the built-in moods (scene ids 776 and 777, "Viel Licht") and any mood the motion settings name
+  (`<LSConfig OpM= ScMv=>`) stay in the set, under their names (a rename is a delete); each circuit's value of a
+  kind it takes (`on` on a switch only, a percentage on a switch or dimmer, `rgb(…)` on a colour circuit,
+  `temp(…)` on a tunable-white one; `all <v>` sets only the circuits it fits, as lox does, so `all on` leaves a
+  dimmer off); circuits `AQ1` … `AQ<outputs>`; at most 64 moods. One mood list per controller: one the rest of
+  the module claims is refused, naming that `file:line` (`set_claims`, which now lists `moods` claims too), and
+  so is a block the rest of the module manages. A controller added or adopted here is claimed by its slug.
+- **A mood keeps its identity by name.** lox keeps a mood the controller has (its scene id, which `Sel<n>` and the
+  app select it by), deletes one the set leaves out, and gives a new one the lowest free scene id: one a deleted
+  mood freed, too. So a button on `Sel2` whose mood is deleted selects nothing, or the next new mood. The browser
+  warns before a save that deletes or renames a mood a button selects (*Save anyway*); the server does not refuse
+  it. The off mood keeps its place: first stays first, last stays last.
+- **Claimed twice** (the module's own file claims the controller too) is mended as for switching times: dropping
+  vislox's claim is let through and compiles the module's uncompiled change along.
+- **Checked after the compile.** The pending config must have, on each controller the request changed and every
+  controller sharing its set, exactly the set's moods in order (the off mood aside), each circuit's value as lox
+  encodes it; otherwise the edit is refused and the files, lock and out are put back. lox pins the UUIDs of the
+  moods it mints in the lockfile (`moods`); Discard puts the lock back with the rest.
+- **Read back.** vislox reads the sets and claims of `edits.loxl` with lox's parser; a set or claim not named
+  `vx_…`, a claim without its set, or one on a slug that is neither an extern of the file nor a block of vislox's
+  files is refused. Removing a block added here, and handing an adopted one back, are refused while vislox claims
+  its moods; adopting a block is too.
+- **Not deployed and Revert.** `GET /api/edits` sends `moods` (per controller vislox's files claim now or claimed
+  in the deployed revision: `set`, `moods`, `shared`, `deployed`, `pending`) and `mood_sets` (each set with its
+  `controllers` and `moods`). Revert changes only its controller: when other controllers claim the deployed set
+  now, it gets the deployed moods in a set of its own. Dropping a claim leaves the moods as the base has them:
+  before Apply, Loxone Config's; after, the last ones written (lox keeps no lock state for the claim).
+- **Circuits.** On a controller added (#59) or adopted (#72) here, `Circuit<n>: "switch"` or `"dimmer"` in its
+  declaration declares circuit `AQ<n>` the way the mood editor's *Lichtkreise* tab does: the `setting` op with
+  `name: "Circuit<n>"` (`AQ1` … `AQ5`, lox's `CIRCUIT_PARAMS`; `null` drops it). A circuit whose moods hold colours
+  is refused: RGB and tunable-white circuits, and `Circuit6` and above, stay with Loxone Config. lox names the
+  circuit after the actuator `AQ<n>` drives and refuses one that drives none; changing the kind clears that
+  circuit's values in every mood, as the editor does.
+- **Lint.** `lox logic lint`'s `no-actuator` finding (a percentage on a circuit without an actuator, which the
+  Miniserver only switches; lox lints only claimed controllers) names the controller; the browser shows it on the
+  circuit its message names.
+
+The browser: *Moods* in Properties of a LightController2, on any revision: the circuits and moods as above. On the
+newest config, *Edit moods* opens a grid, a row per mood (name, ↑ ↓, ✕; the built-in and motion moods keep their
+name and have no ✕) and a column per circuit shown (*Add a circuit* for the others; a circuit not shown keeps its
+values), each cell a choice of the values that circuit takes and, for a percentage, a colour or white, its
+numbers. The draft is checked in the browser first. *Add mood*, *Use the same moods as …*, *Change … too* (on)
+when the set is shared, *Revert*, and *Remove vislox's claim* when claimed twice, as for switching times; on a
+controller added or adopted here, a switch-or-dimmer choice per circuit `AQ1` … `AQ5`. The Deploy pane counts the
+controllers whose moods are edited and not deployed.
+
+Later: a controller's motion settings, presence and other behaviour (they are not in the language yet); the
+central lighting block's members are #75.
+
 ## Undo and redo (#62)
 
 Undo is not a second way to change the module: it sends the edit's `undo` back to `POST /api/edit` as an edit of
@@ -656,6 +748,7 @@ cannot express is left out, not worked around.
 | #61 wire | `x.Port <- y.Q` in `edits.loxl` | Adds a wire between objects Loxone Config drew and blocks added here, and removes one vislox drew. A wire Loxone Config drew cannot be removed. |
 | #72 adopt | `lox logic adopt` on a copy; its declaration in `<module>/vislox/<page>.loxl` | The block keeps its UUIDs, the config stays as it is; then edited like a block added here. |
 | #73 switching times | `schedule vx_… end`, `x.schedule = vx_…` in `edits.loxl` | A DayTimer, extern or added/adopted here; several timers may share a set. |
+| #74 moods | `moods vx_… end`, `x.moods = vx_…` in `edits.loxl`; `Circuit<n>:` | A LightController2, extern or added/adopted here; several controllers may share a set. Circuits only on one added/adopted here. |
 
 Blocks the module already manages (they are in the lockfile) are refused: they are edited in their own `.loxl`.
 The blocks vislox added or adopted (#72) are the exception: their `.loxl` is vislox's.
@@ -706,7 +799,7 @@ Each of these plugs in as new op kinds on `POST /api/edit`, written into `<modul
 | #62 (built) | undo and redo (the edits' own `undo`, sent back as an edit) |
 | #72 (built) | adopt a block into the module (`lox logic adopt`) |
 | #73 (built) | Daytimer switching times (`schedule`, `.schedule`) |
-| #74 | lighting moods and circuits (`moods`, `.moods`) |
+| #74 (built) | lighting moods and circuits (`moods`, `.moods`, `Circuit<n>:`) |
 | #75 | members of a central block (`.members`) |
 | #76 | NFC Code Touch access (`access`, `.access`) |
 | #77 | notification recipients and messages (`recipients`, `OutputRefLM`) |
