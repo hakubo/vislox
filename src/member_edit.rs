@@ -167,7 +167,7 @@ pub fn apply(
             "{name}: the module manages this block; change its members in its .loxl file"
         ));
     }
-    if let Some(at) = ctx.members_claimed.get(&uuid.to_ascii_lowercase()) {
+    if let Some(at) = ctx.claimed("members").get(&uuid.to_ascii_lowercase()) {
         return Err(format!(
             "{name}: {at} claims its members; change them there (a central block takes one \
              members claim)"
@@ -340,6 +340,109 @@ pub fn edits_section(
         .collect()
 }
 
+/// Member lists as a kind of claim ([`set_claim::KINDS`]). No named sets:
+/// each claim holds its own list.
+pub struct MemberKind;
+
+impl set_claim::ClaimKind for MemberKind {
+    fn keyword(&self) -> &'static str {
+        "members"
+    }
+    fn what(&self) -> &'static str {
+        "members"
+    }
+    fn makes_sets(&self) -> bool {
+        false
+    }
+    fn op<'a>(&self, op: &'a crate::edit::Op) -> Option<(&'a str, bool)> {
+        match op {
+            crate::edit::Op::Members { uuid, value } => Some((uuid, value.is_none())),
+            _ => None,
+        }
+    }
+    fn restored(&self, _: &crate::edit::Op) -> Vec<String> {
+        Vec::new()
+    }
+    fn is_empty(&self, c: &crate::edit::Claims) -> bool {
+        c.4.is_empty()
+    }
+    fn render(&self, c: &crate::edit::Claims) -> String {
+        render(&c.4)
+    }
+    fn on(&self, c: &crate::edit::Claims, slug: &str) -> Option<(String, &'static str)> {
+        let (central, _) = names(&c.4).find(|(_, m)| m.as_str() == slug)?;
+        Some(if central == slug {
+            (format!("its members ({central}.members)"), "them")
+        } else {
+            (
+                format!("it among a central block's members ({central}.members)"),
+                "it",
+            )
+        })
+    }
+    fn set_names<'a>(&self, _: &'a crate::edit::Claims) -> Vec<&'a str> {
+        Vec::new()
+    }
+    fn read(
+        &self,
+        c: &mut crate::edit::Claims,
+        item: &loxone_config::logic::Item,
+    ) -> Option<Result<(), String>> {
+        match item {
+            loxone_config::logic::Item::MembersClaim(mc)
+                if mc.slug.starts_with(crate::blocks::SLUG_PREFIX) =>
+            {
+                Some(
+                    if c.4.insert(mc.slug.clone(), mc.members.clone()).is_some() {
+                        Err(format!("a second `{}.members`", mc.slug))
+                    } else {
+                        Ok(())
+                    },
+                )
+            }
+            _ => None,
+        }
+    }
+    /// A member list names vislox's blocks: its externs, or the blocks it
+    /// added.
+    fn check_read(&self, c: &crate::edit::Claims) -> Result<(), String> {
+        for (central, m) in names(&c.4) {
+            if !m.starts_with(crate::blocks::SLUG_PREFIX) {
+                return Err(format!("`{central}.members` naming `{m}`"));
+            }
+        }
+        Ok(())
+    }
+    fn names(&self, c: &crate::edit::Claims) -> Vec<(String, String)> {
+        names(&c.4)
+            .map(|(central, m)| (format!("{central}.members"), m.clone()))
+            .collect()
+    }
+    fn missed(
+        &self,
+        files: &Files,
+        out: &LoxoneDoc,
+        lock: &Lock,
+        uuids: &[String],
+        _: &[String],
+    ) -> Vec<String> {
+        missed(files, out, lock, uuids)
+    }
+    fn edits_section(
+        &self,
+        now: &Files,
+        was: &Files,
+        lock: &Lock,
+        pending: Option<&LoxoneDoc>,
+        deployed: Option<&LoxoneDoc>,
+    ) -> Vec<(&'static str, Value)> {
+        vec![("members", edits_section(now, was, lock, pending, deployed))]
+    }
+    fn keys(&self) -> Value {
+        Value::Null
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod fixture {
     use crate::mood_edit::fixture as lights;
@@ -398,10 +501,7 @@ mod tests {
                 drawn: &Default::default(),
                 adoptions: &Default::default(),
                 page_adoptions: &Default::default(),
-                sched_claimed: &Default::default(),
-                moods_claimed: &Default::default(),
-                members_claimed: $claimed,
-                access_claimed: &Default::default(),
+                claimed: $claimed,
             }
         };
     }
@@ -504,7 +604,10 @@ mod tests {
         let (doc, mut lock) = ctx_parts();
         lock.slugs.insert("flur".into(), FLUR.into());
         lock.slugs.insert("rollos".into(), ROLLOS.into());
-        let claimed = BTreeMap::from([(ALLE.to_string(), "pages/licht.loxl:4".to_string())]);
+        let claimed = BTreeMap::from([(
+            "members",
+            BTreeMap::from([(ALLE.to_string(), "pages/licht.loxl:4".to_string())]),
+        )]);
         let ctx = ctx!(&doc, &lock, &claimed);
         let mut files = Files::default();
         let e = edit::apply_op(&mut files, &ctx, &op(ROLLOS, Some(&[ROLLO]))).unwrap_err();

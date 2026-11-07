@@ -123,10 +123,14 @@ published under the same version (see [docker/README.md](docker/README.md)).
   which writes a Lox Logic `access vx_… end` set and the Code Touch's `.access` claim into
   `<module>/vislox/edits.loxl` and compiles; the compile must give the Code Touch exactly those rights. Who loses
   access is said before the save (*Save anyway*), and Apply's confirmation says it again, now with the schedule a
-  user gains access under and who keeps access under another schedule. *Same rights as …* shares a set between
+  user gains access under; a user who keeps a door under fewer access schedules is warned about as a loss
+  everywhere (review, Properties, editor, Apply). *Same rights as …* shares a set between
   Code Touches; *Change … too* rewrites a shared set, its undo gives the others theirs back. Built on
   `set_claim.rs`. `ACT=` (operating it in the app) is kept. Credentials never leave the server; `GET /api/edits`
   names users, groups and schedules by UUID only. Adopting a Code Touch leaves its rights as they are. Never deploys.
+- Fixed: Revert of switching times, moods or access whose deployed content could not be read sent the set's name
+  alone, which claimed the set as it was and changed nothing; it is now refused with the reason. One Revert
+  serves every set kind, from the keys the server sends (`set_kinds`).
 - Fixed: Discard failed when the last commit had no lockfile (the first compile writes one), or one was staged
   but not committed. Discard now reads the last commit, never deletes a lock vislox did not write (one not in git
   goes back to how it was before vislox's first edit), and puts everything back when a step fails.

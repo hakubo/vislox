@@ -1499,15 +1499,17 @@ try {
     // seAdd finds another free hour when the clicked one is taken, and says so when the day is full.
     assert.equal(await page.evaluate(() => { const c = { spans: [{ from: 0, to: 1440 }] }; return seAdd(c, 600, false); }), null);
     assert.deepEqual(await page.evaluate(() => { const c = { spans: [{ from: 1350, to: 1440 }] }; seAdd(c, 1435, false); return c.spans.map((s) => [s.from, s.to]); }), [[0, 60], [1350, 1440]]);
-    // seRevertValue: the deployed set while only this timer claims it; else the deployed times in a set of its
+    // setRevertValue: the deployed set while only this timer claims it; else the deployed times in a set of its
     // own, never a rewrite of the others'; refused when the deployed times cannot be read.
     const M = { [dayU(4)]: [{ from: 60, to: 120, value: "20" }] };
-    const rv = (e, sets) => page.evaluate(([e, sets, u]) => seRevertValue(e, sets, u), [e, sets, UHR]);
+    const rv = (e, sets) => page.evaluate(([e, sets, u]) => setRevertValue("schedule", e, sets, u), [e, sets, UHR]);
     assert.deepEqual(await rv({ deployed: null }, []), { value: null });
     assert.deepEqual(await rv({ deployed: { set: "vx_a", modes: M } }, [{ name: "vx_a", timers: [UHR] }]), { value: { set: "vx_a", modes: M } });
     assert.deepEqual(await rv({ deployed: { set: "vx_a", modes: M } }, [{ name: "vx_a", timers: [UHR, HEIZ] }]), { value: { modes: M } });
     assert.deepEqual(await rv({ deployed: { set: "vx_a", modes: M } }, [{ name: "vx_a", timers: [HEIZ] }]), { value: { modes: M } });
     assert.match((await rv({ deployed: { set: "vx_a", modes: null } }, [{ name: "vx_a", timers: [HEIZ] }])).why, /Heizung claims that set now/);
+    // Unreadable and nobody else on it: refused too, never the set's name alone (which would change nothing).
+    assert.match((await rv({ deployed: { set: "vx_a", modes: null } }, [{ name: "vx_a", timers: [UHR] }])).why, /deployed switching times \(vx_a\) cannot be read/);
   });
   await step("a lighting controller's moods are shown, edited as a moods set, undone, shared and reverted (#74)", async () => {
     await page.waitForFunction(() => /Nothing pending/.test(document.querySelector("#deploy-pend")?.textContent || ""), null, { timeout: 10000 });
@@ -1606,14 +1608,15 @@ try {
     await page.click(`${sec} [data-mo="revert"]`);
     await page.waitForFunction((u) => S.view.objects[u].moods.moods.length === 4 && !S.edits?.moods?.length, LC_W, { timeout: 15000 });
     await page.waitForFunction(() => /Nothing pending/.test(document.querySelector("#deploy-pend")?.textContent || ""), null, { timeout: 10000 });
-    // moRevertValue: the deployed set while only this controller claims it; else the deployed moods in a set of
+    // setRevertValue: the deployed set while only this controller claims it; else the deployed moods in a set of
     // its own, never a rewrite of the others'.
     const M = [{ name: "Viel Licht", values: "all on" }];
-    const rv = (e, sets) => page.evaluate(([e, sets, u]) => moRevertValue(e, sets, u), [e, sets, LC_W]);
+    const rv = (e, sets) => page.evaluate(([e, sets, u]) => setRevertValue("moods", e, sets, u), [e, sets, LC_W]);
     assert.deepEqual(await rv({ deployed: null }, []), { value: null });
     assert.deepEqual(await rv({ deployed: { set: "vx_a", moods: M } }, [{ name: "vx_a", controllers: [LC_W] }]), { value: { set: "vx_a", moods: M } });
     assert.deepEqual(await rv({ deployed: { set: "vx_a", moods: M } }, [{ name: "vx_a", controllers: [LC_W, LC_F] }]), { value: { moods: M } });
     assert.match((await rv({ deployed: { set: "vx_a", moods: null } }, [{ name: "vx_a", controllers: [LC_F] }])).why, /Diele claims that set now/);
+    assert.match((await rv({ deployed: { set: "vx_a", moods: null } }, [])).why, /deployed moods \(vx_a\) cannot be read/);
     // A claimant the config lost is named, with Drop its claim (the server refuses the set until it goes).
     const stale = await page.evaluate(() => staleRows({ name: "vx_a", stale: ["10000099-0000-0990-ffff504f94000001"] }, "mo", null).join(""));
     assert.match(stale, /vx_a is also claimed for 10000099-0000-0990-ffff504f94000001, which this config does not have/);
@@ -1730,12 +1733,20 @@ try {
     await show(TOUCH);
     assert.match(await page.textContent(sec), /Anna \(Always\)[\s\S]*Opens for\s*Anna/);
     // The pickers' lists need the admin token: without it the server refuses them.
+    // They come from the config the draft is made on (its blob), never another: a blob the History does not list is
+    // refused.
     const url = `http://127.0.0.1:${port}/api/access/choices`;
-    assert.equal((await fetch(url, { method: "POST", headers: { "X-Vislox": "act" } })).status, 401);
-    assert.equal((await fetch(url, { method: "POST", headers: { "X-Vislox": "act", "X-Vislox-Token": "wrong" } })).status, 401);
-    const listed = await fetch(url, { method: "POST", headers: { "X-Vislox": "act", "X-Vislox-Token": "secret" } });
+    const blob = await page.evaluate(() => editRev().blob);
+    const ask = (token, base) => fetch(url, { method: "POST", headers: { "Content-Type": "application/json", "X-Vislox": "act", ...(token ? { "X-Vislox-Token": token } : {}) }, body: JSON.stringify({ base }) });
+    assert.equal((await ask(null, blob)).status, 401);
+    assert.equal((await ask("wrong", blob)).status, 401);
+    assert.equal((await ask("secret", "0000000000000000000000000000000000000000")).status, 409);
+    const listed = await ask("secret", blob);
+    assert.equal(listed.status, 200);
     assert.equal(listed.headers.get("cache-control"), "no-store");
-    assert.doesNotMatch(await listed.text(), /0A1B2C3D4E5F|00112233/);
+    const listedText = await listed.text();
+    assert.match(listedText, /"Anna"/);
+    assert.doesNotMatch(listedText, /0A1B2C3D4E5F|00112233/);
     // The draft starts from who holds the right; the pickers list every user, group and access schedule by title.
     await page.click(`${sec} [data-ac="open"]`);
     await page.waitForSelector(`${sec} [data-ac-p="0"]`);
@@ -1780,10 +1791,23 @@ try {
     assert.doesNotMatch(file(), /access/);
     ops = await undoKey(true, (u) => S.view.objects[u].rights.list.map((p) => p.title).join() === "Bewohner", TOUCH);
     assert.deepEqual(ops, [{ op: "access", uuid: TOUCH, value: { set: "vx_haustuer_access", grants: [{ kind: "group", uuid: BEWOHNER, schedule: WERKTAGS }] } }]);
-    // A draft belongs to its Code Touch and its pending config: another selection drops it.
+    // Another schedule for Bewohner: Ben keeps the door, but vislox cannot tell the new times cover the old ones, so
+    // it is a loss, warned before anything is sent.
     await page.waitForSelector(`${sec} [data-ac="open"]`);
     await page.click(`${sec} [data-ac="open"]`);
-    await page.waitForSelector(`${sec} [data-ac-p="0"]`);
+    await page.waitForSelector(`${sec} [data-ac-s="0"]`);
+    await page.selectOption(`${sec} [data-ac-s="0"]`, ALWAYS);
+    const n3 = edits.length;
+    await page.click(`${sec} [data-ac="save"]`);
+    await waitText(sec, /⚠ Ben may open Haustür only at Always, no longer at Werktags\./);
+    assert.equal(await page.textContent(`${sec} [data-ac="save"]`), "Save anyway");
+    assert.equal(edits.length, n3);
+    // Apply's confirmation warns about such a change on its own (#68): fewer opening times are a loss.
+    const narrowed = await page.evaluate((u) => rightsApplyText({ rights: [{ uuid: u, kind: "access", title: "Haustür", lose: [], gain: [], added: [], removed: [], rescheduled: [], narrowed: [{ title: "Ben", uuid: "x", from: ["Werktags"], to: ["Always"] }] }] }), TOUCH);
+    assert.match(narrowed, /^⚠ Ben may open Haustür only at Always, no longer at Werktags/, narrowed);
+    // A Revert whose deployed rights cannot be read is refused with the reason, never sent as the set's name alone.
+    assert.match((await page.evaluate((u) => setRevertValue("access", { deployed: { set: "vx_a", grants: null } }, [], u), TOUCH)).why, /deployed access rights \(vx_a\) cannot be read/);
+    // A draft belongs to its Code Touch and its pending config: another selection drops it.
     await show(GARAGE);
     assert.equal(await page.evaluate(() => AC.open), false);
     assert.match(await page.textContent(sec), /No user or group may open it/);

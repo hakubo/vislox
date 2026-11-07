@@ -2826,6 +2826,12 @@ function holderLi(p, cls, sign, extra) {
   const tip = whoTip(p);
   return `<li class="${cls}"${tip ? ` title="${esc(tip)}"` : ""}><span class="rt-s">${sign}</span>${esc(whoText(p))}${p.schedule ? ` <span class="none-v">(${esc(p.schedule)})</span>` : ""}${extra || ""}</li>`;
 }
+/** A user who may still open a door, but not under every schedule: "bob may open Haustür only at Workdays, no
+ *  longer at Always". vislox cannot compare what the schedules' times cover, so any schedule taken away counts. */
+function narrowText(n, door) {
+  const gone = n.from.filter((x) => !n.to.includes(x));
+  return `${n.title} may open ${door} only at ${n.to.join(", ") || "—"}, no longer at ${gone.join(", ") || n.from.join(", ")}`;
+}
 function lossText(c, users) {
   const names = users.map((u) => u.title).join(", ");
   return c.kind === "access" ? `${names} ${users.length === 1 ? "loses" : "lose"} access` : `${names} ${users.length === 1 ? "stops" : "stop"} getting it`;
@@ -2849,7 +2855,7 @@ function renderRights() {
   box.classList.toggle("hidden", !list.length);
   if (!list.length) { box.innerHTML = ""; return; }
   const open = box.querySelector("details")?.open ?? true;
-  const lost = new Set(list.flatMap((c) => (c.lose || []).map((u) => u.uuid))).size;
+  const lost = new Set(list.flatMap((c) => [...(c.lose || []), ...(c.narrowed || [])].map((u) => u.uuid))).size;
   const items = list.map((c) => {
     const o = v.objects[c.uuid];
     const claims = setClaims(c.uuid);
@@ -2858,6 +2864,7 @@ function renderRights() {
     if (c.kind === "schedule") return `<li class="rt-item">${head}${scheduleSideBySide(o)}</li>`;
     const lines = [
       ...(c.lose?.length ? [`<li class="rt-lose">⚠ ${esc(lossText(c, c.lose))}</li>`] : []),
+      ...(c.narrowed || []).map((n) => `<li class="rt-lose">⚠ ${esc(narrowText(n, c.title))}</li>`),
       ...c.removed.map((p) => holderLi(p, "rt-rem", "−")),
       ...c.added.map((p) => holderLi(p, "rt-add", "+")),
       ...c.rescheduled.map((r) => holderLi(r.principal, "rt-chg", "~", ` <span class="none-v">was ${esc(r.from || "—")}</span>`)),
@@ -2911,6 +2918,7 @@ function rightsRows(o, marks) {
     const now = ids(r.users), then = ids(old.users);
     const lose = old.users.filter((u) => !now.has(u.uuid)), gain = r.users.filter((u) => !then.has(u.uuid));
     if (lose.length) rows.push(`<div class="ed-note ck-err">⚠ ${esc(lossText({ kind: r.kind }, lose))} here.</div>`);
+    for (const n of (S.view?.rights || []).find((c) => c.uuid === o.uuid)?.narrowed || []) rows.push(`<div class="ed-note ck-err">⚠ ${esc(narrowText(n, displayTitle(o)))} here.</div>`);
     if (gain.length) rows.push(`<div class="ed-note">${esc(gainText({ kind: r.kind }, gain))} here.</div>`);
   }
   return { rows, count: r.list.length };
@@ -2929,11 +2937,8 @@ function rightsApplyText(hw) {
     // A user who holds the new right directly gains it under its schedule: "alice gains access to Haustür (Always)".
     const when = (u) => { const p = (c.added || []).find((x) => x.kind === "user" && x.uuid === u.uuid); return p?.schedule ? ` (${p.schedule})` : ""; };
     for (const u of c.gain || []) gain.push(c.kind === "access" ? `${u.title} gains access to ${c.title}${when(u)}` : `${u.title} starts getting ${c.title}`);
-    // Who keeps access under another schedule (#76): "bob may open Haustür at Workdays, not Always".
-    for (const r of c.rescheduled || []) {
-      const to = r.principal.schedule || "—", from = r.from || "—";
-      gain.push(`${whoText(r.principal)} may open ${c.title} ${to === from ? `under another access schedule titled ${to}` : `at ${to}, not ${from}`}${src}`);
-    }
+    // Who keeps access, but not under every schedule they had (#76): a loss of opening times, warned as one.
+    for (const n of c.narrowed || []) lose.push(narrowText(n, c.title) + src);
   }
   return (lose.length ? `⚠ ${lose.join("\n⚠ ")}\n\n` : "") + (gain.length ? `${gain.join("\n")}\n\n` : "");
 }
@@ -3558,25 +3563,28 @@ async function seSend(o, st, op, label) {
   }
   renderProps();
 }
-/** What Revert sends for timer `uuid` (`e`: its `schedules` entry; `sets`: `schedule_sets`): `{ value }`, or
- *  `{ why }`. Back to the deployed switching times, for this timer only: the deployed set, or no claim. When
- *  other timers claim that set now, rewriting it would change them too, so this timer gets the deployed times in
- *  a set of its own (`modes` without `set`) instead. */
-function seRevertValue(e, sets, uuid) {
+/** What Revert sends for a block's set claim of `kind` (`schedule`, `moods`, `access`): `{ value }`, or `{ why }`.
+ *  `e` is the block's entry of `GET /api/edits`, `sets` that kind's sets; the keys come from the server
+ *  (`set_kinds`). Back to the deployed content, for this block only: the deployed set with its content while no
+ *  other block claims it, else the deployed content in a set of its own, never a rewrite of the others'. No claim
+ *  deployed: vislox's claim goes. When the deployed content cannot be read against this config, Revert is refused
+ *  with the reason: sending the set's name alone would claim it as it is now, and change nothing. */
+function setRevertValue(kind, e, sets, uuid) {
+  const k = S.edits?.set_kinds?.[kind];
   const d = e?.deployed ?? null;
   if (!d) return { value: null };
-  const others = (sets.find((x) => x.name === d.set)?.timers || []).filter((u) => u !== uuid);
-  if (!others.length) return { value: d };
-  if (!d.modes) {
+  if (!k) return { why: "The server did not say how to revert this." };
+  const others = (sets.find((x) => x.name === d.set)?.[k.members] || []).filter((u) => u !== uuid);
+  if (d[k.content] == null) {
     const names = others.map((u) => { const x = S.view?.objects[u]; return x ? displayTitle(x) : u; });
-    return { why: `The deployed switching times (${d.set}) cannot be read, and ${names.join(", ")} ${others.length === 1 ? "claims" : "claim"} that set now: revert in the module, or Discard.` };
+    return { why: `The deployed ${k.what} (${d.set}) cannot be read against this config${names.length ? `, and ${names.join(", ")} ${others.length === 1 ? "claims" : "claim"} that set now` : ""}: revert in the module, or Discard.` };
   }
-  return { value: { modes: d.modes } };
+  return { value: others.length ? { [k.content]: d[k.content] } : { set: d.set, [k.content]: d[k.content] } };
 }
 async function seRevert(uuid) {
   const o = S.view?.objects[uuid], st = o && seState(o), e = schedEdit(uuid);
   if (!st || !e) return;
-  const r = seRevertValue(e, S.edits?.schedule_sets || [], uuid);
+  const r = setRevertValue("schedule", e, S.edits?.schedule_sets || [], uuid);
   if (r.why) { SE.uuid = uuid; SE.err = r.why; SE.msg = ""; renderProps(); return; }
   await seSend(o, st, { op: "schedule", uuid, value: r.value }, `Revert the switching times of ${displayTitle(o)}`);
 }
@@ -3935,25 +3943,10 @@ async function moSend(o, st, op, label) {
   }
   renderProps();
 }
-/** What Revert sends for controller `uuid` (`e`: its `moods` entry; `sets`: `mood_sets`): `{ value }`, or
- *  `{ why }`. Back to the deployed moods, for this controller only: the deployed set, or no claim. When other
- *  controllers claim that set now, rewriting it would change them too, so this one gets the deployed moods in a
- *  set of its own (`moods` without `set`) instead. */
-function moRevertValue(e, sets, uuid) {
-  const d = e?.deployed ?? null;
-  if (!d) return { value: null };
-  const others = (sets.find((x) => x.name === d.set)?.controllers || []).filter((u) => u !== uuid);
-  if (!others.length) return { value: d };
-  if (!d.moods) {
-    const names = others.map((u) => { const x = S.view?.objects[u]; return x ? displayTitle(x) : u; });
-    return { why: `The deployed moods (${d.set}) cannot be read, and ${names.join(", ")} ${others.length === 1 ? "claims" : "claim"} that set now: revert in the module, or Discard.` };
-  }
-  return { value: { moods: d.moods } };
-}
 async function moRevert(uuid) {
   const o = S.view?.objects[uuid], st = o && moState(o), e = moodsEdit(uuid);
   if (!st || !e) return;
-  const r = moRevertValue(e, S.edits?.mood_sets || [], uuid);
+  const r = setRevertValue("moods", e, S.edits?.mood_sets || [], uuid);
   if (r.why) { MO.uuid = uuid; MO.err = r.why; MO.msg = ""; renderProps(); return; }
   await moSend(o, st, { op: "moods", uuid, value: r.value }, `Revert the moods of ${displayTitle(o)}`);
 }
@@ -4232,7 +4225,7 @@ async function acOpen(uuid) {
   Object.assign(AC, { uuid, blob: st.rev.blob, busy: true, msg: "", err: "", warned: "", same: null });
   renderProps();
   let choices;
-  try { choices = await act("/api/access/choices"); } catch (err) { AC.busy = false; AC.err = `Cannot list the users: ${err.message}`; renderProps(); return; }
+  try { choices = await acChoices(AC.blob); } catch (err) { AC.busy = false; AC.err = `Cannot list the users: ${err.message}`; renderProps(); return; }
   AC.busy = false;
   // Selected elsewhere, or a new pending config, while the list was asked for: no draft.
   if (S.sel !== uuid || editRev()?.blob !== AC.blob) { acReset(); renderProps(); return; }
@@ -4256,26 +4249,44 @@ function acTitles(list) {
 }
 /** A user or group of the pickers' lists, by UUID. */
 function acWho(kind, uuid) { return (kind === "group" ? AC.choices?.groups : AC.choices?.users)?.find((x) => x.uuid === uuid) || null; }
-/** The users a draft lets in: those it lists, and the users its groups reach. */
-function acUsers(rows) {
-  const s = new Set();
+/** The pickers' lists of the config the draft is made on (its blob): the server answers from that revision, or
+ *  refuses when it is gone, never from another one. */
+function acChoices(blob) { return act("/api/access/choices", { base: blob }); }
+/** A Code Touch's rights as draft rows: one per right (a user or group may hold two, under two schedules). */
+function acRowsOf(x) { return (x?.rights?.list || []).map((p) => ({ kind: p.kind, uuid: p.uuid.toLowerCase(), schedule: (p.schedule_uuid || "").toLowerCase() })); }
+/** Each user a set of rights lets in → the access schedules that do: directly, or through a group (`choices`). */
+function acUserScheds(rows, choices) {
+  const m = new Map();
+  const add = (u, sch) => { if (!m.has(u)) m.set(u, new Set()); m.get(u).add(sch); };
   for (const r of rows) {
-    if (r.kind === "user") s.add(r.uuid);
-    else for (const u of acWho("group", r.uuid)?.users || []) s.add(u);
+    if (r.kind === "user") add(r.uuid, r.schedule);
+    else for (const u of choices.groups.find((g) => g.uuid === r.uuid)?.users || []) add(u, r.schedule);
   }
-  return s;
+  return m;
 }
-/** Who loses access to each Code Touch the save changes: this one, and those sharing its set when they change too. */
-function acLosses(o, keep) {
-  const e = accessEdit(o.uuid);
-  const doors = [o.uuid, ...(e?.set && e.shared?.length && AC.shareAll ? e.shared : [])];
+/** What going from the rights `was` to `now` takes away on the Code Touch `door`, in sentences: who loses access,
+ *  and who keeps it under fewer access schedules. vislox cannot tell whether one schedule's times cover another's,
+ *  so any schedule taken from a user counts as a loss. */
+function acLossesOf(door, was, now, choices) {
+  const before = acUserScheds(was, choices), after = acUserScheds(now, choices);
+  const name = (u) => choices.users.find((x) => x.uuid === u)?.title || u;
+  const sch = (id) => choices.schedules.find((x) => x.uuid === id)?.title || id;
   const out = [];
-  for (const d of doors) {
-    const x = S.view?.objects[d];
-    const lost = (x?.rights?.users || []).filter((u) => !keep.has(u.uuid.toLowerCase()));
-    if (lost.length) out.push(`${lost.map((u) => u.title).join(", ")} ${lost.length === 1 ? "loses" : "lose"} access to ${x ? displayTitle(x) : d}`);
+  const lost = [...before.keys()].filter((u) => !after.has(u)).map(name);
+  if (lost.length) out.push(`${lost.join(", ")} ${lost.length === 1 ? "loses" : "lose"} access to ${door}`);
+  for (const [u, b] of before) {
+    const a = after.get(u);
+    if (!a) continue;
+    const gone = [...b].filter((x) => !a.has(x));
+    if (gone.length) out.push(`${name(u)} may open ${door} only at ${[...a].map(sch).join(", ")}, no longer at ${gone.map(sch).join(", ")}`);
   }
   return out;
+}
+/** The losses of saving the draft: on this Code Touch, and on those sharing its set when they change too. */
+function acLosses(o) {
+  const e = accessEdit(o.uuid);
+  const doors = [o.uuid, ...(e?.set && e.shared?.length && AC.shareAll ? e.shared : [])];
+  return doors.flatMap((d) => { const x = S.view?.objects[d]; return acLossesOf(x ? displayTitle(x) : d, acRowsOf(x), AC.rows, AC.choices); });
 }
 /** The rows of *Edit access*, below who holds the right. */
 function acRows(o) {
@@ -4362,33 +4373,28 @@ async function acSave() {
     return;
   }
   // Warned once: taking access away is said before the save, as Apply's confirmation says it again.
-  const lose = acLosses(o, acUsers(AC.rows));
+  const lose = acLosses(o);
   if (lose.length && !AC.warned) { AC.warned = `${lose.join("; ")}.`; renderProps(); return; }
   const e = accessEdit(o.uuid);
   const value = { grants: AC.rows.map((r) => ({ kind: r.kind, uuid: r.uuid, schedule: r.schedule })), ...(e?.set && e.shared?.length && AC.shareAll ? { set: e.set } : {}) };
   await acSend(o, AC.blob, { op: "access", uuid: o.uuid, value });
 }
-/** What Revert sends: back to the deployed rights, for this Code Touch only (as moods do, `moRevertValue`). */
-function acRevertValue(e, sets, uuid) {
-  const d = e?.deployed ?? null;
-  if (!d) return { value: null };
-  const others = (sets.find((x) => x.name === d.set)?.code_touches || []).filter((u) => u !== uuid);
-  if (!others.length) return { value: d };
-  if (!d.grants) {
-    const names = others.map((u) => { const x = S.view?.objects[u]; return x ? displayTitle(x) : u; });
-    return { why: `The deployed access rights (${d.set}) cannot be read, and ${names.join(", ")} ${others.length === 1 ? "claims" : "claim"} that set now: revert in the module, or Discard.` };
-  }
-  return { value: { grants: d.grants } };
-}
-/** *Same rights as …*: claim another Code Touch's set as it is; who loses access is said first. */
-function acSame(o, set) {
+/** *Same rights as …*: claim another Code Touch's set as it is; who loses access, or opening times, is said first. */
+async function acSame(o, set) {
   const st = acState(o), x = (S.edits?.access_sets || []).find((s) => s.name === set);
-  if (!st || !x) return;
-  const keep = new Set(x.code_touches.flatMap((u) => (S.view?.objects[u]?.rights?.users || []).map((n) => n.uuid.toLowerCase())));
-  const lost = (o.rights?.users || []).filter((u) => !keep.has(u.uuid.toLowerCase()));
+  if (!st || !x || AC.busy) return;
+  const blob = st.rev.blob;
   const label = `Same access as ${x.code_touches.map((u) => { const y = S.view?.objects[u]; return y ? displayTitle(y) : u; }).join(", ")} for ${displayTitle(o)}`;
-  if (!lost.length) return acSend(o, st.rev.blob, { op: "access", uuid: o.uuid, value: { set } }, label);
-  Object.assign(AC, { uuid: o.uuid, blob: st.rev.blob, open: false, msg: "", err: "", same: { set, label, lose: [`${lost.map((u) => u.title).join(", ")} ${lost.length === 1 ? "loses" : "lose"} access to ${displayTitle(o)}`] } });
+  Object.assign(AC, { uuid: o.uuid, blob, busy: true, open: false, msg: "", err: "", same: null });
+  renderProps();
+  let choices;
+  try { choices = await acChoices(blob); } catch (err) { AC.busy = false; AC.err = `Cannot list the users: ${err.message}`; renderProps(); return; }
+  AC.busy = false;
+  if (S.sel !== o.uuid || editRev()?.blob !== blob) { acReset(); renderProps(); return; }
+  // The set's rights as a Code Touch claiming it has them now.
+  const lose = acLossesOf(displayTitle(o), acRowsOf(o), acRowsOf(S.view?.objects[x.code_touches[0]]), choices);
+  if (!lose.length) return acSend(o, blob, { op: "access", uuid: o.uuid, value: { set } }, label);
+  AC.same = { set, label, lose };
   renderProps();
   $("props").querySelector('[data-ac="sameok"]')?.focus();
 }
@@ -4412,7 +4418,7 @@ $("props").addEventListener("click", (e) => {
   }
   if (what === "revert") {
     if (!st || !ed) return;
-    const r = acRevertValue(ed, S.edits?.access_sets || [], o.uuid);
+    const r = setRevertValue("access", ed, S.edits?.access_sets || [], o.uuid);
     if (r.why) { AC.uuid = o.uuid; AC.err = r.why; AC.msg = ""; renderProps(); return; }
     return acSend(o, st.rev.blob, { op: "access", uuid: o.uuid, value: r.value }, `Revert the access rights of ${displayTitle(o)}`);
   }

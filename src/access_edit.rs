@@ -36,7 +36,7 @@ use crate::edit::{self, Applied, Claims, Ctx, Files, Lock};
 use crate::set_claim;
 use loxone_config::LoxoneDoc;
 use loxone_config::access::{AccessModel, PrincipalKind};
-use loxone_config::logic::AccessGrant;
+use loxone_config::logic::{AccessGrant, Item, RightKind};
 use loxone_config::xml::Element;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -102,15 +102,15 @@ impl set_claim::SetKind for AccessKind {
          # Code Touch: whoever it leaves out loses access. Deleting it leaves the rights as last written.\n";
     const CONTENT_KEY: &'static str = "grants";
     const MEMBERS_KEY: &'static str = "code_touches";
+    const ENTRIES_KEY: &'static str = "access";
+    const SETS_KEY: &'static str = "access_sets";
+    type Index<'a> = Directory;
 
     fn store(c: &Claims) -> &AccessSets {
         &c.5
     }
     fn store_mut(c: &mut Claims) -> &mut AccessSets {
         &mut c.5
-    }
-    fn claimed_elsewhere<'a>(ctx: &'a Ctx) -> &'a BTreeMap<String, String> {
-        ctx.access_claimed
     }
     fn wrong_type(name: &str) -> String {
         format!("{name}: only an NFC Code Touch's access rights are written in Lox Logic")
@@ -129,9 +129,43 @@ impl set_claim::SetKind for AccessKind {
             restore,
         }
     }
-    fn content_of(lines: &[AccessGrant], doc: &LoxoneDoc, _: &Lock) -> Option<Vec<Grant>> {
-        let m = Directory::read(doc);
+    fn index<'a>(doc: &'a LoxoneDoc, _: &'a Lock) -> Directory {
+        Directory::read(doc)
+    }
+    fn content_of(lines: &[AccessGrant], m: &Directory) -> Option<Vec<Grant>> {
         lines.iter().map(|l| m.grant_of(l).ok()).collect()
+    }
+    fn read_item(item: &Item) -> Option<set_claim::SetItem<Self::Line>> {
+        let vx = |n: &str| n.starts_with(crate::blocks::SLUG_PREFIX);
+        match item {
+            Item::Access(a) if a.right == RightKind::Access && vx(&a.name) => Some(
+                set_claim::SetItem::Set(a.name.clone(), a.grants().cloned().collect()),
+            ),
+            Item::AccessClaim(c) if c.right == RightKind::Access && vx(&c.slug) => {
+                Some(set_claim::SetItem::Claim(c.slug.clone(), c.set.clone()))
+            }
+            _ => None,
+        }
+    }
+    fn op(op: &crate::edit::Op) -> Option<(&str, Option<&Self::Val>)> {
+        match op {
+            crate::edit::Op::Access { uuid, value } => Some((uuid, value.as_ref())),
+            _ => None,
+        }
+    }
+    fn missed(
+        files: &Files,
+        out: &LoxoneDoc,
+        lock: &Lock,
+        uuids: &[String],
+        restored: &[String],
+    ) -> Vec<String> {
+        missed(files, out, lock, uuids, restored)
+    }
+    fn differ<'a>(a: &'a LoxoneDoc, b: &'a LoxoneDoc) -> Box<dyn Fn(&str) -> bool + 'a> {
+        // Each config's rights read once, not once per Code Touch.
+        let (ra, rb) = (crate::rights::read(a), crate::rights::read(b));
+        Box::new(move |u| of(&ra, u) != of(&rb, u))
     }
     fn lines_of(
         grants: &Vec<Grant>,
@@ -169,7 +203,7 @@ impl set_claim::SetKind for AccessKind {
 pub struct Directory {
     /// (UUID, title) of each user, in document order.
     pub users: Vec<(String, String)>,
-    /// (UUID, title, the users it reaches, nested groups too) of each group.
+    /// (UUID, title, its direct members: users and groups) of each group.
     pub groups: Vec<(String, String, Vec<String>)>,
     /// (UUID, title) of each access schedule.
     pub schedules: Vec<(String, String)>,
@@ -188,17 +222,13 @@ impl Directory {
             .groups
             .iter()
             .map(|g| {
-                let reach: Vec<String> = m
-                    .users
+                let direct = g
+                    .members
                     .iter()
-                    .filter(|u| {
-                        m.groups_of_transitive(&u.uuid)
-                            .iter()
-                            .any(|x| x.uuid == g.uuid)
-                    })
-                    .map(|u| u.uuid.to_ascii_lowercase())
+                    .chain(&g.subgroups)
+                    .map(|u| u.to_ascii_lowercase())
                     .collect();
-                (g.uuid.to_ascii_lowercase(), title(&g.title), reach)
+                (g.uuid.to_ascii_lowercase(), title(&g.title), direct)
             })
             .collect();
         let schedules = m
@@ -332,13 +362,41 @@ impl Directory {
         Ok(out)
     }
 
+    /// Group UUID → the users it reaches, through nested groups too, in
+    /// document order: one walk up the groups per user.
+    pub fn reach(&self) -> BTreeMap<String, Vec<String>> {
+        let mut parents: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+        for (g, _, direct) in &self.groups {
+            for m in direct {
+                parents.entry(m.as_str()).or_default().push(g.as_str());
+            }
+        }
+        let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (u, _) in &self.users {
+            let mut seen: BTreeSet<&str> = BTreeSet::new();
+            let mut queue = vec![u.as_str()];
+            while let Some(x) = queue.pop() {
+                for g in parents.get(x).into_iter().flatten() {
+                    if seen.insert(g) {
+                        queue.push(g);
+                    }
+                }
+            }
+            for g in seen {
+                out.entry(g.to_string()).or_default().push(u.clone());
+            }
+        }
+        out
+    }
+
     /// The pickers' lists for the browser: users, groups (with the users
     /// they reach) and access schedules, by UUID and title. Personal data:
     /// served only to a request with the admin token.
     pub fn choices(&self) -> Value {
+        let reach = self.reach();
         json!({
             "users": self.users.iter().map(|(u, t)| json!({ "uuid": u, "title": t })).collect::<Vec<_>>(),
-            "groups": self.groups.iter().map(|(u, t, r)| json!({ "uuid": u, "title": t, "users": r })).collect::<Vec<_>>(),
+            "groups": self.groups.iter().map(|(u, t, _)| json!({ "uuid": u, "title": t, "users": reach.get(u).cloned().unwrap_or_default() })).collect::<Vec<_>>(),
             "schedules": self.schedules.iter().map(|(u, t)| json!({ "uuid": u, "title": t })).collect::<Vec<_>>(),
         })
     }
@@ -355,14 +413,18 @@ pub fn apply(
     set_claim::apply::<AccessKind>(files, ctx, uuid, value)
 }
 
-/// A Code Touch's access rights as `doc` has them: (kind, principal UUID,
-/// schedule UUID), lowercase. `ACT=` aside.
-fn compiled_of(doc: &LoxoneDoc, uuid: &str) -> Option<BTreeSet<(String, String, String)>> {
-    let r = crate::rights::read(doc);
-    let r = r
-        .iter()
-        .find(|(u, _)| u.eq_ignore_ascii_case(uuid))
-        .map(|(_, r)| r)?;
+/// A Code Touch's access rights in `rights` (one config's [`crate::rights::read`]):
+/// (kind, principal UUID, schedule UUID), lowercase. `ACT=` aside.
+fn of(
+    rights: &BTreeMap<String, crate::rights::Rights>,
+    uuid: &str,
+) -> Option<BTreeSet<(String, String, String)>> {
+    let r = rights.get(uuid).or_else(|| {
+        rights
+            .iter()
+            .find(|(u, _)| u.eq_ignore_ascii_case(uuid))
+            .map(|(_, r)| r)
+    })?;
     Some(
         r.list
             .iter()
@@ -393,13 +455,19 @@ pub fn missed(
     let s = &files.claims.5;
     let sets = set_claim::sets_written::<AccessKind>(files, lock, uuids, restored);
     let mut bad = Vec::new();
+    if sets.is_empty() {
+        return bad;
+    }
+    // The config's rights and directory, read once.
+    let rights = crate::rights::read(out);
+    let dir = Directory::read(out);
     for set in sets {
         let Some(lines) = s.sets.get(set) else {
             continue;
         };
         let want: Option<BTreeSet<(String, String, String)>> = {
             use set_claim::SetKind;
-            AccessKind::content_of(lines, out, lock).map(|g| {
+            AccessKind::content_of(lines, &dir).map(|g| {
                 g.into_iter()
                     .map(|g| (g.kind, g.uuid, g.schedule))
                     .collect()
@@ -412,7 +480,7 @@ pub fn missed(
             let Some(el) = edit::find(&out.xml.root, &u) else {
                 continue;
             };
-            if want.is_none() || want != compiled_of(out, &u) {
+            if want.is_none() || want != of(&rights, &u) {
                 bad.push(el.attr_decoded("Title").unwrap_or_default().into_owned());
             }
         }
@@ -421,9 +489,11 @@ pub fn missed(
 }
 
 /// Whether the Code Touch `uuid` has other access rights in `a` than in `b`
-/// (or is in only one of them).
+/// (or is in only one of them). For one block; [`set_claim::SetKind::differ`]
+/// reads each config once for many.
+#[cfg(test)]
 pub fn differs(a: &LoxoneDoc, b: &LoxoneDoc, uuid: &str) -> bool {
-    compiled_of(a, uuid) != compiled_of(b, uuid)
+    of(&crate::rights::read(a), uuid) != of(&crate::rights::read(b), uuid)
 }
 
 #[cfg(test)]
@@ -475,8 +545,7 @@ mod tests {
         let e = m.lines_of(&[grant("robot", ALICE, ALWAYS)]).unwrap_err();
         assert!(e.contains("user's or a group's"), "{e}");
         // A group reaches its members, nested groups too.
-        let (_, _, reach) = m.groups.iter().find(|g| g.0 == BEWOHNER).unwrap();
-        assert_eq!(reach, &[BOB.to_string()]);
+        assert_eq!(m.reach()[BEWOHNER], [BOB.to_string()]);
         // The pickers' lists carry titles, never a credential.
         let c = serde_json::to_string(&m.choices()).unwrap();
         assert!(c.contains("\"alice\"") && !c.contains("0A1B2C3D4E5F") && !c.contains("00112233"));

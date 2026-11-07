@@ -620,8 +620,17 @@ content becomes lines and how lines are checked for each block): resolve the blo
 block's own when no other block claims it, else `vx_<name>_<stem>`), write it checked for every claimant (refusing
 one the config lost), claim it, prune, and build `previous` as a whole inverse (`restore` for every other set the
 op rewrote that others still claim). It also builds the section of `GET /api/edits` (`edits_section`: per block
-`set`, its content, `deployed`, `shared`, `pending`; per set its blocks, content and `stale` claimants). The browser's
-Revert sends the deployed set only while no other block claims it, else the deployed content in a set of its own.
+`set`, its content, `deployed`, `shared`, `pending`; per set its blocks, content and `stale` claimants), reading
+each config once (`SetKind::index`, `SetKind::differ`), and `set_kinds` tells the browser each kind's keys. The
+browser's one Revert (`setRevertValue`) sends the deployed set with its content only while no other block claims
+it, else the deployed content in a set of its own; deployed content it cannot read refuses Revert with the reason
+(the set's name alone would claim it as it is now, and change nothing).
+
+Every kind of claim on a block's whole content, members too, is one entry of `set_claim::KINDS` (a `ClaimKind`):
+reading and rendering vislox's file, the names a new set must not take (the module's names are loaded for any op
+of a kind that makes sets), the blocks the rest of the module claims (`Ctx::claimed`, by kind), the refusals of
+Remove and Hand back, mending a claim made twice, the check after the compile, and `GET /api/edits` go through it.
+A new kind (#77, #78) is a `SetKind`, its slot in `Claims`, its `Op` variant, and one line in `KINDS`.
 A central block's members (#75) are no such set: each claim holds its own list, and a block is in as many lists
 as name it. `member_edit.rs` takes only `set_claim.rs`'s naming of vislox's blocks (`member_of`, `target_of`).
 
@@ -845,23 +854,29 @@ vx_50000009_0000_0090_ffff504f94000001.access = vx_haustuer_access
 - **Who may see it.** `GET /api/edits` sends `access` (per Code Touch vislox's file claims now or claimed in the
   deployed revision: `set`, `grants`, `shared`, `deployed`, `pending`) and `access_sets` (each set with its
   `code_touches`, `grants` and `stale` claimants), by UUID only. The pickers' list, every user, group (with the
-  users it reaches) and access schedule of the newest config by UUID and title, is `POST /api/access/choices`: it
-  needs the admin token (`X-Vislox-Token`, and `X-Vislox`), is sent `no-store`, never logged, and the browser keeps
-  it in memory only while the editor is open. No credential is read into it. Names otherwise reach the browser
+  users it reaches) and access schedule by UUID and title, is `POST /api/access/choices` with `{ "base": <blob> }`:
+  read from that revision, the one the draft is made on (a blob the History no longer lists is refused with 409,
+  never answered from another revision). It needs the admin token (`X-Vislox-Token`, and `X-Vislox`), is sent
+  `no-store`, never logged, and the browser keeps it in memory only while the editor is open. No credential is read into it. Names otherwise reach the browser
   only as the review (#68) already shows them, never in a URL, the page title or the event stream.
 - **Every change shows in the review and Apply's confirmation** (#68), since both read the compiled config: a
   right taken away directly, through a shared set (*Change … too*, *Same rights as …*), through a group the set
   drops, or because the Code Touch is gone. Apply's confirmation now also gives the schedule a user gains access
-  under (*alice gains access to Haustür (Always)*) and who keeps access under another schedule (*bob may open
-  Haustür at Workdays, not Always*).
+  under (*alice gains access to Haustür (Always)*).
+- **Fewer opening times are a loss.** vislox cannot tell whether one access schedule's times cover another's, so a
+  user who keeps a door but not under every schedule that let them in before (a schedule replaced, or a right
+  through a group dropped while another stays) loses opening times. `rights.rs` says so per block (`narrowed`:
+  the user, the schedules before and after), and the review, Properties, Apply's confirmation (*⚠ bob may open
+  Haustür only at Workdays, no longer at Always*, a warning on its own) and the editor's *Save anyway* warn about it
+  like a lost door.
 
 The browser: *Access* in Properties of an NFC Code Touch, on the newest config, with *Edit access*: it asks for
-the pickers' list (the admin token), then shows a row per user or group (a choice of the config's users and groups
+the pickers' list of the config shown (the admin token, the config's blob), then shows a row per user or group (a choice of the config's users and groups
 by title, *at*, a choice of its access schedules, ✕) and *Add user or group*. A principal with two rights on the
-door (two schedules) keeps the first, and the editor says so. *Save* first names who loses access, to this Code
-Touch and, when *Change … too* is on, to those sharing its set (*Save anyway*), then sends the op. *Same rights
-as …* (a Code Touch whose rights vislox claims) does the same: it claims at once when nobody loses access, else
-asks (*Use anyway*). *Revert*, and *Remove vislox's claim* when claimed twice, as for moods. The draft belongs to
+door (two schedules) keeps the first, and the editor says so. *Save* first names who loses access or opening
+times, on this Code Touch and, when *Change … too* is on, on those sharing its set (*Save anyway*), then sends the
+op. *Same rights as …* (a Code Touch whose rights vislox claims) does the same: it claims at once when nobody loses
+anything, else asks (*Use anyway*). *Revert*, and *Remove vislox's claim* when claimed twice, as for moods. The draft belongs to
 one Code Touch and one pending config: selecting another block, or a new pending config, drops it, and *Save*
 sends the blob it was made on. The Deploy pane counts the Code Touches whose access is edited and not deployed.
 

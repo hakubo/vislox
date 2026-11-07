@@ -88,8 +88,11 @@ The binary is an `axum` server with the UI embedded (plain JS and SVG, no build 
   `.access` claims in `edits.loxl`, each title checked to name exactly one user, group or schedule (lox's
   `AccessModel`, no credential read), checked after the compile against `rights.rs`' reading of the compiled config
   (`missed`), and `GET /api/edits`' `access` and `access_sets`. `Directory::choices` is the pickers' list, served
-  only to a request with the admin token (`POST /api/access/choices`). The review and Apply's confirmation are
-  #68's `rights.rs`, unchanged.
+  only to a request with the admin token (`POST /api/access/choices`, from the revision whose blob the draft is
+  made on). The review and Apply's confirmation are #68's `rights.rs`, which also says who keeps a door under
+  fewer access schedules (`narrowed`, a loss).
+- `src/set_claim.rs`' `KINDS` lists every kind of claim on a block's whole content (switching times, moods,
+  access, members) as a `ClaimKind`; `edit.rs` and `actions.rs` loop over it instead of naming each kind.
 - `src/blocks.rs` is adding blocks (#59): the types vislox offers (`GET /api/block-types`, from lox's builtin
   table and its language server's descriptions), and vislox's file of new blocks per page
   (`<module>/vislox/<page>.loxl`). `edit.rs` applies `add_block` and `remove_block` to it.
