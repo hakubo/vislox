@@ -131,6 +131,15 @@ The binary is an `axum` server with the UI embedded (plain JS and SVG, no build 
   `expressions`. `src/expr_edit.rs` is editing them in vislox's files: the `expr` op (an expression or a port of
   vislox's into one input: `Claim::exprs` in `edits.loxl`, `NewBlock::exprs` in a declaration, or a wire) and the
   `signal` op (`PageFile::signals`, with `.title`), operands checked against vislox's names.
+- `src/templates.rs` reads the module's templates and their instances (#83) with lox's parser: each template's
+  parameters and outputs, each instance (nested ones by their path, `sued.hitze`) with its arguments as written, the
+  lockfile entries it made (`<prefix>_<body name>`, and lox's expression blocks of the body), its outputs' blocks,
+  and against the module's files at the deployed revision's commit, whether a template's body or an instance's call
+  changed; and lox's template library (`loxone_config::library`), for `GET /api/edits`' `templates`.
+  `src/template_edit.rs` is the `instance` op: a call in vislox's page file (`blocks::InstanceDef`, under the
+  file's *Template instances* comment), checked against the template's parameters, its library template copied into
+  `<module>/vislox/templates.loxl` (`Files::templates`) while it is called, `removed` lines for a dropped compiled
+  one. The module's own templates reach the op as `Ctx::templates` (`edit::module_decls`).
 - `src/set_claim.rs`' `KINDS` lists every kind of claim on a block's whole content (switching times, moods,
   access, recipients, tiles, members) as a `ClaimKind`; `edit.rs` and `actions.rs` loop over it instead of naming each kind.
 - `src/blocks.rs` is adding blocks (#59): the types vislox offers (`GET /api/block-types`, from lox's builtin

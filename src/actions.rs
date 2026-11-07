@@ -66,6 +66,9 @@ pub struct Actions {
     edit_state: Mutex<EditState>,
     /// `GET /api/edits`, for the [`EditState::key`] it was worked out for.
     edits_cache: Mutex<Option<(String, Value)>>,
+    /// The module's `.loxl` files at the deployed revision's commit (#83), by
+    /// commit: a commit never changes.
+    module_at: Mutex<Option<(String, ModuleAt)>>,
     /// The base parsed and indexed for adopting (#72), by its blob id.
     adopt_base: Mutex<Option<(String, Arc<crate::adopt::Indexed>)>>,
     /// The module's `.loxl` files as last read (#64): read and hashed again
@@ -167,6 +170,7 @@ fn needs_module_names(ops: &[edit::Op]) -> bool {
                 | edit::Op::Let { .. }
                 | edit::Op::Expr { value: Some(_), .. }
                 | edit::Op::Signal { .. }
+                | edit::Op::Instance { .. }
         )
             // A value that may name a constant (#81); a number needs none.
             || matches!(o, edit::Op::Param { value: Some(v), .. } if edit::bare_name(v)) || crate::set_claim::kind_of(o).is_some_and(|k| k.makes_sets())
@@ -456,6 +460,39 @@ impl Rollback {
             };
         }
     }
+}
+
+/// The module's `.loxl` files at a commit: path and text.
+type ModuleAt = Vec<(String, String)>;
+
+/// The module's `.loxl` files as `commit` has them (`module`: its path from
+/// the project), by their path from the top of the repository; `None` when
+/// git cannot list them.
+async fn module_texts_at(dir: &Path, commit: &str, module: &str) -> Option<Vec<(String, String)>> {
+    let list = git(
+        dir,
+        &[
+            "ls-tree",
+            "-r",
+            "--full-name",
+            "--name-only",
+            commit,
+            "--",
+            &format!("./{module}"),
+        ],
+    )
+    .await
+    .ok()?;
+    let paths: Vec<&str> = list.lines().filter(|l| l.ends_with(".loxl")).collect();
+    let specs: Vec<String> = paths.iter().map(|p| format!("{commit}:{p}")).collect();
+    let objects = git_objects(dir, &specs).await.ok()?;
+    Some(
+        paths
+            .iter()
+            .zip(objects)
+            .filter_map(|(p, b)| Some((p.to_string(), String::from_utf8_lossy(&b?).into_owned())))
+            .collect(),
+    )
 }
 
 /// Read objects (`<commit>:<path>`) with one `git cat-file --batch`: each
@@ -857,6 +894,7 @@ impl Actions {
             tx,
             edit_state: Mutex::new(EditState::default()),
             edits_cache: Mutex::new(None),
+            module_at: Mutex::new(None),
             adopt_base: Mutex::new(None),
             module_files: Arc::default(),
             compiled: Mutex::new(None),
@@ -2032,7 +2070,9 @@ impl Actions {
                 if req.ops.iter().any(|o| {
                     matches!(
                         o,
-                        edit::Op::RemoveBlock { .. } | edit::Op::Signal { value: None, .. }
+                        edit::Op::RemoveBlock { .. }
+                            | edit::Op::Signal { value: None, .. }
+                            | edit::Op::Instance { value: None, .. }
                     )
                 }) =>
             {
@@ -2052,12 +2092,24 @@ impl Actions {
             .collect();
         // The names of the module's own files, and of them its `let` constants
         // (#81), which a port's value may name. vislox's own are in `files`.
-        let (names, lets) = if needs_module_names(&req.ops) {
+        let (names, lets, templates) = if needs_module_names(&req.ops) {
             match edit::module_decls(&p.module) {
-                Ok(d) => (d.names, d.lets),
+                Ok(d) => (d.names, d.lets, d.templates),
                 // A value that would name a constant cannot be told from a typo:
                 // say why. A new name is checked again once written.
                 Err(e) => {
+                    // Nor a template of the module from lox's library's of that
+                    // name (#83): copying the library's would declare it twice.
+                    if req
+                        .ops
+                        .iter()
+                        .any(|o| matches!(o, edit::Op::Instance { value: Some(_), .. }))
+                    {
+                        return Err(bad(format!(
+                            "the module does not read, so its templates cannot be told from lox's \
+                             library: {e}"
+                        )));
+                    }
                     if let Some(v) = req.ops.iter().find_map(|o| match o {
                         edit::Op::Param { value: Some(v), .. }
                             if edit::bare_name(v)
@@ -2187,6 +2239,7 @@ impl Actions {
             adoptions: &prepared.adoptions,
             page_adoptions: &prepared.pages,
             claimed: &claimed,
+            templates: &templates,
         };
         // `removed` and `moved` lines lox needs no more go first: their slugs
         // are free. A request of `tidy` asks for that alone (#80).
@@ -3120,7 +3173,7 @@ impl Actions {
         pending: Option<Arc<Vec<u8>>>,
     ) -> Value {
         let off = || {
-            let mut v = json!({ "available": false, "reason": state.why, "claims": [], "managed": [], "sources": {}, "set_claims": [], "members_claims": [], "constants": { "lets": [], "defaults": [], "uses": {} }, "expressions": [], "set_kinds": {} });
+            let mut v = json!({ "available": false, "reason": state.why, "claims": [], "managed": [], "sources": {}, "set_claims": [], "members_claims": [], "constants": { "lets": [], "defaults": [], "uses": {} }, "expressions": [], "templates": { "templates": [], "instances": [], "library": [] }, "set_kinds": {} });
             for k in crate::set_claim::KINDS {
                 for (key, _) in k.edits_section(
                     &Default::default(),
@@ -3304,6 +3357,66 @@ impl Actions {
                 v
             })
             .collect();
+        // The module's templates and their instances (#83), the blocks each
+        // instance made, and what differs from the deployed revision's files:
+        // a template's body, an instance's call. An instance of vislox's
+        // carries its call as the `instance` op takes it (`edit`) and the op
+        // that puts back the deployed revision's (`revert`).
+        let module_rel = rel_of(&p.module);
+        let deployed_texts = match deployed.as_ref().and_then(|d| d.commit.clone()) {
+            Some(commit) => {
+                let key = format!("{commit}:{module_rel}");
+                let kept = self
+                    .module_at
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .filter(|(k, _)| *k == key)
+                    .map(|(_, v)| v.clone());
+                match kept {
+                    Some(v) => Some(v),
+                    // Kept only when git read them: a failure is tried again.
+                    None => {
+                        let v = module_texts_at(dir, &commit, &module_rel).await;
+                        if let Some(v) = &v {
+                            *self.module_at.lock().unwrap() = Some((key, v.clone()));
+                        }
+                        v
+                    }
+                }
+            }
+            None => None,
+        };
+        let mut templates = crate::templates::read(&texts, &lock, |f| f.starts_with(&mine));
+        crate::templates::compare(&mut templates, deployed_texts.as_deref());
+        let instances: Vec<Value> = templates
+            .instances
+            .iter()
+            .map(|x| {
+                let mut v = serde_json::to_value(x).unwrap_or_default();
+                if x.ours
+                    && x.parent.is_none()
+                    && let Some((file, def)) = now.instance(&x.path)
+                {
+                    let page = now.pages[file].uuid.clone().unwrap_or_default();
+                    v["edit"] = json!(crate::template_edit::call_of(def));
+                    v["revert"] = json!(edit::Op::Instance {
+                        slug: x.path.clone(),
+                        page,
+                        value: was
+                            .instance(&x.path)
+                            .map(|(_, d)| crate::template_edit::call_of(d)),
+                    });
+                    v["committed"] = json!(was.instance(&x.path).is_some());
+                }
+                v
+            })
+            .collect();
+        let templates = json!({
+            "templates": templates.templates,
+            "instances": instances,
+            "library": crate::templates::library(),
+        });
         // What vislox's file claims on a block's whole content now or
         // claimed in the deployed revision: per kind (switching times #73,
         // moods #74, members #75, access #76) its entries and sets, and the
@@ -3454,6 +3567,7 @@ impl Actions {
                 adoptions: &none_a,
                 page_adoptions: &none_p,
                 claimed: &Default::default(),
+                templates: &Default::default(),
             };
             for b in blocks.iter_mut().filter(|b| b["adopted"] == true) {
                 let Some(u) = b["uuid"].as_str().map(String::from) else {
@@ -3481,6 +3595,7 @@ impl Actions {
                 adoptions: &none_a,
                 page_adoptions: &none_p,
                 claimed: &Default::default(),
+                templates: &Default::default(),
             };
             for b in blocks.iter_mut() {
                 let Some(u) = b["uuid"].as_str().map(String::from) else {
@@ -3503,6 +3618,7 @@ impl Actions {
             "members_claims": members_claims,
             "constants": constants,
             "expressions": expressions,
+            "templates": templates,
             "set_kinds": set_kinds,
             "movable": movable,
             "moves": moves,
@@ -5789,6 +5905,89 @@ esac
         assert_eq!(x[1]["title"], "Warm");
         assert_eq!(x[1]["top"], "u-warm");
         assert!(x[1].get("revert").is_none(), "{e}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_instance_is_refused_while_the_module_does_not_read() {
+        let (tmp, a) = project_for_edits();
+        let d = tmp.path().join("project");
+        // The module may declare a template named like one of lox's library:
+        // unread, it is not taken for the library's.
+        std::fs::write(d.join("pages/main.loxl"), "template Treppenlicht(\n").unwrap();
+        let (code, msg) = a
+            .edit(
+                &edit::Request {
+                    base: blob(&d, "out.Loxone"),
+                    ops: vec![edit::Op::Instance {
+                        slug: "vx_t".into(),
+                        page: "10000008-0000-0080-ffff504f94000001".into(),
+                        value: Some(crate::template_edit::Call {
+                            template: "Treppenlicht".into(),
+                            label: None,
+                            args: [("taster".to_string(), "vx_x".to_string())].into(),
+                        }),
+                    }],
+                },
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(code, axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(msg.contains("the module does not read"), "{msg}");
+        assert!(!d.join("pages/vislox/templates.loxl").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_template_instances_are_listed_with_their_blocks_and_what_changed() {
+        let (tmp, a) = project_for_edits();
+        let d = tmp.path().join("project");
+        std::fs::write(
+            d.join("pages/main.loxl"),
+            "template Paar(label: string = \"P\", quelle: input) -> (Q: g.Q)\n\tg = Not(\"{label}\", In: quelle)\nend\n\nnord = Paar(\"Nord\")\n",
+        )
+        .unwrap();
+        std::fs::write(
+            d.join("logic.lock.json"),
+            r#"{"objects":{"nord_g":{"uuid":"u-g","type":"Not","page_uuid":"p"}}}"#,
+        )
+        .unwrap();
+        let e = edits_of(&a, &d).await;
+        let t = &e["templates"];
+        assert_eq!(t["templates"][0]["name"], "Paar", "{e}");
+        assert_eq!(t["templates"][0]["line"], 1);
+        // Not in the deployed revision's files: new, and so is its instance.
+        assert_eq!(t["templates"][0]["deployed"], false);
+        assert_eq!(t["instances"][0]["path"], "nord");
+        assert_eq!(t["instances"][0]["label"], "Nord");
+        assert_eq!(t["instances"][0]["line"], 5);
+        assert_eq!(t["instances"][0]["change"], "new");
+        assert_eq!(t["instances"][0]["blocks"][0]["uuid"], "u-g");
+        assert_eq!(t["instances"][0]["blocks"][0]["name"], "nord.g");
+        assert_eq!(t["instances"][0]["outputs"][0]["uuid"], "u-g");
+        assert!(
+            t["instances"][0].get("edit").is_none(),
+            "the module's own: no form"
+        );
+        assert!(
+            t["library"]
+                .as_array()
+                .is_some_and(|l| l.iter().any(|x| x["name"] == "Treppenlicht"))
+        );
+        // In the deployed revision's commit (the base's newest): nothing changed.
+        git(&d, &["add", "-A"]).await.unwrap();
+        git(&d, &["commit", "--amend", "-qm", "init"])
+            .await
+            .unwrap();
+        // A comment more: the module changed (what /api/edits is worked out again for), nothing it makes.
+        let main = std::fs::read_to_string(d.join("pages/main.loxl")).unwrap();
+        std::fs::write(d.join("pages/main.loxl"), format!("{main}# reformatted\n")).unwrap();
+        let e = edits_of(&a, &d).await;
+        let t = &e["templates"];
+        assert_eq!(t["templates"][0]["deployed"], true, "{e}");
+        assert_eq!(t["templates"][0]["changed"], false);
+        assert!(t["instances"][0]["change"].is_null());
     }
 
     #[cfg(unix)]

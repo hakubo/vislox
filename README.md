@@ -50,10 +50,12 @@ Then open <http://127.0.0.1:7878>. Started without a path or `--ctx` in a direct
   block's label and settings (a PulseAt's time, a Formula, a program block's program, constants with units), rename
   and delete a managed block (`moved`, keeping its UUIDs; `removed`), make `let` constants and bind ports to them,
   feed an input from an expression and name it as a signal (`x.Port <- a.Q and b.AQ >= 28`, `vx_warm = …`),
+  add and edit template instances (the module's templates or lox's library: `vx_ost = Treppenlicht(…)`),
   then Apply, Sync and Discard from the browser.
 - For a `lox.toml` project: the blocks its Lox Logic module manages marked, each with the `.loxl` file and line that
   makes it, each parameter a `let` constant or a `defaults` statement gives named after it, and the blocks lox made
-  for an expression drawn as one block showing the expression.
+  for an expression drawn as one block showing the expression, and a template instance's blocks framed under its
+  call (`sued: Fassade`), the Changes list grouping what a template's body changed.
 - For a `lox.toml` project: `lox logic check` errors listed by file, line and block when the module doesn't compile
   (Apply is off until it does), and *Compile* when the pending config is from before the module's latest change.
 - For a `lox.toml` project: `lox logic lint` findings (unused names, blocks whose outputs feed nothing, users whose
@@ -140,7 +142,7 @@ Opt-ins:
 | Sync, Discard | `--admin-token-file`, then the token | nothing; they change the project and its git repository |
 | Push to git | `--admin-token-file`, then the token | nothing; it pushes the commits git's remote lacks, after `lox logic scan` finds no personal data in them |
 | Compile (a module changed outside vislox) | `--admin-token-file`, then the token | nothing; it runs `lox logic compile` |
-| Edit values, switching times, moods, members and access rights, add, adopt, move, rename and delete blocks, draw wires | `--admin-token-file`, then the token | nothing; vislox writes its files in the module (and positions and adopted blocks in the lockfile; `lox logic adopt` runs on a copy) and runs `lox logic compile` |
+| Edit values, switching times, moods, members and access rights, add, adopt, move, rename and delete blocks, template instances, draw wires | `--admin-token-file`, then the token | nothing; vislox writes its files in the module (and positions and adopted blocks in the lockfile; `lox logic adopt` runs on a copy) and runs `lox logic compile` |
 | Operate virtual inputs | `--operate` with `--admin-token-file` | `jdev/sps/io/<uuid>/<cmd>`, only to `VirtualIn` objects, each confirmed |
 | Query blocks on this page | a toggle in the legend, off by default | read-only `jdev/sps/io/<uuid>/all`, at most 20 a second |
 | Debug-Monitor | `--monitor`, then Start | `dev/sps/log/<address>`: the Miniserver sends its debug output to vislox until Stop or the time limit |

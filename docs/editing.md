@@ -5,9 +5,9 @@ make and change connections (#61), undo and redo (#62), adopt the blocks Loxone 
 Daytimer's switching times (#73), a lighting controller's moods (#74), a central block's members (#75), who may
 open an NFC Code Touch (#76), push notifications: who gets them and what they say (#77), the tiles of a Touch
 Pure Flex (#78), a managed block's label and settings, its program among them (#79), deleting and renaming a
-managed block (#80), `let` constants and `defaults` (#81), and expressions and named signals (#82). This page is the
-design they share. #58 to #62, #72 to #82 are built (#81 and #82 in part: see their sections); the rest says where
-each step plugs in.
+managed block (#80), `let` constants and `defaults` (#81), expressions and named signals (#82), and template
+instances (#83). This page is the design they share. #58 to #62, #72 to #83 are built (#81, #82 and #83 in part: see
+their sections); the rest says where each step plugs in.
 
 ## The rules
 
@@ -68,7 +68,9 @@ POST /api/edit
            { "op": "param", "uuid": "…", "port": "Time", "value": "vx_nachlauf" },
            { "op": "expr", "uuid": "…", "port": "I2", "value": "vx_….Q and vx_….AQ >= 28" },
            { "op": "signal", "slug": "vx_warm", "page": "<page uuid>", "value": "vx_….AQ >= 28",
-             "title": "Warm" } ] }
+             "title": "Warm" },
+           { "op": "instance", "slug": "vx_ost", "page": "<page uuid>",
+             "value": { "template": "Treppenlicht", "args": { "taster": "vx_…", "dauer": "5min" } } } ] }
 ```
 
 `adopt`, `adopt_page` and `unadopt` go in a request of their own (#72), and so does `rename` (#80). `restore_block`
@@ -95,7 +97,8 @@ is what undoes a `remove_block` of a deployed block (#80); vislox makes it, see 
   rights (#76), `recipients` for a notification's recipients (#77), and `tiles` for a Touch Pure Flex's tiles (#78).
   `let` is a value op (#81): its `previous` is the constant's value before, or null when the op made it. `expr`
   is a value op too (#82): what vislox's files fed the input before, or null; `signal`'s `previous` is the `signal`
-  op that puts back what was (null `value`: the op made the signal).
+  op that puts back what was (null `value`: the op made the signal). `instance` is as `signal`, for a template
+  instance (#83).
   A reconnected wire is one request, `unwire` then `wire`:
   undone, the reverse list. The ops of one request see each other: `unwire` then `wire` of the same wire is
   accepted (and changes nothing). `remove_block`'s `add_block` carries the wires the removal took out
@@ -363,7 +366,7 @@ vx_60000002_0000_0000_ffff504f94000001.Time = vx_nachlauf
   `constant` the constant a default names (`defaults Monoflop(Time: nachlauf)`); `file`/`line` the statement;
   `at_file`/`at_line` where the block binds it (the argument, or the `x.Port = name` line) or, for a default, the
   block's declaration; `at_ours` whether that is a file of vislox's. They are read with lox's parser, at the top
-  level of each file (a template's body is #83's): a managed block's arguments (the lockfile's `objects`), an
+  level of each file (a template's body is expanded per instance, which #83 reads): a managed block's arguments (the lockfile's `objects`), an
   extern's `x.Port = name` and its folded arguments (its `uuid: "…"`, else `externals`), and every managed block of
   a type a `defaults` statement names that does not bind the port itself (lox's `defaults_taken`). An alias (`let x
   = y.Q`) names a port, not a value, and is left out; a file that does not parse is left out (`lox logic check`
@@ -418,7 +421,7 @@ the signal's top block `<signal>` itself (hand-owned). lox re-derives them on ev
 edited as blocks: the expression is.
 
 - **Read.** `GET /api/edits` sends `expressions`, read with lox's parser at the top level of each file (a template's
-  body is #83's): `id` (the blocks' prefix; a second expression on one prefix is `<prefix>#2`), `kind` (`wire`, `argument` or `signal`), `sink` (`jal.AutoShade`, or the
+  body's expressions are its instances' blocks, #83): `id` (the blocks' prefix; a second expression on one prefix is `<prefix>#2`), `kind` (`wire`, `argument` or `signal`), `sink` (`jal.AutoShade`, or the
   signal's slug), `to` (`[object UUID, connector key]` of the input it feeds), `text` (as lox prints it), a signal's
   `title`, `file`, `line`, `ours` (in vislox's files), `top` and `top_type` (its top block: the signal's, or the last
   one lox's post-order count names), `blocks` (the blocks lox names for this expression, by the same count shared
@@ -467,6 +470,96 @@ edited as blocks: the expression is.
 - **Deleting** a block of vislox's files that an expression of theirs reads is refused (#80's `delete_refusal`).
 - Not offered: editing an expression of the module's own files (vislox writes only its own, as for `let`, #81),
   deleting a deployed signal, and an expression on a new block's input in *Add block* (add it, then feed the input).
+
+## Template instances (#83)
+
+A `template` is a block type made of blocks: each instance (`sued = Fassade("Süd", sonne: sonne_sued)`) stamps out a
+copy whose lockfile keys are `<instance>_<body name>` (`sued_hoch`; `sued_hitze_alarm` under a nested instance
+`hitze`), and source spells those blocks `sued.hoch` and `sued.hitze.alarm`. The compiled config has only the
+blocks, so vislox reads the module's source to say which blocks one call made.
+
+```text
+template Fassade(label: string, sonne: input, pos: number = 70) -> (Q: b.Q, Hitze: hitze.Q)   # the module's file
+	b = And("{label} B", In1: sonne)
+	hitze = Waechter("{label} H", quelle: sonne)
+end
+
+# Template instances written in vislox: lox makes each one's blocks.               # vislox's page file
+vx_ost = Fassade("Ost", sonne: vx_10000006_0000_0060_ffff504f94000001.AQ, pos: 55)
+```
+
+- **Read.** `GET /api/edits` sends `templates`: `templates` (each template's `name`, `file`, `line`, `ours` (vislox's
+  copy of a library template), `library` (the library file when its text is the library's), `params` (`name`, `kind`:
+  `object`, `input`, `value` or `set`, `type`, `default`, `required`), `outputs`, `description` (the comment opening
+  its body), `instances` (how many), `deployed` (the deployed revision's files had it) and `changed` (its body as lox
+  prints it differs from theirs)); `instances` (`path`: `sued`, `sued.hitze` for a nested one; `prefix`: its blocks'
+  lockfile prefix; `template`; `parent`; `label` (a nested call's interpolated with its parent's text parameters, as
+  lox's expansion does); `args` as written; the `file` and `line` of its call (a nested one's, its outermost
+  instance's, and `body_line` in the parent template); `ours`; `page`; `outputs` (each to its block's UUID and
+  connector key, through a nested instance too); `blocks` (`uuid`, `slug`, `name` as source spells it, `expression`:
+  lox made it for an expression of the body); `change`: `new` or `call` against the deployed revision's files, for a
+  top-level instance); and `library`, lox's template library (`loxl templates`) with each template's parameters. An
+  instance of vislox's also carries `edit` (its call as the `instance` op takes it), `revert` (the op that puts the
+  deployed revision's call back, or drops it) and `committed`. Read with lox's parser over every `.loxl` file of the
+  module, templates classified across files as lox does (`classify_instances_of`). A lockfile key belongs to the
+  instance with the longest prefix whose template's body declares the name after it (`<prefix>_<name>`), or for
+  which lox made an expression block of that body (`<prefix>_<name>__…`, `<prefix>_<name>_<port>__…`). An
+  expression in a body onto an object parameter (`jalousie.AutoShade <- …`) is named after the object passed, not
+  the instance, and is no instance's. What the deployed revision had is the module's `.loxl` files at its commit
+  (`git ls-tree` and `cat-file`, kept per commit once git read them). Like `sources`, it is the module as it is now: shown on the
+  newest config only.
+- **The canvas** frames each instance's blocks in a dashed box behind them, headed by `sued: Fassade "Süd"` and its
+  arguments and outputs (`sonne: teiler.AQ · pos: 55  → Q, Hitze`); a nested instance's box sits inside its parent's.
+  The header's tooltip names the template's file and line, and a click selects the instance's first block.
+- **Properties** of a block of an instance has a *Template* section: the block's name as source spells it
+  (`sued.hoch`), the instance and its label, the template with its file and line (and whether it is lox's library's),
+  the enclosing instances of a nested one, each parameter with its argument or its default, the outputs (linked to
+  their blocks), the call's file and line, and *Not deployed* when the template's body changed, the instance is new,
+  or its call changed since the deployed revision. One of the module's own files is read-only: *change it there*.
+- **The Changes list**, comparing the deployed revision, puts a change to a block of an instance whose template (or
+  an enclosing instance's) changed under the template: `Waechter: 2 instances changed · 2 changes`, with the
+  template's line; any other change to an instance's blocks goes under its top-level instance, `sued: Fassade (call
+  changed)` or `(new)`. The headings come before an expression's (#82) and a constant's (#81).
+- **`instance`** makes, changes or drops a template instance of vislox's page file of `page`: `{ "op": "instance",
+  "slug": "vx_ost", "page": "<page uuid>", "value": { "template": "Fassade", "label": "Ost", "args": { "sonne":
+  "vx_….AQ", "pos": "55" } } }`, written under the file's `# Template instances` comment. `value: null` drops it. Its
+  `previous` is the `instance` op that puts back what was (`value: null` when the op made it).
+  - The template is one of the module's own, or of lox's library: vislox copies a library template into its
+    directory (`<module>/vislox/templates.loxl`, which holds only such copies) for the first instance that calls it,
+    and drops the copy with the last one, or when the module declares that name itself. While the module's own
+    files do not read, an instance is refused with lox's error rather than taken for the library's template of that
+    name. `templates.loxl` is no page's file name (a page titled *Templates* gets `page-templates.loxl`); a page file
+    of vislox's that already has the name (it has a `page` line) stays a page file, and a library template is then
+    refused (copy it into the module).
+  - The name is `vx_` and lowercase letters, digits and `_`, without `__`, not `vx_<uuid>`, not taken, and no other
+    name of the module, its lockfile or vislox's files may start with `<name>_` (its blocks are named so).
+  - Checked as `lox logic check` checks a call, before anything is written: an unknown parameter (the error lists
+    the template's), a missing one (an object, a value or set without a default), a label for a template without
+    `label: string`, a value of the wrong kind (`number`, `duration`, `string`, `bool`; a constant's name is taken).
+    Each argument is kept as written, so a quoted text stays a text and a constant's name a reference through Save,
+    Revert and undo; a text parameter's value typed without quotes is quoted unless it names a constant. An object
+    parameter names an object vislox's files may name: one Loxone Config drew as `vx_<uuid>` (an extern of
+    `edits.loxl`, added with the instance and dropped with the last name of it), or a block or signal of vislox's, or
+    a block of an instance of vislox's (`vx_ost.b`, checked against its template's body; the bare instance is no
+    object); an input parameter a port, a bare name or an expression over such names (of an instance: bare for its
+    first output, an output or a block); a set parameter a set of vislox's file of that kind. lox checks the rest
+    (the object's type, the ports the body uses) when the module is checked and compiled.
+  - The template of an existing instance is not changed: lox keeps its blocks' types (make a new instance, then drop
+    this one).
+  - Dropping is refused while vislox's files read the instance (a wire out of it, an expression, another instance's
+    argument) and once any of its blocks is deployed (deleting a deployed instance is a later step: its blocks would
+    take #70's removals). A compiled one leaves `removed <instance>_<name>` for each of its blocks, under the comment
+    `# Instances dropped here`, which goes when the instance is made again or lox forgets the blocks.
+  - Deleting a block or signal of vislox's files that an instance's argument names is refused (#80's
+    `delete_refusal`, as for an expression).
+- **Add block** lists the module's templates and lox's library's next to the block types (*Template · …*). Picking
+  one asks for the instance's name (vislox proposes `vx_<template>_<n>`), its label when it takes one, and each
+  parameter (its kind and default as the placeholder): one `instance` op. **Properties** of a block of an instance of
+  vislox's edits its arguments (*Save*), puts the deployed call back (*Revert*), and takes out one that was never
+  committed (*Remove instance*).
+- Not offered: editing an instance or a template of the module's own files (vislox writes only its own, as for
+  `let`, #81, and expressions, #82); renaming an instance (`moved` per expanded block); deleting a deployed
+  instance; and wiring an instance's output from vislox's `wire` op (feed an input parameter instead).
 
 ## Moving blocks (#60)
 
@@ -561,8 +654,8 @@ or in Loxone Config (where an edit to a managed block is overwritten on the next
   - `expression`: a block lox made for an expression, named `<sink>_<port key>__<op><n>` (lox's `desugar.rs`), at
     the line of the expression: the `<-` statement, the argument of the block it feeds, or the named signal
     (`<signal>__<op><n>`). Two expressions into one port share a prefix; the first one's line is given.
-  - `template`: a block a template instance made (`<instance>_<block>`), at the instance's line (pointing into the
-    template's body is left to #83).
+  - `template`: a block a template instance made (`<instance>_<block>`), at the instance's line. Properties'
+    *Template* section names it as source does (`sued.hoch`) and gives the template's line (#83).
   - `ambiguous`: a name declared twice at the top level (lox refuses that module), or an expression into such a
     name: no line, rather than a guess.
   - none (`file` null): the lockfile pins it, but no `.loxl` file declares it now.
@@ -1393,7 +1486,8 @@ The blocks vislox added or adopted (#72) are the exception: their `.loxl` is vis
   - blocks lox creates but that do nothing until they are set up in Loxone Config: the burglar and smoke alarms,
     the room controller, the irrigation, and the central light and shade blocks (the members of one the config
     has are edited here, #75);
-  - every type outside lox's table (lox refuses it: "Refuse, never guess"), and templates (#83).
+  - every type outside lox's table (lox refuses it: "Refuse, never guess"). A template is added as an instance
+    (#83).
 - On a new block: a wire when it is added (draw it once it is on the page, #61) or an expression on an input (feed
   it once the block is on the page, #82),
   a position when it is added (lox places it; it can be moved after), and a room or category (lox has no claim for
@@ -1428,7 +1522,7 @@ Each of these plugs in as new op kinds on `POST /api/edit`, written into `<modul
 | #80 (built) | delete and rename managed blocks (`removed`, `moved`) |
 | #81 (built in part) | `let` constants made and changed in vislox's file, ports bound to them; the module's `let` and `defaults` shown |
 | #82 (built in part) | expressions (`<-`, `Port: …`) and named signals (`slug = …`, `.title`) of vislox's files; the module's shown |
-| #83 | `template` instances |
+| #83 (built in part) | `template` instances of vislox's files (the `instance` op, lox's library copied in); the module's shown, grouped and reviewed |
 | #84 | virtual inputs, virtual and Modbus devices |
 | #85 | Tree and Air hardware (`Statistics:`, new Tree devices) |
 | #86 | operating modes and calendar entries |

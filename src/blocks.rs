@@ -371,6 +371,81 @@ pub struct PageFile {
     /// Of `removed`, the signals dropped here (#82): only making one again
     /// takes its line back. Written under a comment of their own.
     pub dropped: BTreeSet<String>,
+    /// The template instances written here (#83).
+    pub instances: Vec<InstanceDef>,
+    /// Of `removed`, the blocks of instances dropped here (#83): only making
+    /// the instance again takes their lines back. Under a comment of their own.
+    pub unstamped: BTreeSet<String>,
+}
+
+/// A template instance of a page file (#83): `vx_ost = Fassade("Ost",
+/// sonne: vx_….AQ)`. lox expands it into the template's blocks, keyed
+/// `vx_ost_<body name>` in the lockfile.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct InstanceDef {
+    pub slug: String,
+    pub template: String,
+    /// The label, which binds the template's `label` parameter.
+    pub label: Option<String>,
+    /// Parameter → its argument as lox prints it, in the order written.
+    pub args: Vec<(String, String)>,
+    /// The names of vislox's the arguments read (an object, a port's block,
+    /// an expression's operands), but its constants.
+    pub names: Vec<String>,
+}
+
+impl InstanceDef {
+    pub fn render(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(t) = &self.label {
+            parts.push(Value::Str(t.clone()).to_string());
+        }
+        for (k, v) in &self.args {
+            parts.push(format!("{k}: {v}"));
+        }
+        format!("{} = {}({})", self.slug, self.template, parts.join(", "))
+    }
+
+    /// Read a call as lox parsed it (`consts`: vislox's constants, which an
+    /// argument names as a value).
+    pub fn of(b: &loxone_config::logic::BlockDecl, consts: &BTreeSet<String>) -> InstanceDef {
+        let mut names: Vec<String> = Vec::new();
+        let mut push = |n: &str| {
+            if n.starts_with(SLUG_PREFIX) && !consts.contains(n) && !names.iter().any(|x| x == n) {
+                names.push(n.to_string());
+            }
+        };
+        let mut args = Vec::new();
+        let mut label = b.title.clone();
+        for x in b.bindings() {
+            match &x.kind {
+                BindingKind::Param(Value::Str(s)) if x.port == "label" && label.is_none() => {
+                    label = Some(s.clone());
+                    continue;
+                }
+                BindingKind::Param(Value::Ref(n)) => push(n),
+                BindingKind::Wire(p) => push(&p.slug),
+                BindingKind::Expr(e) => {
+                    for o in e.operands() {
+                        match o {
+                            loxone_config::logic::Operand::Port(p) => push(&p.slug),
+                            loxone_config::logic::Operand::Value(Value::Ref(n)) => push(n),
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+            args.push((x.port.clone(), x.kind.to_string()));
+        }
+        InstanceDef {
+            slug: b.slug.clone(),
+            template: b.block_type.clone(),
+            label,
+            args,
+            names,
+        }
+    }
 }
 
 /// `to <- from`: a wire of a page file, out of a block adopted there.
@@ -396,6 +471,14 @@ pub const ADOPTED_LINE: &str = "Adopted from Loxone Config";
 /// The comment above the `removed` lines of signals dropped here (#82).
 pub const DROPPED_LINE: &str = "Signals dropped here";
 
+/// The comment above the template instances written here (#83): the calls
+/// after it are instances, not blocks.
+pub const INSTANCES_LINE: &str = "Template instances";
+
+/// The comment above the `removed` lines of the blocks of instances dropped
+/// here (#83).
+pub const UNSTAMPED_LINE: &str = "Instances dropped here";
+
 fn foreign(what: &str) -> String {
     format!("it holds {what}, which vislox did not write; move it to another file of the module")
 }
@@ -413,6 +496,8 @@ impl PageFile {
             wires: Vec::new(),
             signals: Vec::new(),
             dropped: BTreeSet::new(),
+            instances: Vec::new(),
+            unstamped: BTreeSet::new(),
         }
     }
 
@@ -421,6 +506,7 @@ impl PageFile {
             && self.removed.is_empty()
             && self.moved.is_empty()
             && self.signals.is_empty()
+            && self.instances.is_empty()
     }
 
     /// Read a file vislox wrote. Only what vislox writes is accepted, so
@@ -440,6 +526,10 @@ impl PageFile {
         let mut adopted = false;
         // Under the comment of the signals dropped here (#82).
         let mut dropping = false;
+        // Under the comment of the instances (#83), or of their blocks
+        // dropped here.
+        let mut instancing = false;
+        let mut unstamping = false;
         for item in m.items {
             match item {
                 Item::Comment(c) if file.is_none() && c.trim().starts_with(UUID_LINE) => {
@@ -448,9 +538,29 @@ impl PageFile {
                 Item::Comment(c) if file.is_some() && c.trim().starts_with(ADOPTED_LINE) => {
                     adopted = true;
                     dropping = false;
+                    instancing = false;
+                    unstamping = false;
+                }
+                Item::Comment(c) if file.is_some() && c.trim().starts_with(INSTANCES_LINE) => {
+                    instancing = true;
+                    adopted = false;
+                    dropping = false;
+                    unstamping = false;
                 }
                 Item::Comment(c) if file.is_some() => {
                     dropping = c.trim().starts_with(DROPPED_LINE);
+                    unstamping = c.trim().starts_with(UNSTAMPED_LINE);
+                    if dropping || unstamping {
+                        instancing = false;
+                    }
+                }
+                // A template instance (#83).
+                Item::Block(b) | Item::Instance(b) if instancing => {
+                    let f = file.as_mut().expect("under a comment after the page line");
+                    if !b.slug.starts_with(SLUG_PREFIX) {
+                        return Err(foreign(&format!("`{}`", b.slug)));
+                    }
+                    f.instances.push(InstanceDef::of(&b, consts));
                 }
                 Item::Page(p) if file.is_none() => {
                     file = Some(PageFile {
@@ -580,6 +690,9 @@ impl PageFile {
                     if dropping {
                         f.dropped.insert(r.slug.clone());
                     }
+                    if unstamping {
+                        f.unstamped.insert(r.slug.clone());
+                    }
                     f.removed.insert(r.slug);
                 }
                 Item::Moved(m)
@@ -644,8 +757,21 @@ impl PageFile {
             out.push_str(&x.render());
             out.push('\n');
         }
+        if !self.instances.is_empty() {
+            out.push_str(&format!(
+                "\n# {INSTANCES_LINE} written in vislox: lox makes each one's blocks.\n"
+            ));
+        }
+        for x in &self.instances {
+            out.push_str(&x.render());
+            out.push('\n');
+        }
+        let (unstamped, removed): (Vec<&String>, Vec<&String>) = self
+            .removed
+            .iter()
+            .partition(|s| self.unstamped.contains(*s));
         let (signals, deleted): (Vec<&String>, Vec<&String>) =
-            self.removed.iter().partition(|s| self.dropped.contains(*s));
+            removed.into_iter().partition(|s| self.dropped.contains(*s));
         if !deleted.is_empty() {
             out.push_str("\n# Deleted here: lox takes them out of the config.\n");
         }
@@ -658,6 +784,14 @@ impl PageFile {
             ));
         }
         for s in signals {
+            out.push_str(&format!("removed {s}\n"));
+        }
+        if !unstamped.is_empty() {
+            out.push_str(&format!(
+                "\n# {UNSTAMPED_LINE}: lox takes their blocks out of the config.\n"
+            ));
+        }
+        for s in unstamped {
             out.push_str(&format!("removed {s}\n"));
         }
         if !self.moved.is_empty() {
@@ -714,8 +848,9 @@ pub fn file_name(title: &str, taken: &dyn Fn(&str) -> bool) -> String {
     }
     let mut stem: String = s.trim_matches('-').chars().take(40).collect();
     stem = stem.trim_end_matches('-').to_string();
-    // `edits.loxl` is the file of #58's claims.
-    if stem.is_empty() || stem == "edits" {
+    // `edits.loxl` is the file of #58's claims, `templates.loxl` that of the
+    // library templates vislox copies in (#83).
+    if stem.is_empty() || stem == "edits" || stem == "templates" {
         stem = format!("page-{stem}").trim_end_matches('-').to_string();
     }
     let mut name = format!("{stem}.loxl");
@@ -959,6 +1094,8 @@ mod tests {
         assert_eq!(file_name("Küche Licht", &none), "kueche-licht.loxl");
         assert_eq!(file_name("  ", &none), "page.loxl");
         assert_eq!(file_name("Edits", &none), "page-edits.loxl");
+        // `templates.loxl` is vislox's file of library templates (#83).
+        assert_eq!(file_name("Templates", &none), "page-templates.loxl");
         let taken = |n: &str| n == "bad.loxl" || n == "bad-2.loxl";
         assert_eq!(file_name("Bad", &taken), "bad-3.loxl");
         let used = |s: &str| s == "vx_greaterequal_1";

@@ -222,6 +222,16 @@ pub fn expressions<T: AsRef<str>>(
             })
         })
         .collect();
+    // A call of a template is an instance (#83): what it binds are its
+    // parameters, and lox desugars an expression there inside its body.
+    let template_names: std::collections::BTreeSet<&str> = parsed
+        .iter()
+        .flat_map(|p| p.items.iter())
+        .filter_map(|i| match i {
+            Item::Template(t) => Some(t.name.as_str()),
+            _ => None,
+        })
+        .collect();
     // Slug → (type, UUID when known), for externs and blocks.
     let mut objects: BTreeMap<String, (String, Option<String>)> = BTreeMap::new();
     // A signal's label.
@@ -325,7 +335,7 @@ pub fn expressions<T: AsRef<str>>(
                         wire_line(p, &w.to.slug, &w.to.port),
                     );
                 }
-                Item::Block(b) => {
+                Item::Block(b) if !template_names.contains(b.block_type.as_str()) => {
                     let lines: BTreeMap<String, usize> = decls
                         .at(&b.slug, Some(p.file))
                         .map(|(_, l)| bindings(&p.lines, l - 1))

@@ -180,6 +180,14 @@ published under the same version (see [docker/README.md](docker/README.md)).
   its text, *Name this expression* (a named signal of the page, `vx_warm = …`, feeding the input), a signal's label
   (`.title`), Revert and Undo. lox's rules hold: a signal keeps its top block's type (`and` → `or` is refused), and a
   deployed signal is not deleted yet. The module's own expressions are shown, not changed. Never deploys.
+- Template instances (#83): an instance's blocks are framed on the page, headed by its call (`sued: Fassade "Süd"`,
+  arguments and outputs; nested instances inside), and Properties of any of them names the block as source does
+  (`sued.hoch`), the instance and the template with its file and line. The Changes list puts the changes a template's
+  body caused under the template (`Waechter: 2 instances changed`) and those of one call under its instance. *Add
+  block* offers the module's templates and lox's library (a library template is copied into vislox's directory while
+  an instance calls it); an instance of vislox's files is edited in Properties (arguments checked as lox checks a
+  call), reverted, and removed while never committed. The module's own instances are shown, not changed. Never
+  deploys.
 
 ## 0.2.0
 
