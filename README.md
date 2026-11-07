@@ -50,6 +50,9 @@ Then open <http://127.0.0.1:7878>. Started without a path or `--ctx` in a direct
   (Apply is off until it does), and *Compile* when the pending config is from before the module's latest change.
 - For a `lox.toml` project: `lox logic lint` findings (unused names, blocks whose outputs feed nothing, users whose
   tag opens no Code Touch, …) as a warning badge on each block and a *Lint* list in the Deploy pane. Hints only.
+- For a `lox.toml` project: the module's `lox logic test` scenarios run in lox's simulator, each with pass, fail or
+  couldn't run, the failing `expect` with expected and actual values, and the blocks it checks. Apply stops while
+  a test fails.
 - Ctrl+K to find any page or block (by name, or by its Lox Logic slug), links that reopen a page, block and revision, and full keyboard use (`?`).
 
 Details: [docs/features.md](docs/features.md).

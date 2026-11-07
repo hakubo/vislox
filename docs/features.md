@@ -151,7 +151,8 @@ sends to the Miniserver see [miniserver.md](miniserver.md).
 - **Apply, Sync, Discard** (for a `lox.toml` project, when started with an admin token): edit the project's Lox
   Logic module and compile it with `lox logic`, by hand or with an agent of your own working in the repository
   (see [agent-workflow.md](agent-workflow.md)). The compile shows as the pending revision, so you
-  review it like any other change. **Apply** deploys it with `lox config push --force` (download, drift check,
+  review it like any other change. **Apply** first checks that the module compiles and its tests pass, then
+  deploys it with `lox config push --force` (download, drift check,
   upload, program restart, verify), then commits the project and pushes it to its git remote. Each step shows
   as it happens, with how long it took. vislox follows the program restart itself: the Miniserver going out of
   service, back online after N s, and the new config loaded (its structure version changed). When Apply
@@ -181,6 +182,14 @@ sends to the Miniserver see [miniserver.md](miniserver.md).
   them all by kind, each with its file and line and a button per block that shows it on its page. An NFC Code
   Touch's Properties list the users whose NFC tag or code opens no Code Touch. Findings never stop Apply. How:
   [editing.md](editing.md#lint-findings-66).
+
+- **Tests** (a `lox.toml` project): with the same check, vislox runs the module's `test "…" … end` blocks in
+  lox's simulator (`lox logic test`). The Deploy pane's *Tests: N of M passed* lists each test with pass, fail or
+  couldn't run, the `expect` that did not hold with its expected and actual value, and buttons for the blocks it
+  checks; a test that could not run names the blocks the simulator does not model, so a pass isn't read as full
+  coverage. A block a failing test checks gets a red badge, and the test in Properties. **Apply is off while a test
+  fails**, and Apply's *Tests pass* step runs the tests of the exact config it would deploy and stops there,
+  before anything is sent. How: [editing.md](editing.md#tests-67).
 
 - **Edit values** (for a `lox.toml` project, with the admin token): Properties' *Edit values* changes a block's
   name, its room and category, the constant of an unwired input (lox checks it against the documented range) and the settings of a

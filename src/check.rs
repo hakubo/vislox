@@ -243,9 +243,10 @@ fn lint_finding(l: &str) -> Option<(Option<&str>, &str, &str)> {
     Some((file, name, message))
 }
 
-/// Whether a `lox logic lint` that gave no count is a lox without it:
-/// lox's usage error (exit 2, `unknown command`), not a lint that failed.
-pub fn lint_unsupported(code: Option<i32>, stdout: &str, stderr: &str) -> bool {
+/// Whether a `lox logic lint` (or `test`) that gave no count is a lox
+/// without it: lox's usage error (exit 2, `unknown command`), not a run
+/// that failed.
+pub fn unsupported(code: Option<i32>, stdout: &str, stderr: &str) -> bool {
     let said = |t: &str| t.contains("unknown command") || t.contains("unrecognized subcommand");
     code == Some(2) || said(stdout) || said(stderr)
 }
@@ -266,30 +267,324 @@ pub fn locate_findings<T: AsRef<str>>(
             f.file = Some(file);
             f.line = Some(line);
         }
-        let mut blocks: Vec<String> = lock
-            .uuid_of(&f.name)
-            .map(String::from)
-            .into_iter()
-            .collect();
-        blocks.extend(as_uuid(f.name.strip_prefix("vx_").unwrap_or(&f.name)));
-        let text = match (&f.file, f.line) {
-            (Some(file), Some(line)) => texts
-                .iter()
-                .find(|(t, _)| t == file)
-                .and_then(|(_, t)| t.as_ref().lines().nth(line - 1)),
-            _ => None,
-        };
-        if let Some(text) = text
-            && let [Tok::Ident(kw), Tok::Ident(n), ..] = tokens(text).as_slice()
-            && kw == "extern"
-            && *n == f.name
-        {
-            blocks.extend(names(text).1.iter().filter_map(|u| as_uuid(u)));
+        f.blocks = name_blocks(&f.name, f.file.as_deref(), f.line, texts, lock);
+    }
+}
+
+/// The blocks `name` is: the managed block or device the lockfile pins by
+/// it, the UUID vislox names an extern after, or the object an extern of
+/// that name pins on its declaration's line (`file`:`line`).
+fn name_blocks<T: AsRef<str>>(
+    name: &str,
+    file: Option<&str>,
+    line: Option<usize>,
+    texts: &[(String, T)],
+    lock: &Lock,
+) -> Vec<String> {
+    let mut blocks: Vec<String> = lock.uuid_of(name).map(String::from).into_iter().collect();
+    blocks.extend(as_uuid(name.strip_prefix("vx_").unwrap_or(name)));
+    let text = match (file, line) {
+        (Some(file), Some(line)) => texts
+            .iter()
+            .find(|(t, _)| t == file)
+            .and_then(|(_, t)| t.as_ref().lines().nth(line - 1)),
+        _ => None,
+    };
+    if let Some(text) = text
+        && let [Tok::Ident(kw), Tok::Ident(n), ..] = tokens(text).as_slice()
+        && kw == "extern"
+        && *n == name
+    {
+        blocks.extend(names(text).1.iter().filter_map(|u| as_uuid(u)));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    blocks.retain(|u| seen.insert(u.clone()));
+    blocks
+}
+
+/// One test of `lox logic test` (#67).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TestRun {
+    pub name: String,
+    /// `pass`, `fail` (an `expect` did not hold) or `error` (the test could
+    /// not run: a block the simulator does not model, a port outside the
+    /// simulated logic).
+    pub status: &'static str,
+    /// The `expect`s that did not hold.
+    pub failures: Vec<Expectation>,
+    /// Why it could not run (`error`), as lox says it.
+    pub error: Option<String>,
+    /// The blocks the simulator does not model that stopped it.
+    pub unmodeled: Vec<Unmodeled>,
+    /// The `.loxl` file of `test "…"`, shown as [`Error::file`] is.
+    pub file: Option<String>,
+    /// 1-based: the `test "…"` line.
+    pub line: Option<usize>,
+    /// The blocks it checks: what its `expect`s name, by UUID.
+    pub blocks: Vec<String>,
+}
+
+/// A failed `expect`: `step 1: expect both.Q == 1 — actual 0`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Expectation {
+    /// The `tick` or `step` (1-based) it is checked after.
+    pub step: Option<usize>,
+    /// The statement as lox prints it (`expect both.Q == 1`).
+    pub expect: String,
+    /// What it reads: `both.Q`.
+    pub signal: Option<String>,
+    /// The comparison and the value expected: `==`, `1`.
+    pub cmp: Option<String>,
+    pub expected: Option<String>,
+    /// What the simulator read.
+    pub actual: String,
+    /// Its line in the test, when the statement is found there.
+    pub line: Option<usize>,
+    /// The block `signal` is on, by UUID.
+    pub blocks: Vec<String>,
+}
+
+/// A block a test used that the simulator does not model, as lox names it:
+/// `StateV "Status" (00000000-…)`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Unmodeled {
+    pub uuid: String,
+    #[serde(rename = "type")]
+    pub ty: String,
+    pub title: String,
+}
+
+/// What `lox logic test` said: each test, in order.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Tested {
+    pub tests: Vec<TestRun>,
+}
+
+/// `lox logic test`'s standard output, read: a line per test
+/// (`test "name" ... ok`, `FAILED` or `ERROR`), each failed `expect` or the
+/// error on the lines under it (indented by four), and the count it ends
+/// with (`3 tests: 2 passed, 1 failed`), or `no tests in …` / `no tests
+/// match …` when there are none. `None` without either: lox failed (the
+/// module does not compile: exit 1, `Error: …` on standard error) or is not
+/// one vislox can read. lox has no JSON for test yet, so this reads the text
+/// it prints.
+pub fn parse_test(stdout: &str) -> Option<Tested> {
+    let mut tests: Vec<TestRun> = Vec::new();
+    // The lines under a test until `trace:` (lox's `--trace`, never asked).
+    let mut open = false;
+    for l in stdout.lines() {
+        if tests.is_empty() && (l.starts_with("no tests in ") || l.starts_with("no tests match ")) {
+            return Some(Tested::default());
         }
+        if test_count(l) {
+            return Some(Tested { tests });
+        }
+        if let Some((name, verdict)) = test_line(l) {
+            tests.push(TestRun {
+                name: name.to_string(),
+                status: verdict,
+                failures: Vec::new(),
+                error: None,
+                unmodeled: Vec::new(),
+                file: None,
+                line: None,
+                blocks: Vec::new(),
+            });
+            open = true;
+            continue;
+        }
+        let Some(t) = tests.last_mut().filter(|_| open) else {
+            continue;
+        };
+        let Some(detail) = l.strip_prefix("    ") else {
+            open = false;
+            continue;
+        };
+        if detail.trim() == "trace:" {
+            open = false;
+            continue;
+        }
+        let detail = detail.trim();
+        match t.status {
+            "fail" => t.failures.push(expectation(detail)),
+            "error" => {
+                t.unmodeled.extend(unmodeled(detail));
+                match &mut t.error {
+                    Some(e) => {
+                        e.push('\n');
+                        e.push_str(detail);
+                    }
+                    None => t.error = Some(detail.to_string()),
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// `3 tests: 2 passed, 1 failed` (`1 tests: …` too).
+fn test_count(l: &str) -> bool {
+    let Some((n, rest)) = l.split_once(" tests: ") else {
+        return false;
+    };
+    let Some((p, f)) = rest.split_once(" passed, ") else {
+        return false;
+    };
+    let num = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    num(n) && num(p) && f.strip_suffix(" failed").is_some_and(num)
+}
+
+/// `test "name" ... ok`: the name and `pass`, `fail` or `error`.
+fn test_line(l: &str) -> Option<(&str, &'static str)> {
+    let rest = l.strip_prefix("test \"")?;
+    let (name, verdict) = rest.rsplit_once("\" ... ")?;
+    let status = match verdict {
+        "ok" => "pass",
+        "FAILED" => "fail",
+        "ERROR" => "error",
+        _ => return None,
+    };
+    Some((name, status))
+}
+
+/// A failed `expect`, as lox prints it: `step 2: expect both.Q >= 0.5 —
+/// actual 0` (with `--lox`, ` (key)` after the value).
+fn expectation(l: &str) -> Expectation {
+    let (step, rest) = match l
+        .strip_prefix("step ")
+        .and_then(|r| r.split_once(": "))
+        .and_then(|(n, r)| Some((n.parse::<usize>().ok()?, r)))
+    {
+        Some((n, r)) => (Some(n), r),
+        None => (None, l),
+    };
+    let (expect, actual) = rest.rsplit_once(" — actual ").unwrap_or((rest, ""));
+    let actual = actual.split(" (").next().unwrap_or(actual).trim();
+    let words: Vec<&str> = expect.split_whitespace().collect();
+    let (signal, cmp, expected) = match words.as_slice() {
+        ["expect", s, c, v @ ..] if !v.is_empty() => {
+            (Some(s.to_string()), Some(c.to_string()), Some(v.join(" ")))
+        }
+        _ => (None, None, None),
+    };
+    Expectation {
+        step,
+        expect: expect.trim().to_string(),
+        signal,
+        cmp,
+        expected,
+        actual: actual.to_string(),
+        line: None,
+        blocks: Vec::new(),
+    }
+}
+
+/// The blocks an error names as not simulated: `StateV "Status"
+/// (00000000-0000-001e-ffff504f94000001) is not simulated: no model …`,
+/// each with its type and title.
+fn unmodeled(l: &str) -> Vec<Unmodeled> {
+    let mut out = Vec::new();
+    let mut rest = l;
+    while let Some(i) = rest.find(") is not simulated") {
+        let head = &rest[..i];
+        rest = &rest[i + 1..];
+        let Some(open) = head.rfind(" (") else {
+            continue;
+        };
+        let Some(uuid) = as_uuid(&head[open + 2..]) else {
+            continue;
+        };
+        let before = &head[..open];
+        let Some(t) = before.strip_suffix('"') else {
+            continue;
+        };
+        let Some(q) = t.rfind('"') else {
+            continue;
+        };
+        let title = &t[q + 1..];
+        let ty = t[..q]
+            .trim_end()
+            .rsplit(' ')
+            .next()
+            .unwrap_or("")
+            .trim_start_matches('`');
+        out.push(Unmodeled {
+            uuid,
+            ty: ty.to_string(),
+            title: title.to_string(),
+        });
+    }
+    out
+}
+
+/// Pin each test to its `test "…"` line, each failed `expect` to its line
+/// in that test (the first statement lox printed as it is written there),
+/// and both to the blocks their `expect`s read: what the slug before the
+/// port is ([`name_blocks`]). Only top-level `test` blocks (lox allows
+/// them nowhere else).
+pub fn locate_tests<T: AsRef<str>>(tests: &mut [TestRun], texts: &[(String, T)], lock: &Lock) {
+    let decls = crate::managed::Declarations::new(texts);
+    let blocks_of = |signal: &str| -> Vec<String> {
+        let slug = signal.split('.').next().unwrap_or(signal);
+        let (file, line) = decls.at(slug, None).unzip();
+        name_blocks(slug, file.as_deref(), line, texts, lock)
+    };
+    for t in tests {
+        // The test's body: from `test "name"` to its `end`.
+        let head = format!("test \"{}\"", t.name);
+        let body = texts.iter().find_map(|(f, text)| {
+            let lines: Vec<&str> = text.as_ref().lines().collect();
+            let at = lines.iter().position(|l| {
+                l.strip_prefix(head.as_str())
+                    .is_some_and(|r| r.trim().is_empty() || r.trim_start().starts_with('#'))
+            })?;
+            let end = lines[at + 1..]
+                .iter()
+                .position(|l| l.trim() == "end")
+                .map_or(lines.len(), |e| at + 1 + e);
+            Some((f.clone(), at, lines[at + 1..end].to_vec(), at + 1))
+        });
+        let mut blocks: Vec<String> = Vec::new();
+        if let Some((file, at, body, first)) = &body {
+            t.file = Some(file.clone());
+            t.line = Some(at + 1);
+            for l in body {
+                let tl = l.split('#').next().unwrap_or("").trim();
+                if let Some(rest) = tl.strip_prefix("expect ")
+                    && let Some(signal) = rest.split_whitespace().next()
+                {
+                    blocks.extend(blocks_of(signal));
+                }
+            }
+            let mut used = std::collections::BTreeSet::new();
+            for e in &mut t.failures {
+                let found = body.iter().enumerate().find(|(i, l)| {
+                    !used.contains(i)
+                        && squash(l.split('#').next().unwrap_or("")) == squash(&e.expect)
+                });
+                if let Some((i, _)) = found {
+                    used.insert(i);
+                    e.line = Some(first + i + 1);
+                }
+            }
+        }
+        for e in &mut t.failures {
+            if let Some(s) = &e.signal {
+                e.blocks = blocks_of(s);
+            }
+        }
+        blocks.extend(t.unmodeled.iter().map(|u| u.uuid.clone()));
         let mut seen = std::collections::BTreeSet::new();
         blocks.retain(|u| seen.insert(u.clone()));
-        f.blocks = blocks;
+        t.blocks = blocks;
     }
+}
+
+/// A statement with its spaces run together, to compare what lox prints
+/// with what is written.
+fn squash(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// The UUIDs a line of Lox Logic names ([`names`]): a name by the
@@ -652,22 +947,22 @@ lint: 2 findings
 
     #[test]
     fn a_lox_without_lint_is_told_from_a_lint_that_failed() {
-        assert!(lint_unsupported(
+        assert!(unsupported(
             Some(2),
             "",
             "unknown command `lint`. Run `lox logic help`."
         ));
-        assert!(lint_unsupported(
+        assert!(unsupported(
             Some(2),
             "",
             "error: unrecognized subcommand 'logic'"
         ));
-        assert!(!lint_unsupported(
+        assert!(!unsupported(
             Some(1),
             "",
             "error: compile for dead-output analysis failed: boom"
         ));
-        assert!(!lint_unsupported(None, "", ""));
+        assert!(!unsupported(None, "", ""));
     }
 
     #[test]
@@ -729,5 +1024,118 @@ lint: 2 findings
         assert_eq!(as_uuid(DIV).as_deref(), Some(DIV));
         assert_eq!(as_uuid("vx_and_1"), None);
         assert_eq!(as_uuid("10000006-0000-0060"), None);
+    }
+
+    /// What lox 0.83.0 prints (`lox logic test` on a module with a test
+    /// that passes, one that fails twice and one that reads a block the
+    /// simulator does not model).
+    const TEST_OUT: &str = "test \"And schaltet\" ... ok
+test \"And falsch\" ... FAILED
+    step 1: expect both.Q == 1 — actual 0
+    step 2: expect both.Q >= 0.5 — actual 0
+test \"Status\" ... ERROR
+    step 1: `stat.AQ` cannot be simulated: StateV \"Status\" (00000000-0000-001e-ffff504f94000001) is not simulated: no model for `StateV` blocks. Set a port between it and the expectation in the test.
+3 tests: 1 passed, 2 failed
+(--trace shows each test cycle by cycle)
+";
+
+    #[test]
+    fn test_results_are_read_test_by_test() {
+        let t = parse_test(TEST_OUT).unwrap();
+        let st: Vec<(&str, &str)> = t
+            .tests
+            .iter()
+            .map(|t| (t.name.as_str(), t.status))
+            .collect();
+        assert_eq!(
+            st,
+            vec![
+                ("And schaltet", "pass"),
+                ("And falsch", "fail"),
+                ("Status", "error")
+            ]
+        );
+        let f = &t.tests[1].failures;
+        assert_eq!(f.len(), 2);
+        assert_eq!(f[0].step, Some(1));
+        assert_eq!(f[0].expect, "expect both.Q == 1");
+        assert_eq!(f[0].signal.as_deref(), Some("both.Q"));
+        assert_eq!(f[0].cmp.as_deref(), Some("=="));
+        assert_eq!(f[0].expected.as_deref(), Some("1"));
+        assert_eq!(f[0].actual, "0");
+        assert_eq!(f[1].cmp.as_deref(), Some(">="));
+        assert_eq!(f[1].expected.as_deref(), Some("0.5"));
+        let e = &t.tests[2];
+        assert!(
+            e.error
+                .as_deref()
+                .unwrap()
+                .contains("no model for `StateV` blocks")
+        );
+        assert_eq!(
+            e.unmodeled,
+            vec![Unmodeled {
+                uuid: "00000000-0000-001e-ffff504f94000001".into(),
+                ty: "StateV".into(),
+                title: "Status".into()
+            }]
+        );
+        // `--lox` names the key after the value; a unit stays with the value.
+        let t = parse_test(
+            "test \"a\" ... FAILED\n    step 3: expect x.AQ ~= 21.5 °C — actual 19 (AQ)\n1 tests: 0 passed, 1 failed\n",
+        )
+        .unwrap();
+        assert_eq!(t.tests[0].failures[0].expected.as_deref(), Some("21.5 °C"));
+        assert_eq!(t.tests[0].failures[0].actual, "19");
+    }
+
+    #[test]
+    fn no_tests_are_no_tests_and_anything_else_is_unknown() {
+        assert_eq!(parse_test("no tests in pages\n"), Some(Tested::default()));
+        assert_eq!(
+            parse_test("test \"x\" ... ok\n1 tests: 1 passed, 0 failed\n")
+                .unwrap()
+                .tests
+                .len(),
+            1
+        );
+        // A module that does not compile: lox says so on standard error.
+        assert_eq!(parse_test(""), None);
+        // Cut off before the count.
+        assert_eq!(parse_test("test \"x\" ... ok\n"), None);
+        assert_eq!(parse_test("unexpected: logic test ."), None);
+    }
+
+    #[test]
+    fn a_test_points_at_its_line_and_the_blocks_it_checks() {
+        let main = format!(
+            "page \"OG\"\nboth = And(\"Beide\")\nextern teiler = Div(uuid: \"{DIV}\")\n\n\
+             test \"And falsch\"  # the second input stays off\n\tboth.In1 = 0\n\ttick 1s\n\
+             \texpect both.Q == 1\n\ttick 2s\n\texpect  both.Q >= 0.5 # half\n\texpect teiler.AQ == 0\nend\n\
+             test \"Status\"\n\ttick 1s\n\texpect stat.AQ == 0\nend\n"
+        );
+        let texts = vec![("pages/main.loxl".to_string(), main)];
+        let lock = Lock {
+            slugs: [("both".to_string(), FLUR.to_string())].into(),
+            ..Default::default()
+        };
+        let mut t = parse_test(TEST_OUT).unwrap().tests;
+        locate_tests(&mut t, &texts, &lock);
+        assert_eq!(t[1].file.as_deref(), Some("pages/main.loxl"));
+        assert_eq!(t[1].line, Some(5));
+        // What its `expect`s read: the managed block and the extern.
+        assert_eq!(t[1].blocks, vec![FLUR.to_string(), DIV.to_string()]);
+        assert_eq!(t[1].failures[0].line, Some(8));
+        assert_eq!(t[1].failures[1].line, Some(10));
+        assert_eq!(t[1].failures[0].blocks, vec![FLUR.to_string()]);
+        // Not found in the module: no line, but still the failures lox gave.
+        assert_eq!(t[0].line, None);
+        // A block not in the lock (new, not compiled yet) is none; the
+        // block the simulator lacks is named by lox's UUID.
+        assert_eq!(t[2].line, Some(13));
+        assert_eq!(
+            t[2].blocks,
+            vec!["00000000-0000-001e-ffff504f94000001".to_string()]
+        );
     }
 }

@@ -69,9 +69,10 @@ pub struct Actions {
     /// ([`Self::check_key`]) it was worked out for. Only the check worker
     /// writes it ([`Self::check_once`]); a request only reads it.
     check_cache: Mutex<Option<CheckEntry>>,
-    /// The lox found to have no `logic lint` (#66), by path, modification
-    /// time and size: it is not asked again until it changes.
-    lint_unsupported: Mutex<Option<String>>,
+    /// The lox found to have no `logic lint` (#66) or `logic test` (#67),
+    /// by the command, then by path, modification time and size: it is not
+    /// asked again until it changes.
+    unsupported: Mutex<std::collections::BTreeMap<&'static str, String>>,
     /// Counts the checks kept, for the browsers (`actions.check`).
     check_version: std::sync::atomic::AtomicU64,
     /// Wakes the check worker: a file changed, or an action ended.
@@ -171,11 +172,13 @@ impl EditState {
 }
 
 /// `GET /api/check`'s last check, the key it was worked out for
-/// ([`Actions::check_key`]), and whether lint is still to run on it.
+/// ([`Actions::check_key`]), and whether lint (#66) and the tests (#67) are
+/// still to run on it.
 struct CheckEntry {
     key: String,
     v: Value,
     lint_due: bool,
+    test_due: bool,
 }
 
 /// The revision the Miniserver runs, for `GET /api/edits`.
@@ -480,8 +483,9 @@ struct Step {
 }
 
 /// Apply's steps, in order.
-const APPLY_STEPS: [(&str, &str); 9] = [
+const APPLY_STEPS: [(&str, &str); 10] = [
     ("module", "Module compiles"),
+    ("tests", "Tests pass"),
     ("check", "Download and drift check"),
     ("upload", "Upload"),
     ("restart", "Program restarting"),
@@ -686,7 +690,7 @@ impl Actions {
             module_files: Arc::default(),
             compiled: Mutex::new(None),
             check_cache: Mutex::new(None),
-            lint_unsupported: Mutex::new(None),
+            unsupported: Mutex::new(Default::default()),
             check_version: Default::default(),
             check_wake: tokio::sync::Notify::new(),
             preempt: tokio::sync::Notify::new(),
@@ -962,6 +966,17 @@ impl Actions {
                     return Err((StatusCode::CONFLICT, why));
                 }
             },
+        }
+        // Then its tests (#67) must pass, on the config Apply deploys: the
+        // check's run when it is of the files as they are, else run now.
+        self.progress(|p| p.start("tests"));
+        let tests = self.tests_now().await;
+        match tests_verdict(&tests) {
+            Ok((state, detail)) => self.progress(|p| p.finish("tests", state, Some(detail))),
+            Err(why) => {
+                self.end_with("apply", &Err(why.clone()), None);
+                return Err((StatusCode::CONFLICT, why));
+            }
         }
         let res = self.apply_steps(opts).await;
         let (res, deployed) = match res {
@@ -1708,17 +1723,18 @@ impl Actions {
     }
 
     /// Check the module once, if its key changed since the last check kept,
-    /// and keep it if nothing changed meanwhile; then lint it (#66), as a
-    /// second step. Returns whether to work again (the key moved while lox
-    /// ran, or lint is still to run). Never while an action runs: that check
-    /// would be of a project half written, so it is not kept; the action's
-    /// end wakes the worker again. The check holds the compile lock, so its
-    /// scratch compile never runs beside another compile, and an action that
-    /// starts meanwhile waits for it; lint does not (see [`Self::lint_once`]).
+    /// and keep it if nothing changed meanwhile; then lint it (#66) and run
+    /// its tests (#67), side by side, as a second step. Returns whether to
+    /// work again (the key moved while lox ran, or the second step is still
+    /// to run). Never while an action runs: that check would be of a project
+    /// half written, so it is not kept; the action's end wakes the worker
+    /// again. The check holds the compile lock, so its scratch compile never
+    /// runs beside another compile, and an action that starts meanwhile
+    /// waits for it; lint and the tests do not (see [`Self::second_once`]).
     pub async fn check_once(&self) -> bool {
         let k = self.check_key();
-        let lint = match &*self.check_cache.lock().unwrap() {
-            Some(c) if c.key == k && !c.lint_due => return false,
+        let second = match &*self.check_cache.lock().unwrap() {
+            Some(c) if c.key == k && !c.lint_due && !c.test_due => return false,
             Some(c) => c.key == k,
             None => false,
         };
@@ -1738,8 +1754,8 @@ impl Actions {
             self.set_files(now);
             return true;
         }
-        if lint {
-            return self.lint_once(&k, &files).await;
+        if second {
+            return self.second_once(&k, &files).await;
         }
         let v = {
             let Ok(_compiling) = self.compile_lock.try_lock() else {
@@ -1750,33 +1766,40 @@ impl Actions {
         if self.check_key() != k || self.files_key_now().await != files {
             return true;
         }
-        // Errors and hints are shown at once; lint follows, while the
-        // findings of the last lint stay up (`running`).
+        // Errors and hints are shown at once; lint and the tests follow,
+        // while what the last ones found stays up (`running`).
         let mut v = v;
         let compiles = v["ok"] == true;
-        let unsupported = self.lint_unsupported_now();
-        v["lint"] = if !compiles {
-            Value::Null
-        } else if let Some(why) = &unsupported {
-            json!({ "available": false, "unsupported": true, "reason": why })
-        } else {
-            let last = self
-                .check_cache
-                .lock()
-                .unwrap()
-                .as_ref()
-                .and_then(|c| c.v["lint"]["findings"].as_array().cloned())
-                .unwrap_or_default();
-            json!({ "available": true, "running": true, "findings": last })
-        };
-        let lint_due = compiles && unsupported.is_none();
+        let mut due = [false; 2];
+        for (i, (cmd, list)) in [("lint", "findings"), ("test", "tests")]
+            .into_iter()
+            .enumerate()
+        {
+            let unsupported = self.unsupported_now(cmd);
+            v[cmd] = if !compiles {
+                Value::Null
+            } else if let Some(why) = &unsupported {
+                json!({ "available": false, "unsupported": true, "reason": why })
+            } else {
+                let last = self
+                    .check_cache
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .and_then(|c| c.v[cmd][list].as_array().cloned())
+                    .unwrap_or_default();
+                json!({ "available": true, "running": true, list: last })
+            };
+            due[i] = compiles && unsupported.is_none();
+        }
         *self.check_cache.lock().unwrap() = Some(CheckEntry {
             key: k,
             v,
-            lint_due,
+            lint_due: due[0],
+            test_due: due[1],
         });
         self.checked();
-        lint_due
+        due[0] || due[1]
     }
 
     /// An action (an edit, Compile, Apply, Sync, Discard) runs.
@@ -1814,11 +1837,126 @@ impl Actions {
         )
     }
 
-    /// Why lint is not run: this lox has no `logic lint` (found out once).
-    fn lint_unsupported_now(&self) -> Option<String> {
+    /// Why `lox logic <cmd>` (`lint`, `test`) is not run: this lox has
+    /// none (found out once).
+    fn unsupported_now(&self, cmd: &str) -> Option<String> {
         let me = self.lox_identity();
-        (self.lint_unsupported.lock().unwrap().as_deref() == Some(me.as_str()))
-            .then(|| "this lox has no `lox logic lint`".to_string())
+        (self.unsupported.lock().unwrap().get(cmd) == Some(&me))
+            .then(|| format!("this lox has no `lox logic {cmd}`"))
+    }
+
+    /// The second step of a check that found no errors: lint (#66) and the
+    /// tests (#67), each when still due, side by side. Returns whether to
+    /// work again.
+    async fn second_once(&self, k: &str, files: &Option<String>) -> bool {
+        let (lint, test) = match &*self.check_cache.lock().unwrap() {
+            Some(c) if c.key == k => (c.lint_due, c.test_due),
+            _ => return true,
+        };
+        let (a, b) = tokio::join!(async { lint && self.lint_once(k, files).await }, async {
+            test && self.test_once(k, files).await
+        },);
+        a || b
+    }
+
+    /// `lox logic test .` on the project (#67), as [`Self::lint_once`] is
+    /// run: it compiles the module in memory and writes nothing, so it does
+    /// not hold the compile lock, and an action that starts meanwhile stops
+    /// it. Kept only when the files are still the ones it read. Returns
+    /// whether to work again.
+    async fn test_once(&self, k: &str, files: &Option<String>) -> bool {
+        let ran = tokio::select! {
+            r = self.run_tests() => r,
+            _ = self.preempted() => return false,
+        };
+        if self.check_key() != k || self.files_key_now().await != *files {
+            return true;
+        }
+        let mut cache = self.check_cache.lock().unwrap();
+        let Some(c) = cache.as_mut().filter(|c| c.key == k) else {
+            return true;
+        };
+        c.v["test"] = ran;
+        c.test_due = false;
+        drop(cache);
+        self.checked();
+        false
+    }
+
+    /// `lox logic test .` on the project as it is now, read and pinned to
+    /// the module's lines and blocks: `{ available: true, tests, passed,
+    /// failed }`, or `{ available: false, reason }` (with `unsupported` for
+    /// a lox without it, which is then not asked again).
+    async fn run_tests(&self) -> Value {
+        let off = |why: String| json!({ "available": false, "reason": why });
+        let (Some(dir), Ok(p)) = (self.s.project.as_deref(), self.project()) else {
+            return off("only for a lox.toml project".into());
+        };
+        let args = ["logic", "test", "."];
+        let (code, o, e) = match run_status(&self.s.lox, &args, dir, COMPILE_TIMEOUT).await {
+            Ok(r) => r,
+            Err(reason) => return off(reason),
+        };
+        match check::parse_test(&o) {
+            Some(mut t) => {
+                if !t.tests.is_empty() {
+                    let texts = {
+                        let mut m = self.module_files.lock().unwrap();
+                        m.refresh(&p.root, &p.module);
+                        m.texts()
+                    };
+                    let lock = edit::Lock::read(&p.lock);
+                    check::locate_tests(&mut t.tests, &texts, &lock);
+                }
+                let passed = t.tests.iter().filter(|t| t.status == "pass").count();
+                json!({ "available": true, "tests": t.tests, "passed": passed,
+                        "failed": t.tests.len() - passed })
+            }
+            None if check::unsupported(code, &o, &e) => {
+                self.unsupported
+                    .lock()
+                    .unwrap()
+                    .insert("test", self.lox_identity());
+                json!({ "available": false, "unsupported": true,
+                        "reason": "this lox has no `lox logic test`" })
+            }
+            None => {
+                let e = last_lines(e.trim().trim_start_matches("Error: "), 3);
+                off(if e.is_empty() {
+                    "lox logic test gave no answer vislox can read".to_string()
+                } else {
+                    e
+                })
+            }
+        }
+    }
+
+    /// The tests of the exact config Apply deploys (#67): the check
+    /// worker's run when it is of the files as they are now and done, else
+    /// a run now (kept for the browsers when the check is of these files).
+    async fn tests_now(&self) -> Value {
+        let k = self.check_key();
+        let files = self.edit_state.lock().unwrap().files.clone();
+        let fresh = self.files_key_now().await == files;
+        if fresh
+            && let Some(c) = &*self.check_cache.lock().unwrap()
+            && c.key == k
+            && !c.test_due
+            && c.v["test"].is_object()
+        {
+            return c.v["test"].clone();
+        }
+        let v = self.run_tests().await;
+        if self.check_key() == k && self.files_key_now().await == files {
+            let mut cache = self.check_cache.lock().unwrap();
+            if let Some(c) = cache.as_mut().filter(|c| c.key == k && c.v["ok"] == true) {
+                c.v["test"] = v.clone();
+                c.test_due = false;
+                drop(cache);
+                self.checked();
+            }
+        }
+        v
     }
 
     /// `lox logic lint .` on the project (#66), as the second step of a
@@ -1855,8 +1993,11 @@ impl Actions {
                     }
                     json!({ "available": true, "findings": findings })
                 }
-                None if check::lint_unsupported(code, &o, &e) => {
-                    *self.lint_unsupported.lock().unwrap() = Some(self.lox_identity());
+                None if check::unsupported(code, &o, &e) => {
+                    self.unsupported
+                        .lock()
+                        .unwrap()
+                        .insert("lint", self.lox_identity());
                     json!({ "available": false, "unsupported": true,
                             "reason": "this lox has no `lox logic lint`" })
                 }
@@ -1953,6 +2094,7 @@ impl Actions {
             "unformatted": unformatted,
             "stale": stale,
             "lint": Value::Null,
+            "test": Value::Null,
         })
     }
 
@@ -2535,6 +2677,66 @@ async fn run_status(
 
 /// Why Apply must not run: the module has errors (#65), the first five of
 /// them; `None` when it has none.
+/// What Apply's *Tests pass* step makes of `lox logic test` (#67): `ok`
+/// with how many pass, `skip` with why none ran, or the refusal: each test
+/// that fails or could not run (the first five), with its file and line and
+/// the `expect`s that did not hold.
+fn tests_verdict(t: &Value) -> Result<(&'static str, String), String> {
+    if t["available"] != true {
+        let why = t["reason"]
+            .as_str()
+            .unwrap_or("lox logic test gave no answer");
+        return Ok(("skip", why.to_string()));
+    }
+    let tests = t["tests"].as_array().cloned().unwrap_or_default();
+    if tests.is_empty() {
+        return Ok(("skip", "the module has no tests".into()));
+    }
+    let bad: Vec<&Value> = tests.iter().filter(|t| t["status"] != "pass").collect();
+    if bad.is_empty() {
+        let n = tests.len();
+        return Ok((
+            "ok",
+            format!("{n} test{} passed", if n == 1 { "" } else { "s" }),
+        ));
+    }
+    let mut list = Vec::new();
+    for t in bad.iter().take(5) {
+        let at = match (t["file"].as_str(), t["line"].as_u64()) {
+            (Some(f), Some(l)) => format!(" ({f}:{l})"),
+            _ => String::new(),
+        };
+        let how = if t["status"] == "error" {
+            "could not run"
+        } else {
+            "failed"
+        };
+        list.push(format!(
+            "  test \"{}\" {how}{at}",
+            t["name"].as_str().unwrap_or("")
+        ));
+        for f in t["failures"].as_array().into_iter().flatten().take(3) {
+            list.push(format!(
+                "    {} — actual {}",
+                f["expect"].as_str().unwrap_or(""),
+                f["actual"].as_str().unwrap_or("?")
+            ));
+        }
+        if let Some(e) = t["error"].as_str() {
+            list.push(format!("    {}", last_lines(e, 1)));
+        }
+    }
+    let n = bad.len();
+    Err(format!(
+        "{n} of {} test{} {} (lox logic test), so nothing was deployed. Fix the module or its tests, then apply.\n{}{}",
+        tests.len(),
+        if tests.len() == 1 { "" } else { "s" },
+        if n == 1 { "fails" } else { "fail" },
+        list.join("\n"),
+        if n > 5 { "\n  …" } else { "" }
+    ))
+}
+
 fn broken_message(c: &check::Checked) -> Option<String> {
     if c.errors.is_empty() {
         return None;
@@ -3413,7 +3615,12 @@ sed "s/Title=\"Testhaus\"/Title=\"Testhaus $w\"/" base.Loxone > "$out"
     /// extern on main.loxl's `extern` line and dead outputs on `teiler` when
     /// main.loxl says `# dead` (and fails when it says LINTFAIL; takes as
     /// many seconds as `../slowlint` says, then logs LINTEND; and is a lox
-    /// without lint while `../nolint` exists), whose
+    /// without lint while `../nolint` exists), whose `logic test .` (#67)
+    /// passes a test `Teiler` when main.loxl has one, unless main.loxl says
+    /// FAILTEST (its `expect teiler.AQ == 1` reads 0) or TESTERROR (a block
+    /// without a model), finds none otherwise (taking as many seconds as
+    /// `../slowtest` says, then logging TESTEND; a lox without test while
+    /// `../notest` exists), whose
     /// `logic compile` writes the base
     /// and the module's files into out (taking as many seconds as `../slow`
     /// says, and logging CONCURRENT when another compile runs), and whose
@@ -3479,6 +3686,21 @@ case "$1 $2 $3" in
     if grep -q '# dead' pages/main.loxl; then echo 'dead-outputs (1)'; echo '  pages/main.loxl: `teiler` — no wire draws from any of its ports'; n=$((n+1)); fi
     [ $n = 0 ] && { echo 'lint: clean'; exit 0; }
     echo "lint: $n findings"; exit 1 ;;
+  "logic test .")
+    [ -e ../notest ] && { echo 'unknown command `test`. Run `lox logic help`.' >&2; exit 2; }
+    sleep $(cat ../slowtest 2>/dev/null || echo 0)
+    echo TESTEND >> ../calls.log
+    grep -q '^test ' pages/main.loxl || { echo 'no tests in pages'; exit 0; }
+    if grep -q FAILTEST pages/main.loxl; then
+      echo 'test "Teiler" ... FAILED'; echo '    step 1: expect teiler.AQ == 1 — actual 0'
+      echo '1 tests: 0 passed, 1 failed'; exit 1
+    fi
+    if grep -q TESTERROR pages/main.loxl; then
+      echo 'test "Teiler" ... ERROR'
+      echo '    step 1: `teiler.AQ` cannot be simulated: Div "Teiler" (10000006-0000-0060-ffff504f94000001) is not simulated: no model for `Div` blocks. Set a port between it and the expectation in the test.'
+      echo '1 tests: 0 passed, 1 failed'; exit 1
+    fi
+    echo 'test "Teiler" ... ok'; echo '1 tests: 1 passed, 0 failed' ;;
   "config push"*) echo 'The Miniserver refused the upload.' >&2; exit 1 ;;
   *) echo "unexpected: $*" >&2; exit 2 ;;
 esac
@@ -3748,6 +3970,192 @@ esac
         let c = check_of(&a, &d).await;
         assert_eq!(c["lint"]["findings"][0]["name"], "teiler", "{c}");
         assert_eq!(ends(), before + 1, "{}", calls_in(&tmp));
+    }
+
+    /// main.loxl with the test `Teiler`, which `teiler` and `extra` say.
+    fn with_test(extra: &str) -> String {
+        format!(
+            "teiler = Div(\"Teiler\")\n\ntest \"Teiler\" # {extra}\n\tteiler.I1 = 2\n\ttick 1s\n\texpect teiler.AQ == 1\nend\n"
+        )
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failing_test_is_pinned_to_its_lines_and_blocks_and_stops_apply() {
+        use axum::http::StatusCode;
+        let (tmp, d, a) = project_to_check();
+        // No tests: said, and Apply's step is skipped.
+        a.compile().await.unwrap();
+        let c = check_of(&a, &d).await;
+        assert_eq!(
+            c["test"],
+            json!({ "available": true, "tests": [], "passed": 0, "failed": 0 }),
+            "{c}"
+        );
+        std::fs::write(d.join("pages/main.loxl"), with_test("FAILTEST")).unwrap();
+        a.compile().await.unwrap();
+        let c = check_of(&a, &d).await;
+        assert_eq!(c["ok"], true, "{c}");
+        assert_eq!(
+            c["test"],
+            json!({ "available": true, "passed": 0, "failed": 1, "tests": [{
+                "name": "Teiler", "status": "fail", "error": null, "unmodeled": [],
+                "file": "pages/main.loxl", "line": 3, "blocks": [DIV],
+                "failures": [{ "step": 1, "expect": "expect teiler.AQ == 1", "signal": "teiler.AQ",
+                    "cmp": "==", "expected": "1", "actual": "0", "line": 6, "blocks": [DIV] }],
+            }] }),
+            "{c}"
+        );
+        // Apply: the module compiles, its test fails: refused there, before
+        // anything is sent, and the step says so.
+        let runs = || {
+            calls_in(&tmp)
+                .lines()
+                .filter(|l| *l == "logic test .")
+                .count()
+        };
+        let before = runs();
+        let (code, msg) = a.apply(&ApplyOpts::default()).await.unwrap_err();
+        assert_eq!(code, StatusCode::CONFLICT);
+        assert!(msg.starts_with("1 of 1 test fails"), "{msg}");
+        assert!(
+            msg.contains("test \"Teiler\" failed (pages/main.loxl:3)"),
+            "{msg}"
+        );
+        assert!(msg.contains("expect teiler.AQ == 1 — actual 0"), "{msg}");
+        // The check's run was of these files: not run again.
+        assert_eq!(runs(), before, "{}", calls_in(&tmp));
+        let steps = a.info()["progress"]["steps"].clone();
+        assert_eq!(steps[0]["state"], "ok", "{steps}");
+        assert_eq!(steps[1]["id"], "tests", "{steps}");
+        assert_eq!(steps[1]["state"], "fail", "{steps}");
+        assert!(!calls_in(&tmp).contains("config push"), "nothing deployed");
+        assert!(!calls_in(&tmp).contains("logic diff"), "{}", calls_in(&tmp));
+
+        // A test that cannot run (a block without a model) stops it too, and
+        // names that block.
+        std::fs::write(d.join("pages/main.loxl"), with_test("TESTERROR")).unwrap();
+        a.compile().await.unwrap();
+        let c = check_of(&a, &d).await;
+        let t = &c["test"]["tests"][0];
+        assert_eq!(t["status"], "error", "{c}");
+        assert_eq!(
+            t["unmodeled"],
+            json!([{ "uuid": DIV, "type": "Div", "title": "Teiler" }])
+        );
+        let (_, msg) = a.apply(&ApplyOpts::default()).await.unwrap_err();
+        assert!(msg.contains("test \"Teiler\" could not run"), "{msg}");
+        assert!(msg.contains("no model for `Div` blocks"), "{msg}");
+
+        // It passes: Apply goes on (to a push the stand-in refuses).
+        std::fs::write(d.join("pages/main.loxl"), with_test("ok")).unwrap();
+        a.compile().await.unwrap();
+        let c = check_of(&a, &d).await;
+        assert_eq!(c["test"]["passed"], 1, "{c}");
+        let (code, msg) = a.apply(&ApplyOpts::default()).await.unwrap_err();
+        assert_eq!(code, StatusCode::BAD_GATEWAY, "{msg}");
+        let steps = a.info()["progress"]["steps"].clone();
+        assert_eq!(steps[1]["state"], "ok", "{steps}");
+        assert_eq!(steps[1]["detail"], "1 test passed", "{steps}");
+        assert!(calls_in(&tmp).contains("config push"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn apply_runs_the_tests_again_when_the_check_is_not_of_the_files() {
+        let (tmp, d, a) = project_to_check();
+        std::fs::write(d.join("pages/main.loxl"), with_test("ok")).unwrap();
+        a.compile().await.unwrap();
+        let c = check_of(&a, &d).await;
+        assert_eq!(c["test"]["passed"], 1, "{c}");
+        // Changed, and neither the watcher nor the worker has looked: the
+        // pass is of other files, so Apply runs the tests itself.
+        std::fs::write(d.join("pages/main.loxl"), with_test("FAILTEST")).unwrap();
+        let runs = || {
+            calls_in(&tmp)
+                .lines()
+                .filter(|l| *l == "logic test .")
+                .count()
+        };
+        let before = runs();
+        let (_, msg) = a.apply(&ApplyOpts::default()).await.unwrap_err();
+        assert!(msg.starts_with("1 of 1 test fails"), "{msg}");
+        assert_eq!(runs(), before + 1, "{}", calls_in(&tmp));
+        assert!(!calls_in(&tmp).contains("config push"));
+        // And while the check's tests of these files still run, Apply does
+        // not take the last ones (a pass, of the files before).
+        std::fs::write(tmp.path().join("slowtest"), "3").unwrap();
+        a.set_disk(
+            file_blob(&d.join("base.Loxone")),
+            file_blob(&d.join("out.Loxone")),
+        );
+        a.refresh_edit(None, None);
+        let (_, res) = tokio::join!(async { while a.check_once().await {} }, async {
+            let t = std::time::Instant::now();
+            while a.check_result()["test"]["running"] != true {
+                assert!(t.elapsed() < Duration::from_secs(5), "{}", a.check_result());
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            // The last run's pass stays up meanwhile.
+            assert_eq!(a.check_result()["test"]["tests"][0]["status"], "pass");
+            std::fs::write(tmp.path().join("slowtest"), "0").unwrap();
+            a.apply(&ApplyOpts::default()).await
+        });
+        let (_, msg) = res.unwrap_err();
+        assert!(msg.starts_with("1 of 1 test fails"), "{msg}");
+        assert!(!calls_in(&tmp).contains("config push"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_edit_never_waits_for_the_tests_and_stops_them() {
+        let (tmp, d, a) = project_to_check();
+        std::fs::write(d.join("pages/main.loxl"), with_test("ok")).unwrap();
+        a.compile().await.unwrap();
+        std::fs::write(tmp.path().join("slowtest"), "5").unwrap();
+        let ends = || calls_in(&tmp).lines().filter(|l| *l == "TESTEND").count();
+        a.set_disk(
+            file_blob(&d.join("base.Loxone")),
+            file_blob(&d.join("out.Loxone")),
+        );
+        a.refresh_edit(None, None);
+        let (_, took) = tokio::join!(async { while a.check_once().await {} }, async {
+            tokio::time::sleep(Duration::from_millis(800)).await;
+            assert_eq!(a.check_result()["test"]["running"], true);
+            let t = std::time::Instant::now();
+            a.compile().await.unwrap();
+            t.elapsed()
+        });
+        assert!(took < Duration::from_secs(2), "{took:?}");
+        assert_eq!(ends(), 0, "{}", calls_in(&tmp));
+        std::fs::write(tmp.path().join("slowtest"), "0").unwrap();
+        let c = check_of(&a, &d).await;
+        assert_eq!(c["test"]["passed"], 1, "{c}");
+        assert_eq!(ends(), 1, "{}", calls_in(&tmp));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_lox_without_test_is_asked_once_and_does_not_stop_apply() {
+        let (tmp, d, a) = project_to_check();
+        std::fs::write(tmp.path().join("notest"), "").unwrap();
+        std::fs::write(d.join("pages/main.loxl"), with_test("FAILTEST")).unwrap();
+        a.compile().await.unwrap();
+        let c = check_of(&a, &d).await;
+        assert_eq!(
+            c["test"],
+            json!({ "available": false, "unsupported": true, "reason": "this lox has no `lox logic test`" }),
+            "{c}"
+        );
+        let (_, msg) = a.apply(&ApplyOpts::default()).await.unwrap_err();
+        assert!(msg.contains("lox config push failed"), "{msg}");
+        let steps = a.info()["progress"]["steps"].clone();
+        assert_eq!(steps[1]["state"], "skip", "{steps}");
+        let runs = calls_in(&tmp)
+            .lines()
+            .filter(|l| *l == "logic test .")
+            .count();
+        assert_eq!(runs, 1, "{}", calls_in(&tmp));
     }
 
     #[cfg(unix)]

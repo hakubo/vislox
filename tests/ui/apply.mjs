@@ -15,7 +15,7 @@ import { spawn, execFileSync } from "node:child_process";
 import { createServer as createHttpServer } from "node:http";
 import { createServer as createTcpServer } from "node:net";
 import { createSocket } from "node:dgram";
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, chmodSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, chmodSync, existsSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -58,6 +58,8 @@ writeFileSync(join(dir, "out.Loxone"), base.replace('Title="Licht OG"', 'Title="
   .replace('Serial="B03B368A" SubType="32771" TreeType="32771" AC="1"', 'Serial="B03B9999" SubType="32771" TreeType="32771" AC="0"'));
 writeFileSync(join(dir, "lox.toml"), 'base = "base.Loxone"\nmodule = "pages"\nout = "out.Loxone"\n');
 writeFileSync(join(dir, "pages", "main.lox"), "# module\n");
+// The module's test fails at first (#67).
+const failTest = () => join(loxDir, "failtest");
 execFileSync("git", ["init", "-q", "--bare", join(root, "remote.git")]);
 git("init", "-q");
 git("add", "-A");
@@ -85,6 +87,13 @@ const fakeLox = join(loxDir, "lox");
 writeFileSync(fakeLox, `#!/bin/sh
 case "$1 $2" in
   "logic diff") echo "Rename Licht OG to Licht oben" ;;
+  "logic test")
+    # The module's test (#67): it fails while ${loxDir}/failtest exists.
+    if [ -f "${loxDir}/failtest" ]; then
+      echo 'test "Licht oben" ... FAILED'; echo '    step 1: expect licht.Q == 1 — actual 0'
+      echo '1 tests: 0 passed, 1 failed'; exit 1
+    fi
+    echo 'test "Licht oben" ... ok'; echo '1 tests: 1 passed, 0 failed' ;;
   "config push")
     echo "Downloading the live config..." >&2; sleep 1
     echo "Uploading as sps_new.zip..." >&2; sleep 1
@@ -114,6 +123,7 @@ case "$1 $2" in
 esac
 `);
 chmodSync(fakeLox, 0o755);
+writeFileSync(failTest(), "");
 const token = join(loxDir, "token");
 writeFileSync(token, "secret\n");
 const TEMP = "10000003-0000-0032-01ff504f94000001";
@@ -200,6 +210,23 @@ try {
     await page.click(".chg-filter .pill.hw");
     await page.click('.hrev >> nth=0');
   });
+  await step("a failing test stops Apply at its Tests step, before anything is sent (#67)", async () => {
+    // This stand-in has no lox logic check, so the browser knows of no test: the server's preflight refuses.
+    await page.click("#btn-apply");
+    await page.waitForFunction(() => /1 of 1 test fails/.test(document.querySelector("#deploy-msg")?.textContent || ""), null, { timeout: 20000 });
+    assert.match(await page.textContent("#deploy-msg"), /1 of 1 test fails \(lox logic test\), so nothing was deployed[\s\S]*test "Licht oben" failed[\s\S]*expect licht\.Q == 1 — actual 0/);
+    assert.equal(await state("Module compiles"), "skip");
+    assert.equal(await state("Tests pass"), "fail");
+    assert.equal(await state("Download and drift check"), "wait");
+    assert.equal(existsSync(join(loxDir, "pushed")), false);
+    assert.equal(applies, 1);
+    // The refusal (409) is the only error the browser logs.
+    const i = errors.findIndex((e) => /status of 409/.test(e));
+    assert.ok(i >= 0, errors.join(" | "));
+    errors.splice(i, 1);
+    unlinkSync(failTest());
+    dialogs = 0; applies = 0; asked.length = 0;
+  });
   await step("Apply shows its steps as they happen", async () => {
     // With live values on, the confirmation names the schedule the Miniserver runs differently.
     await page.click("#sw-live .track");
@@ -223,6 +250,8 @@ try {
     assert.match(asked[0], /This reconfigures 1 device: it stores the new configuration/);
     assert.match(asked[0], /Touch Küche \(Touch Tree\): replaced, serial B03B368A → B03B9999/);
     assert.equal(applies, 1, "one /api/apply request");
+    assert.equal(await state("Tests pass"), "ok");
+    assert.match(await page.textContent("#deploy-steps"), /Tests pass.*1 test passed/);
     for (const l of ["Download and drift check", "Upload", "Program restarting", "Back online", "New config loaded", "Verified", "Committed", "Pushed to git"]) {
       assert.equal(await state(l), "ok", l);
     }
