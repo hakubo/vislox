@@ -4,7 +4,7 @@
 # the image pinned to the latest build of main, for Portainer's Git updates.
 services:
   vislox:
-    image: ghcr.io/hakubo/vislox:main
+    image: ghcr.io/hakubo/vislox:sha-e45a25d
     restart: unless-stopped
     ports:
       - "${VISLOX_PORT:-7878}:7878"
