@@ -170,26 +170,39 @@ sends to the Miniserver see [miniserver.md](miniserver.md).
   (`<stamp>-post-push`). A commit whose base is a post-push program is a push, and the deployed one gets **Roll
   back to before this** under its History entry; older pushes show the button off (*only the newest deploy can be
   rolled back*), and a commit no kept download belongs to gets none. A Roll back is an Apply, with nothing skipped:
-  - First vislox works out what it deploys, changing nothing: the module and lockfile as they were before the
-    commit, compiled onto the pre-push download in a scratch directory (`lox logic compile --base … --module …
-    --lock … --out …`), as `lox config push` will compile them. That must give back the download (byte for byte,
-    or no difference lox's diff sees), else it refuses and names the differences. The result shows as the
-    revision *Roll back: <subject>* (`rollback:<commit>`), compared with what runs now, so you review it like a
-    pending compile, and the confirmation is Apply's: who loses or gains access and notifications (#68), the
-    switching times the Miniserver runs differently, calendar entries changed in the app, the devices it
-    reconfigures, a config saved after the base, and the number of changes.
+  - First vislox works out what it deploys, changing nothing (`POST /api/rollback/plan`, while no other action
+    runs, holding the compile lock): the module and lockfile as git had them before the commit, compiled onto the
+    pre-push download in a scratch directory (`lox logic compile --base … --module … --lock … --out …`). That
+    must give back the download (byte for byte, or no difference lox's diff sees), else it refuses and names the
+    differences. The result shows as the revision *Roll back: <subject>* (`rollback:<commit>`), compared with what
+    runs now, in the browser that asked only; Cancel forgets it (`POST /api/rollback/cancel`), and the server drops
+    it after 15 minutes or once another commit is deployed. The confirmation is Apply's: who loses or gains access
+    and notifications (#68), the switching times the Miniserver runs differently, calendar entries changed in the
+    app, the devices it reconfigures, a config saved after the base, and the number of changes.
   - It refuses on any doubt: changes in lox.toml, the base, the module, the lockfile or out that are not
     committed (Apply or Discard them first), any of them changed in a commit after the one rolled back, a later
     deploy, a download that is missing, unreadable, or two programs (the `.zip` and the `.Loxone` differ), a
-    commit with nothing before it, or a module that does not compile onto the download.
-  - Then the same preflight as Apply (serial, FTP, web port), and Apply's steps: *Backup checked*, *Module before
-    the Apply compiles to it*, *Tests pass* (`lox logic test` on that module, #67), then `lox config push --force
-    --patched-from backups/<stamp>-post-push.Loxone`: lox refuses unless the Miniserver still runs exactly what
-    the Apply deployed (a save from Loxone Config since stops it), lists custom changes made in the app (deleted
-    only when you allow it, as for Apply), uploads, restarts the program and verifies by download. vislox follows
-    the restart, verifies by load, keeps the base in git, commits `Roll back: <subject>` (its body names the
-    download and the commit) and pushes. Anything that fails before lox verified the push puts the project back
-    as it was.
+    commit with nothing before it, a file git does not track (an ignored one) where the module from before has
+    one, or a module that does not compile onto the download. Files git does not track in the module are never
+    deleted or overwritten: only tracked files go back.
+  - Then the same preflight as Apply (serial, FTP, web port), and the plan worked out again: it must be the
+    program you reviewed (the browser sends its blob id). Apply's steps follow, each checking that what goes up
+    is what you reviewed: *Backup checked*; *Module before the Apply compiles to it*: written into the project
+    (lox.toml's base pointed at a copy of the download in `backups/`, the base file untouched) and compiled there
+    with the project's own settings (`lox logic compile`), `out` must be the reviewed program; *Tests pass*
+    (`lox logic test`, #67); *Upload is what you reviewed*: `lox config push --patched-from
+    backups/<stamp>-post-push.Loxone` without `--force` runs lox's drift check (the Miniserver must still run
+    exactly what the Apply deployed; a save from Loxone Config since stops it) and stages the upload, which must
+    extract to the reviewed program. Only then the same command with `--force`: custom changes made in the app
+    are deleted only when you allow it, as for Apply; lox uploads, restarts the program and verifies by download,
+    and that download must be the reviewed program too. vislox follows the restart, verifies by load, keeps the
+    base in git, commits `Roll back: <subject>` (its body names the download and the commit) and pushes.
+  - When something fails: before lox's upload line nothing was sent, and the project is put back as it was.
+    After it, vislox downloads what the Miniserver runs (`lox config download`, read-only) and compares: the
+    rolled-back program is recorded as deployed (committed, *Rolled back, but not verified*); the Apply's program
+    with no upload waiting in `/prog` means nothing changed (put back); anything else (no answer, a third
+    program, `sps_new.zip` waiting) is reported as unknown, with the project left at its last commit and how to
+    find out (*Which config the Miniserver runs*, then Pull or Sync).
   - Afterwards the project matches the Miniserver: the base is what it runs, the module and lockfile are as before
     the Apply, nothing is pending, and **Changed by this Roll back** lists what changed. So neither Sync nor
     Discard is needed. To try the change again, edit the module again, or roll back the Roll back (it is a push

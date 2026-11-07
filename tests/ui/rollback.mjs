@@ -92,30 +92,40 @@ const loxDir = mkdtempSync(join(tmpdir(), "vislox-lox-"));
 const loxConfig = join(loxDir, "config.yaml");
 writeFileSync(loxConfig, `host: http://127.0.0.1:${webPort}\nuser: u\npass: p\nserial: 504F94000001\n`);
 // The stand-in lox. `logic compile` copies --base to --out (the module from before gives back what ran
-// before). `config push` logs its arguments, downloads what runs now as its pre-push, "deploys" lox.toml's
-// base, keeps it as its post-push download and points lox.toml's base at that, as lox does.
+// before), and in the project lox.toml's base to out. `config push` downloads what runs now as its pre-push;
+// without --force it stages lox.toml's base and says where; with it, it "deploys" lox.toml's base, keeps it as
+// its post-push download and points lox.toml's base at that, as lox does. Each logs its arguments.
 const fakeLox = join(loxDir, "lox");
 writeFileSync(fakeLox, `#!/bin/sh
 # VISLOX_TEST_LOX_DELAY (ms): compile and test as slowly as a busy CI runner does.
 slow() { sleep "$(awk "BEGIN { print \${VISLOX_TEST_LOX_DELAY:-0} / 1000 }")"; }
+base() { sed -n 's/^base *= *"\\(.*\\)"/\\1/p' lox.toml; }
 case "$1 $2" in
   "logic test") slow; echo 'test "Licht" ... ok'; echo '1 tests: 1 passed, 0 failed' ;;
   "logic compile")
-    slow; shift 2
+    slow
+    if [ $# -eq 2 ]; then cp "$(base)" out.Loxone; exit 0; fi
+    shift 2
     while [ $# -gt 0 ]; do case "$1" in --base) b=$2; shift;; --out) o=$2; shift;; esac; shift; done
     cp "$b" "$o" ;;
   "config push")
-    echo "$@" > "${loxDir}/push-args"
     stamp=$(date +%Y%m%d-%H%M%S)
     echo "Downloading the live config..." >&2; sleep 1
     cp backups/${STAMP}-post-push.Loxone "backups/$stamp-pre-push.Loxone"
+    if [ "$3" != "--force" ]; then
+      echo "$@" > "${loxDir}/stage-args"
+      cp "$(base)" "backups/$stamp-push.Loxone"
+      echo "Staged backups/$stamp-push.zip (extracts to exactly backups/$stamp-push.Loxone). Run again with --force to upload it." >&2
+      exit 0
+    fi
+    echo "$@" > "${loxDir}/push-args"
     echo "Uploading as sps_new.zip..." >&2; sleep 1
     echo "Restarting the program..." >&2; sleep 1
     echo "Downloading the config again to verify..." >&2; sleep 1
-    b=$(sed -n 's/^base *= *"\\(.*\\)"/\\1/p' lox.toml)
+    b=$(base)
     cp "$b" out.Loxone
     cp "$b" "backups/$stamp-post-push.Loxone"
-    sed "s|^base *=.*|base = \\"backups/$stamp-post-push.Loxone\\"|" lox.toml > lox.toml.new && mv lox.toml.new lox.toml
+    sed "s|^base *=.*|base = \\\"backups/$stamp-post-push.Loxone\\\"|" lox.toml > lox.toml.new && mv lox.toml.new lox.toml
     touch "${loxDir}/pushed"
     echo "Pushed and verified." >&2 ;;
   "log -n") echo "2026-11-07 09:15:02.000;PRG start program" ;;
@@ -151,8 +161,11 @@ try {
   page = await browser.newPage({ viewport: { width: 1400, height: 900 } });
   page.on("pageerror", (e) => errors.push(e.message));
   page.on("console", (m) => { if (m.type() === "error") errors.push(m.text()); });
-  let dismissNext = false, rollbacks = 0;
-  page.on("dialog", (d) => { asked.push(d.message()); if (dismissNext) { dismissNext = false; d.dismiss(); } else d.accept(); });
+  let dismissNext = false, holdNext = false, held = null, rollbacks = 0;
+  page.on("dialog", (d) => {
+    asked.push(d.message());
+    if (holdNext) { holdNext = false; held = d; } else if (dismissNext) { dismissNext = false; d.dismiss(); } else d.accept();
+  });
   page.on("request", (r) => { if (r.method() === "POST" && new URL(r.url()).pathname === "/api/rollback") rollbacks++; });
   await page.addInitScript(() => localStorage.setItem("vislox.token", "secret"));
   await page.goto(`http://127.0.0.1:${port}/`);
@@ -190,22 +203,35 @@ try {
     unlinkSync(join(dir, "pages", "draft.loxl"));
   });
   await step("the confirmation shows what it deploys, compared with what runs now; dismissed, nothing is sent", async () => {
-    dismissNext = true;
+    holdNext = true;
     await page.click(".rb-btn");
     for (const end = Date.now() + 20000; !asked.length && Date.now() < end;) await new Promise((ok) => setTimeout(ok, 50));
     assert.match(asked[0] || "", /Roll back "Rename Licht OG to Licht oben"\?/, asked[0]);
     assert.match(asked[0], new RegExp(`runs what it ran before it \\(backups/${STAMP}-pre-push\\.zip\\): 1 change from what it runs now`), asked[0]);
     assert.match(asked[0], /The module and lockfile go back to before it/);
     assert.match(asked[0], /tests run \(lox logic test\), lox config push checks that the Miniserver still runs this config/);
-    // Behind it, the view: the revision a Roll back deploys, compared with the Apply.
-    await page.waitForSelector(".hrev.k-rollback.sel");
-    assert.match(await page.textContent(".hrev.k-rollback"), /Roll back: Rename Licht OG to Licht oben[\s\S]*would be deployed by Roll back/);
-    assert.match(await page.textContent(".hrev.base"), /Rename Licht OG to Licht oben/);
-    const changes = await page.$$eval(".changes .chg .t", (n) => n.map((x) => x.textContent));
-    assert.ok(changes.some((t) => t.includes("Licht oben → Licht OG")), changes.join(" | "));
+    // Behind it (the count above comes from it), the view: the revision a Roll back deploys, compared with
+    // the Apply. While the dialog is open this page runs no script: ask the server from another browser,
+    // which never shows the plan (it is the asking tab's).
     assert.equal(rollbacks, 0);
     assert.equal(existsSync(join(loxDir, "push-args")), false);
+    const other = await browser.newPage({ viewport: { width: 1400, height: 900 } });
+    await other.addInitScript(() => localStorage.setItem("vislox.token", "secret"));
+    await other.goto(`http://127.0.0.1:${port}/`);
+    await other.waitForSelector(".rb-row");
+    assert.equal(await other.$$eval(".hrev.k-rollback", (n) => n.length), 0);
+    const view = await other.evaluate(async (q) => (await fetch(`/api/view?${q}`)).json(), `rev=rollback:${apply}&base=git:${apply}`);
+    assert.ok(view.changes.some((c) => /Licht oben → Licht OG/.test(JSON.stringify(c))), JSON.stringify(view.changes));
+    await other.close();
+    // Cancelled: the plan is gone, here and on the server, and the view is back on what runs.
+    await held.dismiss();
+    await page.waitForFunction(() => !document.querySelector(".hrev.k-rollback"));
     if (process.env.SHOT) await page.screenshot({ path: process.env.SHOT + "-review.png" });
+    await page.waitForFunction(() => /Rename Licht OG to Licht oben/.test(document.querySelector(".hrev.sel")?.textContent || ""));
+    assert.equal(await page.evaluate(async (id) => (await fetch(`/api/view?rev=${id}`)).status, "rollback:" + apply), 422);
+    // That 422 is the only error the browser logs here.
+    for (const end = Date.now() + 5000; !errors.some((e) => /status of 422/.test(e)) && Date.now() < end;) await new Promise((ok) => setTimeout(ok, 50));
+    errors.splice(errors.findIndex((e) => /status of 422/.test(e)), 1);
     asked.length = 0;
   });
   await step("accepted, Apply's steps run, and every one ends done", async () => {
@@ -216,14 +242,16 @@ try {
     await msgMatches(/^Rolled back/, 60000);
     assert.equal(asked.length, 1, "one confirmation");
     assert.equal(rollbacks, 1);
-    for (const l of ["Backup checked", "Module before the Apply compiles to it", "Tests pass", "Download and drift check", "Upload",
+    for (const l of ["Backup checked", "Module before the Apply compiles to it", "Tests pass", "Upload is what you reviewed", "Download and drift check", "Upload",
       "Program restarting", "Back online", "Config loaded", "Verified", "Committed", "Pushed to git"]) {
       assert.equal(await state(l), "ok", l);
     }
     assert.match(await page.textContent("#deploy-steps"), /Backup checked.*backups\/20261107-091500-pre-push\.zip/);
     // lox pushed onto the download the Apply verified: it refuses unless the Miniserver still runs it.
-    assert.equal(readFileSync(join(loxDir, "push-args"), "utf8").trim(),
-      `config push --force --patched-from ${join(realpathSync(dir), "backups", `${STAMP}-post-push.Loxone`)}`);
+    const post = join(realpathSync(dir), "backups", `${STAMP}-post-push.Loxone`);
+    // Staged first, without --force: what it would upload must be what was reviewed.
+    assert.equal(readFileSync(join(loxDir, "stage-args"), "utf8").trim(), `config push --patched-from ${post}`);
+    assert.equal(readFileSync(join(loxDir, "push-args"), "utf8").trim(), `config push --force --patched-from ${post}`);
   });
   await step("the project is back to before the Apply, committed and pushed", async () => {
     assert.equal(readFileSync(join(dir, "base.Loxone"), "utf8"), before);

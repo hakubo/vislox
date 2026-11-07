@@ -162,10 +162,15 @@ pub fn read_pre_push(push: &Push, root: &Path) -> Result<Vec<u8>, String> {
             &crate::history::blob_id(&x)[..10],
             &crate::history::blob_id(&z)[..10]
         )),
+        (Some(b), _) | (None, Some(b)) if b.is_empty() => Err(format!(
+            "{} holds no program",
+            show(if push.pre_xml.exists() {
+                &push.pre_xml
+            } else {
+                &push.pre_zip
+            })
+        )),
         (Some(b), _) | (None, Some(b)) => {
-            if b.is_empty() {
-                return Err(format!("{} is empty", show(&push.pre_xml)));
-            }
             loxone_config::LoxoneDoc::parse(&b)
                 .map_err(|e| format!("cannot read the program from before this Apply: {e}"))?;
             Ok(b)
@@ -317,7 +322,13 @@ mod tests {
         // Not a config at all.
         std::fs::remove_file(&p.pre_zip).unwrap();
         std::fs::write(&p.pre_xml, "").unwrap();
-        assert!(read_pre_push(&p, d).is_err());
+        let empty = read_pre_push(&p, d).unwrap_err();
+        assert_eq!(empty, "20261107-101500-pre-push.Loxone holds no program");
+        // Read from the ZIP alone: the ZIP is named.
+        std::fs::remove_file(&p.pre_xml).unwrap();
+        std::fs::write(&p.pre_zip, zip_of(b"")).unwrap();
+        let empty = read_pre_push(&p, d).unwrap_err();
+        assert_eq!(empty, "20261107-101500-pre-push.zip holds no program");
     }
 
     #[test]

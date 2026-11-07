@@ -14,7 +14,7 @@ const S = {
   follow: true, marks: true, vp: {}, open: new Set(["__pages"]), chgOff: new Set(), chgHw: false,
   objPage: new Map(), pageOf: new Map(), loadSeq: 0, onlyChanged: false, chgIdx: -1,
   closed: new Set(["Advanced"]), dim: true, onlyManaged: false, treeFocus: null, hash: null, applyingHash: false,
-  app: null, appBusy: false, appErr: "", applyReads: 0, deployed: null,
+  app: null, appBusy: false, appErr: "", applyReads: 0, deployed: null, rollbackRev: null, rollbackAt: 0,
   live: { on: pref("live", false), dim: pref("liveDim", true), query: pref("liveQuery", false), qes: null, qkey: "", qstat: null, es: null, status: null, values: new Map(), controls: {}, globals: {}, periods: null },
 };
 function pref(k, d) { try { const v = localStorage.getItem("vislox." + k); return v === null ? d : v === "1"; } catch { return d; } }
@@ -71,7 +71,7 @@ function setStatus(text, cls) {
   $("status").className = "status " + (cls || "");
   $("status").title = text;
 }
-function allRevs() { return S.hist ? [...(S.hist.rollback || []), ...S.hist.pending, ...S.hist.history, ...(S.hist.backups || [])] : []; }
+function allRevs() { return S.hist ? [...(rollbackPreview() ? [S.rollbackRev] : []), ...S.hist.pending, ...S.hist.history, ...(S.hist.backups || [])] : []; }
 function revById(id) { return allRevs().find((r) => r.id === id); }
 function lightColor(rgb) {
   const m = /^(\d+),(\d+),(\d+)$/.exec(rgb || "");
@@ -224,7 +224,7 @@ function renderHistory() {
     }
   };
   renderOpLog(box);
-  if (S.hist.rollback?.length) sec("Roll back, not deployed", S.hist.rollback);
+  if (rollbackPreview()) sec("Roll back, not deployed", [S.rollbackRev]);
   if (S.hist.pending.length) { sec("Pending deployment", S.hist.pending); sec("Deployed history", S.hist.history); }
   else sec(null, S.hist.history);
   if (!S.hist.history.length) box.insertAdjacentHTML("beforeend", '<div class="empty">No revisions yet.</div>');
@@ -2530,14 +2530,32 @@ async function rollBack(r) {
   rollbackAsking = true; renderHistory();
   try { await rollBackAsk(r); } finally { rollbackAsking = false; renderHistory(); renderActions(); }
 }
+/** The Roll back's plan this tab asked for (#69), shown only here, while it is about the deployed commit and
+ *  younger than the server keeps it. */
+const ROLLBACK_TTL = 15 * 60 * 1000;
+function rollbackPreview() {
+  const r = S.rollbackRev;
+  if (!r) return null;
+  const deployed = S.hist?.history.find((x) => x.kind === "git");
+  if (deployed?.id !== r.base || Date.now() - S.rollbackAt > ROLLBACK_TTL) { S.rollbackRev = null; return null; }
+  return r;
+}
+/** Forget the plan, here and on the server; show what runs again if the plan was shown. */
+async function dropRollback(back) {
+  const r = S.rollbackRev;
+  if (!r) return;
+  S.rollbackRev = null;
+  try { await fetch("/api/rollback/cancel", { method: "POST", headers: { "Content-Type": "application/json", "X-Vislox": "rollback" }, body: JSON.stringify({ rev: r.id }) }); } catch { /* the server forgets it anyway */ }
+  if (back && S.rev === r.id) { S.rev = r.base; S.base = null; renderHistory(); renderSelects(); await loadView(); writeHash(true); }
+  else renderHistory();
+}
 async function rollBackAsk(r) {
   deployMsg("");
   let plan;
   try { plan = await act("/api/rollback/plan", { commit: r.id }); } catch (err) { deployMsg(`Cannot roll back: ${err.message}`, true); return; }
-  // What it deploys, compared with what runs now, behind the confirmation.
-  await loadHistory();
-  const target = revById(plan.rev);
-  if (!target) { deployMsg("Cannot roll back: the deployed config changed meanwhile. Try again.", true); return; }
+  // What it deploys, compared with what runs now, behind the confirmation: in this tab only.
+  S.rollbackRev = plan.revision; S.rollbackAt = Date.now();
+  const target = plan.revision;
   S.rev = plan.rev; S.base = plan.base; S.follow = false; $("chk-follow").checked = false;
   renderHistory(); renderSelects(); await loadView(); writeHash(true);
   const [, calNow, hw] = await Promise.all([loadMs(true), loadCal(true), pendingHardware(target, plan.base)]);
@@ -2551,8 +2569,13 @@ async function rollBackAsk(r) {
     (n == null ? "" : `: ${plural(n, "change")} from what it runs now, as the view shows`) +
     ". The module and lockfile go back to before it, so nothing is pending afterwards.\n\n" +
     "Whatever changed on the Miniserver since is lost: a save from Loxone Config stops the Roll back, and custom changes made in the app are deleted only if you allow it.\n\n" +
-    "As Apply: the tests run (lox logic test), lox config push checks that the Miniserver still runs this config, uploads, restarts the program and verifies, then vislox commits and pushes to git.")) return;
-  await deploy("/api/rollback", { commit: plan.commit }, "rolling back");
+    "As Apply: the tests run (lox logic test), lox config push checks that the Miniserver still runs this config and stages exactly what you reviewed, uploads, restarts the program and verifies, then vislox commits and pushes to git.")) {
+    await dropRollback(true);
+    return;
+  }
+  // The server works the plan out again, and deploys only what was reviewed.
+  await deploy("/api/rollback", { commit: plan.commit, reviewed: plan.blob }, "rolling back");
+  await dropRollback(false);
 }
 $("btn-sync").onclick = async () => {
   deployMsg("");

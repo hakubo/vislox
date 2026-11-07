@@ -56,9 +56,6 @@ pub struct Lists {
     pub history: Vec<Revision>,
     /// The Miniserver backups that show on their own, newest first.
     pub backups: Vec<Revision>,
-    /// What a Roll back would deploy (#69), while it is about the deployed
-    /// revision: compared with it.
-    pub rollback: Vec<Revision>,
     by_id: HashMap<String, Revision>,
 }
 
@@ -116,6 +113,10 @@ pub struct History {
     /// What a Roll back would deploy, [`History::set_rollback`].
     rollback: Option<Revision>,
 }
+
+/// How long a Roll back's plan can be looked at (seconds): then it is
+/// worked out again.
+pub const ROLLBACK_TTL: i64 = 15 * 60;
 
 pub fn blob_id(bytes: &[u8]) -> String {
     let mut h = Sha1::new();
@@ -376,7 +377,8 @@ impl History {
                 })
                 .collect()
         };
-        // Only while it is about what the Miniserver runs: the newest commit.
+        // A Roll back's plan, by its id only (the tab that asked shows it), and
+        // only while it is about what the Miniserver runs: the newest commit.
         let deployed = hist.iter().find(|r| r.kind == "git").map(|r| r.id.clone());
         let rollback: Vec<Revision> = self
             .rollback
@@ -395,13 +397,16 @@ impl History {
             pending,
             history: hist,
             backups,
-            rollback,
             by_id,
         }
     }
 
     pub fn find(&self, id: &str) -> Option<Revision> {
-        self.lists().by_id.get(id).cloned()
+        self.lists()
+            .by_id
+            .get(id)
+            .filter(|r| r.kind != "rollback" || now() - r.time < ROLLBACK_TTL)
+            .cloned()
     }
 
     /// Show these backups (see `backups.rs`), whose stamps are in `zone`,
@@ -417,20 +422,21 @@ impl History {
     }
 
     /// What a Roll back of commit `base` (`git:<hash>`) would deploy (#69):
-    /// shown as `rollback:<hash>`, compared with that commit, while it is the
-    /// newest one.
+    /// found as `rollback:<hash>`, compared with that commit, while it is the
+    /// newest one, for [`ROLLBACK_TTL`], until [`Self::clear_rollback`] or
+    /// another plan. It is in no list: only the browser that asked shows it.
     pub fn set_rollback(
         &mut self,
         base: &str,
         label: String,
         detail: String,
         bytes: Vec<u8>,
-    ) -> String {
+    ) -> Revision {
         let blob = blob_id(&bytes);
         let id = format!("rollback:{}", base.trim_start_matches("git:"));
         self.contents.insert(blob.clone(), Arc::new(bytes));
-        self.rollback = Some(Revision {
-            id: id.clone(),
+        let r = Revision {
+            id,
             kind: "rollback",
             label,
             detail,
@@ -438,9 +444,18 @@ impl History {
             blob,
             base: Some(base.to_string()),
             ..Revision::default()
-        });
+        };
+        self.rollback = Some(r.clone());
         self.version += 1;
-        id
+        r
+    }
+
+    /// The Roll back plan `id` was cancelled, or deployed: forget it.
+    pub fn clear_rollback(&mut self, id: &str) {
+        if self.rollback.as_ref().is_some_and(|r| r.id == id) {
+            self.rollback = None;
+            self.version += 1;
+        }
     }
 
     /// Something else the History shows changed (a backup's download
@@ -712,7 +727,7 @@ mod tests {
     }
 
     #[test]
-    fn a_rollback_shows_while_it_is_about_the_deployed_commit() {
+    fn a_rollback_plan_is_found_while_it_is_about_the_deployed_commit() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().canonicalize().unwrap();
         let base = dir.join("base.Loxone");
@@ -726,34 +741,47 @@ mod tests {
         let mut h = History::new(base.clone(), None);
         let (_, hist) = h.list();
         let applied = hist[0].id.clone();
-        let id = h.set_rollback(
+        let plan = h.set_rollback(
             &applied,
             "Roll back: Apply".into(),
             "backups/x".into(),
             b"before".to_vec(),
         );
         assert_eq!(
-            id,
+            plan.id,
             format!("rollback:{}", applied.trim_start_matches("git:"))
         );
-        let l = h.lists();
-        assert_eq!(l.rollback.len(), 1);
-        let r = h.find(&id).unwrap();
+        // In no list: only the browser that asked shows it.
+        let (pending, hist2) = h.list();
+        assert!(pending.iter().chain(&hist2).all(|r| r.kind != "rollback"));
+        let r = h.find(&plan.id).unwrap();
         assert_eq!(
             (r.kind, r.base.as_deref()),
             ("rollback", Some(applied.as_str()))
         );
-        assert_eq!(r.blob, blob_id(b"before"));
         assert_eq!(h.content(&r.blob).unwrap().as_slice(), b"before");
-        // The older commit is not what the Miniserver runs: no rollback of it shows.
-        let older = hist[1].id.clone();
+        // Cancelled: gone.
+        h.clear_rollback(&plan.id);
+        assert!(h.find(&plan.id).is_none());
+        // Too old: gone.
         h.set_rollback(
+            &applied,
+            "Roll back: Apply".into(),
+            String::new(),
+            b"before".to_vec(),
+        );
+        h.rollback.as_mut().unwrap().time -= ROLLBACK_TTL;
+        h.version += 1;
+        assert!(h.find(&plan.id).is_none());
+        // Of an older commit, not what the Miniserver runs: never found.
+        let older = hist[1].id.clone();
+        let o = h.set_rollback(
             &older,
             "Roll back: one".into(),
             String::new(),
             b"x".to_vec(),
         );
-        assert!(h.lists().rollback.is_empty());
+        assert!(h.find(&o.id).is_none());
         // Nor once another commit is deployed.
         h.set_rollback(
             &applied,
@@ -761,11 +789,11 @@ mod tests {
             String::new(),
             b"before".to_vec(),
         );
+        assert!(h.find(&plan.id).is_some());
         fs::write(&base, "before").unwrap();
         git(&dir, &["commit", "-qam", "Roll back: Apply"]);
         assert!(h.refresh_git());
-        assert!(h.lists().rollback.is_empty());
-        assert!(h.find(&id).is_none());
+        assert!(h.find(&plan.id).is_none());
     }
 
     #[test]

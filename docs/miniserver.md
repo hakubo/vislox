@@ -324,8 +324,11 @@ configuration). Otherwise the button is greyed out and its tooltip says why. `--
 ## Roll back
 
 A Roll back (#69) sends the Miniserver nothing Apply does not: the same preflight (serial, FTP, web port), then
-`lox config push --force --patched-from <the Apply's post-push download>`, which downloads what it runs (and
-refuses unless that is exactly the download the Apply verified), uploads, restarts the program and downloads again
-to verify; vislox follows the restart and checks the load as for Apply. Working out what it would deploy (`POST
+`lox config push --patched-from <the Apply's post-push download>` without `--force` (it downloads what the
+Miniserver runs and stages the upload; nothing is uploaded), then the same with `--force`, which downloads again
+(and refuses unless that is exactly the download the Apply verified), uploads, restarts the program and downloads
+again to verify; vislox follows the restart and checks the load as for Apply. Only when that push fails after its
+upload line, vislox downloads what the Miniserver runs (`lox config download`, FTP, read-only) and reads `/prog`,
+to tell whether anything changed. Working out what it would deploy (`POST
 /api/rollback/plan`) reads only the project's `backups/` and git, and runs `lox logic compile` in a scratch
 directory: nothing goes to the Miniserver. See [features.md](features.md#apply-sync-and-discard).

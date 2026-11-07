@@ -36,9 +36,12 @@ published under the same version (see [docker/README.md](docker/README.md)).
   the Apply, compiled onto that download, which must give it back) as a revision compared with what runs now,
   asks with Apply's confirmation, then runs Apply's steps: the tests, `lox config push --force --patched-from
   <the Apply's post-push download>` (which refuses unless the Miniserver still runs exactly that), the program
-  restart, verification, a commit (`Roll back: <subject>`) and git push. It refuses on any doubt: changes not
-  committed, a later deploy, a download that is missing, unreadable or two different programs, a module that does
-  not give it back. A failure before lox verified the push leaves the project as it was.
+  restart, verification, a commit (`Roll back: <subject>`) and git push. The in-place compile, lox's staged upload
+  (`lox config push` without `--force`, first) and its verified download must each be the program reviewed. It
+  refuses on any doubt: changes not committed, a later deploy, a download that is missing, unreadable or two
+  different programs, an untracked or ignored file in the way, a module that does not give it back. Files git does
+  not track are never touched. A push that fails after its upload is judged by what the Miniserver runs (recorded
+  as deployed, put back, or reported as unknown); before it, the project is put back.
 - Fixed: Discard failed when the last commit had no lockfile (the first compile writes one), or one was staged
   but not committed. Discard now reads the last commit, never deletes a lock vislox did not write (one not in git
   goes back to how it was before vislox's first edit), and puts everything back when a step fails.

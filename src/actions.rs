@@ -20,6 +20,8 @@
 //! writes no config: lox and git do.
 
 use crate::{check, edit, restart};
+
+mod rollback;
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -521,10 +523,11 @@ const APPLY_STEPS: [(&str, &str); 10] = [
 ];
 /// A Roll back's steps (#69): Apply's, from the backup and the module
 /// before the Apply.
-const ROLLBACK_STEPS: [(&str, &str); 11] = [
+const ROLLBACK_STEPS: [(&str, &str); 12] = [
     ("backup", "Backup checked"),
     ("module", "Module before the Apply compiles to it"),
     ("tests", "Tests pass"),
+    ("stage", "Upload is what you reviewed"),
     ("check", "Download and drift check"),
     ("upload", "Upload"),
     ("restart", "Program restarting"),
@@ -706,80 +709,6 @@ struct Outcome {
 struct Deployed {
     before: Option<String>,
     after: String,
-}
-
-/// What a Roll back deploys ([`Actions::rollback_plan`]).
-pub struct RollbackPlan {
-    /// The commit rolled back, in full.
-    pub commit: String,
-    pub subject: String,
-    /// `backups/<stamp>-pre-push.zip`, for messages.
-    pub backup: String,
-    /// The download the commit deployed: the Miniserver must still run it.
-    post: PathBuf,
-    /// The base's blob id in the commit.
-    pub deployed: String,
-    /// The program the Miniserver ran before.
-    pre: Vec<u8>,
-    /// The module from before, compiled onto it: what will run.
-    pub compiled: Vec<u8>,
-    /// `compiled` is `pre` byte for byte (else the same program).
-    pub same_bytes: bool,
-    /// The module's files before the commit, by path.
-    files: Vec<(PathBuf, Vec<u8>)>,
-    module_file: bool,
-    lock: Option<Vec<u8>>,
-}
-
-impl RollbackPlan {
-    /// Put the module and lockfile back to before the commit, and the base
-    /// to the download from before it.
-    fn write(&self, p: &loxone_config::Project) -> Result<(), String> {
-        let err = |path: &Path, e: std::io::Error| format!("cannot write {}: {e}", path.display());
-        if self.module_file {
-            let _ = std::fs::remove_file(&p.module);
-        } else {
-            let mut now = Vec::new();
-            all_files(&p.module, &mut now);
-            for f in now {
-                std::fs::remove_file(&f).map_err(|e| err(&f, e))?;
-            }
-        }
-        for (path, bytes) in &self.files {
-            if let Some(d) = path.parent() {
-                std::fs::create_dir_all(d).map_err(|e| err(d, e))?;
-            }
-            std::fs::write(path, bytes).map_err(|e| err(path, e))?;
-        }
-        match &self.lock {
-            Some(l) => std::fs::write(&p.lock, l).map_err(|e| err(&p.lock, e))?,
-            None if p.lock.exists() => {
-                std::fs::remove_file(&p.lock).map_err(|e| err(&p.lock, e))?
-            }
-            None => {}
-        }
-        // The base lox compiles onto: the download from before, in lox's
-        // backups/ (as lox points the base at its download after a push).
-        // The project's base file stays as it is until the push is verified:
-        // then Apply's `keep_base` copies the new download over it.
-        let base = self.base_file();
-        std::fs::write(&base, &self.pre).map_err(|e| err(&base, e))?;
-        let toml = p.root.join("lox.toml");
-        let text = std::fs::read_to_string(&toml).map_err(|e| err(&toml, e))?;
-        let rel = base
-            .strip_prefix(&p.root)
-            .unwrap_or(&base)
-            .to_string_lossy();
-        std::fs::write(&toml, set_base(&text, &rel)).map_err(|e| err(&toml, e))
-    }
-
-    /// `backups/<stamp>-rollback-base.Loxone`, next to the push's downloads.
-    fn base_file(&self) -> PathBuf {
-        let name = self.post.file_name().unwrap_or_default().to_string_lossy();
-        let stem = name.strip_suffix("-post-push.Loxone").unwrap_or(&name);
-        self.post
-            .with_file_name(format!("{stem}-rollback-base.Loxone"))
-    }
 }
 
 /// A refused or failed action: HTTP status and message.
@@ -1138,8 +1067,12 @@ impl Actions {
             .ok()
             .map(|b| crate::history::blob_id(&b));
         let (pushed, ran_before) = self.push_config(&args).await?;
-        self.after_push(&p, &pushed, &ran_before, before, &subject, None)
-            .await
+        let c = Commit {
+            subject: &subject,
+            body: None,
+            force_add: &[],
+        };
+        self.after_push(&p, &pushed, &ran_before, before, &c).await
     }
 
     /// `lox config push` with `args`, followed (see [`Self::push_followed`]),
@@ -1155,17 +1088,21 @@ impl Actions {
     }
 
     /// After a verified push: check the Miniserver loaded it, keep the base
-    /// in git, commit (`subject`, and `body`) and push. `before` is the
-    /// deployed base's blob id before the push.
+    /// in git, commit (`c`) and push. `before` is the deployed base's blob id
+    /// before the push.
     async fn after_push(
         &self,
         p: &loxone_config::Project,
         pushed: &str,
         ran_before: &crate::running::Report,
         before: Option<String>,
-        subject: &str,
-        body: Option<&str>,
+        c: &Commit<'_>,
     ) -> Result<(String, Option<Deployed>), String> {
+        let Commit {
+            subject,
+            body,
+            force_add,
+        } = *c;
         let dir = self.s.project.as_deref().unwrap();
         let mut report = vec![last_lines(pushed, 6)];
         report.push(self.verify_load(ran_before).await);
@@ -1178,6 +1115,16 @@ impl Actions {
         });
         self.progress(|p| p.start("commit"));
         git(dir, &["add", "-A", "."]).await?;
+        let forced: Vec<String> = force_add
+            .iter()
+            .filter(|f| f.exists())
+            .map(|f| f.to_string_lossy().into_owned())
+            .collect();
+        if !forced.is_empty() {
+            let mut args = vec!["add", "-f", "--"];
+            args.extend(forced.iter().map(String::as_str));
+            git(dir, &args).await?;
+        }
         let staged = git(dir, &["diff", "--cached", "--quiet"]).await.is_err();
         if staged {
             let mut args = vec!["commit", "-q", "-m", subject];
@@ -1280,352 +1227,6 @@ impl Actions {
             }
         }
         format!("{UNVERIFIED} by load: {}.", why.join("; "))
-    }
-
-    /// Which of the History's commits can be rolled back (#69), by revision
-    /// id: the pushes whose download from before is in `backups/`. Only the
-    /// newest commit of the base can be: the Miniserver runs it.
-    pub fn rollbacks(&self, hist: &[crate::history::Revision]) -> Value {
-        if self.why_not_apply().is_some() {
-            return json!({});
-        }
-        let Ok(p) = self.project() else {
-            return json!({});
-        };
-        let pushes = self.pushes.list(&p.root.join("backups"));
-        let deployed = hist.iter().find(|r| r.kind == "git").map(|r| r.id.as_str());
-        let mut out = serde_json::Map::new();
-        // A push made one commit: the newest with its program. An older one
-        // with the same bytes (a rollback goes back to them) did not push it.
-        let mut taken = std::collections::HashSet::new();
-        for r in hist.iter().filter(|r| r.kind == "git") {
-            let Some(push) = pushes
-                .get(&r.blob)
-                .filter(|_| taken.insert(r.blob.as_str()))
-            else {
-                continue;
-            };
-            let backup = push.shown(&p.root);
-            let why = if Some(r.id.as_str()) != deployed {
-                Some("Only the newest deploy can be rolled back: the Miniserver runs a later config. Roll that back first.".to_string())
-            } else if !push.pre_zip.exists() && !push.pre_xml.exists() {
-                Some(format!("The download from before it is gone ({backup})."))
-            } else {
-                None
-            };
-            out.insert(
-                r.id.clone(),
-                json!({ "stamp": push.stamp, "backup": backup,
-                        "available": why.is_none(), "reason": why }),
-            );
-        }
-        Value::Object(out)
-    }
-
-    /// What rolling back commit `commit` would deploy (#69), worked out
-    /// without touching the project, refused on any doubt: the commit must be
-    /// the newest commit of the base, a verified push (a post-push download
-    /// holds its base), with nothing changed since; the download from before
-    /// it must be there and readable; and the module and lockfile from
-    /// before it must compile onto that download and give it back.
-    pub async fn rollback_plan(&self, commit: &str) -> Result<RollbackPlan, String> {
-        let dir = self
-            .s
-            .project
-            .as_deref()
-            .ok_or("only for a lox.toml project")?;
-        if let Some(why) = self.why_not_apply() {
-            return Err(why.into());
-        }
-        let p = self.project()?;
-        let commit = commit.trim_start_matches("git:");
-        if !(7..=64).contains(&commit.len()) || !commit.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Err(format!("not a commit: {commit}"));
-        }
-        let full = git(
-            dir,
-            &[
-                "rev-parse",
-                "-q",
-                "--verify",
-                &format!("{commit}^{{commit}}"),
-            ],
-        )
-        .await
-        .map_err(|_| format!("no commit {commit}"))?
-        .trim()
-        .to_string();
-        let short = &full[..10.min(full.len())];
-        let rel = |q: &Path| {
-            q.strip_prefix(&p.root)
-                .unwrap_or(q)
-                .to_string_lossy()
-                .into_owned()
-        };
-        let (base, module, lock, out) = (rel(&p.base), rel(&p.module), rel(&p.lock), rel(&p.out));
-        let newest = git(dir, &["log", "-1", "--format=%H", "--", &base]).await?;
-        if newest.trim() != full {
-            return Err(format!(
-                "Only the newest deploy can be rolled back: {base} changed after {short}, so the \
-                 Miniserver runs a later config. Roll that back first."
-            ));
-        }
-        let paths = [
-            "lox.toml",
-            base.as_str(),
-            module.as_str(),
-            lock.as_str(),
-            out.as_str(),
-        ];
-        let mut status = vec!["status", "--porcelain", "--untracked-files=all", "--"];
-        status.extend(paths);
-        let dirty = git(dir, &status).await?;
-        if !dirty.trim().is_empty() {
-            return Err(format!(
-                "The project has changes that are not committed ({}). Apply or Discard them \
-                 first: a Roll back puts the module back to before the Apply.",
-                last_lines(dirty.trim(), 3).replace('\n', ", ")
-            ));
-        }
-        let mut since = vec!["diff", "--quiet", full.as_str(), "HEAD", "--"];
-        since.extend(&paths[..4]);
-        if git(dir, &since).await.is_err() {
-            return Err(format!(
-                "lox.toml, the module or the lockfile changed in a commit after {short}. A Roll \
-                 back would drop that too: revert it first."
-            ));
-        }
-        let deployed = git(dir, &["rev-parse", &format!("{full}:./{base}")])
-            .await
-            .map_err(|_| format!("{short} has no {base}"))?
-            .trim()
-            .to_string();
-        if file_blob(&p.base).as_deref() != Some(deployed.as_str()) {
-            return Err(format!("{base} on disk is not the one {short} committed."));
-        }
-        let subject = git(dir, &["log", "-1", "--format=%s", &full])
-            .await?
-            .trim()
-            .to_string();
-        let parent = git(dir, &["rev-parse", "-q", "--verify", &format!("{full}^")])
-            .await
-            .map_err(|_| format!("{short} is the first commit: there is nothing before it"))?
-            .trim()
-            .to_string();
-        let backups = p.root.join("backups");
-        let push = crate::rollback::Pushes::find_now(&backups, &deployed).ok_or_else(|| {
-            format!(
-                "{short} is not a verified push vislox can roll back: no \
-                 backups/<stamp>-post-push.Loxone holds its {base}, so what the Miniserver ran \
-                 before it is not known."
-            )
-        })?;
-        let backup = push.shown(&p.root);
-        let pre = crate::rollback::read_pre_push(&push, &p.root)?;
-        // The module and lockfile as they were before the Apply.
-        let listed = git(
-            dir,
-            &["ls-tree", "-r", "-z", "--name-only", &parent, "--", &module],
-        )
-        .await?;
-        let names: Vec<&str> = listed.split('\0').filter(|n| !n.is_empty()).collect();
-        if names.is_empty() {
-            return Err(format!("{module} did not exist before {short}."));
-        }
-        let mut specs: Vec<String> = names.iter().map(|n| format!("{parent}:./{n}")).collect();
-        specs.push(format!("{parent}:./{lock}"));
-        let mut objects = git_objects(dir, &specs).await?;
-        let lock_bytes = objects.pop().flatten();
-        let mut files = Vec::new();
-        for (name, bytes) in names.iter().zip(objects) {
-            let bytes = bytes.ok_or_else(|| format!("cannot read {name} of {short}^"))?;
-            files.push((dir.join(name), bytes));
-        }
-        let module_file = names.len() == 1 && names[0] == module;
-        // Compiled in a scratch directory, as lox config push will compile it.
-        // Unique within this process too: two plans may start in one tick.
-        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let scratch = std::env::temp_dir().join(format!(
-            "vislox-rollback-{}-{}-{n}",
-            std::process::id(),
-            now_nanos()
-        ));
-        let _gone = RemoveDir(scratch.clone());
-        let s_module = if module_file {
-            scratch.join(p.module.file_name().unwrap_or_default())
-        } else {
-            scratch.join("module")
-        };
-        let write = |path: &Path, bytes: &[u8]| -> Result<(), String> {
-            if let Some(d) = path.parent() {
-                std::fs::create_dir_all(d)
-                    .map_err(|e| format!("cannot create {}: {e}", d.display()))?;
-            }
-            std::fs::write(path, bytes).map_err(|e| format!("cannot write {}: {e}", path.display()))
-        };
-        for (path, bytes) in &files {
-            let inner = path.strip_prefix(&p.module).unwrap_or(Path::new(""));
-            let to = if module_file {
-                s_module.clone()
-            } else {
-                s_module.join(inner)
-            };
-            write(&to, bytes)?;
-        }
-        let (s_lock, s_base, s_out) = (
-            scratch.join("lock.json"),
-            scratch.join("base.Loxone"),
-            scratch.join("out.Loxone"),
-        );
-        if let Some(l) = &lock_bytes {
-            write(&s_lock, l)?;
-        }
-        write(&s_base, &pre)?;
-        let (m, l, b, o) = (
-            s_module.to_string_lossy(),
-            s_lock.to_string_lossy(),
-            s_base.to_string_lossy(),
-            s_out.to_string_lossy(),
-        );
-        let args = [
-            "logic", "compile", "--base", &b, "--module", &m, "--lock", &l, "--out", &o,
-        ];
-        run(&self.s.lox, &args, dir, COMPILE_TIMEOUT)
-            .await
-            .map_err(|e| {
-                format!(
-                    "The module from before {short} does not compile onto {backup}: {}",
-                    last_lines(&e, 3)
-                )
-            })?;
-        let compiled =
-            std::fs::read(&s_out).map_err(|e| format!("lox logic compile wrote no config: {e}"))?;
-        let same_bytes = crate::rollback::same_program(&pre, &compiled).map_err(|why| {
-            format!(
-                "The module from before {short} does not compile back to what the Miniserver \
-                 ran then ({backup}): it {why}. A Roll back would not restore it."
-            )
-        })?;
-        Ok(RollbackPlan {
-            commit: full,
-            subject,
-            backup,
-            post: push.post_xml,
-            deployed,
-            pre,
-            compiled,
-            same_bytes,
-            files,
-            module_file,
-            lock: lock_bytes,
-        })
-    }
-
-    /// Roll back commit `commit` (#69): Apply's path, onto the download from
-    /// before it. The module and lockfile go back to before the commit and
-    /// lox.toml's base to that download (a copy in `backups/`); then the
-    /// tests, and
-    /// `lox config push --force --patched-from <post-push download>`, which
-    /// refuses unless the Miniserver still runs exactly what the commit
-    /// deployed, uploads, restarts the program and verifies; then vislox
-    /// verifies by load, commits and pushes. Until the push is verified,
-    /// anything that fails puts the project back as it was.
-    pub async fn rollback(&self, commit: &str, opts: &ApplyOpts) -> Result<String, Refusal> {
-        use axum::http::StatusCode;
-        let _one = self
-            .busy
-            .try_lock()
-            .map_err(|_| (StatusCode::CONFLICT, "already running".to_string()))?;
-        self.st.lock().unwrap().progress = Some(Progress::rollback());
-        self.begin("Roll back")?;
-        let _compiling = self.compile_lock.lock().await;
-        self.progress(|p| p.start("backup"));
-        let plan = match self.rollback_plan(commit).await {
-            Ok(plan) => plan,
-            Err(why) => {
-                self.end_with("rollback", &Err(why.clone()), None);
-                return Err((StatusCode::CONFLICT, why));
-            }
-        };
-        self.progress(|p| {
-            p.finish("backup", "ok", Some(plan.backup.clone()));
-            p.finish(
-                "module",
-                "ok",
-                Some(if plan.same_bytes {
-                    "gives it back byte for byte".into()
-                } else {
-                    "gives back its program".into()
-                }),
-            );
-        });
-        let p = match self.project() {
-            Ok(p) => p,
-            Err(why) => {
-                self.end_with("rollback", &Err(why.clone()), None);
-                return Err((StatusCode::CONFLICT, why));
-            }
-        };
-        let dir = self.s.project.as_deref().unwrap();
-        // Put back exactly this if anything fails before lox verified the push.
-        let toml = dir.join("lox.toml");
-        let base_file = plan.base_file();
-        let mut keep: Vec<&Path> = vec![&p.lock, &p.base, &p.out, &toml, &base_file];
-        if p.module.is_file() {
-            keep.push(&p.module);
-        }
-        let guard = Rollback::take(&p.module, &keep);
-        let fail = |why: String, status: StatusCode| {
-            guard.restore();
-            *self.compiled.lock().unwrap() = None;
-            self.end_with("rollback", &Err(why.clone()), None);
-            Err((status, why))
-        };
-        if let Err(why) = plan.write(&p) {
-            return fail(why, StatusCode::BAD_GATEWAY);
-        }
-        *self.compiled.lock().unwrap() = None;
-        // The tests (#67) of the module it deploys.
-        self.progress(|p| p.start("tests"));
-        match tests_verdict(&self.tests_now().await) {
-            Ok((state, detail)) => self.progress(|p| p.finish("tests", state, Some(detail))),
-            Err(why) => return fail(why, StatusCode::CONFLICT),
-        }
-        let post = plan.post.to_string_lossy().into_owned();
-        let mut args = vec!["config", "push", "--force", "--patched-from", post.as_str()];
-        if let Err(why) = push_opts(opts, &mut args) {
-            return fail(why, StatusCode::BAD_REQUEST);
-        }
-        let (pushed, ran_before) = match self.push_config(&args).await {
-            Ok(r) => r,
-            Err(why) => return fail(why, StatusCode::BAD_GATEWAY),
-        };
-        let short = &plan.commit[..10.min(plan.commit.len())];
-        let subject = format!("Roll back: {}", plan.subject);
-        let body = format!(
-            "Restored {}: what the Miniserver ran before {short}. The module and lockfile are as \
-             before that commit.",
-            plan.backup
-        );
-        let res = self
-            .after_push(
-                &p,
-                &pushed,
-                &ran_before,
-                Some(plan.deployed.clone()),
-                &subject,
-                Some(&body),
-            )
-            .await
-            .map(|(m, d)| (format!("Rolled back {short} to {}.\n{m}", plan.backup), d));
-        let _ = std::fs::remove_file(&base_file);
-        let (res, deployed) = match res {
-            Ok((m, d)) => (Ok(m), d),
-            Err(e) => (Err(e), None),
-        };
-        self.end_with("rollback", &res, deployed);
-        res.map_err(|e| (StatusCode::BAD_GATEWAY, e))
     }
 
     /// Make the Miniserver's running config the project's base
@@ -2925,6 +2526,15 @@ impl Actions {
         }
         Ok(msg)
     }
+}
+
+/// The commit after a push: its subject and body, and files to commit even
+/// when ignored (a Roll back's module files from before).
+#[derive(Clone, Copy)]
+struct Commit<'a> {
+    subject: &'a str,
+    body: Option<&'a str>,
+    force_add: &'a [PathBuf],
 }
 
 /// The flags of the user's answers to a refused Apply or Roll back.
@@ -5514,18 +5124,99 @@ esac
         w.finish().unwrap().into_inner()
     }
 
-    /// A project after two deploys: `init` (base A, module v1, lock1) and an
-    /// Apply (base B, module v2 with a second file, lock2), whose push left
-    /// its downloads in `backups/` (pre-push A, post-push B). Its `lox`
-    /// compiles by copying `--base` to `--out` (or changes it, when the file
-    /// `compile-differs` is there), and pushes by downloading the Apply's
-    /// config as its pre-push, and copying lox.toml's base to out and to a
-    /// new post-push download, which it points lox.toml at (or fails, with
-    /// `push-fails`), logging its arguments to `push-args`. `nested`: the
+    /// A stand-in `lox` for Roll back, in `t`. Files in `t` steer it:
+    /// - `logic compile --base … --out …` (the plan's scratch compile) copies
+    ///   the base (`compile-differs`: changes it); `logic compile` in the
+    ///   project copies lox.toml's base to out (`inplace-differs`: changes it);
+    /// - `config push` without `--force` downloads what runs (the Apply's
+    ///   config) as its pre-push, refuses with `push-fails`, else stages
+    ///   lox.toml's base (`stage-differs`: changed) and says where; arguments
+    ///   in `stage-args`;
+    /// - `config push --force` (arguments in `push-args`) fails before its
+    ///   upload line with `force-fails-early`, after it with `upload-fails`,
+    ///   else "deploys" lox.toml's base:
+    ///   out, a post-push download, lox.toml's base pointed at it;
+    /// - `config download --save-as` copies `runs.zip` (`download-fails`:
+    ///   fails).
+    #[cfg(unix)]
+    fn rollback_lox(t: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let lox = t.join("lox");
+        let t_s = t.display();
+        std::fs::write(
+            &lox,
+            format!(
+                r#"#!/bin/sh
+base() {{ sed -n 's/^base *= *"\(.*\)"/\1/p' lox.toml; }}
+case "$1 $2" in
+  'logic test')
+    if [ -f '{t_s}/test-fails' ]; then
+      echo 'test "Licht" ... FAILED'; echo '    step 1: expect licht.Q == 1 — actual 0'
+      echo '1 tests: 0 passed, 1 failed'; exit 1
+    fi
+    echo 'no tests in pages' ;;
+  'logic compile')
+    if [ $# -eq 2 ]; then
+      if [ -f '{t_s}/inplace-differs' ]; then sed 's/Haus/Halle/' "$(base)" > out.Loxone; else cp "$(base)" out.Loxone; fi
+      exit 0
+    fi
+    shift 2
+    while [ $# -gt 0 ]; do case "$1" in --base) b=$2; shift;; --out) o=$2; shift;; esac; shift; done
+    if [ -f '{t_s}/compile-differs' ]; then sed 's/Haus/Halle/' "$b" > "$o"; else cp "$b" "$o"; fi ;;
+  'config push')
+    case "$3" in
+      --force)
+        echo "$@" > '{t_s}/push-args'
+        echo 'Downloading the live config...' >&2
+        cp backups/20261107-100000-post-push.Loxone backups/20991231-235959-pre-push.Loxone
+        if [ -f '{t_s}/force-fails-early' ]; then echo 'Error: The Miniserver holds custom changes.' >&2; exit 1; fi
+        echo 'Uploading as sps_new.zip...' >&2
+        if [ -f '{t_s}/upload-fails' ]; then echo 'The Miniserver did not load the upload within a minute.' >&2; exit 1; fi
+        echo 'Restarting the program...' >&2
+        echo 'Downloading the config again to verify...' >&2
+        cp "$(base)" out.Loxone
+        cp "$(base)" backups/20991231-235959-post-push.Loxone
+        sed 's|^base *=.*|base = "backups/20991231-235959-post-push.Loxone"|' lox.toml > lox.toml.new && mv lox.toml.new lox.toml
+        echo 'Pushed and verified.' >&2 ;;
+      *)
+        echo "$@" > '{t_s}/stage-args'
+        echo 'Downloading the live config...' >&2
+        cp backups/20261107-100000-post-push.Loxone backups/20991231-235958-pre-push.Loxone
+        if [ -f '{t_s}/push-fails' ]; then echo 'The live config is no longer the download the patched base was built from.' >&2; exit 1; fi
+        if [ -f '{t_s}/stage-differs' ]; then sed 's/Haus/Halle/' "$(base)" > backups/20991231-235958-push.Loxone; else cp "$(base)" backups/20991231-235958-push.Loxone; fi
+        echo 'Staged backups/20991231-235958-push.zip (extracts to exactly backups/20991231-235958-push.Loxone). Run again with --force to upload it and restart the program.' >&2 ;;
+    esac ;;
+  'config download')
+    if [ -f '{t_s}/download-fails' ]; then echo 'Error: FTP: connection refused' >&2; exit 1; fi
+    cp '{t_s}/runs.zip' "$4" ;;
+  *) echo "unexpected: $*" >&2; exit 2 ;;
+esac
+"#
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&lox, std::fs::Permissions::from_mode(0o755)).unwrap();
+        lox
+    }
+
+    fn rollback_actions(d: &Path, lox: PathBuf) -> Actions {
+        Actions::new(Settings {
+            token: Some("t".into()),
+            project: Some(d.to_path_buf()),
+            lox,
+            probe: None,
+            running: Arc::new(crate::running::Running::new(Err("test".into()))),
+        })
+    }
+
+    /// A project after two deploys: `init` (base A, module v1 and an ignored
+    /// file git tracks, `pages/keep.local`; lock1) and an Apply (base B,
+    /// module v2 with a second file, keep.local untracked; lock2), whose push
+    /// left its downloads in `backups/` (pre-push A, post-push B). Its lox is
+    /// [`rollback_lox`]; the Miniserver runs A (`runs.zip`). `nested`: the
     /// project is a directory below the repository's top.
     #[cfg(unix)]
     fn project_after_an_apply(nested: bool) -> (tempfile::TempDir, PathBuf, Actions) {
-        use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
         let t = tmp.path();
         let repo = if nested {
@@ -5541,6 +5232,7 @@ esac
         std::fs::create_dir_all(d.join("pages")).unwrap();
         std::fs::create_dir_all(d.join("backups")).unwrap();
         std::fs::write(d.join("backups/.gitignore"), "*\n").unwrap();
+        std::fs::write(d.join(".gitignore"), "pages/*.local\n").unwrap();
         std::fs::write(
             d.join("lox.toml"),
             "base = \"base.Loxone\"\nmodule = \"pages\"\nout = \"out.Loxone\"\nlock = \"logic.lock.json\"\n",
@@ -5549,6 +5241,7 @@ esac
         std::fs::write(d.join("base.Loxone"), DOC_A).unwrap();
         std::fs::write(d.join("out.Loxone"), DOC_A).unwrap();
         std::fs::write(d.join("pages/main.loxl"), "v1\n").unwrap();
+        std::fs::write(d.join("pages/keep.local"), "kept\n").unwrap();
         std::fs::write(d.join("logic.lock.json"), "lock1\n").unwrap();
         sh(t, "git init -q --bare remote.git");
         sh(&repo, "git init -q");
@@ -5556,8 +5249,8 @@ esac
             &d,
             &format!(
                 "git config user.email t@t && git config user.name t \
-                 && git add -A && git commit -qm init && git remote add origin {} \
-                 && git push -q -u origin HEAD",
+                 && git add -A && git add -f pages/keep.local && git commit -qm init \
+                 && git remote add origin {} && git push -q -u origin HEAD",
                 t.join("remote.git").display()
             ),
         );
@@ -5568,7 +5261,7 @@ esac
         std::fs::write(d.join("logic.lock.json"), "lock2\n").unwrap();
         sh(
             &d,
-            "git add -A && git commit -qm 'Rename Haus' && git push -q",
+            "git rm -q pages/keep.local && git add -A && git commit -qm 'Rename Haus' && git push -q",
         );
         let b = d.join("backups");
         std::fs::write(b.join("20261107-100000-pre-push.Loxone"), DOC_A).unwrap();
@@ -5578,50 +5271,8 @@ esac
         )
         .unwrap();
         std::fs::write(b.join("20261107-100000-post-push.Loxone"), doc_b()).unwrap();
-        let lox = t.join("lox");
-        let t_s = t.display();
-        std::fs::write(
-            &lox,
-            format!(
-                r#"#!/bin/sh
-case "$1 $2" in
-  'logic test')
-    if [ -f '{t_s}/test-fails' ]; then
-      echo 'test "Licht" ... FAILED'; echo '    step 1: expect licht.Q == 1 — actual 0'
-      echo '1 tests: 0 passed, 1 failed'; exit 1
-    fi
-    echo 'no tests in pages' ;;
-  'logic compile')
-    shift 2
-    while [ $# -gt 0 ]; do case "$1" in --base) b=$2; shift;; --out) o=$2; shift;; esac; shift; done
-    if [ -f '{t_s}/compile-differs' ]; then sed 's/Haus/Halle/' "$b" > "$o"; else cp "$b" "$o"; fi ;;
-  'config push')
-    echo "$@" > '{t_s}/push-args'
-    echo 'Downloading the live config...' >&2
-    cp backups/20261107-100000-post-push.Loxone backups/20991231-235959-pre-push.Loxone
-    if [ -f '{t_s}/push-fails' ]; then echo 'The live config is no longer the download the patched base was built from.' >&2; exit 1; fi
-    echo 'Uploading as sps_new.zip...' >&2
-    echo 'Restarting the program...' >&2
-    echo 'Downloading the config again to verify...' >&2
-    b=$(sed -n 's/^base *= *"\(.*\)"/\1/p' lox.toml)
-    cp "$b" out.Loxone
-    cp "$b" backups/20991231-235959-post-push.Loxone
-    sed 's|^base *=.*|base = "backups/20991231-235959-post-push.Loxone"|' lox.toml > lox.toml.new && mv lox.toml.new lox.toml
-    echo 'Pushed and verified.' >&2 ;;
-  *) echo "unexpected: $*" >&2; exit 2 ;;
-esac
-"#
-            ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&lox, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let a = Actions::new(Settings {
-            token: Some("t".into()),
-            project: Some(d.clone()),
-            lox,
-            probe: None,
-            running: Arc::new(crate::running::Running::new(Err("test".into()))),
-        });
+        std::fs::write(t.join("runs.zip"), zip_of(DOC_A.as_bytes())).unwrap();
+        let a = rollback_actions(&d, rollback_lox(t));
         (tmp, d, a)
     }
 
@@ -5632,6 +5283,37 @@ esac
             .output()
             .unwrap();
         String::from_utf8_lossy(&o.stdout).trim().to_string()
+    }
+
+    fn read(p: &Path) -> String {
+        std::fs::read_to_string(p).unwrap_or_default()
+    }
+
+    fn step_states(a: &Actions) -> std::collections::BTreeMap<String, String> {
+        a.info()["progress"]["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| {
+                (
+                    s["id"].as_str().unwrap().to_string(),
+                    s["state"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect()
+    }
+
+    /// The project as the Apply left it: committed, nothing written.
+    fn as_the_apply_left_it(d: &Path, head: &str) {
+        assert_eq!(git_out(d, &["status", "--porcelain"]), "");
+        assert_eq!(git_out(d, &["rev-parse", "HEAD"]), head);
+        assert_eq!(read(&d.join("pages/main.loxl")), "v2\n");
+        assert_eq!(read(&d.join("base.Loxone")), doc_b());
+        assert!(read(&d.join("lox.toml")).contains("base = \"base.Loxone\""));
+        assert!(
+            !d.join("backups/20261107-100000-rollback-base.Loxone")
+                .exists()
+        );
     }
 
     #[cfg(unix)]
@@ -5649,78 +5331,74 @@ esac
     #[cfg(unix)]
     async fn rollback_deploys(nested: bool) {
         let (tmp, d, a) = project_after_an_apply(nested);
+        let t = tmp.path();
         let head = git_out(&d, &["rev-parse", "HEAD"]);
-        // History offers it on the deployed commit only.
-        let hist = vec![
-            crate::history::Revision {
-                id: format!("git:{head}"),
-                kind: "git",
-                blob: crate::history::blob_id(doc_b().as_bytes()),
-                ..Default::default()
-            },
-            crate::history::Revision {
-                id: "git:older".into(),
-                kind: "git",
-                blob: crate::history::blob_id(DOC_A.as_bytes()),
-                ..Default::default()
-            },
-        ];
-        let mut hist = hist;
-        hist.push(crate::history::Revision {
-            id: "git:same-bytes".into(),
+        // History offers it on the deployed commit only, once per push.
+        let rev = |id: &str, doc: &str| crate::history::Revision {
+            id: id.into(),
             kind: "git",
-            blob: crate::history::blob_id(doc_b().as_bytes()),
+            blob: crate::history::blob_id(doc.as_bytes()),
             ..Default::default()
-        });
+        };
+        let hist = vec![
+            rev(&format!("git:{head}"), &doc_b()),
+            rev("git:older", DOC_A),
+            rev("git:same-bytes", &doc_b()),
+        ];
         let r = a.rollbacks(&hist);
         assert_eq!(r[format!("git:{head}")]["available"], true, "{r}");
-        assert!(r.get("git:same-bytes").is_none(), "{r}");
         assert_eq!(
             r[format!("git:{head}")]["backup"],
             "backups/20261107-100000-pre-push.zip"
         );
-        assert!(r.get("git:older").is_none(), "{r}");
+        assert!(
+            r.get("git:same-bytes").is_none() && r.get("git:older").is_none(),
+            "{r}"
+        );
+        // An ignored file in the module, which no git command would bring back.
+        std::fs::write(d.join("pages/notes.local"), "mine\n").unwrap();
         // The plan changes nothing.
         let plan = a.rollback_plan(&head).await.unwrap();
         assert_eq!(plan.compiled, DOC_A.as_bytes());
         assert!(plan.same_bytes);
         assert_eq!(plan.subject, "Rename Haus");
         assert_eq!(git_out(&d, &["status", "--porcelain"]), "");
-        let msg = a.rollback(&head, &ApplyOpts::default()).await.unwrap();
+        let msg = a
+            .rollback(&head, Some(&plan.blob()), &ApplyOpts::default())
+            .await
+            .unwrap();
         assert!(
             msg.starts_with(&format!(
-                "Rolled back {} to backups/20261107-100000-pre-push.zip.",
+                "Rolled back {} to backups/20261107-100000-pre-push.zip.\nThe download lox verified is the program you reviewed.",
                 &head[..10]
             )),
             "{msg}"
         );
-        // lox pushed onto the download the Apply deployed: it refuses unless the Miniserver still runs it.
-        let args = std::fs::read_to_string(tmp.path().join("push-args")).unwrap();
+        // lox staged first, then pushed, onto the download the Apply deployed.
+        let post = d.join("backups/20261107-100000-post-push.Loxone");
         assert_eq!(
-            args.trim(),
-            format!(
-                "config push --force --patched-from {}",
-                d.join("backups/20261107-100000-post-push.Loxone").display()
-            )
+            read(&t.join("stage-args")).trim(),
+            format!("config push --patched-from {}", post.display())
+        );
+        assert_eq!(
+            read(&t.join("push-args")).trim(),
+            format!("config push --force --patched-from {}", post.display())
         );
         // The module and lockfile are back to before the Apply, the base is what ran before.
-        assert_eq!(
-            std::fs::read_to_string(d.join("pages/main.loxl")).unwrap(),
-            "v1\n"
-        );
+        assert_eq!(read(&d.join("pages/main.loxl")), "v1\n");
         assert!(!d.join("pages/extra.loxl").exists());
-        assert_eq!(
-            std::fs::read_to_string(d.join("logic.lock.json")).unwrap(),
-            "lock1\n"
-        );
-        assert_eq!(
-            std::fs::read_to_string(d.join("base.Loxone")).unwrap(),
-            DOC_A
-        );
-        let toml = std::fs::read_to_string(d.join("lox.toml")).unwrap();
-        assert!(toml.contains("base   = \"base.Loxone\""), "{toml}");
-        // Committed and pushed, with a subject that says what it was.
+        assert_eq!(read(&d.join("pages/keep.local")), "kept\n");
+        assert_eq!(read(&d.join("logic.lock.json")), "lock1\n");
+        assert_eq!(read(&d.join("base.Loxone")), DOC_A);
+        assert!(read(&d.join("lox.toml")).contains("base   = \"base.Loxone\""));
+        // The ignored file is still there, and not committed.
+        assert_eq!(read(&d.join("pages/notes.local")), "mine\n");
+        // Committed (the tracked ignored file too) and pushed.
         assert_eq!(git_out(&d, &["status", "--porcelain"]), "");
+        assert_eq!(
+            git_out(&d, &["ls-files", "pages"]),
+            "pages/keep.local\npages/main.loxl"
+        );
         assert_eq!(
             git_out(&d, &["log", "-1", "--format=%s"]),
             "Roll back: Rename Haus"
@@ -5730,10 +5408,7 @@ esac
                 .contains("Restored backups/20261107-100000-pre-push.zip")
         );
         assert_eq!(
-            git_out(
-                tmp.path(),
-                &["--git-dir=remote.git", "log", "-1", "--format=%s"]
-            ),
+            git_out(t, &["--git-dir=remote.git", "log", "-1", "--format=%s"]),
             "Roll back: Rename Haus"
         );
         let info = a.info();
@@ -5746,13 +5421,14 @@ esac
             info["last"]["deployed"]["after"],
             crate::history::blob_id(DOC_A.as_bytes())
         );
-        let steps = info["progress"]["steps"].as_array().unwrap();
+        let steps = step_states(&a);
         for id in [
-            "backup", "module", "check", "upload", "restart", "verify", "commit", "push",
+            "backup", "module", "stage", "check", "upload", "restart", "verify", "commit", "push",
         ] {
-            let s = steps.iter().find(|s| s["id"] == id).unwrap();
-            assert_eq!(s["state"], "ok", "{id}: {steps:?}");
+            assert_eq!(steps[id], "ok", "{id}: {steps:?}");
         }
+        // The module has no tests.
+        assert_eq!(steps["tests"], "skip");
         // The rollback is a push too: rolling it back would deploy the Apply again.
         let head2 = git_out(&d, &["rev-parse", "HEAD"]);
         let again = a.rollback_plan(&head2).await.unwrap();
@@ -5769,83 +5445,275 @@ esac
     #[tokio::test]
     async fn a_rollback_refuses_on_any_doubt_and_changes_nothing() {
         let (tmp, d, a) = project_after_an_apply(false);
+        let t = tmp.path();
         let head = git_out(&d, &["rev-parse", "HEAD"]);
-        let refused = |e: Result<String, Refusal>| e.err().unwrap().1;
+        let refused = |e: Result<String, Refusal>| e.err().unwrap();
+        let none = ApplyOpts::default();
+        let go = || a.rollback(&head, None, &none);
         let b = d.join("backups");
+        // A request that is wrong in itself: refused before anything starts.
+        let bad = ApplyOpts {
+            accept_version: Some("16.x".into()),
+            ..Default::default()
+        };
+        let (status, e) = refused(a.rollback(&head, None, &bad).await);
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        assert!(e.contains("not a Loxone Config version"), "{e}");
+        assert!(a.info()["progress"].is_null());
         // Changes nobody committed.
         std::fs::write(d.join("pages/main.loxl"), "v3\n").unwrap();
-        let e = refused(a.rollback(&head, &ApplyOpts::default()).await);
+        let e = refused(go().await).1;
         assert!(e.contains("not committed"), "{e}");
-        assert_eq!(
-            std::fs::read_to_string(d.join("pages/main.loxl")).unwrap(),
-            "v3\n"
-        );
+        assert_eq!(read(&d.join("pages/main.loxl")), "v3\n");
         sh(&d, "git checkout -q -- pages");
+        // An ignored file where the module from before has one: never overwritten.
+        std::fs::write(d.join("pages/keep.local"), "someone's\n").unwrap();
+        let e = refused(go().await).1;
+        assert!(e.starts_with("pages/keep.local is in the way"), "{e}");
+        assert_eq!(read(&d.join("pages/keep.local")), "someone's\n");
+        std::fs::remove_file(d.join("pages/keep.local")).unwrap();
         // The download from before is gone.
         let zip = std::fs::read(b.join("20261107-100000-pre-push.zip")).unwrap();
         std::fs::remove_file(b.join("20261107-100000-pre-push.zip")).unwrap();
         std::fs::remove_file(b.join("20261107-100000-pre-push.Loxone")).unwrap();
-        let e = refused(a.rollback(&head, &ApplyOpts::default()).await);
+        let e = refused(go().await).1;
         assert!(e.contains("is gone"), "{e}");
         // Two different programs.
         std::fs::write(b.join("20261107-100000-pre-push.zip"), &zip).unwrap();
         std::fs::write(b.join("20261107-100000-pre-push.Loxone"), doc_b()).unwrap();
-        let e = refused(a.rollback(&head, &ApplyOpts::default()).await);
+        let e = refused(go().await).1;
         assert!(e.contains("hold different programs"), "{e}");
         std::fs::write(b.join("20261107-100000-pre-push.Loxone"), DOC_A).unwrap();
         // The module from before does not give the download back.
-        std::fs::write(tmp.path().join("compile-differs"), "").unwrap();
-        let e = refused(a.rollback(&head, &ApplyOpts::default()).await);
+        std::fs::write(t.join("compile-differs"), "").unwrap();
+        let e = refused(go().await).1;
         assert!(
             e.contains("does not compile back to what the Miniserver ran then"),
             "{e}"
         );
         assert!(e.contains("Halle"), "{e}");
-        std::fs::remove_file(tmp.path().join("compile-differs")).unwrap();
+        std::fs::remove_file(t.join("compile-differs")).unwrap();
         // Not a push vislox knows of.
         std::fs::rename(
             b.join("20261107-100000-post-push.Loxone"),
             b.join("post.bak"),
         )
         .unwrap();
-        let e = refused(a.rollback(&head, &ApplyOpts::default()).await);
+        let e = refused(go().await).1;
         assert!(e.contains("is not a verified push"), "{e}");
         std::fs::rename(
             b.join("post.bak"),
             b.join("20261107-100000-post-push.Loxone"),
         )
         .unwrap();
-        // Nothing before the first commit.
-        let first = git_out(&d, &["rev-list", "--max-parents=0", "HEAD"]);
-        let e = refused(a.rollback(&first, &ApplyOpts::default()).await);
-        assert!(e.contains("Only the newest deploy"), "{e}");
-        // A test of the module from before fails (#67): stopped there, all back as it was.
-        std::fs::write(tmp.path().join("test-fails"), "").unwrap();
-        let e = refused(a.rollback(&head, &ApplyOpts::default()).await);
+        // Not what was reviewed: the plan changed since.
+        let e = refused(
+            a.rollback(&head, Some("0123456789abcdef"), &ApplyOpts::default())
+                .await,
+        )
+        .1;
+        assert!(
+            e.starts_with("What a Roll back deploys changed since you reviewed it"),
+            "{e}"
+        );
+        // A test of the module from before fails (#67): stopped there.
+        std::fs::write(t.join("test-fails"), "").unwrap();
+        let e = refused(go().await).1;
         assert!(e.contains("1 of 1 test fails"), "{e}");
-        assert_eq!(git_out(&d, &["status", "--porcelain"]), "");
-        assert_eq!(
-            std::fs::read_to_string(d.join("pages/main.loxl")).unwrap(),
-            "v2\n"
-        );
-        std::fs::remove_file(tmp.path().join("test-fails")).unwrap();
-        assert!(!tmp.path().join("push-args").exists(), "nothing was pushed");
-        // lox refuses the push (the Miniserver no longer runs the Apply's config): all back as it was.
-        std::fs::write(tmp.path().join("push-fails"), "").unwrap();
-        let e = refused(a.rollback(&head, &ApplyOpts::default()).await);
+        as_the_apply_left_it(&d, &head);
+        std::fs::remove_file(t.join("test-fails")).unwrap();
+        assert!(!t.join("stage-args").exists() && !t.join("push-args").exists());
+        // lox's drift check refuses (the Miniserver no longer runs the Apply's config).
+        std::fs::write(t.join("push-fails"), "").unwrap();
+        let e = refused(go().await).1;
         assert!(e.contains("no longer the download"), "{e}");
-        assert_eq!(git_out(&d, &["status", "--porcelain"]), "");
-        assert!(!b.join("20261107-100000-rollback-base.Loxone").exists());
-        assert_eq!(git_out(&d, &["rev-parse", "HEAD"]), head);
-        assert_eq!(
-            std::fs::read_to_string(d.join("pages/extra.loxl")).unwrap(),
-            "new\n"
+        assert!(e.contains("nothing uploaded"), "{e}");
+        as_the_apply_left_it(&d, &head);
+        assert!(!t.join("push-args").exists(), "never pushed with --force");
+        let steps = step_states(&a);
+        assert_eq!(steps["stage"], "fail", "{steps:?}");
+        assert_eq!(a.info()["last"]["ok"], false);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_rollback_uploads_only_the_program_that_was_reviewed() {
+        let (tmp, d, a) = project_after_an_apply(false);
+        let t = tmp.path();
+        let head = git_out(&d, &["rev-parse", "HEAD"]);
+        let plan = a.rollback_plan(&head).await.unwrap();
+        // Compiled in the project, with its own settings, it gives something else.
+        std::fs::write(t.join("inplace-differs"), "").unwrap();
+        let (_, e) = a
+            .rollback(&head, Some(&plan.blob()), &ApplyOpts::default())
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            e.starts_with("Compiled in the project, the module from before gives another program"),
+            "{e}"
         );
-        let info = a.info();
-        assert_eq!(info["last"]["kind"], "rollback");
-        assert_eq!(info["last"]["ok"], false);
-        let steps = info["progress"]["steps"].as_array().unwrap();
-        let check = steps.iter().find(|s| s["id"] == "check").unwrap();
-        assert_eq!(check["state"], "fail", "{steps:?}");
+        assert_eq!(step_states(&a)["module"], "fail");
+        as_the_apply_left_it(&d, &head);
+        assert!(!t.join("stage-args").exists() && !t.join("push-args").exists());
+        std::fs::remove_file(t.join("inplace-differs")).unwrap();
+        // lox stages something else.
+        std::fs::write(t.join("stage-differs"), "").unwrap();
+        let (_, e) = a
+            .rollback(&head, Some(&plan.blob()), &ApplyOpts::default())
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            e.starts_with("lox staged another program than the one you reviewed"),
+            "{e}"
+        );
+        assert_eq!(step_states(&a)["stage"], "fail");
+        as_the_apply_left_it(&d, &head);
+        assert!(!t.join("push-args").exists(), "never pushed with --force");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_push_that_fails_after_its_upload_is_recorded_by_what_the_miniserver_runs() {
+        let (tmp, d, a) = project_after_an_apply(false);
+        let t = tmp.path();
+        let head = git_out(&d, &["rev-parse", "HEAD"]);
+        // Before its upload line: nothing was sent, the project is put back.
+        std::fs::write(t.join("force-fails-early"), "").unwrap();
+        let (_, e) = a
+            .rollback(&head, None, &ApplyOpts::default())
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            e.contains("lox stopped before the upload: nothing changed on the Miniserver"),
+            "{e}"
+        );
+        as_the_apply_left_it(&d, &head);
+        assert_eq!(step_states(&a)["check"], "fail");
+        std::fs::remove_file(t.join("force-fails-early")).unwrap();
+        std::fs::write(t.join("upload-fails"), "").unwrap();
+        // vislox cannot tell what runs: it says so, and leaves the project at its commit.
+        std::fs::write(t.join("download-fails"), "").unwrap();
+        let (_, e) = a
+            .rollback(&head, None, &ApplyOpts::default())
+            .await
+            .err()
+            .unwrap();
+        assert!(e.contains("did not load the upload"), "{e}");
+        assert!(e.contains("cannot tell which config the Miniserver runs now (lox config download: Error: FTP: connection refused)"), "{e}");
+        assert!(
+            e.contains("It may run the rolled-back config or the Apply's"),
+            "{e}"
+        );
+        as_the_apply_left_it(&d, &head);
+        // It runs a third program: the same.
+        std::fs::remove_file(t.join("download-fails")).unwrap();
+        std::fs::write(
+            t.join("runs.zip"),
+            zip_of(DOC_A.replace("Haus", "Werkstatt").as_bytes()),
+        )
+        .unwrap();
+        let (_, e) = a
+            .rollback(&head, None, &ApplyOpts::default())
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            e.contains("neither the Apply's nor the rolled-back one"),
+            "{e}"
+        );
+        as_the_apply_left_it(&d, &head);
+        // It runs the Apply's, but whether an upload waits cannot be checked here: the same.
+        std::fs::write(t.join("runs.zip"), zip_of(doc_b().as_bytes())).unwrap();
+        let (_, e) = a
+            .rollback(&head, None, &ApplyOpts::default())
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            e.contains("whether an upload waits cannot be checked"),
+            "{e}"
+        );
+        as_the_apply_left_it(&d, &head);
+        // It runs the rolled-back program: recorded as deployed, not verified.
+        std::fs::write(t.join("runs.zip"), zip_of(DOC_A.as_bytes())).unwrap();
+        let msg = a
+            .rollback(&head, None, &ApplyOpts::default())
+            .await
+            .unwrap();
+        assert!(msg.contains("Not verified: lox failed after the upload, but the Miniserver runs the rolled-back program"), "{msg}");
+        assert_eq!(a.info()["last"]["warn"], true);
+        assert_eq!(git_out(&d, &["status", "--porcelain"]), "");
+        assert_eq!(
+            git_out(&d, &["log", "-1", "--format=%s"]),
+            "Roll back: Rename Haus"
+        );
+        assert_eq!(read(&d.join("base.Loxone")), DOC_A);
+        assert_eq!(read(&d.join("out.Loxone")), DOC_A);
+        assert_eq!(read(&d.join("pages/main.loxl")), "v1\n");
+        assert!(read(&d.join("lox.toml")).contains("base   = \"base.Loxone\""));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_first_commit_has_nothing_to_roll_back_to() {
+        let tmp = tempfile::tempdir().unwrap();
+        let t = tmp.path();
+        let d = t.join("project");
+        std::fs::create_dir_all(d.join("pages")).unwrap();
+        std::fs::create_dir_all(d.join("backups")).unwrap();
+        std::fs::write(d.join("backups/.gitignore"), "*\n").unwrap();
+        std::fs::write(
+            d.join("lox.toml"),
+            "base = \"base.Loxone\"\nmodule = \"pages\"\nout = \"out.Loxone\"\n",
+        )
+        .unwrap();
+        std::fs::write(d.join("base.Loxone"), doc_b()).unwrap();
+        std::fs::write(d.join("out.Loxone"), doc_b()).unwrap();
+        std::fs::write(d.join("pages/main.loxl"), "v1\n").unwrap();
+        sh(
+            &d,
+            "git init -q && git config user.email t@t && git config user.name t \
+             && git add -A && git commit -qm 'First push'",
+        );
+        // Its base is a push's download, with the download from before kept.
+        std::fs::write(d.join("backups/20261107-100000-post-push.Loxone"), doc_b()).unwrap();
+        std::fs::write(d.join("backups/20261107-100000-pre-push.Loxone"), DOC_A).unwrap();
+        let a = rollback_actions(&d, rollback_lox(t));
+        let head = git_out(&d, &["rev-parse", "HEAD"]);
+        let e = a.rollback_plan(&head).await.err().unwrap();
+        assert!(
+            e.ends_with("is the first commit: there is nothing before it to go back to"),
+            "{e}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_plan_waits_for_the_compile_lock_and_refuses_during_an_action() {
+        let (_tmp, d, a) = project_after_an_apply(false);
+        let head = git_out(&d, &["rev-parse", "HEAD"]);
+        // An action runs (Apply, Discard, a Roll back): refused at once.
+        {
+            let _busy = a.busy.lock().await;
+            a.st.lock().unwrap().running = Some("Apply");
+            let e = a.rollback_plan(&head).await.err().unwrap();
+            assert_eq!(e, "Apply is running");
+            a.st.lock().unwrap().running = None;
+        }
+        // An edit or Compile holds the compile lock: the plan waits for it.
+        let held = a.compile_lock.lock().await;
+        let plan = a.rollback_plan(&head);
+        tokio::pin!(plan);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), &mut plan)
+                .await
+                .is_err(),
+            "the plan did not wait"
+        );
+        drop(held);
+        assert!(plan.await.is_ok());
     }
 }
