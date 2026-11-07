@@ -55,6 +55,9 @@ pub struct Actions {
     edit_state: Mutex<EditState>,
     /// `GET /api/edits`, for the [`EditState::key`] it was worked out for.
     edits_cache: Mutex<Option<(String, Value)>>,
+    /// The module's `.loxl` files as last read (#64): read and hashed again
+    /// only when they change, for the key and for `sources`.
+    module_files: Mutex<crate::managed::ModuleFiles>,
     /// What vislox's last compile compiled: each module file's blob id (by
     /// its path from the project), and the blob id of the `out` it wrote.
     /// An edit checks the module against it by content ([`Self::uncompiled`]).
@@ -607,6 +610,7 @@ impl Actions {
             tx,
             edit_state: Mutex::new(EditState::default()),
             edits_cache: Mutex::new(None),
+            module_files: Mutex::default(),
             compiled: Mutex::new(None),
         };
         a.edit_state.lock().unwrap().why = a.why_not_edit_now();
@@ -676,11 +680,17 @@ impl Actions {
             .as_deref()
             .and_then(|d| loxone_config::Project::load(&d.join("lox.toml")).ok())
             .map(|p| {
-                // vislox's files, and the lockfile: which blocks lox can move
-                // comes from it, and lox or a Discard may change it alone.
-                let mut all: Vec<String> = edit::Files::texts(&p.module.join(edit::DIR))
-                    .iter()
-                    .map(|(n, x)| format!("{n}={}", crate::history::blob_id(x.as_bytes())))
+                // The module's files, vislox's among them: where each managed
+                // block is declared (#64) moves with them, compiled or not.
+                // And the lockfile: which blocks lox can move comes from it,
+                // and lox or a Discard may change it alone.
+                let mut all: Vec<String> = self
+                    .module_files
+                    .lock()
+                    .unwrap()
+                    .refresh(&p.root, &p.module)
+                    .into_iter()
+                    .map(|(n, b)| format!("{n}={b}"))
                     .collect();
                 if let Ok(lock) = std::fs::read(&p.lock) {
                     all.push(format!("lock={}", crate::history::blob_id(&lock)));
@@ -1469,8 +1479,7 @@ impl Actions {
         deployed: Option<DeployedRev>,
         pending: Option<Arc<Vec<u8>>>,
     ) -> Value {
-        let off =
-            || json!({ "available": false, "reason": state.why, "claims": [], "managed": [] });
+        let off = || json!({ "available": false, "reason": state.why, "claims": [], "managed": [], "sources": {} });
         let Some(dir) = self.s.project.as_deref() else {
             return off();
         };
@@ -1568,6 +1577,14 @@ impl Actions {
             .map(|(_, u)| u.clone())
             .collect();
         managed.sort();
+        // Where the module declares each block it manages, the blocks added
+        // here among them (#64): UUID → slug, file and line.
+        let texts = {
+            let mut m = self.module_files.lock().unwrap();
+            m.refresh(&p.root, &p.module);
+            m.texts()
+        };
+        let sources = crate::managed::sources(&texts, &lock.slugs);
         // The blocks lox can move (#60): those it manages that are drawn on a
         // page, and of them those the pending config draws elsewhere than the
         // deployed one, on the same page.
@@ -1664,6 +1681,7 @@ impl Actions {
             "claims": claims,
             "blocks": blocks,
             "managed": managed,
+            "sources": sources,
             "movable": movable,
             "moves": moves,
             "arrange": arrange,
@@ -2768,6 +2786,44 @@ sed "s/Title=\"Testhaus\"/Title=\"Testhaus $w\"/" base.Loxone > "$out"
             calls.lines().all(|l| l.starts_with("logic compile")),
             "{calls}"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_managed_blocks_point_at_their_source_lines() {
+        const AND: &str = "10000004-0000-0040-ffff504f94000001";
+        let (tmp, a) = project_for_edits();
+        let d = tmp.path().join("project");
+        std::fs::write(
+            d.join("pages/main.loxl"),
+            "# the module\nteiler = Div(\"Teiler\")\n",
+        )
+        .unwrap();
+        std::fs::write(
+            d.join("logic.lock.json"),
+            format!(
+                r#"{{"objects":{{"teiler":{{"uuid":"{DIV}","type":"Div"}}}},"externals":{{"temp":{{"uuid":"{AND}"}}}}}}"#
+            ),
+        )
+        .unwrap();
+        let e = edits_of(&a, &d).await;
+        // The extern is not managed: Loxone Config owns it.
+        assert_eq!(
+            e["sources"],
+            json!({ DIV: { "slug": "teiler", "file": "pages/main.loxl", "line": 2, "how": "declared" } }),
+            "{e}"
+        );
+        // A line moved in the module, not compiled yet: the key changes, and
+        // the line follows.
+        let key = a.edit_state.lock().unwrap().key.clone();
+        std::fs::write(
+            d.join("pages/main.loxl"),
+            "# the module\n\n# Teiler\nteiler = Div(\"Teiler\")\n",
+        )
+        .unwrap();
+        let e = edits_of(&a, &d).await;
+        assert_ne!(a.edit_state.lock().unwrap().key, key);
+        assert_eq!(e["sources"][DIV]["line"], 4, "{e}");
     }
 
     #[cfg(unix)]

@@ -95,6 +95,9 @@
         <span class="lg w-dig">digital</span><span class="lg w-ana">analog</span><span class="lg in-app" title="Blocks with a blue phone are shown in the Loxone app. The Miniserver sends live values only for these and the periphery (inputs and outputs).">in the app</span>
         <span class="lg-sep diff-only"></span>
         <span class="lg added diff-only">added</span><span class="lg changed diff-only">changed</span><span class="lg removed diff-only">removed</span><span class="lg moved diff-only">moved</span>
+        <span class="lg-sep managed-only"></span>
+        <span class="lg managed-k managed-only" title="Blocks the project's Lox Logic module manages: the lockfile pins them, and a .loxl file declares them. Shown on the newest config only, as the lockfile and module are now">managed</span>
+        <label class="lg-dim managed-only" title="Fade the blocks Loxone Config owns"><input type="checkbox" id="chk-only-managed"> Show managed blocks only</label>
         <span class="lg-sep live-only"></span>
         <span class="lg w-on live-only">on</span><span class="lg-pill live-only">21.5°</span><span class="lg-pill computed live-only" title="Computed by vislox from the block's inputs; the Miniserver does not send it">computed</span><span class="lg-pill queried live-only" title="Queried from the block: up to one round (2 s or more) old">queried</span><span class="lg-note live-only" id="live-note"></span>
         <label class="lg-dim live-only" title="Fade wires the Miniserver sends no value for"><input type="checkbox" id="chk-live-dim" checked> Dim wires without a value</label>
@@ -237,7 +240,7 @@
   <div class="help-box">
     <h2 id="help-h">Keyboard shortcuts</h2>
     <dl>
-      <dt><kbd>Ctrl</kbd> <kbd>K</kbd></dt><dd>Go to a page or block</dd>
+      <dt><kbd>Ctrl</kbd> <kbd>K</kbd></dt><dd>Go to a page or block, by its name or its Lox Logic slug</dd>
       <dt><kbd>Ctrl</kbd> <kbd>F</kbd></dt><dd>Filter the project tree</dd>
       <dt><kbd>PageUp</kbd> <kbd>PageDown</kbd></dt><dd>Previous / next page</dd>
       <dt><kbd>[</kbd> <kbd>]</kbd></dt><dd>Previous / next change</dd>

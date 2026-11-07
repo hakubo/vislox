@@ -85,7 +85,15 @@ sends to the Miniserver see [miniserver.md](miniserver.md).
 - **Readable at every zoom**: zoomed out, each block shows only its name, at a readable size. From about 80 %
   the full detail appears. Gates show their operation (`AND`, `Less`, `Divide`) instead of Loxone's automatic names
   (`O208698`); a named gate keeps its operation in grey, as Loxone Config 16 shows it. Selecting a block highlights its wires and neighbours and dims the rest.
-- **Navigation**: Ctrl+K finds any page or block. There is a minimap, a "Changed pages only" filter, and links
+- **Blocks the Lox Logic module manages** (a `lox.toml` project): a block whose UUID the lockfile pins
+  (`logic.lock.json`, or `lock` in `lox.toml`) has a purple λ badge at its upper left; an `extern` stays unmarked,
+  since Loxone Config owns it. Its Properties have a *Lox Logic* section: the slug, the `.loxl` file and line
+  that make it (`pages/beschattung.loxl:12`) and *Copy path*, for pasting into an editor or an agent's prompt. A
+  block lox made for an expression (`temp_hoch and sonne` becomes an `And`) points at the line of the expression;
+  one a template instance made, at the instance. The legend's *Show managed blocks only* fades the rest, and
+  Ctrl+K finds a block by its slug as well as its name. The lines follow the module's files as they are on disk,
+  compiled or not, and are shown on the newest config only (the lockfile is today's). See [editing.md](editing.md#blocks-the-module-manages-64).
+- **Navigation**: Ctrl+K finds any page or block (a managed one by its slug too). There is a minimap, a "Changed pages only" filter, and links
   (`#page=…&sel=…&rev=…`) that reopen the same page, block and revision. The browser's Back button works.
 - **Keyboard**: the tree, tabs and canvas all work from the keyboard; press `?` for the shortcuts.
 

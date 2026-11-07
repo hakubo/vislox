@@ -30,6 +30,9 @@ The binary is an `axum` server with the UI embedded (plain JS and SVG, no build 
 - `src/blocks.rs` is adding blocks (#59): the types vislox offers (`GET /api/block-types`, from lox's builtin
   table and its language server's descriptions), and vislox's file of new blocks per page
   (`<module>/vislox/<page>.loxl`). `edit.rs` applies `add_block` and `remove_block` to it.
+- `src/managed.rs` finds where the module's `.loxl` files make each block the lockfile manages (#64): its
+  declaration, the expression lox made it for, or the template instance, with lox's own declaration scan.
+  `GET /api/edits` sends it as `sources`.
 - `src/restart.rs` follows the program restart during Apply: out of service, back online, new config loaded.
 - `src/backups.rs` lists and downloads the Miniserver's own backups for the History and caches their programs
   by blob id; `history.rs` shows each with the Pull of the same bytes, or between the Pulls around it.
