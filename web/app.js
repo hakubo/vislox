@@ -366,6 +366,9 @@ async function loadView() {
   if (!S.rev) { showMsg("No config found."); return; }
   const seq = ++S.loadSeq, rev = S.rev;
   showMsg("Loading…");
+  // Whatever names blocks from the view (the links of the Deploy pane, the defaults line) stops doing so while
+  // the view shown is not this revision's: a load that fails or is superseded leaves no old names behind (#126).
+  renderActions();
   let v;
   try {
     v = await api(`/api/view?rev=${encodeURIComponent(S.rev)}&base=${encodeURIComponent(S.base || "")}`);
@@ -400,6 +403,10 @@ async function loadView() {
   renderChanges();
   renderPage();
   renderProps();
+  // What names blocks from the view (goButtons, dfltName) is drawn again from this one: the check's answer can
+  // come before the view of a new pending revision (#126). An open palette lists this view's names too.
+  renderActions();
+  if (!$("palette").classList.contains("hidden")) renderPalette();
   if (h) select(h.sel && v.objects[h.sel] ? h.sel : null);
   else if (S.sel) applyFocus();
   // A link or Back/Forward says whether the view is open; a reload of the revision keeps it as it is.
@@ -2933,8 +2940,9 @@ async function dropRemovals() {
   if (!p) return;
   S.removals = null;
   try { await fetch("/api/removals/cancel", { method: "POST", headers: { "Content-Type": "application/json", "X-Vislox": "removals" }, body: JSON.stringify({ rev: p.rev }) }); } catch { /* the server forgets it anyway */ }
-  if (S.rev === p.rev) { S.rev = editRev()?.id || p.base; S.base = null; renderSelects(); await loadView(); writeHash(true); }
-  renderHistory(); renderCheck();
+  // The view load draws the Deploy pane again; without one, it is drawn here.
+  if (S.rev === p.rev) { S.rev = editRev()?.id || p.base; S.base = null; renderHistory(); renderSelects(); await loadView(); writeHash(true); }
+  else { renderHistory(); renderCheck(); }
 }
 /** `Licht (Or) on page "EG": from Taster.Q, to Lampe.I1`: where a block is and what is wired to it. */
 function removalLine(b) {
@@ -2954,7 +2962,7 @@ async function removalsPlan() {
   // The server keeps this plan now (the next history read says so too).
   if (S.hist?.actions) S.hist.actions.removals = plan.rev;
   S.rev = plan.rev; S.base = plan.base; S.follow = false; $("chk-follow").checked = false;
-  renderHistory(); renderSelects(); renderCheck(); await loadView(); writeHash(true);
+  renderHistory(); renderSelects(); await loadView(); writeHash(true);
   return plan;
 }
 /** The confirmation: exactly the blocks the plan deletes. The consent, or null (the plan is then forgotten). */
@@ -3438,7 +3446,7 @@ function renderCheck() {
       `<div class="ck-sub">${rm.refused ? `lox refuses to compile it (<span class="mono">${esc(rm.refused)}</span> is in the lockfile but not in the source). `
         : `The lockfile deletes them: <span class="mono">${esc(tombs)}</span>. `}` +
       "Review what Apply would delete, and what is wired to it; Apply asks you to confirm exactly these blocks.</div>",
-      plan ? `<ul class="rm-list">${plan.blocks.map((b) => `<li>${esc(removalLine(b))} ${goButtons([b.uuid])}</li>`).join("")}</ul>` : "",
+      plan ? `<ul class="rm-list">${plan.blocks.map((b) => `<li>${esc(removalLine(b))} ${goButtons([b.uuid], plan.rev)}</li>`).join("")}</ul>` : "",
       `<div class="ck-row"><button type="button" id="btn-removals" class="ghost small"${why || busy ? " disabled" : ""}
         title="${esc(why || "Compile the module with the removals allowed in a scratch copy and show it, compared with what runs. Nothing changes and nothing is deployed.")}">${plan ? "Review the removals again" : "Review the removals"}</button></div>`);
   } else if (stale) {
@@ -3459,9 +3467,15 @@ function renderCheck() {
   renderLint();
 }
 /** The block buttons of an error or finding: each shows its block, on its page. */
-function goButtons(uuids) {
-  return (uuids || []).filter((u) => S.view?.objects[u]).map((u) =>
-    `<button type="button" class="go" data-go="${esc(u)}" title="Show this block">${esc(displayTitle(S.view.objects[u]))}</button>`).join("");
+/** The loaded view when it is revision `rev`'s and the one shown, else null: names of blocks are read from no other. */
+function viewFor(rev) { return rev && S.view && S.rev === rev && S.viewRev === rev ? S.view : null; }
+/** The block buttons of an error or finding, for the config the check is about (`rev`, by default the newest: the
+ *  pending compile, else the deployed config). They name the blocks of that revision, so while another one is
+ *  shown (or loading) there are none: its names are not these blocks' (#126). */
+function goButtons(uuids, rev = editRev()?.id) {
+  const v = viewFor(rev);
+  return (uuids || []).filter((u) => v?.objects[u]).map((u) =>
+    `<button type="button" class="go" data-go="${esc(u)}" title="Show this block">${esc(displayTitle(v.objects[u]))}</button>`).join("");
 }
 // ── lox logic test (#67) ──────────────────────────────────────────────
 // The same check runs the module's tests (test "…" … end) in lox's simulator when the module compiles, beside
@@ -4356,7 +4370,7 @@ function constEditState() {
   return { ok: true, rev: r };
 }
 /** A block's title, else its slug, for the blocks a default reaches. */
-function dfltName(b) { const o = b.uuid && S.view?.objects[b.uuid]; return o ? displayTitle(o) : b.slug; }
+function dfltName(b) { const o = b.uuid && viewFor(editRev()?.id)?.objects[b.uuid]; return o ? displayTitle(o) : b.slug; }
 function dfltList(blocks) { return blocks.length ? blocks.map(dfltName).join(", ") : "none"; }
 /** *Default…* on a parameter of a managed block whose value no constant gives. */
 function dfltButton(o, q) {

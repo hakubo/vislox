@@ -1161,6 +1161,15 @@ message and a button per block its line names (on the newest config); *Pending i
 `pages/x.loxl`* (or, with nothing pending, *The module changed … and is not compiled yet*) with *Compile*; and the
 formatting hint. Properties shows a block's errors in its *Lox Logic* section.
 
+The buttons name their blocks from the loaded view of the revision the check is about (the pending compile, else the
+deployed config; for the removals review, its plan's revision). The check's answer (`GET /api/check`) and the view of
+a new pending revision arrive in either order, so while another revision is shown or still loading (or its load
+failed) the entries have no buttons, and their text (file, line, message) stays. They are drawn again when a view is
+loaded, with the names of that view: a block a compile renamed shows under its new name at once, and a block added
+since an older commit has its button once the newest config is shown, never one named by that commit (#126). The
+defaults line of *Compiled changes are pending* reads the same way (the block's slug until the view is in), and an
+open Ctrl+K palette is refreshed from each new view.
+
 `lox logic test` results (#67) join this as lint does (below): `GET /api/check`'s `test`, worked out on the
 same key, shown in the same pane and on the blocks the tests check.
 

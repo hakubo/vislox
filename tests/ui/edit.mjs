@@ -1124,6 +1124,23 @@ try {
   const SETTLED = `!UNDO.busy && !UNDO.inflight && !S.hist?.actions?.running && S.viewRev === S.rev && S.rev === editRev()?.id &&
     !/Compiling…|Undo or redo is compiling/.test(document.querySelector("#props")?.textContent || "")`;
   const settled = () => page.waitForFunction(SETTLED, null, { timeout: 20000 });
+  // The view of a pending revision, held until `release()` or answered with a 500 (#126): the check's answer then
+  // comes before it, or the view never comes. `stop()` puts the route away (and releases what is held).
+  const pendingView = (r) => decodeURIComponent(new URL(r.request().url()).searchParams.get("rev") || "").startsWith("pending:");
+  const viewRoute = async (mode) => {
+    let release;
+    const held = new Promise((r) => { release = r; });
+    const route = { failed: 0 };
+    await page.route("**/api/view*", async (r) => {
+      if (!pendingView(r)) return r.continue().catch(() => {});
+      if (mode === "fail") return route.failed++, r.fulfill({ status: 500, contentType: "application/json", body: JSON.stringify({ error: "refused for the test" }) });
+      await held;
+      await r.continue().catch(() => {});
+    });
+    return Object.assign(route, { release, stop: async () => { release(); await page.unroute("**/api/view*"); } });
+  };
+  // The block buttons of the Deploy pane, by their text.
+  const goLabels = (sel) => page.evaluate((s) => [...document.querySelectorAll(`${s} .go`)].map((b) => b.textContent), sel);
   const undoKey = async (redo, done, arg) => {
     const n = edits.length;
     await page.evaluate(() => document.activeElement?.blur());
@@ -1932,11 +1949,49 @@ try {
       `\ntest "Flur schaltet"\n\tflur.In1 = 1\n\tflur.In2 = 1\n\ttick 1s\n\texpect flur.Q == 1 # ${mark}\nend\n`;
     writeFileSync(flur, withTest("FAILTEST"));
     await waitText("#deploy-check", /The module changed \(pages\/flur\.loxl\) and is not compiled yet/);
-    await page.click("#btn-compile");
-    await waitText("#deploy-pend", /Compiled changes are pending/);
-    // The final state: the tests of these files ran, and failed.
-    await page.waitForFunction(() => S.check?.current && S.check.test?.available && !S.check.test.running && S.check.test.failed === 1, null, { timeout: 15000 });
-    await waitText("#deploy-tests", /Tests: 0 of 1 passed, 1 failed/);
+    // The check's results come before the pending revision's view, or the view never comes (#126): the links
+    // name the blocks of the revision shown, so with another one shown (or loading) there are none, and with the
+    // pending one loaded they take their names from it, not from the view it replaced.
+    // What the box shows the moment each load of a view is done: no later event may be what corrects it.
+    await page.evaluate(() => {
+      window.__loaded = [];
+      window.__loadView = loadView;
+      loadView = async function (...a) {
+        await window.__loadView.apply(this, a);
+        window.__loaded.push({ rev: S.viewRev, go: [...document.querySelectorAll("#deploy-tests .go")].map((b) => b.textContent) });
+      };
+    });
+    const finalState = async () => {
+      await page.waitForFunction(() => S.check?.current && S.check.test?.available && !S.check.test.running && S.check.test.failed === 1, null, { timeout: 15000 });
+      await waitText("#deploy-tests", /Tests: 0 of 1 passed, 1 failed/);
+      // The view of the revision before the compile is the one shown: the pending one is not.
+      assert.notEqual(await page.evaluate(() => S.viewRev), await page.evaluate(() => S.rev));
+      assert.deepEqual(await goLabels("#deploy-tests"), []);
+      assert.doesNotMatch(await page.textContent("#deploy-tests"), /Flur(?! schaltet)/);
+    };
+    // A view that fails to load: no buttons with the names of the view before.
+    let route = await viewRoute("fail");
+    const seen = errors.length;
+    try {
+      await page.click("#btn-compile");
+      await waitText("#deploy-pend", /Compiled changes are pending/);
+      await finalState();
+      await until(() => route.failed > 0, "a refused view");
+      await finalState();
+    } finally { await route.stop(); }
+    // The refused views' own status in the console is expected; nothing else is.
+    const refused = errors.splice(seen);
+    assert.ok(refused.length > 0 && refused.every((e) => /status of 500/.test(e)), refused.join(" | "));
+    // A view that comes after the check's answer: held until it is in.
+    route = await viewRoute("hold");
+    try {
+      await page.evaluate(() => { window.__again = loadView(); });
+      await finalState();
+    } finally { await route.stop(); }
+    await page.waitForFunction(() => S.viewRev === S.rev && S.rev.startsWith("pending:") && window.__loaded.some((l) => l.rev === S.rev), null, { timeout: 15000 });
+    const loaded = await page.evaluate(() => { loadView = window.__loadView; return window.__loaded.filter((l) => l.rev.startsWith("pending:")); });
+    // Every link names its block as the loaded revision does ("Flur getestet"), as soon as the view is in.
+    assert.ok(loaded.length > 0 && loaded.every((l) => l.go.length > 0 && l.go.every((t) => t === "Flur getestet")), JSON.stringify(loaded));
     // Open while it fails: the test with its file and line, the expect with expected and actual, and its block.
     assert.match(await page.textContent("#deploy-tests"), /pages\/flur\.loxl:5Flur schaltet[\s\S]*pages\/flur\.loxl:9step 1: expect flur\.Q == 1 — expected 1, actual 0/);
     assert.match(await page.textContent("#deploy-tests"), /A pass covers only what the simulator models/);
@@ -2997,6 +3052,43 @@ try {
     assert.deepEqual(ops, [{ op: "defaults", type: "Monoflop", port: "Time", value: null, blocks: ["kurz"] }]);
     assert.doesNotMatch(claims(), /defaults/);
     await page.waitForFunction(() => /Nothing pending/.test(document.querySelector("#deploy-pend")?.textContent || ""), null, { timeout: 15000 });
+  });
+  await step("the defaults line and an open palette name blocks from the view that is shown (#126)", async () => {
+    await settled();
+    const params = '#props [data-body="Parameters"]';
+    const claims = () => readFileSync(join(dir, "pages", "vislox", "edits.loxl"), "utf8");
+    const zeiten = join(dir, "pages", "zeiten.loxl"), zeitenWas = readFileSync(zeiten, "utf8");
+    const n = edits.length;
+    await pick(K4);
+    await page.click(`${params} [data-dflt="open"][data-key="Time"]`);
+    await page.fill("#dflt-v", "5min");
+    await page.click(`${params} [data-dflt="save"]`);
+    await until(() => edits.length > n && statuses[n] !== undefined, "a default");
+    assert.equal(statuses[n], 200);
+    await settled();
+    await waitText("#deploy-pend", /the default Monoflop Time, which changes 1 block \(Kurz\)/);
+    // The module renames the block and is compiled: until the view of that compile is in, the line says the
+    // slug (the view shown is the one before); then the new name, never the old one in between.
+    writeFileSync(zeiten, zeitenWas.replace('Monoflop("Kurz")', 'Monoflop("Kurz neu")'));
+    await waitText("#deploy-check", /Pending is from before the latest edit to pages\/zeiten\.loxl/);
+    const route = await viewRoute("hold");
+    try {
+      await page.click("#btn-compile");
+      await page.waitForFunction(() => S.rev.startsWith("pending:") && S.viewRev !== S.rev, null, { timeout: 10000 });
+      await waitText("#deploy-pend", /the default Monoflop Time, which changes 1 block \(kurz\)/);
+      // A palette opened meanwhile lists the names of the view shown; it is refreshed when the new view is in.
+      await page.evaluate(() => openPalette("kurz"));
+      await waitText("#pal-list", /Kurz/);
+      assert.doesNotMatch(await page.textContent("#pal-list"), /Kurz neu/);
+    } finally { await route.stop(); }
+    await waitText("#deploy-pend", /the default Monoflop Time, which changes 1 block \(Kurz neu\)/);
+    await waitText("#pal-list", /Kurz neu/);
+    await page.evaluate(() => closePalette());
+    await page.click("#btn-discard");
+    await page.waitForFunction(() => /Nothing pending/.test(document.querySelector("#deploy-pend")?.textContent || ""), null, { timeout: 15000 });
+    assert.doesNotMatch(claims(), /defaults/);
+    writeFileSync(zeiten, zeitenWas);
+    await settled();
   });
   await step("expressions are drawn as one block, shown with their source, edited, named and undone (#82)", async () => {
     await settled();
