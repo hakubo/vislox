@@ -173,6 +173,7 @@ config's serial, and refuses otherwise. Every request is described in [docs/mini
 ## Development
 
 ```bash
+npm ci && npm run lint  # Node 22.13.0+; no frontend build step
 cargo fmt --check && cargo clippy --all-targets -- -D warnings
 cargo test
 cargo build --release
@@ -182,6 +183,18 @@ VISLOX_BIN=target/release/vislox node tests/ui/apply.mjs   # Apply's steps, with
 VISLOX_BIN=target/release/vislox node tests/ui/edit.mjs    # editing values, adding and moving blocks, with a stand-in lox
 VISLOX_BIN=target/release/vislox node tests/ui/rollback.mjs  # rolling back an Apply, with a stand-in lox
 ```
+
+The root npm package pins ESLint and its recommended rules/browser globals with a lockfile.
+`npm run lint` runs the lint regression checks and checks every `web/*.js` classic script with
+ESLint's recommended bug checks, strict equality and unused-argument checks. It enforces no
+formatting style. Nullish `== null`/`!= null` checks remain allowed. Confusable browser globals
+such as `name`, `status` and `event` must be declared locally or accessed through `window`.
+
+`/* exported */` headers are the source of truth for shared globals. The config uses
+`tools/script-globals.mjs` to parse the scripts loaded by `index.html` with ESLint's own parser,
+verify each export has a top-level declaration, reject cross-script binding clashes, and generate
+readonly globals for the other scripts. This adds no parser dependency. Update the producer's
+export header when adding or renaming a shared function; missing exports fail lint at their consumers.
 
 CI (`.github/workflows/ci.yml`) runs all of these on every push to `main` and every pull request.
 

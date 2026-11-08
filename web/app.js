@@ -1,3 +1,4 @@
+/* exported $, S, UNDO, api, ciEq, displayTitle, editAct, editRev, editShowNewest, editsBlock, editsChanged, esc, gotoPage, hideTip, liveHere, liveOn, liveStart, liveVal, loadRunning, loadView, nodeById, plural, removalsPreview, renderActions, renderHistory, renderLiveSwitch, renderLog, renderPull, renderSelects, rollbackPreview, running, seUuid, select, setStatus, showTip, showingWhy, svg, undoSync */
 "use strict";
 // vislox — Loxone Config style viewer: read-only by default, with optional editing and deployment.
 // Canvas coordinates are the config's own units: one port row is 192.
@@ -73,9 +74,6 @@ function setStatus(text, cls) {
 }
 /** How long a Roll back's or a removal's plan (#69, #70) is shown: the server keeps it as long. */
 const PREVIEW_TTL = 15 * 60 * 1000;
-function allRevs() { return S.hist ? [...(rollbackPreview() ? [S.rollbackRev] : []), ...(removalsPreview() ? [S.removals.revision] : []), ...S.hist.pending, ...S.hist.history, ...(S.hist.backups || [])] : []; }
-function newestRev(hist = S.hist) { return hist ? hist.pending[0] || hist.history[0] || null : null; }
-function revById(id) { return allRevs().find((r) => r.id === id); }
 function lightColor(rgb) {
   const m = /^(\d+),(\d+),(\d+)$/.exec(rgb || "");
   if (!m) return false;
@@ -104,119 +102,7 @@ function revInfo(r) {
   return { title, sub, short: `${title} · ${fmtWhen(r.time)}` };
 }
 
-// ── URL state: #page=…&sel=…&rev=…&base=… ─────────────────────────────
-function readHash() {
-  const h = new URLSearchParams(location.hash.slice(1));
-  return { page: h.get("page"), sel: h.get("sel"), rev: h.get("rev"), base: h.get("base"), view: h.get("view") };
-}
-function writeHash(push) {
-  if (S.applyingHash) return;
-  const h = new URLSearchParams();
-  if (S.page) h.set("page", S.page);
-  if (S.sel) h.set("sel", S.sel);
-  if (!S.follow && S.rev) h.set("rev", S.rev);
-  if (!S.follow && S.base) h.set("base", S.base);
-  if (MD.open) h.set("view", "modes");
-  const s = "#" + h.toString();
-  if (s === location.hash) return;
-  if (push) history.pushState(null, "", s); else history.replaceState(null, "", s);
-}
-let popstateSeq = 0;
-let historyLoadSeq = 0;
-let historyRetryTimer = null;
-let historyRetryDelay = 1000;
 let streamRetryTimer = null;
-window.addEventListener("popstate", async () => {
-  const seq = ++popstateSeq;
-  const h = readHash();
-  S.applyingHash = true;
-  S.hash = h;
-  try {
-    let light = false;
-    if (!h.rev) {
-      const latest = newestRev();
-      if (S.hist && S.follow && S.rev === latest?.id && S.base === (latest?.base || null)) light = true;
-      else await followLatest(seq);
-    } else if (revById(h.rev)) {
-      if (h.rev !== S.rev || (h.base || null) !== S.base || S.follow) {
-        S.rev = h.rev; S.base = h.base || null; S.follow = false; $("chk-follow").checked = false;
-        renderHistory(); renderSelects(); await loadView();
-        if (seq !== popstateSeq) return;
-      } else light = true;
-    } else {
-      // Keep the current revision for a stale or unavailable history URL.
-      light = true;
-    }
-    if (light && S.viewRev === S.rev) {
-      S.hash = null;
-      if (h.page && h.page !== S.page) gotoPage(h.page);
-      select(h.sel || null, { noReveal: false });
-      if (h.view === "modes") modesOpen({ quiet: true }); else modesClose(true);
-    }
-  } finally { if (seq === popstateSeq) S.applyingHash = false; }
-});
-
-// ── history ────────────────────────────────────────────────────────────
-function followLatest(navigation) {
-  S.follow = true; S.rev = null; $("chk-follow").checked = true;
-  return loadHistory(false, navigation);
-}
-async function loadHistory(fromEvent, navigation) {
-  const seq = ++historyLoadSeq;
-  let h;
-  try { h = await api("/api/history"); } catch (e) {
-    if (seq !== historyLoadSeq || (navigation != null && navigation !== popstateSeq)) return;
-    setStatus("server unreachable", "error");
-    if (!S.hist && historyRetryTimer == null) {
-      const delay = historyRetryDelay;
-      historyRetryDelay = Math.min(historyRetryDelay * 2, 30000);
-      historyRetryTimer = setTimeout(() => { historyRetryTimer = null; loadHistory(); }, delay);
-    }
-    return;
-  }
-  if (seq !== historyLoadSeq || (navigation != null && navigation !== popstateSeq)) return;
-  clearTimeout(historyRetryTimer);
-  historyRetryTimer = null;
-  historyRetryDelay = 1000;
-  if ($("status").classList.contains("error")) setStatus("live", "live");
-  const prevNewest = newestRev(S.hist)?.id;
-  S.hist = h;
-  // The History showing another config than an edit was made on ends the wait for it, for good (a Discard may
-  // bring the first one back).
-  showingWhy();
-  $("doc-sub").textContent = h.label + (h.error ? " · " + h.error : "");
-  if (h.vislox) {
-    $("ver").textContent = "v" + h.vislox.version;
-    $("ver").title = `vislox ${h.vislox.version}` + (h.vislox.commit ? ` (commit ${h.vislox.commit})` : "");
-  }
-  if (h.running && !running.loaded) loadRunning(false);
-  const newest = newestRev(h);
-  let changed = false;
-  if (S.hash?.rev && revById(S.hash.rev) && !S.rev) {
-    S.rev = S.hash.rev; S.base = S.hash.base || null; S.follow = false; $("chk-follow").checked = false; changed = true;
-  }
-  if (!S.rev || !revById(S.rev) || (S.follow && newest && newest.id !== S.rev)) {
-    const inPending = S.rev && S.rev.startsWith("pending:");
-    const pick = (inPending ? h.pending[0] : null) || newestRev(h);
-    if (pick && pick.id !== S.rev) { S.rev = pick.id; S.base = pick.base; changed = true; }
-  }
-  if (S.base && !revById(S.base)) { S.base = revById(S.rev)?.base || null; changed = true; }
-  renderHistory();
-  renderSelects();
-  if (S.live.on && h.live?.available) liveStart();
-  renderLiveSwitch();
-  renderPull();
-  undoSync();
-  renderActions();
-  editsChanged();
-  renderLog();
-  if (fromEvent) {
-    setStatus("updated " + new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }), "live flash");
-    setTimeout(() => setStatus("live", "live"), 2500);
-  }
-  if (changed || !S.view) await loadView();
-  else if (fromEvent && newest && newest.id !== prevNewest && !S.follow) setStatus("new revision in History", "live flash");
-}
 
 /** What the Miniserver runs: `deployed`, as the server says (the last Apply, Roll back or Pull, else the newest
  *  commit; one of the history, never a compile). Not `current`, which is only what the watched file holds: an edit
@@ -4108,13 +3994,6 @@ function constTip(u) {
     ? `From the constant ${u.name} = ${u.value}${at ? ` (${at})` : ""}, which ${plural(constCount(u), "port")} take. lox writes its value into each one.`
     : `From defaults ${u.name}${at ? ` (${at})` : ""}: every block of the type that does not bind the port takes it${u.constant ? `, here the constant ${u.constant} = ${u.value}` : ""}.`;
 }
-/** Why *Only this block* is off for this field (the module's own file binds the port to a constant, `x.Port = name`:
- *  a value of the block's own would claim it twice), as the server says; or null. */
-function constBlockRefusal(o, field) {
-  const [k, key] = field.split(/:(.*)/s);
-  const u = k === "p" ? constUse(o.uuid, key) : null;
-  return u?.block_refusal || null;
-}
 /** The module's own `let` the server lists, with its line as the file has it (`source`). */
 function constLetOf(name) { return constLets().find((l) => l.name === name) || null; }
 /** Why this field takes no value at all: the server refuses both the constant (a text constant) and only this block
@@ -5384,10 +5263,6 @@ function ruState(o) {
   return { ok: true, rev: r };
 }
 function ruModes() { return (S.view?.modes || []).map((m) => ({ uuid: m.uuid.toLowerCase(), title: m.title })); }
-function ruModeTitle(m) {
-  const x = ruModes().find((y) => ciEq(y.uuid, m || ""));
-  return x ? x.title : (m || "").replace(/^"|"$/g, "");
-}
 function ruDefault(kind) {
   const mode = ruModes()[0]?.uuid || "";
   return {
@@ -5512,9 +5387,8 @@ function ruRows(o, row, marks) {
     if (ri.why) rows.push(`<div class="ed-note">${esc(ri.why)}</div>`);
     else {
       rows.push(`<div class="ru-sum${old ? " pr-chg" : ""}">${old ? `<span class="old">${esc(old.summary)}</span><br>` : ""}${esc(ri.summary)}</div>`);
-      let g = 0;
       for (const l of ri.lines) {
-        if (l.kind === "or") { g++; rows.push('<div class="ru-or">or</div>'); continue; }
+        if (l.kind === "or") { rows.push('<div class="ru-or">or</div>'); continue; }
         const label = l.kind === "then" ? "Then" : "When";
         rows.push(row(label, `${esc(l.words)}${l.target ? ` <span class="ru-link">${linkTarget(l.target)}</span>` : ""}`));
       }

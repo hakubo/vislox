@@ -528,6 +528,10 @@ async fn main() -> Result<()> {
     let router = Router::new()
         .route("/", get(root))
         .route(
+            "/navigation.js",
+            get(|| async { asset("text/javascript", include_str!("../web/navigation.js")) }),
+        )
+        .route(
             "/app.js",
             get(|| async { asset("text/javascript", include_str!("../web/app.js")) }),
         )

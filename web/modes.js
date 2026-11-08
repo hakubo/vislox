@@ -1,3 +1,4 @@
+/* exported MD, mdClimate, mdEditKey, mdEntries, mdModeTitle, mdPeriodRows, mdRenderEdit, mfOpen, modesClose, modesKey, modesLive, modesOpen, renderModes */
 "use strict";
 // vislox — Operating modes: a year calendar of when each mode is on.
 // The dates come decoded from the server (`calendar.date` of each entry, see src/calendar.rs);
