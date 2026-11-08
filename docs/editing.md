@@ -2004,8 +2004,9 @@ lost is deleted only with consent to exactly that list, see [features.md](featur
 - The Operating modes view has *Add mode* and *Add entry* in its header, and *Edit* on each calendar entry (off, with
   the server's reason, on one Loxone Config made) (#86). The form takes the name, the mode it switches on (the
   config's modes) and the date by kind. A click on a day of the year picks it (for *Relative to Easter*, its offset
-  from that year's Easter Sunday), a drag across days picks a period (or the range every year, for that kind), and the
-  draft's days are outlined on the year. A draft is dropped when the pending config changes, and an entry's when it
+  from that year's Easter Sunday), a drag across days picks a period (or the range every year, for that kind). With
+  keyboard focus on a day, Enter picks it and Shift+Enter extends a range from the first picked day; the draft's days
+  are outlined on the year. A draft is dropped when the pending config changes, and an entry's when it
   is no longer selected; saving sends the blob it was opened on. *Add* on the project tree's calendar folder opens
   the same form (the palette's `view: "modes"`); the Betriebsmodi folder's *Add* adds a mode with its name.
 - *Add block* (top left of the page, on the newest revision) lists the types vislox offers (`GET /api/block-types`:

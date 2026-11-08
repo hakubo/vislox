@@ -3548,8 +3548,30 @@ try {
     await page.evaluate(() => { MD.year = 2026; renderModes(); });
     await page.click("#md-add-entry:not([disabled])");
     await page.fill("#mf-title", "Grillfest");
-    await page.selectOption("#mf-mode", grill);
+    await page.keyboard.press("Tab");
+    await page.keyboard.press("g");
+    assert.equal(await page.inputValue("#mf-mode"), grill);
     const [d4, d5] = await page.evaluate(() => [mdDay(2026, 7, 4), mdDay(2026, 7, 5)]);
+    // Keyboard-only date selection: Shift+Tab to the grid, Enter picks a day,
+    // and Shift+Enter extends the period from that first day.
+    await page.keyboard.press("Shift+Tab");
+    await page.keyboard.press("Shift+Tab");
+    const anchor = await page.evaluate(() => +document.activeElement.dataset.day);
+    assert.ok(anchor, "Tab reaches the calendar day control");
+    await page.keyboard.press("Enter");
+    await page.waitForFunction((n) => {
+      const d = MF.draft, ymd = mdYmdText(n), md = mdMdText(n), [y, m, day] = mdYmd(n);
+      return d.kind === "period" ? d.from === ymd && d.to === ymd
+        : d.kind === "yearly" ? d.yfrom === md && d.yto === md
+          : d.kind === "every" ? d.every === md
+            : d.kind === "easter" && d.easter === String(n - mdDay(y, ...easterSunday(y)));
+    }, anchor);
+    await page.keyboard.press("ArrowRight");
+    await page.keyboard.press("Shift+Enter");
+    await page.waitForFunction((n) => {
+      const d = MF.draft, a = mdYmdText(n), b = mdYmdText(n + 1), am = mdMdText(n), bm = mdMdText(n + 1);
+      return d.kind === "yearly" ? d.yfrom === am && d.yto === bm : d.kind === "period" && d.from === a && d.to === b;
+    }, anchor);
     await page.hover(`#md-grid [data-day="${d4}"]`);
     await page.mouse.down();
     await page.hover(`#md-grid [data-day="${d5}"]`);

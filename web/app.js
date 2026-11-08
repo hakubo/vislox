@@ -2065,6 +2065,7 @@ $("chk-only-managed").onchange = (e) => { S.onlyManaged = e.target.checked; rend
 $("chk-follow").onchange = (e) => { if (e.target.checked) followLatest(); else S.follow = false; writeHash(false); };
 
 window.addEventListener("keydown", (e) => {
+  if (e.defaultPrevented) return;
   if (!$("palette").classList.contains("hidden") || !$("help").classList.contains("hidden")) {
     if (e.key === "Escape") { closePalette(); closeHelp(); }
     return;
@@ -2094,7 +2095,7 @@ window.addEventListener("keydown", (e) => {
   }
   if (e.ctrlKey || e.metaKey || e.altKey) return;
   const inTree = e.target.id === "tree", inTabs = e.target.closest?.("#tab-list");
-  // The Operating modes view takes the arrows (years) and Esc; the hidden page is not panned or zoomed.
+  // The Operating modes view handles its year and date navigation; the hidden page is not panned or zoomed.
   if (!inTree && !inTabs && modesKey(e)) return;
   const step = e.shiftKey ? 240 : 60;
   switch (e.key) {
