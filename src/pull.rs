@@ -148,14 +148,8 @@ fn check(
             f.ms_dir, f.conn.host
         ));
     }
-    let lox = which(lox).ok_or_else(|| {
-        format!(
-            "`{}` not found (install lox, or pass --lox <path>)",
-            lox.display()
-        )
-    })?;
     Ok(Cmd {
-        lox,
+        lox: lox.to_path_buf(),
         ctx: f.ctx.clone(),
         cwd: start.to_path_buf(),
     })
@@ -180,20 +174,91 @@ pub(crate) async fn output_retrying(
     }
 }
 
-/// `name` as a path, or looked up on `PATH`.
-pub(crate) fn which(name: &Path) -> Option<PathBuf> {
-    if name.components().count() > 1 {
-        return name.is_file().then(|| name.to_path_buf());
+/// Make an explicit relative executable path absolute before commands change
+/// directories. Bare names stay bare so each spawn resolves them on `PATH`.
+pub(crate) fn resolve_lox(path: &Path) -> std::io::Result<PathBuf> {
+    if path.is_absolute() || path.components().count() == 1 {
+        return Ok(path.to_path_buf());
     }
-    std::env::split_paths(&std::env::var_os("PATH")?)
-        .map(|d| d.join(name))
-        .find(|p| p.is_file())
+    resolve_lox_from(path, &std::env::current_dir()?)
+}
+
+fn resolve_lox_from(path: &Path, cwd: &Path) -> std::io::Result<PathBuf> {
+    if path.is_absolute() || path.components().count() == 1 {
+        Ok(path.to_path_buf())
+    } else {
+        Ok(cwd.join(path))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use loxone_client::Connection;
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_relative_executable_runs_after_changing_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let startup = tmp.path().join("startup");
+        let elsewhere = tmp.path().join("project");
+        std::fs::create_dir_all(startup.join("bin")).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let explicit = startup.join("bin/lox");
+        std::fs::write(&explicit, "#!/bin/sh\nprintf ran").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&explicit, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let resolved = resolve_lox_from(Path::new("./bin/lox"), &startup).unwrap();
+        let child = std::process::Command::new(resolved)
+            .current_dir(&elsewhere)
+            .output()
+            .unwrap();
+        assert!(child.status.success());
+        assert_eq!(child.stdout, b"ran");
+    }
+
+    #[test]
+    fn bare_executable_name_stays_bare() {
+        assert_eq!(
+            resolve_lox_from(Path::new("lox"), Path::new("/startup")).unwrap(),
+            PathBuf::from("lox")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn absolute_executable_does_not_need_path_or_current_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let executable = tmp.path().join("lox");
+        std::fs::write(&executable, "#!/bin/sh\nprintf ran").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let resolved = resolve_lox(&executable).unwrap();
+        let child = std::process::Command::new(resolved)
+            .env_clear()
+            .output()
+            .unwrap();
+        assert!(child.status.success());
+        assert_eq!(child.stdout, b"ran");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_symlink_path_is_not_canonicalized() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let target = dir.join("real-lox");
+        let link = dir.join("lox-link");
+        std::fs::write(&target, "target").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let resolved = resolve_lox_from(Path::new("./lox-link"), dir).unwrap();
+        assert_eq!(resolved, dir.join("./lox-link"));
+        assert_ne!(resolved, target);
+    }
 
     fn setup() -> (tempfile::TempDir, Source, PathBuf) {
         let tmp = tempfile::tempdir().unwrap();
@@ -231,13 +296,10 @@ mod tests {
         assert!(why(&found(None, "192_168_1_120")).contains("lox config init"));
         assert!(why(&found(Some(tmp.path()), "192_168_1_120")).contains("not into"));
         assert!(why(&found(Some(&repo), "504F94000001")).contains("not 192_168_1_120"));
-        let missing = tmp.path().join("nope/lox");
-        assert!(
-            check(&missing, None, &src, Ok(&ok), &start)
-                .err()
-                .unwrap()
-                .contains("not found")
-        );
+        // Existence is checked when the command runs. In particular, bare
+        // names must remain available for PATH lookup at each spawn.
+        let missing = Path::new("not-installed-yet");
+        assert!(check(missing, None, &src, Ok(&ok), &start).is_ok());
         assert!(
             check(&lox, Some("off"), &src, Ok(&ok), &start)
                 .err()
