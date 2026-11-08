@@ -38,6 +38,8 @@ mod restart;
 mod rights;
 mod rollback;
 mod route;
+mod rule_edit;
+mod rules;
 mod running;
 mod sched_edit;
 mod schedule;

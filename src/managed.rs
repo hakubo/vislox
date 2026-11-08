@@ -675,6 +675,67 @@ pub fn members_claims<T: AsRef<str>>(
     .0
 }
 
+/// Every top-level `rule <slug>` of the module's files (#87), as a
+/// [`SetClaim`] of kind `rule` whose `set` is the rule's name when it is a
+/// named one (`rule <slug> "Name"`) and whose `blocks` is the rule the slug
+/// names: its extern's object, or the lock's pin of a named rule.
+pub fn rule_claims<T: AsRef<str>>(
+    files: &[(String, T)],
+    lock: &crate::edit::Lock,
+) -> Vec<SetClaim> {
+    let mut out = Vec::new();
+    for (file, text) in files {
+        let mut in_template = false;
+        for (n, line) in text.as_ref().lines().enumerate() {
+            if line.starts_with("template ") {
+                in_template = true;
+            } else if in_template && line.trim_end() == "end" {
+                in_template = false;
+                continue;
+            }
+            if in_template {
+                continue;
+            }
+            let Some(rest) = line.strip_prefix("rule ") else {
+                continue;
+            };
+            let rest = rest.trim();
+            let slug: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            if !is_name(&slug) {
+                continue;
+            }
+            let after = rest[slug.len()..].trim();
+            let set = after
+                .strip_prefix('"')
+                .and_then(|t| t.split('"').next())
+                .unwrap_or("")
+                .to_string();
+            let blocks = lock
+                .externals
+                .get(&slug)
+                .or_else(|| lock.rules.get(&slug))
+                .or_else(|| lock.slugs.get(&slug))
+                .map(|u| vec![u.to_ascii_lowercase()])
+                .or_else(|| crate::edit::slug_uuid(&slug).map(|u| vec![u]))
+                .unwrap_or_default();
+            out.push(SetClaim {
+                kind: "rule",
+                slug,
+                set,
+                file: file.clone(),
+                line: n + 1,
+                set_file: None,
+                set_line: None,
+                blocks,
+            });
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -271,6 +271,38 @@ pub enum Op {
     /// 2026-09-05` or `from: 10-01, to: 04-30`. `None` drops it (lox then
     /// writes 1 January). A value op.
     EntryDate { uuid: String, value: Option<String> },
+    /// What the Automatic Designer rule `uuid` does (#87): a `rule`
+    /// declaration in [`FILE`] ([`crate::rule_edit`]): `active`, its
+    /// conditions and its actions, blocks and modes by UUID. `None` drops
+    /// vislox's declaration: the rule stays as last written. Its `previous`
+    /// is what the file stated before (null: nothing).
+    Rule {
+        uuid: String,
+        value: Option<crate::rules::RuleVal>,
+    },
+    /// A rule named `title` (#87): `rule vx_rule_<n> "Title"` in [`FILE`],
+    /// which the compile creates below the config's last rule and gives
+    /// `value` (a condition and an action at least). The reply names it (`added`); `remove_block` of
+    /// its UUID undoes it.
+    NewRule {
+        title: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        value: Option<crate::rules::RuleVal>,
+        /// The UUID of the rule this creates again: set in the `previous` of
+        /// a `remove_block`, as for `add_block`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        restores: Option<String>,
+    },
+    /// Bring back a rule created here that `remove_block` deleted, while lox
+    /// keeps its tombstone: its declaration and the lock's pin, so it keeps
+    /// its UUID. Only the `previous` of a `remove_block` makes one; its
+    /// `previous` is the `remove_block`.
+    RestoreRule {
+        uuid: String,
+        slug: String,
+        title: String,
+        value: crate::rules::RuleVal,
+    },
 }
 
 /// Where a `place` puts one block: its top left corner, as `move` takes it.
@@ -303,8 +335,11 @@ impl Op {
             | Op::Statistics { uuid, .. }
             | Op::EntryMode { uuid, .. }
             | Op::EntryDate { uuid, .. }
+            | Op::Rule { uuid, .. }
+            | Op::RestoreRule { uuid, .. }
             | Op::Tiles { uuid, .. } => Some(uuid),
-            Op::AddBlock { .. }
+            Op::NewRule { .. }
+            | Op::AddBlock { .. }
             | Op::Signal { .. }
             | Op::Instance { .. }
             | Op::Relayout { .. }
@@ -352,6 +387,9 @@ impl Op {
             | Op::Members { .. }
             | Op::Access { .. }
             | Op::Recipients { .. }
+            | Op::Rule { .. }
+            | Op::NewRule { .. }
+            | Op::RestoreRule { .. }
             | Op::Tiles { .. } => None,
         }
     }
@@ -390,6 +428,9 @@ impl Op {
             | Op::Members { .. }
             | Op::Access { .. }
             | Op::Recipients { .. }
+            | Op::Rule { .. }
+            | Op::NewRule { .. }
+            | Op::RestoreRule { .. }
             | Op::Tiles { .. } => {}
         }
         op
@@ -601,7 +642,10 @@ pub fn caps(el: &Element) -> Option<Caps> {
     let io = el.child_elements().find(|c| c.name == "IoData");
     let bound = |a: &str| io.and_then(|io| io.attr(a)).is_some_and(|v| !v.is_empty());
     let caps = Caps {
-        title: el.attr("Title").is_some(),
+        // A rule's name is the app's (its payload holds it too, which a
+        // title claim would not change, #87); a rule created here takes its
+        // name in its declaration.
+        title: el.attr("Title").is_some() && ty != crate::rules::RULE,
         room: bound("Pr"),
         category: bound("Cr"),
         params,
@@ -638,6 +682,8 @@ pub struct Claims(
     pub crate::tiles_edit::TileSets,
     /// The `let` constants made here (#81): name → value.
     pub BTreeMap<String, Value>,
+    /// The Automatic Designer rules it declares (#87).
+    pub crate::rule_edit::Rules,
 );
 
 /// A wire vislox draws: `to.port <- from.port`, each end a slug (an
@@ -1004,6 +1050,9 @@ impl Claims {
             | Op::Statistics { .. }
             | Op::EntryMode { .. }
             | Op::EntryDate { .. }
+            | Op::Rule { .. }
+            | Op::NewRule { .. }
+            | Op::RestoreRule { .. }
             | Op::Let { .. } => None,
         }
     }
@@ -1271,6 +1320,9 @@ pub fn apply(
                     | Op::Statistics { .. }
                     | Op::EntryMode { .. }
                     | Op::EntryDate { .. }
+                    | Op::Rule { .. }
+                    | Op::NewRule { .. }
+                    | Op::RestoreRule { .. }
             )
         })
         .ok_or_else(|| "not a value".to_string())?;
@@ -1388,6 +1440,9 @@ pub fn apply(
         | Op::Statistics { .. }
         | Op::EntryMode { .. }
         | Op::EntryDate { .. }
+        | Op::Rule { .. }
+        | Op::NewRule { .. }
+        | Op::RestoreRule { .. }
         | Op::Let { .. } => {
             unreachable!("not a value")
         }
@@ -1443,6 +1498,8 @@ pub struct Lock {
     /// The externals a hardware declaration owns (`owned`, #85): the module
     /// writes their title, room, category and settings.
     pub owned: BTreeSet<String>,
+    /// The named Automatic Designer rules (`rules`, #87): slug → rule UUID.
+    pub rules: BTreeMap<String, String>,
 }
 
 impl Lock {
@@ -1524,6 +1581,15 @@ impl Lock {
                     .collect()
             })
             .unwrap_or_default();
+        let rules = v
+            .get("rules")
+            .and_then(|o| o.as_object())
+            .map(|o| {
+                o.iter()
+                    .filter_map(|(s, u)| Some((s.clone(), u.as_str()?.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default();
         Lock {
             slugs,
             placed,
@@ -1532,6 +1598,7 @@ impl Lock {
             entries,
             tombs,
             owned,
+            rules,
         }
     }
 
@@ -1988,6 +2055,8 @@ impl Files {
         self.hardware
             .removed
             .retain(|s| lock.externals.contains_key(s));
+        // A rule created here (#87).
+        crate::rule_edit::tidy(&mut self.claims.9, lock);
     }
 
     /// The lines [`Files::tidy`] would drop, as written.
@@ -2006,6 +2075,7 @@ impl Files {
                 out.push(format!("removed {s}"));
             }
         }
+        out.extend(crate::rule_edit::stale_lines(&self.claims.9, lock));
         out
     }
 
@@ -2202,10 +2272,33 @@ pub fn apply_op(files: &mut Files, ctx: &Ctx, op: &Op) -> Result<Applied, String
             crate::hw_edit::add_device(files, ctx, op)
         }
         Op::AddBlock { .. } => add_block(files, ctx, op),
-        Op::RemoveBlock { uuid } => match crate::hw_edit::created_slug(files, ctx, uuid) {
-            Some(slug) => crate::hw_edit::remove_device(files, ctx, &slug, uuid),
-            None => remove_block(files, ctx, uuid),
-        },
+        Op::RemoveBlock { uuid } => {
+            // A rule created here (#87).
+            if let Some(slug) = crate::rule_edit::created_slug(files, ctx.lock, uuid) {
+                return crate::rule_edit::remove(files, ctx, &slug, uuid);
+            }
+            match crate::hw_edit::created_slug(files, ctx, uuid) {
+                Some(slug) => crate::hw_edit::remove_device(files, ctx, &slug, uuid),
+                None => remove_block(files, ctx, uuid),
+            }
+        }
+        Op::Rule { uuid, value } => crate::rule_edit::apply(files, ctx, uuid, value.as_ref()),
+        Op::NewRule { title, value, .. } => {
+            crate::rule_edit::new_rule(files, ctx, title, value.as_ref())
+        }
+        Op::RestoreRule {
+            uuid,
+            slug,
+            title,
+            value,
+        } => crate::rule_edit::restore(files, ctx, uuid, slug, title, value),
+        // A rule created here takes its name in its declaration (#87).
+        Op::Title { uuid, value }
+            if crate::rule_edit::created_slug(files, ctx.lock, uuid).is_some() =>
+        {
+            let slug = crate::rule_edit::created_slug(files, ctx.lock, uuid).expect("checked");
+            crate::rule_edit::rename(files, ctx, &slug, value.as_deref())
+        }
         Op::RestoreBlock { uuid, .. } if crate::hw_edit::restores_device(ctx, uuid) => {
             crate::hw_edit::restore_device(files, ctx, op)
         }
@@ -2325,12 +2418,13 @@ pub fn undo_ops(
             )
         };
         match op {
-            Op::AddBlock { .. } => match minted.get(i).cloned().flatten() {
+            Op::AddBlock { .. } | Op::NewRule { .. } => match minted.get(i).cloned().flatten() {
                 Some(uuid) => undo.push(Op::RemoveBlock { uuid }),
                 None => {
                     return Err(format!(
-                        "op {} (add_block): lox named no UUID for the block it added",
-                        i + 1
+                        "op {} ({}): lox named no UUID for what it added",
+                        i + 1,
+                        op_name(op)
                     ));
                 }
             },
@@ -2347,7 +2441,12 @@ pub fn undo_ops(
             | Op::AdoptPage { .. }
             | Op::Signal { .. }
             | Op::Instance { .. }
+            | Op::RestoreRule { .. }
             | Op::Unadopt { .. } => undo.push(serde_json::from_value(prev).map_err(bad)?),
+            Op::Rule { uuid, .. } => undo.push(Op::Rule {
+                uuid: uuid.clone(),
+                value: serde_json::from_value(prev).map_err(bad)?,
+            }),
             Op::Moods { uuid, .. } => undo.push(Op::Moods {
                 uuid: uuid.clone(),
                 value: serde_json::from_value(prev).map_err(bad)?,
@@ -5023,6 +5122,9 @@ pub fn current_with(
         | Op::Expr { .. }
         | Op::Signal { .. }
         | Op::Instance { .. }
+        | Op::Rule { .. }
+        | Op::NewRule { .. }
+        | Op::RestoreRule { .. }
         | Op::Let { .. } => None,
     }
 }
@@ -5454,6 +5556,7 @@ mod tests {
                 .filter(|(_, e)| e.owned)
                 .map(|(s, _)| s.clone())
                 .collect(),
+            rules: l.rules.clone(),
         }
     }
 
@@ -12311,5 +12414,473 @@ mod tests {
         );
         // Text that is neither a UUID, a title nor a name is refused.
         assert!(apply_op(&mut files, &ctx, &mode("Fort;")).is_err());
+    }
+
+    // ── Automatic Designer rules (#87) ──────────────────────────────────
+
+    fn rules_doc() -> LoxoneDoc {
+        LoxoneDoc::parse(crate::rules::fixture::house().as_bytes()).unwrap()
+    }
+
+    fn rule_op(uuid: &str, v: Option<crate::rules::RuleVal>) -> Op {
+        Op::Rule {
+            uuid: uuid.into(),
+            value: v,
+        }
+    }
+
+    fn read_rule(doc: &LoxoneDoc, uuid: &str) -> Option<crate::rules::RuleVal> {
+        match crate::rules::read(doc).remove(&uuid.to_ascii_lowercase())? {
+            crate::rules::Read::Rule(v) => Some(crate::rule_edit::normalized(&v)),
+            crate::rules::Read::Not(_) => None,
+        }
+    }
+
+    #[test]
+    fn a_rule_is_declared_compiled_by_lox_read_back_and_undone() {
+        use crate::rules::fixture::{PARTY, PUMP, RULE_ODD, RULE_OFF};
+        use crate::rules::{Line, RuleVal};
+        let d = rules_doc();
+        let names = BTreeSet::new();
+        let mut files = Files::default();
+        let mut l = Lockfile::default();
+        let lock = lock_of(&l);
+        let ctx = ctx_of(&d, &d, &lock, None, &names);
+        let want = RuleVal {
+            active: true,
+            lines: vec![
+                Line::Weekday {
+                    days: ["mon", "tue", "wed", "thu", "fri"]
+                        .map(String::from)
+                        .to_vec(),
+                },
+                Line::Time { at: "7:30".into() },
+                Line::Or,
+                Line::Mode {
+                    mode: PARTY.to_uppercase(),
+                    on: true,
+                },
+                Line::Then {
+                    block: PUMP.into(),
+                    command: "off".into(),
+                },
+                Line::Wait {
+                    duration: "5s".into(),
+                },
+            ],
+        };
+        let a = apply_op(&mut files, &ctx, &rule_op(RULE_OFF, Some(want.clone()))).unwrap();
+        assert_eq!(a.previous, serde_json::Value::Null);
+        let text = files.claims.render();
+        let (r, p) = (slug(RULE_OFF), slug(PUMP));
+        for line in [
+            format!("extern {r} = AutopilotRule(uuid: \"{RULE_OFF}\")\n"),
+            format!("extern {p} = PushButton(uuid: \"{PUMP}\")\n"),
+            format!(
+                "rule {r}\n\tactive\n\twhen weekday weekdays\n\twhen time 07:30\n\tor\n\twhen mode \"Party\"\n\tthen {p} off\n\tthen wait 5s\nend\n"
+            ),
+        ] {
+            assert!(text.contains(&line), "{text}");
+        }
+        assert_eq!(Claims::parse(&text).unwrap(), files.claims);
+        let out = compile_files(&d, &files, &mut l).unwrap();
+        assert_eq!(
+            read_rule(&out, RULE_OFF),
+            Some(crate::rule_edit::normalized(&want))
+        );
+        // The pending config is as the file states it.
+        let lock = lock_of(&l);
+        assert!(crate::rule_edit::missed(&files, &out, &lock, &[RULE_OFF.into()]).is_empty());
+        // The other rules are untouched.
+        assert_eq!(
+            read_rule(&out, crate::rules::fixture::RULE_ON),
+            read_rule(&d, crate::rules::fixture::RULE_ON)
+        );
+        // `GET /api/edits`: stated here, not deployed (the deployed config has
+        // the rule otherwise), nothing to revert to but the rule as last written.
+        let section =
+            crate::rule_edit::edits_section(&files, &Files::default(), &lock, Some(&out), Some(&d));
+        assert_eq!(section[0]["uuid"], RULE_OFF);
+        assert_eq!(section[0]["pending"], true);
+        assert_eq!(section[0]["deployed"], serde_json::Value::Null);
+        let same = crate::rule_edit::edits_section(&files, &files, &lock, Some(&out), Some(&out));
+        assert_eq!(same[0]["pending"], false);
+        // Which rules vislox may state: not one Lox Logic cannot write.
+        let e = crate::rule_edit::edit_section(&files, &ctx_of(&out, &d, &lock, None, &names));
+        assert_eq!(e["rules"][RULE_OFF], serde_json::Value::Null);
+        assert!(
+            e["rules"][RULE_ODD]
+                .as_str()
+                .unwrap()
+                .contains("cannot write")
+        );
+        assert_eq!(e["create"], serde_json::Value::Null);
+        assert_eq!(
+            e["offers"]["PushButton"]["commands"],
+            serde_json::json!(["off", "on"])
+        );
+
+        // A second edit's previous is what the file stated, by UUID: its undo.
+        let ctx = ctx_of(&out, &d, &lock, None, &names);
+        let then = RuleVal {
+            active: false,
+            lines: vec![
+                Line::Sun {
+                    at: "sunset".into(),
+                },
+                Line::Then {
+                    block: PUMP.into(),
+                    command: "on".into(),
+                },
+            ],
+        };
+        let a = apply_op(&mut files, &ctx, &rule_op(RULE_OFF, Some(then.clone()))).unwrap();
+        let prev: RuleVal = serde_json::from_value(a.previous.clone()).unwrap();
+        assert_eq!(
+            crate::rule_edit::normalized(&prev),
+            crate::rule_edit::normalized(&want)
+        );
+        let undo = undo_ops(&[rule_op(RULE_OFF, Some(then))], &[a.previous], &[]).unwrap();
+        assert_eq!(undo, vec![rule_op(RULE_OFF, Some(prev))]);
+
+        // Refused, changing nothing: a rule Lox Logic cannot write, a block
+        // the module manages, a `/` in a message, no action, an action before
+        // a condition, a mode the config lacks, a block that is no rule.
+        let mut managed = lock_of(&l);
+        managed
+            .slugs
+            .insert("pumpe".into(), crate::rules::fixture::COVER.into());
+        let mctx = ctx_of(&out, &d, &managed, None, &names);
+        let at = Line::Time { at: "09:00".into() };
+        let on = Line::Then {
+            block: PUMP.into(),
+            command: "on".into(),
+        };
+        let v = |lines: Vec<Line>| {
+            Some(RuleVal {
+                active: true,
+                lines,
+            })
+        };
+        for (op, c, says) in [
+            (
+                rule_op(RULE_ODD, v(vec![at.clone(), on.clone()])),
+                &ctx,
+                "cannot write this rule",
+            ),
+            (
+                rule_op(
+                    RULE_OFF,
+                    v(vec![
+                        at.clone(),
+                        Line::Then {
+                            block: crate::rules::fixture::COVER.into(),
+                            command: "pulse".into(),
+                        },
+                    ]),
+                ),
+                &mctx,
+                "managed by the module",
+            ),
+            (
+                rule_op(
+                    RULE_OFF,
+                    v(vec![
+                        at.clone(),
+                        Line::Message {
+                            severity: "info".into(),
+                            subject: "a/b".into(),
+                            text: "x".into(),
+                            admins: false,
+                        },
+                    ]),
+                ),
+                &ctx,
+                "cannot contain `/`",
+            ),
+            (
+                rule_op(RULE_OFF, v(vec![at.clone()])),
+                &ctx,
+                "add an action",
+            ),
+            (
+                rule_op(RULE_OFF, v(vec![on.clone(), at.clone()])),
+                &ctx,
+                "come before",
+            ),
+            (
+                rule_op(
+                    RULE_OFF,
+                    v(vec![
+                        Line::Mode {
+                            mode: "40000099-0000-0990-ffff504f94112233".into(),
+                            on: true,
+                        },
+                        on.clone(),
+                    ]),
+                ),
+                &ctx,
+                "no operating mode",
+            ),
+            (
+                rule_op(PUMP, v(vec![at.clone(), on.clone()])),
+                &ctx,
+                "no Automatic Designer rule",
+            ),
+        ] {
+            let was = files.clone();
+            let e = apply_op(&mut files, c, &op).unwrap_err();
+            assert!(e.contains(says), "{e}");
+            assert_eq!(files, was);
+        }
+        // A mode the module names by its own slug is the module's to name.
+        let mut moded = lock_of(&l);
+        moded.externals.insert("party".into(), PARTY.into());
+        let e = apply_op(
+            &mut files.clone(),
+            &ctx_of(&out, &d, &moded, None, &names),
+            &rule_op(
+                RULE_OFF,
+                v(vec![
+                    Line::Mode {
+                        mode: PARTY.into(),
+                        on: true,
+                    },
+                    on.clone(),
+                ]),
+            ),
+        )
+        .unwrap_err();
+        assert!(e.contains("named `party` by the module"), "{e}");
+        // A command the block does not offer is lox's to refuse, with the
+        // commands it offers.
+        let mut bad = files.clone();
+        apply_op(
+            &mut bad,
+            &ctx,
+            &rule_op(
+                RULE_OFF,
+                v(vec![
+                    at.clone(),
+                    Line::Then {
+                        block: PUMP.into(),
+                        command: "Mood 7".into(),
+                    },
+                ]),
+            ),
+        )
+        .unwrap();
+        let e = compile_files(&d, &bad, &mut l.clone()).unwrap_err();
+        assert!(e.contains("Mood 7"), "{e}");
+
+        // Dropping the declaration is always let through, and takes its
+        // externs along.
+        let a = apply_op(&mut files, &ctx, &rule_op(RULE_OFF, None)).unwrap();
+        assert!(a.previous.is_object());
+        assert_eq!(files.claims, Claims::default());
+    }
+
+    #[test]
+    fn a_rule_is_created_by_name_renamed_deleted_and_brought_back() {
+        use crate::rules::fixture::PUMP;
+        use crate::rules::{Line, RuleVal};
+        let d = rules_doc();
+        let names = BTreeSet::new();
+        let mut files = Files::default();
+        let mut l = Lockfile::default();
+        let lock = lock_of(&l);
+        let ctx = ctx_of(&d, &d, &lock, None, &names);
+        let body = RuleVal {
+            active: true,
+            lines: vec![
+                Line::Time { at: "12:30".into() },
+                Line::Then {
+                    block: PUMP.into(),
+                    command: "on".into(),
+                },
+            ],
+        };
+        let new = |t: &str, v: Option<RuleVal>| Op::NewRule {
+            title: t.into(),
+            value: v,
+            restores: None,
+        };
+        // Not a name another rule has (lox would take that one), nor empty,
+        // nor in a config the app has put no rule into yet.
+        for (t, says) in [("pumpe ein", "named \"pumpe ein\""), (" ", "needs a name")] {
+            let e = apply_op(&mut files.clone(), &ctx, &new(t, None)).unwrap_err();
+            assert!(e.contains(says), "{e}");
+        }
+        let bare = doc("house.Loxone");
+        let e = apply_op(
+            &mut files.clone(),
+            &ctx_of(&bare, &bare, &lock, None, &names),
+            &new("Neu", None),
+        )
+        .unwrap_err();
+        assert!(e.contains("create one in the app"), "{e}");
+
+        let a = apply_op(&mut files, &ctx, &new("Pumpe Mittag", Some(body.clone()))).unwrap();
+        assert_eq!(a.added.as_deref(), Some("vx_rule_1"));
+        let text = files.claims.render();
+        assert!(
+            text.contains(&format!(
+                "rule vx_rule_1 \"Pumpe Mittag\"\n\tactive\n\twhen time 12:30\n\tthen {} on\nend\n",
+                slug(PUMP)
+            )),
+            "{text}"
+        );
+        assert_eq!(Claims::parse(&text).unwrap(), files.claims);
+        let out = compile_files(&d, &files, &mut l).unwrap();
+        let uuid = l.rules["vx_rule_1"].clone();
+        assert_eq!(
+            find(&out.xml.root, &uuid).and_then(|e| e.attr("Title")),
+            Some("Pumpe Mittag")
+        );
+        assert_eq!(
+            read_rule(&out, &uuid),
+            Some(crate::rule_edit::normalized(&body))
+        );
+        // Checked after the compile: the rule created as stated, and one the
+        // config lacks named.
+        let made = [new("Pumpe Mittag", Some(body.clone()))];
+        let added = [Some("vx_rule_1".to_string())];
+        let pinned = lock_of(&l);
+        assert!(crate::rule_edit::missed_ops(&files, &out, &pinned, &made, &added).is_empty());
+        assert_eq!(
+            crate::rule_edit::missed_ops(&files, &d, &pinned, &made, &added),
+            ["Pumpe Mittag"]
+        );
+        // The undo of creating it is removing it.
+        assert_eq!(
+            undo_ops(
+                &[new("Pumpe Mittag", None)],
+                &[a.previous],
+                &[Some(uuid.clone())]
+            )
+            .unwrap(),
+            vec![Op::RemoveBlock { uuid: uuid.clone() }]
+        );
+
+        // Renamed: the source owns its name.
+        let lock = lock_of(&l);
+        let ctx = ctx_of(&out, &d, &lock, None, &names);
+        let a = apply_op(
+            &mut files,
+            &ctx,
+            &Op::Title {
+                uuid: uuid.clone(),
+                value: Some("Pumpe Mittags".into()),
+            },
+        )
+        .unwrap();
+        assert_eq!(a.previous, serde_json::json!("Pumpe Mittag"));
+        let before = out.clone();
+        let out = compile_files(&d, &files, &mut l).unwrap();
+        assert_eq!(
+            find(&out.xml.root, &uuid).and_then(|e| e.attr("Title")),
+            Some("Pumpe Mittags")
+        );
+        // Only renamed: pending all the same, so it shows Revert and counts.
+        let lock = lock_of(&l);
+        let was = Files::from_texts(&files.render()).map(|mut f| {
+            f.claims.9.claims.get_mut("vx_rule_1").unwrap().title = Some("Pumpe Mittag".into());
+            f
+        });
+        let section = crate::rule_edit::edits_section(
+            &files,
+            &was.unwrap(),
+            &lock,
+            Some(&out),
+            Some(&before),
+        );
+        assert_eq!(section[0]["pending"], true);
+        assert_eq!(section[0]["deployed_title"], "Pumpe Mittag");
+        // Deployed under that name, renamed, then renamed back (an undo, a
+        // Revert) or in another case only: its own name is no other rule's.
+        let ctx = ctx_of(&out, &out, &lock, None, &names);
+        let mut renamed = files.clone();
+        let title = |v: &str| Op::Title {
+            uuid: uuid.clone(),
+            value: Some(v.into()),
+        };
+        apply_op(&mut renamed, &ctx, &title("Pumpe Abends")).unwrap();
+        apply_op(&mut renamed, &ctx, &title("Pumpe Mittags")).unwrap();
+        apply_op(&mut renamed, &ctx, &title("pumpe mittags")).unwrap();
+        // Another rule's name stays refused.
+        assert!(
+            apply_op(&mut renamed, &ctx, &title("Pumpe Ein"))
+                .unwrap_err()
+                .contains("already")
+        );
+
+        // Not deployed yet (the base lacks it): taken out, and its undo creates
+        // it again.
+        let lock = lock_of(&l);
+        let ctx = ctx_of(&out, &d, &lock, None, &names);
+        let mut gone = files.clone();
+        let a = apply_op(&mut gone, &ctx, &Op::RemoveBlock { uuid: uuid.clone() }).unwrap();
+        let back: Op = serde_json::from_value(a.previous).unwrap();
+        assert!(
+            matches!(&back, Op::NewRule { title, restores: Some(r), .. } if title == "Pumpe Mittags" && *r == uuid),
+            "{back:?}"
+        );
+        assert!(gone.claims.9.is_empty());
+
+        // Deployed (the base has it): `removed`, and back with its UUID.
+        let base = out.clone();
+        let ctx = ctx_of(&out, &base, &lock, None, &names);
+        let a = apply_op(&mut files, &ctx, &Op::RemoveBlock { uuid: uuid.clone() }).unwrap();
+        let back: Op = serde_json::from_value(a.previous).unwrap();
+        assert!(
+            matches!(&back, Op::RestoreRule { slug, .. } if slug == "vx_rule_1"),
+            "{back:?}"
+        );
+        assert!(files.claims.render().contains("removed vx_rule_1\n"));
+        let out = compile_files(&base, &files, &mut l).unwrap();
+        assert!(find_ci(&out.xml.root, &uuid).is_none());
+        let lock = lock_of(&l);
+        assert!(lock.tomb(&uuid).is_some());
+        // A tombstone of another type is not a rule's to restore.
+        let mut wrong = lock.clone();
+        wrong
+            .tombs
+            .insert(uuid.clone(), ("vx_rule_1".into(), "Monoflop".into()));
+        assert!(
+            apply_op(
+                &mut files.clone(),
+                &ctx_of(&out, &base, &wrong, None, &names),
+                &back
+            )
+            .unwrap_err()
+            .contains("no deleted rule")
+        );
+        // Not under a name another rule has taken meanwhile.
+        let taken = String::from_utf8(out.to_bytes())
+            .unwrap()
+            .replace("Title=\"Pumpe Ein\"", "Title=\"Pumpe Mittags\"");
+        let taken = LoxoneDoc::parse(taken.as_bytes()).unwrap();
+        let e = apply_op(
+            &mut files.clone(),
+            &ctx_of(&taken, &base, &lock, None, &names),
+            &back,
+        )
+        .unwrap_err();
+        assert!(e.contains("cannot come back under its name"), "{e}");
+        let ctx = ctx_of(&out, &base, &lock, None, &names);
+        let a = apply_op(&mut files, &ctx, &back).unwrap();
+        assert_eq!(
+            serde_json::from_value::<Op>(a.previous).unwrap(),
+            Op::RemoveBlock { uuid: uuid.clone() }
+        );
+        let mut l = edit_lock(&l, &files.lock_edits);
+        files.lock_edits = Default::default();
+        let out = compile_files(&base, &files, &mut l).unwrap();
+        assert!(find(&out.xml.root, &uuid).is_some());
+        assert_eq!(l.rules["vx_rule_1"], uuid);
+        assert_eq!(
+            read_rule(&out, &uuid),
+            Some(crate::rule_edit::normalized(&body))
+        );
     }
 }

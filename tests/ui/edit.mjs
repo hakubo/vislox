@@ -43,6 +43,28 @@ const MELDUNGEN = "40000030-0000-0000-ffff504f94000001", WARN = "40000031-0000-0
 // (Code16) and a Monoflop whose Time is 1800 s.
 const ZEITEN = "50000000-0000-0000-ffff504f94000001", PULSE = "50000001-0000-0000-ffff504f94000001";
 const HUE = "50000002-0000-0000-ffff504f94000001", NACH = "50000003-0000-0000-ffff504f94000001";
+// Automatic Designer rules (#87): a page Regeln with a push button the app shows as a switch (Pumpe), the rule Pumpe
+// Ein (active, weekdays at 09:00: Pumpe on, as the app writes it) and Ansage, whose speech output Lox Logic cannot
+// write; their AutoPilot container.
+const REGELN = "a0000000-0000-0000-ffff504f94000001", R_PUMP = "a0000001-0000-0000-ffff504f94000001";
+const R_EIN = "a0000002-0000-0000-ffff504f94000001", R_ODD = "a0000003-0000-0000-ffff504f94000001", AUTOPILOT = "a0000004-0000-0000-ffff504f94000001";
+const apc = (o) => JSON.stringify(o).replace(/"/g, "&quot;");
+const regelnXml = `\t\t<C Type="AutoPilot" V="178" U="${AUTOPILOT}" Title="Regeln"/>
+\t\t<C Type="Page" V="178" U="${REGELN}" Title="Regeln" WF="16384">
+\t\t\t<C Type="PushButton" V="178" U="${R_PUMP}" Title="Brunnenpumpe" Px="960" Py="960" Px2="2304" Py2="1656" Cl="141,255,112" Nio="2" WF="16384" SpStates="a0000001-0000-0013-ffff504f94000001,70000001-0000-0014-ffff504f94000001,70000001-0000-0015-ffff504f94000001">
+\t\t\t\t<Co K="Reset" U="a0000001-0000-0001-ffff504f94000001"/>
+\t\t\t\t<Co K="Q" U="a0000001-0000-0002-ffff504f94000001"/>
+\t\t\t\t<IoData Visu="true" Pr="${"10000041-0000-0000-ffff504f94000001"}"/>
+\t\t\t\t<Display Type="1"/>
+\t\t\t</C>
+\t\t\t<C Type="AutopilotRule" V="178" U="${R_EIN}" Title="Pumpe Ein" Px="960" Py="2880" Px2="2304" Py2="3576" Cl="141,255,112" Nio="1" WF="16384" APC="${apc({ type: 1, id: R_EIN, active: true, activeIfValid: true, name: "Pumpe Ein", description: "", operator: 3, invalid: false, eventGroups: [{ operator: 1, events: [{ type: 3, descID: 270001, id: 270, value: 9999999999, operator: 1, forceEdge: false, arrValues: [0, 1, 2, 3, 4] }, { type: 5, descID: 272001, id: 272, value: 540, operator: 1, forceEdge: false }] }], actions: [{ type: 0, descID: 342101, id: R_PUMP, command: "on" }] })}" STA="1" ref="${AUTOPILOT}">
+\t\t\t\t<Co K="Q" U="a0000002-0000-0001-ffff504f94000001"/>
+\t\t\t</C>
+\t\t\t<C Type="AutopilotRule" V="178" U="${R_ODD}" Title="Ansage" Px="960" Py="4800" Px2="2304" Py2="5496" Cl="141,255,112" Nio="1" WF="16384" APC="${apc({ type: 1, id: R_ODD, active: true, activeIfValid: true, name: "Ansage", description: "", operator: 3, invalid: false, eventGroups: [{ operator: 1, events: [{ type: 5, descID: 272001, id: 272, value: 600, operator: 1, forceEdge: false }] }], actions: [{ type: 9, descID: 999999, id: 0, command: "say" }] })}" STA="1" ref="${AUTOPILOT}">
+\t\t\t\t<Co K="Q" U="a0000003-0000-0001-ffff504f94000001"/>
+\t\t\t</C>
+\t\t</C>
+`;
 const zeitenXml = `\t\t<C Type="Page" V="178" U="${ZEITEN}" Title="Zeiten" WF="16384">
 \t\t\t<C Type="PulseAt" V="178" U="${PULSE}" Title="Abends" Px="960" Py="960" Px2="2304" Py2="1656" Cl="141,255,112" Nio="1" WF="16384" Typ="0" Sec="68280">
 \t\t\t\t<Co K="Q" U="50000001-0000-0001-ffff504f94000001"/>
@@ -248,7 +270,7 @@ const base0 = readFileSync(fixture, "utf8").replace('<Co K="Q" U="10000009-0000-
     "\t\t</C>\n" +
     `\t\t<C Type="Page" V="178" U="${MELDUNGEN}" Title="Meldungen" WF="16384">\n` +
     `\t\t\t<C Type="OutputRefLM" V="178" U="${WARN}" Title="Frostwarnung" Px="960" Py="960" Px2="2304" Py2="1656" Cl="0,0,0" Nio="2" Ref="${FROST}"><Co K="AI" U="40000031-0000-0001-ffff504f94000001"/><Co K="AQ" U="40000031-0000-0002-ffff504f94000001"/><LoggerMailer RefNotification="${FROST}" On="Frost im Garten" MinimumTime="43200000" NL="1"/></C>\n` +
-    "\t\t</C>\n" + zeitenXml + konstXml + ausdruckXml + vorlagenXml + "\t</C>\n</ControlList>");
+    "\t\t</C>\n" + regelnXml + zeitenXml + konstXml + ausdruckXml + vorlagenXml + "\t</C>\n</ControlList>");
 const base = base0.replace(`\t\t<C Type="Place" V="178" U="${KITCHEN}"`, `${flexXml}\t\t<C Type="Place" V="178" U="${KITCHEN}"`)
   .replace(`\t\t<C Type="Page" V="178" U="${MELDUNGEN}"`, `${beschXml}\t\t<C Type="Page" V="178" U="${MELDUNGEN}"`)
   .replace('\t\t<C Type="ModeCaption"', `${periphXml}${hwXml}\t\t<C Type="ModeCaption"`);
@@ -907,7 +929,43 @@ const externals = {}, hardware = {};
     }
   }
 }
-const hwLock = { ...(Object.keys(externals).length ? { externals } : {}), ...(Object.keys(hardware).length ? { hardware } : {}) };
+// Automatic Designer rules (#87): a \`rule <slug>\` declaration of edits.loxl rewrites the rule's APC= as the app
+// writes it (\`active\`, \`when weekday …\`, \`when time HH:MM\`, \`or\`, \`then <push button> on|off\`), and STA= follows
+// \`active\`. A named one (\`rule vx_rule_<n> "Name"\`) creates the rule below the last one, its UUID pinned in the
+// lock's \`rules\`.
+const rules = {};
+{
+  const DAYS = { mon: [0], tue: [1], wed: [2], thu: [3], fri: [4], sat: [5], sun: [6], weekdays: [0, 1, 2, 3, 4], weekend: [5, 6], daily: [0, 1, 2, 3, 4, 5, 6] };
+  for (const [, slug, title, body] of src.matchAll(/^rule (\\w+)(?: "([^"]*)")?\\n((?:\\t.*\\n)*)end$/gm)) {
+    let uuid = slugs[slug];
+    if (title !== undefined) {
+      uuid = lock.rules?.[slug] || \`a7ffff\${String(++n).padStart(2, "0")}-0000-0000-ffff504f94000001\`;
+      rules[slug] = uuid;
+      if (!out.some((l) => l.includes(\`U="\${uuid}"\`))) {
+        const last = out.findLastIndex((l) => l.includes('Type="AutopilotRule"'));
+        const end = out.findIndex((l, i) => i > last && l.trim() === "</C>");
+        out.splice(end + 1, 0, \`\\t\\t\\t<C Type="AutopilotRule" V="178" U="\${uuid}" Title="\${xml(title)}" Nio="1" WF="16384" APC="" ref="${AUTOPILOT}">\`, \`\\t\\t\\t\\t<Co K="Q" U="\${uuid.slice(0, 9)}0000-0001-ffff504f94000001"/>\`, "\\t\\t\\t</C>");
+      }
+    }
+    let active = false;
+    const groups = [{ operator: 1, events: [] }], actions = [];
+    for (const raw of body.split("\\n")) {
+      const l = raw.trim();
+      let m;
+      if (l === "active" || l === "inactive") active = l === "active";
+      else if (l === "or") groups.push({ operator: 1, events: [] });
+      else if ((m = l.match(/^when weekday (.*)$/))) groups.at(-1).events.push({ type: 3, descID: 270001, id: 270, value: 9999999999, operator: 1, forceEdge: false, arrValues: [...new Set(m[1].split(" ").flatMap((d) => DAYS[d]))].sort() });
+      else if ((m = l.match(/^when time (\\d\\d):(\\d\\d)$/))) groups.at(-1).events.push({ type: 5, descID: 272001, id: 272, value: +m[1] * 60 + +m[2], operator: 1, forceEdge: false });
+      else if ((m = l.match(/^then (\\w+) "?(on|off)"?$/))) actions.push({ type: 0, descID: m[2] === "on" ? 342101 : 342102, id: slugs[m[1]], command: m[2] });
+      else if (l) { console.error(\`error: compile error: \\\`rule \${slug}\\\`: \\\`\${l}\\\`: the stand-in does not write this\`); process.exit(1); }
+    }
+    const i = out.findIndex((l) => l.includes(\`U="\${uuid}"\`) && l.includes("<C "));
+    const name = out[i].match(/ Title="([^"]*)"/)[1];
+    const payload = { type: 1, id: uuid, active, activeIfValid: active, name, description: "", operator: 3, invalid: false, eventGroups: groups, actions };
+    out[i] = out[i].replace(/ APC="[^"]*"/, \` APC="\${JSON.stringify(payload).replace(/&/g, "&amp;").replace(/"/g, "&quot;")}"\`).replace(/ STA="1"/, "").replace(/ ref=/, active ? ' STA="1" ref=' : " ref=");
+  }
+}
+const hwLock = { ...(Object.keys(externals).length ? { externals } : {}), ...(Object.keys(hardware).length ? { hardware } : {}), ...(Object.keys(rules).length ? { rules } : {}) };
 fs.writeFileSync(lockFile, JSON.stringify(removed ? { objects, removed, ...hwLock } : { objects, ...hwLock }));
 if (lockAt < 0) fs.writeFileSync(mintFile, String(n));
 const to = process.argv.indexOf("--out");
@@ -3188,6 +3246,111 @@ try {
     await undoKey(false, () => !S.edits?.blocks.some((b) => b.slug === "vx_mode_1"));
     assert.doesNotMatch(pfile(), /= (Mode|CalendarEntry)\(/);
     await page.evaluate(() => modesClose());
+  });
+  await step("an Automatic Designer rule is shown in words, edited, compiled, undone and reverted; a new one is created and deleted (#87)", async () => {
+    await page.waitForFunction(() => /Nothing pending/.test(document.querySelector("#deploy-pend")?.textContent || ""), null, { timeout: 10000 });
+    await page.evaluate(() => editGoNewest());
+    await settled();
+    const send = async (act, what) => {
+      const n = edits.length;
+      await act();
+      await until(() => edits.length > n && statuses[n] !== undefined, what);
+      assert.equal(statuses[n], 200, what);
+      await settled();
+      return edits[n].ops;
+    };
+    const go = async (u) => { await page.evaluate((x) => { gotoPage(S.objPage.get(x), { focus: x }); select(x); }, u); };
+    const sec = '#props [data-body="Rule"]';
+    const file = () => readFileSync(join(dir, "pages", "vislox", "edits.loxl"), "utf8");
+    const rs = `vx_${R_EIN.replace(/-/g, "_")}`, ps = `vx_${R_PUMP.replace(/-/g, "_")}`;
+    // A rule Lox Logic cannot write is read-only, and says why.
+    await go(R_ODD);
+    await waitText(sec, /Lox Logic cannot write this rule/);
+    assert.equal(await page.$(`${sec} [data-ru="open"]`), null);
+    // The rule in words, its block a link.
+    await go(R_EIN);
+    await page.waitForSelector(`${sec} [data-ru="open"]`);
+    await waitText(sec, /On weekdays and at 09:00: Brunnenpumpe: on/);
+    assert.equal(await page.getAttribute(`${sec} .ru-link .lnk`, "data-go"), R_PUMP);
+    // Edit: inactive, 10:00; a command without its block is not sent.
+    await page.click(`${sec} [data-ru="open"]`);
+    await page.uncheck(`${sec} [data-ru-f="active"]`);
+    await page.fill(`${sec} [data-ru-field="at:1"]`, "10:00");
+    await page.click(`${sec} [data-ru="addthen"]`);
+    await waitText(sec, /Pick the block of every condition and command/);
+    assert.equal(await page.getAttribute(`${sec} [data-ru="save"]`, "disabled"), "");
+    await page.click(`${sec} [data-ru="del"][data-i="3"]`);
+    let ops = await send(() => page.click(`${sec} [data-ru="save"]`), "the rule");
+    assert.deepEqual(ops, [{ op: "rule", uuid: R_EIN, value: { active: false, lines: [
+      { kind: "weekday", days: ["weekdays"] }, { kind: "time", at: "10:00" }, { kind: "then", block: R_PUMP, command: "on" }] } }]);
+    assert.ok(file().includes(`rule ${rs}\n\tinactive\n\twhen weekday weekdays\n\twhen time 10:00\n\tthen ${ps} on\nend\n`), file());
+    assert.match(file(), new RegExp(`^extern ${rs} = AutopilotRule\\(uuid: "${R_EIN}"\\)$`, "m"));
+    await page.waitForFunction((u) => S.view.objects[u].rule?.summary === "On weekdays and at 10:00: Brunnenpumpe: on" && !S.view.objects[u].rule.active, R_EIN, { timeout: 10000 });
+    await waitText(sec, /edited here[\s\S]*not deployed[\s\S]*Revert/);
+    await waitText("#deploy-pend", /1 Automatic Designer rule edited here/);
+    const changes = await page.evaluate(() => S.view.changes.map((c) => c.text));
+    assert.ok(changes.includes("Pumpe Ein · active → inactive"), changes.join(" | "));
+    assert.ok(changes.includes("Pumpe Ein · condition changed: at 09:00 → at 10:00"), changes.join(" | "));
+    assert.ok(!changes.some((c) => /APC/.test(c)), changes.join(" | "));
+    // Undone and redone through the reply's undo.
+    ops = await undoKey(false, (u) => S.view.objects[u].rule?.active === true && !S.edits?.rules?.length, R_EIN);
+    assert.deepEqual(ops, [{ op: "rule", uuid: R_EIN, value: null }]);
+    assert.doesNotMatch(file(), /^rule /m);
+    ops = await undoKey(true, (u) => S.view.objects[u].rule?.active === false, R_EIN);
+    assert.equal(ops[0].op, "rule");
+    // A draft made on a config an undo replaced is dropped, never saved over the newer rule.
+    await page.waitForSelector(`${sec} [data-ru="open"]`);
+    await page.click(`${sec} [data-ru="open"]`);
+    await undoKey(false, (u) => S.view.objects[u].rule?.active === true, R_EIN);
+    await waitText(sec, /The pending config changed while editing: the draft was dropped/);
+    assert.equal(await page.$(`${sec} [data-ru="save"]`), null);
+    await undoKey(true, (u) => S.view.objects[u].rule?.active === false, R_EIN);
+    // Revert: back to the rule as last written, vislox's declaration goes.
+    await page.waitForSelector(`${sec} [data-ru="revert"]`);
+    ops = await send(() => page.click(`${sec} [data-ru="revert"]`), "revert the rule");
+    assert.deepEqual(ops, [{ op: "rule", uuid: R_EIN, value: null }]);
+    await page.waitForFunction((u) => S.view.objects[u].rule?.active === true, R_EIN, { timeout: 10000 });
+    assert.doesNotMatch(file(), /^rule /m);
+    // A new rule by its name, with a condition and an action: created below the last one, selected, then deleted.
+    await page.click(`${sec} [data-ru="new"]`);
+    await page.fill(`${sec} [data-ru-f="name"]`, "Pumpe Mittag");
+    await waitText(sec, /Pick the block of every condition and command/);
+    await page.click(`${sec} [data-ru="pick"][data-i="1"]`);
+    await page.waitForSelector("#palette:not(.hidden)");
+    await page.keyboard.type("Brunnen");
+    await page.waitForFunction(() => /Brunnenpumpe/.test(document.querySelector("#pal-list [role=option]")?.textContent || ""));
+    await page.keyboard.press("Enter");
+    await page.waitForSelector("#palette.hidden", { state: "attached" });
+    await page.fill(`${sec} [data-ru-field="command:1"]`, "on");
+    ops = await send(() => page.click(`${sec} [data-ru="save"]`), "the new rule");
+    assert.deepEqual(ops, [{ op: "new_rule", title: "Pumpe Mittag", value: { active: false, lines: [{ kind: "time", at: "08:00" }, { kind: "then", block: R_PUMP, command: "on" }] } }]);
+    assert.ok(file().includes(`rule vx_rule_1 "Pumpe Mittag"\n\tinactive\n\twhen time 08:00\n\tthen ${ps} on\nend\n`), file());
+    await page.waitForFunction(() => S.view.objects[S.sel]?.title === "Pumpe Mittag", null, { timeout: 10000 });
+    const made = await page.evaluate(() => S.sel);
+    await waitText(sec, /At 08:00: Brunnenpumpe: on/);
+    await waitText(sec, /Created here as vx_rule_1/);
+    // Edited, deleted, then both undone: it comes back under a new UUID, and the history follows it.
+    await page.click(`${sec} [data-ru="open"]`);
+    await page.check(`${sec} [data-ru-f="active"]`);
+    ops = await send(() => page.click(`${sec} [data-ru="save"]`), "edit the new rule");
+    assert.equal(ops[0].op, "rule");
+    assert.equal(ops[0].value.active, true);
+    ops = await send(() => page.click(`${sec} [data-ru="delete"]`), "delete the new rule");
+    assert.deepEqual(ops, [{ op: "remove_block", uuid: made }]);
+    assert.doesNotMatch(file(), /vx_rule_1/);
+    await page.waitForFunction((u) => !S.view.objects[u], made, { timeout: 10000 });
+    const titled = () => Object.values(S.view.objects).find((x) => x.title === "Pumpe Mittag" && x.status !== "removed");
+    ops = await undoKey(false, () => Object.values(S.view.objects).find((x) => x.title === "Pumpe Mittag" && x.status !== "removed")?.rule?.active === true);
+    assert.equal(ops[0].op, "new_rule");
+    assert.equal(ops[0].restores, made);
+    const again = await page.evaluate(`(${titled})()?.uuid`);
+    assert.ok(again && again !== made, again);
+    ops = await undoKey(false, (u) => S.view.objects[u]?.rule?.active === false, again);
+    assert.deepEqual(ops.map((o) => [o.op, o.uuid]), [["rule", again]]);
+    // And the creation itself.
+    ops = await undoKey(false, (u) => !S.view.objects[u], again);
+    assert.deepEqual(ops, [{ op: "remove_block", uuid: again }]);
+    assert.doesNotMatch(file(), /vx_rule_1/);
   });
   await step("nothing was deployed: lox only compiled, checked, linted and tested", async () => {
     const ran = readFileSync(calls, "utf8").trim().split("\n");

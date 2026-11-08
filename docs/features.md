@@ -24,6 +24,13 @@ sends to the Miniserver see [miniserver.md](miniserver.md).
   on*, linked to the `Mode` object. The tree's tooltip says the same, and the Changes list reads a changed entry
   as *24 Dec → 26 Dec* and *Holiday → Party* instead of raw attributes. An entry vislox cannot decode says why;
   its raw attributes stay under Advanced.
+- **Automatic Designer rules** (#87): Properties of a rule (`AutopilotRule`) has *Rule*: active or not, the rule in
+  one sentence (*On weekdays and at 09:00: Pumpe: on*), then each condition (*When*, the groups split by *or*) and
+  each action (*Then*) in order, with a link to the block it watches or drives or the operating mode it names. It is
+  read as Lox Logic reads it (lox's decompile), so states and commands are the app's own names. A rule Lox Logic cannot
+  write (text values, calls, speech output) says so; its payload stays under Advanced. Compared with another revision,
+  the Changes list reads a changed rule per line (*Pumpe Ein · condition changed: at 09:00 → at 10:00*, *· action
+  added: wait 5s*, *· active → inactive*) in place of the raw `APC=` change.
 - **Operating modes** (Ctrl+K *Operating modes*, or **Year** on the tree's Calendar or Operating modes folder): a
   year calendar of when each mode is on. Each day carries the colour of every mode its entries switch on; ← / →
   go to other years (from 2009, Loxone's day 0), and a mode's chip hides or shows its days. Hovering a day lists its entries, and clicking
@@ -460,6 +467,21 @@ sends to the Miniserver see [miniserver.md](miniserver.md).
   share one set. Saved and not deployed, the section says so, with *Revert*. On a controller added or adopted
   here, each switch or dimmer circuit `AQ1` … `AQ5` can be declared the other kind. How:
   [editing.md](editing.md#lighting-moods-74).
+
+- **Automatic Designer rules** (the same project and token, #87): *Edit rule* in a rule's *Rule* section opens its
+  lines: *Active*, and each condition and action with its kind and fields (a time of day, days of the week, a block's
+  state with a comparison, an operating mode, a weather field, a day of the month, day or night, sunrise and the
+  like, a date; a block's command, switching a mode, a wait, a push notification, a mail, a message center entry). A
+  block is picked with the Ctrl+K picker; a state or command offers those the config's rules already use on blocks
+  of that type, and lox checks it against the app's capability table when it compiles (its refusal lists what the
+  block offers). *Add condition*, *Add “or”* and *Add action*, ↑ ↓ and ✕. *Save* writes a Lox Logic `rule`
+  declaration into vislox's file of the module and compiles; it shows as *not deployed* with *Revert*, and *Remove
+  vislox's declaration* leaves the rule as last written. *New rule…* opens the same form for a named rule (its name,
+  a condition and an action at least), which lox creates below the config's last rule; a rule created here is renamed
+  in its form and taken out with *Delete rule*. A config without any rule cannot get one (the app decides where
+  rules live), `when date` needs the Miniserver's time zone in the config, and rules the module's own files state
+  are changed there. Nothing runs a rule or sends a notification, mail or message. How:
+  [editing.md](editing.md#automatic-designer-rules-87).
 
 - **Members of a central block** (#75): Properties of a CentralLight or CentralShade has *Members*: the lighting
   controllers or automatic blinds it drives, in the order the app lists them, each a link to its block (and its

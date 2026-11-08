@@ -7,8 +7,9 @@ open an NFC Code Touch (#76), push notifications: who gets them and what they sa
 Pure Flex (#78), a managed block's label and settings, its program among them (#79), deleting and renaming a
 managed block (#80), `let` constants and `defaults` (#81), expressions and named signals (#82), template
 instances (#83), virtual inputs, virtual and Modbus devices (#84), Tree and Air hardware: statistics and new
-Tree devices (#85), and operating modes and calendar entries (#86). This page is the design they share. #58 to #62,
-#72 to #86 are built (#81 to #84 and #86 in part: see their sections); the rest says where each step plugs in.
+Tree devices (#85), operating modes and calendar entries (#86), and Automatic Designer rules (#87). This page is the
+design they share. #58 to #62, #72 to #87 are built (#81 to #84 and #86 in part: see their sections); the rest says
+where each step plugs in.
 
 ## The rules
 
@@ -21,7 +22,8 @@ Tree devices (#85), and operating modes and calendar entries (#86). This page is
   the values it claims, the wires it draws and the constants it makes (#81), and one file per page for the blocks it adds
   (`<module>/vislox/obergeschoss.loxl`), `_periphery.loxl` for the virtual inputs and devices (#84), operating modes and
   calendar entries (#86) it adds,
-  `_hardware.loxl` for the Tree and Air hardware it declares (#85), and a file per program a block of them runs
+  `_hardware.loxl` for the Tree and Air hardware it declares (#85), the Automatic Designer rules it states and creates
+  in `edits.loxl` too (#87), and a file per program a block of them runs
   (`vx_code16_1.c`, #79).
   The rest of the module is never touched. A module that is one file cannot be edited from vislox.
   The exceptions are the lockfile: a move (#60), since lox keeps a managed block's position there, not in the
@@ -79,7 +81,12 @@ POST /api/edit
              "settings": { "Address": "http://192.0.2.10/status", "Poll": "1min" } },
            { "op": "statistics", "uuid": "<Tree or Air I/O uuid>", "value": "on" },
            { "op": "add_block", "page": "<Tree extension uuid>", "type": "TreeDevice", "title": "Melder Flur",
-             "settings": { "kind": "PresenceSensorTree", "branch": "left" } } ] }
+             "settings": { "kind": "PresenceSensorTree", "branch": "left" } },
+           { "op": "rule", "uuid": "<rule uuid>", "value": { "active": true, "lines": [
+               { "kind": "weekday", "days": ["weekdays"] }, { "kind": "time", "at": "09:00" },
+               { "kind": "then", "block": "<block uuid>", "command": "on" } ] } },
+           { "op": "new_rule", "title": "Pumpe Mittag", "value": { "active": false, "lines": [
+               { "kind": "time", "at": "12:30" }, { "kind": "then", "block": "<block uuid>", "command": "on" } ] } } ] }
 ```
 
 `adopt`, `adopt_page` and `unadopt` go in a request of their own (#72), and so does `rename` (#80). `restore_block`
@@ -110,7 +117,10 @@ is what undoes a `remove_block` of a deployed block (#80); vislox makes it, see 
   instance (#83). `statistics` is a value op (#85): what vislox's file claimed before, or null. `entry_mode` and
   `entry_date` are value ops (#86): the mode's UUID and the date as written before, or null. A Tree device created
   here is added and removed as a block: `remove_block`'s `previous` is the `add_block` that creates it again (a new
-  UUID) or, once deployed, the `restore_block` that brings it back with its UUID.
+  UUID) or, once deployed, the `restore_block` that brings it back with its UUID. `rule` is as `members` (#87): its
+  `previous` is what vislox's file stated (null: nothing); `new_rule` is undone by `remove_block` of the UUID lox gave
+  the rule, and a rule created here is removed as a block: `remove_block`'s `previous` is the `new_rule` that creates it
+  again or, once the base has it, the `restore_rule` that brings it back with its UUID.
   A reconnected wire is one request, `unwire` then `wire`:
   undone, the reverse list. The ops of one request see each other: `unwire` then `wire` of the same wire is
   accepted (and changes nothing). `remove_block`'s `add_block` carries the wires the removal took out
@@ -676,6 +686,98 @@ vx_calendarentry_3 = CalendarEntry("Fasching", switches: "Party", easter: -47)
 - **Read-only**: entries Loxone Config made (adopting them, like adopting its modes, waits for vislox's adoption to
   take objects of the object tree), the module's own entries, and an entry of a weekday in a month (*the last Monday
   of May*), which the language cannot write.
+
+## Automatic Designer rules (#87)
+
+A rule of the app's Automatic Designer (`AutopilotRule`) stores what it does as a JSON payload (`APC=`). Lox Logic
+writes it as a `rule` declaration, and vislox writes those into `edits.loxl` (`src/rule_edit.rs`):
+
+```text
+extern vx_70000002_0000_0000_ffff504f94000001 = AutopilotRule(uuid: "70000002-0000-0000-ffff504f94000001")
+extern vx_70000001_0000_0000_ffff504f94000001 = PushButton(uuid: "70000001-0000-0000-ffff504f94000001")
+
+# Automatic Designer rules edited in vislox. A declaration states what the rule does;
+# deleting it leaves the rule as last written.
+
+rule vx_70000002_0000_0000_ffff504f94000001
+	inactive
+	when weekday weekdays
+	when time 10:00
+	or
+	when mode "Party"
+	then vx_70000001_0000_0000_ffff504f94000001 on
+	then wait 5s
+end
+
+rule vx_rule_1 "Pumpe Mittag"
+	active
+	when time 12:30
+	then vx_70000001_0000_0000_ffff504f94000001 on
+end
+```
+
+- **Read as lox reads it.** lox's own reading of a payload and the app's capability table are private to lox, so
+  vislox reads every rule through lox's public decompile (`src/rules.rs`), as `lox logic decompile` and `adopt` write
+  it: the state names, commands and weekday words are lox's. Properties shows `o.rule`: active, a one-sentence summary,
+  each line in words with the block or mode it names as a link, and `value`, its lines with blocks and modes by UUID
+  (what the editor starts from). A rule decompile does not lift (text values, calls, speech output, a block the config
+  lacks) is read-only and says why; its payload stays under Advanced. The Changes list reads a changed rule per line
+  (`rules::changes`: active ↔ inactive, each condition by group and each action by place, old → new, added, removed)
+  in place of the raw `APC=` and `STA=` lines.
+- **The op** is `{ "op": "rule", "uuid": <rule>, "value": { "active", "lines": [...] } }`: the whole rule, its lines
+  each a `kind` with its fields (`time` `at`, `weekday` `days`, `state` `block` `state` `op` `value`, `mode` `mode` `on`,
+  `weather` `field` `op` `value`, `day` `op` `value`, `daylight` `on`, `sun` `at`, `date` `date`, `or`; `then` `block`
+  `command`, `then_mode` `mode` `on`, `notify` `subject` `text`, `mail` `to` `subject` `text`, `wait` `duration`,
+  `message` `severity` `subject` `text` `admins`). A block is named by UUID (a block of vislox's files lox has not pinned
+  yet, by its slug), a mode by UUID (one no mode of the config is, as written: a slug or a quoted title). `value: null`
+  drops vislox's declaration: the rule stays as last written (lox keeps no lock state for it), so before Apply that is
+  the base's rule.
+- **Checked before lox sees it**: each line is turned into Lox Logic (its words and numbers checked so that it is one
+  statement; strings quoted as lox quotes them) and the whole body read back with lox's parser, so lox's parser checks
+  a time of day, a duration's range (0.1 s … 24 h), a weekday word. The shape is lox's checker's: the conditions first,
+  a condition in every group, an action at least. A message's subject and text without `/`. `when date` needs the
+  Miniserver's time zone in the config (`rule_edit.date` says why not; lox refuses a zone outside Central European
+  time). A block the module manages is refused (vislox's files name only their own blocks and Loxone Config's), and so
+  is a rule the module's own files state (`managed::rule_claims`, sent as `rule_claims`), one the module declares by
+  name, and one Lox Logic cannot write. Weekdays are written in their shortest words (`weekdays`, `weekend`, `daily`),
+  as lox lifts them. A mode is spelled as lox takes it in a rule: a mode of vislox's files by its slug, any other mode
+  the module neither declares nor externs by its quoted title (a title two modes share is refused); one the module
+  names by a slug of its own is refused (lox would refuse its title, and vislox's files name only their own modes and
+  Loxone Config's). A message's severity is `info`, `warning`, `important` or `critical` (lox 0.83's parser).
+- **Checked by lox when it compiles**: each block's states and commands against the app's capability table per control
+  type, plus the commands a rule of the config already sends. lox's refusal lists what the block offers; vislox cannot
+  read that table, so the form only suggests the states and commands the config's rules already use on blocks of the
+  same type (`rule_edit.offers`).
+- **Checked after the compile.** The pending config must read, for each rule the request stated, as its declaration
+  (`rule_edit::missed`, compared after normalizing: UUIDs lowercase, weekday words, `on`/`off` as 1/0, a time's two
+  digits, a day of the month as a number); and each rule a request created, brought back or renamed must be in it under
+  its name and with its lines (`rule_edit::missed_ops`). Otherwise the edit is refused and the files, lock and out are
+  put back.
+- **A new rule** is `{ "op": "new_rule", "title": "…", "value": {…} }`: `rule vx_rule_<n> "Title"`, which lox creates
+  below the config's last rule and files like it, and pins in the lockfile's `rules`. Its name is one line and no
+  other rule's (compared case-blind: lox would take that rule instead of creating one; a rule's own name, in the base
+  too, is no other's, so a rename and its undo or Revert, or a change of case, go through), and its body a condition and
+  an action at least (lox's checker refuses an empty one). A config without any rule cannot get one: the app decides
+  where rules live (`rule_edit.create` says so). Its name is the source's: a `title` op renames it. `remove_block` of
+  it drops the declaration while the base lacks it (`previous`: the `new_rule` that creates it again), else writes
+  `removed vx_rule_<n>` (`previous`: the `restore_rule` with its slug, name and lines, which puts the declaration and the
+  lock's pin back, taken out of lox's tombstone; it is routed by the tombstone's type, never by the request, and refused
+  while another rule has its name). The reply's `added` names the rule an undone delete creates again next to the UUID
+  it had (`restores`), as for a block, and the browser follows it in its history. A rule
+  whose output feeds a block in the pending config is not deleted (lox refuses it too). The `removed` lines lox needs
+  no more are dropped as for blocks (`Files::tidy`).
+- **Not deployed and Revert.** `GET /api/edits` sends `rules`: per rule vislox's file states now or stated in the
+  deployed revision, `value`, `deployed` (what Revert sends), `created` (its slug and name, for a rule created here),
+  `deployed_title`, `missing` and `pending` (the pending config's rule reads otherwise than the deployed one's,
+  compared as above, or has another name); and `rule_edit`: per rule of the config shown, null when vislox may state it, else why not.
+
+The browser: *Rule* in Properties of a rule, on any revision. On the newest config, *Edit rule* opens the lines: *Active*,
+each line's kind and fields, ↑ ↓ ✕, *Add condition*, *Add “or”*, *Add action*; a block is picked with the Ctrl+K picker
+(*Pick…*), a state or command from the suggestions or typed. The browser checks the shape first (nothing is sent while
+it fails). *New rule…* opens the same form with a name. The draft belongs to the rule and the pending config it was
+opened on, as for members; *Save* sends that config's blob as `base`. *Revert*, *Remove vislox's declaration* and, on a
+rule created here, *Delete rule*. The Deploy pane counts the rules edited here and not deployed. Nothing runs a rule
+or sends a notification, mail or message: they happen only on the Miniserver, after Apply.
 
 ## Tree and Air hardware (#85)
 
@@ -1637,6 +1739,8 @@ cannot express is left out, not worked around.
 | #85 new Tree device | `vx_<kind>_<n> = TreeDevice("…", kind: "…", tree: …, branch: "…")`, `removed vx_…` | The four kinds lox creates, on a Tree extension of the base; unpaired until a Tree search in Loxone Config. |
 | #86 operating mode | `vx_mode_<n> = Mode("…")` in `_periphery.loxl` | A new user mode; lox mints its `Mode=` number. Built-in modes and Loxone Config's stay as they are. |
 | #86 calendar entry | `vx_calendarentry_<n> = CalendarEntry("…", switches: …, every: 12-31)` in `_periphery.loxl` | A new entry, then its mode (`entry_mode`) and date (`entry_date`, one of four kinds). Loxone Config's entries stay read-only. |
+| #87 rule | `rule vx_<uuid> … end` on an extern in `edits.loxl` | Active, conditions and actions of a rule Lox Logic can write; its name stays the app's. lox checks states and commands against the app's capability table. |
+| #87 new rule | `rule vx_rule_<n> "Name" … end`, `removed vx_rule_<n>` in `edits.loxl` | Created below the config's last rule; not in a config without any rule. |
 
 Blocks the module already manages (they are in the lockfile) are refused: they are edited in their own `.loxl`.
 The blocks vislox added or adopted (#72) are the exception: their `.loxl` is vislox's.
@@ -1679,6 +1783,9 @@ The blocks vislox added or adopted (#72) are the exception: their `.loxl` is vis
   them on a managed block). Its settings (`Formula:`, `Type:`, `At:`, a program, …) are given when it is added and
   changed later in Properties (#79).
 - A block on a page whose title an earlier page has, and a new page (#88).
+- A rule with conditions or actions Lox Logic does not write (text values, calls, speech output): it stays the app's
+  (#87). A rule's states and commands cannot be listed from the app's capability table: lox keeps it private, so the
+  form suggests those the config's rules use and lox's refusal names the rest.
 - A push notification itself (lox never writes into *Messages*), and adopting a notification's block Loxone Config
   drew (`lox logic adopt` of an `OutputRefLM` fails in lox 0.83): its message is changed in Loxone Config (#77).
 - A Touch Pure Flex's layout (adding, moving or removing a tile, its icon) and its API link: lox writes only the
@@ -1711,7 +1818,7 @@ Each of these plugs in as new op kinds on `POST /api/edit`, written into `<modul
 | #84 (built in part) | virtual inputs, virtual and Modbus devices added and edited in `_periphery.loxl` (`device:`); adopting Loxone Config's is left |
 | #85 (built) | Tree and Air hardware: `Statistics:` on an I/O, new Tree devices (`kind:`, `removed`) in `_hardware.loxl` |
 | #86 (built in part) | operating modes and calendar entries added in `_periphery.loxl`, an entry's mode and date edited (`switches:`, `every:`, `easter:`, `from:`/`to:`); adopting Loxone Config's is left |
-| #87 | Automatic Designer rules (`rule`) |
+| #87 (built) | Automatic Designer rules (`rule`, named rules, `removed`) |
 | #88 | new pages (`page "…" (room: …)`) |
 
 Around the module: #64 (mark managed blocks, built), #65 (`lox logic check` errors, built), #66 (lint, built), #67 (`lox logic test`, built),
