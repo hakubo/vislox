@@ -2,10 +2,14 @@
   "name": "vislox-frontend-checks",
   "private": true,
   "scripts": {
-    "lint": "eslint web/*.js"
+    "lint": "node --test tools/script-globals.test.mjs && eslint web/*.js"
   },
   "devDependencies": {
+    "@eslint/js": "9.39.5",
     "eslint": "9.39.5",
     "globals": "16.5.0"
+  },
+  "engines": {
+    "node": ">=22.13.0"
   }
 }

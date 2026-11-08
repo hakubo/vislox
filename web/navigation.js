@@ -35,6 +35,7 @@ let historyLoadSeq = 0;
 let historyRetryTimer = null;
 let historyRetryDelay = 1000;
 window.addEventListener("popstate", async () => {
+  if (typeof S === "undefined") return;
   const seq = ++popstateSeq;
   const h = readHash();
   S.applyingHash = true;

@@ -6,10 +6,10 @@ The binary is an `axum` server with the UI embedded (plain JS and SVG, no build 
 `navigation.js` owns URL state, Back/Forward navigation and history loading, including request
 sequence guards and retry state. Its header lists the shared state and refresh dependencies.
 It defines functions and registers a popstate listener before `app.js` starts the initial loads;
-those functions use app/calendar globals only when called. `app.js` keeps the shared `S` state,
+the listener ignores events until `S` exists. Those functions use app/calendar globals only when called. `app.js` keeps the shared `S` state,
 rendering, editing and deployment logic; `modes.js` owns the operating-mode calendar.
-The scripts share the browser global scope, with explicit imports in `eslint.config.mjs` and
-`/* exported */` comments for lint. They are embedded individually with `include_str!` and routed
+The scripts share the browser global scope. `eslint.config.mjs` generates imports from the
+`/* exported */` headers after checking declarations and cross-script binding clashes. They are embedded individually with `include_str!` and routed
 in `src/main.rs`. All assets use `Cache-Control: no-cache` (no ETag or hashed filenames), so new
 scripts need both an HTML script tag and an embedded route. No bundler or npm package ships in
 the binary.
