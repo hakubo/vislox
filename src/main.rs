@@ -25,6 +25,7 @@ mod managed;
 mod member_edit;
 mod miniserver;
 mod model;
+mod module_edit;
 mod monframe;
 mod monitor;
 mod mood_edit;
@@ -575,6 +576,7 @@ async fn main() -> Result<()> {
         .route("/api/discard", axum::routing::post(api_discard))
         .route("/api/edit", axum::routing::post(api_edit))
         .route("/api/edits", get(api_edits))
+        .route("/api/defaults", get(api_defaults))
         .route(
             "/api/access/choices",
             axum::routing::post(api_access_choices),
@@ -1805,6 +1807,24 @@ async fn api_edit(
 async fn api_edits(State(app): State<Arc<App>>) -> Response {
     let (deployed, pending) = edit_revisions(&app).await;
     Json(app.actions.edits(deployed, pending).await).into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct DefaultsQuery {
+    #[serde(rename = "type")]
+    ty: String,
+    /// A connector key, as the `defaults` op takes it.
+    port: String,
+}
+
+/// What a default of `type`'s `port` reaches (#81): the managed blocks of
+/// the type that do not bind the port, which the `defaults` op must name,
+/// and the statement it changes or why vislox does not. Read-only.
+async fn api_defaults(State(app): State<Arc<App>>, Query(q): Query<DefaultsQuery>) -> Response {
+    match app.actions.defaults_reach(&q.ty, &q.port) {
+        Ok(v) => Json(v).into_response(),
+        Err(r) => refused(r),
+    }
 }
 
 /// The users, groups and access schedules an access set may name (#76), by

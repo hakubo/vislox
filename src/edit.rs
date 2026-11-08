@@ -218,13 +218,37 @@ pub enum Op {
         uuid: String,
         value: Option<crate::tiles_edit::TilesVal>,
     },
-    /// A `let` constant of vislox's file (#81): `let <name> = <value>` in
-    /// [`FILE`]. Every port bound to it takes the new value (lox scales a
-    /// suffixed one into each port's unit). A new name makes the constant;
-    /// `None` drops it, once nothing is bound to it. A constant the module's
-    /// own files declare is changed there. Its `previous` is the value before
-    /// (none: it did not exist).
-    Let { name: String, value: Option<String> },
+    /// A `let` constant (#81). One of vislox's file: `let <name> = <value>`
+    /// in [`FILE`]; a new name makes it, `None` drops it once nothing is
+    /// bound to it, and its `previous` is the value before (none: it did not
+    /// exist). One the module's own files declare: its value rewritten on its
+    /// line and nothing else ([`crate::module_edit`]), `source` the line as
+    /// the browser saw it; its `previous` is the `let` op that writes the old
+    /// text back. Every port bound to it takes the new value (lox scales a
+    /// suffixed one into each port's unit).
+    Let {
+        name: String,
+        value: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
+    },
+    /// The default of port `port` (a connector key) for every managed block
+    /// of `type` that does not bind it (#81): `defaults <Type>(Port: value)`.
+    /// On the module's own statement, that value rewritten (`source`: the
+    /// statement as the browser saw it); else vislox's statement in [`FILE`],
+    /// made when there is none, `None` dropping the value. `blocks` names
+    /// exactly the blocks it changes (their slugs), the user's consent. Its
+    /// `previous` is the `defaults` op that undoes it.
+    Defaults {
+        #[serde(rename = "type")]
+        ty: String,
+        port: String,
+        value: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        blocks: Option<Vec<String>>,
+    },
     /// What vislox's files feed into the input `port` (a connector key) of
     /// `uuid` (#82): an expression (`vx_a.Q and vx_b.AQ >= 28`), written
     /// `x.Port <- …` on a block Loxone Config drew and `Port: …` in the
@@ -370,6 +394,7 @@ impl Op {
             | Op::AdoptPage { .. }
             | Op::Unadopt { .. }
             | Op::Let { .. }
+            | Op::Defaults { .. }
             | Op::Tidy => None,
         }
     }
@@ -393,6 +418,7 @@ impl Op {
             | Op::RemoveBlock { .. }
             | Op::RestoreBlock { .. }
             | Op::Rename { .. }
+            | Op::Defaults { .. }
             | Op::Tidy
             | Op::Move { .. }
             | Op::Relayout { .. }
@@ -436,6 +462,7 @@ impl Op {
             | Op::RemoveBlock { .. }
             | Op::RestoreBlock { .. }
             | Op::Rename { .. }
+            | Op::Defaults { .. }
             | Op::Tidy
             | Op::Move { .. }
             | Op::Relayout { .. }
@@ -708,6 +735,9 @@ pub struct Claims(
     pub BTreeMap<String, Value>,
     /// The Automatic Designer rules it declares (#87).
     pub crate::rule_edit::Rules,
+    /// The `defaults` statements made here (#81): type → port (its Lox
+    /// Logic name) → value.
+    pub BTreeMap<String, BTreeMap<String, Value>>,
 );
 
 /// A wire vislox draws: `to.port <- from.port`, each end a slug (an
@@ -916,6 +946,17 @@ impl Claims {
                     }
                     c.8.insert(l.name, l.value);
                 }
+                // A default made here (#81): values only, one statement a type.
+                Item::Defaults(d) => {
+                    if c.10.contains_key(&d.block_type) {
+                        return Err(foreign(&format!("a second `defaults {}`", d.block_type)));
+                    }
+                    let mut m = BTreeMap::new();
+                    for (port, v) in d.params() {
+                        m.insert(port.to_string(), v.clone());
+                    }
+                    c.10.insert(d.block_type.clone(), m);
+                }
                 Item::Gap | Item::FragmentEnd | Item::Comment(_) => {}
                 // Switching times, moods, members, access: each kind reads
                 // its own sets and claims.
@@ -1003,6 +1044,16 @@ impl Claims {
         for (n, v) in &self.8 {
             out.push_str(&format!("let {n} = {v}\n"));
         }
+        if !self.10.is_empty() {
+            out.push_str(
+                "\n# Defaults made in vislox. Every managed block of the type that does not bind the\n\
+                 # port itself takes the value, the module's own blocks among them.\n",
+            );
+        }
+        for (ty, m) in &self.10 {
+            let args: Vec<String> = m.iter().map(|(p, v)| format!("{p}: {v}")).collect();
+            out.push_str(&format!("defaults {ty}({})\n", args.join(", ")));
+        }
         let named = self.named_slugs();
         for (uuid, c) in &self.0 {
             let s = slug(uuid);
@@ -1056,6 +1107,7 @@ impl Claims {
             | Op::RemoveBlock { .. }
             | Op::RestoreBlock { .. }
             | Op::Rename { .. }
+            | Op::Defaults { .. }
             | Op::Tidy
             | Op::Move { .. }
             | Op::Relayout { .. }
@@ -1123,6 +1175,7 @@ impl Claims {
             v.push(Op::Let {
                 name: n.clone(),
                 value: Some(val.to_string()),
+                source: None,
             });
         }
         v
@@ -1220,7 +1273,7 @@ fn constant_ref(
 /// A constant's value as Lox Logic writes it: a number, one with its unit
 /// (`30min`, `70%`), a time of day (`19:00`) or `on`/`off`. lox checks it
 /// against each port bound to it.
-fn constant_value(v: &str) -> Result<Value, String> {
+pub(crate) fn constant_value(v: &str) -> Result<Value, String> {
     let t = v.trim();
     match t {
         "on" => return Ok(Value::Bool(true)),
@@ -1273,12 +1326,6 @@ fn set_constant(
     let name = name.trim();
     let previous = files.claims.8.get(name).map(|v| v.to_string());
     if previous.is_none() {
-        if ctx.lets.contains(name) {
-            return Err(format!(
-                "`{name}` is a constant of the module's own files: change it there (vislox \
-                 writes only its own files), or bind this block's port to a value of its own"
-            ));
-        }
         let Some(_) = value else {
             return Err(format!("vislox's file has no constant `{name}`"));
         };
@@ -1447,6 +1494,7 @@ pub fn apply(
         | Op::RemoveBlock { .. }
         | Op::RestoreBlock { .. }
         | Op::Rename { .. }
+        | Op::Defaults { .. }
         | Op::Tidy
         | Op::Move { .. }
         | Op::Relayout { .. }
@@ -1702,6 +1750,11 @@ pub struct Files {
     pub templates: BTreeMap<String, logic::TemplateDecl>,
     /// The Tree and Air hardware it declares (#85): [`crate::hw_edit::FILE`].
     pub hardware: crate::hw_edit::HwFile,
+    /// The module's own files a request rewrites (#81): one `let` or
+    /// `defaults` value changed, by path from the project root
+    /// ([`crate::module_edit`]). Not read from vislox's directory: an edit
+    /// writes them, and Discard takes them back with the rest of the module.
+    pub module: BTreeMap<String, String>,
 }
 
 /// The positions an edit gives managed blocks, and the pages it lays out
@@ -1871,6 +1924,7 @@ impl Files {
         if !self.claims.0.values().all(Claim::is_empty)
             || !self.claims.1.is_empty()
             || !self.claims.8.is_empty()
+            || !self.claims.10.is_empty()
             || crate::set_claim::KINDS
                 .iter()
                 .any(|k| !k.is_empty(&self.claims))
@@ -2286,6 +2340,9 @@ pub struct Ctx<'a> {
     /// The templates the module's own files declare (#83), by name: an
     /// instance of vislox's may call one.
     pub templates: &'a BTreeMap<String, logic::TemplateDecl>,
+    /// The module's own files (#81), read for a request that changes one
+    /// of their `let` or `defaults` values, or makes a default.
+    pub module: &'a crate::module_edit::ModuleSrc,
 }
 
 impl Ctx<'_> {
@@ -2394,7 +2451,46 @@ pub fn apply_op(files: &mut Files, ctx: &Ctx, op: &Op) -> Result<Applied, String
             crate::recipients_edit::apply(files, ctx, uuid, value.as_ref())
         }
         Op::Tiles { uuid, value } => crate::tiles_edit::apply(files, ctx, uuid, value.as_ref()),
-        Op::Let { name, value } => set_constant(files, ctx, name, value.as_deref()).map(done),
+        // A constant of the module's own files (#81): rewritten there.
+        Op::Let {
+            name,
+            value,
+            source,
+        } if !files.claims.8.contains_key(name.trim()) && ctx.lets.contains(name.trim()) => {
+            crate::module_edit::set_let(
+                files,
+                ctx,
+                name.trim(),
+                value.as_deref(),
+                source.as_deref(),
+            )
+            .map(|previous| Applied {
+                previous,
+                added: None,
+                warnings: Vec::new(),
+            })
+        }
+        Op::Let { name, value, .. } => set_constant(files, ctx, name, value.as_deref()).map(done),
+        Op::Defaults {
+            ty,
+            port,
+            value,
+            source,
+            blocks,
+        } => crate::module_edit::set_defaults(
+            files,
+            ctx,
+            ty.trim(),
+            port.trim(),
+            value.as_deref(),
+            source.as_deref(),
+            blocks.as_deref(),
+        )
+        .map(|previous| Applied {
+            previous,
+            added: None,
+            warnings: Vec::new(),
+        }),
         Op::Expr { uuid, port, value } => {
             crate::expr_edit::set_expr(files, ctx, uuid, port, value.as_deref()).map(done)
         }
@@ -2504,7 +2600,13 @@ pub fn undo_ops(
             | Op::Instance { .. }
             | Op::RestoreRule { .. }
             | Op::RemovePage { .. }
+            | Op::Defaults { .. }
             | Op::Unadopt { .. } => undo.push(serde_json::from_value(prev).map_err(bad)?),
+            // A constant of the module's own files (#81): the op that writes
+            // its old text back.
+            Op::Let { .. } if prev.is_object() => {
+                undo.push(serde_json::from_value(prev).map_err(bad)?)
+            }
             Op::Rule { uuid, .. } => undo.push(Op::Rule {
                 uuid: uuid.clone(),
                 value: serde_json::from_value(prev).map_err(bad)?,
@@ -5149,6 +5251,7 @@ pub fn current_with(
         | Op::RemoveBlock { .. }
         | Op::RestoreBlock { .. }
         | Op::Rename { .. }
+        | Op::Defaults { .. }
         | Op::Tidy
         | Op::Move { .. }
         | Op::Relayout { .. }
@@ -5658,6 +5761,7 @@ pub(crate) mod tests {
             page_adoptions: &pad,
             claimed: &claimed,
             templates: &NO_TEMPLATES,
+            module: &crate::module_edit::NO_MODULE,
         };
         let op = Op::NewPage {
             title: "Küche Logik".into(),
@@ -5859,6 +5963,7 @@ pub(crate) mod tests {
                 page_adoptions: &Default::default(),
                 claimed: &Default::default(),
                 templates: &Default::default(),
+                module: &Default::default(),
             };
             apply_op(&mut files, &ctx, &add(EG, t, None, &[], &[])).unwrap();
             let mut l = Lockfile::default();
@@ -5894,6 +5999,7 @@ pub(crate) mod tests {
             page_adoptions: &Default::default(),
             claimed: &Default::default(),
             templates: &Default::default(),
+            module: &Default::default(),
         };
         let a = apply_op(
             &mut files,
@@ -5966,6 +6072,7 @@ pub(crate) mod tests {
             page_adoptions: &Default::default(),
             claimed: &Default::default(),
             templates: &Default::default(),
+            module: &Default::default(),
         };
         let title = Op::Title {
             uuid: mono.clone(),
@@ -6031,6 +6138,7 @@ pub(crate) mod tests {
             page_adoptions: &Default::default(),
             claimed: &Default::default(),
             templates: &Default::default(),
+            module: &Default::default(),
         };
         let r = apply_op(&mut files, &ctx, &Op::RemoveBlock { uuid: mono.clone() }).unwrap();
         // It names the block it adds again (#62): lox mints new UUIDs for it.
@@ -6061,6 +6169,7 @@ pub(crate) mod tests {
             page_adoptions: &Default::default(),
             claimed: &Default::default(),
             templates: &Default::default(),
+            module: &Default::default(),
         };
         let r = apply_op(&mut files.clone(), &ctx, &Op::RemoveBlock { uuid: pulse }).unwrap();
         assert_eq!(r.previous["op"], "restore_block");
@@ -6087,6 +6196,7 @@ pub(crate) mod tests {
             page_adoptions: &Default::default(),
             claimed: &Default::default(),
             templates: &Default::default(),
+            module: &Default::default(),
         };
         apply_op(&mut files, &ctx, &add(OG, "And", Some("Licht"), &[], &[])).unwrap();
         let text = files.render()["obergeschoss.loxl"].clone();
@@ -6121,6 +6231,7 @@ pub(crate) mod tests {
             page_adoptions: &Default::default(),
             claimed: &Default::default(),
             templates: &Default::default(),
+            module: &Default::default(),
         };
         apply_op(&mut files, &ctx, &add(OG, "Or", None, &[], &[])).unwrap();
         let r = files.render();
@@ -6157,6 +6268,7 @@ pub(crate) mod tests {
             page_adoptions: &Default::default(),
             claimed: &Default::default(),
             templates: &Default::default(),
+            module: &Default::default(),
         };
         for s in ["vx_and_1", "vx_or_1"] {
             let uuid = l.objects[s].uuid.clone();
@@ -6189,6 +6301,7 @@ pub(crate) mod tests {
             page_adoptions: &Default::default(),
             claimed: &Default::default(),
             templates: &Default::default(),
+            module: &Default::default(),
         };
         let mut files = Files::default();
         let prog = "int main() {\r\n  setoutput(0, 1);\r\n}\r\n";
@@ -6291,6 +6404,7 @@ pub(crate) mod tests {
             page_adoptions: &Default::default(),
             claimed: &Default::default(),
             templates: &Default::default(),
+            module: &Default::default(),
         };
         let mut files = Files::default();
         apply_op(
@@ -6347,6 +6461,7 @@ pub(crate) mod tests {
             page_adoptions: &Default::default(),
             claimed: &Default::default(),
             templates: &Default::default(),
+            module: &Default::default(),
         };
         let mut files = Files::default();
         let err = |op: Op| apply_op(&mut files.clone(), &ctx, &op).unwrap_err();
@@ -6386,6 +6501,7 @@ pub(crate) mod tests {
             page_adoptions: &Default::default(),
             claimed: &Default::default(),
             templates: &Default::default(),
+            module: &Default::default(),
         };
         let e = apply_op(&mut Files::default(), &ctx, &add(OG, "And", None, &[], &[])).unwrap_err();
         assert!(e.contains("2 pages are titled"), "{e}");
@@ -6438,6 +6554,7 @@ pub(crate) mod tests {
             page_adoptions: &Default::default(),
             claimed: &Default::default(),
             templates: &Default::default(),
+            module: &Default::default(),
         };
         apply_op(&mut files, &ctx, &add(OG, "And", Some("Licht"), &[], &[])).unwrap();
         // Deployed: the base draws it where lox placed it.
@@ -6458,6 +6575,7 @@ pub(crate) mod tests {
             page_adoptions: &Default::default(),
             claimed: &Default::default(),
             templates: &Default::default(),
+            module: &Default::default(),
         };
         // Snapped to the grid, the size kept; `previous` moves it back.
         let mut files = Files::from_texts(&files.render()).unwrap();
@@ -6543,6 +6661,7 @@ pub(crate) mod tests {
             page_adoptions: &Default::default(),
             claimed: &Default::default(),
             templates: &Default::default(),
+            module: &Default::default(),
         };
         apply_op(&mut files, &ctx, &add(OG, "And", None, &[], &[])).unwrap();
         apply_op(&mut files, &ctx, &add(OG, "Or", None, &[], &[])).unwrap();
@@ -6560,6 +6679,7 @@ pub(crate) mod tests {
             page_adoptions: &Default::default(),
             claimed: &Default::default(),
             templates: &Default::default(),
+            module: &Default::default(),
         };
         let err = |op: Op| apply_op(&mut files.clone(), &ctx, &op).unwrap_err();
         // Drawn in Loxone Config: lox does not move it.
@@ -6669,6 +6789,7 @@ pub(crate) mod tests {
             page_adoptions: &Default::default(),
             claimed: &Default::default(),
             templates: &Default::default(),
+            module: &Default::default(),
         };
         apply_op(&mut files, &ctx, &add(OG, "And", None, &[], &[])).unwrap();
         let out = compile_files(&d, &files, &mut l).unwrap();
@@ -6696,6 +6817,7 @@ pub(crate) mod tests {
                 page_adoptions: &Default::default(),
                 claimed: &Default::default(),
                 templates: &Default::default(),
+                module: &Default::default(),
             };
             files.layout = Placement::default();
             apply_op(
@@ -6769,6 +6891,7 @@ pub(crate) mod tests {
             page_adoptions: &Default::default(),
             claimed: &Default::default(),
             templates: &Default::default(),
+            module: &Default::default(),
         };
         apply_op(&mut files, &ctx, &add(OG, "And", None, &[], &[])).unwrap();
         apply_op(&mut files, &ctx, &add(EG, "Or", None, &[], &[])).unwrap();
@@ -6825,6 +6948,7 @@ pub(crate) mod tests {
             page_adoptions: &Default::default(),
             claimed: &Default::default(),
             templates: &Default::default(),
+            module: &Default::default(),
         };
         apply_op(&mut files, &ctx, &add(OG, "And", None, &[], &[])).unwrap();
         let out = compile_files(&d, &files, &mut l).unwrap();
@@ -6916,6 +7040,7 @@ pub(crate) mod tests {
             page_adoptions: &Default::default(),
             claimed: &Default::default(),
             templates: &Default::default(),
+            module: &Default::default(),
         };
         // The Divide block's output onto the upper floor's OR: another page.
         let w = wire_op((DIV, "AQ"), (OR, "I2"));
@@ -6964,6 +7089,7 @@ pub(crate) mod tests {
             page_adoptions: &Default::default(),
             claimed: &Default::default(),
             templates: &Default::default(),
+            module: &Default::default(),
         };
         // One request may take a wire out and draw it again (an undo and a
         // redo, a reconnect to the same port): the ops see each other.
@@ -7004,6 +7130,7 @@ pub(crate) mod tests {
             page_adoptions: &Default::default(),
             claimed: &Default::default(),
             templates: &Default::default(),
+            module: &Default::default(),
         };
         let err = |op: Op| apply_op(&mut Files::default(), &ctx, &op).unwrap_err();
         assert!(err(wire_op((DIV, "Input2"), (OR, "I2"))).contains("is an input"));
@@ -7055,6 +7182,7 @@ pub(crate) mod tests {
             page_adoptions: &Default::default(),
             claimed: &Default::default(),
             templates: &Default::default(),
+            module: &Default::default(),
         };
         let e = apply_op(
             &mut Files::default(),
@@ -7093,6 +7221,7 @@ pub(crate) mod tests {
             page_adoptions: &Default::default(),
             claimed: &Default::default(),
             templates: &Default::default(),
+            module: &Default::default(),
         };
         let e = apply_op(
             &mut Files::default(),
@@ -7134,6 +7263,7 @@ pub(crate) mod tests {
             page_adoptions: &Default::default(),
             claimed: &Default::default(),
             templates: &Default::default(),
+            module: &Default::default(),
         };
         apply_op(&mut files, &ctx, &add(OG, "And", None, &[("I2", "1")], &[])).unwrap();
         let out = compile_files(&d, &files, &mut l).unwrap();
@@ -7151,6 +7281,7 @@ pub(crate) mod tests {
             page_adoptions: &Default::default(),
             claimed: &Default::default(),
             templates: &Default::default(),
+            module: &Default::default(),
         };
         // Its input with a constant takes no wire; the other does.
         let e = apply_op(&mut files, &ctx, &wire_op((DIV, "AQ"), (&new, "I2"))).unwrap_err();
@@ -7189,6 +7320,7 @@ pub(crate) mod tests {
             page_adoptions: &Default::default(),
             claimed: &Default::default(),
             templates: &Default::default(),
+            module: &Default::default(),
         };
         let undo = apply_op(&mut files, &ctx, &Op::RemoveBlock { uuid: new.clone() })
             .unwrap()
@@ -7229,6 +7361,7 @@ pub(crate) mod tests {
             page_adoptions: &Default::default(),
             claimed: &Default::default(),
             templates: &Default::default(),
+            module: &Default::default(),
         };
         let a = apply_op(&mut files, &ctx, &undo).unwrap();
         let slug2 = a.added.unwrap();
@@ -7322,6 +7455,7 @@ pub(crate) mod tests {
             page_adoptions: &pages,
             claimed: &Default::default(),
             templates: &Default::default(),
+            module: &Default::default(),
         };
         let back = |f: &mut Files, u: &str| {
             apply_op(
@@ -7469,6 +7603,7 @@ pub(crate) mod tests {
             page_adoptions: &Default::default(),
             claimed: &claimed,
             templates: &Default::default(),
+            module: &Default::default(),
         };
         let (mon, sat, hol) = (builtin_uuid(4), builtin_uuid(9), builtin_uuid(1));
         let wk: Vec<(String, Vec<Sp>)> = (4..=8)
@@ -7691,6 +7826,7 @@ pub(crate) mod tests {
             page_adoptions: &Default::default(),
             claimed: &Default::default(),
             templates: &Default::default(),
+            module: &Default::default(),
         };
         let mon = builtin_uuid(4);
         let mut files = Files::default();
@@ -7799,6 +7935,7 @@ pub(crate) mod tests {
             page_adoptions: &Default::default(),
             claimed: &Default::default(),
             templates: &Default::default(),
+            module: &Default::default(),
         };
         let mut files = Files::default();
         let mon = builtin_uuid(4);
@@ -7913,6 +8050,7 @@ pub(crate) mod tests {
             page_adoptions: &EMPTY_PAGES,
             claimed,
             templates: &NO_TEMPLATES,
+            module: &crate::module_edit::NO_MODULE,
         }
     }
 
@@ -8447,6 +8585,7 @@ pub(crate) mod tests {
             page_adoptions: &EMPTY_PAGES,
             claimed,
             templates: &NO_TEMPLATES,
+            module: &crate::module_edit::NO_MODULE,
         }
     }
 
@@ -9562,6 +9701,7 @@ pub(crate) mod tests {
             page_adoptions: &NONE_P,
             claimed: &NONE_C,
             templates: &NO_TEMPLATES,
+            module: &crate::module_edit::NO_MODULE,
         }
     }
 
@@ -10087,6 +10227,7 @@ pub(crate) mod tests {
         Op::Let {
             name: name.into(),
             value: v.map(Into::into),
+            source: None,
         }
     }
 
@@ -10179,6 +10320,260 @@ pub(crate) mod tests {
         assert_eq!(files.render(), text_with(&files));
     }
 
+    /// [`compile_files`] with the module's own files too (`own`: path in
+    /// the module → text) and the rewrites of `files.module` over them.
+    fn compile_own(
+        base: &LoxoneDoc,
+        own: &BTreeMap<String, String>,
+        files: &Files,
+        lock: &mut Lockfile,
+    ) -> Result<LoxoneDoc, String> {
+        let tmp = tempfile::tempdir().map_err(|e| e.to_string())?;
+        let module = tmp.path().join("module");
+        let dir = module.join(DIR);
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        for (name, t) in files.all_texts() {
+            std::fs::write(dir.join(name), t).map_err(|e| e.to_string())?;
+        }
+        for (path, t) in own {
+            let t = files.module.get(&format!("module/{path}")).unwrap_or(t);
+            std::fs::write(module.join(path), t).map_err(|e| e.to_string())?;
+        }
+        let m =
+            loxone_config::cli::read_module(module.to_str().unwrap()).map_err(|e| e.to_string())?;
+        let opts = CompileOptions {
+            machine: [0x50, 0x4f, 0x94, 0, 0, 1],
+            mint_time_unix: 0,
+            page_title: None,
+            allow_removals: false,
+            accept_version: None,
+            relayout: vec![],
+        };
+        let out = logic::compile(base, &m, lock, &opts).map_err(|e| e.to_string())?;
+        LoxoneDoc::parse(&out.to_bytes()).map_err(|e| e.to_string())
+    }
+
+    fn defaults_op(
+        ty: &str,
+        port: &str,
+        v: Option<&str>,
+        source: Option<&str>,
+        blocks: Option<&[&str]>,
+    ) -> Op {
+        Op::Defaults {
+            ty: ty.into(),
+            port: port.into(),
+            value: v.map(Into::into),
+            source: source.map(Into::into),
+            blocks: blocks.map(|b| b.iter().map(|s| s.to_string()).collect()),
+        }
+    }
+
+    /// The module's own `let` and `defaults` values are rewritten where they
+    /// are (#81): one value, the rest of the file byte for byte, compiled by
+    /// lox, refused on a stale line, and undone to the exact old text.
+    #[test]
+    fn a_module_constant_and_default_are_rewritten_in_place_and_undone() {
+        let d = doc("house.Loxone");
+        let own_text = "page \"Obergeschoss\"\n\n# Werte des Hauses\nlet nachlauf  =  30min   # bis aus\nlet name = \"Haus\"\ndefaults Monoflop(\n\tTime: nachlauf, # alle\n\tReset: 0,\n)\n\nlicht = Monoflop(\"Licht\")\nflur = Monoflop(\"Flur\", Time: 10s)\nteil = Div(\"Teil\")\n";
+        let own: BTreeMap<String, String> =
+            [("haus.loxl".to_string(), own_text.to_string())].into();
+        let mut l = Lockfile::default();
+        let out = compile_own(&d, &own, &Files::default(), &mut l).unwrap();
+        let licht = l.objects["licht"].uuid.clone();
+        let flur = l.objects["flur"].uuid.clone();
+        let teil = l.objects["teil"].uuid.clone();
+        let before_time = def_of(&out, &licht, "Time").unwrap();
+        let lock = lock_of(&l);
+        let names: BTreeSet<String> = ["nachlauf", "name", "licht", "flur", "teil"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let lets: BTreeSet<String> = ["nachlauf".to_string(), "name".to_string()].into();
+        let src = crate::module_edit::ModuleSrc {
+            dir: "module/vislox".into(),
+            texts: [("module/haus.loxl".to_string(), own_text.to_string())].into(),
+        };
+        let mut ctx = ctx_of(&out, &d, &lock, None, &names);
+        ctx.lets = &lets;
+        ctx.module = &src;
+        let mut files = Files::default();
+        let line = "let nachlauf  =  30min   # bis aus";
+        let mlet = |v: Option<&str>, source: Option<&str>| Op::Let {
+            name: "nachlauf".into(),
+            value: v.map(Into::into),
+            source: source.map(Into::into),
+        };
+        // Refused, changing nothing: no line, a stale line, no value, a text.
+        for (op, why) in [
+            (mlet(Some("45min"), None), "`source`"),
+            (
+                mlet(Some("45min"), Some("let nachlauf = 30min")),
+                "changed since",
+            ),
+            (mlet(None, Some(line)), "never drops"),
+            (mlet(Some("hoch"), Some(line)), "no constant"),
+            (
+                Op::Let {
+                    name: "name".into(),
+                    value: Some("1".into()),
+                    source: Some("let name = \"Haus\"".into()),
+                },
+                "text constant",
+            ),
+        ] {
+            let e = apply_op(&mut files, &ctx, &op).unwrap_err();
+            assert!(e.contains(why), "{why}: {e}");
+            assert_eq!(files, Files::default());
+        }
+        // Changed: that value and nothing else.
+        let r = apply_op(&mut files, &ctx, &mlet(Some("45min"), Some(line))).unwrap();
+        let new_text = own_text.replace("=  30min   #", "=  45min   #");
+        assert_eq!(files.module["module/haus.loxl"], new_text);
+        assert!(files.render().is_empty(), "{:?}", files.render());
+        assert_eq!(
+            r.previous,
+            serde_json::json!({ "op": "let", "name": "nachlauf", "value": "30min",
+                                "source": "let nachlauf  =  45min   # bis aus" })
+        );
+        let out2 = compile_own(&d, &own, &files, &mut l).unwrap();
+        let after_time = def_of(&out2, &licht, "Time").unwrap();
+        let (b, a): (f64, f64) = (before_time.parse().unwrap(), after_time.parse().unwrap());
+        assert_eq!(a / b, 1.5, "{before_time} → {after_time}");
+        assert_eq!(def_of(&out2, &flur, "Time"), def_of(&out, &flur, "Time"));
+        // Undone through `undo`: the exact old text, byte for byte.
+        let ops = [mlet(Some("45min"), Some(line))];
+        let undo = undo_ops(&ops, std::slice::from_ref(&r.previous), &[None]).unwrap();
+        let mut back = files.clone();
+        apply_op(&mut back, &ctx, &undo[0]).unwrap();
+        assert_eq!(back.module["module/haus.loxl"], own_text);
+
+        // The default: its consent names exactly the blocks it changes, the
+        // module's own `licht` (`flur` binds Time itself).
+        let stmt = "defaults Monoflop(\n\tTime: nachlauf, # alle\n\tReset: 0,\n)";
+        let e = apply_op(
+            &mut files.clone(),
+            &ctx,
+            &defaults_op("Monoflop", "Time", Some("5min"), Some(stmt), None),
+        )
+        .unwrap_err();
+        assert!(e.contains("changes 1 block: licht"), "{e}");
+        let e = apply_op(
+            &mut files.clone(),
+            &ctx,
+            &defaults_op(
+                "Monoflop",
+                "Time",
+                Some("5min"),
+                Some(stmt),
+                Some(&["licht", "flur"]),
+            ),
+        )
+        .unwrap_err();
+        assert!(e.contains("Confirm exactly these"), "{e}");
+        let e = apply_op(
+            &mut files.clone(),
+            &ctx,
+            &defaults_op(
+                "Monoflop",
+                "Time",
+                Some("5min"),
+                Some("defaults Monoflop(Time: 1)"),
+                Some(&["licht"]),
+            ),
+        )
+        .unwrap_err();
+        assert!(e.contains("changed since"), "{e}");
+        let e = apply_op(
+            &mut files.clone(),
+            &ctx,
+            &defaults_op(
+                "Monoflop",
+                "Trigger",
+                Some("1"),
+                Some(stmt),
+                Some(&["licht", "flur"]),
+            ),
+        )
+        .unwrap_err();
+        assert!(e.contains("never adds one"), "{e}");
+        let before = files.clone();
+        let r = apply_op(
+            &mut files,
+            &ctx,
+            &defaults_op(
+                "Monoflop",
+                "Time",
+                Some("5min"),
+                Some(stmt),
+                Some(&["licht"]),
+            ),
+        )
+        .unwrap();
+        let new2 = new_text.replace("\tTime: nachlauf, # alle", "\tTime: 5min, # alle");
+        assert_eq!(files.module["module/haus.loxl"], new2);
+        let out3 = compile_own(&d, &own, &files, &mut l).unwrap();
+        assert_eq!(
+            def_of(&out3, &licht, "Time").map(|t| t.parse::<f64>().unwrap() / b),
+            Some(1.0 / 6.0)
+        );
+        let ops = [defaults_op(
+            "Monoflop",
+            "Time",
+            Some("5min"),
+            Some(stmt),
+            Some(&["licht"]),
+        )];
+        let undo = undo_ops(&ops, std::slice::from_ref(&r.previous), &[None]).unwrap();
+        let mut back = files.clone();
+        apply_op(&mut back, &ctx, &undo[0]).unwrap();
+        assert_eq!(back, before);
+
+        // A default made here: in vislox's file of claims, reaching the
+        // module's own block; undone, it is gone.
+        let e = apply_op(
+            &mut files.clone(),
+            &ctx,
+            &defaults_op("Div", "Input2", Some("4"), None, Some(&[])),
+        )
+        .unwrap_err();
+        assert!(e.contains("changes 1 block: teil"), "{e}");
+        let before = files.clone();
+        let r = apply_op(
+            &mut files,
+            &ctx,
+            &defaults_op("Div", "Input2", Some("4"), None, Some(&["teil"])),
+        )
+        .unwrap();
+        assert_eq!(r.previous["value"], serde_json::Value::Null);
+        assert!(
+            files.render()["edits.loxl"].contains("\ndefaults Div(In2: 4)\n"),
+            "{}",
+            files.render()["edits.loxl"]
+        );
+        assert_eq!(
+            Files::from_texts(&files.render()).unwrap().claims,
+            files.claims
+        );
+        let out4 = compile_own(&d, &own, &files, &mut l).unwrap();
+        assert_eq!(def_of(&out4, &teil, "Input2").as_deref(), Some("4"));
+        let undo = undo_ops(
+            &[defaults_op(
+                "Div",
+                "Input2",
+                Some("4"),
+                None,
+                Some(&["teil"]),
+            )],
+            &[r.previous],
+            &[None],
+        )
+        .unwrap();
+        apply_op(&mut files, &ctx, &undo[0]).unwrap();
+        assert_eq!(files, before);
+        assert!(files.render().is_empty());
+    }
+
     /// The files' texts, read back and rendered again: a fixed point.
     fn text_with(files: &Files) -> BTreeMap<String, String> {
         Files::from_texts(&files.render()).unwrap().render()
@@ -10198,7 +10593,8 @@ pub(crate) mod tests {
         assert!(err(&mut files, let_op("vx_Zeit", Some("1"))).contains("invalid slug"));
         assert!(err(&mut files, let_op("vx_belegt", Some("1"))).contains("is taken"));
         assert!(err(&mut files, let_op(&slug(DIV), Some("1"))).contains("vx_"));
-        // The module's own constant is changed in its file.
+        // The module's own constant is rewritten in its file, which names the
+        // line it changes (see `a_module_constant_and_default_are_rewritten_…`).
         assert!(err(&mut files, let_op("schwelle", Some("1"))).contains("module's own files"));
         assert!(err(&mut files, let_op("vx_x", None)).contains("has no constant"));
         assert!(err(&mut files, let_op("vx_x", Some("12,5"))).contains("no constant"));

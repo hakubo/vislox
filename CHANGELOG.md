@@ -170,8 +170,11 @@ published under the same version (see [docker/README.md](docker/README.md)).
   its value from (`Time 30min (nachlauf)`), with its file and line, and the Changes list puts the changes one
   constant causes together under it. *Make a constant* names a value in vislox's file (`let vx_… = 30min`) and binds
   the port to it; another block takes it by its name. Changing it asks: the constant (every port bound to it) or
-  only this block. The module's own `let` and `defaults` lines are shown, not changed: vislox writes only its own
-  files. Never deploys.
+  only this block. The module's own `let` and `defaults` values are changed where they are: one value rewritten on
+  its line, every other byte of the file kept, refused when the line changed since the page showed it, undone to
+  the exact old text. *Default…* makes a `defaults` statement in vislox's file or changes one; it lists every block
+  the default changes (the module's own among them) and the edit names exactly those. The Deploy pane and Apply's
+  confirmation name each changed constant and default with its blocks. Never deploys.
 - Expressions and named signals (#82): the `And`, `Or`, `Not`, comparator and `Formula` blocks lox made for one
   expression are drawn as one block showing the expression (click to open the group, its title folds it again),
   Properties of any of them shows the expression, what it feeds or the signal's name, and its file and line, and the

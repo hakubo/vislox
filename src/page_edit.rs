@@ -486,6 +486,7 @@ pub(crate) mod tests {
             page_adoptions: &PAD,
             claimed: &CL,
             templates: &NO_TEMPLATES,
+            module: &crate::module_edit::NO_MODULE,
         }
     }
 
