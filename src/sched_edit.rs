@@ -179,6 +179,32 @@ impl Modes {
         Ok(Day::Title(title.clone()))
     }
 
+    /// How a calendar entry's `switches:` names the mode `uuid` (#86): the
+    /// one spelling lox takes, as a schedule line names it.
+    pub fn spell(&self, uuid: &str) -> Result<loxone_config::logic::Value, String> {
+        use loxone_config::logic::Value;
+        Ok(match self.day(uuid)? {
+            Day::Keyword(w) | Day::Slug(w) => Value::Ref(w),
+            Day::Title(t) => Value::Str(t),
+        })
+    }
+
+    /// The mode a `switches:` value names, by UUID (lowercase): a day word,
+    /// a slug of the lockfile's, or a title.
+    pub fn uuid_of(&self, v: &loxone_config::logic::Value) -> Option<String> {
+        use loxone_config::logic::Value;
+        let day = match v {
+            Value::Ref(w) if BUILTIN.iter().any(|(_, d)| d == w) => Day::Keyword(w.clone()),
+            Value::Ref(s) => Day::Slug(s.clone()),
+            Value::Str(t) => Day::Title(t.clone()),
+            _ => return None,
+        };
+        match self.uuids(&day).ok()?.as_slice() {
+            [u] => Some(u.to_ascii_lowercase()),
+            _ => None,
+        }
+    }
+
     /// The modes a line's day names, by UUID (lowercase).
     fn uuids(&self, day: &Day) -> Result<Vec<String>, String> {
         let builtin = |ns: &[u8]| ns.iter().map(|n| builtin_uuid(*n)).collect();
@@ -441,6 +467,22 @@ impl set_claim::SetKind for SchedKind {
             "{name}: only a DayTimer's switching times are written in Lox Logic; change these in \
              Loxone Config"
         )
+    }
+    /// The operating modes of vislox's files a set's lines name by slug
+    /// (#86): such a mode is not deleted while a set names it. A mode the
+    /// module names stays the module's.
+    fn named(lines: &[ScheduleLine]) -> Vec<String> {
+        let mut out: Vec<String> = lines
+            .iter()
+            .flat_map(|l| &l.days)
+            .filter_map(|d| match d {
+                Day::Slug(s) if s.starts_with(crate::blocks::SLUG_PREFIX) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        out.sort();
+        out.dedup();
+        out
     }
     fn parts(v: &Sched) -> set_claim::Parts<'_, Self> {
         (v.set.as_ref(), v.modes.as_ref(), &v.restore)

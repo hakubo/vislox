@@ -192,6 +192,11 @@ published under the same version (see [docker/README.md](docker/README.md)).
   (Properties, shown read-only everywhere), and *Add* on a Tree extension creates an unpaired Tree device of the kinds
   lox creates, tagged *unpaired* in the tree and in Apply's confirmation; Remove/Delete and Undo as for a block. Written
   into `<module>/vislox/_hardware.loxl` as hardware declarations. Never deploys, never pairs.
+- Operating modes and calendar entries (#86): *Add mode* and *Add entry* in the Operating modes view, and *Edit* on an
+  entry added here: its name, the mode it switches on and its date (every year on a day, relative to Easter, one
+  period, a range every year), typed or picked on the year by a click or a drag, the draft's days outlined. Written into
+  `<module>/vislox/_periphery.loxl` with the mode spelled as lox takes it; Undo, Revert, Remove and Delete as for a
+  block. Entries and modes Loxone Config made stay read-only. Never deploys, never touches the live calendar.
 
 ## 0.2.0
 

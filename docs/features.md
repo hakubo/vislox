@@ -382,6 +382,16 @@ sends to the Miniserver see [miniserver.md](miniserver.md).
   (with each command of a device added with it) and a changed setting old → new. Nothing is sent to the device.
   Adopting one Loxone Config made is not offered yet. How: [editing.md](editing.md#virtual-inputs-virtual-and-modbus-devices-84).
 
+- **Operating modes and calendar entries** (the same project and token, #86): the Operating modes view's *Add mode*
+  adds a user mode by its name (lox numbers it), and *Add entry* a calendar entry: its name, the mode it switches on
+  and its date, one of four kinds: every year on a day, relative to Easter, one period, a range every year. Click a
+  day of the year, or drag across days, to pick the date; the draft's days are outlined, and once compiled the new
+  days show outlined as added. *Edit* on an entry added here changes its name, mode and date; Undo, Revert, Remove
+  and Delete work as for a block, and a mode is not deleted while an entry switches it on. vislox writes
+  `<module>/vislox/_periphery.loxl` and names each mode the one way lox takes it (`holiday`, a slug, or `"Title"`).
+  Entries and modes Loxone Config made stay read-only (*Edit* says why), and nothing changes the Miniserver's live
+  calendar. How: [editing.md](editing.md#operating-modes-and-calendar-entries-86).
+
 - **Tree and Air hardware** (the same project and token, #85): *Edit values* on a Tree or Air input, digital output
   or analog sensor switches its *Statistics* on or off (shown read-only on every revision, old → new when comparing).
   *Add* on a Tree extension of the project tree creates a Tree device lox can create (Touch Tree, Presence Sensor

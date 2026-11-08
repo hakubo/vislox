@@ -6,9 +6,9 @@ Daytimer's switching times (#73), a lighting controller's moods (#74), a central
 open an NFC Code Touch (#76), push notifications: who gets them and what they say (#77), the tiles of a Touch
 Pure Flex (#78), a managed block's label and settings, its program among them (#79), deleting and renaming a
 managed block (#80), `let` constants and `defaults` (#81), expressions and named signals (#82), template
-instances (#83), virtual inputs, virtual and Modbus devices (#84), and Tree and Air hardware: statistics and new
-Tree devices (#85). This page is the design they share. #58 to #62, #72 to #85 are built (#81 to #84 in part: see
-their sections); the rest says where each step plugs in.
+instances (#83), virtual inputs, virtual and Modbus devices (#84), Tree and Air hardware: statistics and new
+Tree devices (#85), and operating modes and calendar entries (#86). This page is the design they share. #58 to #62,
+#72 to #86 are built (#81 to #84 and #86 in part: see their sections); the rest says where each step plugs in.
 
 ## The rules
 
@@ -19,7 +19,8 @@ their sections); the rest says where each step plugs in.
   Miniserver runs.
 - **vislox writes one place: its own files under the module directory**, `<module>/vislox/`: `edits.loxl` for
   the values it claims, the wires it draws and the constants it makes (#81), and one file per page for the blocks it adds
-  (`<module>/vislox/obergeschoss.loxl`), `_periphery.loxl` for the virtual inputs and devices it adds (#84),
+  (`<module>/vislox/obergeschoss.loxl`), `_periphery.loxl` for the virtual inputs and devices (#84), operating modes and
+  calendar entries (#86) it adds,
   `_hardware.loxl` for the Tree and Air hardware it declares (#85), and a file per program a block of them runs
   (`vx_code16_1.c`, #79).
   The rest of the module is never touched. A module that is one file cannot be edited from vislox.
@@ -106,7 +107,8 @@ is what undoes a `remove_block` of a deployed block (#80); vislox makes it, see 
   `let` is a value op (#81): its `previous` is the constant's value before, or null when the op made it. `expr`
   is a value op too (#82): what vislox's files fed the input before, or null; `signal`'s `previous` is the `signal`
   op that puts back what was (null `value`: the op made the signal). `instance` is as `signal`, for a template
-  instance (#83). `statistics` is a value op (#85): what vislox's file claimed before, or null. A Tree device created
+  instance (#83). `statistics` is a value op (#85): what vislox's file claimed before, or null. `entry_mode` and
+  `entry_date` are value ops (#86): the mode's UUID and the date as written before, or null. A Tree device created
   here is added and removed as a block: `remove_block`'s `previous` is the `add_block` that creates it again (a new
   UUID) or, once deployed, the `restore_block` that brings it back with its UUID.
   A reconnected wire is one request, `unwire` then `wire`:
@@ -622,7 +624,58 @@ vx_modbusdev_1 = ModbusDev("Regler", device: vx_7e000002_0000_0000_ffff504f94000
 - **Not yet**: adopting a virtual input or device Loxone Config made (lox's `adopt --uuid` takes a device with all
   its I/O, under slugs lox picks, `<device slug>_<title>`, into a file per folder; vislox's adoption (#72) moves
   only page blocks into its page files). Until then its settings are Loxone Config's (Properties shows them
-  read-only). Operating modes and calendar entries, of the same lox table, are #86's.
+  read-only). Operating modes and calendar entries, of the same lox table, are #86's (next section).
+
+## Operating modes and calendar entries (#86)
+
+An operating mode (`Mode`) and a calendar entry (`CalendarEntry`) are objects of the object tree too, declared in
+`_periphery.loxl` (`src/calendar_edit.rs`). lox puts a mode into the *Betriebsmodi* folder (`ModeCaption`) and mints
+its `Mode=` number once (one below the lowest in use: `-1`, `-2`, …); an entry goes into *Betriebszeiten*
+(`CalendarCaption`):
+
+```text
+vx_mode_1 = Mode("Grill")                                                              # <module>/vislox/_periphery.loxl
+vx_calendarentry_1 = CalendarEntry("Grillfest", switches: vx_mode_1, from: 2026-07-04, to: 2026-07-05)
+vx_calendarentry_2 = CalendarEntry("Betriebsurlaub", switches: vacation, every: 08-01)
+vx_calendarentry_3 = CalendarEntry("Fasching", switches: "Party", easter: -47)
+```
+
+- **A mode** is added with `add_block` (`type: "Mode"`, `page` the Betriebsmodi folder, a name and nothing else).
+  It is renamed, taken out, deleted and undone as a block of vislox's files. Its name is no other mode's (compared
+  case-blind), so that a `switches: "Title"` or a schedule line naming a mode by its title keeps naming one. It is
+  not taken out or deleted while anything names it: an entry of vislox's (`switches: vx_mode_1`), a schedule set of
+  vislox's (`vx_mode_1 08:00-12:00`), or an entry of the pending config Loxone Config made whose `CalType=` is its number
+  (`blocks[].delete` names them). A built-in mode (`Mode=` ≥ 0) and one Loxone
+  Config made are not edited here (lox adopts a user mode with `adopt --uuid`; vislox's adoption, #72, moves page
+  blocks only).
+- **An entry** is added with `add_block` (`type: "CalendarEntry"`, `page` the Betriebszeiten folder) and two
+  settings: `switches`, the UUID of the mode it switches on, and `date`, as the source writes it. Its mode and date
+  are then changed with two value ops, both on an entry of vislox's files only:
+  - `entry_mode` (`{ "op": "entry_mode", "uuid": "<entry>", "value": "<mode UUID>" }`): vislox writes the one
+    spelling lox takes (`sched_edit::Modes::spell`, as a schedule line): a built-in mode by its day word (`holiday`,
+    `vacation`, `dayoff`, `mon` … `sun`, `heating`, `cooling`), a mode the module or vislox names by its slug (not
+    a slug that is a day word), any other by its quoted title. A title two modes share is refused.
+  - `entry_date` (`{ "op": "entry_date", "uuid": "<entry>", "value": "every: 12-31" }`): one of the four kinds,
+    `every: MM-DD` (no year), `easter: <days>` (before Easter Sunday when negative, at most 366 either way),
+    `from: YYYY-MM-DD, to: YYYY-MM-DD` (one period, on 2009-01-01 or later, ending on or after its start) and
+    `from: MM-DD, to: MM-DD` (every year; across New Year when `to` is earlier). Checked as lox checks it: two-digit
+    month and day, a day of the year (`02-29` is one).
+  The stored attributes (`CalType`, `Mode`, `Month`, `From`, `EasterOffset`, `WeekDayInMonth`, …) are never
+  settings: Properties shows the entry's *When* and *Switches on*, and Advanced the attributes.
+- **Undo** carries the mode by UUID, never by its spelling (where `switches:` names no mode of the config any more,
+  the undo carries it as written, `"Urlaub"`, and puts exactly that back): `remove_block`'s `previous` of an entry is the
+  `add_block` with `switches` the mode's UUID. `Files::ops` lists `entry_mode` and `entry_date` for each entry of
+  vislox's files, and `edit::current` reads both back from the config (`CalType=` through the modes' `Mode=` numbers,
+  read once per config: a mode without a valid `Mode=` numbers nothing, and 0 with none is the holiday mode;
+  the date as the source writes it), so *not deployed* compares the mode and the date, not their wording, and Revert
+  works on a deployed entry.
+- **Which entries** are edited here is the server's: `GET /api/edits`' `entries` names each calendar entry of the
+  config shown, null for an entry of vislox's files, else why not (the module declares it, or Loxone Config made it:
+  `lox logic adopt --uuid` takes one over). Each block of vislox's files that is an entry carries `entry` (`mode` by
+  UUID, `date` as written) for the form.
+- **Read-only**: entries Loxone Config made (adopting them, like adopting its modes, waits for vislox's adoption to
+  take objects of the object tree), the module's own entries, and an entry of a weekday in a month (*the last Monday
+  of May*), which the language cannot write.
 
 ## Tree and Air hardware (#85)
 
@@ -1582,6 +1635,8 @@ cannot express is left out, not worked around.
 | #81 constants | `let vx_… = 30min` in `edits.loxl`; `x.Time = vx_…`, `Time: vx_…` | Made, changed and dropped in vislox's file; a port bound to it, or to a constant of the module. The module's own `let` and `defaults` lines are shown, not changed. |
 | #85 statistics | `vx_hw_… = TreeSensor(device: …, uuid: "…", Statistics: on)` in `_hardware.loxl` | A Tree or Air input, digital output or analog sensor; its device declared by `uuid:` alone. Not on one the module declares. |
 | #85 new Tree device | `vx_<kind>_<n> = TreeDevice("…", kind: "…", tree: …, branch: "…")`, `removed vx_…` | The four kinds lox creates, on a Tree extension of the base; unpaired until a Tree search in Loxone Config. |
+| #86 operating mode | `vx_mode_<n> = Mode("…")` in `_periphery.loxl` | A new user mode; lox mints its `Mode=` number. Built-in modes and Loxone Config's stay as they are. |
+| #86 calendar entry | `vx_calendarentry_<n> = CalendarEntry("…", switches: …, every: 12-31)` in `_periphery.loxl` | A new entry, then its mode (`entry_mode`) and date (`entry_date`, one of four kinds). Loxone Config's entries stay read-only. |
 
 Blocks the module already manages (they are in the lockfile) are refused: they are edited in their own `.loxl`.
 The blocks vislox added or adopted (#72) are the exception: their `.loxl` is vislox's.
@@ -1609,7 +1664,8 @@ The blocks vislox added or adopted (#72) are the exception: their `.loxl` is vis
   lox creates and that work as placed; a test compiles each one with lox. Not offered:
   - virtual inputs, virtual HTTP, UDP and text inputs, virtual outputs and their commands, Modbus servers,
     devices and their I/O: objects of the object tree, added from the project tree instead (#84, see *Virtual
-    inputs, virtual and Modbus devices*); operating modes (#86);
+    inputs, virtual and Modbus devices*); operating modes and calendar entries, added in the Operating modes
+    view (#86);
   - the NFC Code Touch, Intercom and Touch Pure Flex controller blocks, which exist because Loxone Config paired
     the device (lox adopts them, never creates them);
   - blocks lox creates but that do nothing until they are set up in Loxone Config: the burglar and smoke alarms,
@@ -1654,7 +1710,7 @@ Each of these plugs in as new op kinds on `POST /api/edit`, written into `<modul
 | #83 (built in part) | `template` instances of vislox's files (the `instance` op, lox's library copied in); the module's shown, grouped and reviewed |
 | #84 (built in part) | virtual inputs, virtual and Modbus devices added and edited in `_periphery.loxl` (`device:`); adopting Loxone Config's is left |
 | #85 (built) | Tree and Air hardware: `Statistics:` on an I/O, new Tree devices (`kind:`, `removed`) in `_hardware.loxl` |
-| #86 | operating modes and calendar entries |
+| #86 (built in part) | operating modes and calendar entries added in `_periphery.loxl`, an entry's mode and date edited (`switches:`, `every:`, `easter:`, `from:`/`to:`); adopting Loxone Config's is left |
 | #87 | Automatic Designer rules (`rule`) |
 | #88 | new pages (`page "…" (room: …)`) |
 
@@ -1675,6 +1731,13 @@ lost is deleted only with consent to exactly that list, see [features.md](featur
   A Tree extension takes a new Tree device the same way, its kind and branch picked from lists (#85).
 - *Edit values* on a Tree or Air input or output has *Statistics* (on or off) where lox switches them; below a Tree
   device created here and not deployed it is the only field (#85).
+- The Operating modes view has *Add mode* and *Add entry* in its header, and *Edit* on each calendar entry (off, with
+  the server's reason, on one Loxone Config made) (#86). The form takes the name, the mode it switches on (the
+  config's modes) and the date by kind. A click on a day of the year picks it (for *Relative to Easter*, its offset
+  from that year's Easter Sunday), a drag across days picks a period (or the range every year, for that kind), and the
+  draft's days are outlined on the year. A draft is dropped when the pending config changes, and an entry's when it
+  is no longer selected; saving sends the blob it was opened on. *Add* on the project tree's calendar folder opens
+  the same form (the palette's `view: "modes"`); the Betriebsmodi folder's *Add* adds a mode with its name.
 - *Add block* (top left of the page, on the newest revision) lists the types vislox offers (`GET /api/block-types`:
   each type's purpose and link to Loxone's documentation, its ports with their units, canvas labels and the value
   Loxone Config places them with, and its settings), searched by name, type and purpose. The form asks for the

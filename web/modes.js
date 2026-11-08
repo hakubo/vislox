@@ -201,6 +201,8 @@ function modesStep(d) { MD.year = Math.max(MD_FIRST_YEAR, Math.min(MD_LAST_YEAR,
 
 function renderModes() {
   if (!MD.open || !S.view) return;
+  mfSync();
+  mdRenderEdit();
   MD.year = Math.max(MD_FIRST_YEAR, Math.min(MD_LAST_YEAR, MD.year));
   const y = MD.year, modes = mdModes(), { days, entries } = mdYear(y), marks = mdMarks();
   MD.cache = { year: y, days, modes };
@@ -229,8 +231,8 @@ function renderModes() {
   }).join("") + (liveOnNow ? "" : `<span class="md-hint">${S.live.on ? "Live values show on the current, deployed revision only." : `Turn on live values to see which modes are on now${mdPeriodsAvailable() ? " and the heating and cooling periods" : ""}.`}</span>`)
     + mdPeriodLegend(periods);
 
-  // The year: 12 months, weeks from Monday.
-  const shown = (e) => !MD.hidden.has(e.key);
+  // The year: 12 months, weeks from Monday. The days of the entry being drafted are outlined (#86).
+  const shown = (e) => !MD.hidden.has(e.key), draft = mfDays(y);
   let html = "";
   for (let m = 1; m <= 12; m++) {
     const first = mdDay(y, m, 1), len = mdDay(m === 12 ? y + 1 : y, m === 12 ? 1 : m + 1, 1) - first;
@@ -245,6 +247,7 @@ function renderModes() {
       const cls = ["md-d", cols.length ? "md-on" : "", (lead + i) % 7 >= 5 ? "md-we" : "", n === today ? "md-today" : "",
         marks && add && rem ? "md-chg" : marks && add ? "md-add" : marks && rem ? "md-rem" : "",
         S.sel && d && [...d.on, ...d.add, ...d.rem].some((e) => e.uuid === S.sel) ? "md-hl" : "",
+        draft.has(n) ? "md-draft" : "", MF.open && MF.what === "entry" ? "md-pickable" : "",
         ...pdays.filter((p) => p.days.has(n)).map((p) => "md-" + p.key)].filter(Boolean).join(" ");
       cells += `<span class="${cls}" data-day="${n}"${bg ? ` style="${bg}"` : ""}>${i + 1}</span>`;
     }
@@ -263,7 +266,10 @@ function renderModes() {
     const when = c.when == null ? `<span class="none-v">Cannot read: ${esc(c.why || "unknown")}</span>` : marks && c.old_when != null ? `<span class="old">${esc(c.old_when)}</span> <span class="new">${esc(c.when)}</span>` : esc(c.when);
     const modeT = marks && c.old_mode ? `<span class="old">${esc(c.old_mode.title)}</span> <span class="new">${esc(c.mode.title)}</span>` : esc(c.mode.title);
     const inYear = e.days.length ? (e.days.length === 1 ? mdFmt(e.days[0]) : `${plural(e.days.length, "day")} in ${y}`) : c.date ? `not in ${y}` : "";
-    return `<li><button type="button" class="md-e${e.uuid === S.sel ? " sel" : ""}${e.days.length ? "" : " none"}${marks && e.status ? " " + e.status : ""}" data-go="${esc(e.uuid)}" aria-current="${e.uuid === S.sel}">` +
+    // Edit (#86): offered on each entry the server names; disabled with why on those not edited here.
+    const est = e.status !== "removed" ? mdEntryState(e.uuid) : null;
+    const edit = est ? `<button type="button" class="ed-btn small md-edit" data-md-edit="${esc(e.uuid)}"${est.ok && !MF.busy ? "" : " disabled"} title="${esc(est.ok ? `Edit ${e.title}: its name, mode and date` : est.why)}" aria-label="Edit ${esc(e.title)}">Edit</button>` : "";
+    return `<li class="md-li">${edit}<button type="button" class="md-e${e.uuid === S.sel ? " sel" : ""}${e.days.length ? "" : " none"}${marks && e.status ? " " + e.status : ""}" data-go="${esc(e.uuid)}" aria-current="${e.uuid === S.sel}">` +
       `<span class="md-sw" style="background:${mode?.color || "#888"}"></span><span class="md-et">${esc(e.title)}${st}</span>` +
       `<span class="md-ew">${when}</span><span class="md-em">${modeT}${inYear ? ` · <span class="md-ey">${esc(inYear)}</span>` : ""}</span></button></li>`;
   }).join("") : '<li class="empty">This config has no calendar entries.</li>';
@@ -324,6 +330,8 @@ $("md-grid").addEventListener("mousemove", (e) => {
 $("md-grid").addEventListener("mouseleave", hideTip);
 $("md-grid").addEventListener("click", (e) => {
   // A day selects its first entry (one it switches on, else one removed from it).
+  // While an entry is drafted, a day is picked for it instead (#86).
+  if (MF.open && MF.what === "entry") return;
   const c = e.target.closest("[data-day]");
   const d = c && MD.cache?.days.get(+c.dataset.day);
   const first = d && [...d.on, ...d.rem].find((x) => !MD.hidden.has(x.key));
@@ -343,3 +351,303 @@ function modesKey(e) {
   e.preventDefault();
   return true;
 }
+
+// ── adding modes, and adding or editing calendar entries (#86) ─────────
+// "Add mode" makes a Mode in the Operating Modes folder (lox mints its Mode= number); "Add entry" and an entry's
+// "Edit" make or change a CalendarEntry: its name, the mode it switches on and its date, one of four kinds. Days
+// are typed, or picked on the year: click a day, or drag across days for a range. The draft's days are outlined
+// on the year. Saving sends `add_block` (with `switches`, the mode's UUID, and `date`, as the source writes it),
+// or `title`, `entry_mode` and `entry_date` ops: compiled, never deployed. Which folders take new objects and
+// which entries are edited here, and why not, come from the server (`add_under`, `entries` of GET /api/edits).
+const MF = { open: false, what: null, uuid: null, base: null, draft: {}, orig: null, bad: {}, busy: false, err: "", msg: "", drag: null };
+const MF_KINDS = [["every", "Every year on a day"], ["easter", "Relative to Easter"], ["period", "One period"], ["yearly", "A range every year"]];
+const MF_MD = /^\d{2}-\d{2}$/, MF_YMD = /^\d{4}-\d{2}-\d{2}$/;
+function mdModeTitle(u) { const m = (S.view?.modes || []).find((x) => ciEq(x.uuid, u)); return m ? m.title : u; }
+function mdPad(n) { return String(n).padStart(2, "0"); }
+function mdMdText(n) { const [, m, d] = mdYmd(n); return `${mdPad(m)}-${mdPad(d)}`; }
+function mdYmdText(n) { const [y, m, d] = mdYmd(n); return `${String(y).padStart(4, "0")}-${mdPad(m)}-${mdPad(d)}`; }
+/** The folder of type `ty` that takes new objects here (GET /api/edits' `add_under`), by UUID. */
+function mdFolder(ty) { return Object.keys(S.edits?.add_under || {}).find((u) => nodeById(u)?.ty === ty) || null; }
+/** Whether modes and entries can be edited now: `{ ok, rev }`, or `{ why }`; null: editing is not offered. */
+function mdEditState() {
+  const a = S.hist?.actions;
+  if (!a?.shown || !S.edits || !S.view) return null;
+  if (!a.edit?.available) return { why: `Editing is off: ${a.edit?.reason || "unknown"}.` };
+  const r = editRev();
+  if (!r) return { why: "The config on disk is not in the History yet." };
+  if (S.rev !== r.id) return { why: `Modes and calendar entries are edited on the newest config (${r.kind === "pending" ? "Pending" : "deployed"}).` };
+  if (a.running) return { why: `${a.running} is running.` };
+  if (UNDO.busy) return { why: "Undo or redo is compiling." };
+  return { ok: true, rev: r };
+}
+/** Whether a mode (`ModeCaption`) or an entry (`CalendarCaption`) can be added: `{ ok, rev, folder }` or `{ why }`. */
+function mdAddState(ty) {
+  const st = mdEditState();
+  if (!st) return null;
+  if (!st.ok) return st;
+  const f = mdFolder(ty);
+  if (!f) return { why: `This config has no ${ty === "ModeCaption" ? "Operating Modes" : "calendar"} folder vislox can add to.` };
+  if (S.edits.add_under[f]) return { why: S.edits.add_under[f] };
+  return { ...st, folder: f };
+}
+/** Whether the entry `uuid` can be edited: `{ ok, rev }` or `{ why }`; null: the server says nothing of it. */
+function mdEntryState(uuid) {
+  const st = mdEditState();
+  if (!st) return null;
+  const k = Object.keys(S.edits.entries || {}).find((u) => ciEq(u, uuid));
+  if (k === undefined) return null;
+  if (S.edits.entries[k]) return { why: S.edits.entries[k] };
+  return st;
+}
+function mfState() { return MF.what === "mode" ? mdAddState("ModeCaption") : MF.uuid ? mdEntryState(MF.uuid) : mdAddState("CalendarCaption"); }
+
+/** A date as the source writes it → the form's fields. */
+function mfDateDraft(text) {
+  const t = text || "";
+  let m;
+  if ((m = /^every: (\d{2}-\d{2})$/.exec(t))) return { kind: "every", every: m[1] };
+  if ((m = /^easter: (-?\d+)$/.exec(t))) return { kind: "easter", easter: m[1] };
+  if ((m = /^from: (\d{4}-\d{2}-\d{2}), to: (\d{4}-\d{2}-\d{2})$/.exec(t))) return { kind: "period", from: m[1], to: m[2] };
+  if ((m = /^from: (\d{2}-\d{2}), to: (\d{2}-\d{2})$/.exec(t))) return { kind: "yearly", yfrom: m[1], yto: m[2] };
+  const today = mdToday();
+  return { kind: "every", every: mdMdText(today) };
+}
+/** The form's date as the source writes it (`text`), or what is wrong with a field (`bad`). The server checks it again. */
+function mfDateText(d) {
+  const v = (k) => (d[k] || "").trim();
+  switch (d.kind) {
+    case "every": return MF_MD.test(v("every")) ? { text: `every: ${v("every")}` } : { bad: { every: "A day of the year, MM-DD, like 12-31." } };
+    case "easter": return /^[-+]?\d+$/.test(v("easter")) ? { text: `easter: ${+v("easter")}` } : { bad: { easter: "Whole days after Easter Sunday, like 1, or before it, like -2." } };
+    case "period": {
+      const bad = {};
+      if (!MF_YMD.test(v("from"))) bad.from = "A date, YYYY-MM-DD.";
+      if (!MF_YMD.test(v("to"))) bad.to = "A date, YYYY-MM-DD.";
+      return Object.keys(bad).length ? { bad } : { text: `from: ${v("from")}, to: ${v("to")}` };
+    }
+    case "yearly": {
+      const bad = {};
+      if (!MF_MD.test(v("yfrom"))) bad.yfrom = "A day of the year, MM-DD.";
+      if (!MF_MD.test(v("yto"))) bad.yto = "A day of the year, MM-DD.";
+      return Object.keys(bad).length ? { bad } : { text: `from: ${v("yfrom")}, to: ${v("yto")}` };
+    }
+  }
+  return { bad: { kind: "Pick the kind of date." } };
+}
+/** The form's date as the year lays it out (`calendar.date`), or null while it does not read. */
+function mfDate(d) {
+  const r = mfDateText(d);
+  if (!r.text) return null;
+  const md = (s) => s.split("-").map(Number);
+  switch (d.kind) {
+    case "every": { const [month, day] = md(d.every.trim()); return { kind: "fixed", month, day }; }
+    case "easter": return { kind: "easter", offset: +d.easter.trim() };
+    case "period": return { kind: "period", from: d.from.trim(), to: d.to.trim() };
+    case "yearly": { const [month, day] = md(d.yfrom.trim()), [month2, day2] = md(d.yto.trim()); return { kind: "yearly", month, day, month2, day2 }; }
+  }
+  return null;
+}
+
+/** Open the form: a new mode (`what` "mode"), a new entry, or the entry `uuid`. */
+function mfOpen(what, uuid) {
+  MF.what = what; MF.uuid = uuid || null;
+  const st = mfState();
+  if (!st?.ok) { MF.what = null; MF.uuid = null; return; }
+  let draft = { title: "" };
+  if (what === "entry" && uuid) {
+    const o = S.view.objects[uuid], e = editsBlock(uuid)?.entry || {};
+    // A mode that no longer resolves stays as written (`switches`), shown as unknown.
+    draft = { title: o?.title || "", mode: e.mode || e.switches || "", ...mfDateDraft(e.date) };
+  } else if (what === "entry") {
+    const modes = S.view.modes || [];
+    const holiday = modes.find((m) => ciEq(m.uuid, seUuid(1)));
+    draft = { title: "", mode: (holiday || modes[0])?.uuid || "", ...mfDateDraft("") };
+  }
+  Object.assign(MF, { open: true, base: st.rev.blob, draft, orig: { ...draft, date: mfDateText(draft).text }, bad: {}, busy: false, err: "", msg: "", drag: null });
+  mfRender();
+  renderModes();
+  $("md-form").querySelector("[data-mf]")?.focus();
+}
+function mfClose(msg) {
+  Object.assign(MF, { open: false, what: null, uuid: null, base: null, draft: {}, orig: null, bad: {}, busy: false, err: "", drag: null, msg: msg || "" });
+  mfRender();
+  if (MD.open) renderModes();
+}
+/** A draft belongs to the pending config it was opened on, and an entry's to that entry while it is selected. */
+function mfSync() {
+  if (!MF.open || MF.busy) return;
+  const r = editRev();
+  if (!r || r.blob !== MF.base) mfClose("The pending config changed: the form was closed. Open it again to edit the newest.");
+  else if (MF.uuid && !ciEq(S.sel, MF.uuid)) mfClose();
+}
+
+function mfRender() {
+  const box = $("md-form");
+  if (!MF.open) {
+    box.classList.toggle("hidden", !MF.msg);
+    box.innerHTML = MF.msg ? `<div class="ed-msg" role="status">${esc(MF.msg)}</div>` : "";
+    return;
+  }
+  box.classList.remove("hidden");
+  const d = MF.draft, dis = MF.busy ? " disabled" : "";
+  const field = (k, label, ph, hint) => {
+    const id = `mf-${k}`, bad = MF.bad[k];
+    return `<div class="pr ed-row"><label class="k" for="${id}">${esc(label)}</label><div class="v"><input id="${id}" data-mf="${k}" value="${esc(d[k] ?? "")}" placeholder="${esc(ph)}" title="${esc(hint)}" autocomplete="off" spellcheck="false"${bad ? ` aria-invalid="true" aria-describedby="${id}-e"` : ""}${dis}>${bad ? `<div class="ed-bad" id="${id}-e">${esc(bad)}</div>` : ""}</div></div>`;
+  };
+  let html;
+  if (MF.what === "mode") {
+    html = `<h4 id="md-form-h">Add an operating mode</h4>${field("title", "Name", "Party", "The mode's name; lox numbers it")}`;
+  } else {
+    const modes = S.view?.modes || [];
+    // A mode the config does not have (or none) is shown as such, never as the first mode.
+    const known = modes.some((m) => ciEq(m.uuid, d.mode));
+    const opts = (known ? "" : `<option value="${esc(d.mode || "")}" selected>${d.mode ? `(unknown: ${esc(d.mode)})` : "(none)"}</option>`) +
+      modes.map((m) => `<option value="${esc(m.uuid)}"${ciEq(m.uuid, d.mode) ? " selected" : ""}>${esc(m.title)}</option>`).join("");
+    const kinds = MF_KINDS.map(([k, t]) => `<option value="${k}"${d.kind === k ? " selected" : ""}>${esc(t)}</option>`).join("");
+    const dates = {
+      every: field("every", "Day", "12-31", "Month and day, MM-DD: every year on that day"),
+      easter: field("easter", "Days after Easter", "1", "Days after Easter Sunday (1: Easter Monday), or before it (-2: Good Friday)"),
+      period: field("from", "From", "2026-07-04", "The first day, YYYY-MM-DD (2009 or later)") + field("to", "To", "2026-09-05", "The last day, YYYY-MM-DD"),
+      yearly: field("yfrom", "From", "10-01", "The first day every year, MM-DD") + field("yto", "To", "04-30", "The last day every year, MM-DD; earlier than From runs across New Year"),
+    }[d.kind] || "";
+    html = `<h4 id="md-form-h">${MF.uuid ? `Edit ${esc(MF.orig.title || "the entry")}` : "Add a calendar entry"}</h4>${field("title", "Name", "Silvester", "The entry's name")}
+      <div class="pr ed-row"><label class="k" for="mf-mode">Switches on</label><div class="v"><select id="mf-mode" data-mf="mode"${dis}${MF.bad.mode ? ' aria-invalid="true"' : ""}>${opts}</select>${MF.bad.mode ? `<div class="ed-bad">${esc(MF.bad.mode)}</div>` : ""}</div></div>
+      <div class="pr ed-row"><label class="k" for="mf-kind">Date</label><div class="v"><select id="mf-kind" data-mf="kind"${dis}>${kinds}</select></div></div>${dates}`;
+  }
+  const note = MF.what === "mode" ? "Adding compiles the module; nothing is deployed." : "Click a day on the year, or drag across days for a range. Saving compiles the module; nothing is deployed.";
+  html += `<div class="ed-bar"><button type="button" class="primary small" data-mf-act="save"${dis}>${MF.busy ? "Compiling…" : MF.uuid ? "Save" : "Add"}</button><button type="button" class="ed-btn small" data-mf-act="cancel"${dis}>Cancel</button>
+    <span class="ed-msg${MF.err ? " err" : ""}" role="status" aria-live="polite">${esc(MF.err || note)}</span></div>`;
+  box.innerHTML = html;
+}
+
+async function mfSave() {
+  const st = mfState();
+  if (!st?.ok || MF.busy || !MF.open) return;
+  const d = MF.draft, bad = {}, title = (d.title || "").trim();
+  if (!title) bad.title = "A name.";
+  let ops = [], label;
+  if (MF.what === "mode") {
+    ops = [{ op: "add_block", page: st.folder, type: "Mode", title, params: {}, settings: {} }];
+    label = `Add the mode ${title}`;
+  } else {
+    const date = mfDateText(d);
+    Object.assign(bad, date.bad || {});
+    if (!d.mode) bad.mode = "Pick the mode it switches on.";
+    if (!MF.uuid) {
+      ops = [{ op: "add_block", page: st.folder, type: "CalendarEntry", title, params: {}, settings: { switches: d.mode, date: date.text } }];
+      label = `Add the calendar entry ${title}`;
+    } else {
+      if (title !== (MF.orig.title || "").trim()) ops.push({ op: "title", uuid: MF.uuid, value: title });
+      if (!ciEq(d.mode, MF.orig.mode)) ops.push({ op: "entry_mode", uuid: MF.uuid, value: d.mode });
+      if (date.text && date.text !== MF.orig.date) ops.push({ op: "entry_date", uuid: MF.uuid, value: date.text });
+      label = `Calendar entry ${MF.orig.title || title}`;
+    }
+  }
+  MF.bad = bad; MF.err = "";
+  if (Object.keys(bad).length) { MF.err = "Fix the marked values."; mfRender(); $("md-form").querySelector('[aria-invalid="true"]')?.focus(); return; }
+  if (!ops.length) { MF.err = "Nothing changed."; mfRender(); return; }
+  MF.busy = true; mfRender();
+  try {
+    const res = await editAct(MF.base, ops, label);
+    const added = res.added?.[0]?.uuid, keep = MF.uuid;
+    MF.busy = false;
+    mfClose(`${MF.what === "mode" ? "Added" : keep ? "Saved" : "Added"} and compiled: pending, not deployed. Review it, then Apply or Discard.`);
+    await editShowNewest(res.blob);
+    const u = added && Object.keys(S.view?.objects || {}).find((k) => ciEq(k, added));
+    if (u && S.view.objects[u].calendar) select(u, { noReveal: true });
+    if (MD.open) renderModes();
+  } catch (err) {
+    MF.busy = false; MF.err = err.message;
+    mfRender();
+  }
+}
+
+/** The days the draft covers in year `y`, and those a drag is picking. */
+function mfDays(y) { return MF.open && MF.what === "entry" ? new Set(entryDays(mfDate(MF.draft), y)) : new Set(); }
+function mfPaint() {
+  if (!MD.open) return;
+  const draft = mfDays(MD.year), dr = MF.drag, lo = dr ? Math.min(dr.a, dr.b) : 0, hi = dr ? Math.max(dr.a, dr.b) : -1;
+  for (const c of $("md-grid").querySelectorAll("[data-day]")) {
+    const n = +c.dataset.day;
+    c.classList.toggle("md-draft", draft.has(n));
+    c.classList.toggle("md-pick", n >= lo && n <= hi);
+  }
+}
+/** Days `a` to `b` picked on the year: one day, or a range (one period, or every year for a yearly range). */
+function mfPick(a, b) {
+  const lo = Math.min(a, b), hi = Math.max(a, b), d = MF.draft, [y] = mdYmd(lo);
+  if (lo === hi) {
+    if (d.kind === "easter") { const [m, dd] = easterSunday(y); d.easter = String(lo - mdDay(y, m, dd)); }
+    else if (d.kind === "period") { d.from = d.to = mdYmdText(lo); }
+    else if (d.kind === "yearly") { d.yfrom = d.yto = mdMdText(lo); }
+    else { d.kind = "every"; d.every = mdMdText(lo); }
+  } else if (d.kind === "yearly") { d.yfrom = mdMdText(lo); d.yto = mdMdText(hi); }
+  else { d.kind = "period"; d.from = mdYmdText(lo); d.to = mdYmdText(hi); }
+  MF.bad = {}; MF.err = "";
+  mfRender();
+  mfPaint();
+}
+
+/** What the year and the entries' Edit buttons follow of GET /api/edits: the entries, where to add, each entry's values. */
+function mdEditKey() {
+  const e = S.edits;
+  return e ? JSON.stringify([e.entries || null, e.add_under || null, (e.blocks || []).filter((b) => b.entry).map((b) => [b.uuid, b.entry])]) : "";
+}
+function mdRenderEdit() {
+  for (const [id, ty, what] of [["md-add-mode", "ModeCaption", "a mode"], ["md-add-entry", "CalendarCaption", "a calendar entry"]]) {
+    const st = mdAddState(ty), b = $(id);
+    b.classList.toggle("hidden", !st);
+    b.disabled = !st?.ok || MF.busy;
+    b.title = !st ? "" : st.ok ? `Add ${what} (it is compiled, not deployed)` : st.why;
+  }
+}
+
+$("md-add-mode").onclick = () => mfOpen("mode");
+$("md-add-entry").onclick = () => mfOpen("entry");
+$("md-form").addEventListener("input", (e) => {
+  const f = e.target.closest("[data-mf]");
+  if (!f || !MF.open) return;
+  MF.draft[f.dataset.mf] = f.value;
+  if (f.dataset.mf === "kind") {
+    // The fields of the other kind, from the date picked so far where they can.
+    const n = mdToday(), d = MF.draft;
+    if (d.kind === "every") d.every ||= mdMdText(n);
+    if (d.kind === "easter") d.easter ||= "1";
+    if (d.kind === "period") { d.from ||= mdYmdText(n); d.to ||= d.from; }
+    if (d.kind === "yearly") { d.yfrom ||= mdMdText(n); d.yto ||= d.yfrom; }
+    mfRender();
+  }
+  mfPaint();
+});
+$("md-form").addEventListener("click", (e) => {
+  const b = e.target.closest("[data-mf-act]");
+  if (b?.dataset.mfAct === "save") mfSave();
+  else if (b?.dataset.mfAct === "cancel") mfClose();
+});
+$("md-form").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && e.target.tagName === "INPUT") { e.preventDefault(); mfSave(); }
+  else if (e.key === "Escape" && !MF.busy) { e.preventDefault(); e.stopPropagation(); mfClose(); }
+});
+$("md-list").addEventListener("click", (e) => {
+  const b = e.target.closest("[data-md-edit]");
+  if (!b) return;
+  e.stopPropagation();
+  select(b.dataset.mdEdit, { noReveal: true });
+  mfOpen("entry", b.dataset.mdEdit);
+});
+$("md-grid").addEventListener("mousedown", (e) => {
+  const c = e.target.closest("[data-day]");
+  if (!c || e.button !== 0 || !MF.open || MF.what !== "entry" || MF.busy) return;
+  e.preventDefault();
+  MF.drag = { a: +c.dataset.day, b: +c.dataset.day };
+  mfPaint();
+});
+$("md-grid").addEventListener("mouseover", (e) => {
+  const c = MF.drag && e.target.closest("[data-day]");
+  if (c && +c.dataset.day !== MF.drag.b) { MF.drag.b = +c.dataset.day; mfPaint(); }
+});
+window.addEventListener("mouseup", () => {
+  if (!MF.drag) return;
+  const { a, b } = MF.drag;
+  MF.drag = null;
+  mfPick(a, b);
+});

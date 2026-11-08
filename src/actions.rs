@@ -3256,7 +3256,10 @@ impl Actions {
         type Slot = (edit::Op, (Option<String>, Option<String>));
         let mut slots: std::collections::BTreeMap<String, Slot> = Default::default();
         let key = |op: &edit::Op| serde_json::to_string(op).unwrap_or_default();
-        for (ops, now_side) in [(now.ops(&lock), true), (was.ops(&lock), false)] {
+        // A calendar entry's mode (#86) is named by UUID, in the config of its side.
+        let ops_now = now.ops_in(&lock, pending_doc.as_ref().or(deployed_doc.as_ref()));
+        let ops_was = was.ops_in(&lock, deployed_doc.as_ref());
+        for (ops, now_side) in [(ops_now, true), (ops_was, false)] {
             for op in ops {
                 let k = op.with_value(None);
                 let slot = slots.entry(key(&k)).or_insert((k, (None, None)));
@@ -3264,16 +3267,22 @@ impl Actions {
                 if now_side { slot.1.0 = v } else { slot.1.1 = v }
             }
         }
+        // The configs' modes by number, read once for every calendar entry (#86).
+        let pending_numbers = pending_doc.as_ref().map(crate::calendar_edit::Numbers::of);
+        let deployed_numbers = deployed_doc.as_ref().map(crate::calendar_edit::Numbers::of);
         let claims: Vec<Value> = slots
             .into_values()
             .map(|(op, (now, was))| {
-                let value_in = |d: &Option<loxone_config::LoxoneDoc>| {
-                    d.as_ref().and_then(|d| edit::current(d, &op))
-                };
-                let deployed_value = value_in(&deployed_doc);
+                let value_in =
+                    |d: &Option<loxone_config::LoxoneDoc>,
+                     n: &Option<crate::calendar_edit::Numbers>| {
+                        d.as_ref()
+                            .and_then(|d| edit::current_with(d, &op, n.as_ref()))
+                    };
+                let deployed_value = value_in(&deployed_doc, &deployed_numbers);
                 // Nothing pending: the pending config is the deployed one.
                 let pending_value = if pending.is_some() {
-                    value_in(&pending_doc)
+                    value_in(&pending_doc, &pending_numbers)
                 } else {
                     deployed_value.clone()
                 };
@@ -3479,6 +3488,8 @@ impl Actions {
                 arrange.insert(page.to_string(), json!(why));
             }
         }
+        // The operating modes a calendar entry of vislox's names (#86).
+        let shown_modes = shown.map(|d| crate::sched_edit::Modes::new(d, &lock));
         let mut blocks: Vec<Value> = now
             .pages
             .iter()
@@ -3486,6 +3497,10 @@ impl Actions {
             .map(|(name, f, b)| {
                 let uuid = lock.uuid_of(&b.slug);
                 json!({
+                    // A calendar entry's mode by UUID and its date as written (#86).
+                    "entry": shown_modes
+                        .as_ref()
+                        .and_then(|m| crate::calendar_edit::listed(m, b)),
                     "slug": b.slug,
                     "uuid": uuid,
                     "type": b.ty,
@@ -3557,6 +3572,7 @@ impl Actions {
         // One walk of each config (an index), and the base parsed once per blob.
         let mut adopt = serde_json::Map::new();
         let mut add_under = serde_json::Map::new();
+        let mut entries = serde_json::Map::new();
         if let (Some(doc), Some(base)) = (shown, self.adopt_base(&p))
             && state.why.is_none()
         {
@@ -3597,6 +3613,8 @@ impl Actions {
             // Each folder and device that takes new objects of the object tree
             // (#84): null, or why `add_block` there would be refused.
             add_under = crate::periphery::add_refusals(&now, &ctx);
+            // Each calendar entry: whether its mode and date are edited here (#86).
+            entries = crate::calendar_edit::edit_refusals(&now, &ctx);
             // And each Tree extension, for a new Tree device (#85).
             add_under.extend(crate::hw_edit::add_refusals(&ctx));
         }
@@ -3652,6 +3670,7 @@ impl Actions {
             "adopted_wires": adopted_wires,
             "adopt": adopt,
             "add_under": add_under,
+            "entries": entries,
             // `removed` and `moved` lines lox needs no more (#80): the next edit
             // drops them, and `tidy` does only that.
             "stale_lines": now.stale_lines(&lock),
