@@ -3452,12 +3452,16 @@ try {
   });
   await step("device Revert and Undo restore the whole adoption group, root first (#133)", async () => {
     await settled();
+    // The reply comes after the History and the edits have shown the adoption (held a while): the Changes list
+    // draws its rows while the edit is still running, and Revert must come on when it ends.
+    await page.route("**/api/edit", async (r) => { const resp = await r.fetch(); await new Promise((x) => setTimeout(x, 2500)); await r.fulfill({ response: resp }).catch(() => {}); }, { times: 1 });
     const reply = await page.evaluate(([u, slug]) => adoptSend(u, [{ op: "adopt", blocks: [{ uuid: u.toUpperCase(), slug }] }]), [IMPORT_HTTP, "vx_imported"]);
     assert.ok(reply, await page.evaluate(() => JSON.stringify({err: AD.err, state: adoptState()})));
     assert.equal(reply.adopted[0].uuid, IMPORT_HTTP);
     assert.equal(reply.adopted.length, 2);
     await page.waitForFunction(([p,c]) => [p,c].every((u) => S.edits?.blocks?.some((b) => b.uuid === u && b.adopted)), [IMPORT_HTTP, IMPORT_CMD]);
     await settled();
+    await page.waitForSelector('#changes .adoption:has-text("Imported HTTP") button:has-text("Revert"):not([disabled])', { timeout: 10000 });
     await page.click('#changes .adoption:has-text("Imported HTTP") button:has-text("Revert")');
     await page.waitForFunction(([p,c]) => !S.edits?.blocks?.some((b) => [p,c].includes(b.uuid)), [IMPORT_HTTP, IMPORT_CMD]);
     await settled();

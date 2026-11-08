@@ -1798,10 +1798,10 @@ function renderChanges() {
       go.textContent = `Adopt into vislox: ${v.objects[b.uuid]?.title || b.slug}`;
       go.onclick = () => select(b.uuid); d.appendChild(go);
       const revert = document.createElement("button"); revert.type = "button"; revert.textContent = "Revert";
-      revert.disabled = !!b.hand_back || !adoptState()?.ok;
-      revert.title = b.hand_back || "Hand back to Loxone Config";
+      revert.dataset.adoptRevert = b.uuid;
       revert.onclick = () => { select(b.uuid); adoptHandBack(b.uuid); }; d.appendChild(revert); box.appendChild(d);
     }
+    adoptRevertSync();
   };
   const compact = (!v.compared || !v.changes.length) && !adopted.length;
   $("right").classList.toggle("compact", compact);
@@ -6184,6 +6184,18 @@ $("props").addEventListener("keydown", (e) => {
 // an edit like any other: compiled, never deployed, undone through its reply's `undo`.
 const AD = { uuid: null, open: false, slug: "", busy: false, msg: "", err: "" };
 /** Whether adopting can be asked now: `{ ok, rev }`, or `{ why }`. */
+/** The Changes list's Revert of each adopted block follows whether an edit can be sent now. It is drawn with the
+ *  list, and an edit running then (or finished since) is no reason for it to stay off: this runs wherever that
+ *  state changes (renderAddHud: an edit starts or ends, History's actions). */
+function adoptRevertSync() {
+  const st = adoptState(), box = $("changes");
+  if (!box) return;
+  for (const btn of box.querySelectorAll("[data-adopt-revert]")) {
+    const b = editsBlock(btn.dataset.adoptRevert);
+    btn.disabled = !!b?.hand_back || !st?.ok;
+    btn.title = b?.hand_back || (st?.ok ? "Hand back to Loxone Config" : st?.why || "Hand back to Loxone Config");
+  }
+}
 function adoptState() {
   const a = S.hist?.actions;
   if (!a?.shown || !a.edit?.available) return null;
@@ -7185,6 +7197,7 @@ function addState() {
 }
 function renderAddHud() {
   renderNewPageBtn();
+  adoptRevertSync();
   const st = addState(), b = $("btn-add-block"), r = $("btn-relayout");
   $("hud-add").classList.toggle("hidden", !st);
   if (!st) { undoListToggle(false); return; }
