@@ -142,7 +142,7 @@ the binary.
   back under its UUID, a rename changing nothing (`loxone_config::diff`).
 - `src/constants.rs` reads the module's `let` constants and `defaults` statements and the ports that take a value
   from one (#81), with lox's parser and `defaults_taken`, for `GET /api/edits`' `constants`. vislox's own constants
-  are `Claims`' ninth field in `edit.rs` (`let vx_… = …` in `edits.loxl`), its defaults the eleventh (`defaults
+  are `Claims`' ninth field in `src/edit/files.rs` (`let vx_… = …` in `edits.loxl`), its defaults the eleventh (`defaults
   T(P: v)`); the `let` op is `set_constant`, and a `param` op whose value names a constant (`Ctx::lets`, the
   module's) binds the port to it (`constant_ref`). `constants::reach` is the blocks a default reaches (the module
   expanded without the type's statement), and `constants::pending` the values that differ from the deployed
