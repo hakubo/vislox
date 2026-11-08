@@ -28,12 +28,10 @@ use std::path::Path;
 
 mod files;
 mod request;
+#[cfg(test)]
+use files::Claim;
 pub(crate) use files::{CLAIMS, TEMPLATES};
 pub use files::{Claims, Files, Placement, Which, Wire, extern_key, plain, slug, slug_uuid};
-// Only tests name `Claim` (the rest reach it through `Claims`): kept here
-// so that `edit::Claim` still names it.
-#[allow(unused_imports)]
-pub use files::Claim;
 pub use request::{MAX_OPS, Op, Placed, Request};
 
 /// vislox's own file in the module directory, for the values it claims.
