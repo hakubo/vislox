@@ -228,7 +228,7 @@ function renderModes() {
       : todayKeys.has(m.key) ? "Off now, although a calendar entry has it today." : "Off now.";
     return `<button type="button" class="md-chip${MD.hidden.has(m.key) ? " off" : ""}${live ? " live" : ""}" data-mode="${esc(m.key)}" aria-pressed="${!MD.hidden.has(m.key)}" title="${esc(`${m.title}: ${mdEntriesN(n, "calendar ")}. Click to ${MD.hidden.has(m.key) ? "show" : "hide"} its days.${why ? "\n" + why : ""}`)}">` +
       `<span class="md-sw" style="background:${m.color}"></span>${esc(m.title)}${live ? '<span class="md-now">on now</span>' : ""}</button>`;
-  }).join("") + (liveOnNow ? "" : `<span class="md-hint">${S.live.on ? "Live values show on the current, deployed revision only." : `Turn on live values to see which modes are on now${mdPeriodsAvailable() ? " and the heating and cooling periods" : ""}.`}</span>`)
+  }).join("") + (liveOnNow ? "" : `<span class="md-hint">${S.live.on ? "Live values show on the deployed revision only (what the Miniserver runs, not an edit on disk)." : `Turn on live values to see which modes are on now${mdPeriodsAvailable() ? " and the heating and cooling periods" : ""}.`}</span>`)
     + mdPeriodLegend(periods);
 
   // The year: 12 months, weeks from Monday. The days of the entry being drafted are outlined (#86).

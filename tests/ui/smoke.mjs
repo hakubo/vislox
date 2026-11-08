@@ -231,6 +231,17 @@ try {
   await page.waitForSelector(".tab");
 
   const step = async (name, fn) => { await fn(); console.log("ok -", name); };
+  // The Miniserver runs the last commit; the uncommitted edit on disk is the newest revision (#121). What is about
+  // the running config (live values, the app, the log) shows on the one and not on the other.
+  const showDeployed = async () => {
+    await page.click(".hrev.deployed");
+    await page.waitForFunction(() => revById(S.rev)?.deployed && S.viewRev === S.rev, null, { timeout: 10000 });
+  };
+  const showNewest = async () => {
+    await page.click(".hrev >> nth=0");
+    await page.evaluate(() => { const f = $("chk-follow"); f.checked = true; f.dispatchEvent(new Event("change")); });
+    await page.waitForFunction(() => S.rev === S.hist.history[0].id && S.viewRev === S.rev, null, { timeout: 10000 });
+  };
 
   await step("both pages are tabs", async () => {
     assert.deepEqual(await page.$$eval(".tab", (t) => t.map((x) => x.textContent.replace(/\d+$/, "").trim())), ["Erdgeschoss", "Obergeschoss"]);
@@ -241,6 +252,24 @@ try {
     const changes = await page.$$eval(".changes .chg .t", (n) => n.map((x) => x.textContent));
     assert.ok(changes.some((t) => t.includes("Licht OG → Licht oben")), changes.join(" | "));
     assert.ok(changes.some((t) => t.includes("1000 → 100")), changes.join(" | "));
+  });
+  await step("an edit on disk that nothing committed is not marked as on the Miniserver, and gets no live values (#121)", async () => {
+    // The file on disk is the newest revision and the one shown; the Miniserver runs the last commit.
+    const hist = await page.evaluate(() => S.hist.history.map((r) => ({ kind: r.kind, current: r.current, deployed: r.deployed })));
+    assert.deepEqual(hist.map((r) => [r.kind, r.current, r.deployed]), [["live", true, false], ["git", false, true]]);
+    assert.equal(await page.$$eval(".hrev.deployed", (n) => n.length), 1);
+    assert.equal(await page.$$eval(".hrev.sel.deployed, .hrev.sel .pill.cur", (n) => n.length), 0, "the file on disk is not marked deployed");
+    assert.equal(await page.$$eval(".hrev.k-git.deployed .pill.cur", (n) => n.length), 1, "the last commit is");
+    assert.match(await page.getAttribute(".hrev.sel", "title"), /Only Apply deploys it; a Pull would overwrite it/);
+    // Live values are the deployed revision's: turned on, they stay off on this one.
+    await page.click("#sw-live .track");
+    await page.waitForFunction(() => $("live-state").textContent === "other revision");
+    assert.match(await page.textContent("#live-note"), /deployed revision only/);
+    assert.equal(await page.evaluate(() => liveHere()), false);
+    assert.equal(await page.$eval("#canvas", (n) => n.classList.contains("live")), false);
+    assert.equal(await page.$$eval(".live-pill", (n) => n.filter((x) => x.style.display !== "none").length), 0);
+    await page.click("#sw-live .track");
+    await page.waitForFunction(() => !S.live.on);
   });
   await step("blocks are drawn", async () => {
     assert.ok((await page.$$("#viewport .blk")).length >= 3);
@@ -309,6 +338,7 @@ try {
     assert.deepEqual(bus[1].devices, [{ name: "Raumklima Bad", serial: "B0100001", online: true, type: "Tree Device", parent: null }]);
   });
   await step("In the app: the config's settings, then what the Miniserver's app shows", async () => {
+    await showDeployed();
     await page.keyboard.press("Control+k");
     await page.keyboard.type("zähler");
     await page.keyboard.press("Enter");
@@ -341,6 +371,7 @@ try {
     if (i >= 0) errors.splice(i, 1);
   });
   await step("Operating modes: a year calendar of the calendar entries", async () => {
+    await showNewest();
     // Ctrl+K lists the view after pages and blocks, and only for a word it starts with.
     await page.keyboard.press("Control+k");
     await page.keyboard.type("o");
@@ -407,7 +438,8 @@ try {
     assert.equal(await page.textContent("#md-year"), "2025");
     assert.doesNotMatch(await cls(7, 4, 2025), /md-on/);
     assert.ok((await page.textContent("#md-list")).includes("Feiertag · 21 Apr 2025"), "Easter Monday 2025 is 21 Apr");
-    // Live values: the modes that are on now.
+    // Live values: the modes that are on now, on the revision the Miniserver runs.
+    await showDeployed();
     assert.equal(await page.$$eval(".md-chip.live", (n) => n.length), 0);
     await page.click("#sw-live .track");
     await page.waitForSelector('.md-chip.live:has-text("Feiertag")');
@@ -511,9 +543,10 @@ try {
     const pill = (t) => page.waitForFunction((t) => [...document.querySelectorAll(".live-pill")].some((n) => n.style.display !== "none" && n.textContent === t), t);
     await pill("21.5");
     assert.ok((await page.$$("#viewport .wire.lv-on")).length >= 1, "the AND gate's wire is on");
-    // The Divide block streams nothing: vislox computes 21.5 / 100 (the edited parameter).
+    // The Divide block streams nothing: vislox computes 21.5 / 1000, the deployed parameter (the edit to 100 is
+    // not deployed, and gets no live values).
     await page.click('[data-uuid="10000006-0000-0060-ffff504f94000001"]');
-    await page.waitForFunction(() => [...document.querySelectorAll("#props .lv.computed")].some((n) => /^0\.2\d$/.test(n.textContent)));
+    await page.waitForFunction(() => [...document.querySelectorAll("#props .lv.computed")].some((n) => /^0\.02\d*$/.test(n.textContent)));
     appendFileSync(liveFile, liveLine("Temperatur", "value", "22.25", TEMP));
     await pill("22.25");
     // Block queries need a Miniserver connection: a recording offers none.
@@ -522,6 +555,8 @@ try {
     await page.waitForFunction(() => !document.querySelector("#canvas").classList.contains("live"));
   });
   await step("a Daytimer's switching times: changes per mode, and the Miniserver's next to the config's", async () => {
+    await showNewest();
+    await page.waitForSelector(".changes .chg");
     const changes = await page.$$eval(".changes .chg .t", (n) => n.map((x) => x.textContent));
     assert.ok(changes.includes("Uhr · schedule, Party: 18:00–23:00 22.5 → 17:00–23:00 22.5"), changes.join(" | "));
     await page.click('.changes .chg:has-text("Uhr · schedule")');
@@ -532,25 +567,36 @@ try {
     // A column the compared revision alone has still gets its row, with what it was.
     assert.ok(changes.includes("Uhr · schedule, Urlaub: 10:00–11:00 5 → no entries"), changes.join(" | "));
     assert.match(await sec(), /Urlaubwas 10:00–11:00 5/);
+    // Live values on the edit on disk: the Miniserver does not run it, so what it sends is not "changed in the app".
     await page.click("#sw-live .track");
+    await page.waitForFunction(() => /The Miniserver runs other switching times than this revision/.test(document.querySelector('#props .ps-b[data-body="Schedule"]')?.textContent || ""));
+    assert.doesNotMatch(await sec(), /Changed in the app since this config/);
+    // On the revision the Miniserver runs (the last commit): Feiertag and Party were changed in the app, and
+    // the Urlaub column the Miniserver sends nothing for.
+    await showDeployed();
     await page.waitForFunction(() => document.querySelector("#props .sch-row.diff"));
-    // Party is the same on both sides; Feiertag was changed in the app.
-    assert.match(await sec(), /Changed in the app since this config \(Feiertag\)/);
+    assert.match(await sec(), /Changed in the app since this config \(Feiertag, Party, Urlaub\)/);
     assert.match(await sec(), /Miniserver: 07:00–08:00 21/);
-    assert.equal(await page.$$eval("#props .sch-row.diff", (r) => r.length), 1);
-    assert.equal(await page.$$eval("#props .sch-bar.live", (r) => r.length), 3);
+    assert.equal(await page.$$eval("#props .sch-row.diff", (r) => r.length), 3);
     // A new event table from the Miniserver updates the section in place.
     appendFileSync(liveFile, liveLine("Uhr", "entriesAndDefaultValue", { ...schedule, entries: [
-      { mode: 0, from: 390, to: 480, activate: false, value: 21 }, { mode: -1, from: 1020, to: 1380, activate: false, value: 22.5 }] }, TIMER));
+      { mode: 0, from: 390, to: 480, activate: false, value: 21 }, { mode: -1, from: 1080, to: 1380, activate: false, value: 22.5 },
+      { mode: 1, from: 600, to: 660, activate: false, value: 5 }] }, TIMER));
     await page.waitForFunction(() => /The Miniserver runs the same switching times/.test(document.querySelector('#props .ps-b[data-body="Schedule"]')?.textContent || ""));
     assert.equal(await page.$$eval("#props .sch-row.diff", (r) => r.length), 0);
     await page.click("#sw-live .track");
     await page.waitForFunction(() => !document.querySelector("#canvas").classList.contains("live"));
+    await showNewest();
   });
   await step("an edit on disk shows up live", async () => {
     const before = (await page.$$(".hrev")).length;
     edit('Title="Zähler"', 'Title="Stromzähler"');
     await page.waitForFunction((n) => document.querySelectorAll(".hrev").length > n, before, { timeout: 10000 });
+    // A new save on disk is the newest and what the file holds, never what the Miniserver runs (#121).
+    await page.waitForFunction(() => S.hist.history[0].kind === "live" && S.hist.history[0].current && !S.hist.history[0].deployed);
+    assert.deepEqual(await page.evaluate(() => S.hist.history.filter((r) => r.deployed).map((r) => r.kind)), ["git"]);
+    assert.equal(await page.$$eval(".hrev.k-live.current", (n) => n.length), 1, "the file on disk has its row");
+    assert.equal(await page.$$eval(".hrev.k-live.current.deployed, .hrev.k-live.current .pill.cur", (n) => n.length), 0);
   });
   await step("the Miniserver chip shows its serial and firmware", async () => {
     await page.waitForSelector("#ms-chip.ok");
@@ -628,10 +674,13 @@ try {
       "Silvester: deleted (was Every year on 31 Dec · switches on Party)",
     ]);
     assert.equal(await page.isVisible("#cal-drift-pull"), true);
-    // The entry's Properties say so too, on the deployed revision.
+    // The entry's Properties say so too, on the file on disk (the newest revision) as well as on the deployed one.
     await page.click('#cal-drift-list .lnk:has-text("Ostermontag")');
     await page.waitForFunction(() => document.querySelector(".ph-t")?.textContent === "Ostermontag");
     assert.match(await page.textContent("#props"), /In the appChanged in the app since the deployed config: when: Easter Monday \(Easter \+1\) → Good Friday \(Easter −2\)\. Pull or Sync to take it over\./);
+    await showDeployed();
+    await page.waitForFunction(() => /Changed in the app since the deployed config/.test(document.querySelector("#props")?.textContent || ""));
+    await showNewest();
     await page.click("#ms-chip");
     assert.match(await page.textContent("#ms-body"), /Calendar entries3 changed in the app/);
     await page.keyboard.press("Escape");
@@ -871,7 +920,7 @@ try {
   });
 } catch (e) {
   failed = true;
-  console.error("FAILED:", e.message);
+  console.error("FAILED:", e.stack || e.message);
   if (errors.length) console.error("browser errors:", errors);
 } finally {
   await browser.close();

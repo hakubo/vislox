@@ -29,8 +29,16 @@ pub struct Revision {
     pub blob: String,
     /// The revision this one is compared with, if any.
     pub base: Option<String>,
-    /// This revision is what the file on disk holds now.
+    /// This revision is what the file on disk holds now. Not the same as
+    /// [`Revision::deployed`]: an edit on disk that nothing committed is
+    /// current, and the Miniserver does not run it.
     pub current: bool,
+    /// This revision is what the Miniserver runs, [`deployed_of`]: the last
+    /// Apply, Roll back or Pull ([`History::set_deployed`]), else the newest
+    /// commit, else (without git) the file on disk. Live values, the log and
+    /// queries are about this one, never about a compile or an uncommitted
+    /// edit.
+    pub deployed: bool,
     /// The Miniserver backups with the same program (file names, oldest
     /// first): they show as this revision.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -110,6 +118,9 @@ pub struct History {
     /// The watched file and the pending one as the last poll read them, by
     /// blob id (`None`: not readable).
     on_disk: (Option<String>, Option<String>),
+    /// The blob id of the program the last Apply, Roll back or Pull left on
+    /// the Miniserver, [`History::set_deployed`].
+    deployed: Option<String>,
     /// What a Roll back would deploy, [`History::set_rollback`].
     rollback: Option<Revision>,
     /// What Apply would deploy with the removals allowed (#70),
@@ -117,12 +128,34 @@ pub struct History {
     removals: Option<Revision>,
 }
 
-/// The revision the Miniserver runs: the newest commit, else the file as it
-/// is. What a plan is compared with.
+/// The revision the Miniserver runs, as [`History::lists`] marked it: the
+/// one place that says. What a plan, a live query and an edit are compared
+/// with. `None` when it is not known (a git repository without a commit of
+/// the file).
 pub fn deployed_of(hist: &[Revision]) -> Option<&Revision> {
-    hist.iter()
-        .find(|r| r.kind == "git")
-        .or_else(|| hist.iter().find(|r| r.current))
+    hist.iter().find(|r| r.deployed)
+}
+
+/// Which of `hist` (newest first) the Miniserver runs. `known` is the blob id
+/// of the last program an Apply, a Roll back or a Pull put there (a commit
+/// that failed after an Apply, or one made by hand without deploying, does
+/// not move it); a commit with it is preferred to a snapshot of the file.
+/// Unknown (after a restart), it is the newest commit; with git but no
+/// commit of the file, nothing; without git, the file on disk.
+fn pick_deployed(hist: &[Revision], known: Option<&str>, in_git: bool) -> Option<usize> {
+    if let Some(b) = known
+        && let Some(i) = hist
+            .iter()
+            .position(|r| r.kind == "git" && r.blob == b)
+            .or_else(|| hist.iter().position(|r| r.blob == b))
+    {
+        return Some(i);
+    }
+    if in_git {
+        hist.iter().position(|r| r.kind == "git")
+    } else {
+        hist.iter().position(|r| r.current)
+    }
 }
 
 /// How long a Roll back's or a removal's plan (#69, #70) can be looked at
@@ -365,29 +398,36 @@ impl History {
         if let Some(first) = hist.first_mut() {
             first.current = Some(&first.blob) == disk_blob.as_ref();
         }
-        let head_id = hist.first().map(|r| r.id.clone());
-        // A compile that is the deployed config would deploy nothing; when
-        // the newest one is, nothing is pending at all.
-        let head_blob = hist.first().map(|r| r.blob.clone());
-        let pending: Vec<Revision> = if self.pending.last().map(|r| &r.blob) == head_blob.as_ref() {
-            Vec::new()
-        } else {
-            self.pending
-                .iter()
-                .rev()
-                .filter(|r| Some(&r.blob) != head_blob.as_ref())
-                .enumerate()
-                .map(|(i, r)| {
-                    let mut r = r.clone();
-                    r.base = head_id.clone();
-                    r.current = i == 0;
-                    if i > 0 {
-                        r.label = "Earlier compile".into();
-                    }
-                    r
-                })
-                .collect()
-        };
+        let at = pick_deployed(&hist, self.deployed.as_deref(), self.git.is_some());
+        for (i, r) in hist.iter_mut().enumerate() {
+            r.deployed = Some(i) == at;
+        }
+        // A compile is compared with what the Miniserver runs, not with the
+        // newest revision, which can be an edit on disk. One that is the
+        // deployed config would deploy nothing; when the newest one is,
+        // nothing is pending at all.
+        let head_id = at.map(|i| hist[i].id.clone());
+        let head_blob = at.map(|i| hist[i].blob.clone());
+        let pending: Vec<Revision> =
+            if head_blob.is_some() && self.pending.last().map(|r| &r.blob) == head_blob.as_ref() {
+                Vec::new()
+            } else {
+                self.pending
+                    .iter()
+                    .rev()
+                    .filter(|r| Some(&r.blob) != head_blob.as_ref())
+                    .enumerate()
+                    .map(|(i, r)| {
+                        let mut r = r.clone();
+                        r.base = head_id.clone();
+                        r.current = i == 0;
+                        if i > 0 {
+                            r.label = "Earlier compile".into();
+                        }
+                        r
+                    })
+                    .collect()
+            };
         // A Roll back's plan, by its id only (the tab that asked shows it), and
         // only while it is about what the Miniserver runs: the newest commit.
         let deployed = deployed_of(&hist).map(|r| r.id.clone());
@@ -436,6 +476,18 @@ impl History {
         }
         self.backups = backups;
         self.zone = zone;
+        self.version += 1;
+        true
+    }
+
+    /// Record the blob id of the program an Apply, a Roll back or a Pull left
+    /// on the Miniserver: it is what runs, whatever git holds. Returns
+    /// whether that changed.
+    pub fn set_deployed(&mut self, blob: Option<String>) -> bool {
+        if blob.is_none() || self.deployed == blob {
+            return false;
+        }
+        self.deployed = blob;
         self.version += 1;
         true
     }
@@ -815,6 +867,157 @@ mod tests {
         assert_eq!(hist.len(), 3);
         assert!(hist.iter().all(|r| r.kind == "git"));
         assert!(hist[0].current);
+    }
+
+    #[test]
+    fn an_uncommitted_edit_is_on_disk_but_not_deployed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().canonicalize().unwrap();
+        let file = dir.join("base.Loxone");
+        let out = dir.join("out.Loxone");
+        git(&dir, &["init", "-q"]);
+        fs::write(&file, "v1").unwrap();
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-qm", "one"]);
+        let mut h = History::new(file.clone(), Some(out.clone()));
+        // The file is the newest commit: it is both.
+        let (_, hist) = h.list();
+        assert!(hist[0].current && hist[0].deployed);
+
+        // A save on disk nothing committed: current, and not what runs.
+        fs::write(&file, "v2").unwrap();
+        assert!(h.poll_files());
+        let (_, hist) = h.list();
+        assert_eq!(hist.len(), 2);
+        assert_eq!(hist[0].kind, "live");
+        assert!(hist[0].current && !hist[0].deployed);
+        assert_eq!(hist[1].kind, "git");
+        assert!(!hist[1].current && hist[1].deployed);
+        assert_eq!(hist.iter().filter(|r| r.deployed).count(), 1);
+        // What the server looks a revision up as (a live query, an input).
+        assert!(!h.find(&hist[0].id).unwrap().deployed);
+        assert!(h.find(&hist[1].id).unwrap().deployed);
+
+        // A compile is never deployed, current or not.
+        fs::write(&out, "compiled").unwrap();
+        assert!(h.poll_files());
+        let (pending, _) = h.list();
+        assert!(pending[0].current && !pending[0].deployed);
+        assert!(!h.find(&pending[0].id).unwrap().deployed);
+    }
+
+    #[test]
+    fn what_an_apply_left_on_the_miniserver_is_deployed_whatever_git_holds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().canonicalize().unwrap();
+        let file = dir.join("base.Loxone");
+        git(&dir, &["init", "-q"]);
+        fs::write(&file, "A").unwrap();
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-qm", "A"]);
+        let mut h = History::new(file.clone(), None);
+        // Unknown (just started): the newest commit.
+        assert_eq!(deployed_of(&h.list().1).unwrap().blob, blob_id(b"A"));
+
+        // An Apply uploaded B and its commit failed: B is on disk, not in
+        // git, and it is what runs.
+        fs::write(&file, "B").unwrap();
+        assert!(h.poll_files());
+        assert!(h.set_deployed(Some(blob_id(b"B"))));
+        assert!(!h.set_deployed(Some(blob_id(b"B"))), "unchanged");
+        let (_, hist) = h.list();
+        let d = deployed_of(&hist).unwrap();
+        assert_eq!((d.kind, d.blob.as_str()), ("live", blob_id(b"B").as_str()));
+        assert!(hist.iter().filter(|r| r.deployed).count() == 1);
+
+        // Someone commits C by hand: the newest commit, deployed by nobody.
+        fs::write(&file, "C").unwrap();
+        git(&dir, &["commit", "-qam", "C"]);
+        assert!(h.refresh_git());
+        assert!(h.poll_files());
+        let (_, hist) = h.list();
+        let c = hist.iter().find(|r| r.blob == blob_id(b"C")).unwrap();
+        assert!(c.kind == "git" && !c.deployed);
+        assert_eq!(deployed_of(&hist).unwrap().blob, blob_id(b"B"));
+
+        // A Pull of C says it does run: then the commit is it.
+        assert!(h.set_deployed(Some(blob_id(b"C"))));
+        let (_, hist) = h.list();
+        let d = deployed_of(&hist).unwrap();
+        assert_eq!((d.kind, d.blob.as_str()), ("git", blob_id(b"C").as_str()));
+    }
+
+    #[test]
+    fn in_a_repository_without_a_commit_of_the_file_nothing_is_deployed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().canonicalize().unwrap();
+        let file = dir.join("base.Loxone");
+        git(&dir, &["init", "-q"]);
+        fs::write(&file, "A").unwrap();
+        let h = History::new(file, None);
+        let (_, hist) = h.list();
+        assert_eq!(hist.len(), 1);
+        assert!(hist[0].current && !hist[0].deployed);
+        assert!(deployed_of(&hist).is_none());
+        // What a live query or an input lookup asks.
+        assert!(!h.find(&hist[0].id).unwrap().deployed);
+    }
+
+    #[test]
+    fn a_compile_is_compared_with_what_runs_not_with_an_edit_on_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().canonicalize().unwrap();
+        let file = dir.join("base.Loxone");
+        let out = dir.join("out.Loxone");
+        git(&dir, &["init", "-q"]);
+        fs::write(&file, "A").unwrap();
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-qm", "A"]);
+        let mut h = History::new(file.clone(), Some(out.clone()));
+        // An edit on disk that was not deployed: B.
+        fs::write(&file, "B").unwrap();
+        // Compiled to B: it is not what runs, so it is pending.
+        fs::write(&out, "B").unwrap();
+        assert!(h.poll_files());
+        let (pending, hist) = h.list();
+        let a = hist.iter().find(|r| r.kind == "git").unwrap();
+        assert_eq!(pending.len(), 1, "B is not deployed");
+        assert_eq!(pending[0].base.as_deref(), Some(a.id.as_str()));
+        assert_eq!(pending[0].blob, blob_id(b"B"));
+        // Compiled to C: still compared with A, which hides nothing.
+        fs::write(&out, "C").unwrap();
+        assert!(h.poll_files());
+        let (pending, _) = h.list();
+        assert_eq!(pending[0].blob, blob_id(b"C"));
+        assert!(
+            pending
+                .iter()
+                .all(|r| r.base.as_deref() == Some(a.id.as_str()))
+        );
+        // Compiled back to A: nothing is pending.
+        fs::write(&out, "A").unwrap();
+        assert!(h.poll_files());
+        assert!(h.list().0.is_empty());
+        // And once B is what runs, a compile to B is nothing, to C pending.
+        assert!(h.set_deployed(Some(blob_id(b"B"))));
+        fs::write(&out, "B").unwrap();
+        assert!(h.poll_files());
+        assert!(h.list().0.is_empty());
+        let (_, hist) = h.list();
+        assert_eq!(deployed_of(&hist).unwrap().blob, blob_id(b"B"));
+    }
+
+    #[test]
+    fn without_git_the_file_on_disk_is_what_runs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("base.Loxone");
+        fs::write(&file, "v1").unwrap();
+        let mut h = History::new(file.clone(), None);
+        fs::write(&file, "v2").unwrap();
+        assert!(h.poll_files());
+        let (_, hist) = h.list();
+        assert!(hist[0].current && hist[0].deployed);
+        assert!(!hist[1].current && !hist[1].deployed);
     }
 
     #[test]
