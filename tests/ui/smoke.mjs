@@ -227,8 +227,16 @@ try {
   page.on("pageerror", (e) => errors.push(e.message));
   page.on("console", (m) => { if (m.type() === "error") errors.push(m.text()); });
   const url = `http://127.0.0.1:${port}/`;
+  let failedInitialHistory = false;
+  await page.route("**/api/history", async (route) => {
+    if (!failedInitialHistory) {
+      failedInitialHistory = true;
+      await route.fulfill({ status: 200, body: "not json" });
+    } else await route.continue();
+  });
   await page.goto(url);
-  await page.waitForSelector(".tab");
+  await page.waitForFunction(() => S.hist && S.view && document.querySelector(".tab"), null, { timeout: 10000 });
+  assert.equal(failedInitialHistory, true, "the initial history request failed");
 
   const step = async (name, fn) => { await fn(); console.log("ok -", name); };
   // The Miniserver runs the last commit; the uncommitted edit on disk is the newest revision (#121). What is about

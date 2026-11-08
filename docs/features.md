@@ -655,7 +655,8 @@ Miniserver; only Apply writes to it, and with `--operate`, commands to virtual i
 | History entry | show it | compare the viewed revision with this one (again: stop comparing) |
 
 The *Viewing* and *compared with* menus in the toolbar pick any pair of revisions. Pick *nothing* to see
-a revision without change marks. *Follow latest* jumps to each new revision as it appears.
+a revision without change marks. *Follow latest* jumps to each new revision as it appears. If the initial history
+request fails, vislox retries when the event stream connects, so the page recovers without a config change.
 
 Keys:
 - `Ctrl+K`: go to a page or block. `Ctrl+F`: filter the tree. `?`: list all shortcuts.

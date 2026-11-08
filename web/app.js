@@ -8476,7 +8476,7 @@ function flash(n) {
 function connect() {
   const es = new EventSource("/api/events");
   // Changes while the stream was down (or before it opened) are not replayed: catch up.
-  es.onopen = () => { setStatus("live", "live"); if (S.hist) loadHistory(); };
+  es.onopen = () => { setStatus("live", "live"); loadHistory(); };
   // A new deployed revision may have taken over the app's calendar edits.
   es.addEventListener("history", () => { loadHistory(true); loadCal(); });
   // `changed`: re-read it. `read` again unchanged: only an Apply waiting for a read cares.
