@@ -754,7 +754,7 @@ rect.ghost, line.ghost { fill: #1f6fd10a; stroke: var(--moved); stroke-opacity: 
 .md-mh { font-weight: 700; font-size: 13px; margin-bottom: 4px; }
 .md-wk, .md-days { display: grid; grid-template-columns: repeat(7, 1fr); gap: 2px; }
 .md-wk span { font-size: 10px; color: var(--faint); text-align: center; }
-.md-d { height: 22px; display: flex; align-items: center; justify-content: center; font-size: 11px; border-radius: 3px; font-variant-numeric: tabular-nums; cursor: default; }
+.md-d { border: 0; padding: 0; background-color: transparent; color: inherit; font: inherit; height: 22px; display: flex; align-items: center; justify-content: center; font-size: 11px; border-radius: 3px; font-variant-numeric: tabular-nums; cursor: pointer; }
 .md-d.md-we { color: var(--faint); }
 .md-d.md-on { color: #fff; font-weight: 600; cursor: pointer; text-shadow: 0 0 2px #0006; }
 .md-d.md-today { outline: 2px solid var(--text); outline-offset: 0; font-weight: 700; }
@@ -763,6 +763,7 @@ rect.ghost, line.ghost { fill: #1f6fd10a; stroke: var(--moved); stroke-opacity: 
 .md-d.md-rem:not(.md-on) { color: var(--removed); }
 .md-d.md-chg { box-shadow: inset 0 0 0 2px var(--changed-dot); cursor: pointer; }
 .md-d.md-hl { outline: 2px solid var(--sel); outline-offset: 1px; z-index: 1; }
+#md-grid .md-d:focus-visible { outline: 3px solid var(--text); outline-offset: 2px; z-index: 3; }
 .md-side { width: 320px; flex: none; border-left: 1px solid var(--line); background: var(--panel); display: flex; flex-direction: column; min-height: 0; }
 .md-side h3 { margin: 0; padding: 10px 12px 6px; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
 .md-list { list-style: none; margin: 0; padding: 0 6px 10px; overflow: auto; flex: 1; }

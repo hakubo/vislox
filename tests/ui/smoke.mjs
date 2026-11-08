@@ -472,7 +472,38 @@ try {
     // Dates are whole days, also in years before 100 (Date.UTC would make 50 into 1950).
     assert.deepEqual(await page.evaluate(() => mdYmd(mdDay(50, 3, 1))), [50, 3, 1]);
     // Today is fixed for the test: Easter Monday 2026, a Feiertag.
-    await page.evaluate(() => { window.mdToday = () => mdDay(2026, 4, 6); MD.year = 2026; renderModes(); });
+    await page.evaluate(() => { window.mdToday = () => mdDay(2026, 4, 6); MD.year = 2026; MD.focusDay = mdDay(2026, 4, 6); renderModes(); });
+    // Keyboard interaction stays on the date grid and never pans the hidden logic page.
+    for (let i = 0; i < 50 && !(await page.evaluate(() => document.activeElement.matches("[data-day]"))); i++) await page.keyboard.press("Tab");
+    assert.equal(await page.evaluate(() => +document.activeElement.dataset.day), await page.evaluate(() => mdDay(2026, 4, 6)));
+    assert.match(await page.evaluate(() => document.activeElement.getAttribute("aria-label")), /Monday, April 6, 2026.*Feiertag.*Urlaub/);
+    const ring = await page.evaluate(() => ({ style: getComputedStyle(document.activeElement).outlineStyle, width: parseFloat(getComputedStyle(document.activeElement).outlineWidth) }));
+    assert.equal(ring.style, "solid");
+    assert.ok(ring.width >= 3, "focused day has a visible ring above today and selection outlines");
+    const panBefore = await page.evaluate(() => JSON.stringify(S.vp[S.page]));
+    await page.keyboard.press("ArrowRight");
+    await page.waitForFunction(() => document.activeElement.matches('[data-day="' + mdDay(2026, 4, 7) + '"]'));
+    assert.equal(await page.evaluate(() => JSON.stringify(S.vp[S.page])), panBefore, "day arrows do not pan the hidden page");
+    await page.keyboard.press("Escape");
+    await page.waitForFunction(() => document.querySelector("#modes")?.classList.contains("hidden"));
+
+    // Reopen by keyboard. A year-button redraw must leave focus on that button, and a redraw
+    // while focus is there must not move focus into the hidden grid.
+    await page.keyboard.press("Control+k");
+    await page.keyboard.type("operating");
+    await page.keyboard.press("Enter");
+    await page.waitForSelector("#modes:not(.hidden)");
+    for (let i = 0; i < 30 && (await page.evaluate(() => document.activeElement.id)) !== "md-next"; i++) await page.keyboard.press("Tab");
+    assert.equal(await page.evaluate(() => document.activeElement.id), "md-next");
+    await page.keyboard.press("Enter");
+    await page.waitForFunction(() => document.querySelector("#md-year")?.textContent === "2027");
+    assert.equal(await page.evaluate(() => document.activeElement.id), "md-next");
+    await page.evaluate(() => { MD.year = 2026; MD.focusDay = mdDay(2026, 4, 6); renderModes(); });
+    assert.equal(await page.evaluate(() => document.activeElement.id), "md-next", "rendering while focus is elsewhere does not steal it");
+    for (let i = 0; i < 50 && !(await page.evaluate(() => document.activeElement.matches("[data-day]"))); i++) await page.keyboard.press("Tab");
+    assert.equal(await page.evaluate(() => +document.activeElement.dataset.day), await page.evaluate(() => mdDay(2026, 4, 6)));
+    await page.keyboard.press("Enter");
+    await page.waitForFunction(() => document.querySelector(".ph-t")?.textContent === "Ostermontag" && document.activeElement.matches('[data-day="' + mdDay(2026, 4, 6) + '"]'));
     const cls = (m, d, y = 2026) => page.evaluate(([y, m, d]) => document.querySelector(`#md-grid [data-day="${mdDay(y, m, d)}"]`)?.className ?? "", [y, m, d]);
     const bg = (m, d) => page.evaluate(([m, d]) => document.querySelector(`#md-grid [data-day="${mdDay(2026, m, d)}"]`)?.getAttribute("style") ?? "", [m, d]);
     assert.match(await cls(4, 6), /md-on/, "Easter Monday 2026 is 6 Apr");
@@ -518,6 +549,7 @@ try {
     // Another year: the summer holidays of 2026 are not in 2025. The arrows step the year even
     // when focus left the view (a click on a day re-renders it).
     await page.click(`#md-grid [data-day="${await page.evaluate(() => mdDay(2026, 4, 6))}"]`);
+    await page.keyboard.press("Tab"); // leave the day grid; its arrows navigate dates, while the view arrows change years.
     await page.keyboard.press("ArrowLeft");
     assert.equal(await page.textContent("#md-year"), "2025");
     assert.doesNotMatch(await cls(7, 4, 2025), /md-on/);

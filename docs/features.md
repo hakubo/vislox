@@ -47,9 +47,13 @@ sends to the Miniserver see [miniserver.md](miniserver.md).
   the Changes list reads a changed rule per line (*Pumpe Ein · condition changed: at 09:00 → at 10:00*, *· action
   added: wait 5s*, *· active → inactive*) in place of the raw `APC=` change.
 - **Operating modes** (Ctrl+K *Operating modes*, or **Year** on the tree's Calendar or Operating modes folder): a
-  year calendar of when each mode is on. Each day carries the colour of every mode its entries switch on; ← / →
-  go to other years (from 2009, Loxone's day 0), and a mode's chip hides or shows its days. Hovering a day lists its entries, and clicking
-  a day or an entry in the list beside the year selects the entry (Properties). Today is outlined. With live
+  year calendar of when each mode is on. Each day carries the colour of every mode its entries switch on; the year
+  buttons and ← / → outside the date grid change years (from 2009, Loxone's day 0), and a mode's chip hides or
+  shows its days. Each date is a
+  keyboard accessible button named with its full date and the modes and periods on it; focusing it shows the same
+  day details as hovering. Tab enters at one day; the arrow keys move by day or week, Home and End move to the
+  week edges, and PageUp and PageDown change the year. Enter or Space selects the first entry just as a click does. Clicking a day or an entry in the
+  list beside the year selects the entry (Properties). Today is outlined. With live
   values on, the modes that are on now (their `Q`) are marked *on now*, and the chip's tooltip says whether the
   calendar has that mode today or logic switched it on. In change review, days the viewed revision adds are
   outlined green and days it removes red (amber for both), so a timespan in the wrong year stands out. An entry whose date no longer decodes shows its old days as removed. Easter
@@ -423,7 +427,8 @@ sends to the Miniserver see [miniserver.md](miniserver.md).
 - **Operating modes and calendar entries** (the same project and token, #86): the Operating modes view's *Add mode*
   adds a user mode by its name (lox numbers it), and *Add entry* a calendar entry: its name, the mode it switches on
   and its date, one of four kinds: every year on a day, relative to Easter, one period, a range every year. Click a
-  day of the year, or drag across days, to pick the date; the draft's days are outlined, and once compiled the new
+  day of the year, or drag across days, to pick the date; keyboard Enter picks a day and Shift+Enter extends a
+  range from the first picked day. The draft's days are outlined, and once compiled the new
   days show outlined as added. *Edit* on an entry added here changes its name, mode and date; Undo, Revert, Remove
   and Delete work as for a block, and a mode is not deleted while an entry switches it on. vislox writes
   `<module>/vislox/_periphery.loxl` and names each mode the one way lox takes it (`holiday`, a slug, or `"Title"`).
