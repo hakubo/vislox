@@ -10393,6 +10393,7 @@ pub(crate) mod tests {
         let src = crate::module_edit::ModuleSrc {
             dir: "module/vislox".into(),
             texts: [("module/haus.loxl".to_string(), own_text.to_string())].into(),
+            ..Default::default()
         };
         let mut ctx = ctx_of(&out, &d, &lock, None, &names);
         ctx.lets = &lets;
@@ -10489,7 +10490,7 @@ pub(crate) mod tests {
             &ctx,
             &defaults_op(
                 "Monoflop",
-                "Trigger",
+                "InputTrigger",
                 Some("1"),
                 Some(stmt),
                 Some(&["licht", "flur"]),
@@ -10572,6 +10573,83 @@ pub(crate) mod tests {
         apply_op(&mut files, &ctx, &undo[0]).unwrap();
         assert_eq!(files, before);
         assert!(files.render().is_empty());
+    }
+
+    /// Undo writes a previous spelling back as written (`"4"`, read by lox
+    /// as a number); `on`/`off` are values of a default, not constant names;
+    /// a default names a port its type has (#81).
+    #[test]
+    fn a_previous_spelling_is_restored_and_a_default_takes_literals_and_real_ports() {
+        let d = doc("house.Loxone");
+        let own_text = "page \"Obergeschoss\"\nlet t = \"4\" # vier\ndefaults Monoflop(Reset: off)\nlicht = Monoflop(\"Licht\")\n";
+        let own: BTreeMap<String, String> =
+            [("haus.loxl".to_string(), own_text.to_string())].into();
+        let mut l = Lockfile::default();
+        let out = compile_own(&d, &own, &Files::default(), &mut l).unwrap();
+        let lock = lock_of(&l);
+        let names: BTreeSet<String> = ["t", "licht"].into_iter().map(String::from).collect();
+        let lets: BTreeSet<String> = ["t".to_string()].into();
+        let src = crate::module_edit::ModuleSrc {
+            dir: "module/vislox".into(),
+            texts: [("module/haus.loxl".to_string(), own_text.to_string())].into(),
+            ..Default::default()
+        };
+        let mut ctx = ctx_of(&out, &d, &lock, None, &names);
+        ctx.lets = &lets;
+        ctx.module = &src;
+        let mut files = Files::default();
+        let op = Op::Let {
+            name: "t".into(),
+            value: Some("8".into()),
+            source: Some("let t = \"4\" # vier".into()),
+        };
+        let r = apply_op(&mut files, &ctx, &op).unwrap();
+        assert_eq!(r.previous["value"], "\"4\"");
+        let undo = undo_ops(&[op], std::slice::from_ref(&r.previous), &[None]).unwrap();
+        let mut back = files.clone();
+        apply_op(&mut back, &ctx, &undo[0]).unwrap();
+        assert_eq!(back.module["module/haus.loxl"], own_text);
+        // A boolean default, and its inverse.
+        let stmt = "defaults Monoflop(Reset: off)";
+        let op = defaults_op(
+            "Monoflop",
+            "Reset",
+            Some("on"),
+            Some(stmt),
+            Some(&["licht"]),
+        );
+        let r = apply_op(&mut files, &ctx, &op).unwrap();
+        assert!(files.module["module/haus.loxl"].contains("defaults Monoflop(Reset: on)\n"));
+        let undo = undo_ops(&[op], std::slice::from_ref(&r.previous), &[None]).unwrap();
+        apply_op(&mut files, &ctx, &undo[0]).unwrap();
+        assert!(files.module["module/haus.loxl"].contains("defaults Monoflop(Reset: off)\n"));
+        // On vislox's statement too: `on` is a value.
+        let before = files.clone();
+        apply_op(
+            &mut files,
+            &ctx,
+            &defaults_op("Div", "Input2", Some("on"), None, Some(&[])),
+        )
+        .unwrap();
+        assert_eq!(files.claims.10["Div"]["In2"], Value::Bool(true));
+        files = before;
+        // A port the type does not have, and a type lox does not know.
+        let before = files.clone();
+        let e = apply_op(
+            &mut files,
+            &ctx,
+            &defaults_op("Monoflop", "Tme", Some("5s"), None, Some(&["licht"])),
+        )
+        .unwrap_err();
+        assert!(e.contains("no parameter or setting of Monoflop"), "{e}");
+        let e = apply_op(
+            &mut files,
+            &ctx,
+            &defaults_op("Monoflopp", "Time", Some("5s"), None, Some(&[])),
+        )
+        .unwrap_err();
+        assert!(e.contains("no block type lox knows"), "{e}");
+        assert_eq!(files, before);
     }
 
     /// The files' texts, read back and rendered again: a fixed point.

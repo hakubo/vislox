@@ -2880,6 +2880,20 @@ try {
     await page.click(`${params} [data-dflt="open"][data-key="Time"]`);
     await waitText(params, /a new statement in pages\/vislox\/edits\.loxl\. It changes every Monoflop that does not set Time itself, the module's own blocks among them: 1 block: Kurz\./);
     await page.fill("#dflt-v", "5min");
+    // The blocks change while the panel is open (a Monoflop added to the module's file): the save is refused, and the
+    // panel asks the server again and shows the new list for consent; so again once the file is put back.
+    const zeiten = join(dir, "pages", "zeiten.loxl"), zeitenWas = readFileSync(zeiten, "utf8");
+    const refused = async (re) => {
+      const n = edits.length;
+      await page.click(`${params} [data-dflt="save"]`);
+      await until(() => edits.length > n && statuses[n] !== undefined, "a refused default");
+      assert.equal(statuses[n], 422);
+      await waitText(params, re);
+    };
+    writeFileSync(zeiten, zeitenWas + 'mittel = Monoflop("Mittel")\n');
+    await refused(/not the ones listed before: now 2 blocks: Kurz, mittel\. Save again to confirm these/);
+    writeFileSync(zeiten, zeitenWas);
+    await refused(/not the ones listed before: now 1 block: Kurz\. Save again to confirm these/);
     ops = await send(() => page.click(`${params} [data-dflt="save"]`), "make a default");
     assert.deepEqual(ops, [{ op: "defaults", type: "Monoflop", port: "Time", value: "5min", blocks: ["kurz"] }]);
     assert.match(claims(), /^defaults Monoflop\(Time: 5min\)$/m);
@@ -2888,6 +2902,13 @@ try {
     await waitText(params, /Default Monoflop Time\s*5min\s*not deployed/);
     await waitText("#deploy-pend", /the default Monoflop Time, which changes 1 block \(Kurz\)/);
     assert.match(await page.evaluate(() => constApplyText()), /defaults Monoflop\(Time: 5min\) \(was none\), pages\/vislox\/edits\.loxl:\d+: changes 1 block: Kurz/);
+    // Revert, named by kind, type and port (not by its place in the list): the default is taken out; undone, it is back.
+    ops = await send(() => page.click(`${params} [data-dflt="revert"][data-key="defaults|Monoflop|Time"]`), "revert the default");
+    assert.deepEqual(ops, [{ op: "defaults", type: "Monoflop", port: "Time", value: null, blocks: ["kurz"] }]);
+    await page.waitForFunction(`${time(K4)} === "60"`, null, { timeout: 10000 });
+    assert.doesNotMatch(claims(), /defaults/);
+    ops = await undoKey(false, `${time(K4)} === "300"`);
+    assert.deepEqual(ops, [{ op: "defaults", type: "Monoflop", port: "Time", value: "5min", blocks: ["kurz"] }]);
     // Changed again: vislox's own statement, so no line is named.
     await page.click(`${params} [data-dflt="open"][data-key="Time"]`);
     await waitText(params, /vislox's statement in pages\/vislox\/edits\.loxl:\d+/);

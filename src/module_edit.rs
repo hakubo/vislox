@@ -34,6 +34,73 @@ pub struct ModuleSrc {
     /// vislox's directory, from the project root (`module/vislox`).
     pub dir: String,
     pub texts: BTreeMap<String, String>,
+    /// The files reached through a symbolic link (the file, or a directory
+    /// on its way), by path: read, never written ([`plain_inside`]), with why.
+    pub linked: BTreeMap<String, String>,
+}
+
+/// Whether `file` is a plain file inside the module directory `module`,
+/// reached without a symbolic link: neither it nor a directory between it
+/// and `module` is one, and its real path is inside the module's. vislox
+/// writes only such a file of the module's own, so a link never sends a
+/// rewrite outside the module.
+pub fn plain_inside(module: &std::path::Path, file: &std::path::Path) -> Result<(), String> {
+    let shown = file.display();
+    let rel = file
+        .strip_prefix(module)
+        .map_err(|_| format!("{shown} is not in the module"))?;
+    let root = module
+        .canonicalize()
+        .map_err(|e| format!("cannot read the module directory: {e}"))?;
+    let mut at = module.to_path_buf();
+    for c in rel.components() {
+        at.push(c);
+        let m = std::fs::symlink_metadata(&at).map_err(|e| format!("{}: {e}", at.display()))?;
+        if m.file_type().is_symlink() {
+            return Err(format!(
+                "{shown} is reached through a symbolic link ({}): vislox writes only plain files \
+                 inside the module; change it there",
+                at.display()
+            ));
+        }
+    }
+    let real = file.canonicalize().map_err(|e| format!("{shown}: {e}"))?;
+    if real != root.join(rel) || !real.starts_with(&root) {
+        return Err(format!("{shown} is outside the module; change it there"));
+    }
+    if !std::fs::symlink_metadata(file).is_ok_and(|m| m.is_file()) {
+        return Err(format!("{shown} is no plain file"));
+    }
+    Ok(())
+}
+
+/// Write `text` over the module's own `file`, checked with [`plain_inside`]
+/// first and opened without following a link (O_NOFOLLOW).
+pub fn write_inside(
+    module: &std::path::Path,
+    file: &std::path::Path,
+    text: &str,
+) -> Result<(), String> {
+    use std::io::Write;
+    plain_inside(module, file)?;
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.custom_flags(libc::O_NOFOLLOW);
+    }
+    o.open(file)
+        .and_then(|mut f| f.write_all(text.as_bytes()))
+        .map_err(|e| format!("cannot write {}: {e}", file.display()))
+}
+
+/// Refused when the module's own file `path` is reached through a link.
+fn writable(ctx: &Ctx, path: &str) -> Result<(), String> {
+    match ctx.module.linked.get(path) {
+        Some(why) => Err(why.clone()),
+        None => Ok(()),
+    }
 }
 
 /// No module files: a [`Ctx`] of a request that changes none.
@@ -41,6 +108,7 @@ pub struct ModuleSrc {
 pub static NO_MODULE: ModuleSrc = ModuleSrc {
     dir: String::new(),
     texts: BTreeMap::new(),
+    linked: BTreeMap::new(),
 };
 
 /// The module as the request has changed it so far: its own files (with
@@ -327,6 +395,7 @@ pub fn set_let(
             "`{name}` is a text constant: change it in its file ({path})"
         ));
     }
+    writable(ctx, path)?;
     let text = text_now(files, ctx, path).to_string();
     let lines: Vec<&str> = text.split('\n').collect();
     let n = let_line(&lines, name)
@@ -339,19 +408,14 @@ pub fn set_let(
         &at,
     )?;
     let new = written(value)?;
-    crate::edit::constant_value(&new)?;
+    // As lox reads it: a previous spelling an undo writes back (`"4"`, `4.0`)
+    // is taken as written.
+    let want = let_parsed(name, &new)?;
     let span = let_value_span(lines[n]).ok_or_else(|| format!("`{name}`: no value on {at}"))?;
     let old = lines[n][span.clone()].to_string();
     let out = splice(&text, n, span, &new);
     // The rewrite is that one value: the file reads as before but for it,
     // and it reads as the value does alone.
-    let want = Module::parse_fragment(&format!("let {name} = {new}\n"))
-        .ok()
-        .and_then(|m| match m.items.into_iter().next() {
-            Some(Item::Let(l)) => Some(l.value),
-            _ => None,
-        })
-        .ok_or_else(|| format!("`{new}` is no value lox reads"))?;
     let m = Module::parse_fragment(&out).map_err(|e| format!("{at}: {e}"))?;
     let before = &mods.iter().find(|(p, _)| p == *path).expect("found").1;
     let ok = m.items.len() == before.items.len()
@@ -395,23 +459,81 @@ fn module_defaults<'a>(
     })
 }
 
-/// A default's value as the browser sent it, checked: a constant by its
-/// name (vislox's or the module's), else a value the port takes.
-fn default_value(ctx: &Ctx, files: &Files, ty: &str, key: &str, v: &str) -> Result<(), String> {
-    let t = v.trim();
-    if crate::edit::bare_name(t) {
-        if files.claims.8.contains_key(t) || ctx.lets.contains(t) {
-            return Ok(());
+/// A constant's value `t` as lox reads it in `let <name> = t`: a number (with
+/// its unit), a time of day or `on`/`off`, however it is spelled.
+fn let_parsed(name: &str, t: &str) -> Result<Value, String> {
+    let v = Module::parse_fragment(&format!("let {name} = {t}\n"))
+        .ok()
+        .and_then(|m| match m.items.into_iter().next() {
+            Some(Item::Let(l)) => Some(l.value),
+            _ => None,
+        });
+    match v {
+        Some(v @ (Value::Number(_) | Value::Unit { .. } | Value::Clock(_) | Value::Bool(_))) => {
+            Ok(v)
         }
-        return Err(format!("`{t}` is no constant of the module"));
+        _ => Err(crate::edit::constant_value(t)
+            .err()
+            .unwrap_or_else(|| format!("`{t}` is no value lox reads"))),
     }
-    if loxone_config::connectors::builtin(ty)
-        .is_some_and(|specs| specs.iter().any(|s| s.key == key))
+}
+
+/// A default's value `t` as lox reads it in `defaults <ty>(<port>: t)`.
+fn default_parsed(ty: &str, port: &str, t: &str) -> Result<Value, String> {
+    Module::parse_fragment(&format!("defaults {ty}({port}: {t})\n"))
+        .ok()
+        .and_then(|m| match m.items.into_iter().next() {
+            Some(Item::Defaults(d)) => d.params().next().map(|(_, v)| v.clone()),
+            _ => None,
+        })
+        .ok_or_else(|| format!("`{t}` is no value lox reads in a default"))
+}
+
+/// Port `key` (a connector key) of `ty` that a default may set: one of its
+/// parameters or inputs, or one of its settings. Its Lox Logic name.
+pub fn default_port(ty: &str, key: &str) -> Result<String, String> {
+    if !crate::managed::is_name(ty) || loxone_config::connectors::builtin(ty).is_none() {
+        return Err(format!("`{ty}` is no block type lox knows"));
+    }
+    if !(crate::blocks::valued_ports(ty).any(|s| s.key == key)
+        || loxone_config::connectors::attr_params(ty).contains(&key))
     {
-        crate::units::port_value(ty, key, t).map(|_| ())
-    } else {
-        crate::edit::constant_value(t).map(|_| ())
+        return Err(format!("`{key}` is no parameter or setting of {ty}"));
     }
+    Ok(port_names::name_of(ty, key).to_string())
+}
+
+/// A default's value as the browser sent it (written as given), checked:
+/// literals first (`on`/`off` are values, not names), a number against the
+/// port's unit, else a constant by its name (vislox's or the module's).
+fn default_value(
+    ctx: &Ctx,
+    files: &Files,
+    ty: &str,
+    key: &str,
+    port: &str,
+    t: &str,
+) -> Result<Value, String> {
+    let v = default_parsed(ty, port, t)?;
+    match &v {
+        Value::Number(_) | Value::Unit { .. } => {
+            if loxone_config::connectors::builtin(ty)
+                .is_some_and(|specs| specs.iter().any(|s| s.key == key))
+            {
+                crate::units::port_value(ty, key, &v.to_string())?;
+            }
+        }
+        Value::Clock(_) | Value::Bool(_) | Value::Str(_) => {}
+        Value::Ref(n) if files.claims.8.contains_key(n) || ctx.lets.contains(n) => {}
+        Value::Ref(n) => return Err(format!("`{n}` is no constant of the module")),
+        _ => {
+            return Err(format!(
+                "`{t}`: a default takes a number (with its unit), on or off, a time of day, a \
+                 text or a constant's name"
+            ));
+        }
+    }
+    Ok(v)
 }
 
 /// The `defaults` op: the default of port `key` (a connector key) for every
@@ -428,17 +550,16 @@ pub fn set_defaults(
     source: Option<&str>,
     blocks: Option<&[String]>,
 ) -> Result<serde_json::Value, String> {
-    if !crate::managed::is_name(ty) {
-        return Err(format!("`{ty}` is no block type"));
-    }
-    let port = port_names::name_of(ty, key).to_string();
-    if !crate::managed::is_name(&port) {
-        return Err(format!("`{key}` is no port of {ty}"));
-    }
-    if let Some(v) = value {
-        written(v)?;
-        default_value(ctx, files, ty, key, v)?;
-    }
+    let port = default_port(ty, key)?;
+    // The value as written, and as lox reads it: checked once, first.
+    let value = match value {
+        Some(v) => {
+            let t = written(v)?;
+            let parsed = default_value(ctx, files, ty, key, &port, &t)?;
+            Some((t, parsed))
+        }
+        None => None,
+    };
     let mods = parsed(files, ctx)?;
     // Every check first: the blocks it changes, as the module is now.
     let reach =
@@ -457,7 +578,7 @@ pub fn set_defaults(
         op
     };
     if let Some((path, index, decl)) = module_defaults(&mods, ty) {
-        let Some(value) = value else {
+        let Some((new, want)) = value else {
             return Err(format!(
                 "`defaults {ty}` is in the module's own file ({path}): vislox changes one of its \
                  values, it never drops one; take it out there"
@@ -469,6 +590,7 @@ pub fn set_defaults(
                  adds one; add it there"
             ));
         }
+        writable(ctx, path)?;
         let text = text_now(files, ctx, path).to_string();
         let lines: Vec<&str> = text.split('\n').collect();
         let start = defaults_line(&lines, ty)
@@ -481,19 +603,11 @@ pub fn set_defaults(
             &format!("`defaults {ty}`"),
             &at,
         )?;
-        let new = written(value)?;
         let (n, span) = (start..=end)
             .find_map(|n| arg_value_span(lines[n], &port).map(|s| (n, s)))
             .ok_or_else(|| format!("`defaults {ty}`: vislox cannot find {port} on {at}"))?;
         let old = lines[n][span.clone()].to_string();
         let out = splice(&text, n, span, &new);
-        let want = Module::parse_fragment(&format!("defaults {ty}({port}: {new})\n"))
-            .ok()
-            .and_then(|m| match m.items.into_iter().next() {
-                Some(Item::Defaults(d)) => d.params().next().map(|(_, v)| v.clone()),
-                _ => None,
-            })
-            .ok_or_else(|| format!("`{new}` is no value lox reads in a default"))?;
         let m = Module::parse_fragment(&out).map_err(|e| format!("{at}: {e}"))?;
         let before = &mods.iter().find(|(p, _)| p == path).expect("found").1;
         let same_but = |a: &Item| -> bool {
@@ -535,15 +649,7 @@ pub fn set_defaults(
     let ours = files.claims.10.entry(ty.to_string()).or_default();
     let previous = ours.get(&port).map(|v| v.to_string());
     match value {
-        Some(v) => {
-            let t = v.trim();
-            let parsed = Module::parse_fragment(&format!("defaults {ty}({port}: {t})\n"))
-                .ok()
-                .and_then(|m| match m.items.into_iter().next() {
-                    Some(Item::Defaults(d)) => d.params().next().map(|(_, v)| v.clone()),
-                    _ => None,
-                })
-                .ok_or_else(|| format!("`{t}` is no value lox reads in a default"))?;
+        Some((_, parsed)) => {
             ours.insert(port.clone(), parsed);
         }
         None if previous.is_none() => {

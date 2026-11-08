@@ -499,11 +499,15 @@ vx_60000002_0000_0000_ffff504f94000001.Time = vx_nachlauf
   showed it`), so a hand edit is never overwritten. It is refused, changing nothing, when a file of the module does
   not read (lox's error, naming the file), for a text constant (`refusal`, which the form shows), and for `value:
   null` (vislox never drops the module's constant). The new file must read as the old one but for that value, or it
-  is refused. Its `previous` is the `let` op that writes the old text back (`"value": "30min"`, `source` the line as
+  is refused. A value is taken as lox reads it, so an undo writes a previous spelling back as it was (`"4"`, `4.0`).
+  A file reached through a symbolic link (the file, or a directory on its way) is read but never written: vislox
+  checks that the file is a plain file whose real path is inside the module, right before it writes, and opens it
+  without following a link (`O_NOFOLLOW`). Its `previous` is the `let` op that writes the old text back (`"value": "30min"`, `source` the line as
   the op left it), so undo restores the exact old bytes. It is a pending edit like any other: written before the
   compile (put back when the compile fails), compiled into the pending revision, in the Changes list, Apply's review
   and Discard (which takes the module back to the last commit).
-- **The form** offers *Change the constant (N uses)* for the module's constant too, naming the line it rewrites.
+- **The form** offers *Change the constant (N uses)* for the module's constant too, naming the line it rewrites. A
+  field neither scope may change (a text constant the module's own extern binds) is read-only, with both reasons.
   Where the module's own file binds the port (`x.Port = name` on an extern), *Only this block* is off and says why
   (`constants.uses[…].block_refusal`): a claim of vislox's on the same port would claim it twice, and the server
   refuses a `param` claim there (`… is bound in pages/x.loxl:3, the module's own file`). Dropping vislox's claim is
@@ -516,13 +520,15 @@ vx_60000002_0000_0000_ffff504f94000001.Time = vx_nachlauf
   it goes into vislox's statement in `edits.loxl`, made when there is none: `defaults Monoflop(Time: 5min)`. lox
   reads a `defaults` statement from any file of the module, at its top level, one per type (lox's language.md,
   *defaults*), so vislox's file scopes it module-wide like any other. `value: null` drops vislox's value (the
-  statement goes with its last one). The value is a number (with its unit, checked against the port), `on`/`off`,
-  a time of day, or a constant's name (vislox's or the module's).
+  statement goes with its last one). `port` must be a parameter, input or setting of the type, and the type one lox
+  knows. The value is a number (with its unit, checked against the port), `on`/`off` (a value, never read as a
+  constant's name), a time of day, a text, or a constant's name (vislox's or the module's).
 - **A default's consent.** A default changes every managed block of the type that does not bind the port, the
   module's own blocks and template instances' among them (lox's `Module::expand` without the type's statement, then
   the blocks that leave the port unbound). So the op names exactly those blocks by slug (`blocks`), as Apply's
   consent to removals names its blocks (#70): any other list, or none, is refused with the list the server worked
-  out, changing nothing. `GET /api/defaults?type=Monoflop&port=Time` says which blocks those are (`blocks`: slug and
+  out, changing nothing; *Default…* then asks the server again and shows the new list for consent.
+  `GET /api/defaults?type=Monoflop&port=Time` says which blocks those are (`blocks`: slug and
   UUID), the statement a change goes to (`statement`: file, line, `ours`, `source`, `value`, or null for a new one)
   and why vislox would refuse it (`refusal`). `constants.defaults[].reach` lists them per port of each statement.
   Undo and Revert carry the same list; when the blocks changed since (a block of the type added), they are refused
@@ -533,7 +539,9 @@ vx_60000002_0000_0000_ffff504f94000001.Time = vx_nachlauf
 - **Not deployed.** `GET /api/edits`' `constants.pending` lists each value of the module's constants and of every
   `defaults` statement that differs from the deployed revision's files, compared by value: `{ kind, name, port, key,
   value, deployed, file, line, ours, uses, blocks, revert }` (`revert` the op that puts the deployed value back, or
-  null where vislox cannot: a value the module's file did not have then). Properties shows each under the
+  null where the op would refuse it: a text constant, a value the module's file did not have then, or a port taken
+  out of the module's statement since). The browser names each by kind, name and port, not by its place in the
+  list. The module is parsed once per `GET /api/edits` and expanded once per type a default names. Properties shows each under the
   Parameters of a block that takes it (*Constant nachlauf 45min not deployed*, *Default Monoflop Time 5min not
   deployed · changes 1 block: Kurz*) with *Revert*; the Deploy pane names them (`the default Monoflop Time, which
   changes 1 block (Kurz)`), and Apply's confirmation lists each with its blocks (`defaults Monoflop(Time: 5min) (was

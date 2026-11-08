@@ -2324,6 +2324,7 @@ impl Actions {
             .any(|o| matches!(o, edit::Op::Let { .. } | edit::Op::Defaults { .. }))
         {
             let mut texts = std::collections::BTreeMap::new();
+            let mut linked = std::collections::BTreeMap::new();
             let mut err = None;
             edit::module_files(&p.module, &mut |f, _| {
                 if f.extension().is_some_and(|x| x == "loxl") && !f.starts_with(&dir_path) {
@@ -2332,6 +2333,10 @@ impl Actions {
                         .unwrap_or(f)
                         .to_string_lossy()
                         .replace('\\', "/");
+                    // Read through a link like lox does, but never written.
+                    if let Err(why) = crate::module_edit::plain_inside(&p.module, f) {
+                        linked.insert(rel.clone(), why);
+                    }
                     match std::fs::read_to_string(f) {
                         Ok(t) => {
                             texts.insert(rel, t);
@@ -2346,6 +2351,7 @@ impl Actions {
             crate::module_edit::ModuleSrc {
                 dir: shown.replace('\\', "/"),
                 texts,
+                linked,
             }
         } else {
             Default::default()
@@ -2463,13 +2469,19 @@ impl Actions {
         // The module's own files the request rewrites (#81), put back with
         // the rest; the lock and out last.
         let rewritten: Vec<PathBuf> = files.module.keys().map(|k| p.root.join(k)).collect();
+        // Never through a link, nor put back through one on failure.
+        for path in &rewritten {
+            crate::module_edit::plain_inside(&p.module, path).map_err(bad)?;
+        }
         let mut saved: Vec<&Path> = rewritten.iter().map(PathBuf::as_path).collect();
         saved.extend([p.lock.as_path(), p.out.as_path()]);
         let mut undo = Undo::new(&dir_path, old.clone(), &saved);
+        // Checked again right before: a plain file inside the module, never
+        // through a link (#81).
         for (k, text) in &files.module {
             let path = p.root.join(k);
             if std::fs::read_to_string(&path).ok().as_deref() != Some(text.as_str()) {
-                std::fs::write(&path, text).map_err(|e| fail(format!("cannot write {k}: {e}")))?;
+                crate::module_edit::write_inside(&p.module, &path, text).map_err(bad)?;
             }
         }
         std::fs::create_dir_all(&dir_path)
@@ -2825,10 +2837,7 @@ impl Actions {
         let p = loxone_config::Project::load(&dir.join("lox.toml"))
             .map_err(|e| bad(format!("cannot read lox.toml: {e}")))?;
         let (ty, key) = (ty.trim(), key.trim());
-        if !crate::managed::is_name(ty) {
-            return Err(bad(format!("`{ty}` is no block type")));
-        }
-        let port = loxone_config::port_names::name_of(ty, key).to_string();
+        let port = crate::module_edit::default_port(ty, key).map_err(bad)?;
         let texts = {
             let mut m = self.module_files.lock().unwrap();
             m.refresh(&p.root, &p.module);
@@ -2845,12 +2854,14 @@ impl Actions {
                     .replace('\\', "/")
             )
         };
-        let blocks = crate::constants::reach(&texts, &lock, ty, &port).map_err(|e| {
+        let src = crate::constants::Source::new(&texts);
+        let blocks = src.reach(&lock, ty, &port).map_err(|e| {
             bad(format!(
                 "the module does not read, so the blocks a default changes are not known: {e}"
             ))
         })?;
-        let c = crate::constants::constants(&texts, &lock, |f| f.starts_with(&mine));
+        let c =
+            crate::constants::constants_with(&texts, &lock, |f| f.starts_with(&mine), Some(&src));
         let stmt = c.defaults.iter().find(|d| d.ty == ty);
         let refusal = match stmt {
             Some(d) if !d.ours && !d.params.contains_key(&port) => Some(format!(
@@ -3659,7 +3670,11 @@ impl Actions {
         // The module's `let` constants and `defaults`, and the ports that take
         // their values from one (#81).
         let mine = format!("{rel_dir}/");
-        let constants = crate::constants::constants(&texts, &lock, |f| f.starts_with(&mine));
+        // Parsed once for the constants, what each default reaches and what is
+        // pending; each type a default names is expanded once.
+        let src = crate::constants::Source::new(&texts);
+        let constants =
+            crate::constants::constants_with(&texts, &lock, |f| f.starts_with(&mine), Some(&src));
         // The module's expressions and named signals, their blocks and what the
         // deployed revision had (#82). A signal of vislox's carries the ops that
         // revert it to the deployed revision's files: first each input it feeds
@@ -3741,10 +3756,13 @@ impl Actions {
             Some(was_texts) => {
                 // The deployed files are named from the repository's top: a
                 // default of vislox's is in its file of claims there too.
-                let was = crate::constants::constants(was_texts, &lock, |f| {
-                    f == rel || f.ends_with(&format!("/{rel}"))
-                });
-                crate::constants::pending(&constants, &was, &texts, &lock)
+                let was = crate::constants::constants_with(
+                    was_texts,
+                    &lock,
+                    |f| f == rel || f.ends_with(&format!("/{rel}")),
+                    None,
+                );
+                crate::constants::pending(&constants, &was, &src, &lock)
             }
             None => Vec::new(),
         };
@@ -5373,6 +5391,66 @@ fi
             "{msg}"
         );
         assert_eq!(std::fs::read_to_string(&main).unwrap(), text);
+    }
+
+    /// A file of the module's own reached through a symbolic link (#81): a
+    /// linked directory or a linked file is read, never written, and the file
+    /// outside the module keeps its bytes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_module_constant_behind_a_symbolic_link_is_never_written() {
+        let (tmp, a) = project_for_edits();
+        let d = tmp.path().join("project");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(outside.join("shared")).unwrap();
+        let dir_text = "let geteilt = 4 # outside\n";
+        let file_text = "let verlinkt = 7\n";
+        std::fs::write(outside.join("shared/werte.loxl"), dir_text).unwrap();
+        std::fs::write(outside.join("datei.loxl"), file_text).unwrap();
+        std::os::unix::fs::symlink(outside.join("shared"), d.join("pages/shared")).unwrap();
+        std::os::unix::fs::symlink(outside.join("datei.loxl"), d.join("pages/datei.loxl")).unwrap();
+        sh(&d, "git add -A && git commit -q --amend --no-edit");
+        let req = |name: &str, line: &str| edit::Request {
+            base: blob(&d, "out.Loxone"),
+            ops: vec![edit::Op::Let {
+                name: name.into(),
+                value: Some("9".into()),
+                source: Some(line.into()),
+            }],
+        };
+        for (name, line, path) in [
+            ("geteilt", "let geteilt = 4 # outside", "pages/shared"),
+            ("verlinkt", "let verlinkt = 7", "pages/datei.loxl"),
+        ] {
+            let (_, msg) = a.edit(&req(name, line), None).await.unwrap_err();
+            assert!(msg.contains("symbolic link") && msg.contains(path), "{msg}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(outside.join("shared/werte.loxl")).unwrap(),
+            dir_text
+        );
+        assert_eq!(
+            std::fs::read_to_string(outside.join("datei.loxl")).unwrap(),
+            file_text
+        );
+        // And the check itself: a plain file passes, either link does not.
+        std::fs::write(d.join("pages/eigen.loxl"), "let e = 1\n").unwrap();
+        let module = d.join("pages");
+        crate::module_edit::plain_inside(&module, &module.join("eigen.loxl")).unwrap();
+        for f in ["shared/werte.loxl", "datei.loxl"] {
+            assert!(
+                crate::module_edit::plain_inside(&module, &module.join(f)).is_err(),
+                "{f}"
+            );
+            assert!(
+                crate::module_edit::write_inside(&module, &module.join(f), "x").is_err(),
+                "{f}"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(outside.join("datei.loxl")).unwrap(),
+            file_text
+        );
     }
 
     #[cfg(unix)]

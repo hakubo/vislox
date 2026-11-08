@@ -2284,6 +2284,7 @@ dependencies = [
  "flate2",
  "futures-util",
  "hex",
+ "libc",
  "loxone-client",
  "loxone-config",
  "notify",

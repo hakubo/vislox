@@ -1821,9 +1821,12 @@ struct DefaultsQuery {
 /// the type that do not bind the port, which the `defaults` op must name,
 /// and the statement it changes or why vislox does not. Read-only.
 async fn api_defaults(State(app): State<Arc<App>>, Query(q): Query<DefaultsQuery>) -> Response {
-    match app.actions.defaults_reach(&q.ty, &q.port) {
-        Ok(v) => Json(v).into_response(),
-        Err(r) => refused(r),
+    // It parses and expands the module: off the async runtime.
+    let a = app.clone();
+    match tokio::task::spawn_blocking(move || a.actions.defaults_reach(&q.ty, &q.port)).await {
+        Ok(Ok(v)) => Json(v).into_response(),
+        Ok(Err(r)) => refused(r),
+        Err(e) => refused((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
     }
 }
 

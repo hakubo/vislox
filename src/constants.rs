@@ -153,6 +153,74 @@ fn set_line(p: &Parsed, slug: &str, port: &str) -> Option<usize> {
     })
 }
 
+/// The module's files parsed once, and expanded once per block type a
+/// default is asked about: what [`constants_with`], [`pending`] and
+/// [`Source::reach`] read, so a request parses the module once.
+pub struct Source {
+    /// Each file by path: its items, or lox's error naming it.
+    files: Vec<(String, Result<Module, String>)>,
+    /// Type → its managed blocks with the module expanded without the type's
+    /// `defaults` statement ([`Source::typed`]).
+    typed: std::sync::Mutex<BTreeMap<String, Result<Vec<BlockDecl>, String>>>,
+}
+
+impl Source {
+    pub fn new<T: AsRef<str>>(files: &[(String, T)]) -> Source {
+        Source {
+            files: files
+                .iter()
+                .map(|(f, t)| {
+                    let m = Module::parse_fragment(t.as_ref()).map_err(|e| format!("{f}: {e}"));
+                    (f.clone(), m)
+                })
+                .collect(),
+            typed: Default::default(),
+        }
+    }
+
+    /// The managed blocks of type `ty` after the module is expanded without
+    /// its `defaults <ty>` statement: what a default of the type may reach.
+    /// lox's error, naming the file, when the module does not read.
+    fn typed(&self, ty: &str) -> Result<Vec<BlockDecl>, String> {
+        if let Some(r) = self.typed.lock().unwrap().get(ty) {
+            return r.clone();
+        }
+        let r = (|| {
+            let mut fragments = Vec::new();
+            for (_, m) in &self.files {
+                let mut m = m.clone()?;
+                m.items
+                    .retain(|i| !matches!(i, Item::Defaults(d) if d.block_type == ty));
+                fragments.push(m);
+            }
+            let m = Module::from_fragments(fragments)
+                .expand()
+                .map_err(|e| e.to_string())?;
+            Ok(m.items
+                .into_iter()
+                .filter_map(|i| match i {
+                    Item::Block(b) if b.block_type == ty => Some(b),
+                    _ => None,
+                })
+                .collect())
+        })();
+        self.typed.lock().unwrap().insert(ty.to_string(), r.clone());
+        r
+    }
+
+    /// The managed blocks a default of `ty`'s `port` (its Lox Logic name)
+    /// reaches, with the module's own statement for the type or without:
+    /// those of the type that do not bind the port themselves.
+    pub fn reach(
+        &self,
+        lock: &crate::edit::Lock,
+        ty: &str,
+        port: &str,
+    ) -> Result<Vec<Reached>, String> {
+        Ok(reached(&self.typed(ty)?, lock, port))
+    }
+}
+
 /// Every `let` and `defaults` of the module's files (`files`: the path as
 /// shown, the text), and the ports that take a value from one. `ours` tells
 /// a file of vislox's directory.
@@ -161,17 +229,33 @@ pub fn constants<T: AsRef<str>>(
     lock: &crate::edit::Lock,
     ours: impl Fn(&str) -> bool,
 ) -> Constants {
+    constants_with(files, lock, ours, Some(&Source::new(files)))
+}
+
+/// [`constants`] read from `src` (`files` parsed), which also tells what
+/// each default reaches; `None` parses `files` here and leaves `reach` out.
+pub fn constants_with<T: AsRef<str>>(
+    files: &[(String, T)],
+    lock: &crate::edit::Lock,
+    ours: impl Fn(&str) -> bool,
+    src: Option<&Source>,
+) -> Constants {
     let decls = Declarations::new(files);
     let parsed: Vec<Parsed> = files
         .iter()
-        .filter_map(|(f, t)| {
+        .enumerate()
+        .filter_map(|(i, (f, t))| {
             let t = t.as_ref();
             let lines: Vec<&str> = t.split('\n').collect();
+            let items = match src.and_then(|s| s.files.get(i)) {
+                Some((_, m)) => m.as_ref().ok()?.items.clone(),
+                None => Module::parse_fragment(t).ok()?.items,
+            };
             Some(Parsed {
                 file: f.as_str(),
                 body: template_bodies(&lines),
                 lines,
-                items: Module::parse_fragment(t).ok()?.items,
+                items,
             })
         })
         .collect();
@@ -366,7 +450,8 @@ pub fn constants<T: AsRef<str>>(
     // applies defaults (an instance's blocks too). A module that does not
     // read reaches nothing known.
     for d in &mut out.defaults {
-        if let Ok(blocks) = typed_blocks(files, &d.ty) {
+        let Some(src) = src else { break };
+        if let Ok(blocks) = src.typed(&d.ty) {
             for port in d.params.keys() {
                 d.reach.insert(port.clone(), reached(&blocks, lock, port));
             }
@@ -384,33 +469,10 @@ fn refusal_of(u: &Use) -> Option<String> {
             None => u.at_file.clone(),
         };
         format!(
-            "the module's own file binds it ({at}): a value of this block's own would claim it              twice; change the constant, or the binding there"
+            "the module's own file binds it ({at}): a value of this block's own would claim it \
+             twice; change the constant, or the binding there"
         )
     })
-}
-
-/// The managed blocks of type `ty` after the module (`files`, every file of
-/// it by path) is expanded without its `defaults <ty>` statement: what a
-/// default of the type may reach. lox's error, naming the file, when the
-/// module does not read.
-fn typed_blocks<T: AsRef<str>>(files: &[(String, T)], ty: &str) -> Result<Vec<BlockDecl>, String> {
-    let mut fragments = Vec::new();
-    for (f, t) in files {
-        let mut m = Module::parse_fragment(t.as_ref()).map_err(|e| format!("{f}: {e}"))?;
-        m.items
-            .retain(|i| !matches!(i, Item::Defaults(d) if d.block_type == ty));
-        fragments.push(m);
-    }
-    let m = Module::from_fragments(fragments)
-        .expand()
-        .map_err(|e| e.to_string())?;
-    Ok(m.items
-        .into_iter()
-        .filter_map(|i| match i {
-            Item::Block(b) if b.block_type == ty => Some(b),
-            _ => None,
-        })
-        .collect())
 }
 
 /// Of `blocks`, those that do not bind `port` themselves: a default of it
@@ -439,7 +501,7 @@ pub fn reach<T: AsRef<str>>(
     ty: &str,
     port: &str,
 ) -> Result<Vec<Reached>, String> {
-    Ok(reached(&typed_blocks(files, ty)?, lock, port))
+    Source::new(files).reach(lock, ty, port)
 }
 
 /// A value of the module's own `let` or of a `defaults` statement that is
@@ -475,10 +537,10 @@ pub struct Pending {
 
 /// What [`Constants`] of the module now (`files`, every file by path) gives
 /// differently from `was`, the deployed revision's files'.
-pub fn pending<T: AsRef<str>>(
+pub fn pending(
     now: &Constants,
     was: &Constants,
-    files: &[(String, T)],
+    src: &Source,
     lock: &crate::edit::Lock,
 ) -> Vec<Pending> {
     let mut out = Vec::new();
@@ -499,11 +561,14 @@ pub fn pending<T: AsRef<str>>(
             ours: false,
             uses: l.uses,
             blocks: Vec::new(),
-            revert: w.map(|w| crate::edit::Op::Let {
-                name: l.name.clone(),
-                value: Some(w.value.clone()),
-                source: Some(l.source.clone()),
-            }),
+            // A text constant is never rewritten (`refusal`): no revert.
+            revert: w
+                .filter(|_| l.refusal.is_none())
+                .map(|w| crate::edit::Op::Let {
+                    name: l.name.clone(),
+                    value: Some(w.value.clone()),
+                    source: Some(l.source.clone()),
+                }),
         });
     }
     let types: BTreeSet<&str> = now
@@ -533,17 +598,20 @@ pub fn pending<T: AsRef<str>>(
             }
             let blocks = match n.and_then(|d| d.reach.get(port)) {
                 Some(r) => r.clone(),
-                None => reach(files, lock, ty, port).unwrap_or_default(),
+                None => src.reach(lock, ty, port).unwrap_or_default(),
             };
             let ours = n.is_none_or(|d| d.ours);
             let key = key(ty, port);
-            let revert = (ours || was_v.is_some()).then(|| crate::edit::Op::Defaults {
-                ty: ty.to_string(),
-                port: key.clone(),
-                value: was_v.clone(),
-                source: (!ours).then(|| stmt.source.clone()),
-                blocks: Some(blocks.iter().map(|b| b.slug.clone()).collect()),
-            });
+            // vislox's statement is set back either way; on the module's own a
+            // value it still has is rewritten, but one taken out is not added.
+            let revert =
+                (ours || (was_v.is_some() && now_v.is_some())).then(|| crate::edit::Op::Defaults {
+                    ty: ty.to_string(),
+                    port: key.clone(),
+                    value: was_v.clone(),
+                    source: (!ours).then(|| stmt.source.clone()),
+                    blocks: Some(blocks.iter().map(|b| b.slug.clone()).collect()),
+                });
             out.push(Pending {
                 kind: "defaults",
                 name: ty.to_string(),
@@ -738,6 +806,39 @@ mod tests {
             reach(&broken, &lock(), "Monoflop", "Time")
                 .unwrap_err()
                 .starts_with("m/b.loxl: ")
+        );
+    }
+
+    #[test]
+    fn a_revert_is_offered_only_where_the_op_takes_it() {
+        let lock = lock();
+        let was = vec![(
+            "m/a.loxl".to_string(),
+            "let name = \"Alt\"\ndefaults Monoflop(Time: 5s, Reset: 0)\nlicht = Monoflop(\"Licht\")\n".to_string(),
+        )];
+        let now = vec![(
+            "m/a.loxl".to_string(),
+            "let name = \"Neu\"\ndefaults Monoflop(Time: 9s)\nlicht = Monoflop(\"Licht\")\n"
+                .to_string(),
+        )];
+        let ours = |f: &str| f.starts_with("m/vislox/");
+        let src = Source::new(&now);
+        let n = constants_with(&now, &lock, ours, Some(&src));
+        let w = constants_with(&was, &lock, ours, None);
+        let p = pending(&n, &w, &src, &lock);
+        let by: Vec<(&str, Option<&str>, bool)> = p
+            .iter()
+            .map(|x| (x.name.as_str(), x.port.as_deref(), x.revert.is_some()))
+            .collect();
+        // A text constant is never rewritten; a port taken out of the
+        // module's statement is never added back; a changed value is.
+        assert_eq!(
+            by,
+            vec![
+                ("name", None, false),
+                ("Monoflop", Some("Reset"), false),
+                ("Monoflop", Some("Time"), true)
+            ]
         );
     }
 }

@@ -1383,7 +1383,7 @@ $("props").addEventListener("click", (e) => {
     if (what === "open") dfltOpen(db.dataset.key);
     else if (what === "save") dfltSave();
     else if (what === "cancel") dfltClose();
-    else if (what === "revert") dfltRevert(db.dataset.i);
+    else if (what === "revert") dfltRevert(db.dataset.key);
     return;
   }
   const eb = e.target.closest("[data-ed]");
@@ -3976,6 +3976,14 @@ function constBlockRefusal(o, field) {
 }
 /** The module's own `let` the server lists, with its line as the file has it (`source`). */
 function constLetOf(name) { return constLets().find((l) => l.name === name) || null; }
+/** Why this field takes no value at all: the server refuses both the constant (a text constant) and only this block
+ *  (the module's own file binds the port); or null. */
+function constAllRefused(o, field) {
+  const [k, key] = field.split(/:(.*)/s);
+  const u = k === "p" ? constUse(o.uuid, key) : null;
+  const l = u?.kind === "let" ? constLetOf(u.name) : null;
+  return l?.refusal && u.block_refusal ? `${l.refusal}; ${u.block_refusal}` : null;
+}
 /** The note and the choice under a field whose value a constant or default gives (#81). */
 function constFieldRows(o, field, mine, kind) {
   const [k, key] = field.split(/:(.*)/s);
@@ -4080,7 +4088,9 @@ function editRows(o, row) {
     for (const [field, label, now, kind, unit, choices] of editFields(o)) {
       const v = mine.draft[field] ?? now, bad = mine.bad[field];
       const id = `ed-${field.replace(/[^\w-]/g, "_")}`;
-      const attrs = `id="${id}" data-ed-field="${esc(field)}"${bad ? ` aria-invalid="true" aria-describedby="${id}-e"` : ""}${mine.busy ? " disabled" : ""}`;
+      // Neither the constant nor this block can take a value (the server's refusals, #81): read-only.
+      const locked = constAllRefused(o, field);
+      const attrs = `id="${id}" data-ed-field="${esc(field)}"${bad ? ` aria-invalid="true" aria-describedby="${id}-e"` : ""}${mine.busy || locked ? " disabled" : ""}${locked ? ` title="${esc(locked)}"` : ""}`;
       const input = kind === "Place" || kind === "Category"
         ? `<select ${attrs}>${editPlaces(kind).map(([t, n]) => `<option value="${esc(t)}"${t === v ? " selected" : ""}${n > 1 ? ' disabled title="Two of them have this title: rename one in Loxone Config to pick it"' : ""}>${esc(t)}</option>`).join("")}</select>`
         : kind === "choice" || kind === "on_off"
@@ -4121,7 +4131,7 @@ async function editSave() {
   const ops = [], bad = {}, added = !!editsBlock(o.uuid), lets = new Set(constLets().map((l) => l.name)), changed = new Map();
   for (const [field, , now, kind] of editFields(o)) {
     const v = S.edit.draft[field];
-    if (v == null || v === now) continue;
+    if (v == null || v === now || constAllRefused(o, field)) continue;
     const t = kind === "number" || kind === "quantity" || kind === "time" || kind === "duration" ? v.trim() : v;
     const [k, key] = field.split(/:(.*)/s);
     // A constant's name binds the port to it (#81).
@@ -4220,6 +4230,8 @@ async function constMake() {
 const DF = { uuid: null, key: null, info: null, value: "", busy: false, err: "" };
 /** The module's values not deployed (`constants.pending`): a constant's, or a default's per port. */
 function constPending() { return managedShown() ? S.edits.constants?.pending || [] : []; }
+/** What names one of them across a refresh of the list: its kind, constant or type, and port. */
+function constPendingKey(p) { return [p.kind, p.name, p.port || ""].join("|"); }
 /** Whether edits can be sent now, on the newest config: `{ ok, rev }` or `{ why }`. */
 function constEditState() {
   const a = S.hist?.actions, r = editRev();
@@ -4246,11 +4258,11 @@ function constPendingRows(o, row) {
     const takes = p.kind === "let" ? o.ports.some((q) => constLet(constUse(o.uuid, q.key)) === p.name)
       : p.blocks.some((b) => ciEq(b.uuid, o.uuid));
     if (!takes) continue;
-    const i = constPending().indexOf(p);
+    const key = constPendingKey(p);
     const what = p.kind === "let" ? `Constant ${p.name}` : `Default ${p.name} ${p.port}`;
     const was = p.deployed == null ? "new, not deployed" : `deployed as ${p.deployed}`;
     const reach = p.kind === "defaults" ? ` · changes ${plural(p.blocks.length, "block")}: ${dfltList(p.blocks)}` : ` · ${plural(p.uses, "use")}`;
-    const back = st.ok && p.revert ? `<button type="button" class="ed-btn small" data-dflt="revert" data-i="${i}" title="${p.deployed == null ? "Take the default out of vislox's file" : `Back to ${esc(p.deployed)}, as deployed`}">Revert</button>` : "";
+    const back = st.ok && p.revert ? `<button type="button" class="ed-btn small" data-dflt="revert" data-key="${esc(key)}" title="${p.deployed == null ? "Take the default out of vislox's file" : `Back to ${esc(p.deployed)}, as deployed`}">Revert</button>` : "";
     rows.push(row(what, `<span class="ed-v">${esc(p.value ?? "(none)")}</span><span class="ed-tag" title="${esc(`${was}${reach}`)}">not deployed</span>${back}<div class="const-why">${esc(`${constAt(p.file, p.line)}${reach}`)}</div>`, "pr-chg"));
   }
   return rows;
@@ -4313,11 +4325,26 @@ async function dfltSave() {
   if (!value) { DF.err = "A value: a number, one with its unit (30min), on or off, or a constant's name."; renderProps(); return; }
   const op = { op: "defaults", type: i.type, port: i.key, value, blocks: i.blocks.map((b) => b.slug) };
   if (i.statement && !i.statement.ours) op.source = i.statement.source;
-  if (await dfltSend([op], `Default ${i.type} ${i.port} = ${value}`)) Object.assign(DF, { uuid: null, key: null, info: null });
+  if (await dfltSend([op], `Default ${i.type} ${i.port} = ${value}`)) {
+    Object.assign(DF, { uuid: null, key: null, info: null });
+  } else if (/Confirm exactly these/.test(DF.err)) {
+    // The blocks it changes are no longer the ones listed: ask the server again and show them for consent.
+    const was = i.blocks.map((b) => b.slug).join(), uuid = DF.uuid, key = DF.key;
+    try {
+      const fresh = await api(`/api/defaults?type=${encodeURIComponent(i.type)}&port=${encodeURIComponent(i.key)}`);
+      if (DF.uuid === uuid && DF.key === key) {
+        DF.info = fresh;
+        DF.err = fresh.blocks.map((b) => b.slug).join() === was ? DF.err
+          : `The blocks it changes are not the ones listed before: now ${plural(fresh.blocks.length, "block")}: ${dfltList(fresh.blocks)}. Save again to confirm these.`;
+      }
+    } catch (err) {
+      DF.err = err.message;
+    }
+  }
   renderProps();
 }
-async function dfltRevert(i) {
-  const p = constPending()[+i];
+async function dfltRevert(key) {
+  const p = constPending().find((x) => constPendingKey(x) === key);
   if (!p?.revert) return;
   await dfltSend([p.revert], p.kind === "let" ? `Revert the constant ${p.name}` : `Revert the default ${p.name} ${p.port}`);
 }
