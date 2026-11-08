@@ -2037,8 +2037,11 @@ impl Files {
             // on a block added here too, and the device an I/O hangs below
             // (#84).
             for b in &p.blocks {
-                for k in [blocks::MIRRORS, crate::periphery::DEVICE] {
+                for k in [blocks::MIRRORS, crate::periphery::DEVICE, "switches"] {
                     if let Some(Value::Ref(n)) = b.get(k) {
+                        if k == "switches" && !n.starts_with(blocks::SLUG_PREFIX) {
+                            continue;
+                        }
                         out.push((n.clone(), name.clone()));
                     }
                 }
@@ -3342,8 +3345,11 @@ fn delete_block(
     // vislox's externs its source names: brought back with it.
     let mut named: Vec<String> = b.wires.iter().map(|(_, src)| src.slug.clone()).collect();
     named.extend(out_wires.iter().map(|w| w.to.slug.clone()));
-    for k in [blocks::MIRRORS, crate::periphery::DEVICE] {
+    for k in [blocks::MIRRORS, crate::periphery::DEVICE, "switches"] {
         if let Some(Value::Ref(n)) = b.get(k) {
+            if k == "switches" && !n.starts_with(blocks::SLUG_PREFIX) {
+                continue;
+            }
             named.push(n.clone());
         }
     }
@@ -3628,8 +3634,11 @@ fn restore_block(files: &mut Files, ctx: &Ctx, op: &Op) -> Result<Applied, Strin
     // claims file, or a block of vislox's files.
     let mut named: Vec<&str> = b.wires.iter().map(|(_, src)| src.slug.as_str()).collect();
     named.extend(pf.wires.iter().map(|w| w.to.slug.as_str()));
-    for k in [blocks::MIRRORS, crate::periphery::DEVICE] {
+    for k in [blocks::MIRRORS, crate::periphery::DEVICE, "switches"] {
         if let Some(Value::Ref(n)) = b.get(k) {
+            if k == "switches" && !n.starts_with(blocks::SLUG_PREFIX) {
+                continue;
+            }
             named.push(n);
         }
     }
@@ -3864,6 +3873,40 @@ fn rename_block(files: &mut Files, ctx: &Ctx, uuid: &str, new: &str) -> Result<A
 /// [`FILE`], its lockfile entry and tracked wires for the lock.
 fn adopt(files: &mut Files, ctx: &Ctx, uuids: &[String]) -> Result<Applied, String> {
     for u in uuids {
+        if !ctx.adoptions.keys().any(|k| k.eq_ignore_ascii_case(u)) {
+            return Err(format!("{u} was not adopted on the scratch copy"));
+        }
+    }
+    let uuids: Vec<String> = ctx
+        .adoptions
+        .keys()
+        .filter(|u| {
+            uuids.iter().any(|root| {
+                find_ci(&ctx.base.xml.root, root).is_some_and(|el| find_ci(el, u).is_some())
+            })
+        })
+        .cloned()
+        .collect();
+    // Validate the whole request before changing any files.
+    for u in &uuids {
+        let a = &ctx.adoptions[u];
+        if files.block(&a.slug).is_some() {
+            return Err(format!("`{}` is a block of vislox's files already", a.slug));
+        }
+        if a.page.is_empty() {
+            continue;
+        }
+        let mut same = Vec::new();
+        pages_titled(&ctx.base.xml.root, &a.page_title, &mut same);
+        if same
+            .first()
+            .and_then(|e| e.attr("U"))
+            .is_none_or(|u| !u.eq_ignore_ascii_case(&a.page))
+        {
+            return Err(format!("page title {} is ambiguous", a.page_title));
+        }
+    }
+    for u in &uuids {
         let a = ctx
             .adoptions
             .get(u)
@@ -3871,30 +3914,29 @@ fn adopt(files: &mut Files, ctx: &Ctx, uuids: &[String]) -> Result<Applied, Stri
         if files.block(&a.slug).is_some() {
             return Err(format!("`{}` is a block of vislox's files already", a.slug));
         }
-        // `page "…"` names a page by its title, and lox builds on the first.
-        let mut same = Vec::new();
-        pages_titled(&ctx.base.xml.root, &a.page_title, &mut same);
-        if same.first().and_then(|e| e.attr("U")) != Some(a.page.as_str()) {
-            return Err(format!(
-                "{} pages are titled \"{}\", and lox puts a page's blocks on the first; rename one \
-                 in Loxone Config to adopt blocks there",
-                same.len(),
-                a.page_title
-            ));
-        }
-        let file = match files
-            .pages
-            .iter()
-            .find(|(_, p)| p.uuid.as_deref() == Some(a.page.as_str()))
-        {
-            Some((n, _)) => n.clone(),
-            None => blocks::file_name(&a.page_title, &|n| {
-                n == CLAIMS || files.pages.contains_key(n)
-            }),
+        let file = if a.page.is_empty() {
+            crate::periphery::FILE.to_string()
+        } else {
+            match files
+                .pages
+                .iter()
+                .find(|(_, p)| p.uuid.as_deref() == Some(a.page.as_str()))
+            {
+                Some((n, _)) => n.clone(),
+                None => blocks::file_name(&a.page_title, &|n| {
+                    n == CLAIMS || files.pages.contains_key(n)
+                }),
+            }
         };
-        let f = files.pages.entry(file).or_insert_with(|| PageFile {
-            uuid: Some(a.page.clone()),
-            ..PageFile::new(&a.page_title)
+        let f = files.pages.entry(file).or_insert_with(|| {
+            if a.page.is_empty() {
+                PageFile::periphery()
+            } else {
+                PageFile {
+                    uuid: Some(a.page.clone()),
+                    ..PageFile::new(&a.page_title)
+                }
+            }
         });
         f.page = a.page_title.clone();
         f.blocks.push(a.block.clone());
@@ -3913,6 +3955,13 @@ fn adopt(files: &mut Files, ctx: &Ctx, uuids: &[String]) -> Result<Applied, Stri
             for p in files.pages.values_mut() {
                 p.wires.retain(|w| w.to.slug != ext);
                 for b in p.blocks.iter_mut() {
+                    for (_, v) in &mut b.args {
+                        if let Value::Ref(n) = v
+                            && *n == ext
+                        {
+                            *n = a.slug.clone();
+                        }
+                    }
                     for (_, src) in b.wires.iter_mut() {
                         if src.slug == ext {
                             src.slug = a.slug.clone();
@@ -4061,6 +4110,13 @@ fn unadopt(files: &mut Files, ctx: &Ctx, uuids: &[String]) -> Result<Applied, St
     for (s, ext, _) in &externs {
         for p in files.pages.values_mut() {
             for b in p.blocks.iter_mut().filter(|b| !slugs.contains(&b.slug)) {
+                for (_, v) in &mut b.args {
+                    if let Value::Ref(n) = v
+                        && n == s
+                    {
+                        *n = ext.clone();
+                    }
+                }
                 for (_, src) in b.wires.iter_mut() {
                     if &src.slug == s {
                         src.slug = ext.clone();
@@ -4956,6 +5012,11 @@ fn edit_new_block(
     let el = find(&ctx.doc.xml.root, uuid)
         .ok_or_else(|| format!("no object {uuid} in the pending config"))?;
     let name = el.attr_decoded("Title").unwrap_or_default().into_owned();
+    if el.attr("Type") == Some(crate::calendar_edit::ENTRY)
+        && crate::calendar_edit::date_of(el).is_none()
+    {
+        return Err("This calendar date cannot be written by Lox Logic; it stays read-only".into());
+    }
     let caps = caps(el).unwrap_or_default();
     // A circuit of a controller whose moods vislox claims (#74): the claimed
     // set writes the circuit's values anew, so they must fit its new kind.
@@ -12671,6 +12732,214 @@ pub(crate) mod tests {
     const MODE_F: &str = "10000010-0000-0100-ffff504f94000001";
     const CAL_F: &str = "10000012-0000-0120-ffff504f94000001";
     const HEILIGABEND: &str = "10000013-0000-0130-ffff504f94000001";
+
+    #[test]
+    fn device_adoption_takes_children_and_undo_hands_every_object_back() {
+        let original = periphery_house();
+        let names = BTreeSet::new();
+        let mut seed = Files::default();
+        let mut l = Lockfile::default();
+        let lock = lock_of(&l);
+        let ctx = ctx_of(&original, &original, &lock, None, &names);
+        apply_op(
+            &mut seed,
+            &ctx,
+            &add(
+                VI_FOLDER,
+                "VirtualHttpIn",
+                Some("Weather"),
+                &[],
+                &[("Address", "http://192.0.2.1"), ("Poll", "60")],
+            ),
+        )
+        .unwrap();
+        let out = compile_files(&original, &seed, &mut l).unwrap();
+        let uuid = l.objects["vx_virtualhttpin_1"].uuid.clone();
+        let lock = lock_of(&l);
+        let ctx = ctx_of(&out, &original, &lock, None, &names);
+        apply_op(
+            &mut seed,
+            &ctx,
+            &add(
+                &uuid,
+                "VirtualHttpInCmd",
+                Some("Temperature"),
+                &[],
+                &[("Check", "value=\\v")],
+            ),
+        )
+        .unwrap();
+        let base = compile_files(&original, &seed, &mut l).unwrap();
+        let mut scratch = Lockfile::default();
+        let a =
+            logic::adopt_one(&base, &uuid, "vx_weather", &Module::default(), &mut scratch).unwrap();
+        let picked = scratch
+            .objects
+            .iter()
+            .map(|(s, o)| (o.uuid.clone(), s.clone()))
+            .collect();
+        let found = crate::adopt::extract(
+            &BTreeMap::new(),
+            &BTreeMap::from([("tree.loxl".into(), Module { items: a.items }.to_text())]),
+            (
+                &serde_json::to_value(Lockfile::default()).unwrap(),
+                &serde_json::to_value(&scratch).unwrap(),
+            ),
+            &picked,
+            &|_| false,
+            &names,
+            &base,
+        )
+        .unwrap();
+        assert_eq!(found.len(), 2);
+        let adoptions = found.into_iter().map(|a| (a.uuid.clone(), a)).collect();
+        let mut files = Files::default();
+        let mut l = Lockfile::default();
+        let lock = lock_of(&l);
+        let mut ctx = ctx_of(&base, &base, &lock, None, &names);
+        ctx.adoptions = &adoptions;
+        let r = apply_op(
+            &mut files,
+            &ctx,
+            &Op::Adopt {
+                blocks: vec![crate::adopt::Pick {
+                    uuid: uuid.clone(),
+                    slug: None,
+                }],
+            },
+        )
+        .unwrap();
+        let undo: Op = serde_json::from_value(r.previous).unwrap();
+        l = edit_lock(&l, &files.lock_edits);
+        files.lock_edits = Default::default();
+        let out = compile_files(&base, &files, &mut l).unwrap();
+        crate::adopt::verify(&base, &base, &out, std::slice::from_ref(&uuid)).unwrap();
+        let lock = lock_of(&l);
+        let ctx = ctx_of(&out, &base, &lock, None, &names);
+        apply_op(&mut files, &ctx, &undo).unwrap();
+        l = edit_lock(&l, &files.lock_edits);
+        files.lock_edits = Default::default();
+        let out = compile_files(&base, &files, &mut l).unwrap();
+        crate::adopt::verify(&base, &base, &out, std::slice::from_ref(&uuid)).unwrap();
+        assert!(l.objects.is_empty());
+    }
+
+    #[test]
+    fn object_tree_adoption_edit_and_two_undos_preserve_identity() {
+        // The viewer fixture omits calendar connectors; a real entry has I and Q.
+        let xml = String::from_utf8(doc("house.Loxone").to_bytes()).unwrap();
+        let start = xml.find("<C Type=\"CalendarEntry\"").unwrap();
+        let end = start + xml[start..].find("/>").unwrap();
+        let xml = format!(
+            "{}><Co K=\"I\" U=\"cc000001-0000-0001-ffff504f94000001\"/><Co K=\"Q\" U=\"cc000001-0000-0002-ffff504f94000001\"/></C>{}",
+            &xml[..end],
+            &xml[end + 2..]
+        );
+        let base = LoxoneDoc::parse(xml.as_bytes()).unwrap();
+        let names = BTreeSet::new();
+        for ty in ["Mode", "CalendarEntry", "VirtualIn"] {
+            let obj = base
+                .objects()
+                .into_iter()
+                .find(|o| {
+                    o.block_type == ty
+                        && (ty != "Mode"
+                            || find_ci(&base.xml.root, &o.uuid)
+                                .unwrap()
+                                .attr("Mode")
+                                .unwrap_or("0")
+                                .parse::<i64>()
+                                .unwrap()
+                                < 0)
+                })
+                .unwrap();
+            let uuid = obj.uuid;
+            let mut scratch_lock = Lockfile::default();
+            let adopted = logic::adopt_one(
+                &base,
+                &uuid,
+                "vx_taken",
+                &Module::default(),
+                &mut scratch_lock,
+            )
+            .unwrap();
+            let before = BTreeMap::new();
+            let after = BTreeMap::from([(
+                "tree.loxl".into(),
+                Module {
+                    items: adopted.items,
+                }
+                .to_text(),
+            )]);
+            let found = crate::adopt::extract(
+                &before,
+                &after,
+                (
+                    &serde_json::to_value(Lockfile::default()).unwrap(),
+                    &serde_json::to_value(&scratch_lock).unwrap(),
+                ),
+                &BTreeMap::from([(uuid.clone(), "vx_taken".into())]),
+                &|_| false,
+                &names,
+                &base,
+            )
+            .unwrap();
+            let adoptions = found.into_iter().map(|a| (a.uuid.clone(), a)).collect();
+            let mut files = Files::default();
+            let mut l = Lockfile::default();
+            let lock = lock_of(&l);
+            let mut ctx = ctx_of(&base, &base, &lock, None, &names);
+            ctx.adoptions = &adoptions;
+            let r = apply_op(
+                &mut files,
+                &ctx,
+                &Op::Adopt {
+                    blocks: vec![crate::adopt::Pick {
+                        uuid: uuid.to_uppercase(),
+                        slug: None,
+                    }],
+                },
+            )
+            .unwrap();
+            let unadopt: Op = serde_json::from_value(r.previous).unwrap();
+            l = edit_lock(&l, &files.lock_edits);
+            files.lock_edits = Default::default();
+            let out = compile_files(&base, &files, &mut l).unwrap();
+            crate::adopt::verify(&base, &base, &out, std::slice::from_ref(&uuid)).unwrap();
+            assert!(files.render()[crate::periphery::FILE].contains("# Adopted"));
+            let lock = lock_of(&l);
+            let ctx = ctx_of(&out, &base, &lock, None, &names);
+            let edit = if ty == "CalendarEntry" {
+                Op::EntryDate {
+                    uuid: uuid.clone(),
+                    value: Some("easter: 2".into()),
+                }
+            } else {
+                Op::Title {
+                    uuid: uuid.clone(),
+                    value: Some("Edited".into()),
+                }
+            };
+            let r = apply_op(&mut files, &ctx, &edit).unwrap();
+            let mut undo = serde_json::to_value(&edit).unwrap();
+            undo["value"] = r.previous;
+            let undo: Op = serde_json::from_value(undo).unwrap();
+            let edited = compile_files(&base, &files, &mut l).unwrap();
+            assert!(!crate::adopt::same_block(&base, &edited, &uuid));
+            let lock = lock_of(&l);
+            let ctx = ctx_of(&edited, &base, &lock, None, &names);
+            apply_op(&mut files, &ctx, &undo).unwrap();
+            let out = compile_files(&base, &files, &mut l).unwrap();
+            let lock = lock_of(&l);
+            let ctx = ctx_of(&out, &base, &lock, None, &names);
+            apply_op(&mut files, &ctx, &unadopt).unwrap();
+            l = edit_lock(&l, &files.lock_edits);
+            files.lock_edits = Default::default();
+            let out = compile_files(&base, &files, &mut l).unwrap();
+            crate::adopt::verify(&base, &base, &out, std::slice::from_ref(&uuid)).unwrap();
+            assert!(lock_of(&l).slug_of(&uuid).is_none());
+        }
+    }
 
     #[test]
     fn modes_and_calendar_entries_are_added_and_edited_as_lox_compiles_them() {

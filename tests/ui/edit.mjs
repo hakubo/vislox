@@ -396,6 +396,20 @@ if (process.argv.slice(2, 4).join(" ") === "logic adopt") {
     console.error(\`error: compile error: cannot adopt InputRef "\${title}" (uuid \${uuid}): attribute \\\`Ref\\\` is not understood by the rebuild and would be lost\`);
     process.exit(1);
   }
+  if (["Mode", "CalendarEntry", "VirtualIn"].includes(ty)) {
+    const lk = JSON.parse(fs.readFileSync(lockPath, "utf8"));
+    const file = mod + "/objects.loxl";
+    let args = "";
+    if (ty === "CalendarEntry") args = ', switches: holiday, every: 12-24';
+    fs.writeFileSync(file, (fs.existsSync(file) ? fs.readFileSync(file, "utf8") : "") + \`\${slug} = \${ty}("\${title}"\${args})\\n\`);
+    const ports = {};
+    for (let j = i + 1; j < lines.length && !lines[j].includes("</C>"); j++) {
+      const co = lines[j].match(/<Co K="([^" ]+)"[^>]* U="([^"]+)"/); if (co) ports[co[1]] = co[2];
+    }
+    lk.objects = { ...lk.objects, [slug]: { uuid, type: ty, ports, layout: null } };
+    fs.writeFileSync(lockPath, JSON.stringify(lk));
+    process.exit(0);
+  }
   let p = i;
   while (p >= 0 && !lines[p].includes('Type="Page"')) p--;
   const pageTitle = lines[p].match(/Title="([^"]*)"/)[1], pageUuid = lines[p].match(/U="([^"]+)"/)[1];
@@ -660,6 +674,14 @@ if (fs.existsSync("pages/vislox/_periphery.loxl")) {
     const title = rest.match(/^"((?:[^"\\\\]|\\\\.)*)"/);
     const attrs = ty === "Mode" ? \` Mode="\${(modeNo[slug] = --nextMode)}"\` : ty === "CalendarEntry" ? entryAttrs(rest) : [...rest.matchAll(/(\\w+): ("(?:[^"\\\\]|\\\\.)*"|[^,]+)/g)].filter(([, k]) => k !== "device")
       .map(([, k, v]) => \` \${k}="\${xml(v.startsWith('"') ? JSON.parse(v) : v === "on" ? "true" : v === "off" ? "false" : scale(v))}"\`).join("");
+    const kept = out.findIndex((l) => l.includes("<C ") && l.includes(\`U="\${uuid}"\`));
+    if (kept >= 0) {
+      objects[slug] = { ...lock.objects[slug] };
+      if (ty === "Mode") modeNo[slug] = modeOf(out[kept]);
+      if (title) out[kept] = out[kept].replace(/Title="[^"]*"/, \`Title="\${xml(JSON.parse('"' + title[1] + '"'))}"\`);
+      if (ty !== "Mode") out[kept] = withAttrs(out[kept], ty === "CalendarEntry" ? Object.fromEntries([...entryAttrs(rest).matchAll(/ (\\w+)="([^"]*)"/g)].map(([, k, v]) => [k, v])) : settingAttrs(rest));
+      continue;
+    }
     out.splice(i + 1, 0, \`\\t\\t\\t<C Type="\${ty}" V="178" U="\${uuid}" Title="\${xml(title ? JSON.parse('"' + title[1] + '"') : slug)}"\${attrs}>\`, "\\t\\t\\t</C>");
   }
 }
@@ -1387,12 +1409,17 @@ try {
   }, [FLUR, since, x, moved], { timeout: 10000 });
   let moved;
   await step("a block the module manages is dragged on the page, snapped to the grid, and shows as moved", async () => {
+    await settled();
     // In the middle of the canvas, where nothing covers it.
     await page.evaluate(([pg, u]) => { gotoPage(pg); focusObj(u, 0.05); }, [OG, FLUR]);
     const g = page.locator(`#canvas g.movable[data-uuid="${FLUR}"]`).first();
     await g.waitFor();
     const n = edits.length, r0 = await rev();
-    const box = await g.boundingBox();
+    const box = await (await page.waitForFunction(([pg, u]) => {
+      gotoPage(pg); focusObj(u, 0.05);
+      const r = document.querySelector(`#canvas g.movable[data-uuid="${u}"]`)?.getBoundingClientRect();
+      return r?.width && r.height ? { x: r.x, y: r.y, width: r.width, height: r.height } : false;
+    }, [OG, FLUR])).jsonValue();
     const [cx, cy] = [box.x + box.width / 2, box.y + box.height / 2];
     await page.mouse.move(cx, cy);
     await page.mouse.down();
@@ -2561,7 +2588,7 @@ try {
     const sets = '#props [data-body="Settings"]';
     // Drawn in Loxone Config: shown by their Lox Logic names, read-only until the module manages the block.
     await pick(PULSE);
-    await waitText(sets, /At\s*18:58[\s\S]*Pulse\s*time[\s\S]*Read-only[\s\S]*Manage with Lox Logic to edit/);
+    await waitText(sets, /At\s*18:58[\s\S]*Pulse\s*time[\s\S]*Read-only[\s\S]*Adopt into vislox/);
     assert.doesNotMatch(await page.textContent('#props [data-body="Advanced"]').catch(() => ""), /\bSec\b|\bTyp\b/);
     await pick(HUE);
     await waitText(sets, /Program\s*1 line/);
@@ -3282,6 +3309,28 @@ try {
     await send(() => page.click('#props [data-ed="remove"]'), "take the device out again");
     assert.doesNotMatch(hfile(), /= TreeDevice\(/);
   });
+  await step("object-tree adoption, edit, undo and hand back (#86)", async () => {
+    for (const [uuid, slug] of [[PARTY, "vx_party"], [HEILIGABEND, "vx_christmas"], ["10000001-0000-0010-ffff504f94000001", "vx_temperature"]]) {
+      await settled();
+      await page.evaluate((u) => select(u), uuid);
+      await page.waitForSelector('#props [data-ed="adopt-open"]:not([disabled])');
+      await page.click('#props [data-ed="adopt-open"]');
+      await page.fill("#ad-slug", slug);
+      await page.click('#props [data-ed="adopt"]');
+      await page.waitForFunction((u) => S.edits?.blocks?.some((b) => b.uuid === u && b.adopted), uuid, { timeout: 20000 });
+      await settled();
+      await page.waitForSelector("#changes .adoption");
+      await page.click('#props [data-ed="open"]');
+      await page.fill('#props [data-ed-field="title"]', "Changed title");
+      await page.click('#props [data-ed="save"]');
+      await page.waitForFunction((u) => S.view?.objects[u]?.title === "Changed title", uuid, { timeout: 20000 });
+      await undoKey(false, () => !Object.values(S.view.objects).some((o) => o.title === "Changed title"));
+      await undoKey(false, () => !S.edits?.blocks?.some((b) => b.adopted));
+      await settled();
+      assert.equal(JSON.parse(readFileSync(join(dir, "logic.lock.json"), "utf8")).objects[slug], undefined);
+    }
+  });
+
   await step("operating modes are added, and calendar entries added, picked on the year, edited and undone (#86)", async () => {
     await settled();
     const send = async (act, what, status = 200) => {

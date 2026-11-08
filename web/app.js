@@ -1687,7 +1687,20 @@ function renderChanges() {
   const v = S.view, box = $("changes"), filt = $("chg-filter");
   box.innerHTML = ""; filt.innerHTML = "";
   renderRights();
-  const compact = !v.compared || !v.changes.length;
+  const adopted = adoptedUncommitted();
+  const adoptionRows = () => {
+    for (const b of adopted) {
+      const d = document.createElement("div"); d.className = "chg adoption";
+      const go = document.createElement("button"); go.type = "button";
+      go.textContent = `Adopt into vislox: ${v.objects[b.uuid]?.title || b.slug}`;
+      go.onclick = () => select(b.uuid); d.appendChild(go);
+      const revert = document.createElement("button"); revert.type = "button"; revert.textContent = "Revert";
+      revert.disabled = !!b.hand_back || !adoptState()?.ok;
+      revert.title = b.hand_back || "Hand back to Loxone Config";
+      revert.onclick = () => { select(b.uuid); adoptHandBack(b.uuid); }; d.appendChild(revert); box.appendChild(d);
+    }
+  };
+  const compact = (!v.compared || !v.changes.length) && !adopted.length;
   $("right").classList.toggle("compact", compact);
   $("chg-nav").classList.toggle("hidden", !v.compared || !v.changes.length);
   $("chg-dim").classList.toggle("hidden", !v.compared || !v.changes.length);
@@ -1699,9 +1712,10 @@ function renderChanges() {
       ? '<div class="empty"><b>Only one revision so far.</b><br>When the config changes — after <code>lox config pull</code>, a compile, or an edit on disk — the new revision appears in History and its changes are listed here.</div>'
       : `<div class="empty">Plain view: nothing is being compared.${base ? ' <button type="button" class="lnk" id="cmp-prev">Compare with the revision before</button>' : ""}</div>`;
     $("cmp-prev")?.addEventListener("click", () => { S.base = base; renderHistory(); renderSelects(); loadView(); writeHash(true); });
+    adoptionRows();
     return;
   }
-  $("chg-count").textContent = v.changes.length;
+  $("chg-count").textContent = v.changes.length + adopted.length;
   const counts = {};
   for (const c of v.changes) counts[c.kind] = (counts[c.kind] || 0) + 1;
   for (const k of Object.keys(KIND)) {
@@ -1727,7 +1741,7 @@ function renderChanges() {
     p.onclick = () => { S.chgHw = !S.chgHw; S.chgIdx = -1; renderChanges(); };
     filt.appendChild(p);
   }
-  if (!v.changes.length) { box.innerHTML = '<div class="empty">No differences between these revisions.</div>'; return; }
+  if (!v.changes.length) { box.innerHTML = adopted.length ? '' : '<div class="empty">No differences between these revisions.</div>'; adoptionRows(); return; }
   const list = shownChanges().slice(0, 2000);
   const groups = new Map();
   for (const c of list) { const k = chgKey(c); if (k) groups.set(k, (groups.get(k) || 0) + 1); }
@@ -1745,6 +1759,7 @@ function renderChanges() {
     d.onclick = () => gotoChange(i);
     box.appendChild(d);
   });
+  adoptionRows();
   updateChangePos();
 }
 function updateChangePos() {
@@ -2788,7 +2803,7 @@ async function confirmApply(pend, plan) {
   const src = !plan && S.check?.available && S.check.ok && S.check.stale;
   const srcText = src ? `⚠ The pending revision is from before the latest edit to ${src.files?.length ? src.files.join(", ") : "the module"}. ` +
     "lox config push compiles the module as it is, so Apply deploys changes this review does not show. Compile first to review them.\n\n" : "";
-  return window.confirm((stale ? `⚠ ${stale} Applying overwrites what changed there since.\n\n` : "") + srcText + rights + sched + constApplyText() +
+  return window.confirm((stale ? `⚠ ${stale} Applying overwrites what changed there since.\n\n` : "") + srcText + rights + sched + constApplyText() + (adoptedUncommitted().length ? `Adopt into vislox: ${adoptedUncommitted().map((b) => b.slug).join(", ")}. Ownership is committed with Apply.\n\n` : "") +
     calApplyWarning(calNow) + hwApplyText(hw) +
     (plan ? `Deploy "${pend.label}" to the Miniserver, with the removals you confirmed?\n\nvislox compiles exactly this program into the project (it refuses if anything changed since), ` +
       "then the tests must pass (lox logic test). "
@@ -3207,7 +3222,7 @@ function settingsRows(o, row, marks, chg) {
   if (S.hist?.actions?.shown && !editsBlock(o.uuid)) {
     const m = managedSrc(o.uuid);
     rows.push(`<div class="ed-note set-note">${m ? `The module manages this block: change its settings in ${esc(srcPath(m) || "its .loxl file")}.`
-      : "Read-only: lox changes these only on a block the module manages. Manage with Lox Logic to edit (in Edit above)."}</div>`);
+      : "Read-only: lox changes these only on a block the module manages. Choose Adopt into vislox in Edit above to change them here."}</div>`);
   }
   return { rows, count: marks ? list.filter((x) => x.changed).length || undefined : undefined };
 }
@@ -3223,6 +3238,7 @@ S.editsKey = null; // the server's key of what /api/edits says (vislox's file, d
 async function loadEdits() {
   const hwWas = JSON.stringify((S.edits?.blocks || []).filter((b) => b.hardware).map((b) => [b.uuid, b.paired]));
   const mdWas = mdEditKey();
+  const adoptionsWas = JSON.stringify(adoptedUncommitted());
   const was = managedSet(), under = JSON.stringify(S.edits?.add_under || null), consts = JSON.stringify(S.edits?.constants || null), exprs = JSON.stringify([S.edits?.expressions || null, S.edits?.templates?.instances || null, S.edits?.templates?.templates || null]);
   if (!S.hist?.actions?.shown) { S.edits = null; managedRefresh(was); return; }
   try { S.edits = await api("/api/edits"); } catch { S.edits = null; S.editsKey = null; }
@@ -3231,6 +3247,7 @@ async function loadEdits() {
   const exprsNow = JSON.stringify([S.edits?.expressions || null, S.edits?.templates?.instances || null, S.edits?.templates?.templates || null]);
   if (S.view && managedSet() === was && exprsNow !== exprs) renderPage();
   managedRefresh(was);
+  if (S.view && JSON.stringify(adoptedUncommitted()) !== adoptionsWas) renderChanges();
   // The claims' λ file:line in Rights and schedules too (#68); the changes a constant causes, grouped (#81).
   if (S.view) S.view.compared && (JSON.stringify(S.edits?.constants || null) !== consts || exprsNow !== exprs) ? renderChanges() : renderRights();
   renderActions();
@@ -6074,12 +6091,12 @@ function adoptRows(o, row) {
   if (!ad || !(o.uuid in ad)) return [];
   if (ad[o.uuid]) return [`<div class="ed-note ad-note">Manage with Lox Logic: ${esc(ad[o.uuid])}</div>`];
   if (!mine?.open) {
-    return [`<div class="ed-bar"><button type="button" class="ed-btn small" data-ed="adopt-open"${st.ok ? "" : ` disabled title="${esc(st.why)}"`} title="Put this block under the project's module (lox logic adopt). The config stays as it is.">Manage with Lox Logic</button>${msg}</div>`];
+    return [`<div class="ed-bar"><button type="button" class="ed-btn small" data-ed="adopt-open"${st.ok ? "" : ` disabled title="${esc(st.why)}"`} title="Put this block under the project's module (lox logic adopt). The config stays as it is.">Adopt into vislox</button>${msg}</div>`];
   }
   return [`<div class="pr ed-row"><label class="k" for="ad-slug">Slug</label><div class="v"><input id="ad-slug" value="${esc(AD.slug)}" placeholder="vx_… (from its name)" autocomplete="off" spellcheck="false"${AD.busy ? " disabled" : ""}></div></div>`,
     `<div class="ed-bar"><button type="button" class="primary small" data-ed="adopt"${AD.busy || !st.ok ? " disabled" : ""}>${AD.busy ? "Adopting…" : "Adopt"}</button>` +
     `<button type="button" class="ed-btn small" data-ed="adopt-cancel"${AD.busy ? " disabled" : ""}>Cancel</button>` +
-    `<span class="ed-msg${AD.err ? " err" : ""}" role="status" aria-live="polite">${esc(AD.err || "lox declares it in vislox's file of this page; it keeps its UUIDs, and nothing changes on the Miniserver.")}</span></div>`];
+    `<span class="ed-msg${AD.err ? " err" : ""}" role="status" aria-live="polite">${esc(AD.err || "lox declares it in vislox's files; it keeps its UUIDs, and nothing changes on the Miniserver.")}</span></div>`];
 }
 function adoptOpen(uuid) {
   Object.assign(AD, { uuid, open: true, slug: "", busy: false, msg: "", err: "" });

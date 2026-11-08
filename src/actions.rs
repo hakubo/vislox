@@ -2745,6 +2745,9 @@ impl Actions {
                     _ => {}
                 }
             }
+            uuids.extend(prepared.adoptions.keys().cloned());
+            uuids.sort_by_key(|u| u.to_ascii_lowercase());
+            uuids.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
             crate::adopt::verify(&base, &doc, out, &uuids)
                 .map_err(|e| bad(format!("{e}. Nothing was adopted or handed back.")))?;
             for u in &uuids {
@@ -3948,7 +3951,7 @@ impl Actions {
             // vislox's files create (#88).
             pages = crate::page_edit::edits_section(&now, base_doc, &lock, &rel_dir);
             let ix = crate::adopt::Index::of(doc);
-            for (u, _) in ix.page_blocks() {
+            for (u, _) in ix.candidates() {
                 if lock.slug_of(u).is_none() {
                     adopt.insert(
                         u.clone(),

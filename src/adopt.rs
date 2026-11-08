@@ -24,7 +24,7 @@
 //! the block. Nothing here talks to the Miniserver.
 
 use crate::blocks::{FileWire, NewBlock};
-use crate::edit::{find, slug as vx};
+use crate::edit::{find_ci as find, slug as vx};
 use loxone_config::LoxoneDoc;
 use loxone_config::connectors;
 use loxone_config::logic::{ArgItem, BindingKind, Item, MatchSpec, Module, PortRef, Value};
@@ -222,6 +222,7 @@ pub struct Entry {
     pub page: Option<String>,
     /// Its connectors' UUIDs.
     pub ports: Vec<String>,
+    pub read_only: Option<String>,
 }
 
 /// A document and its [`Index`].
@@ -245,6 +246,11 @@ impl Index {
                     u.to_string(),
                     Entry {
                         ty: ty.to_string(),
+                        read_only: if ty == "Mode" && el.attr("Mode").and_then(|v| v.parse::<i64>().ok()).is_none_or(|n| n >= 0) {
+                            Some("Built-in operating modes stay read-only".into())
+                        } else if ty == "CalendarEntry" && crate::calendar_edit::date_of(el).is_none() {
+                            Some("This calendar date cannot be written by Lox Logic; it stays read-only".into())
+                        } else { None },
                         title: el.attr_decoded("Title").unwrap_or_default().into_owned(),
                         page: page.map(String::from),
                         ports: el
@@ -268,7 +274,12 @@ impl Index {
     }
 
     pub fn get(&self, uuid: &str) -> Option<&Entry> {
-        self.0.get(uuid)
+        self.0.get(uuid).or_else(|| {
+            self.0
+                .iter()
+                .find(|(u, _)| u.eq_ignore_ascii_case(uuid))
+                .map(|(_, e)| e)
+        })
     }
 
     /// [`title_or`] of `uuid`.
@@ -276,10 +287,11 @@ impl Index {
         title_or(self.get(uuid).map(|e| e.title.as_str()), uuid)
     }
 
-    /// The blocks drawn on a logic page that lox has a type for, by UUID.
-    pub fn page_blocks(&self) -> impl Iterator<Item = (&String, &Entry)> {
+    /// Page blocks and object-tree kinds supported by vislox, by UUID.
+    pub fn candidates(&self) -> impl Iterator<Item = (&String, &Entry)> {
         self.0.iter().filter(|(_, e)| {
-            e.page.is_some() && e.ty != "Page" && connectors::builtin(&e.ty).is_some()
+            (e.page.is_some() && e.ty != "Page" && connectors::builtin(&e.ty).is_some())
+                || crate::periphery::of(&e.ty).is_some()
         })
     }
 }
@@ -293,7 +305,7 @@ pub fn page_of(doc: &LoxoneDoc, uuid: &str) -> Option<(String, String)> {
             page
         };
         for c in el.child_elements() {
-            if c.attr("U") == Some(uuid) {
+            if c.attr("U").is_some_and(|u| u.eq_ignore_ascii_case(uuid)) {
                 let p = page?;
                 return Some((
                     p.attr("U")?.to_string(),
@@ -516,7 +528,9 @@ pub fn extract(
         }
         let u = uuid_in(o).ok_or_else(|| format!("the lock has no UUID for {s}"))?;
         let mine = picked
-            .get(u)
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(u))
+            .map(|(_, v)| v)
             .ok_or_else(|| format!("lox logic adopt pinned {s} ({u}), which was not asked for"))?;
         rename.insert(s.to_string(), mine.clone());
     }
@@ -618,8 +632,20 @@ pub fn extract(
                         // `mirrors:` names the object a ref is (a push
                         // notification's `OutputRefLM`, #77): an extern of
                         // vislox's, as a value, never a wire.
-                        BindingKind::Param(Value::Ref(s)) if x.port == crate::blocks::MIRRORS => {
-                            nb.args.push((x.port.clone(), Value::Ref(name(&slug, s)?)))
+                        BindingKind::Param(Value::Ref(s))
+                            if [crate::blocks::MIRRORS, crate::periphery::DEVICE, "switches"]
+                                .contains(&x.port.as_str()) =>
+                        {
+                            nb.args.push((
+                                x.port.clone(),
+                                Value::Ref(
+                                    if DAY_WORDS.contains(&s.as_str()) && x.port == "switches" {
+                                        s.clone()
+                                    } else {
+                                        name(&slug, s)?
+                                    },
+                                ),
+                            ))
                         }
                         // A bare name is a value when it names a `let`
                         // constant or a day: lox reads it so first.
@@ -659,8 +685,13 @@ pub fn extract(
                         }
                     }
                 }
-                let (page, page_title) = page_of(base, &uuid)
-                    .ok_or_else(|| format!("{slug} is not drawn on a page of the base config"))?;
+                let (page, page_title) = if crate::periphery::of(&nb.ty).is_some() {
+                    (String::new(), String::new())
+                } else {
+                    page_of(base, &uuid).ok_or_else(|| {
+                        format!("{slug} is not drawn on a page of the base config")
+                    })?
+                };
                 // Keyed by its slug in the lock; nothing in the entry names it.
                 let object = entry.clone();
                 let is_promoted = promoted.contains(&vx(&uuid));

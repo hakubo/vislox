@@ -376,6 +376,12 @@ pub fn mode_of(numbers: &Numbers, el: &Element) -> Option<String> {
 /// The date the entry `el` stores, as the source writes it; `None` for a
 /// date the language cannot write (a weekday in a month).
 pub fn date_of(el: &Element) -> Option<String> {
+    if el
+        .attr("WeekDayInMonth")
+        .is_some_and(|v| v != "1" && !v.is_empty())
+    {
+        return None;
+    }
     let d = crate::calendar::EntryDate::from_attrs(|a| el.attr(a)).ok()?;
     Some(DateArgs::of_stored(&d).text())
 }
@@ -490,13 +496,17 @@ fn not_ours_el(
     if el.attr("Type") != Some(ENTRY) {
         return format!("{name}: only a calendar entry switches a mode on a date");
     }
+    if date_of(el).is_none() {
+        return format!(
+            "{name}: this calendar date cannot be written by Lox Logic; it stays read-only"
+        );
+    }
     match ctx.lock.slug_of(uuid) {
         Some(s) if files.block(s).is_none() => {
             format!("{name}: the module declares this entry (`{s}`); change it in its .loxl file")
         }
         _ => format!(
-            "{name}: Loxone Config made this entry; vislox edits the entries added here (change \
-             it in Loxone Config, or take it over with `lox logic adopt --uuid {uuid}`)"
+            "{name}: Loxone Config made this entry; choose Adopt into vislox in Properties to edit it here"
         ),
     }
 }
@@ -527,7 +537,10 @@ pub fn edit_refusals(
             let why = if !ours {
                 Some(not_ours_el(files, ctx, el, u))
             } else if date_of(el).is_none() {
-                Some("Its date cannot be read; undo the edit that wrote it".to_string())
+                Some(
+                    "This calendar date cannot be written by Lox Logic; it stays read-only"
+                        .to_string(),
+                )
             } else {
                 None
             };

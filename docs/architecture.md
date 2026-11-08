@@ -249,3 +249,5 @@ The binary is an `axum` server with the UI embedded (plain JS and SVG, no build 
   `.gitignore` excludes `docs/reference/`, so a local copy for comparison is never committed.
 - `VISLOX_FTP_PORT` overrides the FTP port the status check connects to (default 21). It exists for tests;
   lox always uses 21.
+
+Object-tree adoption uses the same scratch-module path as page blocks. `adopt::extract` maps `device:` and `switches:` as values, preserving their references, and files declarations without pages in `vislox/_periphery.loxl`. Device descendants are validated against the base before joining the adoption and its inverse. The server supplies adoption refusals to the UI.

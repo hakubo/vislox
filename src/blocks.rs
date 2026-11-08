@@ -654,7 +654,10 @@ impl PageFile {
                                 port,
                                 kind: BindingKind::Param(v @ Value::Ref(_)),
                                 ..
-                            }) if port == MIRRORS || port == crate::periphery::DEVICE => {
+                            }) if port == MIRRORS
+                                || port == crate::periphery::DEVICE
+                                || port == "switches" =>
+                            {
                                 args.push((port.clone(), v.clone()))
                             }
                             // A bare name of vislox's on an adopted block: the
