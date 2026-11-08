@@ -2548,7 +2548,7 @@ function renderStaleLines(a) {
   const r = editRev(), shown = !!lines.length && !!r && S.rev === r.id && !!a.edit?.available;
   box.classList.toggle("hidden", !shown);
   if (!shown) { box.innerHTML = ""; return; }
-  const why = a.running ? `${a.running} is running` : UNDO.busy || UNDO.inflight ? "An edit is compiling" : "";
+  const why = a.running ? `${a.running} is running` : UNDO.busy || UNDO.inflight ? "An edit is compiling" : S.showing ? "The last edit is being shown" : "";
   box.innerHTML = `<div class="ck-h">${plural(lines.length, "line")} of vislox's files lox needs no more</div>` +
     `<div class="ck-sub">The compile applied ${lines.length === 1 ? "it" : "them"} (lint: stale-lifecycle); the next edit drops ${lines.length === 1 ? "it" : "them"} too.</div>` +
     `<ul class="ps-list">${lines.map((l) => `<li class="mono">${esc(l)}</li>`).join("")}</ul>` +
@@ -3354,7 +3354,8 @@ async function loadEdits() {
   if (!S.hist?.actions?.shown) { S.edits = null; managedRefresh(was); return; }
   let got = null, failed = false;
   try { got = await api("/api/edits"); } catch { failed = true; }
-  if (seq !== S.editsSeq) return;
+  // The caller that waits for its load (`await S.editsLoad`) waits for the newest, whose data is applied.
+  if (seq !== S.editsSeq) return S.editsLoad;
   if (failed) { S.edits = null; S.editsKey = null; } else S.edits = got;
   // The managed blocks' badges and the legend follow the lockfile and the module (#64); the expressions'
   // groups follow the module too (#82).
@@ -3369,6 +3370,7 @@ async function loadEdits() {
   if (S.view && (JSON.stringify(S.edits?.add_under || null) !== under ||
     JSON.stringify((S.edits?.blocks || []).filter((b) => b.hardware).map((b) => [b.uuid, b.paired])) !== hwWas)) renderTree();
   if (S.sel && S.view) renderProps();
+  wcardRefresh();
   // Add mode, Add entry and each entry's Edit follow the server (#86): the year is drawn again only when what
   // they say changed, the header's buttons always.
   if (MD.open) mdEditKey() !== mdWas ? renderModes() : mdRenderEdit();
@@ -3640,6 +3642,7 @@ function editState(o) {
   if (S.rev !== r.id) return { why: `Edits are made on the newest config (${r.kind === "pending" ? "Pending" : "deployed"}).`, newest: r };
   if (a.running) return { why: `${a.running} is running.` };
   if (UNDO.busy) return { why: "Undo or redo is compiling." };
+  if (S.showing) return { why: SHOWING_WHY };
   return { ok: true, rev: r };
 }
 const EDIT_ATTR = { title: "Name", room: "Room", category: "Category", statistics: "Statistics", entry_mode: "Switches on", entry_date: "Date" };
@@ -3747,6 +3750,7 @@ function exState() {
   if (!r || S.rev !== r.id) return null;
   if (a.running) return { why: `${a.running} is running.` };
   if (UNDO.busy || S.edit.busy) return { why: "An edit is compiling." };
+  if (S.showing) return { why: SHOWING_WHY };
   return { ok: true, rev: r };
 }
 /** The pending claim of the `expr` op on an input (`claims`), for its Revert. */
@@ -4375,6 +4379,7 @@ function constEditState() {
   if (!r || S.rev !== r.id) return { why: "Edits are made on the newest config." };
   if (a.running) return { why: `${a.running} is running.` };
   if (UNDO.busy) return { why: "Undo or redo is compiling." };
+  if (S.showing) return { why: SHOWING_WHY };
   return { ok: true, rev: r };
 }
 /** A block's title, else its slug, for the blocks a default reaches. */
@@ -5371,6 +5376,7 @@ function ruState(o) {
   if (S.rev !== r.id) return { why: `Edits are made on the newest config (${r.kind === "pending" ? "Pending" : "deployed"}).` };
   if (a.running) return { why: `${a.running} is running.` };
   if (UNDO.busy) return { why: "Undo or redo is compiling." };
+  if (S.showing) return { why: SHOWING_WHY };
   if (o) {
     const why = ruWhy(o);
     if (why === undefined && !ruleEdit(o.uuid)) return { why: "Waiting for the server's list of rules." };
@@ -6204,6 +6210,7 @@ function adoptState() {
   if (!r || S.rev !== r.id) return null;
   if (a.running) return { why: `${a.running} is running.` };
   if (UNDO.busy || AD.busy) return { why: "An edit is compiling." };
+  if (S.showing) return { why: SHOWING_WHY };
   return { ok: true, rev: r };
 }
 /** The Edit rows about Lox Logic: adopt an unmanaged block, or why not; hand an adopted one back. */
@@ -6367,7 +6374,18 @@ async function editRemove(uuid) {
   await editSend(uuid, st.rev, [{ op: "remove_block", uuid }], `Remove ${displayTitle(o)}`);
 }
 /** Show the newest config, once the History has the compile `blob` (its file watcher may lag behind the reply). */
+/** An edit is sent against the config the page shows (the server refuses it, 409, when the pending config has
+ *  changed since): while the page is still fetching the one an edit of its own made, no other is sent. */
+S.showing = 0;
+const SHOWING_WHY = "The last edit is still being shown.";
 async function editShowNewest(blob) {
+  S.showing++;
+  try { await showNewest(blob); } finally {
+    S.showing--;
+    if (!S.showing) { renderAddHud(); renderActions(); if (S.view && S.sel && !document.activeElement?.closest?.("#props")) renderProps(); }
+  }
+}
+async function showNewest(blob) {
   await loadHistory();
   for (let i = 0; blob && editRev()?.blob !== blob && i < 40; i++) {
     await new Promise((ok) => setTimeout(ok, 250));
@@ -6587,6 +6605,7 @@ function undoWhy(queue) {
   if (a.running && !(queue && a.running === "Edit")) return `${a.running} is running.`;
   if (queue) return null;
   if (UNDO.busy || UNDO.inflight || S.mvBusy || S.wrBusy || AB.busy || S.edit.busy || MV) return "An edit is compiling.";
+  if (S.showing) return SHOWING_WHY;
   return null;
 }
 /** Undo the last edit, or (`redo`) redo the last one undone. A step waits its turn behind the steps
@@ -6693,7 +6712,7 @@ function editsMoved(uuid) { return (S.edits?.moves || []).filter((m) => (!uuid |
 /** Whether the block `uuid` can be moved now: `{ rev }`, else null. */
 function moveState(uuid) {
   const a = S.hist?.actions;
-  if (!a?.shown || !a.edit?.available || a.running || MD.open || S.mvBusy || UNDO.busy) return null;
+  if (!a?.shown || !a.edit?.available || a.running || MD.open || S.mvBusy || UNDO.busy || S.showing) return null;
   if (!S.edits?.movable?.includes(uuid)) return null;
   const r = editRev();
   return r && S.rev === r.id ? { rev: r } : null;
@@ -7080,6 +7099,23 @@ function wcardMsg(e, text, error) {
 function wcardOpen(e, w) {
   S.wmsg = null;
   S.wsel = { from: w.from, to: w.to, at: wcardAt(e) };
+  wcard.innerHTML = wcardSrc = wcardHtml(w);
+  wcard.classList.remove("hidden");
+  wrHandles();
+  wcardPlace();
+}
+/** The open card follows what it says: /api/edits (who drew the wire) and whether an edit can be sent now
+ *  both arrive after the click, and a card drawn before them would keep offering nothing. Only a changed card is
+ *  written, so that a click on its button is never lost to a redraw. */
+let wcardSrc = "";
+function wcardRefresh() {
+  if (!S.wsel || wcard.classList.contains("hidden")) return;
+  const w = S.view && curPage()?.wires.find((x) => sameEnd(x.from, S.wsel.from) && sameEnd(x.to, S.wsel.to));
+  if (!w) return;
+  const html = wcardHtml(w);
+  if (html !== wcardSrc) { wcard.innerHTML = wcardSrc = html; wrHandles(); wcardPlace(); }
+}
+function wcardHtml(w) {
   const fo = WI?.objs.get(w.from[0]), to = WI?.objs.get(w.to[0]);
   const q = fo?.ports.find((x) => x.key === w.from[1]);
   const x = editsWire(w), st = wireState(), who = wireOwner(w);
@@ -7100,15 +7136,12 @@ function wcardOpen(e, w) {
     what = `<span class="tm">${esc(S.edits?.wire_why?.[who] || "")}</span>`;
   }
   const why = S.hist?.actions?.shown ? wireWhy() : "";
-  wcard.innerHTML = `<div class="wc-head"><b>${esc(fo ? displayTitle(fo) : "")}</b>.${esc(portName(fo, w.from[1]))} → <b>${esc(to ? displayTitle(to) : "")}</b>.${esc(portName(to, w.to[1]))}</div>` +
+  return `<div class="wc-head"><b>${esc(fo ? displayTitle(fo) : "")}</b>.${esc(portName(fo, w.from[1]))} → <b>${esc(to ? displayTitle(to) : "")}</b>.${esc(portName(to, w.to[1]))}</div>` +
     `<div class="wc-sub tm">${esc(q?.kind || (w.analog ? "analog" : "digital"))}${w.status ? " · " + esc(w.status) : ""}</div>` +
     `<div class="wc-what">${what}</div>` +
     (who === "vislox" && !removed && st ? '<div class="wc-note tm">Drag an end of the wire to another port to reconnect it.</div>' : "") +
     (why && btn ? `<div class="wc-note tm">${esc(why)}</div>` : "") +
     `<div class="wc-bar">${st ? btn : ""}<button type="button" class="ed-btn small" data-wc="close">Close</button></div>`;
-  wcard.classList.remove("hidden");
-  wrHandles();
-  wcardPlace();
 }
 function wcardClose() {
   S.wsel = null; S.wmsg = null;
@@ -7157,6 +7190,7 @@ function periphAddState(n) {
   if (under[n.uuid]) return { why: under[n.uuid] };
   if (a.running) return { why: `${a.running} is running.` };
   if (UNDO.busy) return { why: "Undo or redo is compiling." };
+  if (S.showing) return { why: SHOWING_WHY };
   return { ok: true, rev: r };
 }
 /** The palette's types that go under an object of type `ty`. */
@@ -7194,11 +7228,13 @@ function addState() {
   if (pg.status === "removed") return { why: "This page is not in the config any more." };
   if (a.running) return { why: `${a.running} is running.` };
   if (UNDO.busy) return { why: "Undo or redo is compiling." };
+  if (S.showing) return { why: SHOWING_WHY };
   return { ok: true, rev: r, page: pg };
 }
 function renderAddHud() {
   renderNewPageBtn();
   adoptRevertSync();
+  wcardRefresh();
   const st = addState(), b = $("btn-add-block"), r = $("btn-relayout");
   $("hud-add").classList.toggle("hidden", !st);
   if (!st) { undoListToggle(false); return; }
@@ -7243,6 +7279,7 @@ function newPageState() {
   if (S.rev !== r.id) return { why: `Pages are created on the newest config (${r.kind === "pending" ? "Pending" : "deployed"}).` };
   if (a.running) return { why: `${a.running} is running.` };
   if (UNDO.busy) return { why: "Undo or redo is compiling." };
+  if (S.showing) return { why: SHOWING_WHY };
   if (!S.edits?.pages) return { why: "vislox cannot read the project's base config." };
   if (!S.edits.pages.rooms.length) return { why: "The base config has no room a page can be in: make one in Loxone Config first." };
   return { ok: true, rev: r };

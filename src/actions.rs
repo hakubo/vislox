@@ -4993,8 +4993,8 @@ async fn run_lines(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
-    let mut child = c
-        .spawn()
+    let mut child = crate::pull::spawn_retrying(&mut c)
+        .await
         .map_err(|e| format!("cannot run {}: {e}", cmd.display()))?;
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     fn pipe(
@@ -5060,7 +5060,7 @@ async fn run_status(
         .current_dir(dir)
         .stdin(std::process::Stdio::null())
         .kill_on_drop(true);
-    let out = tokio::time::timeout(limit, c.output())
+    let out = tokio::time::timeout(limit, crate::pull::output_retrying(&mut c))
         .await
         .map_err(|_| format!("took longer than {} s", limit.as_secs()))?
         .map_err(|e| format!("cannot run {}: {e}", cmd.display()))?;
@@ -5188,7 +5188,7 @@ async fn run(cmd: &Path, args: &[&str], dir: &Path, limit: Duration) -> Result<S
         .stdin(std::process::Stdio::null())
         .env("GIT_TERMINAL_PROMPT", "0")
         .kill_on_drop(true);
-    let out = tokio::time::timeout(limit, c.output())
+    let out = tokio::time::timeout(limit, crate::pull::output_retrying(&mut c))
         .await
         .map_err(|_| format!("took longer than {} s", limit.as_secs()))?
         .map_err(|e| format!("cannot run {}: {e}", cmd.display()))?;

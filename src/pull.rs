@@ -174,6 +174,39 @@ pub(crate) async fn output_retrying(
     }
 }
 
+/// [`output_retrying`] for `spawn`: the same wait while the binary is busy.
+pub(crate) async fn spawn_retrying(
+    c: &mut tokio::process::Command,
+) -> std::io::Result<tokio::process::Child> {
+    let mut tries = 0;
+    loop {
+        match c.spawn() {
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && tries < 20 => {
+                tries += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+            res => return res,
+        }
+    }
+}
+
+/// [`output_retrying`] for a blocking command (the tests run stand-in executables they just wrote).
+#[cfg(test)]
+pub(crate) fn output_retrying_blocking(
+    c: &mut std::process::Command,
+) -> std::io::Result<std::process::Output> {
+    let mut tries = 0;
+    loop {
+        match c.output() {
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && tries < 20 => {
+                tries += 1;
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            res => return res,
+        }
+    }
+}
+
 /// Make an explicit relative executable path absolute before commands change
 /// directories. Bare names stay bare so each spawn resolves them on `PATH`.
 pub(crate) fn resolve_lox(path: &Path) -> std::io::Result<PathBuf> {
@@ -213,10 +246,9 @@ mod tests {
         }
 
         let resolved = resolve_lox_from(Path::new("./bin/lox"), &startup).unwrap();
-        let child = std::process::Command::new(resolved)
-            .current_dir(&elsewhere)
-            .output()
-            .unwrap();
+        let child =
+            output_retrying_blocking(std::process::Command::new(resolved).current_dir(&elsewhere))
+                .unwrap();
         assert!(child.status.success());
         assert_eq!(child.stdout, b"ran");
     }
@@ -238,12 +270,48 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
         let resolved = resolve_lox(&executable).unwrap();
-        let child = std::process::Command::new(resolved)
-            .env_clear()
-            .output()
-            .unwrap();
+        let child =
+            output_retrying_blocking(std::process::Command::new(resolved).env_clear()).unwrap();
         assert!(child.status.success());
         assert_eq!(child.stdout, b"ran");
+    }
+
+    /// A stand-in lox that was just written can still be open for writing in a child another test thread forked:
+    /// running it then fails with ETXTBSY until that child execs. Held open here for a while, on purpose.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_busy_executable_is_waited_for_not_failed() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let lox = tmp.path().join("lox");
+        std::fs::write(&lox, "#!/bin/sh\nprintf ran").unwrap();
+        std::fs::set_permissions(&lox, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let holder = std::fs::OpenOptions::new().append(true).open(&lox).unwrap();
+        // (Linux and others refuse it; macOS runs it, and there is nothing to wait for.)
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            std::process::Command::new(&lox)
+                .output()
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::ExecutableFileBusy,
+            "a file open for writing is not executable"
+        );
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            drop(holder);
+        });
+        let mut c = tokio::process::Command::new(&lox);
+        let out = output_retrying(&mut c).await.unwrap();
+        assert_eq!(out.stdout, b"ran");
+        let holder = std::fs::OpenOptions::new().append(true).open(&lox).unwrap();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            drop(holder);
+        });
+        let mut c = tokio::process::Command::new(&lox);
+        let mut child = spawn_retrying(&mut c).await.unwrap();
+        assert!(child.wait().await.unwrap().success());
     }
 
     #[cfg(unix)]

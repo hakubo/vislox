@@ -5,6 +5,12 @@ published under the same version (see [docker/README.md](docker/README.md)).
 
 ## Unreleased
 
+- The browser sends no edit while it is still fetching the config an edit of its own made (follow-up to #141). The
+  server refuses an edit made on an older pending config (409), and the page was free to send one in that window; the
+  controls say *The last edit is still being shown* instead. The wire card (Delete, Revert) follows `/api/edits` and
+  the edit state after it is opened, instead of keeping what it showed at the click. Whoever waits for
+  `/api/edits` waits for the newest load, whose data is applied. Running `lox` is retried while its binary is
+  busy (ETXTBSY) everywhere it is run.
 - An older answer of `GET /api/edits` arriving after a newer one no longer overwrites it (follow-up to #124/#126):
   the browser starts a load for each change of the server's edit key, the answers can cross, and the stale one was
   kept because the key already named the newer. Only the newest load applies, as the check's and the History's do.

@@ -1121,7 +1121,7 @@ try {
   // compiled (`done`: what the page shows then).
   // Settled: no undo or redo queued or sent, nothing compiling on the server, the newest config shown,
   // and Properties not waiting for a compile.
-  const SETTLED = `!UNDO.busy && !UNDO.inflight && !S.hist?.actions?.running && S.viewRev === S.rev && S.rev === editRev()?.id &&
+  const SETTLED = `!UNDO.busy && !UNDO.inflight && !S.showing && !S.hist?.actions?.running && S.viewRev === S.rev && S.rev === editRev()?.id &&
     !/Compiling…|Undo or redo is compiling/.test(document.querySelector("#props")?.textContent || "")`;
   const settled = () => page.waitForFunction(SETTLED, null, { timeout: 20000 });
   // The view of a pending revision, held until `release()` or answered with a 500 (#126): the check's answer then
@@ -1711,6 +1711,41 @@ try {
       { op: "wire", from: [DIV, "AQ"], to: [METER, target] },
     ]);
     await wireShown([DIV, "AQ"], [AND, "I2"], false);
+  });
+  await step("an open wire card and a caller waiting for the edits follow the newest load (#141)", async () => {
+    // The card is drawn from /api/edits: answered with a stale list (no wire drawn here), it offers no Revert; the
+    // true answer comes after, and the card has to follow it (it was a snapshot: Delete then did nothing).
+    let stale = true;
+    await page.route("**/api/edits", async (r) => {
+      if (!stale) return r.continue().catch(() => {});
+      const resp = await r.fetch(), j = await resp.json();
+      await r.fulfill({ response: resp, json: { ...j, wires: [] } }).catch(() => {});
+    });
+    try {
+      await page.evaluate(() => { S.editsKey = "stale"; editsChanged(); return S.editsLoad; });
+      await clickWire([DIV, "AQ"], [METER, target]);
+      assert.equal(await page.locator('#wcard [data-wc="unwire"]').count(), 0);
+      stale = false;
+      await page.evaluate(() => { S.editsKey = "fresh"; editsChanged(); return S.editsLoad; });
+      await page.waitForSelector('#wcard [data-wc="unwire"]', { timeout: 5000 });
+      await page.click('#wcard [data-wc="close"]');
+    } finally { await page.unroute("**/api/edits"); }
+    // Two loads overlap, the second held: whoever waits for the first waits for the second's data.
+    let n = 0, release;
+    const held = new Promise((r) => { release = r; });
+    await page.route("**/api/edits", async (r) => {
+      if (++n < 2) return r.continue().catch(() => {});
+      await held;
+      await r.continue().catch(() => {});
+    });
+    try {
+      await page.evaluate(() => { S.editsKey = "a"; editsChanged(); window.__a = S.editsLoad; S.editsKey = "b"; editsChanged(); });
+      assert.equal(await page.evaluate(() => Promise.race([window.__a.then(() => "done"), new Promise((r) => setTimeout(() => r("waiting"), 1000))])), "waiting");
+    } finally {
+      release();
+    }
+    assert.equal(await page.evaluate(() => window.__a.then(() => "done")), "done");
+    await page.unroute("**/api/edits");
   });
   await step("Delete takes a wire drawn here out again", async () => {
     await clickWire([DIV, "AQ"], [METER, target]);
@@ -3317,7 +3352,21 @@ try {
     await page.press("#ab-q", "Enter");
     await page.fill('#ab-body [data-ab-field="title"]', "Leistung");
     await page.fill('#ab-body [data-ab-field="s:Check"]', '"power":\\v');
-    ops = await send(() => page.click('#ab-body [data-ab="add"]'), "add its command");
+    // The History shows the compile late: the page still has the config before the command while the next add is
+    // started. It is refused in the browser until the page shows the newest (never sent for the server to 409).
+    let slow = false;
+    const onReply = (r) => { if (/\/api\/edit$/.test(r.url())) slow = true; };
+    page.on("response", onReply);
+    await page.route("**/api/history", async (r) => { if (slow) await new Promise((x) => setTimeout(x, 2500)); await r.continue().catch(() => {}); });
+    const nc = edits.length;
+    await page.click('#ab-body [data-ab="add"]');
+    await until(() => edits.length > nc && statuses[nc] !== undefined, "add its command");
+    assert.equal(statuses[nc], 200);
+    assert.equal(await page.evaluate(() => addState()?.why), "The last edit is still being shown.");
+    await settled();
+    ops = edits[nc].ops;
+    page.off("response", onReply);
+    await page.unroute("**/api/history");
     assert.deepEqual(ops, [{ op: "add_block", page: http, type: "VirtualHttpInCmd", title: "Leistung", params: {}, settings: { Check: '"power":\\v' } }]);
     assert.match(pfile(), /^vx_virtualhttpincmd_1 = VirtualHttpInCmd\("Leistung", device: vx_virtualhttpin_1, Check: "\\"power\\":\\\\v"\)$/m);
     // A device of Loxone Config's: the Modbus server takes a Modbus device, through vislox's extern of it.
