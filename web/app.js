@@ -74,6 +74,7 @@ function setStatus(text, cls) {
 /** How long a Roll back's or a removal's plan (#69, #70) is shown: the server keeps it as long. */
 const PREVIEW_TTL = 15 * 60 * 1000;
 function allRevs() { return S.hist ? [...(rollbackPreview() ? [S.rollbackRev] : []), ...(removalsPreview() ? [S.removals.revision] : []), ...S.hist.pending, ...S.hist.history, ...(S.hist.backups || [])] : []; }
+function newestRev(hist = S.hist) { return hist ? hist.pending[0] || hist.history[0] || null : null; }
 function revById(id) { return allRevs().find((r) => r.id === id); }
 function lightColor(rgb) {
   const m = /^(\d+),(\d+),(\d+)$/.exec(rgb || "");
@@ -120,26 +121,47 @@ function writeHash(push) {
   if (s === location.hash) return;
   if (push) history.pushState(null, "", s); else history.replaceState(null, "", s);
 }
+let popstateSeq = 0;
 window.addEventListener("popstate", async () => {
+  const seq = ++popstateSeq;
   const h = readHash();
   S.applyingHash = true;
+  S.hash = h;
   try {
-    if (h.rev && (h.rev !== S.rev || (h.base || null) !== S.base) && revById(h.rev)) {
-      S.rev = h.rev; S.base = h.base || null; S.follow = false; $("chk-follow").checked = false;
-      S.hash = h; renderHistory(); renderSelects(); await loadView();
+    let light = false;
+    if (!h.rev) {
+      const latest = newestRev();
+      if (S.hist && S.follow && S.rev === latest?.id && S.base === (latest?.base || null)) light = true;
+      else await followLatest(seq);
+    } else if (revById(h.rev)) {
+      if (h.rev !== S.rev || (h.base || null) !== S.base || S.follow) {
+        S.rev = h.rev; S.base = h.base || null; S.follow = false; $("chk-follow").checked = false;
+        renderHistory(); renderSelects(); await loadView();
+        if (seq !== popstateSeq) return;
+      } else light = true;
     } else {
+      // Keep the current revision for a stale or unavailable history URL.
+      light = true;
+    }
+    if (light && S.viewRev === S.rev) {
+      S.hash = null;
       if (h.page && h.page !== S.page) gotoPage(h.page);
       select(h.sel || null, { noReveal: false });
       if (h.view === "modes") modesOpen({ quiet: true }); else modesClose(true);
     }
-  } finally { S.applyingHash = false; }
+  } finally { if (seq === popstateSeq) S.applyingHash = false; }
 });
 
 // ── history ────────────────────────────────────────────────────────────
-async function loadHistory(fromEvent) {
+function followLatest(navigation) {
+  S.follow = true; S.rev = null; $("chk-follow").checked = true;
+  return loadHistory(false, navigation);
+}
+async function loadHistory(fromEvent, navigation) {
   let h;
-  try { h = await api("/api/history"); } catch (e) { setStatus("server unreachable", "error"); return; }
-  const prevNewest = S.hist ? (S.hist.pending[0] || S.hist.history[0])?.id : null;
+  try { h = await api("/api/history"); } catch (e) { if (navigation == null || navigation === popstateSeq) setStatus("server unreachable", "error"); return; }
+  if (navigation != null && navigation !== popstateSeq) return;
+  const prevNewest = newestRev(S.hist)?.id;
   S.hist = h;
   $("doc-sub").textContent = h.label + (h.error ? " · " + h.error : "");
   if (h.vislox) {
@@ -147,14 +169,14 @@ async function loadHistory(fromEvent) {
     $("ver").title = `vislox ${h.vislox.version}` + (h.vislox.commit ? ` (commit ${h.vislox.commit})` : "");
   }
   if (h.running && !running.loaded) loadRunning(false);
-  const newest = h.pending[0] || h.history[0];
+  const newest = newestRev(h);
   let changed = false;
   if (S.hash?.rev && revById(S.hash.rev) && !S.rev) {
     S.rev = S.hash.rev; S.base = S.hash.base || null; S.follow = false; $("chk-follow").checked = false; changed = true;
   }
   if (!S.rev || !revById(S.rev) || (S.follow && newest && newest.id !== S.rev)) {
     const inPending = S.rev && S.rev.startsWith("pending:");
-    const pick = (inPending ? h.pending[0] : null) || newest;
+    const pick = (inPending ? h.pending[0] : null) || newestRev(h);
     if (pick && pick.id !== S.rev) { S.rev = pick.id; S.base = pick.base; changed = true; }
   }
   if (S.base && !revById(S.base)) { S.base = revById(S.rev)?.base || null; changed = true; }
@@ -345,7 +367,7 @@ async function loadView() {
   const h = S.hash; S.hash = null;
   if (h?.page && S.pageOf.has(h.page)) S.page = h.page;
   if (!S.pageOf.has(S.page)) S.page = (v.pages.find((p) => p.changes > 0) || v.pages[0])?.uuid || null;
-  if (h?.sel && v.objects[h.sel]) S.sel = h.sel;
+  if (h) S.sel = h.sel && v.objects[h.sel] ? h.sel : null;
   if (S.sel && !v.objects[S.sel]) S.sel = null;
   S.chgIdx = -1;
   const compared = v.compared;
@@ -360,7 +382,8 @@ async function loadView() {
   renderChanges();
   renderPage();
   renderProps();
-  if (S.sel) applyFocus();
+  if (h) select(h.sel && v.objects[h.sel] ? h.sel : null);
+  else if (S.sel) applyFocus();
   // A link or Back/Forward says whether the view is open; a reload of the revision keeps it as it is.
   if (h?.view === "modes") modesOpen({ quiet: true });
   else if (h) modesClose(true);
@@ -2014,7 +2037,7 @@ $("chk-live-query").checked = S.live.query;
 $("chk-live-query").onchange = (e) => { S.live.query = e.target.checked; setPref("liveQuery", S.live.query); renderLiveSwitch(); };
 $("chk-dim").onchange = (e) => { S.dim = e.target.checked; renderPage(); applyFocus(); };
 $("chk-only-managed").onchange = (e) => { S.onlyManaged = e.target.checked; renderPage(); applyFocus(); };
-$("chk-follow").onchange = (e) => { S.follow = e.target.checked; if (S.follow) { S.rev = null; loadHistory(); } writeHash(false); };
+$("chk-follow").onchange = (e) => { if (e.target.checked) followLatest(); else S.follow = false; writeHash(false); };
 
 window.addEventListener("keydown", (e) => {
   if (!$("palette").classList.contains("hidden") || !$("help").classList.contains("hidden")) {
