@@ -538,8 +538,11 @@ impl PageFile {
         }
     }
 
+    /// Nothing to write: no block, no line lox needs, and no page it creates
+    /// (`room:`, #88), so the file goes.
     pub fn is_empty(&self) -> bool {
-        self.blocks.is_empty()
+        self.room.is_none()
+            && self.blocks.is_empty()
             && self.removed.is_empty()
             && self.moved.is_empty()
             && self.signals.is_empty()
@@ -790,6 +793,12 @@ impl PageFile {
             );
             if let Some(u) = &self.uuid {
                 out.push_str(&format!("# {UUID_LINE} {u}\n"));
+            }
+            if self.room.is_some() {
+                out.push_str(
+                    "# vislox created this page: lox creates it from the page line until it is\n\
+                     # deployed, and then hands it to Loxone Config.\n",
+                );
             }
             out.push_str(&render_page(&page));
             out.push('\n');

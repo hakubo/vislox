@@ -341,6 +341,9 @@ rect.ghost, line.ghost { fill: #1f6fd10a; stroke: var(--moved); stroke-opacity: 
 .tab[aria-selected="true"] { background: #fff; border-bottom-color: var(--brand); font-weight: 600; color: var(--text); }
 .tab.added { color: var(--added); }
 .tab.removed { color: var(--removed); text-decoration: line-through; }
+.new-page-btn { display: flex; align-items: center; gap: 4px; padding: 0 10px; border: none; border-left: 1px solid var(--line); background: transparent; white-space: nowrap; color: inherit; font-weight: 600; }
+.new-page-btn:hover:not(:disabled) { background: var(--brand-soft); }
+.new-page-btn:disabled { color: var(--faint); cursor: default; }
 .only-changed { display: flex; align-items: center; gap: 4px; padding: 0 10px; border-left: 1px solid var(--line); white-space: nowrap; color: var(--muted); cursor: pointer; }
 
 /* ── history ───────────────────────────────────────── */

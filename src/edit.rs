@@ -293,6 +293,24 @@ pub enum Op {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         restores: Option<String>,
     },
+    /// A new logic page (#88): a file of vislox's headed `page "title" (room:
+    /// …, category: …)`, from which the compile creates the page. `room` and
+    /// `category` are titles of the base's. The reply names its UUID
+    /// (`added`); `remove_page` of it undoes it.
+    NewPage {
+        title: String,
+        room: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        category: Option<String>,
+        /// The UUID of the page this creates again: set in the `previous` of
+        /// a `remove_page`, as for `add_block`. lox mints a new one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        restores: Option<String>,
+    },
+    /// Take out a page `new_page` created that is not deployed yet and holds
+    /// nothing of vislox's (#88): its file goes, and the compile no longer
+    /// creates it. Its `previous` is the `new_page` that creates it again.
+    RemovePage { page: String },
     /// Bring back a rule created here that `remove_block` deleted, while lox
     /// keeps its tombstone: its declaration and the lock's pin, so it keeps
     /// its UUID. Only the `previous` of a `remove_block` makes one; its
@@ -339,6 +357,8 @@ impl Op {
             | Op::RestoreRule { uuid, .. }
             | Op::Tiles { uuid, .. } => Some(uuid),
             Op::NewRule { .. }
+            | Op::NewPage { .. }
+            | Op::RemovePage { .. }
             | Op::AddBlock { .. }
             | Op::Signal { .. }
             | Op::Instance { .. }
@@ -389,6 +409,8 @@ impl Op {
             | Op::Recipients { .. }
             | Op::Rule { .. }
             | Op::NewRule { .. }
+            | Op::NewPage { .. }
+            | Op::RemovePage { .. }
             | Op::RestoreRule { .. }
             | Op::Tiles { .. } => None,
         }
@@ -430,6 +452,8 @@ impl Op {
             | Op::Recipients { .. }
             | Op::Rule { .. }
             | Op::NewRule { .. }
+            | Op::NewPage { .. }
+            | Op::RemovePage { .. }
             | Op::RestoreRule { .. }
             | Op::Tiles { .. } => {}
         }
@@ -1052,6 +1076,8 @@ impl Claims {
             | Op::EntryDate { .. }
             | Op::Rule { .. }
             | Op::NewRule { .. }
+            | Op::NewPage { .. }
+            | Op::RemovePage { .. }
             | Op::RestoreRule { .. }
             | Op::Let { .. } => None,
         }
@@ -1322,6 +1348,8 @@ pub fn apply(
                     | Op::EntryDate { .. }
                     | Op::Rule { .. }
                     | Op::NewRule { .. }
+                    | Op::NewPage { .. }
+                    | Op::RemovePage { .. }
                     | Op::RestoreRule { .. }
             )
         })
@@ -1442,6 +1470,8 @@ pub fn apply(
         | Op::EntryDate { .. }
         | Op::Rule { .. }
         | Op::NewRule { .. }
+        | Op::NewPage { .. }
+        | Op::RemovePage { .. }
         | Op::RestoreRule { .. }
         | Op::Let { .. } => {
             unreachable!("not a value")
@@ -1500,6 +1530,9 @@ pub struct Lock {
     pub owned: BTreeSet<String>,
     /// The named Automatic Designer rules (`rules`, #87): slug → rule UUID.
     pub rules: BTreeMap<String, String>,
+    /// The pages lox created from a `page "…" (room: …)` line (`pages`,
+    /// #88): title → page UUID.
+    pub pages: BTreeMap<String, String>,
 }
 
 impl Lock {
@@ -1590,6 +1623,15 @@ impl Lock {
                     .collect()
             })
             .unwrap_or_default();
+        let pages = v
+            .get("pages")
+            .and_then(|o| o.as_object())
+            .map(|o| {
+                o.iter()
+                    .filter_map(|(t, u)| Some((t.clone(), u.as_str()?.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default();
         Lock {
             slugs,
             placed,
@@ -1599,6 +1641,7 @@ impl Lock {
             tombs,
             owned,
             rules,
+            pages,
         }
     }
 
@@ -1891,24 +1934,28 @@ impl Files {
 
     /// Tie each page file to its page in `base` by UUID, and follow a page
     /// Loxone Config renamed: `page "…"` names the page by its title. A file
-    /// written before it had a UUID takes the first page with its title.
-    pub fn follow_pages(&mut self, base: &LoxoneDoc) {
+    /// written before it had a UUID takes the first page with its title; one
+    /// that creates its page (#88) the UUID lox gave it (`lock`'s `pages`).
+    /// A created page the base has is Loxone Config's: its line loses
+    /// `room:` and `category:`, so that a rename there is followed, not
+    /// refused (lox refuses a created page renamed while they remain).
+    pub fn follow_pages(&mut self, base: &LoxoneDoc, lock: &Lock) {
         for p in self.pages.values_mut().filter(|p| !p.periphery) {
-            match &p.uuid {
-                Some(u) => {
-                    if let Some(t) = find(&base.xml.root, u)
-                        .filter(|e| e.attr("Type") == Some("Page"))
-                        .and_then(|e| e.attr_decoded("Title"))
-                        .filter(|t| !t.trim().is_empty())
-                    {
-                        p.page = t.into_owned();
-                    }
-                }
-                None => {
-                    let mut same = Vec::new();
-                    pages_titled(&base.xml.root, &p.page, &mut same);
-                    p.uuid = same.first().and_then(|e| e.attr("U")).map(String::from);
-                }
+            if p.uuid.is_none() {
+                let mut same = Vec::new();
+                pages_titled(&base.xml.root, &p.page, &mut same);
+                p.uuid = crate::page_edit::created_uuid(p, lock)
+                    .or_else(|| same.first().and_then(|e| e.attr("U")).map(String::from));
+            }
+            let Some(u) = &p.uuid else { continue };
+            if let Some(t) = find_ci(&base.xml.root, u)
+                .filter(|e| e.attr("Type") == Some("Page"))
+                .and_then(|e| e.attr_decoded("Title"))
+                .filter(|t| !t.trim().is_empty())
+            {
+                p.page = t.into_owned();
+                p.room = None;
+                p.category = None;
             }
         }
     }
@@ -2283,6 +2330,13 @@ pub fn apply_op(files: &mut Files, ctx: &Ctx, op: &Op) -> Result<Applied, String
             }
         }
         Op::Rule { uuid, value } => crate::rule_edit::apply(files, ctx, uuid, value.as_ref()),
+        Op::NewPage {
+            title,
+            room,
+            category,
+            ..
+        } => crate::page_edit::new_page(files, ctx, title, room, category.as_deref()),
+        Op::RemovePage { page } => crate::page_edit::remove_page(files, ctx, page),
         Op::NewRule { title, value, .. } => {
             crate::rule_edit::new_rule(files, ctx, title, value.as_ref())
         }
@@ -2418,16 +2472,21 @@ pub fn undo_ops(
             )
         };
         match op {
-            Op::AddBlock { .. } | Op::NewRule { .. } => match minted.get(i).cloned().flatten() {
-                Some(uuid) => undo.push(Op::RemoveBlock { uuid }),
-                None => {
-                    return Err(format!(
-                        "op {} ({}): lox named no UUID for what it added",
-                        i + 1,
-                        op_name(op)
-                    ));
+            Op::AddBlock { .. } | Op::NewRule { .. } | Op::NewPage { .. } => {
+                match minted.get(i).cloned().flatten() {
+                    Some(page) if matches!(op, Op::NewPage { .. }) => {
+                        undo.push(Op::RemovePage { page })
+                    }
+                    Some(uuid) => undo.push(Op::RemoveBlock { uuid }),
+                    None => {
+                        return Err(format!(
+                            "op {} ({}): lox named no UUID for what it added",
+                            i + 1,
+                            op_name(op)
+                        ));
+                    }
                 }
-            },
+            }
             Op::RemoveBlock { .. }
             | Op::RestoreBlock { .. }
             | Op::Rename { .. }
@@ -2442,6 +2501,7 @@ pub fn undo_ops(
             | Op::Signal { .. }
             | Op::Instance { .. }
             | Op::RestoreRule { .. }
+            | Op::RemovePage { .. }
             | Op::Unadopt { .. } => undo.push(serde_json::from_value(prev).map_err(bad)?),
             Op::Rule { uuid, .. } => undo.push(Op::Rule {
                 uuid: uuid.clone(),
@@ -2625,23 +2685,9 @@ fn add_block(files: &mut Files, ctx: &Ctx, op: &Op) -> Result<Applied, String> {
     if let Some(t) = crate::periphery::of(ty) {
         return add_object(files, ctx, op, t);
     }
-    let pg = find(&ctx.base.xml.root, page)
-        .filter(|e| e.attr("Type") == Some("Page"))
-        .ok_or_else(|| format!("no page {page} in the project's base config"))?;
-    let page_title = pg.attr_decoded("Title").unwrap_or_default().into_owned();
-    if page_title.trim().is_empty() {
-        return Err("the page has no title; name it in Loxone Config first".into());
-    }
-    // `page "…"` names a page by its title, and lox builds on the first.
-    let mut same = Vec::new();
-    pages_titled(&ctx.base.xml.root, &page_title, &mut same);
-    if same.first().and_then(|e| e.attr("U")) != Some(page.as_str()) {
-        return Err(format!(
-            "{} pages are titled \"{page_title}\", and lox puts new blocks on the first; \
-             rename one in Loxone Config to add blocks here",
-            same.len()
-        ));
-    }
+    // `page "…"` names a page by its title, and lox builds on the first; a
+    // page created here (#88) is its file's.
+    let (page_title, page_file) = crate::page_edit::target(files, ctx, page, "blocks")?;
     // A push notification drawn on the page (#77): an `OutputRefLM` that
     // mirrors a `Notification` Loxone Config made, with its message.
     let message_ref = ty == blocks::MESSAGE_REF;
@@ -2743,12 +2789,8 @@ fn add_block(files: &mut Files, ctx: &Ctx, op: &Op) -> Result<Applied, String> {
         c.pinned = true;
     }
     // The page's file: by its UUID (it may have been renamed), else a new one.
-    let file = match files
-        .pages
-        .iter()
-        .find(|(_, p)| p.uuid.as_deref() == Some(page.as_str()))
-    {
-        Some((n, _)) => n.clone(),
+    let file = match page_file {
+        Some(n) => n,
         None => blocks::file_name(&page_title, &|n| n == CLAIMS || files.pages.contains_key(n)),
     };
     let f = files.pages.entry(file).or_insert_with(|| PageFile {
@@ -3109,8 +3151,12 @@ fn removal(
 /// the first page of the base with its title.
 fn file_page(files: &Files, ctx: &Ctx, file: &str) -> String {
     let pf = &files.pages[file];
-    match &pf.uuid {
-        Some(u) => u.clone(),
+    match pf
+        .uuid
+        .clone()
+        .or_else(|| crate::page_edit::created_uuid(pf, ctx.lock))
+    {
+        Some(u) => u,
         None => {
             let mut same = Vec::new();
             pages_titled(&ctx.base.xml.root, &pf.page, &mut same);
@@ -5124,6 +5170,8 @@ pub fn current_with(
         | Op::Instance { .. }
         | Op::Rule { .. }
         | Op::NewRule { .. }
+        | Op::NewPage { .. }
+        | Op::RemovePage { .. }
         | Op::RestoreRule { .. }
         | Op::Let { .. } => None,
     }
@@ -5152,7 +5200,7 @@ pub fn module_files(dir: &Path, found: &mut dyn FnMut(&Path, std::time::SystemTi
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use loxone_config::{Lockfile, logic::CompileOptions};
 
@@ -5557,7 +5605,134 @@ mod tests {
                 .map(|(s, _)| s.clone())
                 .collect(),
             rules: l.rules.clone(),
+            pages: l.pages.clone(),
         }
+    }
+
+    /// A base with a program, rooms and categories, as Loxone Config writes
+    /// them: lox creates a page only inside a `<C Type="Program">` (#88).
+    pub(crate) const PROGRAM_BASE: &str = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
+<ControlList Version=\"1\" NextObj=\"50\" NextConst=\"1\" NextNote=\"1\" NextMem=\"1\">\n\
+\t<C Type=\"Document\" V=\"17020000\" U=\"20000000-0000-0001-ffff504f94000001\" Title=\"Haus\" ConfigVersion=\"17020000\">\n\
+\t\t<C Type=\"CategoryCaption\" V=\"178\" U=\"20000000-0000-0002-ffff504f94000001\" Title=\"Kategorien\">\n\
+\t\t\t<C Type=\"Category\" V=\"178\" U=\"20000000-0000-0003-ffff504f94000001\" Title=\"Nicht zugeordnet\" First=\"true\"/>\n\
+\t\t\t<C Type=\"Category\" V=\"178\" U=\"20000000-0000-0004-ffff504f94000001\" Title=\"Beleuchtung\"/>\n\
+\t\t</C>\n\
+\t\t<C Type=\"PlaceCaption\" V=\"178\" U=\"20000000-0000-0005-ffff504f94000001\" Title=\"Räume\">\n\
+\t\t\t<C Type=\"Place\" V=\"178\" U=\"20000000-0000-0006-ffff504f94000001\" Title=\"Nicht zugeordnet\" First=\"true\"/>\n\
+\t\t\t<C Type=\"Place\" V=\"178\" U=\"20000000-0000-0007-ffff504f94000001\" Title=\"Küche\"/>\n\
+\t\t</C>\n\
+\t\t<C Type=\"Program\" V=\"178\" U=\"20000000-0000-0008-ffff504f94000001\" Title=\"Loxone Miniserver\">\n\
+\t\t\t<C Type=\"Page\" V=\"178\" U=\"20000000-0000-000a-ffff504f94000001\" Title=\"Küche\">\n\
+\t\t\t\t<IoData Cr=\"20000000-0000-0003-ffff504f94000001\" Pr=\"20000000-0000-0007-ffff504f94000001\"/>\n\
+\t\t\t</C>\n\
+\t\t</C>\n\
+\t</C>\n\
+</ControlList>\n";
+
+    /// A new page with lox's own compiler (#88): the page line alone creates
+    /// it in the room and category it names, the lock keeps its UUID, a block
+    /// added on it goes into its file, and once empty `remove_page` takes it
+    /// out again. Deployed, the line loses `room:`, and the compile keeps the
+    /// page as Loxone Config has it.
+    #[test]
+    fn a_new_page_is_created_by_lox_and_taken_out_again() {
+        let base = LoxoneDoc::parse(PROGRAM_BASE.as_bytes()).unwrap();
+        let mut lockfile = Lockfile::default();
+        let mut files = Files::default();
+        let lock = lock_of(&lockfile);
+        let none = BTreeSet::new();
+        let names = BTreeSet::new();
+        let drawn = BTreeSet::new();
+        let ad = BTreeMap::new();
+        let pad = BTreeMap::new();
+        let claimed = Default::default();
+        let mk = |doc, lock| Ctx {
+            doc,
+            base: &base,
+            lock,
+            deployed: None,
+            names: &names,
+            lets: &none,
+            drawn: &drawn,
+            adoptions: &ad,
+            page_adoptions: &pad,
+            claimed: &claimed,
+            templates: &NO_TEMPLATES,
+        };
+        let op = Op::NewPage {
+            title: "Küche Logik".into(),
+            room: "Küche".into(),
+            category: Some("Beleuchtung".into()),
+            restores: None,
+        };
+        apply_op(&mut files, &mk(&base, &lock), &op).unwrap();
+        let out = compile_files(&base, &files, &mut lockfile).unwrap();
+        let uuid = lockfile.pages["Küche Logik"].clone();
+        let pg = find(&out.xml.root, &uuid).unwrap();
+        assert_eq!(pg.attr("Type"), Some("Page"));
+        assert_eq!(pg.attr_decoded("Title").as_deref(), Some("Küche Logik"));
+        let io = pg.child_elements().find(|c| c.name == "IoData").unwrap();
+        assert_eq!(io.attr("Pr"), Some("20000000-0000-0007-ffff504f94000001"));
+        assert_eq!(io.attr("Cr"), Some("20000000-0000-0004-ffff504f94000001"));
+        // The next edit: the file takes the UUID, and a block goes on the page.
+        let lock = lock_of(&lockfile);
+        files.follow_pages(&base, &lock);
+        let add = add(&uuid, "And", Some("Neu"), &[], &[]);
+        apply_op(&mut files, &mk(&out, &lock), &add).unwrap();
+        let text = &files.render()["kueche-logik.loxl"];
+        assert!(text.contains(&format!("# page uuid: {uuid}\n")), "{text}");
+        let out = compile_files(&base, &files, &mut lockfile).unwrap();
+        let block = lockfile.objects["vx_and_1"].uuid.clone();
+        let lock = lock_of(&lockfile);
+        assert_eq!(lock.placed["vx_and_1"].as_deref(), Some(uuid.as_str()));
+        assert!(find(&out.xml.root, &block).is_some());
+        // Not while the block is there; then the page goes with its file.
+        let remove = Op::RemovePage { page: uuid.clone() };
+        assert!(apply_op(&mut files.clone(), &mk(&out, &lock), &remove).is_err());
+        apply_op(
+            &mut files,
+            &mk(&out, &lock),
+            &Op::RemoveBlock { uuid: block },
+        )
+        .unwrap();
+        let out = compile_files(&base, &files, &mut lockfile).unwrap();
+        let lock = lock_of(&lockfile);
+        files.tidy(&lock);
+        let a = apply_op(&mut files, &mk(&out, &lock), &remove).unwrap();
+        assert!(files.render().is_empty());
+        let out = compile_files(&base, &files, &mut lockfile).unwrap();
+        assert!(find(&out.xml.root, &uuid).is_none());
+        assert!(lockfile.pages.is_empty());
+        // Its undo creates it again (a new UUID: `restores` names the old one).
+        let again: Op = serde_json::from_value(a.previous).unwrap();
+        assert!(matches!(&again, Op::NewPage { restores: Some(r), .. } if *r == uuid));
+        let lock = lock_of(&lockfile);
+        apply_op(&mut files, &mk(&out, &lock), &again).unwrap();
+        let out = compile_files(&base, &files, &mut lockfile).unwrap();
+        let uuid = lockfile.pages["Küche Logik"].clone();
+        // Deployed: the base has the page, and Loxone Config renamed it.
+        let deployed = String::from_utf8(out.to_bytes())
+            .unwrap()
+            .replace("Title=\"Küche Logik\"", "Title=\"Kochen\"");
+        let deployed = LoxoneDoc::parse(deployed.as_bytes()).unwrap();
+        let lock = lock_of(&lockfile);
+        files.follow_pages(&deployed, &lock);
+        let p = &files.pages["kueche-logik.loxl"];
+        assert_eq!((p.page.as_str(), p.room.as_deref()), ("Kochen", None));
+        let mut tmp = files.clone();
+        tmp.pages
+            .get_mut("kueche-logik.loxl")
+            .unwrap()
+            .blocks
+            .push(blocks::NewBlock {
+                slug: "vx_and_1".into(),
+                ty: "And".into(),
+                ..Default::default()
+            });
+        let out = compile_files(&deployed, &tmp, &mut lockfile).unwrap();
+        let pg = find(&out.xml.root, &uuid).unwrap();
+        assert_eq!(pg.attr_decoded("Title").as_deref(), Some("Kochen"));
     }
 
     fn add(
@@ -5922,7 +6097,7 @@ mod tests {
         )
         .unwrap();
         let mut files = Files::from_texts(&files.render()).unwrap();
-        files.follow_pages(&renamed);
+        files.follow_pages(&renamed, &Lock::default());
         let lock = lock_of(&l);
         let ctx = Ctx {
             doc: &renamed,
@@ -5955,7 +6130,7 @@ mod tests {
             "page \"Oben\"\nvx_and_1 = And()\n".to_string(),
         )]))
         .unwrap();
-        old.follow_pages(&renamed);
+        old.follow_pages(&renamed, &Lock::default());
         assert_eq!(old.pages["oben.loxl"].uuid.as_deref(), Some(OG));
 
         // Both taken out, and forgotten by lox: the file goes.

@@ -29,6 +29,7 @@ mod monframe;
 mod monitor;
 mod mood_edit;
 mod operate;
+mod page_edit;
 mod periphery;
 mod pull;
 mod query;

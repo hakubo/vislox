@@ -207,6 +207,10 @@ published under the same version (see [docker/README.md](docker/README.md)).
   `<module>/vislox/edits.loxl`; lox checks each state and command against the app's capability table. Rules Lox Logic
   cannot write stay read-only. Undo, Revert and *Remove vislox's declaration* as for any claim. Never deploys, never
   runs a rule.
+- New pages (#88): *New page* next to the page tabs takes a title, a room and a category, writes a file of vislox's
+  headed `page "…" (room: …, category: …)` and runs `lox logic compile`, which creates the page; its tab is marked
+  added, blocks added there go into its file, and *Remove page* (or Undo) takes it out while it is not deployed and
+  empty. Once deployed, the line loses `room:` so that Loxone Config owns the page. Never deploys.
 
 ## 0.2.0
 

@@ -643,12 +643,27 @@ if (fs.existsSync("pages/vislox/_periphery.loxl")) {
     out.splice(i + 1, 0, \`\\t\\t\\t<C Type="\${ty}" V="178" U="\${uuid}" Title="\${xml(title ? JSON.parse('"' + title[1] + '"') : slug)}"\${attrs}>\`, "\\t\\t\\t</C>");
   }
 }
+// New pages (#88): a page line with \`room:\` creates the page when no page has its title, in the room it names (by
+// title, as lox resolves it; none or two fail the compile), its UUID kept by title in the lock's \`pages\`.
+const pages = {};
+for (const f of fs.existsSync("pages/vislox") ? fs.readdirSync("pages/vislox") : []) {
+  if (!f.endsWith(".loxl")) continue;
+  const m = fs.readFileSync("pages/vislox/" + f, "utf8").match(/^page "((?:[^"\\\\]|\\\\.)*)" \\(room: "((?:[^"\\\\]|\\\\.)*)"(?:, category: "(?:[^"\\\\]|\\\\.)*")?\\)$/m);
+  if (!m) continue;
+  const [title, room] = [JSON.parse('"' + m[1] + '"'), JSON.parse('"' + m[2] + '"')];
+  const places = out.filter((l) => l.includes('Type="Place"') && l.includes(\`Title="\${xml(room)}"\`));
+  if (places.length !== 1) { console.error(\`error: compile error: \${places.length ? places.length + " rooms are" : "no room"} titled "\${room}"\`); process.exit(1); }
+  if (out.some((l) => l.includes('Type="Page"') && l.includes(\`Title="\${xml(title)}"\`))) continue;
+  pages[title] = (lock.pages || {})[title] || \`ffffff\${String(++n).padStart(2, "0")}-0000-0000-ffff504f94000001\`;
+  const at = out.findIndex((l) => l.includes('<C Type="Page"'));
+  out.splice(at, 0, \`\\t\\t<C Type="Page" V="178" U="\${pages[title]}" Title="\${xml(title)}" WF="16384">\`, \`\\t\\t\\t<IoData Pr="\${places[0].match(/U="([^"]+)"/)[1]}"/>\`, "\\t\\t</C>");
+}
 for (const f of fs.existsSync("pages/vislox") ? fs.readdirSync("pages/vislox") : []) {
   if (f === "edits.loxl" || f === "templates.loxl" || f === "_periphery.loxl" || f === "_hardware.loxl" || !f.endsWith(".loxl")) continue;
   let pageAt = -1, instancing = false;
   for (const line of fs.readFileSync("pages/vislox/" + f, "utf8").split("\\n")) {
     let m;
-    if ((m = line.match(/^page "(.*)"$/))) { pageAt = out.findIndex((l) => l.includes('Type="Page"') && l.includes(\`Title="\${m[1]}"\`)); continue; }
+    if ((m = line.match(/^page "(.*?)"(?: \\(.*\\))?$/))) { pageAt = out.findIndex((l) => l.includes('Type="Page"') && l.includes(\`Title="\${m[1]}"\`)); continue; }
     if (line.startsWith("#")) { instancing = line.startsWith("# Template instances"); continue; }
     if (instancing && (m = line.match(/^(vx_\\w+) = (\\w+)\\((.*)\\)$/))) { instance(m[1], m[2], m[3], pageAt); continue; }
     // A named signal (#82): its top block, labelled with its .title or its expression.
@@ -965,7 +980,7 @@ const rules = {};
     out[i] = out[i].replace(/ APC="[^"]*"/, \` APC="\${JSON.stringify(payload).replace(/&/g, "&amp;").replace(/"/g, "&quot;")}"\`).replace(/ STA="1"/, "").replace(/ ref=/, active ? ' STA="1" ref=' : " ref=");
   }
 }
-const hwLock = { ...(Object.keys(externals).length ? { externals } : {}), ...(Object.keys(hardware).length ? { hardware } : {}), ...(Object.keys(rules).length ? { rules } : {}) };
+const hwLock = { ...(Object.keys(externals).length ? { externals } : {}), ...(Object.keys(hardware).length ? { hardware } : {}), ...(Object.keys(rules).length ? { rules } : {}), ...(Object.keys(pages).length ? { pages } : {}) };
 fs.writeFileSync(lockFile, JSON.stringify(removed ? { objects, removed, ...hwLock } : { objects, ...hwLock }));
 if (lockAt < 0) fs.writeFileSync(mintFile, String(n));
 const to = process.argv.indexOf("--out");
@@ -3351,6 +3366,75 @@ try {
     ops = await undoKey(false, (u) => !S.view.objects[u], again);
     assert.deepEqual(ops, [{ op: "remove_block", uuid: again }]);
     assert.doesNotMatch(file(), /vx_rule_1/);
+  });
+  await step("a new page is created in a room, marked added, takes a block, and is removed and undone (#88)", async () => {
+    await page.evaluate(() => editGoNewest());
+    await settled();
+    const send = async (act, what) => {
+      const n = edits.length;
+      await act();
+      await until(() => edits.length > n && statuses[n] !== undefined, what);
+      assert.equal(statuses[n], 200, what);
+      await settled();
+      return edits[n].ops;
+    };
+    const file = join(dir, "pages", "vislox", "kueche-logik.loxl");
+    const neu = () => page.evaluate(() => S.view?.pages.find((p) => p.title === "Küche Logik")?.uuid || null);
+    // New page, next to the tabs: the base's rooms (the server's list), a title the config has not.
+    await page.waitForSelector("#btn-new-page:not(.hidden):not([disabled])");
+    await page.click("#btn-new-page");
+    await page.waitForSelector("#newpage:not(.hidden) #np-title");
+    assert.deepEqual(await page.$$eval("#np-room option", (o) => o.map((x) => x.textContent)), ["Pick a room…", "Bad", "Küche"]);
+    await page.fill("#np-title", "Obergeschoss");
+    await page.click('#np-body [data-np="add"]');
+    await page.waitForSelector('#np-title[aria-invalid="true"]');
+    assert.match(await page.textContent("#np-body"), /A page has this title already/);
+    assert.match(await page.textContent("#np-body"), /lox needs a room/);
+    await page.fill("#np-title", "Küche Logik");
+    await page.selectOption("#np-room", "Küche");
+    let ops = await send(() => page.click('#np-body [data-np="add"]'), "the new page");
+    assert.deepEqual(ops, [{ op: "new_page", title: "Küche Logik", room: "Küche" }]);
+    assert.equal(await page.isVisible("#newpage"), false);
+    assert.ok(readFileSync(file, "utf8").endsWith('page "Küche Logik" (room: "Küche")\n'), readFileSync(file, "utf8"));
+    // Shown: its tab, marked added, and the page itself.
+    const made = await neu();
+    assert.ok(made, "the new page is in the view");
+    await page.waitForFunction((u) => S.page === u, made, { timeout: 10000 });
+    await page.waitForSelector(`#tab-list .tab.added[data-uuid="${made}"][aria-selected="true"]`);
+    await waitText("#deploy-pend", /1 page created here/);
+    // Remove page is offered on it; Add block puts a block on it, into the same file.
+    await page.waitForSelector("#btn-remove-page:not(.hidden):not([disabled])");
+    await page.click("#btn-add-block");
+    await page.fill("#ab-q", "monofl");
+    await page.press("#ab-q", "Enter");
+    await page.waitForSelector('#ab-body [data-ab-field="title"]');
+    await page.fill('#ab-body [data-ab-field="title"]', "Neu");
+    ops = await send(() => page.press('#ab-body [data-ab-field="title"]', "Enter"), "a block on the new page");
+    assert.deepEqual(ops, [{ op: "add_block", page: made, type: "Monoflop", title: "Neu", params: {}, settings: {} }]);
+    await page.waitForFunction(() => S.view?.objects[S.sel]?.title === "Neu", null, { timeout: 10000 });
+    assert.equal(await page.evaluate(() => S.objPage.get(S.sel)), made);
+    const text = readFileSync(file, "utf8");
+    assert.match(text, new RegExp(`^# page uuid: ${made}$`, "m"));
+    assert.match(text, /^page "Küche Logik" \(room: "Küche"\)\n\nvx_monoflop_\d+ = Monoflop\("Neu"\)$/m);
+    // Not removed while it holds the block: the server says why.
+    await page.waitForFunction(() => document.querySelector("#btn-remove-page")?.disabled && /still has what vislox added/.test(document.querySelector("#btn-remove-page").title), null, { timeout: 10000 });
+    // The block undone, the page is removed: its file goes, and the tab.
+    ops = await undoKey(false, () => !Object.values(S.view.objects).some((o) => o.title === "Neu" && o.status !== "removed"));
+    assert.equal(ops[0].op, "remove_block");
+    await page.waitForSelector("#btn-remove-page:not(.hidden):not([disabled])");
+    ops = await send(() => page.click("#btn-remove-page"), "remove the page");
+    assert.deepEqual(ops, [{ op: "remove_page", page: made }]);
+    await page.waitForFunction((u) => !S.view.pages.some((p) => p.uuid === u), made, { timeout: 10000 });
+    assert.equal(existsSync(file), false);
+    await page.waitForFunction(() => !/page created here/.test(document.querySelector("#deploy-pend")?.textContent || ""));
+    // Undone: created again under a new UUID; redone: the history follows it and takes that one out.
+    ops = await undoKey(false, () => S.view.pages.some((p) => p.title === "Küche Logik"));
+    assert.deepEqual(ops, [{ op: "new_page", title: "Küche Logik", room: "Küche", restores: made }]);
+    const again = await neu();
+    assert.ok(again && again !== made, again);
+    ops = await undoKey(true, () => !S.view.pages.some((p) => p.title === "Küche Logik"));
+    assert.deepEqual(ops, [{ op: "remove_page", page: again }]);
+    assert.equal(existsSync(file), false);
   });
   await step("nothing was deployed: lox only compiled, checked, linted and tested", async () => {
     const ran = readFileSync(calls, "utf8").trim().split("\n");
