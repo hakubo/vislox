@@ -168,6 +168,7 @@ fn needs_module_names(ops: &[edit::Op]) -> bool {
             o,
             edit::Op::AddBlock { .. }
                 | edit::Op::Let { .. }
+                | edit::Op::Defaults { .. }
                 | edit::Op::Expr { value: Some(_), .. }
                 | edit::Op::Signal { .. }
                 | edit::Op::Instance { .. }
@@ -2205,6 +2206,22 @@ impl Actions {
                              library: {e}"
                         )));
                     }
+                    // Nor is a constant of the module's own files changed, nor a
+                    // default made, while it does not read (#81).
+                    if let Some(what) = req.ops.iter().find_map(|o| match o {
+                        edit::Op::Let { name, .. }
+                            if !files.claims.8.contains_key(name.trim())
+                                && !name.trim().starts_with("vx_") =>
+                        {
+                            Some(format!("`{}`", name.trim()))
+                        }
+                        edit::Op::Defaults { ty, .. } => Some(format!("`defaults {ty}`")),
+                        _ => None,
+                    }) {
+                        return Err(bad(format!(
+                            "the module does not read, so {what} cannot be changed: {e}"
+                        )));
+                    }
                     // Nor can a new rule's name be told from the module's (#87).
                     if req
                         .ops
@@ -2298,6 +2315,47 @@ impl Actions {
                 }
             }
         }
+        // The module's own files, for a `let` or `defaults` value changed in
+        // them or a default made (#81): read from disk, as the edit compiles
+        // them.
+        let module_src = if req
+            .ops
+            .iter()
+            .any(|o| matches!(o, edit::Op::Let { .. } | edit::Op::Defaults { .. }))
+        {
+            let mut texts = std::collections::BTreeMap::new();
+            let mut linked = std::collections::BTreeMap::new();
+            let mut err = None;
+            edit::module_files(&p.module, &mut |f, _| {
+                if f.extension().is_some_and(|x| x == "loxl") && !f.starts_with(&dir_path) {
+                    let rel = f
+                        .strip_prefix(&p.root)
+                        .unwrap_or(f)
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    // Read through a link like lox does, but never written.
+                    if let Err(why) = crate::module_edit::plain_inside(&p.module, f) {
+                        linked.insert(rel.clone(), why);
+                    }
+                    match std::fs::read_to_string(f) {
+                        Ok(t) => {
+                            texts.insert(rel, t);
+                        }
+                        Err(e) => err = Some(format!("cannot read {rel}: {e}")),
+                    }
+                }
+            });
+            if let Some(e) = err {
+                return Err(fail(e));
+            }
+            crate::module_edit::ModuleSrc {
+                dir: shown.replace('\\', "/"),
+                texts,
+                linked,
+            }
+        } else {
+            Default::default()
+        };
         let drawn = files.claims.1.clone();
         // Adopting (#72) is worked out on a scratch copy first: lox writes
         // there, and the ops move what it wrote into vislox's files.
@@ -2347,6 +2405,7 @@ impl Actions {
             page_adoptions: &prepared.pages,
             claimed: &claimed,
             templates: &templates,
+            module: &module_src,
         };
         // `removed` and `moved` lines lox needs no more go first: their slugs
         // are free. A request of `tidy` asks for that alone (#80).
@@ -2407,7 +2466,24 @@ impl Actions {
         // Discard puts the lock and out back as they were before vislox's
         // first edit, where the last commit does not have them.
         snapshot_before_edit(dir, &p).await;
-        let mut undo = Undo::new(&dir_path, old.clone(), &[&p.lock, &p.out]);
+        // The module's own files the request rewrites (#81), put back with
+        // the rest; the lock and out last.
+        let rewritten: Vec<PathBuf> = files.module.keys().map(|k| p.root.join(k)).collect();
+        // Never through a link, nor put back through one on failure.
+        for path in &rewritten {
+            crate::module_edit::plain_inside(&p.module, path).map_err(bad)?;
+        }
+        let mut saved: Vec<&Path> = rewritten.iter().map(PathBuf::as_path).collect();
+        saved.extend([p.lock.as_path(), p.out.as_path()]);
+        let mut undo = Undo::new(&dir_path, old.clone(), &saved);
+        // Checked again right before: a plain file inside the module, never
+        // through a link (#81).
+        for (k, text) in &files.module {
+            let path = p.root.join(k);
+            if std::fs::read_to_string(&path).ok().as_deref() != Some(text.as_str()) {
+                crate::module_edit::write_inside(&p.module, &path, text).map_err(bad)?;
+            }
+        }
         std::fs::create_dir_all(&dir_path)
             .map_err(|e| fail(format!("cannot create {shown}: {e}")))?;
         for (name, text) in &new {
@@ -2742,6 +2818,70 @@ impl Actions {
         }
         undo_into(&mut r, edit::undo_ops(&req.ops, &previous, &minted));
         Ok(r)
+    }
+
+    /// What a default of `ty`'s port `key` (a connector key) reaches (#81),
+    /// in the module as it is on disk: the managed blocks of the type that do
+    /// not bind the port (`blocks`, which the `defaults` op names), the
+    /// statement a change goes to (`statement`: the module's own or vislox's,
+    /// null for a new one in vislox's file) and why vislox would refuse it
+    /// (`refusal`, null when it would not). Changes nothing.
+    pub fn defaults_reach(&self, ty: &str, key: &str) -> Result<Value, Refusal> {
+        use axum::http::StatusCode;
+        let bad = |e: String| (StatusCode::UNPROCESSABLE_ENTITY, e);
+        let dir = self
+            .s
+            .project
+            .as_deref()
+            .ok_or_else(|| bad("no lox.toml project: nothing is edited".into()))?;
+        let p = loxone_config::Project::load(&dir.join("lox.toml"))
+            .map_err(|e| bad(format!("cannot read lox.toml: {e}")))?;
+        let (ty, key) = (ty.trim(), key.trim());
+        let port = crate::module_edit::default_port(ty, key).map_err(bad)?;
+        let texts = {
+            let mut m = self.module_files.lock().unwrap();
+            m.refresh(&p.root, &p.module);
+            m.texts()
+        };
+        let lock = edit::Lock::read(&p.lock);
+        let mine = {
+            let d = p.module.join(edit::DIR);
+            format!(
+                "{}/",
+                d.strip_prefix(&p.root)
+                    .unwrap_or(&d)
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            )
+        };
+        let src = crate::constants::Source::new(&texts);
+        let blocks = src.reach(&lock, ty, &port).map_err(|e| {
+            bad(format!(
+                "the module does not read, so the blocks a default changes are not known: {e}"
+            ))
+        })?;
+        let c =
+            crate::constants::constants_with(&texts, &lock, |f| f.starts_with(&mine), Some(&src));
+        let stmt = c.defaults.iter().find(|d| d.ty == ty);
+        let refusal = match stmt {
+            Some(d) if !d.ours && !d.params.contains_key(&port) => Some(format!(
+                "`defaults {ty}` in {} has no {port}: vislox changes a value it has, it never adds \
+                 one; add it there",
+                d.file
+            )),
+            _ => None,
+        };
+        Ok(json!({
+            "type": ty,
+            "port": port,
+            "key": key,
+            "statement": stmt.map(|d| json!({
+                "file": d.file, "line": d.line, "ours": d.ours, "source": d.source,
+                "value": d.params.get(&port),
+            })),
+            "blocks": blocks,
+            "refusal": refusal,
+        }))
     }
 
     /// Refuse when the module holds changes that are not compiled into the
@@ -3370,7 +3510,7 @@ impl Actions {
         pending: Option<Arc<Vec<u8>>>,
     ) -> Value {
         let off = || {
-            let mut v = json!({ "available": false, "reason": state.why, "claims": [], "managed": [], "sources": {}, "set_claims": [], "members_claims": [], "rule_claims": [], "rule_edit": null, "constants": { "lets": [], "defaults": [], "uses": {} }, "expressions": [], "templates": { "templates": [], "instances": [], "library": [] }, "set_kinds": {} });
+            let mut v = json!({ "available": false, "reason": state.why, "claims": [], "managed": [], "sources": {}, "set_claims": [], "members_claims": [], "rule_claims": [], "rule_edit": null, "constants": { "lets": [], "defaults": [], "uses": {}, "pending": [] }, "expressions": [], "templates": { "templates": [], "instances": [], "library": [] }, "set_kinds": {} });
             for k in crate::set_claim::KINDS {
                 for (key, _) in k.edits_section(
                     &Default::default(),
@@ -3530,7 +3670,11 @@ impl Actions {
         // The module's `let` constants and `defaults`, and the ports that take
         // their values from one (#81).
         let mine = format!("{rel_dir}/");
-        let constants = crate::constants::constants(&texts, &lock, |f| f.starts_with(&mine));
+        // Parsed once for the constants, what each default reaches and what is
+        // pending; each type a default names is expanded once.
+        let src = crate::constants::Source::new(&texts);
+        let constants =
+            crate::constants::constants_with(&texts, &lock, |f| f.starts_with(&mine), Some(&src));
         // The module's expressions and named signals, their blocks and what the
         // deployed revision had (#82). A signal of vislox's carries the ops that
         // revert it to the deployed revision's files: first each input it feeds
@@ -3604,6 +3748,23 @@ impl Actions {
                 }
             }
             None => None,
+        };
+        // The module's `let` and `defaults` values that are not the deployed
+        // revision's (#81), compared by value; vislox's own constants are
+        // `claims`. Without a deployed commit, none is known to differ.
+        let constants_pending = match &deployed_texts {
+            Some(was_texts) => {
+                // The deployed files are named from the repository's top: a
+                // default of vislox's is in its file of claims there too.
+                let was = crate::constants::constants_with(
+                    was_texts,
+                    &lock,
+                    |f| f == rel || f.ends_with(&format!("/{rel}")),
+                    None,
+                );
+                crate::constants::pending(&constants, &was, &src, &lock)
+            }
+            None => Vec::new(),
         };
         let mut templates = crate::templates::read(&texts, &lock, |f| f.starts_with(&mine));
         crate::templates::compare(&mut templates, deployed_texts.as_deref());
@@ -3810,6 +3971,7 @@ impl Actions {
                 page_adoptions: &none_p,
                 claimed: &Default::default(),
                 templates: &Default::default(),
+                module: &Default::default(),
             };
             for b in blocks.iter_mut().filter(|b| b["adopted"] == true) {
                 let Some(u) = b["uuid"].as_str().map(String::from) else {
@@ -3851,6 +4013,7 @@ impl Actions {
                 page_adoptions: &none_p,
                 claimed: &Default::default(),
                 templates: &Default::default(),
+                module: &Default::default(),
             };
             let uuids: Vec<String> = blocks
                 .iter()
@@ -3875,7 +4038,12 @@ impl Actions {
             "members_claims": members_claims,
             "rule_claims": rule_claims,
             "rule_edit": rule_edit,
-            "constants": constants,
+            "constants": {
+                "lets": constants.lets,
+                "defaults": constants.defaults,
+                "uses": constants.uses,
+                "pending": constants_pending,
+            },
             "expressions": expressions,
             "templates": templates,
             "set_kinds": set_kinds,
@@ -5051,6 +5219,7 @@ fi
                 &req(vec![edit::Op::Let {
                     name: "vx_a".into(),
                     value: Some("5".into()),
+                    source: None,
                 }]),
                 None,
             )
@@ -5098,6 +5267,190 @@ fi
             .unwrap_err();
         assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "{msg}");
         assert!(msg.contains("the module does not read: main.loxl"), "{msg}");
+    }
+
+    /// The module's own constant (#81): rewritten on disk, one value and
+    /// nothing else; refused on a stale line and put back when the compile
+    /// fails, changing nothing; listed as pending with its revert; undone to
+    /// the exact old bytes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_module_constant_is_rewritten_on_disk_and_undone_byte_for_byte() {
+        use axum::http::StatusCode;
+        let (tmp, a) = project_for_edits();
+        let d = tmp.path().join("project");
+        let main = d.join("pages/main.loxl");
+        let text = format!(
+            "# Das Haus\nlet t  = 4   # vier\n\nextern teiler = Div(uuid: \"{DIV}\")\nteiler.In2 = t\n"
+        );
+        std::fs::write(&main, &text).unwrap();
+        // The deployed revision's files have it too.
+        sh(&d, "git add -A && git commit -q --amend --no-edit");
+        let req = |ops: Vec<edit::Op>| edit::Request {
+            base: blob(&d, "out.Loxone"),
+            ops,
+        };
+        let let_t = |v: &str, source: &str| edit::Op::Let {
+            name: "t".into(),
+            value: Some(v.into()),
+            source: Some(source.into()),
+        };
+        let line = "let t  = 4   # vier";
+        // GET /api/edits names the line the op names.
+        let e = edits_of(&a, &d).await;
+        assert_eq!(e["constants"]["lets"][0]["source"], line, "{e}");
+        assert_eq!(e["constants"]["pending"], json!([]), "{e}");
+        // The extern's binding takes no value of the block's own: the server says why.
+        assert!(
+            e["constants"]["uses"][DIV]["Input2"]["block_refusal"]
+                .as_str()
+                .is_some_and(|w| w.contains("pages/main.loxl:5")),
+            "{e}"
+        );
+        // A stale line: refused, nothing written.
+        let (code, msg) = a
+            .edit(&req(vec![let_t("8", "let t = 4")]), None)
+            .await
+            .unwrap_err();
+        assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "{msg}");
+        assert!(msg.contains("changed since this page showed it"), "{msg}");
+        assert_eq!(std::fs::read_to_string(&main).unwrap(), text);
+        // A compile that fails puts the module's file back.
+        let (_, msg) = a
+            .edit(
+                &req(vec![
+                    let_t("8", line),
+                    edit::Op::Title {
+                        uuid: DIV.into(),
+                        value: Some("refuse".into()),
+                    },
+                ]),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(msg.contains("refused"), "{msg}");
+        assert_eq!(std::fs::read_to_string(&main).unwrap(), text);
+        // Changed: that value, every other byte as it was.
+        let r = a.edit(&req(vec![let_t("8", line)]), None).await.unwrap();
+        let changed = text.replace("let t  = 4   #", "let t  = 8   #");
+        assert_eq!(std::fs::read_to_string(&main).unwrap(), changed);
+        assert!(!d.join("pages/vislox").exists());
+        assert_eq!(
+            r["undo"],
+            json!([{ "op": "let", "name": "t", "value": "4", "source": "let t  = 8   # vier" }])
+        );
+        // Not deployed: listed with what puts the deployed value back.
+        let e = edits_of(&a, &d).await;
+        assert_eq!(
+            e["constants"]["pending"],
+            json!([{ "kind": "let", "name": "t", "value": "8", "deployed": "4", "file": "pages/main.loxl",
+                     "line": 2, "ours": false, "uses": 1, "blocks": [],
+                     "revert": { "op": "let", "name": "t", "value": "4", "source": "let t  = 8   # vier" } }]),
+            "{e}"
+        );
+        // A port the module's own file binds still takes no claim of vislox's.
+        let (_, msg) = a
+            .edit(
+                &req(vec![edit::Op::Param {
+                    uuid: DIV.into(),
+                    port: "Input2".into(),
+                    value: Some("9".into()),
+                }]),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(msg.contains("bound in pages/main.loxl:5"), "{msg}");
+        // Undone: the exact old bytes; and redone.
+        let undo: Vec<edit::Op> = serde_json::from_value(r["undo"].clone()).unwrap();
+        let u = a.edit(&req(undo), None).await.unwrap();
+        assert_eq!(std::fs::read_to_string(&main).unwrap(), text);
+        let redo: Vec<edit::Op> = serde_json::from_value(u["undo"].clone()).unwrap();
+        a.edit(&req(redo), None).await.unwrap();
+        assert_eq!(std::fs::read_to_string(&main).unwrap(), changed);
+        // Discard takes the module's file back with the rest.
+        a.discard().await.unwrap();
+        assert_eq!(std::fs::read_to_string(&main).unwrap(), text);
+        // What a default of the Divide type would reach: no managed block.
+        let v = a.defaults_reach("Div", "Input2").unwrap();
+        assert_eq!(
+            v,
+            json!({ "type": "Div", "port": "In2", "key": "Input2", "statement": null, "blocks": [],
+                    "refusal": null })
+        );
+        // A module that does not read: refused with lox's error, nothing written.
+        std::fs::write(d.join("pages/kaputt.loxl"), "let = (\n").unwrap();
+        let (code, msg) = a
+            .edit(&req(vec![let_t("8", line)]), None)
+            .await
+            .unwrap_err();
+        assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "{msg}");
+        assert!(
+            msg.contains("the module does not read, so `t` cannot be changed: kaputt.loxl"),
+            "{msg}"
+        );
+        assert_eq!(std::fs::read_to_string(&main).unwrap(), text);
+    }
+
+    /// A file of the module's own reached through a symbolic link (#81): a
+    /// linked directory or a linked file is read, never written, and the file
+    /// outside the module keeps its bytes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_module_constant_behind_a_symbolic_link_is_never_written() {
+        let (tmp, a) = project_for_edits();
+        let d = tmp.path().join("project");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(outside.join("shared")).unwrap();
+        let dir_text = "let geteilt = 4 # outside\n";
+        let file_text = "let verlinkt = 7\n";
+        std::fs::write(outside.join("shared/werte.loxl"), dir_text).unwrap();
+        std::fs::write(outside.join("datei.loxl"), file_text).unwrap();
+        std::os::unix::fs::symlink(outside.join("shared"), d.join("pages/shared")).unwrap();
+        std::os::unix::fs::symlink(outside.join("datei.loxl"), d.join("pages/datei.loxl")).unwrap();
+        sh(&d, "git add -A && git commit -q --amend --no-edit");
+        let req = |name: &str, line: &str| edit::Request {
+            base: blob(&d, "out.Loxone"),
+            ops: vec![edit::Op::Let {
+                name: name.into(),
+                value: Some("9".into()),
+                source: Some(line.into()),
+            }],
+        };
+        for (name, line, path) in [
+            ("geteilt", "let geteilt = 4 # outside", "pages/shared"),
+            ("verlinkt", "let verlinkt = 7", "pages/datei.loxl"),
+        ] {
+            let (_, msg) = a.edit(&req(name, line), None).await.unwrap_err();
+            assert!(msg.contains("symbolic link") && msg.contains(path), "{msg}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(outside.join("shared/werte.loxl")).unwrap(),
+            dir_text
+        );
+        assert_eq!(
+            std::fs::read_to_string(outside.join("datei.loxl")).unwrap(),
+            file_text
+        );
+        // And the check itself: a plain file passes, either link does not.
+        std::fs::write(d.join("pages/eigen.loxl"), "let e = 1\n").unwrap();
+        let module = d.join("pages");
+        crate::module_edit::plain_inside(&module, &module.join("eigen.loxl")).unwrap();
+        for f in ["shared/werte.loxl", "datei.loxl"] {
+            assert!(
+                crate::module_edit::plain_inside(&module, &module.join(f)).is_err(),
+                "{f}"
+            );
+            assert!(
+                crate::module_edit::write_inside(&module, &module.join(f), "x").is_err(),
+                "{f}"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(outside.join("datei.loxl")).unwrap(),
+            file_text
+        );
     }
 
     #[cfg(unix)]
@@ -6634,7 +6987,8 @@ esac
         let e = edits_of(&a, &d).await;
         assert_eq!(
             e["constants"]["lets"],
-            json!([{ "name": "teilung", "value": "4", "file": "pages/main.loxl", "line": 2, "uses": 1, "ours": false }]),
+            json!([{ "name": "teilung", "value": "4", "file": "pages/main.loxl", "line": 2, "uses": 1, "ours": false,
+                     "source": "let teilung = 4" }]),
             "{e}"
         );
         assert_eq!(

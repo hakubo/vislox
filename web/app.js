@@ -1139,8 +1139,8 @@ function calTip(cal) {
 const propRow = (k, v, cls, tip) => `<div class="pr ${cls || ""}"><div class="k${tip ? " hinted" : ""}"${tip ? ` title="${esc(tip)}"` : ""}>${esc(k)}</div><div class="v">${v}</div></div>`;
 function renderProps() {
   // Live values re-render Properties often: keep the edit field being typed in.
-  const f = document.activeElement?.closest?.("#props [data-ed-field], #props [data-sch-field], #props [data-mo-field], #props [data-mo-name], #props [data-ex-field], #props [data-tp-field], #props [data-ru-field]");
-  const attr = ["data-ed-field", "data-sch-field", "data-mo-field", "data-mo-name", "data-ex-field", "data-tp-field", "data-ru-field"].find((a) => f?.hasAttribute(a));
+  const f = document.activeElement?.closest?.("#props [data-ed-field], #props [data-sch-field], #props [data-mo-field], #props [data-mo-name], #props [data-ex-field], #props [data-tp-field], #props [data-ru-field], #props [data-dflt-field]");
+  const attr = ["data-ed-field", "data-sch-field", "data-mo-field", "data-mo-name", "data-ex-field", "data-tp-field", "data-ru-field", "data-dflt-field"].find((a) => f?.hasAttribute(a));
   const keep = f && { field: f.getAttribute(attr), a: f.selectionStart, b: f.selectionEnd };
   renderPropsBody();
   if (keep) {
@@ -1278,7 +1278,10 @@ function renderPropsBody() {
   // From a `let` constant or a `defaults` statement (#81): `28 (temp_schwelle)`.
   const constOf = (q) => { const u = constUse(o.uuid, q.key); return u ? ` <span class="const-of" title="${esc(constTip(u))}">(${esc(constName(u))})</span>` : ""; };
   const params = o.ports.filter((q) => q.def != null || q.def_changed || q.inv)
-    .map((q) => row(q.name + (q.inv ? " (inverted)" : ""), chg(q.old_def_text ?? q.old_def, q.def_text ?? q.def, q.def_changed) + constOf(q), marks && q.def_changed ? "pr-chg" : ""));
+    .map((q) => row(q.name + (q.inv ? " (inverted)" : ""), chg(q.old_def_text ?? q.old_def, q.def_text ?? q.def, q.def_changed) + constOf(q) + dfltButton(o, q), marks && q.def_changed ? "pr-chg" : ""));
+  // The module's `let` and `defaults` values this block takes that are not deployed, and a default being made or
+  // changed (#81).
+  params.push(...constPendingRows(o, row), ...dfltRows(o));
   section("Parameters", params, params.length);
   const sets = settingsRows(o, row, marks, chg);
   if (sets) section("Settings", sets.rows, sets.count);
@@ -1352,6 +1355,8 @@ $("props").addEventListener("keydown", (e) => {
   if (xf && e.key === "Enter") { e.preventDefault(); exAct(xf.dataset.exEnter, xf.dataset.id); return; }
   const f = e.target.closest("[data-ed-field]");
   // In a program (#79) Enter is a line break; Ctrl+Enter (⌘ on a Mac) saves.
+  if (e.target.id === "dflt-v" && e.key === "Enter") { e.preventDefault(); dfltSave(); return; }
+  if (e.target.id === "dflt-v" && e.key === "Escape") { e.preventDefault(); e.stopPropagation(); dfltClose(); return; }
   if (f && e.key === "Enter" && (f.tagName !== "TEXTAREA" || e.ctrlKey || e.metaKey)) { e.preventDefault(); editSave(); return; }
   if (f && e.key === "Escape") { e.preventDefault(); e.stopPropagation(); editClose(); return; }
   const i = e.target.closest(".op input");
@@ -1361,6 +1366,7 @@ $("props").addEventListener("toggle", (e) => { if (e.target.classList?.contains(
 $("props").addEventListener("input", (e) => {
   if (e.target.dataset.exField) { exSync(); S.ex.draft[e.target.dataset.exField] = e.target.value; return; }
   if (e.target.id === "ad-slug") { AD.slug = e.target.value; return; }
+  if (e.target.dataset.dfltField) { DF.value = e.target.value; DF.err = ""; return; }
   if (e.target.id === "rn-slug") { RN.slug = e.target.value; return; }
   if (e.target.dataset.edScope && S.edit.uuid === S.sel) { (S.edit.scope ||= {})[e.target.dataset.edScope] = e.target.value; return; }
   const f = e.target.closest("[data-ed-field]");
@@ -1371,6 +1377,15 @@ $("props").addEventListener("input", (e) => {
 $("props").addEventListener("click", (e) => {
   const xb = e.target.closest("[data-ex]");
   if (xb) { exAct(xb.dataset.ex, xb.dataset.id); return; }
+  const db = e.target.closest("[data-dflt]");
+  if (db) {
+    const what = db.dataset.dflt;
+    if (what === "open") dfltOpen(db.dataset.key);
+    else if (what === "save") dfltSave();
+    else if (what === "cancel") dfltClose();
+    else if (what === "revert") dfltRevert(db.dataset.key);
+    return;
+  }
   const eb = e.target.closest("[data-ed]");
   if (eb) {
     const what = eb.dataset.ed;
@@ -2306,6 +2321,11 @@ function editsHere() {
   if (accessPending().length) parts.push(`access to ${accessPending().length} NFC Code Touch${accessPending().length === 1 ? "" : "es"} edited here`);
   if (accessPending("recipients").length) parts.push(`recipients of ${plural(accessPending("recipients").length, "push notification")} edited here`);
   if (tilesPending().length) parts.push(`tiles of ${tilesPending().length === 1 ? "1 Touch Pure Flex" : `${tilesPending().length} Touch Pure Flex devices`} edited here`);
+  // The module's constants and defaults (#81): a default names the blocks it changes.
+  for (const p of constPending()) {
+    parts.push(p.kind === "let" ? `the constant ${p.name} (${plural(p.uses, "use")})`
+      : `the default ${p.name} ${p.port}, which changes ${plural(p.blocks.length, "block")} (${dfltList(p.blocks)})`);
+  }
   const drawn = editsWires().filter((w) => w.now).length, out = editsWires().length - drawn;
   if (drawn) parts.push(`${plural(drawn, "wire")} drawn here`);
   if (out) parts.push(`${plural(out, "wire")} taken out here`);
@@ -2768,7 +2788,7 @@ async function confirmApply(pend, plan) {
   const src = !plan && S.check?.available && S.check.ok && S.check.stale;
   const srcText = src ? `⚠ The pending revision is from before the latest edit to ${src.files?.length ? src.files.join(", ") : "the module"}. ` +
     "lox config push compiles the module as it is, so Apply deploys changes this review does not show. Compile first to review them.\n\n" : "";
-  return window.confirm((stale ? `⚠ ${stale} Applying overwrites what changed there since.\n\n` : "") + srcText + rights + sched +
+  return window.confirm((stale ? `⚠ ${stale} Applying overwrites what changed there since.\n\n` : "") + srcText + rights + sched + constApplyText() +
     calApplyWarning(calNow) + hwApplyText(hw) +
     (plan ? `Deploy "${pend.label}" to the Miniserver, with the removals you confirmed?\n\nvislox compiles exactly this program into the project (it refuses if anything changed since), ` +
       "then the tests must pass (lox logic test). "
@@ -3947,11 +3967,22 @@ function constTip(u) {
     ? `From the constant ${u.name} = ${u.value}${at ? ` (${at})` : ""}, which ${plural(constCount(u), "port")} take. lox writes its value into each one.`
     : `From defaults ${u.name}${at ? ` (${at})` : ""}: every block of the type that does not bind the port takes it${u.constant ? `, here the constant ${u.constant} = ${u.value}` : ""}.`;
 }
-/** Whether the module's own file binds this field's port to a constant (`x.Port = name`): changed there. */
-function constLocked(o, field) {
+/** Why *Only this block* is off for this field (the module's own file binds the port to a constant, `x.Port = name`:
+ *  a value of the block's own would claim it twice), as the server says; or null. */
+function constBlockRefusal(o, field) {
   const [k, key] = field.split(/:(.*)/s);
   const u = k === "p" ? constUse(o.uuid, key) : null;
-  return !!u && u.kind === "let" && !u.at_ours;
+  return u?.block_refusal || null;
+}
+/** The module's own `let` the server lists, with its line as the file has it (`source`). */
+function constLetOf(name) { return constLets().find((l) => l.name === name) || null; }
+/** Why this field takes no value at all: the server refuses both the constant (a text constant) and only this block
+ *  (the module's own file binds the port); or null. */
+function constAllRefused(o, field) {
+  const [k, key] = field.split(/:(.*)/s);
+  const u = k === "p" ? constUse(o.uuid, key) : null;
+  const l = u?.kind === "let" ? constLetOf(u.name) : null;
+  return l?.refusal && u.block_refusal ? `${l.refusal}; ${u.block_refusal}` : null;
 }
 /** The note and the choice under a field whose value a constant or default gives (#81). */
 function constFieldRows(o, field, mine, kind) {
@@ -3969,15 +4000,17 @@ function constFieldRows(o, field, mine, kind) {
   }
   const n = constCount(u), at = constAt(u.file, u.line);
   const from = `From <span class="mono">${esc(constName(u))}</span>${at ? ` (${esc(at)})` : ""}, ${plural(n, "use")}.`;
-  if (u.kind === "let" && u.ours) {
-    const scope = mine.scope?.[field] || "constant";
-    const radio = (v, label) => `<label class="const-scope"><input type="radio" name="${id}-scope" data-ed-scope="${esc(field)}" value="${v}"${scope === v ? " checked" : ""}${busy}> ${label}</label>`;
-    return `<div class="const-why">${from}</div>` + radio("constant", `Change the constant (${plural(n, "use")})`) + radio("block", "Only this block");
+  // A constant, vislox's or the module's own (#81): the constant (its line rewritten in the module's file), or only
+  // this block. The server says when this block cannot take a value of its own, and when the constant is not changed.
+  if (u.kind === "let") {
+    const l = constLetOf(u.name), whyConst = l?.refusal || null, whyBlock = u.block_refusal || null;
+    const scope = whyConst ? "block" : whyBlock ? "constant" : mine.scope?.[field] || "constant";
+    const radio = (v, label, why) => `<label class="const-scope"${why ? ` title="${esc(why)}"` : ""}><input type="radio" name="${id}-scope" data-ed-scope="${esc(field)}" value="${v}"${scope === v ? " checked" : ""}${busy || why ? " disabled" : ""}> ${label}</label>`;
+    const where = u.ours ? "" : ` vislox rewrites its value on ${esc(constAt(u.file, u.line))} and nothing else.`;
+    return `<div class="const-why">${from}${where}</div>` + radio("constant", `Change the constant (${plural(n, "use")})`, whyConst) +
+      radio("block", "Only this block", whyBlock) + (whyBlock ? `<div class="const-why">${esc(whyBlock)}</div>` : whyConst ? `<div class="const-why">${esc(whyConst)}</div>` : "");
   }
-  // Bound in the module's own file (`x.Port = name` on an extern): changed there, never claimed twice.
-  if (!u.at_ours) return `<div class="const-why">${from} Bound in ${esc(constAt(u.at_file, u.at_line))}: change it there; vislox writes only its own files.</div>`;
-  const own = u.kind === "let" ? "the constant is in the module's own file: change it there" : "the default is in the module's own file: change it there";
-  return `<div class="const-why">${from} Saving binds only this block's port; ${own}, vislox writes only its own files.</div>`;
+  return `<div class="const-why">${from} Saving binds only this block's port; <b>Default…</b> under Parameters changes the default for every block of the type.</div>`;
 }
 /** A constant: a number, or one with a unit (#79); the server checks that the port takes the unit. */
 const EDIT_QUANTITY = /^-?\d+(\.\d+)?(ms|s|min|h|%|K|°)?$/;
@@ -4055,9 +4088,9 @@ function editRows(o, row) {
     for (const [field, label, now, kind, unit, choices] of editFields(o)) {
       const v = mine.draft[field] ?? now, bad = mine.bad[field];
       const id = `ed-${field.replace(/[^\w-]/g, "_")}`;
-      // A port the module's own file binds to a constant (#81) is changed there.
-      const locked = constLocked(o, field);
-      const attrs = `id="${id}" data-ed-field="${esc(field)}"${bad ? ` aria-invalid="true" aria-describedby="${id}-e"` : ""}${mine.busy || locked ? " disabled" : ""}`;
+      // Neither the constant nor this block can take a value (the server's refusals, #81): read-only.
+      const locked = constAllRefused(o, field);
+      const attrs = `id="${id}" data-ed-field="${esc(field)}"${bad ? ` aria-invalid="true" aria-describedby="${id}-e"` : ""}${mine.busy || locked ? " disabled" : ""}${locked ? ` title="${esc(locked)}"` : ""}`;
       const input = kind === "Place" || kind === "Category"
         ? `<select ${attrs}>${editPlaces(kind).map(([t, n]) => `<option value="${esc(t)}"${t === v ? " selected" : ""}${n > 1 ? ' disabled title="Two of them have this title: rename one in Loxone Config to pick it"' : ""}>${esc(t)}</option>`).join("")}</select>`
         : kind === "choice" || kind === "on_off"
@@ -4098,19 +4131,22 @@ async function editSave() {
   const ops = [], bad = {}, added = !!editsBlock(o.uuid), lets = new Set(constLets().map((l) => l.name)), changed = new Map();
   for (const [field, , now, kind] of editFields(o)) {
     const v = S.edit.draft[field];
-    if (v == null || v === now || constLocked(o, field)) continue;
+    if (v == null || v === now || constAllRefused(o, field)) continue;
     const t = kind === "number" || kind === "quantity" || kind === "time" || kind === "duration" ? v.trim() : v;
     const [k, key] = field.split(/:(.*)/s);
     // A constant's name binds the port to it (#81).
     if (k === "p" && lets.has(t)) { ops.push({ op: "param", uuid: o.uuid, port: key, value: t }); continue; }
-    // A value of vislox's own constant changes the constant, unless only this block is to change.
+    // A value of a constant changes the constant (vislox's, or the module's own on its line, #81), unless only this
+    // block is to change; the server's reasons pick the scope where one of them is off.
     const u = k === "p" ? constUse(o.uuid, key) : null;
-    if (u?.kind === "let" && u.ours && (S.edit.scope?.[field] || "constant") === "constant") {
+    const l = u?.kind === "let" ? constLetOf(u.name) : null;
+    const scope = l?.refusal ? "block" : u?.block_refusal ? "constant" : S.edit.scope?.[field] || "constant";
+    if (u?.kind === "let" && scope === "constant") {
       if (!EDIT_QUANTITY.test(t) && !AB_TIME.test(t) && !/^(on|off)$/.test(t)) { bad[field] = "A number, one with its unit (30min, 70%), a time of day (19:00), or on or off."; continue; }
       // Two fields of one constant: one value, or say which differ.
       const was = changed.get(u.name);
       if (was && was.value !== t) { bad[field] = `${u.name} is ${was.value} in ${was.label}: give both the same value, or change one for this block only.`; continue; }
-      if (!was) ops.push({ op: "let", name: u.name, value: t });
+      if (!was) ops.push(u.ours ? { op: "let", name: u.name, value: t } : { op: "let", name: u.name, value: t, source: l?.source ?? "" });
       changed.set(u.name, { value: t, label: portName(o, key) });
       continue;
     }
@@ -4185,6 +4221,141 @@ async function constMake() {
   else if (!EDIT_QUANTITY.test(value)) S.edit.bad[mk.field] = "A number, like 12 or -2.5, or one with its unit, like 30min.";
   if (S.edit.bad[mk.field]) { S.edit.err = "Fix the marked values."; renderProps(); return; }
   await editSend(o.uuid, st.rev, [{ op: "let", name, value }, { op: "param", uuid: o.uuid, port: key, value: name }]);
+}
+// ── the module's own `let` and `defaults` values, and defaults made here (#81) ─────────────
+// vislox rewrites one value of the module's own `let` or `defaults` line and nothing else, naming the line as the
+// server listed it (`source`): a file changed since is refused. A default changes every managed block of the type
+// that does not bind the port, the module's own among them, so *Default…* lists them first (GET /api/defaults) and
+// the op names exactly those blocks (`blocks`), as Apply's consent to removals does.
+const DF = { uuid: null, key: null, info: null, value: "", busy: false, err: "" };
+/** The module's values not deployed (`constants.pending`): a constant's, or a default's per port. */
+function constPending() { return managedShown() ? S.edits.constants?.pending || [] : []; }
+/** What names one of them across a refresh of the list: its kind, constant or type, and port. */
+function constPendingKey(p) { return [p.kind, p.name, p.port || ""].join("|"); }
+/** Whether edits can be sent now, on the newest config: `{ ok, rev }` or `{ why }`. */
+function constEditState() {
+  const a = S.hist?.actions, r = editRev();
+  if (!a?.shown || !a.edit?.available) return { why: `Editing is off${a?.edit?.reason ? `: ${a.edit.reason}` : ""}.` };
+  if (!r || S.rev !== r.id) return { why: "Edits are made on the newest config." };
+  if (a.running) return { why: `${a.running} is running.` };
+  if (UNDO.busy) return { why: "Undo or redo is compiling." };
+  return { ok: true, rev: r };
+}
+/** A block's title, else its slug, for the blocks a default reaches. */
+function dfltName(b) { const o = b.uuid && S.view?.objects[b.uuid]; return o ? displayTitle(o) : b.slug; }
+function dfltList(blocks) { return blocks.length ? blocks.map(dfltName).join(", ") : "none"; }
+/** *Default…* on a parameter of a managed block whose value no constant gives. */
+function dfltButton(o, q) {
+  if (!S.edits?.sources?.[o.uuid] || !constEditState().ok || DF.uuid === o.uuid && DF.key === q.key) return "";
+  const u = constUse(o.uuid, q.key);
+  if (u && u.kind !== "defaults") return "";
+  return ` <button type="button" class="lnk const-dflt-open" data-dflt="open" data-key="${esc(q.key)}" title="${u ? `Change defaults ${esc(u.name)} for every block of the type that takes it` : `Make this value the default of every ${esc(o.ty)} that does not set ${esc(q.name)} itself`}">Default…</button>`;
+}
+/** The pending values of the module's constants and defaults this block takes, each with Revert. */
+function constPendingRows(o, row) {
+  const rows = [], st = constEditState();
+  for (const p of constPending()) {
+    const takes = p.kind === "let" ? o.ports.some((q) => constLet(constUse(o.uuid, q.key)) === p.name)
+      : p.blocks.some((b) => ciEq(b.uuid, o.uuid));
+    if (!takes) continue;
+    const key = constPendingKey(p);
+    const what = p.kind === "let" ? `Constant ${p.name}` : `Default ${p.name} ${p.port}`;
+    const was = p.deployed == null ? "new, not deployed" : `deployed as ${p.deployed}`;
+    const reach = p.kind === "defaults" ? ` · changes ${plural(p.blocks.length, "block")}: ${dfltList(p.blocks)}` : ` · ${plural(p.uses, "use")}`;
+    const back = st.ok && p.revert ? `<button type="button" class="ed-btn small" data-dflt="revert" data-key="${esc(key)}" title="${p.deployed == null ? "Take the default out of vislox's file" : `Back to ${esc(p.deployed)}, as deployed`}">Revert</button>` : "";
+    rows.push(row(what, `<span class="ed-v">${esc(p.value ?? "(none)")}</span><span class="ed-tag" title="${esc(`${was}${reach}`)}">not deployed</span>${back}<div class="const-why">${esc(`${constAt(p.file, p.line)}${reach}`)}</div>`, "pr-chg"));
+  }
+  return rows;
+}
+/** The open *Default…* panel of this block. */
+function dfltRows(o) {
+  if (DF.uuid !== o.uuid) return [];
+  const q = o.ports.find((x) => x.key === DF.key), i = DF.info, busy = DF.busy || !constEditState().ok;
+  if (!q) return [];
+  const head = `<span class="mono">defaults ${esc(o.ty)}(${esc(i?.port || q.name)}: …)</span>`;
+  if (!i) return [`<div class="const-dflt" role="group" aria-label="Default">${head} <span class="const-why">${esc(DF.err || "Working out which blocks it changes…")}</span>${DF.err ? ' <button type="button" class="ed-btn small" data-dflt="cancel">Close</button>' : ""}</div>`];
+  const st = i.statement;
+  const where = st ? `${st.ours ? "vislox's statement" : "the module's own statement, rewritten on its line"} in ${constAt(st.file, st.line)}` : `a new statement in ${S.edits?.file || "vislox's file"}`;
+  const label = st && st.value != null ? `Change the default (${plural(i.blocks.length, "block")})` : `Make it the default (${plural(i.blocks.length, "block")})`;
+  return [`<div class="const-dflt" role="group" aria-label="Default">${head}` +
+    `<div class="const-why">${esc(`${where}. It changes every ${o.ty} that does not set ${i.port} itself, the module's own blocks among them: ${plural(i.blocks.length, "block")}: ${dfltList(i.blocks)}.`)}</div>` +
+    (i.refusal ? `<div class="const-why err">${esc(i.refusal)}</div>` : "") +
+    `<label for="dflt-v">Default</label><input id="dflt-v" class="num" data-dflt-field="value" value="${esc(DF.value)}" autocomplete="off" spellcheck="false"${busy || i.refusal ? " disabled" : ""}>` +
+    `<button type="button" class="primary small" data-dflt="save"${busy || i.refusal ? " disabled" : ""}>${DF.busy ? "Compiling…" : esc(label)}</button>` +
+    `<button type="button" class="ed-btn small" data-dflt="cancel"${DF.busy ? " disabled" : ""}>Cancel</button>` +
+    `<span class="ed-msg${DF.err ? " err" : ""}" role="status" aria-live="polite">${esc(DF.err || "Saving compiles the module; nothing is deployed.")}</span></div>`];
+}
+async function dfltOpen(key) {
+  const o = S.view?.objects[S.sel];
+  if (!o) return;
+  Object.assign(DF, { uuid: o.uuid, key, info: null, value: portNow(o, key), busy: false, err: "" });
+  renderProps();
+  try {
+    const i = await api(`/api/defaults?type=${encodeURIComponent(o.ty)}&port=${encodeURIComponent(key)}`);
+    if (DF.uuid !== o.uuid || DF.key !== key) return;
+    DF.info = i;
+    if (i.statement?.value != null) DF.value = i.statement.value;
+  } catch (err) {
+    if (DF.uuid === o.uuid && DF.key === key) DF.err = err.message;
+  }
+  renderProps();
+  $("dflt-v")?.focus();
+}
+function dfltClose() { if (DF.busy) return; Object.assign(DF, { uuid: null, key: null, info: null, busy: false, err: "" }); renderProps(); }
+async function dfltSend(ops, label) {
+  const st = constEditState();
+  if (!st.ok) { DF.err = st.why; renderProps(); return false; }
+  DF.busy = true; DF.err = ""; renderProps();
+  try {
+    const res = await editAct(st.rev.blob, ops, label);
+    await editShowNewest(res.blob);
+    return true;
+  } catch (err) {
+    DF.err = err.message;
+    return false;
+  } finally {
+    DF.busy = false;
+    renderProps();
+  }
+}
+async function dfltSave() {
+  const o = S.view?.objects[DF.uuid], i = DF.info;
+  if (!o || !i || DF.busy || i.refusal) return;
+  const value = DF.value.trim();
+  if (!value) { DF.err = "A value: a number, one with its unit (30min), on or off, or a constant's name."; renderProps(); return; }
+  const op = { op: "defaults", type: i.type, port: i.key, value, blocks: i.blocks.map((b) => b.slug) };
+  if (i.statement && !i.statement.ours) op.source = i.statement.source;
+  if (await dfltSend([op], `Default ${i.type} ${i.port} = ${value}`)) {
+    Object.assign(DF, { uuid: null, key: null, info: null });
+  } else if (/Confirm exactly these/.test(DF.err)) {
+    // The blocks it changes are no longer the ones listed: ask the server again and show them for consent.
+    const was = i.blocks.map((b) => b.slug).join(), uuid = DF.uuid, key = DF.key;
+    try {
+      const fresh = await api(`/api/defaults?type=${encodeURIComponent(i.type)}&port=${encodeURIComponent(i.key)}`);
+      if (DF.uuid === uuid && DF.key === key) {
+        DF.info = fresh;
+        DF.err = fresh.blocks.map((b) => b.slug).join() === was ? DF.err
+          : `The blocks it changes are not the ones listed before: now ${plural(fresh.blocks.length, "block")}: ${dfltList(fresh.blocks)}. Save again to confirm these.`;
+      }
+    } catch (err) {
+      DF.err = err.message;
+    }
+  }
+  renderProps();
+}
+async function dfltRevert(key) {
+  const p = constPending().find((x) => constPendingKey(x) === key);
+  if (!p?.revert) return;
+  await dfltSend([p.revert], p.kind === "let" ? `Revert the constant ${p.name}` : `Revert the default ${p.name} ${p.port}`);
+}
+/** Apply's review of the module's constants and defaults that change (#81): each, and the blocks a default changes. */
+function constApplyText() {
+  const p = constPending();
+  if (!p.length) return "";
+  const line = (x) => x.kind === "let"
+    ? `  • let ${x.name} = ${x.value} (was ${x.deployed ?? "none"}), ${constAt(x.file, x.line)}: ${plural(x.uses, "use")}`
+    : `  • defaults ${x.name}(${x.port}: ${x.value ?? "none"}) (was ${x.deployed ?? "none"}), ${constAt(x.file, x.line)}: changes ${plural(x.blocks.length, "block")}: ${dfltList(x.blocks)}`;
+  return `Constants and defaults that change (each sets every port that takes it):\n${p.map(line).join("\n")}\n\n`;
 }
 /** Back to the deployed value: claim what the deployed revision claimed, or nothing. */
 async function editRevert(key) {
@@ -6105,6 +6276,7 @@ function undoLabel(ops) {
   // Constants (#81): changed, made (and bound), dropped.
   if (op.op === "let" && ops.length === 1) return op.value == null ? `Drop the constant ${op.name}` : `Constant ${op.name}: ${op.value}`;
   if (op.op === "let" && ops.slice(1).every((o) => o.op === "param" && o.value === op.name)) return `Make the constant ${op.name} = ${op.value}`;
+  if (ops.length === 1 && op.op === "defaults") return op.value == null ? `Drop the default ${op.type} ${op.port}` : `Default ${op.type} ${op.port}: ${op.value}`;
   // Made when the op is made, and kept on its history entry: a deleted block is gone from the view afterwards.
   if (ops.length === 1 && op.op === "remove_block") { const b = editsBlock(op.uuid); return `${b?.deployed || b?.adopted ? "Delete" : "Remove"} ${obj(op.uuid)}`; }
   if (ops.length === 1 && op.op === "restore_block") {

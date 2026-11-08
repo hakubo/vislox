@@ -367,8 +367,12 @@ sends to the Miniserver see [miniserver.md](miniserver.md).
   revision, the Changes list puts the parameter changes one constant causes under it (`let vx_nachlauf = 45min · 2
   changes`). In *Edit values*, *Make a constant* names a field's value (`let vx_… = …` in vislox's file, the port
   bound to it); another block takes it by its name, typed into its field. Changing a value one of vislox's constants
-  gives asks: *Change the constant (N uses)* or *Only this block*. The module's own `let` and `defaults` lines are
-  changed in its files; vislox binds only the block. How: [editing.md](editing.md#constants-and-defaults-81).
+  gives asks: *Change the constant (N uses)* or *Only this block*; so does one of the module's own constants, whose
+  value vislox rewrites on its line and nothing else (refused when the line changed since the page showed it).
+  *Default…* on a managed block's parameter makes or changes a `defaults` statement: it lists every block the default
+  changes, the module's own among them, and the edit names exactly those. The Deploy pane and Apply's confirmation
+  name each changed constant and default with the blocks it changes. How:
+  [editing.md](editing.md#constants-and-defaults-81).
 
 - **Expressions and named signals** (the same project and token, #82): an expression of vislox's own files is
   edited in Properties' *Expression* section: its text, and *Name this expression*, which makes it a named signal of

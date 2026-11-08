@@ -508,6 +508,7 @@ mod tests {
                 page_adoptions: &Default::default(),
                 claimed: $claimed,
                 templates: &Default::default(),
+                module: &Default::default(),
             }
         };
     }

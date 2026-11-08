@@ -43,6 +43,11 @@ chrono-tz = "0.10"
 open = "5"
 socket2 = { version = "0.6", features = ["all"] }
 
+[target.'cfg(unix)'.dependencies]
+# O_NOFOLLOW: a file of the module's own that an edit rewrites (#81) is never
+# reached through a symbolic link.
+libc = "0.2"
+
 [profile.release]
 lto = "thin"
 
