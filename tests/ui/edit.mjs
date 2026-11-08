@@ -2906,8 +2906,8 @@ try {
     // The config is what it was: nothing pending.
     assert.equal(readFileSync(join(dir, "out.Loxone"), "utf8"), outWas);
     await waitText('[data-body="Lox Logic"]', /vx_nachlauf/);
-    // The line is done once compiled: the Deploy pane offers to drop it, and the drop is an edit of its own.
-    await waitText("#deploy-lines", /1 line of vislox's files lox needs no more\s*[\s\S]*moved vx_nach -> vx_nachlauf/);
+    // The line is done once compiled: the Deploy pane offers to remove it, and the removal is an edit of its own.
+    await waitText("#deploy-lines", /1 obsolete statement in vislox-managed files\s*[\s\S]*moved vx_nach -> vx_nachlauf/);
     n = edits.length;
     await page.click("#btn-tidy");
     await page.waitForFunction(() => !S.edits?.stale_lines?.length, null, { timeout: 20000 });

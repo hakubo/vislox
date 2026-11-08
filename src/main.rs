@@ -1,5 +1,6 @@
-//! vislox — a read-only, Loxone-Config-style view of the configs `lox` and
+//! vislox — a Loxone-Config-style view of the configs `lox` and
 //! `loxone-config` manage, with live reload, history and change review.
+//! Read-only by default, with optional editing and deployment.
 
 mod access_edit;
 mod actions;
@@ -77,8 +78,9 @@ use tokio::sync::broadcast;
 use tokio_stream::StreamExt as _;
 use tokio_stream::wrappers::BroadcastStream;
 
-/// Visualize a Loxone config the way Loxone Config draws it — read-only, live
-/// reloading, with history and changes marked for review.
+/// Visualize a Loxone config the way Loxone Config draws it — read-only by
+/// default, with optional editing and deployment; live reloading, with history
+/// and changes marked for review.
 #[derive(Parser, Debug)]
 #[command(version = VERSION, about)]
 struct Args {

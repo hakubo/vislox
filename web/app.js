@@ -1,5 +1,5 @@
 "use strict";
-// vislox — read-only Loxone Config style viewer.
+// vislox — Loxone Config style viewer: read-only by default, with optional editing and deployment.
 // Canvas coordinates are the config's own units: one port row is 192.
 
 const ROW = 192, LABEL_W = 2112, SVGNS = "http://www.w3.org/2000/svg";
@@ -2543,19 +2543,19 @@ function renderPush(a) {
     `<div class="ck-row"><button type="button" id="btn-push" class="ghost small"${why ? " disabled" : ""}
       title="${esc(why || "Check the commits not pushed yet for personal data again (lox logic scan), then git push")}">${a.running === "Push" ? "Pushing…" : "Push to git"}</button></div>`;
 }
-// ── lines lox needs no more (#80) ─────────────────────────────────────
+// ── obsolete statements (#80) ─────────────────────────────────────
 // A `removed` or `moved` line of vislox's files is done once the compile applied it (lox logic lint calls it
-// stale-lifecycle). The next edit drops it; this box offers to drop them now, as an edit of its own.
+// stale-lifecycle). The next edit removes it; this box offers to remove them now, as an edit of its own.
 function renderStaleLines(a) {
   const box = $("deploy-lines"), lines = S.edits?.stale_lines || [];
   const r = editRev(), shown = !!lines.length && !!r && S.rev === r.id && !!a.edit?.available;
   box.classList.toggle("hidden", !shown);
   if (!shown) { box.innerHTML = ""; return; }
   const why = a.running ? `${a.running} is running` : UNDO.busy || UNDO.inflight ? "An edit is compiling" : "";
-  box.innerHTML = `<div class="ck-h">${plural(lines.length, "line")} of vislox's files lox needs no more</div>` +
-    `<div class="ck-sub">The compile applied ${lines.length === 1 ? "it" : "them"} (lint: stale-lifecycle); the next edit drops ${lines.length === 1 ? "it" : "them"} too.</div>` +
+  box.innerHTML = `<div class="ck-h">${plural(lines.length, "obsolete statement")} in vislox-managed files</div>` +
+    `<div class="ck-sub">The compile applied ${lines.length === 1 ? "it" : "them"} (lint: stale-lifecycle); the next edit removes ${lines.length === 1 ? "it" : "them"} too.</div>` +
     `<ul class="ps-list">${lines.map((l) => `<li class="mono">${esc(l)}</li>`).join("")}</ul>` +
-    `<div class="ck-row"><button type="button" id="btn-tidy" class="ghost small"${why ? ` disabled title="${esc(why)}"` : ' title="Take the lines out of vislox\'s files and compile: the config does not change"'}>Drop ${lines.length === 1 ? "it" : "them"}</button></div>`;
+    `<div class="ck-row"><button type="button" id="btn-tidy" class="ghost small"${why ? ` disabled title="${esc(why)}"` : ' title="Take the obsolete statements out of vislox-managed files and compile: the config does not change"'}>Remove obsolete statements</button></div>`;
 }
 $("deploy-lines").addEventListener("click", async (e) => {
   if (!e.target.closest("#btn-tidy")) return;
@@ -2563,7 +2563,7 @@ $("deploy-lines").addEventListener("click", async (e) => {
   if (!r) return;
   deployMsg("");
   try {
-    const res = await editAct(r.blob, [{ op: "tidy" }], "Drop lines lox needs no more");
+    const res = await editAct(r.blob, [{ op: "tidy" }], "Remove obsolete statements");
     await editShowNewest(res.blob);
   } catch (err) { deployMsg(err.message, true); }
 });
@@ -3086,7 +3086,7 @@ async function rollBackAsk(r) {
   if (!window.confirm((stale ? `⚠ ${stale} Rolling back overwrites what changed there since.\n\n` : "") + rightsApplyText(hw) + sched +
     calApplyWarning(calNow) + hwApplyText(hw) +
     `Roll back "${plan.subject}"?\n\nThe Miniserver then runs what it ran before it (${plan.backup})` +
-    (plan.same_bytes ? "" : ", compiled again from the module of then") +
+    (plan.same_bytes ? "" : ", recompiled from the module version before that deployment") +
     (n == null ? "" : `: ${plural(n, "change")} from what it runs now, as the view shows`) +
     ". The module and lockfile go back to before it, so nothing is pending afterwards.\n\n" +
     "Whatever changed on the Miniserver since is lost: a save from Loxone Config stops the Roll back, and custom changes made in the app are deleted only if you allow it.\n\n" +
@@ -3580,7 +3580,7 @@ function renderLint() {
   box.classList.toggle("hidden", !l || (l.available && !list.length));
   box.classList.toggle("quiet", !!l?.unsupported);
   if (!l) { box.innerHTML = ""; return; }
-  if (l.unsupported) { box.innerHTML = `<div class="ck-sub">No lint findings: ${esc(l.reason || "this lox has no lox logic lint")}.</div>`; return; }
+  if (l.unsupported) { box.innerHTML = `<div class="ck-sub">Lint is unavailable: ${esc(l.reason || "this lox has no lox logic lint")}.</div>`; return; }
   if (!l.available) { box.innerHTML = `<div class="ck-h">Lint didn't run</div><div class="ck-sub">${esc(l.reason || "")}</div>`; return; }
   const open = box.querySelector("details")?.open ?? false;
   const kinds = [...new Set(list.map((f) => f.kind))];
@@ -6457,7 +6457,7 @@ function undoLabel(ops) {
   if (ops.length === 2 && op.op === "expr" && ops[1].op === "signal" && ops[1].value == null) return `Inline the signal ${ops[1].slug}`;
   // Template instances (#83).
   if (ops.length === 1 && op.op === "instance") return op.value == null ? `Remove the instance ${op.slug}` : `Instance ${op.slug}: ${op.value.template}`;
-  if (ops.length === 1 && op.op === "tidy") return "Drop lines lox needs no more";
+  if (ops.length === 1 && op.op === "tidy") return "Remove obsolete statements";
   if (kinds.size === 1 && op.op === "move") return ops.length === 1 ? `Move ${obj(op.uuid)}` : `Move ${plural(ops.length, "block")}`;
   if (ops.length === 1 && op.op === "relayout") return `Arrange ${S.pageOf?.get(op.page)?.title || "the page"}`;
   if (ops.length === 1 && op.op === "adopt") return op.blocks.length === 1 ? `Adopt ${obj(op.blocks[0].uuid)}` : `Adopt ${plural(op.blocks.length, "block")}`;
