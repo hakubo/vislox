@@ -227,11 +227,13 @@ published under the same version (see [docker/README.md](docker/README.md)).
   uncommitted save. A compile is compared with the deployed revision, not with the newest one.
 - A Discard that fails halfway puts back the git index too (#122): its `git checkout` had reset what was staged in
   the module, and the recovery put back only the files, ignored its own errors and said *Nothing was discarded*.
-  Discard now reads and copies the module, lock, out and the index (byte for byte) before it changes anything, and
-  refuses when it cannot (or while git holds `index.lock`). On a failed step it puts all of it back without
-  writing through a symbolic link, reads it again, and says *Nothing was discarded* only when everything is as it
-  was; otherwise it lists what is not, why, and where its copy is (in the git directory). Roll back's put-back
-  takes the same care and also lists what it could not put back.
+  Discard now reads the module, lock, out and the index (byte for byte, with a split index's shared file) before it
+  changes anything, and refuses when it cannot, when the lock, out or module is a symbolic link or reached through
+  one, or while git holds `index.lock`. On a failed step it writes the files back in place without following a
+  link, puts the index back only when nothing else staged meanwhile, reads it all again, and says *Nothing was
+  discarded* only when everything is as it was; otherwise it lists what is not, why, and where its copy is
+  (`vislox-recovery/` in the git directory, written only then). Roll back refuses a symbolic link where it writes,
+  puts its files back the same way, and lists what it could not.
 
 ## 0.2.0
 
