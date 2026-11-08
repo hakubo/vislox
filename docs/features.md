@@ -16,6 +16,21 @@ sends to the Miniserver see [miniserver.md](miniserver.md).
 - **Links between pages**: when a wire's far end is on another page, the port gets a reference bar with
   the far block, its port and its page. Click it to go to that page. Double-click a ref tag to go to the
   block it mirrors.
+- **Memory flags and their references** (#104): a memory flag (Loxone Config's *Merker*) is one object with a
+  write side (its input) and a read side (its outputs), and Loxone Config shows it by side: on its own page as a
+  tag for each side in use, and on other pages as an *output reference* (writes it) and an *input reference*
+  (reads it). vislox draws it that way. A tag's pill says the way through it: **→M** for the side the flag is
+  written through, **M→** for the side it is read through (a reference of a flag says the same: an output
+  reference **→M**, an input reference **M→**). A flag wired on both sides of a page is two tags, one at the input
+  and one at the outputs, with a gap between them; a flag wired on one side is one tag at that side; a flag wired
+  on neither is a plain **M** pill. A reference's own wire to the flag it shows is not drawn (it is plumbing; the
+  tag is the reference). A flag wired to a block on another page gets a link at that port, like any block.
+  Properties of a flag, an output reference of it or an input reference of it has *Memory flag*: **Written**
+  (the blocks wired to its input and the output references of it, each a link to the page) and **Read** (the
+  blocks wired to its outputs and the input references of it), or *nowhere: nothing sets it* / *nothing uses it*.
+  A reference's section also names the flag it *Writes* or *Reads* (a link). Live values: a flag passes on a value
+  only when one source sets it (a wire to its input, or an output reference, or both for one source); with two
+  sources it holds whichever wrote last, which no wire says, and shows no value unless the Miniserver streams it.
 - **Sidebar with the block's configuration**: the periphery and page tree (filter with Ctrl+F), and the
   selected block's properties: name, type, page, room, category, connections (each one a link),
   parameters and raw attributes.

@@ -11,3 +11,8 @@ mode on.
 input of its own, a Tree Extension with a Touch Tree (audible acknowledgement on, and a temperature input) and
 a Room Comfort Sensor Tree on its left branch, an AI Extension with one voltage input, and a DI Extension with
 one digital input. Its serials are made up.
+
+`memory.Loxone` is a third small synthetic config, for memory flags (#104): two pages, three memory flags and a
+reference to each of two of them. *Anwesend* is written on its page and read on the other through an input
+reference; *Alarm* is written from the other page by a wire and read nowhere; *Hilfsmerker* is written by an AND
+and by an output reference on the other page, and read by a NOT on its page (so it shows as two tags).

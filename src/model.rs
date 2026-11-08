@@ -222,6 +222,24 @@ pub struct Target {
     pub removed: bool,
 }
 
+/// A memory flag (Loxone Config's Merker) as the program uses it (#104). The flag is one object with
+/// a write side (its `Input`) and a read side (its `AQ`/`Q`); Loxone Config shows it on a page as a
+/// tag for each side in use, and shows the same flag on other pages as references: an `OutputRef`
+/// writes it, an `InputRef` reads it.
+#[derive(Serialize)]
+pub struct Flag {
+    /// The memory flag.
+    pub uuid: String,
+    pub title: String,
+    /// What the object asked about is to the flag: `flag` (it is the flag), `writes` (an
+    /// `OutputRef`) or `reads` (an `InputRef`).
+    pub role: &'static str,
+    /// Where it is written: the blocks wired to its input, and the references that write it.
+    pub written: Vec<Target>,
+    /// Where it is read: the blocks its outputs are wired to, and the references that read it.
+    pub read: Vec<Target>,
+}
+
 #[derive(Serialize)]
 pub struct ObjInfo {
     pub uuid: String,
@@ -254,6 +272,8 @@ pub struct ObjInfo {
     /// Ref tags that mirror this object: (page uuid, ref object uuid).
     pub mirrored_by: Vec<[String; 2]>,
     pub target: Option<Target>,
+    /// A memory flag, or a reference to one: where the flag is written and where it is read (#104).
+    pub flag: Option<Flag>,
     /// A calendar entry's date and operating mode, decoded.
     pub calendar: Option<CalInfo>,
     /// The switching times of a Daytimer, or of a block that holds one.
@@ -1177,8 +1197,13 @@ struct Ctx<'a> {
     /// port uuid → (owner uuid, key)
     port_owner: HashMap<String, (String, String)>,
     wires: Vec<WireView>,
-    /// ref target uuid → refs (page, ref uuid)
+    /// port uuid → the wires (indexes into `wires`) that end at it, and that start at it
+    wires_into: HashMap<String, Vec<usize>>,
+    wires_from: HashMap<String, Vec<usize>>,
+    /// ref target uuid (lower case: UUIDs compare without regard to case) → refs (page, ref uuid)
     mirrors: HashMap<String, Vec<[String; 2]>>,
+    /// lower-case uuid → uuid as the document spells it
+    lower: HashMap<String, String>,
     /// Document child order of each object, for the tree.
     order: Vec<String>,
     /// Ports with at least one wire.
@@ -1197,11 +1222,18 @@ impl<'a> Ctx<'a> {
             pages: Vec::new(),
             port_owner: HashMap::new(),
             wires: doc.wires(),
+            wires_into: HashMap::new(),
+            wires_from: HashMap::new(),
             mirrors: HashMap::new(),
+            lower: HashMap::new(),
             order: Vec::new(),
             wired: HashSet::new(),
             modes: HashMap::new(),
         };
+        for (i, w) in c.wires.iter().enumerate() {
+            c.wires_into.entry(w.to_port.clone()).or_default().push(i);
+            c.wires_from.entry(w.from_port.clone()).or_default().push(i);
+        }
         c.wired = c
             .wires
             .iter()
@@ -1218,6 +1250,9 @@ impl<'a> Ctx<'a> {
             };
             let ty = child.attr("Type").unwrap_or("");
             self.els.insert(uuid.to_string(), child);
+            self.lower
+                .entry(uuid.to_ascii_lowercase())
+                .or_insert_with(|| uuid.to_string());
             self.order.push(uuid.to_string());
             if let Some(p) = parent {
                 self.parent.insert(uuid.to_string(), p.to_string());
@@ -1226,7 +1261,7 @@ impl<'a> Ctx<'a> {
                 self.page_of.insert(uuid.to_string(), pg.to_string());
                 if let Some(r) = child.attr("Ref") {
                     self.mirrors
-                        .entry(r.to_string())
+                        .entry(r.to_ascii_lowercase())
                         .or_default()
                         .push([pg.to_string(), uuid.to_string()]);
                 }
@@ -1257,6 +1292,32 @@ impl<'a> Ctx<'a> {
 
     fn el(&self, uuid: &str) -> Option<&'a Element> {
         self.els.get(uuid).copied()
+    }
+
+    /// The uuid of the object a UUID names, as the document spells it (UUIDs compare without
+    /// regard to case).
+    fn resolve(&self, uuid: &str) -> Option<&String> {
+        self.lower.get(&uuid.to_ascii_lowercase())
+    }
+
+    /// What a reference (`REFS`) mirrors: its `Ref=`, resolved.
+    fn ref_of(&self, o: &str) -> Option<&String> {
+        if !REFS.contains(&self.ty(o).as_str()) {
+            return None;
+        }
+        self.resolve(self.el(o)?.attr("Ref")?)
+    }
+
+    /// Whether `o` is a reference of the type list `types` to `target`.
+    fn is_ref_of(&self, o: &str, types: &[&str], target: &str) -> bool {
+        types.contains(&self.ty(o).as_str()) && self.ref_of(o).is_some_and(|t| t == target)
+    }
+
+    /// The refs (page, ref uuid) that mirror an object.
+    fn mirrors_of(&self, uuid: &str) -> &[[String; 2]] {
+        self.mirrors
+            .get(&uuid.to_ascii_lowercase())
+            .map_or(&[], Vec::as_slice)
     }
 
     fn title(&self, uuid: &str) -> String {
@@ -1308,6 +1369,11 @@ impl<'a> Ctx<'a> {
             page,
             removed: false,
         }
+    }
+
+    /// What a ref's `Ref=` names (the UUID may be spelled in another case).
+    fn ref_target(&self, r: &str) -> Target {
+        self.target(self.resolve(r).map_or(r, String::as_str), None)
     }
 
     fn port_target(&self, port_uuid: &str) -> Option<Target> {
@@ -2264,7 +2330,7 @@ pub fn removed_blocks(
                 page_title: page.as_ref().map(|p| c.title(p)),
                 page,
                 wires,
-                refs: c.mirrors.get(u).map_or(0, Vec::len),
+                refs: c.mirrors_of(u).len(),
             }
         })
         .collect();
@@ -2383,7 +2449,7 @@ fn page_view(c: &Ctx, old: Option<&Ctx>, uuid: &str, d: &Delta, gone: bool) -> O
                 },
             });
         }
-        let target = el.and_then(|e| e.attr("Ref")).map(|r| ctx.target(r, None));
+        let target = el.and_then(|e| e.attr("Ref")).map(|r| ctx.ref_target(r));
         let title = match (&target, el.and_then(|e| e.attr("Title"))) {
             (Some(t), None) => t.title.clone(),
             _ => g.title.clone(),
@@ -2430,9 +2496,13 @@ fn page_view(c: &Ctx, old: Option<&Ctx>, uuid: &str, d: &Delta, gone: bool) -> O
     let mut wires = Vec::new();
     let mut labels = Vec::new();
     let mut seen = HashSet::new();
-    let tag_objs: HashSet<String> = objects
+    // Changed wires the page does not draw (a reference's own wire to its flag) still change the page.
+    let mut hidden_changes = 0usize;
+    // A tag *is* the drawing of its far end; a memory flag, though drawn as a tag, is a block
+    // whose wires go where they go.
+    let ref_objs: HashSet<String> = objects
         .iter()
-        .filter(|o| o.shape == "tag")
+        .filter(|o| o.shape == "tag" && o.ty != "Memory")
         .map(|o| o.uuid.clone())
         .collect();
     let mut emit = |w: &WireView,
@@ -2445,6 +2515,17 @@ fn page_view(c: &Ctx, old: Option<&Ctx>, uuid: &str, d: &Delta, gone: bool) -> O
         let key = |p: &str| ctx.port_owner.get(p).cloned().unwrap_or_default();
         let (fo, fk) = key(&w.from_port);
         let (to, tk) = key(&w.to_port);
+        // A reference's wire to or from the object it mirrors is plumbing, no wire of the
+        // program: Loxone Config draws the tag only.
+        if mirror_wire(ctx, &fo, &to) {
+            if (a.is_some() || b.is_some())
+                && !status.is_empty()
+                && seen.insert((w.from_port.clone(), w.to_port.clone()))
+            {
+                hidden_changes += 1;
+            }
+            return;
+        }
         match (a, b) {
             (Some(&(pa, sa, ra)), Some(&(pb, sb, rb))) => {
                 if fo == to || !seen.insert((w.from_port.clone(), w.to_port.clone())) {
@@ -2491,7 +2572,7 @@ fn page_view(c: &Ctx, old: Option<&Ctx>, uuid: &str, d: &Delta, gone: bool) -> O
                     (to.clone(), tk.clone(), &w.from_port)
                 };
                 // A ref tag *is* the drawing of its far end.
-                if tag_objs.contains(&here_obj) {
+                if ref_objs.contains(&here_obj) {
                     return;
                 }
                 if !seen.insert((w.from_port.clone(), w.to_port.clone())) {
@@ -2549,7 +2630,8 @@ fn page_view(c: &Ctx, old: Option<&Ctx>, uuid: &str, d: &Delta, gone: bool) -> O
     } else {
         ""
     };
-    let changes = objects.iter().filter(|o| !o.status.is_empty()).count()
+    let changes = hidden_changes
+        + objects.iter().filter(|o| !o.status.is_empty()).count()
         + wires.iter().filter(|w| !w.status.is_empty()).count()
         + labels.iter().filter(|l| !l.status.is_empty()).count()
         + objects
@@ -2571,6 +2653,124 @@ fn page_view(c: &Ctx, old: Option<&Ctx>, uuid: &str, d: &Delta, gone: bool) -> O
         wires,
         labels,
         sheet: geo.sheet.as_ref().map(rect),
+    })
+}
+
+/// The reference types: a tag that shows another object on this page.
+const REFS: &[&str] = &["InputRef", "OutputRef", "OutputRefLM"];
+/// The references that write the object they mirror, and those that read it.
+const WRITER_REFS: &[&str] = &["OutputRef", "OutputRefLM"];
+const READER_REFS: &[&str] = &["InputRef"];
+/// A memory flag's output connectors: a digital, an analog and a text one.
+const MEMORY_OUTS: &[&str] = &["AQ", "Q", "TQ"];
+
+/// What sets a memory flag, if one source does: the connector behind its input wire(s) and its
+/// output references (an output reference writes the flag, and each wire into it is a source).
+/// Several sources leave the value to whichever wrote last, or to whichever is on, which a wire
+/// cannot say.
+fn memory_writer(c: &Ctx, mem: &Element) -> Option<String> {
+    let uuid = mem.attr("U")?;
+    let feeds = |r: &str| -> Vec<String> {
+        let Some(el) = c.el(r) else {
+            return Vec::new();
+        };
+        ports(el)
+            .into_iter()
+            .filter(|p| p.key == "AI" || p.key == "I")
+            .flat_map(|p| p.inputs)
+            .collect()
+    };
+    let mut sources: Vec<String> = Vec::new();
+    let mut add = |s: String| {
+        if !sources.contains(&s) {
+            sources.push(s);
+        }
+    };
+    if let Some(p) = ports(mem).into_iter().find(|p| p.key == "Input") {
+        for s in p.inputs {
+            match c.port_owner.get(&s).map(|(o, _)| o.as_str()) {
+                Some(o) if c.is_ref_of(o, WRITER_REFS, uuid) => {
+                    feeds(o).into_iter().for_each(&mut add)
+                }
+                _ => add(s),
+            }
+        }
+    }
+    for [_, r] in c.mirrors_of(uuid) {
+        if c.is_ref_of(r, WRITER_REFS, uuid) {
+            feeds(r).into_iter().for_each(&mut add);
+        }
+    }
+    match sources.as_slice() {
+        [one] => Some(one.clone()),
+        _ => None,
+    }
+}
+
+/// Whether a wire from `from` to `to` joins a memory flag and a reference of it: an input
+/// reference reading the flag, an output reference writing it. Loxone Config draws the tag only.
+fn mirror_wire(c: &Ctx, from: &str, to: &str) -> bool {
+    let flag = |o: &str| c.ref_of(o).filter(|t| c.ty(t) == "Memory");
+    (READER_REFS.contains(&c.ty(to).as_str()) && flag(to).is_some_and(|t| t == from))
+        || (WRITER_REFS.contains(&c.ty(from).as_str()) && flag(from).is_some_and(|t| t == to))
+}
+
+/// The memory flag `uuid` is, or a reference to; where it is written and where it is read.
+fn flag_info(c: &Ctx, uuid: &str) -> Option<Flag> {
+    let ty = c.ty(uuid);
+    let (mem, role) = match ty.as_str() {
+        "Memory" => (uuid.to_string(), "flag"),
+        t if READER_REFS.contains(&t) => (c.ref_of(uuid)?.clone(), "reads"),
+        t if WRITER_REFS.contains(&t) => (c.ref_of(uuid)?.clone(), "writes"),
+        _ => return None,
+    };
+    let mel = c.el(&mem).filter(|_| c.ty(&mem) == "Memory")?;
+    let own = ports(mel);
+    let port = |k: &str| own.iter().find(|p| p.key == k).map(|p| p.uuid.clone());
+    let mut written: Vec<Target> = Vec::new();
+    let mut read: Vec<Target> = Vec::new();
+    let add = |list: &mut Vec<Target>, t: Target| {
+        if !list.iter().any(|x| x.uuid == t.uuid && x.port == t.port) {
+            list.push(t);
+        }
+    };
+    // A reference of this flag: its wire to or from the flag is what the reference is, not a block
+    // that writes or reads it.
+    if let Some(input) = port("Input") {
+        for &i in c.wires_into.get(&input).into_iter().flatten() {
+            let from = &c.wires[i].from_port;
+            if let Some((o, _)) = c.port_owner.get(from)
+                && !c.is_ref_of(o, WRITER_REFS, &mem)
+                && let Some(t) = c.port_target(from)
+            {
+                add(&mut written, t);
+            }
+        }
+    }
+    for out in MEMORY_OUTS.iter().filter_map(|k| port(k)) {
+        for &i in c.wires_from.get(&out).into_iter().flatten() {
+            let to = &c.wires[i].to_port;
+            if let Some((o, _)) = c.port_owner.get(to)
+                && !c.is_ref_of(o, READER_REFS, &mem)
+                && let Some(t) = c.port_target(to)
+            {
+                add(&mut read, t);
+            }
+        }
+    }
+    for [_, r] in c.mirrors_of(&mem) {
+        if c.is_ref_of(r, WRITER_REFS, &mem) {
+            add(&mut written, c.target(r, None));
+        } else if c.is_ref_of(r, READER_REFS, &mem) {
+            add(&mut read, c.target(r, None));
+        }
+    }
+    Some(Flag {
+        title: c.title(&mem),
+        uuid: mem,
+        role,
+        written,
+        read,
     })
 }
 
@@ -2739,8 +2939,9 @@ fn obj_info(
         settings: settings_of(&ty, &attrs),
         attrs,
         ports: port_infos,
-        mirrored_by: c.mirrors.get(uuid).cloned().unwrap_or_default(),
-        target: el.attr("Ref").map(|r| c.target(r, None)),
+        mirrored_by: c.mirrors_of(uuid).to_vec(),
+        target: el.attr("Ref").map(|r| c.ref_target(r)),
+        flag: flag_info(c, uuid),
         ty,
     }
 }
@@ -3570,7 +3771,8 @@ fn live_graph(c: &Ctx) -> LiveGraph {
                         g.pass.insert(o.clone(), f.clone());
                     }
                     if let Some(r) = el.attr("Ref") {
-                        g.refs.insert(o, r.to_string());
+                        g.refs
+                            .insert(o, c.resolve(r).map_or(r, String::as_str).to_string());
                     }
                 }
             }
@@ -3583,6 +3785,7 @@ fn live_graph(c: &Ctx) -> LiveGraph {
                     }
                 }
                 if let Some(r) = el.attr("Ref") {
+                    let r = c.resolve(r).map_or(r, String::as_str);
                     for o in outs(&["AQ", "Q"]) {
                         g.refs.insert(o, r.to_string());
                     }
@@ -3603,10 +3806,11 @@ fn live_graph(c: &Ctx) -> LiveGraph {
                     g.pass.insert(p.uuid.clone(), f);
                 }
             }
-            // A memory flag holds what its input is set to.
+            // A memory flag holds what it was last set to: a value to pass on only when one thing
+            // writes it (a wire to its input, or an output reference of it, or both for one source).
             "Memory" => {
-                if let Some(f) = src("Input") {
-                    for o in outs(&["AQ", "Q"]) {
+                if let Some(f) = memory_writer(c, el) {
+                    for o in outs(MEMORY_OUTS) {
                         g.pass.insert(o, f.clone());
                     }
                 }
@@ -4055,6 +4259,285 @@ mod tests {
         let mut plan: Vec<String> = query_plan(&d, "q").into_iter().map(|b| b.uuid).collect();
         plan.sort();
         assert_eq!(plan, ["m", "o"]);
+    }
+
+    /// Page P: an And writes memory flag M (wired), an input reference of M (`ri`, Ref in capitals)
+    /// and a Not read it. Page Q: an output reference of M (`ro`) fed by an Or, an input reference
+    /// of M (`rj`), and M's own wires to the other page.
+    const FLAG: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<ControlList Version="1">
+	<C Type="Document" V="1" U="d" Title="T">
+		<C Type="Page" V="1" U="p" Title="P">
+			<C Type="And" V="1" U="a" Title="And" Px="0" Py="0" Px2="100" Py2="100">
+				<Co K="Q" U="a-q"/>
+			</C>
+			<C Type="Memory" V="1" U="m" Title="Flag" Px="200" Py="0" Px2="2312" Py2="192" Tp="0">
+				<Co K="Input" Nc="1" U="m-in"><In Input="a-q"/></Co>
+				<Co K="AQ" U="m-aq"/>
+				<Co K="Q" U="m-q"/>
+			</C>
+			<C Type="InputRef" V="1" U="ri" Title="Flag" Ref="M" Px="3000" Py="0" Px2="5112" Py2="192">
+				<Co K="AI" Nc="1" U="ri-ai"><In Input="m-q"/></Co>
+				<Co K="Q" U="ri-q"/>
+			</C>
+			<C Type="Not" V="1" U="n" Title="Not" Px="6000" Py="0" Px2="6100" Py2="100">
+				<Co K="I" Nc="1" U="n-i"><In Input="ri-q"/></Co>
+				<Co K="Q" U="n-q"/>
+			</C>
+		</C>
+		<C Type="Page" V="1" U="q" Title="Q">
+			<C Type="Or" V="1" U="o" Title="Or" Px="0" Py="0" Px2="100" Py2="100">
+				<Co K="Q" U="o-q"/>
+			</C>
+			<C Type="OutputRef" V="1" U="ro" Title="Flag" Ref="m" Px="1000" Py="0" Px2="3112" Py2="192">
+				<Co K="AI" Nc="1" U="ro-ai"><In Input="o-q"/></Co>
+				<Co K="AQ" U="ro-aq"/>
+			</C>
+			<C Type="InputRef" V="1" U="rj" Title="Flag" Ref="m" Px="4000" Py="0" Px2="6112" Py2="192">
+				<Co K="AI" Nc="1" U="rj-ai"><In Input="m-q"/></Co>
+				<Co K="Q" U="rj-q"/>
+			</C>
+		</C>
+	</C>
+</ControlList>"#;
+
+    #[test]
+    fn a_memory_flag_lists_where_it_is_written_and_read() {
+        let v = build(&doc(FLAG), None, "t");
+        let uuids = |l: &[Target]| l.iter().map(|t| t.uuid.clone()).collect::<Vec<_>>();
+        // The flag: written by the And and through the output reference on Q; read by the input
+        // references (not by the wire to them, which is the reference's own).
+        let f = v.objects["m"].flag.as_ref().expect("flag");
+        assert_eq!(
+            (f.role, f.uuid.as_str(), f.title.as_str()),
+            ("flag", "m", "Flag")
+        );
+        assert_eq!(uuids(&f.written), ["a", "ro"]);
+        assert_eq!(uuids(&f.read), ["ri", "rj"]);
+        assert_eq!(f.read[1].page.as_deref(), Some("q"));
+        // A reference says which side of the same flag it is, whatever case its `Ref=` is in.
+        let r = v.objects["ri"].flag.as_ref().expect("reads");
+        assert_eq!((r.role, r.uuid.as_str()), ("reads", "m"));
+        assert_eq!(uuids(&r.written), ["a", "ro"]);
+        assert_eq!(v.objects["ro"].flag.as_ref().unwrap().role, "writes");
+        assert_eq!(v.objects["ri"].target.as_ref().unwrap().uuid, "m");
+        // Other objects and references to other things carry none.
+        assert!(v.objects["a"].flag.is_none());
+        assert_eq!(v.objects["m"].mirrored_by.len(), 3);
+    }
+
+    #[test]
+    fn a_memory_flags_links_show_and_its_references_wires_do_not() {
+        let v = build(&doc(FLAG), None, "t");
+        // The wire from a reference's own memory flag is the reference, not a wire of the page.
+        let p = page(&v, "p");
+        assert!(
+            p.wires.iter().all(|w| w.from[0] != "m" || w.to[0] != "ri"),
+            "{:?}",
+            p.wires.iter().map(|w| &w.from).collect::<Vec<_>>()
+        );
+        assert!(
+            p.labels.iter().all(|l| l.obj != "m"),
+            "no link to a reference of the flag"
+        );
+        let wires: Vec<_> = p
+            .wires
+            .iter()
+            .map(|w| (w.from[0].as_str(), w.to[0].as_str()))
+            .collect();
+        assert_eq!(wires, [("a", "m"), ("ri", "n")]);
+        // The Or on the other page writes the flag through its output reference: the tag is
+        // the drawing of its far end, and nothing else is.
+        assert!(page(&v, "q").labels.is_empty());
+        // A flag wired to a block on another page is a link at its port, as for any block.
+        let xml = FLAG.replace(
+            r#"<Co K="Q" U="o-q"/>"#,
+            r#"<Co K="Q" U="o-q"/><Co K="I" Nc="1" U="o-i"><In Input="m-q"/></Co>"#,
+        );
+        let v = build(&doc(&xml), None, "t");
+        let l: Vec<_> = page(&v, "p")
+            .labels
+            .iter()
+            .map(|l| (l.obj.as_str(), l.port.as_str(), l.incoming))
+            .collect();
+        assert_eq!(l, [("m", "Q", false)]);
+        assert_eq!(page(&v, "p").labels[0].target.uuid, "o");
+    }
+
+    #[test]
+    fn the_memory_fixture_shows_each_flag_by_where_it_is_written_and_read() {
+        let xml = std::fs::read_to_string("tests/fixtures/memory.Loxone").unwrap();
+        let v = build(&doc(&xml), None, "Merkerhaus");
+        let names = |l: &[Target]| {
+            l.iter()
+                .map(|t| format!("{}@{}", t.title, t.page_title.clone().unwrap_or_default()))
+                .collect::<Vec<_>>()
+        };
+        let by = |title: &str| {
+            v.objects
+                .values()
+                .find(|o| o.title == title && o.ty == "Memory")
+                .unwrap()
+        };
+        // Written here by the And and read on the other page through an input reference.
+        let f = by("Anwesend").flag.as_ref().unwrap();
+        assert_eq!(names(&f.written), ["O2001@Anwesenheit"]);
+        assert_eq!(names(&f.read), ["Anwesend@Alarmlogik"]);
+        // Written from the other page by a wire, read nowhere.
+        let f = by("Alarm").flag.as_ref().unwrap();
+        assert_eq!(names(&f.written), ["O2003@Alarmlogik"]);
+        assert!(f.read.is_empty());
+        // Written by the And and by an output reference on the other page, read by a Not here.
+        let f = by("Hilfsmerker").flag.as_ref().unwrap();
+        assert_eq!(
+            names(&f.written),
+            ["O2001@Anwesenheit", "Hilfsmerker@Alarmlogik"]
+        );
+        assert_eq!(names(&f.read), ["O2002@Anwesenheit"]);
+        // Alarm's input comes from the other page: a link at its input, none at the references.
+        let p = v.pages.iter().find(|p| p.title == "Anwesenheit").unwrap();
+        let l: Vec<_> = p
+            .labels
+            .iter()
+            .map(|l| (by_title(&v, &l.obj), l.port.as_str(), l.incoming))
+            .collect();
+        assert_eq!(l, [("Alarm".to_string(), "Input", true)]);
+    }
+
+    fn by_title(v: &View, uuid: &str) -> String {
+        v.objects[uuid].title.clone()
+    }
+
+    #[test]
+    fn a_reference_of_another_block_keeps_its_link_and_a_flags_plumbing_still_counts_as_a_change() {
+        // The And on page q is mirrored on page p by an input reference: the wire to the reference is
+        // a link at the And, as before.
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<ControlList Version="1">
+	<C Type="Document" V="1" U="d" Title="T">
+		<C Type="Page" V="1" U="p" Title="P">
+			<C Type="InputRef" V="1" U="r" Title="A" Ref="A" Px="0" Py="0" Px2="2112" Py2="192">
+				<Co K="AI" Nc="1" U="r-ai"><In Input="a-q"/></Co>
+				<Co K="Q" U="r-q"/>
+			</C>
+		</C>
+		<C Type="Page" V="1" U="q" Title="Q">
+			<C Type="And" V="1" U="a" Title="A" Px="0" Py="0" Px2="100" Py2="100">
+				<Co K="Q" U="a-q"/>
+			</C>
+		</C>
+	</C>
+</ControlList>"#;
+        let v = build(&doc(xml), None, "t");
+        let l: Vec<_> = page(&v, "q")
+            .labels
+            .iter()
+            .map(|l| (l.obj.as_str(), l.port.as_str(), l.target.uuid.as_str()))
+            .collect();
+        assert_eq!(l, [("a", "Q", "r")]);
+        // A tag-shaped type vislox does not know is the drawing of its far end, as before.
+        let odd = xml.replace(r#"Type="InputRef""#, r#"Type="SomeTag""#);
+        let v = build(&doc(&odd), None, "t");
+        assert!(page(&v, "q").labels.iter().all(|l| l.obj != "r"));
+        // A flag and its input reference: the reference's wire to the flag is not drawn, but a
+        // revision that only removes it still changes the page.
+        let new = FLAG.replace(
+            r#"<Co K="AI" Nc="1" U="ri-ai"><In Input="m-q"/></Co>"#,
+            r#"<Co K="AI" U="ri-ai"/>"#,
+        );
+        let v = build(&doc(&new), Some(&doc(FLAG)), "t");
+        assert!(page(&v, "p").wires.iter().all(|w| w.status.is_empty()));
+        assert_eq!(page(&v, "p").changes, 1);
+        assert_eq!(page(&v, "p").status, CHANGED);
+        assert_eq!(
+            page(&v, "q").changes,
+            0,
+            "the other page's reference is untouched"
+        );
+        // Nothing changed: nothing counted.
+        let v = build(&doc(FLAG), Some(&doc(FLAG)), "t");
+        assert_eq!(page(&v, "p").changes, 0);
+    }
+
+    #[test]
+    fn a_flag_reads_its_references_in_any_case_and_every_feed_of_a_writer_counts() {
+        let g = |xml: &str| build(&doc(xml), None, "t").live;
+        // `Ref=` in capitals still names the flag, for the live values too.
+        let l = g(FLAG);
+        assert_eq!(l.refs["ri-q"], "m");
+        assert_eq!(l.refs["ro-aq"], "m");
+        // An output reference fed from two places writes from two sources.
+        let two = FLAG
+            .replace(
+                r#"<Co K="Input" Nc="1" U="m-in"><In Input="a-q"/></Co>"#,
+                r#"<Co K="Input" U="m-in"/>"#,
+            )
+            .replace(
+                r#"<In Input="o-q"/>"#,
+                r#"<In Input="o-q"/><In Input="a-q"/>"#,
+            );
+        assert!(!g(&two).pass.contains_key("m-q"));
+        // An output reference of the notification kind writes it too.
+        let lm = FLAG
+            .replace(
+                r#"<Co K="Input" Nc="1" U="m-in"><In Input="a-q"/></Co>"#,
+                r#"<Co K="Input" U="m-in"/>"#,
+            )
+            .replace(r#"Type="OutputRef""#, r#"Type="OutputRefLM""#);
+        assert_eq!(g(&lm).pass["m-q"], "o-q");
+        let v = build(&doc(&lm), None, "t");
+        assert_eq!(v.objects["ro"].flag.as_ref().unwrap().role, "writes");
+        // A text flag passes its input on to its text output, and lists its readers by it.
+        let text = FLAG
+            .replace(
+                r#"<Co K="Q" U="m-q"/>"#,
+                r#"<Co K="Q" U="m-q"/><Co K="TQ" U="m-tq"/>"#,
+            )
+            .replace(
+                r#"<Co K="I" Nc="1" U="n-i"><In Input="ri-q"/></Co>"#,
+                r#"<Co K="I" Nc="1" U="n-i"><In Input="m-tq"/></Co>"#,
+            )
+            .replace(
+                r#"<Co K="AI" Nc="1" U="ri-ai"><In Input="m-q"/></Co>"#,
+                r#"<Co K="AI" U="ri-ai"/>"#,
+            );
+        let wire_only = text.replace(r#"Type="OutputRef""#, r#"Type="Constant""#);
+        assert_eq!(g(&wire_only).pass["m-tq"], "a-q");
+        let v = build(&doc(&text), None, "t");
+        let read = &v.objects["m"].flag.as_ref().unwrap().read;
+        assert!(read.iter().any(|t| t.uuid == "n"), "{read:?}");
+    }
+
+    #[test]
+    fn a_memory_flag_passes_on_the_one_thing_that_sets_it() {
+        let g = |xml: &str| build(&doc(xml), None, "t").live;
+        // One wire into the input and one output reference: two writers.
+        assert!(!g(FLAG).pass.contains_key("m-q"));
+        // Only the wire: the And's output.
+        let wire_only = FLAG.replace(r#"Type="OutputRef""#, r#"Type="Constant""#);
+        let l = g(&wire_only);
+        assert_eq!(l.pass["m-q"], "a-q");
+        assert_eq!(l.pass["m-aq"], "a-q");
+        // Only the output reference, its distribution wire drawn or not: what feeds the reference.
+        let ref_only = FLAG.replace(
+            r#"<Co K="Input" Nc="1" U="m-in"><In Input="a-q"/></Co>"#,
+            r#"<Co K="Input" U="m-in"/>"#,
+        );
+        assert_eq!(g(&ref_only).pass["m-q"], "o-q");
+        let drawn = ref_only.replace(
+            r#"<Co K="Input" U="m-in"/>"#,
+            r#"<Co K="Input" Nc="1" U="m-in"><In Input="ro-aq"/></Co>"#,
+        );
+        assert_eq!(g(&drawn).pass["m-q"], "o-q");
+        // Written from two places, it holds the last, which no wire says.
+        let two = ref_only.replace(
+            r#"<Co K="Input" U="m-in"/>"#,
+            r#"<Co K="Input" Nc="2" U="m-in"><In Input="a-q"/><In Input="ro-aq"/></Co>"#,
+        );
+        assert!(!g(&two).pass.contains_key("m-q"));
+        // Nothing writes it here: nothing to pass on.
+        let none = ref_only.replace(r#"<In Input="o-q"/>"#, "");
+        assert!(!g(&none).pass.contains_key("m-q"));
     }
 
     #[test]
