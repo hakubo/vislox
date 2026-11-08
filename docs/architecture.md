@@ -26,8 +26,9 @@ The binary is an `axum` server with the UI embedded (plain JS and SVG, no build 
 - `src/appcalendar.rs` reads the Miniserver's calendar entries (`calendargetentries`) when live values start,
   after Pull, Apply and Sync and before Apply, for the *changed in the app* notice (`GET /api/calendar`).
 - `src/actions.rs` runs Apply (`lox config push --force`, `git commit`, `git push`), Sync (`lox config merge`,
-  `git commit`, `git push`) and Discard (`git checkout` of the module, lock and out). Apply's steps follow lox's
-  progress lines as they come.
+  `git commit`, `git push`) and Discard (`git checkout` of the module, lock and out; the files and the git index
+  are copied first and put back, verified, when a step fails, see [editing.md](editing.md)). Apply's steps follow
+  lox's progress lines as they come.
 - `src/rollback.rs` finds the downloads `lox config push` leaves in a project's `backups/` (`<stamp>-pre-push` and
   `-post-push`) for Roll back (#69): a commit whose base is a post-push program is a push, and its pre-push
   program is what ran before. It reads and checks them; `actions/rollback.rs` plans the Roll back (`POST

@@ -225,6 +225,13 @@ published under the same version (see [docker/README.md](docker/README.md)).
   the file on disk) next to `current` (what the watched file holds); *on Miniserver*, live values, the log marks,
   block queries, input commands, the edit base and the app comparison follow `deployed`, so they stay off on an
   uncommitted save. A compile is compared with the deployed revision, not with the newest one.
+- A Discard that fails halfway puts back the git index too (#122): its `git checkout` had reset what was staged in
+  the module, and the recovery put back only the files, ignored its own errors and said *Nothing was discarded*.
+  Discard now reads and copies the module, lock, out and the index (byte for byte) before it changes anything, and
+  refuses when it cannot (or while git holds `index.lock`). On a failed step it puts all of it back without
+  writing through a symbolic link, reads it again, and says *Nothing was discarded* only when everything is as it
+  was; otherwise it lists what is not, why, and where its copy is (in the git directory). Roll back's put-back
+  takes the same care and also lists what it could not put back.
 
 ## 0.2.0
 

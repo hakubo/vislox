@@ -462,63 +462,461 @@ async fn clear_snapshot(dir: &Path) {
     }
 }
 
-/// Every file under a directory, hidden ones included.
-fn all_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
-        let path = e.path();
-        if path.is_dir() {
-            all_files(&path, out);
+/// A path as Discard found it, read without following a link.
+#[derive(PartialEq)]
+enum Was {
+    Missing,
+    Dir,
+    File(Vec<u8>, std::fs::Permissions),
+    Link(PathBuf),
+}
+
+impl Was {
+    fn read(path: &Path) -> Result<Was, String> {
+        let m = match std::fs::symlink_metadata(path) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Was::Missing),
+            Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
+        };
+        let t = m.file_type();
+        if t.is_symlink() {
+            std::fs::read_link(path)
+                .map(Was::Link)
+                .map_err(|e| format!("cannot read {}: {e}", path.display()))
+        } else if t.is_dir() {
+            Ok(Was::Dir)
+        } else if t.is_file() {
+            std::fs::read(path)
+                .map(|b| Was::File(b, m.permissions()))
+                .map_err(|e| format!("cannot read {}: {e}", path.display()))
         } else {
-            out.push(path);
+            Err(format!("{} is no file, directory or link", path.display()))
+        }
+    }
+
+    /// Put `path` back as it was. Never writes through a link: a file is
+    /// written beside it and renamed over it, which replaces a link. The
+    /// error does not name `path`: the report does.
+    fn put(&self, path: &Path) -> Result<(), String> {
+        let now = std::fs::symlink_metadata(path).ok();
+        if now.is_some() && Was::read(path).ok().as_ref() == Some(self) {
+            return Ok(());
+        }
+        let is_dir = now.as_ref().is_some_and(|m| m.is_dir());
+        let clear = || -> Result<(), String> {
+            match &now {
+                Some(m) if m.is_dir() => std::fs::remove_dir(path),
+                Some(_) => std::fs::remove_file(path),
+                None => Ok(()),
+            }
+            .map_err(|e| format!("cannot remove what is there: {e}"))
+        };
+        match self {
+            Was::Missing => clear(),
+            Was::Dir => {
+                clear()?;
+                std::fs::create_dir(path).map_err(|e| format!("cannot create it: {e}"))
+            }
+            Was::File(bytes, perm) => {
+                if is_dir {
+                    clear()?;
+                }
+                let name = path.file_name().unwrap_or_default().to_string_lossy();
+                let tmp = path.with_file_name(format!(".{name}.vislox-{}", std::process::id()));
+                let res = (|| {
+                    use std::io::Write;
+                    let mut f = std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&tmp)?;
+                    f.write_all(bytes)?;
+                    drop(f);
+                    std::fs::set_permissions(&tmp, perm.clone())?;
+                    std::fs::rename(&tmp, path)
+                })();
+                if res.is_err() {
+                    let _ = std::fs::remove_file(&tmp);
+                }
+                res.map_err(|e| format!("cannot write it: {e}"))
+            }
+            Was::Link(target) => {
+                clear()?;
+                #[cfg(unix)]
+                let res = std::os::unix::fs::symlink(target, path);
+                #[cfg(not(unix))]
+                let res: std::io::Result<()> = Err(std::io::Error::other(format!(
+                    "a link to {}",
+                    target.display()
+                )));
+                res.map_err(|e| format!("cannot create it: {e}"))
+            }
         }
     }
 }
 
-/// The module's files and the lock and out as they are, to put back when
-/// Discard fails halfway.
+/// `root` and every path under it, parents before children, hidden ones
+/// included; a link is listed, not followed.
+fn paths_under(root: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
+    let m = match std::fs::symlink_metadata(root) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(format!("cannot read {}: {e}", root.display())),
+    };
+    out.push(root.to_path_buf());
+    if m.is_dir() {
+        let mut names = std::fs::read_dir(root)
+            .and_then(|d| {
+                d.map(|e| e.map(|e| e.path()))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .map_err(|e| format!("cannot read {}: {e}", root.display()))?;
+        names.sort();
+        for p in names {
+            paths_under(&p, out)?;
+        }
+    }
+    Ok(())
+}
+
+/// Git's lock beside a file of its own (`index.lock`).
+fn git_lock(file: &Path) -> PathBuf {
+    let mut s = file.as_os_str().to_os_string();
+    s.push(".lock");
+    PathBuf::from(s)
+}
+
+/// What Discard may change, as it is before Discard touches anything: the
+/// module's tree, the lock and out, and the git index (byte for byte, so
+/// that what is staged, anywhere in the repository, comes back as it was).
+/// A copy is kept on disk too, in the git directory, until Discard is done
+/// or has put everything back: when it cannot, the copy is where the rest is.
+/// Roll back takes the files alone ([`Rollback::files`]): it runs no git
+/// command before it deploys.
 struct Rollback {
+    root: PathBuf,
     module: PathBuf,
-    files: Vec<(PathBuf, Vec<u8>)>,
-    others: Vec<(PathBuf, Option<Vec<u8>>)>,
+    /// The module and everything in it, parents first; then the others.
+    paths: Vec<(PathBuf, Was)>,
+    /// The git index file and its bytes (`None`: there was none).
+    index: Option<(PathBuf, Option<Vec<u8>>)>,
+    backup: Option<PathBuf>,
+}
+
+/// A test's fault, run at each named point of a Discard (see
+/// [`discard_fault`]).
+#[cfg(test)]
+type Fault = Box<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
+
+#[cfg(test)]
+tokio::task_local! {
+    static DISCARD_FAULT: Fault;
+}
+
+/// Where a test injects a failure into Discard: `module` after the module
+/// is checked out (an error fails the step), `restore` before a failed
+/// Discard puts things back. Nothing outside tests.
+fn discard_fault(at: &str) -> Result<(), String> {
+    #[cfg(test)]
+    if let Ok(r) = DISCARD_FAULT.try_with(|f| f(at)) {
+        return r;
+    }
+    let _ = at;
+    Ok(())
+}
+
+/// What a Discard that failed could not put back.
+struct Left {
+    what: String,
+    why: String,
+    copy: Option<PathBuf>,
 }
 
 impl Rollback {
-    fn take(module: &Path, others: &[&Path]) -> Rollback {
+    /// Read everything and keep the copy, or refuse: a path that cannot be
+    /// read could not be put back.
+    async fn take(dir: &Path, p: &loxone_config::Project) -> Result<Rollback, String> {
+        let mut rb = Rollback::files(&p.root, &p.module, &[&p.lock, &p.out])?;
+        for (path, was) in &rb.paths[rb.paths.len() - 2..] {
+            if *was == Was::Dir {
+                return Err(format!("{} is a directory", path.display()));
+            }
+        }
+        let git_path = |name: &'static str| async move {
+            git(dir, &["rev-parse", "--git-path", name])
+                .await
+                .map(|p| dir.join(p.trim()))
+        };
+        let index = git_path("index").await?;
+        let lock = git_lock(&index);
+        if std::fs::symlink_metadata(&lock).is_ok() {
+            return Err(format!(
+                "git is busy in this repository ({} is there): try again when it is done",
+                lock.display()
+            ));
+        }
+        let index_was = match std::fs::read(&index) {
+            Ok(b) => Some(b),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                return Err(format!(
+                    "cannot read the git index {}: {e}",
+                    index.display()
+                ));
+            }
+        };
+        let id = crate::history::blob_id(
+            dir.canonicalize()
+                .unwrap_or_else(|_| dir.to_path_buf())
+                .to_string_lossy()
+                .as_bytes(),
+        );
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let backup = git_path("vislox-discard-backup")
+            .await?
+            .join(format!("{}-{stamp}", &id[..16]));
+        rb.index = Some((index, index_was));
+        if let Err(e) = rb.keep_copy(&backup) {
+            let _ = std::fs::remove_dir_all(&backup);
+            return Err(format!(
+                "cannot keep a copy of the files in {}: {e}",
+                backup.display()
+            ));
+        }
+        rb.backup = Some(backup);
+        Ok(rb)
+    }
+
+    /// The module's tree and `others`, or why one cannot be read.
+    fn files(root: &Path, module: &Path, others: &[&Path]) -> Result<Rollback, String> {
+        let mut tree = Vec::new();
+        paths_under(module, &mut tree)?;
+        if tree.is_empty() {
+            tree.push(module.to_path_buf());
+        }
         let mut paths = Vec::new();
-        all_files(module, &mut paths);
-        Rollback {
+        for path in tree
+            .into_iter()
+            .chain(others.iter().map(|p| p.to_path_buf()))
+        {
+            let was = Was::read(&path)?;
+            paths.push((path, was));
+        }
+        Ok(Rollback {
+            root: root.to_path_buf(),
             module: module.to_path_buf(),
-            files: paths
-                .into_iter()
-                .filter_map(|p| Some((p.clone(), std::fs::read(&p).ok()?)))
-                .collect(),
-            others: others
-                .iter()
-                .map(|p| (p.to_path_buf(), std::fs::read(p).ok()))
-                .collect(),
+            paths,
+            index: None,
+            backup: None,
+        })
+    }
+
+    /// Where the copy of `path` is kept: by its path from the project
+    /// directory, under `files`.
+    fn copy_of(&self, backup: &Path, n: usize, path: &Path) -> PathBuf {
+        let files = backup.join("files");
+        match path.strip_prefix(&self.root) {
+            Ok(rel)
+                if rel
+                    .components()
+                    .all(|c| matches!(c, std::path::Component::Normal(_))) =>
+            {
+                files.join(rel)
+            }
+            _ => files.join("outside").join(format!(
+                "{n}-{}",
+                path.file_name().unwrap_or_default().to_string_lossy()
+            )),
         }
     }
 
-    fn restore(&self) {
+    fn keep_copy(&self, backup: &Path) -> std::io::Result<()> {
+        std::fs::create_dir_all(backup.join("files"))?;
+        for (n, (path, was)) in self.paths.iter().enumerate() {
+            let copy = self.copy_of(backup, n, path);
+            if let Some(parent) = copy.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            match was {
+                Was::Missing => {}
+                Was::Dir => std::fs::create_dir_all(&copy)?,
+                Was::File(b, _) => std::fs::write(&copy, b)?,
+                #[cfg(unix)]
+                Was::Link(t) => std::os::unix::fs::symlink(t, &copy)?,
+                #[cfg(not(unix))]
+                Was::Link(t) => std::fs::write(&copy, t.to_string_lossy().as_bytes())?,
+            }
+        }
+        if let Some((_, Some(b))) = &self.index {
+            std::fs::write(backup.join("index"), b)?;
+        }
+        Ok(())
+    }
+
+    /// Discard is done, or everything is back: the copy goes.
+    fn drop_copy(&self) {
+        if let Some(backup) = &self.backup {
+            let _ = std::fs::remove_dir_all(backup);
+            if let Some(parent) = backup.parent() {
+                let _ = std::fs::remove_dir(parent);
+            }
+        }
+    }
+
+    /// The index as it was, written as git writes it: into `index.lock`,
+    /// then renamed. Left alone while git holds the lock.
+    fn put_index(index: &Path, was: &Option<Vec<u8>>) -> Result<(), String> {
+        use std::io::Write;
+        let now = match std::fs::read(index) {
+            Ok(b) => Some(b),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(format!("cannot read it: {e}")),
+        };
+        if now == *was {
+            return Ok(());
+        }
+        let lock = git_lock(index);
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock)
+            .map_err(|e| format!("cannot lock it ({}): {e}", lock.display()))?;
+        let res = match was {
+            Some(b) => f
+                .write_all(b)
+                .and_then(|_| f.sync_all())
+                .and_then(|_| std::fs::rename(&lock, index)),
+            None => std::fs::remove_file(index).and_then(|_| std::fs::remove_file(&lock)),
+        };
+        if res.is_err() {
+            let _ = std::fs::remove_file(&lock);
+        }
+        res.map_err(|e| format!("cannot write it: {e}"))
+    }
+
+    /// Put everything back, then read it all again: what is still not as it
+    /// was, and why.
+    fn restore(&self) -> Vec<Left> {
+        let mut why: std::collections::HashMap<PathBuf, String> = Default::default();
+        let was: std::collections::HashMap<&Path, &Was> =
+            self.paths.iter().map(|(p, w)| (p.as_path(), w)).collect();
+        // What is in the module now and was not (or was something else),
+        // deepest first.
         let mut now = Vec::new();
-        all_files(&self.module, &mut now);
-        for p in now {
-            if !self.files.iter().any(|(q, _)| *q == p) {
-                let _ = std::fs::remove_file(p);
-            }
+        if let Err(e) = paths_under(&self.module, &mut now) {
+            why.insert(self.module.clone(), e);
         }
-        for (p, b) in &self.files {
-            if let Some(parent) = p.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let _ = std::fs::write(p, b);
-        }
-        for (p, b) in &self.others {
-            let _ = match b {
-                Some(b) => std::fs::write(p, b),
-                None => std::fs::remove_file(p),
+        for path in now.iter().rev() {
+            let Ok(m) = std::fs::symlink_metadata(path) else {
+                continue;
             };
+            let t = m.file_type();
+            let keep = match was.get(path.as_path()) {
+                Some(Was::Dir) => t.is_dir(),
+                Some(Was::File(..)) => t.is_file(),
+                Some(Was::Link(_)) => t.is_symlink(),
+                _ => false,
+            };
+            if !keep {
+                let res = if t.is_dir() {
+                    std::fs::remove_dir(path)
+                } else {
+                    std::fs::remove_file(path)
+                };
+                if let Err(e) = res {
+                    why.insert(path.clone(), format!("cannot remove it: {e}"));
+                }
+            }
         }
+        for (path, w) in &self.paths {
+            if let Err(e) = w.put(path) {
+                why.entry(path.clone()).or_insert(e);
+            }
+        }
+        let index_why = self
+            .index
+            .as_ref()
+            .and_then(|(index, was)| Rollback::put_index(index, was).err());
+        // Read back: only what is exactly as it was counts as put back.
+        let rel = |path: &Path| {
+            path.strip_prefix(&self.root)
+                .unwrap_or(path)
+                .display()
+                .to_string()
+        };
+        let mut left = Vec::new();
+        let mut now = Vec::new();
+        let listed = paths_under(&self.module, &mut now);
+        if let Err(e) = listed {
+            left.push(Left {
+                what: rel(&self.module),
+                why: e,
+                copy: None,
+            });
+        }
+        for path in now.iter().filter(|p| !was.contains_key(p.as_path())) {
+            left.push(Left {
+                what: rel(path),
+                why: why
+                    .remove(path)
+                    .unwrap_or_else(|| "was not there before Discard".into()),
+                copy: None,
+            });
+        }
+        for (n, (path, w)) in self.paths.iter().enumerate() {
+            if Was::read(path).ok().as_ref() != Some(w) {
+                left.push(Left {
+                    what: rel(path),
+                    why: why
+                        .remove(path)
+                        .unwrap_or_else(|| "is not as it was".into()),
+                    copy: self
+                        .backup
+                        .as_ref()
+                        .filter(|_| *w != Was::Missing)
+                        .map(|b| self.copy_of(b, n, path)),
+                });
+            }
+        }
+        if let Some((index, was)) = &self.index
+            && std::fs::read(index).ok() != *was
+        {
+            left.push(Left {
+                what: format!("the git index ({}, what is staged)", index.display()),
+                why: index_why.unwrap_or_else(|| "is not as it was".into()),
+                copy: self
+                    .backup
+                    .as_ref()
+                    .filter(|_| was.is_some())
+                    .map(|b| b.join("index")),
+            });
+        }
+        left
+    }
+
+    /// A failed Discard that could not put everything back: what is left
+    /// where.
+    fn report(&self, what: &str, left: &[Left]) -> String {
+        let mut msg = format!(
+            "{what} stopped halfway and could not put everything back. Not as it was before:"
+        );
+        for l in left {
+            msg.push_str(&format!("\n- {}: {}", l.what, l.why));
+            if let Some(c) = &l.copy {
+                msg.push_str(&format!("; as it was: {}", c.display()));
+            }
+        }
+        if let Some(b) = &self.backup {
+            msg.push_str(&format!(
+                "\nA copy of the module, lock, compiled config and git index as they were before \
+                 {what} is kept in {}. Copy back what is listed; the index only while no git \
+                 command runs.",
+                b.display()
+            ));
+        }
+        msg
     }
 }
 
@@ -4185,14 +4583,19 @@ impl Actions {
             in_head(out.clone()).await,
         );
         let snapshot = read_snapshot(dir).await;
-        // All or nothing: a step that fails puts back what the others did.
-        let rollback = Rollback::take(&p.module, &[&p.lock, &p.out]);
+        // All or nothing: a step that fails puts back what the others did,
+        // the index (what is staged) with the files. Nothing is touched
+        // unless all of it was read and copied.
+        let rollback = Rollback::take(dir, &p)
+            .await
+            .map_err(|e| format!("{e}\nNothing was discarded."))?;
         let mut kept = Vec::new();
         let steps = async {
             if module_in {
                 git(dir, &["checkout", "-q", "HEAD", "--", &module]).await?;
             }
             git(dir, &["clean", "-fdq", "--", &module]).await?;
+            discard_fault("module")?;
             let saved = snapshot.as_ref().map(|s| [&s.lock, &s.out]);
             for (i, (path, abs, committed)) in [(&lock, &p.lock, lock_in), (&out, &p.out, out_in)]
                 .into_iter()
@@ -4217,9 +4620,20 @@ impl Actions {
             Ok::<(), String>(())
         };
         if let Err(e) = steps.await {
-            rollback.restore();
-            return Err(format!("{e}\nNothing was discarded."));
+            let _ = discard_fault("restore");
+            let left = rollback.restore();
+            if left.is_empty() {
+                rollback.drop_copy();
+                return Err(format!(
+                    "{e}\nNothing was discarded: the module, lock, compiled config and git index \
+                     are as they were."
+                ));
+            }
+            // Neither the last compile nor the last commit is on disk now.
+            *self.compiled.lock().unwrap() = None;
+            return Err(format!("{e}\n{}", rollback.report("Discard", &left)));
         }
+        rollback.drop_copy();
         clear_snapshot(dir).await;
         // What vislox last compiled is not what is there now: the next check
         // compares by content, and names the files written after out.
@@ -8004,7 +8418,8 @@ esac
         assert!(!d.join("logic.lock.json").exists());
         assert!(!d.join("pages/vislox").exists());
 
-        // The lock was someone's before the edit; now it cannot be written.
+        // The lock was someone's before the edit; now it is a directory,
+        // which Discard cannot copy: refused before anything changes.
         std::fs::write(d.join("logic.lock.json"), "theirs").unwrap();
         a.edit(&req(blob(&d, "out.Loxone")), None).await.unwrap();
         let file = std::fs::read_to_string(d.join("pages/vislox/obergeschoss.loxl")).unwrap();
@@ -8018,6 +8433,269 @@ esac
             file
         );
         assert_eq!(std::fs::read(d.join("out.Loxone")).unwrap(), out);
+    }
+
+    /// A project with something pending to discard and, before it, a change
+    /// to a committed module file staged and another on top of it unstaged,
+    /// and a file outside the module staged. Returns the project directory.
+    #[cfg(unix)]
+    async fn staged_and_pending(tmp: &Path, a: &Actions) -> PathBuf {
+        lox_that_adds_blocks(tmp);
+        let d = tmp.join("project");
+        std::fs::write(d.join("pages/main.loxl"), "let a = 1\n").unwrap();
+        sh(&d, "git add pages/main.loxl && git commit -qm main");
+        std::fs::write(d.join("pages/main.loxl"), "let a = 2\n").unwrap();
+        std::fs::write(d.join("notes.txt"), "staged\n").unwrap();
+        sh(&d, "git add pages/main.loxl notes.txt");
+        std::fs::write(d.join("pages/main.loxl"), "let a = 3\n").unwrap();
+        a.edit(
+            &edit::Request {
+                base: blob(&d, "out.Loxone"),
+                ops: vec![edit::Op::AddBlock {
+                    page: "10000008-0000-0080-ffff504f94000001".into(),
+                    ty: "Or".into(),
+                    title: None,
+                    params: Default::default(),
+                    settings: Default::default(),
+                    wires: vec![],
+                    restores: None,
+                }],
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        d
+    }
+
+    /// Everything a Discard may change: the module's files, the lock, out,
+    /// and the index as git lists it and byte for byte.
+    #[cfg(unix)]
+    type DiscardState = (Vec<(PathBuf, Vec<u8>)>, String, Vec<u8>);
+
+    #[cfg(unix)]
+    fn discard_state(d: &Path) -> DiscardState {
+        let mut files = Vec::new();
+        let mut paths = Vec::new();
+        paths_under(&d.join("pages"), &mut paths).unwrap();
+        for p in paths
+            .into_iter()
+            .chain([d.join("logic.lock.json"), d.join("out.Loxone")])
+        {
+            if p.is_file() {
+                let b = std::fs::read(&p).unwrap();
+                files.push((p, b));
+            }
+        }
+        let staged = std::process::Command::new("git")
+            .args(["ls-files", "-s"])
+            .current_dir(d)
+            .output()
+            .unwrap();
+        (
+            files,
+            String::from_utf8(staged.stdout).unwrap(),
+            std::fs::read(d.join(".git/index")).unwrap(),
+        )
+    }
+
+    #[cfg(unix)]
+    fn staged_text(d: &Path, path: &str) -> String {
+        let o = std::process::Command::new("git")
+            .args(["show", &format!(":{path}")])
+            .current_dir(d)
+            .output()
+            .unwrap();
+        String::from_utf8(o.stdout).unwrap()
+    }
+
+    /// A Discard that fails after the module was checked out (#122): the
+    /// checkout had reset the index too; the staged change, the unstaged
+    /// one on top of it, the files vislox wrote, the lock and out all come
+    /// back, and the copy kept for it is gone. A Discard that works then
+    /// drops the module's staged change and leaves the index elsewhere alone.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_discard_puts_back_the_index_with_the_files() {
+        let (tmp, a) = project_for_edits();
+        let d = staged_and_pending(tmp.path(), &a).await;
+        let before = discard_state(&d);
+        assert!(d.join("pages/vislox").exists());
+        let fail: Fault = Box::new(|at| match at {
+            "module" => Err("injected after the checkout".into()),
+            _ => Ok(()),
+        });
+        let (_, msg) = DISCARD_FAULT.scope(fail, a.discard()).await.unwrap_err();
+        assert!(msg.contains("injected after the checkout"), "{msg}");
+        assert!(
+            msg.contains(
+                "Nothing was discarded: the module, lock, compiled config and git index are as \
+                 they were."
+            ),
+            "{msg}"
+        );
+        assert!(discard_state(&d) == before);
+        assert_eq!(staged_text(&d, "pages/main.loxl"), "let a = 2\n");
+        assert_eq!(
+            std::fs::read_to_string(d.join("pages/main.loxl")).unwrap(),
+            "let a = 3\n"
+        );
+        assert!(!d.join(".git/vislox-discard-backup").exists());
+
+        a.discard().await.unwrap();
+        assert_eq!(staged_text(&d, "pages/main.loxl"), "let a = 1\n");
+        assert_eq!(
+            std::fs::read_to_string(d.join("pages/main.loxl")).unwrap(),
+            "let a = 1\n"
+        );
+        assert_eq!(staged_text(&d, "notes.txt"), "staged\n");
+        assert!(!d.join("pages/vislox").exists());
+        assert!(!d.join(".git/vislox-discard-backup").exists());
+    }
+
+    /// When a failed Discard cannot put everything back, it says so, never
+    /// "Nothing was discarded": each path not as it was, why, and the copy
+    /// of it, which copied back restores what was staged.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_discard_that_cannot_put_everything_back_says_what_is_left_where() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root writes into a read-only directory
+        }
+        let (tmp, a) = project_for_edits();
+        let d = staged_and_pending(tmp.path(), &a).await;
+        let (_, _, index) = discard_state(&d);
+        let file = std::fs::read(d.join("pages/vislox/obergeschoss.loxl")).unwrap();
+        let pages = d.join("pages");
+        let lock = d.join(".git/index.lock");
+        let fail: Fault = Box::new(move |at| {
+            match at {
+                "module" => return Err("injected after the checkout".into()),
+                // pages/vislox cannot come back, nor the index.
+                "restore" => {
+                    std::fs::set_permissions(&pages, std::fs::Permissions::from_mode(0o555))
+                        .unwrap();
+                    std::fs::write(&lock, "").unwrap();
+                }
+                _ => {}
+            }
+            Ok(())
+        });
+        let (_, msg) = DISCARD_FAULT.scope(fail, a.discard()).await.unwrap_err();
+        std::fs::set_permissions(d.join("pages"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::remove_file(d.join(".git/index.lock")).unwrap();
+        assert!(!msg.contains("Nothing was discarded"), "{msg}");
+        assert!(
+            msg.contains("Discard stopped halfway and could not put everything back"),
+            "{msg}"
+        );
+        let backups: Vec<_> = std::fs::read_dir(d.join(".git/vislox-discard-backup"))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        let [backup] = &backups[..] else {
+            panic!("{backups:?}")
+        };
+        assert!(msg.contains(&backup.display().to_string()), "{msg}");
+        assert!(
+            msg.contains("- pages/vislox/obergeschoss.loxl: cannot write it"),
+            "{msg}"
+        );
+        assert!(msg.contains("- the git index ("), "{msg}");
+        assert!(msg.contains("cannot lock it"), "{msg}");
+        let copy = backup.join("files/pages/vislox/obergeschoss.loxl");
+        assert!(msg.contains(&copy.display().to_string()), "{msg}");
+        assert_eq!(std::fs::read(&copy).unwrap(), file);
+        assert_eq!(std::fs::read(backup.join("index")).unwrap(), index);
+        // The read-only directory kept main.loxl from coming back too.
+        let main = backup.join("files/pages/main.loxl");
+        assert!(msg.contains(&main.display().to_string()), "{msg}");
+        assert_eq!(std::fs::read_to_string(&main).unwrap(), "let a = 3\n");
+        // What it says to do brings back what was staged and what was not.
+        std::fs::copy(backup.join("index"), d.join(".git/index")).unwrap();
+        std::fs::create_dir_all(d.join("pages/vislox")).unwrap();
+        std::fs::copy(&copy, d.join("pages/vislox/obergeschoss.loxl")).unwrap();
+        std::fs::copy(&main, d.join("pages/main.loxl")).unwrap();
+        assert_eq!(staged_text(&d, "pages/main.loxl"), "let a = 2\n");
+        assert_eq!(staged_text(&d, "notes.txt"), "staged\n");
+        assert_eq!(
+            std::fs::read_to_string(d.join("pages/main.loxl")).unwrap(),
+            "let a = 3\n"
+        );
+    }
+
+    /// Discard reads and copies everything before it touches anything; what
+    /// it cannot read or copy refuses it, and nothing changes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_discard_that_cannot_take_its_copy_changes_nothing() {
+        use std::os::unix::fs::PermissionsExt;
+        let (tmp, a) = project_for_edits();
+        let d = staged_and_pending(tmp.path(), &a).await;
+        let before = discard_state(&d);
+        let refused = |msg: &str, what: &str| {
+            assert!(
+                msg.contains(what) && msg.ends_with("Nothing was discarded."),
+                "{msg}"
+            );
+            assert!(discard_state(&d) == before);
+            assert!(!d.join(".git/vislox-discard-backup").exists());
+        };
+        // A file of the module it cannot read.
+        if unsafe { libc::geteuid() } != 0 {
+            let f = d.join("pages/geheim.loxl");
+            std::fs::write(&f, "let g = 1\n").unwrap();
+            std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let (_, msg) = a.discard().await.unwrap_err();
+            assert_eq!(std::fs::read(d.join(".git/index")).unwrap(), before.2);
+            std::fs::remove_file(&f).unwrap();
+            refused(&msg, "geheim.loxl");
+        }
+        // git at work in the repository.
+        std::fs::write(d.join(".git/index.lock"), "").unwrap();
+        let (_, msg) = a.discard().await.unwrap_err();
+        std::fs::remove_file(d.join(".git/index.lock")).unwrap();
+        refused(&msg, "git is busy");
+        // No room for the copy.
+        std::fs::write(d.join(".git/vislox-discard-backup"), "").unwrap();
+        let (_, msg) = a.discard().await.unwrap_err();
+        std::fs::remove_file(d.join(".git/vislox-discard-backup")).unwrap();
+        refused(&msg, "cannot keep a copy");
+        a.discard().await.unwrap();
+        assert!(!d.join("pages/vislox").exists());
+    }
+
+    /// Putting the module back never writes through a symbolic link: a
+    /// linked directory comes back as the link, and the file it reaches,
+    /// changed meanwhile, is not rewritten.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_discard_never_writes_through_a_link() {
+        let (tmp, a) = project_for_edits();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("werte.loxl"), "let w = 1\n").unwrap();
+        let d = tmp.path().join("project");
+        std::os::unix::fs::symlink(&outside, d.join("pages/shared")).unwrap();
+        sh(&d, "git add -A && git commit -qm link");
+        let d = staged_and_pending(tmp.path(), &a).await;
+        let werte = outside.join("werte.loxl");
+        let fail: Fault = Box::new(move |at| {
+            match at {
+                "module" => return Err("injected".into()),
+                "restore" => std::fs::write(&werte, "let w = 2\n").unwrap(),
+                _ => {}
+            }
+            Ok(())
+        });
+        let (_, msg) = DISCARD_FAULT.scope(fail, a.discard()).await.unwrap_err();
+        assert!(msg.contains("Nothing was discarded"), "{msg}");
+        assert_eq!(
+            std::fs::read_to_string(outside.join("werte.loxl")).unwrap(),
+            "let w = 2\n"
+        );
+        assert_eq!(std::fs::read_link(d.join("pages/shared")).unwrap(), outside);
     }
 
     #[test]

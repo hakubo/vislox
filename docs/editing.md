@@ -201,7 +201,19 @@ vx_pulseat_1 = PulseAt(At: 07:05, Pulse: "time")
 - **Discard** puts the module, lock and out back to the last commit. A lock or out the last commit does not have
   (never committed, or ignored by git) goes back to how it was before vislox's first edit since that commit,
   which vislox keeps in the git directory; one vislox never edited stays as it is, since a lost lock re-mints
-  every managed block. Discard is all or nothing: when a step fails, it puts back what the others did.
+  every managed block.
+- **Discard is all or nothing (#122).** Before it changes anything, it reads the module (a symbolic link as the
+  link, never what it reaches), the lock, out and the git index byte for byte, and keeps a copy of them in the git
+  directory (`vislox-discard-backup/<project>-<time>/`: the files under `files/` by their path from the project
+  directory, the index as `index`). What it cannot read or copy refuses it, and so does git at work in the
+  repository (an `index.lock`); then *Nothing was discarded.* and nothing changed. When a step fails (`git
+  checkout` resets the index of the paths it checks out, so a change staged in the module would go with it), it
+  puts back the files and the whole index as they were, never writing through a link, and reads them all again:
+  *Nothing was discarded* only when everything is exactly as it was. Otherwise it says *Discard stopped halfway
+  and could not put everything back*, lists each path still not as it was, why, and its copy, and keeps the copy;
+  the index goes back only while no git command runs. The copy goes once Discard is done or everything is back.
+  A Discard that works resets what is staged for the files the last commit has in the module (and the lock and
+  out, when committed), as `git checkout HEAD` does; the index elsewhere in the repository is left as it is.
 
 ## New pages (#88)
 

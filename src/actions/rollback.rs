@@ -468,9 +468,22 @@ impl Actions {
         if p.module.is_file() {
             keep.push(&p.module);
         }
-        let guard = Rollback::take(&p.module, &keep);
+        let guard = match Rollback::files(&p.root, &p.module, &keep) {
+            Ok(g) => g,
+            Err(why) => {
+                return refuse(
+                    format!("{why}\nNothing was sent, and nothing changed."),
+                    StatusCode::CONFLICT,
+                );
+            }
+        };
         let fail = |why: String, status: StatusCode| {
-            guard.restore();
+            let left = guard.restore();
+            let why = if left.is_empty() {
+                why
+            } else {
+                format!("{why}\n{}", guard.report("Roll back", &left))
+            };
             *self.compiled.lock().unwrap() = None;
             self.end_with("rollback", &Err(why.clone()), None);
             Err((status, why))
