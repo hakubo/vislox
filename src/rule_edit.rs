@@ -154,8 +154,8 @@ fn block_of(files: &Files, lock: &Lock, slug: &str) -> String {
 }
 
 /// The UUID a mode name of a declaration names: a slug of the lockfile's, or
-/// a title of `doc`'s modes; else as written.
-fn mode_of(lock: &Lock, doc: Option<&LoxoneDoc>, m: &ModeName) -> String {
+/// a title of `modes` (a config's, read once); else as written.
+fn mode_of(lock: &Lock, modes: &[(String, String)], m: &ModeName) -> String {
     match m {
         ModeName::Slug(s) => lock
             .slugs
@@ -163,14 +163,13 @@ fn mode_of(lock: &Lock, doc: Option<&LoxoneDoc>, m: &ModeName) -> String {
             .or_else(|| lock.externals.get(s))
             .map(|u| u.to_ascii_lowercase())
             .unwrap_or_else(|| s.clone()),
-        ModeName::Title(t) => doc
-            .and_then(|d| {
-                let modes = rules::modes(d);
-                let mut f = modes.iter().filter(|(_, x)| x == t);
-                let first = f.next()?.0.clone();
-                f.next().is_none().then_some(first)
-            })
-            .unwrap_or_else(|| rules::quote(t)),
+        ModeName::Title(t) => {
+            let mut f = modes.iter().filter(|(_, x)| x == t);
+            match (f.next(), f.next()) {
+                (Some(first), None) => first.0.clone(),
+                _ => rules::quote(t),
+            }
+        }
     }
 }
 
@@ -183,6 +182,7 @@ pub fn current(files: &Files, lock: &Lock, doc: Option<&LoxoneDoc>, slug: &str) 
 }
 
 fn val_of(files: &Files, lock: &Lock, doc: Option<&LoxoneDoc>, c: &RuleClaim) -> RuleVal {
+    let modes = doc.map(rules::modes).unwrap_or_default();
     let decl = loxone_config::logic::RuleDecl {
         slug: String::new(),
         title: None,
@@ -200,7 +200,7 @@ fn val_of(files: &Files, lock: &Lock, doc: Option<&LoxoneDoc>, c: &RuleClaim) ->
         end_comment: None,
     };
     rules::lines_of(&decl, &|s| block_of(files, lock, s), &|m| {
-        mode_of(lock, doc, m)
+        mode_of(lock, &modes, m)
     })
 }
 
@@ -259,6 +259,12 @@ pub fn normalized(v: &RuleVal) -> RuleVal {
                 *mode = mode.to_ascii_lowercase()
             }
             Line::Weather { value, .. } => *value = norm_value(value),
+            // A day of the month as lox writes it: `05` is `5`.
+            Line::Day { value, .. } => {
+                if let Ok(n) = value.trim().parse::<u32>() {
+                    *value = n.to_string();
+                }
+            }
             Line::Weekday { days } => *days = canonical_days(days),
             Line::Time { at } => {
                 if let Some((h, m)) = at.split_once(':')
@@ -277,12 +283,13 @@ fn title_of(doc: &LoxoneDoc, uuid: &str) -> String {
     crate::adopt::name_in(doc, uuid)
 }
 
-/// The rules of `doc` titled `t`, case aside.
-fn titled(doc: &LoxoneDoc, t: &str) -> usize {
+/// The rules of `doc` titled `t`, case aside, but for the rule `except`.
+fn titled(doc: &LoxoneDoc, t: &str, except: Option<&str>) -> usize {
     doc.objects()
         .iter()
         .filter(|o| {
             o.block_type == rules::RULE
+                && !except.is_some_and(|u| u.eq_ignore_ascii_case(&o.uuid))
                 && o.title
                     .as_deref()
                     .is_some_and(|x| x.trim().eq_ignore_ascii_case(t.trim()))
@@ -359,7 +366,9 @@ fn body_of(
                 .iter()
                 .find(|(x, _)| *x == u)
                 .ok_or_else(|| format!("the config has no operating mode {m}"))?;
-            // A mode the module declares or externs is named by its slug.
+            // A mode the module declares or externs is named by its slug (lox
+            // refuses its title then): one of vislox's files by its slug, one of
+            // the module's own is refused, as a block of the module is.
             if let Some((s, _)) = ctx
                 .lock
                 .slugs
@@ -367,7 +376,16 @@ fn body_of(
                 .chain(&ctx.lock.externals)
                 .find(|(_, x)| x.eq_ignore_ascii_case(&u))
             {
-                return Ok(s.clone());
+                let ours =
+                    files.block(s).is_some() || files.claims.0.keys().any(|k| edit::slug(k) == *s);
+                if ours {
+                    return Ok(s.clone());
+                }
+                return Err(format!(
+                    "the operating mode \"{title}\" is named `{s}` by the module, and vislox's files \
+                     name only their own modes and Loxone Config's; write this rule in the module's \
+                     own file"
+                ));
             }
             let same = modes.iter().filter(|(_, t)| t == title).count();
             if same > 1 {
@@ -554,14 +572,19 @@ pub fn apply(
     Ok(done(previous))
 }
 
-/// A name for a new rule: one line, not empty, no other rule's (case
-/// aside), so that lox creates it rather than takes another.
+/// A name for a rule created here: one line, not empty, no other rule's
+/// (case aside), so that lox creates it rather than takes another. The rule
+/// itself (`except`: its slug, and its UUID in the configs) is no other.
 fn check_title(
     files: &Files,
     ctx: &Ctx,
     title: &str,
-    except: Option<&str>,
+    except: Option<(&str, Option<&str>)>,
 ) -> Result<String, String> {
+    let (except, except_uuid) = match except {
+        Some((s, u)) => (Some(s), u),
+        None => (None, None),
+    };
     let t = title.trim();
     if t.is_empty() {
         return Err("a new rule needs a name".into());
@@ -569,7 +592,7 @@ fn check_title(
     if t.contains(['\n', '\r']) || t.chars().count() > 120 {
         return Err("a rule's name is one line of at most 120 characters".into());
     }
-    if titled(ctx.doc, t) > 0 || titled(ctx.base, t) > 0 {
+    if titled(ctx.doc, t, except_uuid) > 0 || titled(ctx.base, t, except_uuid) > 0 {
         return Err(format!(
             "the config has a rule named \"{t}\" already: lox would take that rule instead of \
              creating one"
@@ -649,10 +672,11 @@ pub fn rename(
         return Err("a rule created here keeps a name".into());
     };
     let same = before.as_deref().is_some_and(|b| b.trim() == title.trim());
+    let uuid = ctx.lock.rules.get(slug).map(String::as_str);
     let t = if same {
         title.trim().to_string()
     } else {
-        check_title(files, ctx, title, Some(slug))?
+        check_title(files, ctx, title, Some((slug, uuid)))?
     };
     files.claims.9.claims.get_mut(slug).expect("checked").title = Some(t);
     Ok(Applied {
@@ -783,10 +807,15 @@ pub fn restore(
             }
         }
     }
-    let t = title.trim();
-    if t.is_empty() || t.contains(['\n', '\r']) {
-        return Err("a rule created here keeps a name of one line".into());
-    }
+    // Its name may have gone to another rule meanwhile: two rules of one name
+    // would make lox take the other.
+    let t = check_title(files, ctx, title, Some((slug, Some(uuid)))).map_err(|e| {
+        format!(
+            "the rule \"{}\" cannot come back under its name: {e}. Rename the other rule first",
+            title.trim()
+        )
+    })?;
+    let t = t.as_str();
     let (body, externs) = body_of(files, ctx, t, value)?;
     add_externs(files, externs);
     files.claims.9.removed.remove(slug);
@@ -908,15 +937,64 @@ pub fn edits_section(
                 "deployed_title": sw.and_then(|s| was.claims.9.claims.get(s)).and_then(|c| c.title.clone()),
                 "missing": edit::find_ci(&doc.xml.root, &u).is_none(),
                 "pending": match (&rp, &rd) {
+                    // What it does, and its name (a rule created here is renamed here).
                     (Some(p), Some(d)) => read_norm(p, &u) != read_norm(d, &u)
-                        || edit::find_ci(&pending.expect("read").xml.root, &u).is_some()
-                            != edit::find_ci(&deployed.expect("read").xml.root, &u).is_some(),
+                        || rule_title(pending, &u) != rule_title(deployed, &u),
                     (Some(_), None) => true,
                     (None, _) => false,
                 },
             })
         })
         .collect()
+}
+
+/// The name of the rule `uuid` in `doc`, `None` when `doc` has no such rule.
+fn rule_title(doc: Option<&LoxoneDoc>, uuid: &str) -> Option<Option<String>> {
+    let el = edit::find_ci(&doc?.xml.root, uuid)?;
+    Some(el.attr_decoded("Title").map(|t| t.into_owned()))
+}
+
+/// After the compile: the rules created here that the request created,
+/// brought back or renamed (`new_rule` by the slug it `added`, `restore_rule`,
+/// `title`) and the config does not have as vislox's file states them, name
+/// and lines.
+pub fn missed_ops(
+    files: &Files,
+    out: &LoxoneDoc,
+    lock: &Lock,
+    ops: &[Op],
+    added: &[Option<String>],
+) -> Vec<String> {
+    let slugs: BTreeSet<String> = ops
+        .iter()
+        .zip(added.iter().chain(std::iter::repeat(&None)))
+        .filter_map(|(op, a)| match op {
+            Op::NewRule { .. } => a.clone(),
+            Op::RestoreRule { slug, .. } => Some(slug.clone()),
+            Op::Title { uuid, .. } => created_slug(files, lock, uuid),
+            _ => None,
+        })
+        .collect();
+    if slugs.is_empty() {
+        return Vec::new();
+    }
+    let read = rules::read(out);
+    let mut bad = Vec::new();
+    for slug in slugs {
+        let Some(c) = files.claims.9.claims.get(&slug) else {
+            continue;
+        };
+        let want = normalized(&val_of(files, lock, Some(out), c));
+        let uuid = lock.rules.get(&slug).map(|u| u.to_ascii_lowercase());
+        let ok = uuid.as_deref().is_some_and(|u| {
+            read_norm(&read, u) == Some(want.clone())
+                && rule_title(Some(out), u).flatten().as_deref() == c.title.as_deref()
+        });
+        if !ok {
+            bad.push(c.title.clone().unwrap_or(slug));
+        }
+    }
+    bad
 }
 
 /// `GET /api/edits`' `rule_edit`: per rule of `doc`, null when vislox may
@@ -1161,5 +1239,13 @@ mod tests {
         assert_eq!(norm_value("on"), "1");
         assert_eq!(norm_value("1.0"), "1");
         assert_eq!(norm_value("off"), norm_value("0"));
+        let day = |v: &str| RuleVal {
+            active: true,
+            lines: vec![Line::Day {
+                op: "==".into(),
+                value: v.into(),
+            }],
+        };
+        assert_eq!(normalized(&day("05")), normalized(&day("5")));
     }
 }

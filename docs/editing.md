@@ -740,29 +740,36 @@ end
   time). A block the module manages is refused (vislox's files name only their own blocks and Loxone Config's), and so
   is a rule the module's own files state (`managed::rule_claims`, sent as `rule_claims`), one the module declares by
   name, and one Lox Logic cannot write. Weekdays are written in their shortest words (`weekdays`, `weekend`, `daily`),
-  as lox lifts them, and a mode is spelled as lox takes it in a rule: the slug the module names it by, else its quoted
-  title (a title two modes share is refused).
+  as lox lifts them. A mode is spelled as lox takes it in a rule: a mode of vislox's files by its slug, any other mode
+  the module neither declares nor externs by its quoted title (a title two modes share is refused); one the module
+  names by a slug of its own is refused (lox would refuse its title, and vislox's files name only their own modes and
+  Loxone Config's). A message's severity is `info`, `warning`, `important` or `critical` (lox 0.83's parser).
 - **Checked by lox when it compiles**: each block's states and commands against the app's capability table per control
   type, plus the commands a rule of the config already sends. lox's refusal lists what the block offers; vislox cannot
   read that table, so the form only suggests the states and commands the config's rules already use on blocks of the
   same type (`rule_edit.offers`).
 - **Checked after the compile.** The pending config must read, for each rule the request stated, as its declaration
   (`rule_edit::missed`, compared after normalizing: UUIDs lowercase, weekday words, `on`/`off` as 1/0, a time's two
-  digits); otherwise the edit is refused and the files, lock and out are put back.
+  digits, a day of the month as a number); and each rule a request created, brought back or renamed must be in it under
+  its name and with its lines (`rule_edit::missed_ops`). Otherwise the edit is refused and the files, lock and out are
+  put back.
 - **A new rule** is `{ "op": "new_rule", "title": "…", "value": {…} }`: `rule vx_rule_<n> "Title"`, which lox creates
   below the config's last rule and files like it, and pins in the lockfile's `rules`. Its name is one line and no
-  other rule's (compared case-blind: lox would take that rule instead of creating one), and its body a condition and
+  other rule's (compared case-blind: lox would take that rule instead of creating one; a rule's own name, in the base
+  too, is no other's, so a rename and its undo or Revert, or a change of case, go through), and its body a condition and
   an action at least (lox's checker refuses an empty one). A config without any rule cannot get one: the app decides
   where rules live (`rule_edit.create` says so). Its name is the source's: a `title` op renames it. `remove_block` of
   it drops the declaration while the base lacks it (`previous`: the `new_rule` that creates it again), else writes
   `removed vx_rule_<n>` (`previous`: the `restore_rule` with its slug, name and lines, which puts the declaration and the
-  lock's pin back, taken out of lox's tombstone; it is routed by the tombstone's type, never by the request). A rule
+  lock's pin back, taken out of lox's tombstone; it is routed by the tombstone's type, never by the request, and refused
+  while another rule has its name). The reply's `added` names the rule an undone delete creates again next to the UUID
+  it had (`restores`), as for a block, and the browser follows it in its history. A rule
   whose output feeds a block in the pending config is not deleted (lox refuses it too). The `removed` lines lox needs
   no more are dropped as for blocks (`Files::tidy`).
 - **Not deployed and Revert.** `GET /api/edits` sends `rules`: per rule vislox's file states now or stated in the
   deployed revision, `value`, `deployed` (what Revert sends), `created` (its slug and name, for a rule created here),
   `deployed_title`, `missing` and `pending` (the pending config's rule reads otherwise than the deployed one's,
-  compared as above); and `rule_edit`: per rule of the config shown, null when vislox may state it, else why not.
+  compared as above, or has another name); and `rule_edit`: per rule of the config shown, null when vislox may state it, else why not.
 
 The browser: *Rule* in Properties of a rule, on any revision. On the newest config, *Edit rule* opens the lines: *Active*,
 each line's kind and fields, ↑ ↓ ✕, *Add condition*, *Add “or”*, *Add action*; a block is picked with the Ctrl+K picker

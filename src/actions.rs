@@ -2424,7 +2424,20 @@ impl Actions {
                     | edit::Op::Rename { .. }
             )
         });
-        let out_doc = if !place.moves.is_empty() || !written.is_empty() || adopting || lifecycle {
+        // A rule created, brought back or renamed here (#87) is checked too.
+        let rule_ops = req.ops.iter().any(|o| match o {
+            edit::Op::NewRule { .. } | edit::Op::RestoreRule { .. } => true,
+            edit::Op::Title { uuid, .. } => {
+                crate::rule_edit::created_slug(&files, &lock, uuid).is_some()
+            }
+            _ => false,
+        });
+        let out_doc = if !place.moves.is_empty()
+            || !written.is_empty()
+            || adopting
+            || lifecycle
+            || rule_ops
+        {
             Some(
                 std::fs::read(&p.out)
                     .map_err(|e| fail(e.to_string()))
@@ -2456,6 +2469,15 @@ impl Actions {
                         missed.join(", ")
                     )));
                 }
+            }
+        }
+        if let (true, Some(out)) = (rule_ops, &out_doc) {
+            let missed = crate::rule_edit::missed_ops(&files, out, &lock, &req.ops, &slugs);
+            if !missed.is_empty() {
+                return Err(fail(format!(
+                    "lox logic compile did not write the rule {}",
+                    missed.join(", ")
+                )));
             }
         }
         if let (true, Some(out)) = (lifecycle, &out_doc) {
@@ -2546,7 +2568,13 @@ impl Actions {
             .filter_map(|(op, s)| {
                 let s = s.as_deref()?;
                 let mut a = json!({ "slug": s, "uuid": uuid_of(s) });
+                // What it brings back under a new UUID (a block, or a rule
+                // created here, #87): the browser renames it in its history.
                 if let edit::Op::AddBlock {
+                    restores: Some(was),
+                    ..
+                }
+                | edit::Op::NewRule {
                     restores: Some(was),
                     ..
                 } = op

@@ -415,8 +415,11 @@ fn rule_info(
             why: None,
         },
         Read::Not(why) => RuleInfo {
-            // `STA` follows `active`.
-            active: c.el(uuid).is_some_and(|e| e.attr("STA").is_some()),
+            // `STA` follows `active`: `STA="1"`, absent when inactive.
+            active: c
+                .el(uuid)
+                .and_then(|e| e.attr("STA"))
+                .is_some_and(|v| !matches!(v.trim(), "" | "0")),
             value: None,
             why: Some(why.clone()),
             summary: "Read-only: Lox Logic cannot write this rule".into(),
@@ -425,15 +428,23 @@ fn rule_info(
     }
 }
 
-/// Every rule of `c` read (#87), with its compared revision's when that
-/// differs. Only a config with rules is read (lox's decompile).
-fn rule_infos(c: &Ctx, oc: Option<&Ctx>) -> HashMap<String, (RuleInfo, Option<RuleInfo>)> {
+/// Every rule of `c` read (#87) as `new` has it, with its compared revision's
+/// (`oc`, read as `old`) when that differs. Each config is read once (lox's
+/// decompile, only for a config with rules).
+fn rule_infos(
+    c: &Ctx,
+    new: &BTreeMap<String, crate::rules::Read>,
+    oc: Option<(&Ctx, &BTreeMap<String, crate::rules::Read>)>,
+) -> HashMap<String, (RuleInfo, Option<RuleInfo>)> {
     let mut out = HashMap::new();
-    let new = crate::rules::read(c.doc);
     if new.is_empty() {
         return out;
     }
-    let old = oc.map(|o| crate::rules::read(o.doc)).unwrap_or_default();
+    let none = BTreeMap::new();
+    let (oc, old) = match oc {
+        Some((o, r)) => (Some(o), r),
+        None => (None, &none),
+    };
     let lc = |c: &Ctx| -> HashMap<String, String> {
         c.els
             .keys()
@@ -445,7 +456,7 @@ fn rule_infos(c: &Ctx, oc: Option<&Ctx>) -> HashMap<String, (RuleInfo, Option<Ru
         crate::rules::Read::Rule(v) => crate::rules::Read::Rule(crate::rule_edit::normalized(v)),
         other => other.clone(),
     };
-    for (lu, r) in &new {
+    for (lu, r) in new {
         let Some(u) = nlc.get(lu) else { continue };
         let info = rule_info(c, &nlc, u, r);
         let was = oc.and_then(|o| {
@@ -1906,16 +1917,24 @@ pub fn build(new: &LoxoneDoc, old: Option<&LoxoneDoc>, title: &str) -> View {
     }
 
     // Automatic Designer rules (#87), read by lox's decompile.
-    let mut rules = rule_infos(&nc, oc.as_ref().filter(|_| d.on));
-    // The rules of the compared revision this one lost, read only when there are any.
-    let mut gone_rules = match &oc {
-        Some(oc)
-            if oc.order.iter().any(|u| {
-                !nc.els.contains_key(u)
-                    && oc.el(u).and_then(|e| e.attr("Type")) == Some(crate::rules::RULE)
-            }) =>
-        {
-            rule_infos(oc, None)
+    // Each config read once: the compared one serves the comparison and the
+    // rules this one lost.
+    let new_rules = crate::rules::read(nc.doc);
+    let old_rules = oc.as_ref().map(|o| crate::rules::read(o.doc));
+    let mut rules = rule_infos(
+        &nc,
+        &new_rules,
+        oc.as_ref().filter(|_| d.on).zip(old_rules.as_ref()),
+    );
+    let mut gone_rules = match (&oc, &old_rules) {
+        (Some(oc), Some(r)) => {
+            let here: HashSet<String> = new_rules.keys().cloned().collect();
+            let gone: BTreeMap<String, crate::rules::Read> = r
+                .iter()
+                .filter(|(u, _)| !here.contains(*u))
+                .map(|(u, x)| (u.clone(), x.clone()))
+                .collect();
+            rule_infos(oc, &gone, None)
         }
         _ => HashMap::new(),
     };
@@ -4904,6 +4923,14 @@ mod tests {
         // One Lox Logic cannot write is read-only, and says why.
         let odd = v.objects[RULE_ODD].rule.as_ref().unwrap();
         assert!(odd.value.is_none() && odd.why.is_some() && odd.active);
+        // Its state is STA's value, not whether the attribute is there.
+        let off = house().replace(
+            &format!("U=\"{RULE_ODD}\" Title=\"Ansage\" Px=\"960\" Py=\"2880\" Px2=\"2304\" Py2=\"3576\" Nio=\"1\" APC=\"{}\" STA=\"1\"", rule_odd_apc()),
+            &format!("U=\"{RULE_ODD}\" Title=\"Ansage\" Px=\"960\" Py=\"2880\" Px2=\"2304\" Py2=\"3576\" Nio=\"1\" APC=\"{}\" STA=\"0\"", rule_odd_apc()),
+        );
+        assert_ne!(off, house());
+        let v0 = build(&LoxoneDoc::parse(off.as_bytes()).unwrap(), None, "");
+        assert!(!v0.objects[RULE_ODD].rule.as_ref().unwrap().active);
         let texts: Vec<&str> = v.changes.iter().map(|c| c.text.as_str()).collect();
         assert!(
             texts.contains(&"Pumpe Ein · active → inactive"),

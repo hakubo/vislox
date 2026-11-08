@@ -3329,10 +3329,28 @@ try {
     const made = await page.evaluate(() => S.sel);
     await waitText(sec, /At 08:00: Brunnenpumpe: on/);
     await waitText(sec, /Created here as vx_rule_1/);
+    // Edited, deleted, then both undone: it comes back under a new UUID, and the history follows it.
+    await page.click(`${sec} [data-ru="open"]`);
+    await page.check(`${sec} [data-ru-f="active"]`);
+    ops = await send(() => page.click(`${sec} [data-ru="save"]`), "edit the new rule");
+    assert.equal(ops[0].op, "rule");
+    assert.equal(ops[0].value.active, true);
     ops = await send(() => page.click(`${sec} [data-ru="delete"]`), "delete the new rule");
     assert.deepEqual(ops, [{ op: "remove_block", uuid: made }]);
     assert.doesNotMatch(file(), /vx_rule_1/);
     await page.waitForFunction((u) => !S.view.objects[u], made, { timeout: 10000 });
+    const titled = () => Object.values(S.view.objects).find((x) => x.title === "Pumpe Mittag" && x.status !== "removed");
+    ops = await undoKey(false, () => Object.values(S.view.objects).find((x) => x.title === "Pumpe Mittag" && x.status !== "removed")?.rule?.active === true);
+    assert.equal(ops[0].op, "new_rule");
+    assert.equal(ops[0].restores, made);
+    const again = await page.evaluate(`(${titled})()?.uuid`);
+    assert.ok(again && again !== made, again);
+    ops = await undoKey(false, (u) => S.view.objects[u]?.rule?.active === false, again);
+    assert.deepEqual(ops.map((o) => [o.op, o.uuid]), [["rule", again]]);
+    // And the creation itself.
+    ops = await undoKey(false, (u) => !S.view.objects[u], again);
+    assert.deepEqual(ops, [{ op: "remove_block", uuid: again }]);
+    assert.doesNotMatch(file(), /vx_rule_1/);
   });
   await step("nothing was deployed: lox only compiled, checked, linted and tested", async () => {
     const ran = readFileSync(calls, "utf8").trim().split("\n");

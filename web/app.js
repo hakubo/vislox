@@ -5139,6 +5139,8 @@ function ruField(i, f, label, value, attrs = "") {
   return `<label class="ru-f"><span>${esc(label)}</span><input type="text" data-ru-f="${f}" data-ru-field="${f}:${i}" data-i="${i}" value="${esc(value ?? "")}"${attrs}></label>`;
 }
 function ruSelect(i, f, label, value, opts) {
+  // A value the config has that the list lacks is still shown, and kept.
+  if (value != null && value !== "" && !opts.some(([v]) => v === value)) opts = [...opts, [value, `${value} (as written)`]];
   return `<label class="ru-f"><span>${esc(label)}</span><select data-ru-f="${f}" data-ru-field="${f}:${i}" data-i="${i}">${opts.map(([v, t]) => `<option value="${esc(v)}"${v === value ? " selected" : ""}>${esc(t)}</option>`).join("")}</select></label>`;
 }
 /** The fields of one line of the draft. */

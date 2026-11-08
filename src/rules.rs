@@ -119,7 +119,8 @@ pub const WEATHER: &[&str] = &[
     "sunshine",
 ];
 /// A message's severities.
-pub const SEVERITIES: &[&str] = &["info", "warning", "error"];
+/// lox 0.83's parser takes these (`logic::rule::severity`).
+pub const SEVERITIES: &[&str] = &["info", "warning", "important", "critical"];
 
 impl Line {
     /// A condition (or the `or` between groups), not an action.

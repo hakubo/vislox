@@ -12633,6 +12633,25 @@ mod tests {
             assert!(e.contains(says), "{e}");
             assert_eq!(files, was);
         }
+        // A mode the module names by its own slug is the module's to name.
+        let mut moded = lock_of(&l);
+        moded.externals.insert("party".into(), PARTY.into());
+        let e = apply_op(
+            &mut files.clone(),
+            &ctx_of(&out, &d, &moded, None, &names),
+            &rule_op(
+                RULE_OFF,
+                v(vec![
+                    Line::Mode {
+                        mode: PARTY.into(),
+                        on: true,
+                    },
+                    on.clone(),
+                ]),
+            ),
+        )
+        .unwrap_err();
+        assert!(e.contains("named `party` by the module"), "{e}");
         // A command the block does not offer is lox's to refuse, with the
         // commands it offers.
         let mut bad = files.clone();
@@ -12722,6 +12741,16 @@ mod tests {
             read_rule(&out, &uuid),
             Some(crate::rule_edit::normalized(&body))
         );
+        // Checked after the compile: the rule created as stated, and one the
+        // config lacks named.
+        let made = [new("Pumpe Mittag", Some(body.clone()))];
+        let added = [Some("vx_rule_1".to_string())];
+        let pinned = lock_of(&l);
+        assert!(crate::rule_edit::missed_ops(&files, &out, &pinned, &made, &added).is_empty());
+        assert_eq!(
+            crate::rule_edit::missed_ops(&files, &d, &pinned, &made, &added),
+            ["Pumpe Mittag"]
+        );
         // The undo of creating it is removing it.
         assert_eq!(
             undo_ops(
@@ -12746,10 +12775,43 @@ mod tests {
         )
         .unwrap();
         assert_eq!(a.previous, serde_json::json!("Pumpe Mittag"));
+        let before = out.clone();
         let out = compile_files(&d, &files, &mut l).unwrap();
         assert_eq!(
             find(&out.xml.root, &uuid).and_then(|e| e.attr("Title")),
             Some("Pumpe Mittags")
+        );
+        // Only renamed: pending all the same, so it shows Revert and counts.
+        let lock = lock_of(&l);
+        let was = Files::from_texts(&files.render()).map(|mut f| {
+            f.claims.9.claims.get_mut("vx_rule_1").unwrap().title = Some("Pumpe Mittag".into());
+            f
+        });
+        let section = crate::rule_edit::edits_section(
+            &files,
+            &was.unwrap(),
+            &lock,
+            Some(&out),
+            Some(&before),
+        );
+        assert_eq!(section[0]["pending"], true);
+        assert_eq!(section[0]["deployed_title"], "Pumpe Mittag");
+        // Deployed under that name, renamed, then renamed back (an undo, a
+        // Revert) or in another case only: its own name is no other rule's.
+        let ctx = ctx_of(&out, &out, &lock, None, &names);
+        let mut renamed = files.clone();
+        let title = |v: &str| Op::Title {
+            uuid: uuid.clone(),
+            value: Some(v.into()),
+        };
+        apply_op(&mut renamed, &ctx, &title("Pumpe Abends")).unwrap();
+        apply_op(&mut renamed, &ctx, &title("Pumpe Mittags")).unwrap();
+        apply_op(&mut renamed, &ctx, &title("pumpe mittags")).unwrap();
+        // Another rule's name stays refused.
+        assert!(
+            apply_op(&mut renamed, &ctx, &title("Pumpe Ein"))
+                .unwrap_err()
+                .contains("already")
         );
 
         // Not deployed yet (the base lacks it): taken out, and its undo creates
@@ -12793,6 +12855,18 @@ mod tests {
             .unwrap_err()
             .contains("no deleted rule")
         );
+        // Not under a name another rule has taken meanwhile.
+        let taken = String::from_utf8(out.to_bytes())
+            .unwrap()
+            .replace("Title=\"Pumpe Ein\"", "Title=\"Pumpe Mittags\"");
+        let taken = LoxoneDoc::parse(taken.as_bytes()).unwrap();
+        let e = apply_op(
+            &mut files.clone(),
+            &ctx_of(&taken, &base, &lock, None, &names),
+            &back,
+        )
+        .unwrap_err();
+        assert!(e.contains("cannot come back under its name"), "{e}");
         let ctx = ctx_of(&out, &base, &lock, None, &names);
         let a = apply_op(&mut files, &ctx, &back).unwrap();
         assert_eq!(
