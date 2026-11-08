@@ -34,6 +34,29 @@ pub const SLUG_PREFIX: &str = "vx_";
 /// The argument that says which object a ref mirrors (`mirrors: frost`).
 pub const MIRRORS: &str = "mirrors";
 
+/// Arguments whose bare names are object values, rather than wired outputs.
+pub fn value_ref_arg(key: &str) -> bool {
+    [
+        MIRRORS,
+        crate::periphery::DEVICE,
+        crate::calendar_edit::SWITCHES,
+    ]
+    .contains(&key)
+}
+
+/// Object values vislox must keep pinned while a declaration names them.
+pub fn value_refs(b: &NewBlock) -> impl Iterator<Item = &str> {
+    b.args.iter().filter_map(|(k, v)| match v {
+        Value::Ref(n)
+            if value_ref_arg(k)
+                && (k != crate::calendar_edit::SWITCHES || n.starts_with(SLUG_PREFIX)) =>
+        {
+            Some(n.as_str())
+        }
+        _ => None,
+    })
+}
+
 /// A push notification drawn on a page (#77): the block, and the object of
 /// Loxone Config's *Messages* it mirrors. Not in lox's builtin table (it is a
 /// ref), so not in the palette's list of types; added with `mirrors:`.
@@ -654,9 +677,7 @@ impl PageFile {
                                 port,
                                 kind: BindingKind::Param(v @ Value::Ref(_)),
                                 ..
-                            }) if port == MIRRORS || port == crate::periphery::DEVICE => {
-                                args.push((port.clone(), v.clone()))
-                            }
+                            }) if value_ref_arg(port) => args.push((port.clone(), v.clone())),
                             // A bare name of vislox's on an adopted block: the
                             // default output of the object it names, unless it
                             // is one of vislox's constants (#81). Any other bare

@@ -196,3 +196,5 @@ that does not match `Cargo.toml`.
 ## Licence
 
 [MIT](LICENSE)
+
+User modes, calendar entries and virtual or Modbus objects made in Loxone Config can be adopted into vislox from Properties, then edited here. Adoption keeps their UUIDs and stays pending until Apply.

@@ -289,8 +289,7 @@ unchanged in memory. lox has no structured edit command, so vislox works on what
 - **The slug** is `vx_` and lowercase letters, digits and `_` (vislox's files hold only `vx_` names), not taken by
   the module, its lockfile (tombstones too) or vislox's files; left empty, vislox makes one from the block's name
   (`Licht Küche` → `vx_licht_kueche`), else its type.
-- **Not offered** (`adopt` in `GET /api/edits`: UUID → null, or why): a block not on a logic page (devices and
-  the object tree are #84 and #85), of a type lox has no table for (notes, …), not in the base, on another page
+- **Not offered** (`adopt` in `GET /api/edits`: UUID → null, or why): an object outside the supported page and periphery types, of a type lox has no table for (notes, …), not in the base, on another page
   than in the base, with values or wires vislox's edits claim (revert them first: lox would move those lines into
   the declaration), an extern of the module's own files (lox adopts it only under that name and rewrites those
   files). lox's own refusals (a block version or attribute its rebuild does not know, a wire into a
@@ -326,6 +325,25 @@ unchanged in memory. lox has no structured edit command, so vislox works on what
 
 Later: taking out a wire an adopted declaration brought along is left to a later step. Its label and settings are
 edited as for a block added here (#79, see *Block settings*); it is deleted and renamed as #80 says.
+
+
+### Objects of the object tree (#86)
+
+Objects made in Loxone Config offer **Adopt into vislox** in Properties: user operating modes,
+calendar entries, virtual inputs and outputs, and virtual or Modbus devices with their I/O.
+vislox runs `lox logic adopt --uuid` on a scratch copy, moves the declarations into
+`<module>/vislox/_periphery.loxl`, and verifies that the compiled config keeps the same objects,
+UUIDs, connectors and values. The existing editors then edit them.
+
+Handing back a device includes its adopted descendants, so Undo can restore the whole group.
+Adopting a mode rewrites calendar entries in vislox's files from the mode's title to its slug;
+handing the mode back reverses those references.
+
+Adoption is pending: Changes lists it with Revert, and Apply names it in its review. Undo an edit
+before undoing adoption; Revert on the adoption hands ownership back once its changes are reverted.
+Adopting never deploys. Only Apply, after confirmation, deploys and commits the ownership change.
+Built-in operating modes and weekday-in-month calendar entries stay read-only; Lox Logic cannot
+write the latter. lox may refuse other objects it cannot rebuild exactly, with its reason shown.
 
 ## Deleting and renaming managed blocks (#80)
 
@@ -769,9 +787,8 @@ vx_calendarentry_3 = CalendarEntry("Fasching", switches: "Party", easter: -47)
   case-blind), so that a `switches: "Title"` or a schedule line naming a mode by its title keeps naming one. It is
   not taken out or deleted while anything names it: an entry of vislox's (`switches: vx_mode_1`), a schedule set of
   vislox's (`vx_mode_1 08:00-12:00`), or an entry of the pending config Loxone Config made whose `CalType=` is its number
-  (`blocks[].delete` names them). A built-in mode (`Mode=` ≥ 0) and one Loxone
-  Config made are not edited here (lox adopts a user mode with `adopt --uuid`; vislox's adoption, #72, moves page
-  blocks only).
+  (`blocks[].delete` names them). A built-in mode (`Mode=` ≥ 0) stays read-only. A user mode Loxone Config made becomes editable
+  after **Adopt into vislox** in Properties.
 - **An entry** is added with `add_block` (`type: "CalendarEntry"`, `page` the Betriebszeiten folder) and two
   settings: `switches`, the UUID of the mode it switches on, and `date`, as the source writes it. Its mode and date
   are then changed with two value ops, both on an entry of vislox's files only:
@@ -1853,7 +1870,7 @@ cannot express is left out, not worked around.
 | #85 statistics | `vx_hw_… = TreeSensor(device: …, uuid: "…", Statistics: on)` in `_hardware.loxl` | A Tree or Air input, digital output or analog sensor; its device declared by `uuid:` alone. Not on one the module declares. |
 | #85 new Tree device | `vx_<kind>_<n> = TreeDevice("…", kind: "…", tree: …, branch: "…")`, `removed vx_…` | The four kinds lox creates, on a Tree extension of the base; unpaired until a Tree search in Loxone Config. |
 | #86 operating mode | `vx_mode_<n> = Mode("…")` in `_periphery.loxl` | A new user mode; lox mints its `Mode=` number. Built-in modes and Loxone Config's stay as they are. |
-| #86 calendar entry | `vx_calendarentry_<n> = CalendarEntry("…", switches: …, every: 12-31)` in `_periphery.loxl` | A new entry, then its mode (`entry_mode`) and date (`entry_date`, one of four kinds). Loxone Config's entries stay read-only. |
+| #86 calendar entry | `vx_calendarentry_<n> = CalendarEntry("…", switches: …, every: 12-31)` in `_periphery.loxl` | A new entry, then its mode (`entry_mode`) and date (`entry_date`, one of four kinds). Loxone Config's entries become editable after adoption, except weekday-in-month dates. |
 | #87 rule | `rule vx_<uuid> … end` on an extern in `edits.loxl` | Active, conditions and actions of a rule Lox Logic can write; its name stays the app's. lox checks states and commands against the app's capability table. |
 | #87 new rule | `rule vx_rule_<n> "Name" … end`, `removed vx_rule_<n>` in `edits.loxl` | Created below the config's last rule; not in a config without any rule. |
 
@@ -1931,9 +1948,9 @@ Each of these plugs in as new op kinds on `POST /api/edit`, written into `<modul
 | #81 (built) | `let` constants made and changed in vislox's file, ports bound to them; the module's `let` and `defaults` values rewritten on their line; `defaults` made in vislox's file, with consent to the blocks they change |
 | #82 (built in part) | expressions (`<-`, `Port: …`) and named signals (`slug = …`, `.title`) of vislox's files; the module's shown |
 | #83 (built in part) | `template` instances of vislox's files (the `instance` op, lox's library copied in); the module's shown, grouped and reviewed |
-| #84 (built in part) | virtual inputs, virtual and Modbus devices added and edited in `_periphery.loxl` (`device:`); adopting Loxone Config's is left |
+| #84 (built) | virtual inputs, virtual and Modbus devices added and edited in `_periphery.loxl` (`device:`); Loxone Config's objects can be adopted |
 | #85 (built) | Tree and Air hardware: `Statistics:` on an I/O, new Tree devices (`kind:`, `removed`) in `_hardware.loxl` |
-| #86 (built in part) | operating modes and calendar entries added in `_periphery.loxl`, an entry's mode and date edited (`switches:`, `every:`, `easter:`, `from:`/`to:`); adopting Loxone Config's is left |
+| #86 (built) | operating modes and calendar entries added in `_periphery.loxl`, an entry's mode and date edited (`switches:`, `every:`, `easter:`, `from:`/`to:`); Loxone Config's objects can be adopted |
 | #87 (built) | Automatic Designer rules (`rule`, named rules, `removed`) |
 | #88 (built) | new pages (`page "…" (room: …, category: …)`, `remove_page` while not deployed) |
 

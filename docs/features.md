@@ -407,8 +407,8 @@ sends to the Miniserver see [miniserver.md](miniserver.md).
   days show outlined as added. *Edit* on an entry added here changes its name, mode and date; Undo, Revert, Remove
   and Delete work as for a block, and a mode is not deleted while an entry switches it on. vislox writes
   `<module>/vislox/_periphery.loxl` and names each mode the one way lox takes it (`holiday`, a slug, or `"Title"`).
-  Entries and modes Loxone Config made stay read-only (*Edit* says why), and nothing changes the Miniserver's live
-  calendar. How: [editing.md](editing.md#operating-modes-and-calendar-entries-86).
+  Entries and user modes Loxone Config made become editable after **Adopt into vislox** in Properties.
+  Built-in modes and weekday-in-month entries stay read-only. Editing never changes the Miniserver's live calendar. How: [editing.md](editing.md#operating-modes-and-calendar-entries-86).
 
 - **Tree and Air hardware** (the same project and token, #85): *Edit values* on a Tree or Air input, digital output
   or analog sensor switches its *Statistics* on or off (shown read-only on every revision, old → new when comparing).
@@ -644,3 +644,5 @@ Keys:
 - Esc: clear the selection.
 
 With the mouse, drag to pan and scroll to zoom.
+
+**Adopt into vislox** also covers objects in the project tree: user operating modes, writable calendar entries, virtual inputs and outputs, and virtual or Modbus devices with their I/O. Changes lists pending adoption with Revert; Apply names the objects in its review. Built-in modes and weekday-in-month entries stay read-only.

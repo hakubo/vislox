@@ -145,24 +145,44 @@ pub(super) fn why_not(
     if lock.slug_of(u).is_some() {
         return Some(format!("{name} is managed by the module already"));
     }
-    match (&el.page, doc.get(u).and_then(|e| e.page.as_ref())) {
-        (Some(a), Some(b)) if a == b => {}
-        (Some(_), Some(_)) => {
-            return Some(format!(
-                "{name} is on another page in the pending config than in the base"
-            ));
+    if crate::periphery::of(&el.ty).is_none() {
+        match (&el.page, doc.get(u).and_then(|e| e.page.as_ref())) {
+            (Some(a), Some(b)) if a.eq_ignore_ascii_case(b) => {}
+            (Some(_), Some(_)) => {
+                return Some(format!(
+                    "{name} is on another page in the pending config than in the base"
+                ));
+            }
+            _ => {
+                return Some(format!(
+                    "{name} is not on a logic page: vislox adopts only the blocks of a page"
+                ));
+            }
         }
-        _ => {
-            return Some(format!(
-                "{name} is not on a logic page: vislox adopts only the blocks of a page"
-            ));
-        }
+    }
+    if let Some(why) = &el.read_only {
+        return Some(why.clone());
+    }
+    if doc.get(u).is_none() {
+        return Some(format!("{name} is not in the pending config"));
     }
     if loxone_config::connectors::builtin(&el.ty).is_none() {
         return Some(format!("lox cannot manage blocks of type {}", el.ty));
     }
     let s = edit::slug(u);
-    if files.claims.0.get(u).is_some_and(|c| c.claims())
+    if files
+        .claims
+        .0
+        .get(u)
+        .or_else(|| {
+            files
+                .claims
+                .0
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(u))
+                .map(|(_, c)| c)
+        })
+        .is_some_and(|c| c.claims())
         || files.claims.1.iter().any(|w| w.to.0 == s || w.from.0 == s)
         || files.claims.set_claimed(&s)
     {
@@ -175,7 +195,7 @@ pub(super) fn why_not(
     if let Some((x, _)) = lock
         .externals
         .iter()
-        .find(|(x, v)| v.as_str() == u && !x.starts_with(crate::blocks::SLUG_PREFIX))
+        .find(|(x, v)| v.eq_ignore_ascii_case(u) && !x.starts_with(crate::blocks::SLUG_PREFIX))
     {
         return Some(format!(
             "{name} is the module's extern `{x}`: lox adopts it only under that name and \
@@ -219,6 +239,28 @@ fn order(cands: &mut Vec<Cand>, base: &loxone_config::LoxoneDoc, index: &adopt::
     }
     let mut taken: Vec<Option<Cand>> = std::mem::take(cands).into_iter().map(Some).collect();
     *cands = order.into_iter().filter_map(|i| taken[i].take()).collect();
+}
+
+/// Only the outermost picks need a lox invocation: a device includes its I/O.
+fn roots<'a>(cands: &'a [Cand], index: &adopt::Index) -> Vec<&'a Cand> {
+    let selected: BTreeSet<_> = cands
+        .iter()
+        .filter(|c| {
+            index
+                .get(&c.uuid)
+                .is_some_and(|e| crate::periphery::of(&e.ty).is_some())
+        })
+        .map(|c| c.uuid.to_ascii_lowercase())
+        .collect();
+    cands
+        .iter()
+        .filter(|c| {
+            index.get(&c.uuid).is_none_or(|e| {
+                crate::periphery::of(&e.ty).is_none()
+                    || !e.ancestors.iter().any(|u| selected.contains(u))
+            })
+        })
+        .collect()
 }
 
 impl Actions {
@@ -308,6 +350,7 @@ impl Actions {
                     }
                     pages.entry(page.clone()).or_default();
                     for (u, ty, title) in adopt::on_page(doc, page) {
+                        let u = base_ix.get(&u).map(|e| e.uuid.clone()).unwrap_or(u);
                         if lock.slug_of(&u).is_some() || cands.iter().any(|c| c.uuid == u) {
                             continue;
                         }
@@ -374,7 +417,9 @@ impl Actions {
         let mut picked: BTreeMap<String, String> = BTreeMap::new();
         // The copy before each run: what a refused run puts back.
         let (mut tree, mut lock_was, mut lock_now) = (original.clone(), lock0, l0.clone());
-        for c in &cands {
+        // A device takes its descendants with it. An inverse names every
+        // adopted object (and its slug), but lox must run only for the roots.
+        for c in roots(&cands, &base_ix) {
             // A block pinned as an extern (by an earlier adoption of this
             // request, or vislox's extern of a block adopted before) is
             // adopted under that name: lox moves the lines on the extern into
@@ -383,7 +428,11 @@ impl Actions {
                 .as_object()
                 .and_then(|x| {
                     x.iter()
-                        .find(|(_, v)| v["uuid"].as_str() == Some(c.uuid.as_str()))
+                        .find(|(_, v)| {
+                            v["uuid"]
+                                .as_str()
+                                .is_some_and(|u| u.eq_ignore_ascii_case(&c.uuid))
+                        })
                         .map(|(k, _)| k.clone())
                 })
                 .unwrap_or_else(|| c.slug.clone());
@@ -427,6 +476,38 @@ impl Actions {
                     }
                     lock_was = std::fs::read(&lock_path).map_err(|e| fail(e.to_string()))?;
                     lock_now = parse(&lock_was)?;
+                    if let Some(objects) = lock_now["objects"].as_object() {
+                        for (s, o) in objects {
+                            let Some(u) = o["uuid"].as_str() else {
+                                continue;
+                            };
+                            if l0["objects"].get(s).is_some()
+                                || picked.keys().any(|k| k.eq_ignore_ascii_case(u))
+                            {
+                                continue;
+                            }
+                            let root = edit::find_ci(&base.xml.root, &c.uuid)
+                                .ok_or_else(|| bad("adoption root disappeared".into()))?;
+                            if edit::find_ci(root, u).is_none() {
+                                return Err(bad(format!("lox adopted unexpected object {u}")));
+                            }
+                            if let Some(why) = why_not(u) {
+                                return Err(bad(why));
+                            }
+                            let ty = base_ix
+                                .get(u)
+                                .ok_or_else(|| bad(format!("no object {u}")))?;
+                            let mine = cands
+                                .iter()
+                                .find(|c| c.uuid.eq_ignore_ascii_case(u))
+                                .map(|c| c.slug.clone())
+                                .unwrap_or_else(|| {
+                                    adopt::default_slug(&ty.title, &ty.ty, &|n| taken(n, &chosen))
+                                });
+                            chosen.insert(mine.clone());
+                            picked.insert(u.to_string(), mine);
+                        }
+                    }
                     tree = after;
                 }
                 Some(why) => {
@@ -472,5 +553,70 @@ impl Actions {
             pages,
             skipped,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_device_inverse_runs_lox_once_for_the_parent_and_keeps_child_picks() {
+        let doc = loxone_config::LoxoneDoc::parse(br#"<ControlList><C Type="VirtualHttpIn" U="AAAA"><C Type="VirtualHttpInCmd" U="BBBB"/></C><C Type="VirtualIn" U="CCCC"/></ControlList>"#).unwrap();
+        let picks: Vec<Cand> = [
+            ("bbbb", "vx_command"),
+            ("aaaa", "vx_device"),
+            ("cccc", "vx_input"),
+        ]
+        .into_iter()
+        .map(|(u, s)| Cand {
+            uuid: u.into(),
+            title: s.into(),
+            slug: s.into(),
+            page: None,
+        })
+        .collect();
+        let run = roots(&picks, &adopt::Index::of(&doc));
+        assert_eq!(
+            run.iter().map(|c| c.slug.as_str()).collect::<Vec<_>>(),
+            ["vx_device", "vx_input"]
+        );
+        assert_eq!(picks[0].slug, "vx_command");
+    }
+
+    #[test]
+    fn object_tree_enablement_refuses_builtin_modes_and_unwritable_dates() {
+        let xml = include_str!("../../tests/fixtures/house.Loxone");
+        let doc = loxone_config::LoxoneDoc::parse(xml.as_bytes()).unwrap();
+        let ix = adopt::Index::of(&doc);
+        let lock = edit::Lock::default();
+        let files = edit::Files::default();
+        let mode = "10000011-0000-0110-ffff504f94000001";
+        let entry = "10000013-0000-0130-ffff504f94000001";
+        assert_eq!(why_not(&mode.to_uppercase(), &ix, &ix, &lock, &files), None);
+        assert_eq!(why_not(entry, &ix, &ix, &lock, &files), None);
+        assert!(
+            why_not(
+                "00000000-0000-0001-1500000000000000",
+                &ix,
+                &ix,
+                &lock,
+                &files
+            )
+            .unwrap()
+            .contains("Built-in")
+        );
+        let odd = xml.replace("WeekDayInMonth=\"1\"", "WeekDayInMonth=\"5\"");
+        let odd = loxone_config::LoxoneDoc::parse(odd.as_bytes()).unwrap();
+        let ix = adopt::Index::of(&odd);
+        assert!(
+            why_not(entry, &ix, &ix, &lock, &files)
+                .unwrap()
+                .contains("read-only")
+        );
+        assert_eq!(
+            crate::calendar_edit::date_of(edit::find_ci(&odd.xml.root, entry).unwrap()),
+            None
+        );
     }
 }

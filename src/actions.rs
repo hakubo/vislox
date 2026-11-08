@@ -2160,6 +2160,40 @@ impl Actions {
                 edit::parse_doc(&b)
                     .map_err(|e| fail(format!("cannot read {}: {e}", p.base.display())))
             })?;
+        // Normalize adoption identities once, before preparation, application and replies.
+        let mut req = edit::Request {
+            base: req.base.clone(),
+            ops: req.ops.clone(),
+        };
+        if req.ops.iter().any(|op| {
+            matches!(
+                op,
+                edit::Op::Adopt { .. } | edit::Op::AdoptPage { .. } | edit::Op::Unadopt { .. }
+            )
+        }) {
+            let index = crate::adopt::Index::of(&base);
+            for op in &mut req.ops {
+                let canonical = |u: &mut String| {
+                    if let Some(e) = index.get(u) {
+                        *u = e.uuid.clone();
+                    }
+                };
+                match op {
+                    edit::Op::Adopt { blocks } => {
+                        for b in blocks {
+                            canonical(&mut b.uuid);
+                        }
+                    }
+                    edit::Op::AdoptPage { page } => canonical(page),
+                    edit::Op::Unadopt { uuids } => {
+                        for u in uuids {
+                            canonical(u);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
         // The deployed revision: a block added here and in it is deployed.
         let deployed = match deployed {
             Some(b)
@@ -2745,6 +2779,9 @@ impl Actions {
                     _ => {}
                 }
             }
+            uuids.extend(prepared.adoptions.keys().cloned());
+            let mut seen = std::collections::BTreeSet::new();
+            uuids.retain(|u| seen.insert(u.to_ascii_lowercase()));
             crate::adopt::verify(&base, &doc, out, &uuids)
                 .map_err(|e| bad(format!("{e}. Nothing was adopted or handed back.")))?;
             for u in &uuids {
@@ -3948,7 +3985,7 @@ impl Actions {
             // vislox's files create (#88).
             pages = crate::page_edit::edits_section(&now, base_doc, &lock, &rel_dir);
             let ix = crate::adopt::Index::of(doc);
-            for (u, _) in ix.page_blocks() {
+            for (u, _) in ix.candidates() {
                 if lock.slug_of(u).is_none() {
                     adopt.insert(
                         u.clone(),
@@ -7218,7 +7255,10 @@ esac
         assert_eq!(std::fs::read(d.join("out.Loxone")).unwrap(), base);
         std::fs::remove_file(tmp.path().join("break")).unwrap();
         // Adopted: its declaration with vislox's extern, its lock entry.
-        let r = a.edit(&adopt(DIV, None), deployed(&d)).await.unwrap();
+        let r = a
+            .edit(&adopt(&DIV.to_uppercase(), None), deployed(&d))
+            .await
+            .unwrap();
         assert_eq!(
             r["adopted"],
             json!([{ "uuid": DIV, "slug": "vx_o1002" }]),
