@@ -48,8 +48,11 @@ sends to the Miniserver see [miniserver.md](miniserver.md).
   added: wait 5s*, *· active → inactive*) in place of the raw `APC=` change.
 - **Operating modes** (Ctrl+K *Operating modes*, or **Year** on the tree's Calendar or Operating modes folder): a
   year calendar of when each mode is on. Each day carries the colour of every mode its entries switch on; ← / →
-  go to other years (from 2009, Loxone's day 0), and a mode's chip hides or shows its days. Hovering a day lists its entries, and clicking
-  a day or an entry in the list beside the year selects the entry (Properties). Today is outlined. With live
+  go to other years (from 2009, Loxone's day 0), and a mode's chip hides or shows its days. Each date is a
+  keyboard accessible button named with its full date and the modes and periods on it; focusing it shows the same
+  day details as hovering. Tab enters at one day, the arrow keys move by day or week across month and year
+  boundaries, and Enter or Space selects the first entry just as a click does. Clicking a day or an entry in the
+  list beside the year selects the entry (Properties). Today is outlined. With live
   values on, the modes that are on now (their `Q`) are marked *on now*, and the chip's tooltip says whether the
   calendar has that mode today or logic switched it on. In change review, days the viewed revision adds are
   outlined green and days it removes red (amber for both), so a timespan in the wrong year stands out. An entry whose date no longer decodes shows its old days as removed. Easter

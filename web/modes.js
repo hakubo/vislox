@@ -201,10 +201,14 @@ function modesStep(d) { MD.year = Math.max(MD_FIRST_YEAR, Math.min(MD_LAST_YEAR,
 
 function renderModes() {
   if (!MD.open || !S.view) return;
+  const restoreDayFocus = $("md-grid").contains(document.activeElement) && document.activeElement.matches("[data-day]") && !MD.moveFocus;
+  if (restoreDayFocus) MD.focusDay = +document.activeElement.dataset.day;
   mfSync();
   mdRenderEdit();
   MD.year = Math.max(MD_FIRST_YEAR, Math.min(MD_LAST_YEAR, MD.year));
-  const y = MD.year, modes = mdModes(), { days, entries } = mdYear(y), marks = mdMarks();
+  const y = MD.year;
+  if (MD.focusDay == null || mdYmd(MD.focusDay)[0] !== y) MD.focusDay = mdYmd(mdToday())[0] === y ? mdToday() : mdDay(y, 1, 1);
+  const modes = mdModes(), { days, entries } = mdYear(y), marks = mdMarks();
   MD.cache = { year: y, days, modes };
   const liveOnNow = mdLiveOn(), today = mdToday();
   // The periods' days this year, unless their chip hides them.
@@ -249,12 +253,20 @@ function renderModes() {
         S.sel && d && [...d.on, ...d.add, ...d.rem].some((e) => e.uuid === S.sel) ? "md-hl" : "",
         draft.has(n) ? "md-draft" : "", MF.open && MF.what === "entry" ? "md-pickable" : "",
         ...pdays.filter((p) => p.days.has(n)).map((p) => "md-" + p.key)].filter(Boolean).join(" ");
-      cells += `<span class="${cls}" data-day="${n}"${bg ? ` style="${bg}"` : ""}>${i + 1}</span>`;
+      const modesOnDay = [...new Set([...(d?.on || []), ...(d?.add || []), ...(d?.rem || [])].filter(shown).map((e) => modes.get(e.key)?.title || e.cal.mode.title))];
+      const periodsOnDay = pdays.filter((p) => p.days.has(n)).map((p) => p.title);
+      const date = new Date(n * 864e5).toLocaleDateString("en", { timeZone: "UTC", weekday: "long", year: "numeric", month: "long", day: "numeric" });
+      const details = [...modesOnDay, ...periodsOnDay];
+      const aria = `${date}. ${details.length ? `Modes and periods: ${details.join(", ")}.` : "No operating mode or period."}`;
+      const tab = (MD.focusDay ?? today) === n ? 0 : -1;
+      cells += `<button type="button" class="${cls}" data-day="${n}" tabindex="${tab}" aria-label="${esc(aria)}"${bg ? ` style="${bg}"` : ""}>${i + 1}</button>`;
     }
     html += `<div class="md-month"><div class="md-mh">${MD_MONTHS[m - 1]}</div><div class="md-wk">${MD_WEEKDAYS.map((w) => `<span>${w}</span>`).join("")}</div><div class="md-days">${cells}</div></div>`;
   }
   $("md-grid").innerHTML = html;
   $("md-grid").setAttribute("aria-label", `Operating modes in ${y}`);
+  if (restoreDayFocus || MD.moveFocus) $("md-grid").querySelector(`[data-day="${MD.focusDay}"]`)?.focus({ preventScroll: true });
+  MD.moveFocus = false;
 
   // The entries: those with days this year first, by their first day.
   const sorted = [...entries].filter((e) => e.status !== "removed" || marks)
@@ -328,6 +340,28 @@ $("md-grid").addEventListener("mousemove", (e) => {
   if (c && MD.cache) showTip(e, mdDayTip(+c.dataset.day)); else hideTip();
 });
 $("md-grid").addEventListener("mouseleave", hideTip);
+$("md-grid").addEventListener("focusin", (e) => {
+  const c = e.target.closest("[data-day]");
+  if (!c || !MD.cache) return;
+  MD.focusDay = +c.dataset.day;
+  const r = c.getBoundingClientRect();
+  showTip({ target: c, clientX: r.left + r.width / 2, clientY: r.top + r.height / 2 }, mdDayTip(MD.focusDay));
+});
+$("md-grid").addEventListener("focusout", (e) => { if (!e.relatedTarget?.closest?.("[data-day]")) hideTip(); });
+$("md-grid").addEventListener("keydown", (e) => {
+  const c = e.target.closest("[data-day]");
+  if (!c) return;
+  const delta = { ArrowLeft: -1, ArrowRight: 1, ArrowUp: -7, ArrowDown: 7 }[e.key];
+  if (!delta) return;
+  e.preventDefault();
+  const n = +c.dataset.day + delta;
+  const [year] = mdYmd(n);
+  if (year < MD_FIRST_YEAR || year > MD_LAST_YEAR) return;
+  MD.year = year;
+  MD.focusDay = n;
+  MD.moveFocus = true;
+  renderModes();
+});
 $("md-grid").addEventListener("click", (e) => {
   // A day selects its first entry (one it switches on, else one removed from it).
   // While an entry is drafted, a day is picked for it instead (#86).
@@ -340,7 +374,7 @@ $("md-grid").addEventListener("click", (e) => {
 /** The window's keys while the view is open (app.js asks first): ← / → step the year, Esc
  *  closes, and the keys that pan or zoom the hidden page do nothing. True when handled. */
 function modesKey(e) {
-  if (!MD.open) return false;
+  if (!MD.open || e.target.closest?.("[data-day]")) return false;
   switch (e.key) {
     case "ArrowLeft": modesStep(-1); break;
     case "ArrowRight": modesStep(1); break;

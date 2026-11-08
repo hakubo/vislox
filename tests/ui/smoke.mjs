@@ -472,7 +472,18 @@ try {
     // Dates are whole days, also in years before 100 (Date.UTC would make 50 into 1950).
     assert.deepEqual(await page.evaluate(() => mdYmd(mdDay(50, 3, 1))), [50, 3, 1]);
     // Today is fixed for the test: Easter Monday 2026, a Feiertag.
-    await page.evaluate(() => { window.mdToday = () => mdDay(2026, 4, 6); MD.year = 2026; renderModes(); });
+    await page.evaluate(() => { window.mdToday = () => mdDay(2026, 4, 6); MD.year = 2026; MD.focusDay = mdDay(2026, 4, 6); renderModes(); });
+    // The date grid is keyboard-only here: tab to its roving day, inspect its accessible name,
+    // move by one day and back, then activate the calendar entry with Enter.
+    for (let i = 0; i < 50 && !(await page.evaluate(() => document.activeElement.matches("[data-day]"))); i++) await page.keyboard.press("Tab");
+    assert.equal(await page.evaluate(() => +document.activeElement.dataset.day), await page.evaluate(() => mdDay(2026, 4, 6)));
+    assert.match(await page.evaluate(() => document.activeElement.getAttribute("aria-label")), /Monday, April 6, 2026.*Feiertag.*Urlaub/);
+    await page.keyboard.press("ArrowRight");
+    await page.waitForFunction(() => document.activeElement.matches('[data-day="' + mdDay(2026, 4, 7) + '"]'));
+    await page.keyboard.press("ArrowLeft");
+    await page.waitForFunction(() => document.activeElement.matches('[data-day="' + mdDay(2026, 4, 6) + '"]'));
+    await page.keyboard.press("Enter");
+    await page.waitForFunction(() => S.sel && document.activeElement.matches('[data-day="' + mdDay(2026, 4, 6) + '"]'));
     const cls = (m, d, y = 2026) => page.evaluate(([y, m, d]) => document.querySelector(`#md-grid [data-day="${mdDay(y, m, d)}"]`)?.className ?? "", [y, m, d]);
     const bg = (m, d) => page.evaluate(([m, d]) => document.querySelector(`#md-grid [data-day="${mdDay(2026, m, d)}"]`)?.getAttribute("style") ?? "", [m, d]);
     assert.match(await cls(4, 6), /md-on/, "Easter Monday 2026 is 6 Apr");
@@ -518,6 +529,7 @@ try {
     // Another year: the summer holidays of 2026 are not in 2025. The arrows step the year even
     // when focus left the view (a click on a day re-renders it).
     await page.click(`#md-grid [data-day="${await page.evaluate(() => mdDay(2026, 4, 6))}"]`);
+    await page.keyboard.press("Tab"); // leave the day grid; its arrows navigate dates, while the view arrows change years.
     await page.keyboard.press("ArrowLeft");
     assert.equal(await page.textContent("#md-year"), "2025");
     assert.doesNotMatch(await cls(7, 4, 2025), /md-on/);
