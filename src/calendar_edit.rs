@@ -397,6 +397,13 @@ pub fn edit(
     }
     let modes = Modes::new(ctx.doc, ctx.lock);
     match op {
+        // An entry of vislox's always names its mode and its date: lox would
+        // switch the holiday mode on 1 January, and `add_block` takes neither
+        // missing, so the undo of a remove would fail.
+        Op::EntryMode { value: None, .. } | Op::EntryDate { value: None, .. } => Err(format!(
+            "{name}: an entry added here keeps its mode and its date; change them, or remove the \
+             entry"
+        )),
         Op::EntryMode { .. } => {
             let previous = mode_or_text(&modes, &b.args);
             let v = value
@@ -544,8 +551,9 @@ pub fn listed(modes: &Modes, b: &crate::blocks::NewBlock) -> Option<serde_json::
 
 /// The calendar entries that switch on the mode `slug` of vislox's files
 /// (UUID `uuid`): vislox's own (by its slug), and those of the pending
-/// config and the base it does not declare, by the mode's `CalType=`
-/// number. Deleting the mode would leave them naming none. By name.
+/// config it does not declare, by the mode's `CalType=` number. Deleting
+/// the mode would leave them naming none. By name. An entry the base still
+/// has and the pending config does not (one deleted here) is none of them.
 pub fn switched_by(
     files: &crate::edit::Files,
     ctx: &crate::edit::Ctx,
@@ -568,27 +576,24 @@ pub fn switched_by(
         .filter(|b| matches!(switches(&b.args), Some(Value::Ref(s)) if s == slug))
         .map(|b| b.title.clone().unwrap_or_else(|| b.slug.clone()))
         .collect();
-    let mut seen = std::collections::BTreeSet::new();
-    for doc in [ctx.doc, ctx.base] {
-        let Some(n) = Numbers::of(doc).number_of(uuid) else {
-            continue;
-        };
-        let mut all = Vec::new();
-        walk(&doc.xml.root, &mut all);
-        for el in all {
-            let Some(u) = el.attr("U") else { continue };
-            let declared = ctx
-                .lock
-                .slug_of(u)
-                .is_some_and(|s| files.block(s).is_some());
-            let num = crate::calendar::mode_number(el.attr(crate::calendar::MODE_ATTR));
-            if !declared && num == Some(n) && seen.insert(u.to_ascii_lowercase()) {
-                out.push(
-                    el.attr_decoded("Title")
-                        .map(|t| t.into_owned())
-                        .unwrap_or_else(|| u.to_string()),
-                );
-            }
+    let Some(n) = Numbers::of(ctx.doc).number_of(uuid) else {
+        return out;
+    };
+    let mut all = Vec::new();
+    walk(&ctx.doc.xml.root, &mut all);
+    for el in all {
+        let Some(u) = el.attr("U") else { continue };
+        let declared = ctx
+            .lock
+            .slug_of(u)
+            .is_some_and(|s| files.block(s).is_some());
+        let num = crate::calendar::mode_number(el.attr(crate::calendar::MODE_ATTR));
+        if !declared && num == Some(n) {
+            out.push(
+                el.attr_decoded("Title")
+                    .map(|t| t.into_owned())
+                    .unwrap_or_else(|| u.to_string()),
+            );
         }
     }
     out

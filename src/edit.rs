@@ -12215,6 +12215,17 @@ mod tests {
         )
         .unwrap_err();
         assert!(e.contains("Grillabend"), "{e}");
+        // An entry deleted in the pending config (the base, deployed, still
+        // has it) names nothing once that is deployed: the mode goes.
+        let gone = ctx_of(&d2, &d, &lock, None, &names);
+        assert!(
+            apply_op(
+                &mut files.clone(),
+                &gone,
+                &Op::RemoveBlock { uuid: G.into() }
+            )
+            .is_ok()
+        );
         // Nor while a schedule set of vislox's names it by its slug.
         let ctx2 = ctx_of(&d2, &d2, &lock, None, &names);
         assert!(
@@ -12260,6 +12271,23 @@ mod tests {
         assert_eq!(files, was);
         apply_op(&mut files, &ctx, &title("grill")).unwrap();
 
+        // An entry added here keeps its mode and its date: neither is dropped,
+        // so a remove's undo always adds it again.
+        let was = files.clone();
+        for op in [
+            Op::EntryMode {
+                uuid: W.into(),
+                value: None,
+            },
+            Op::EntryDate {
+                uuid: W.into(),
+                value: None,
+            },
+        ] {
+            let e = apply_op(&mut files, &ctx, &op).unwrap_err();
+            assert!(e.contains("keeps its mode and its date"), "{e}");
+        }
+        assert_eq!(files, was);
         // An entry whose mode no longer resolves: undone exactly as written.
         let mode = |v: &str| Op::EntryMode {
             uuid: W.into(),

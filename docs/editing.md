@@ -644,7 +644,7 @@ vx_calendarentry_3 = CalendarEntry("Fasching", switches: "Party", easter: -47)
   It is renamed, taken out, deleted and undone as a block of vislox's files. Its name is no other mode's (compared
   case-blind), so that a `switches: "Title"` or a schedule line naming a mode by its title keeps naming one. It is
   not taken out or deleted while anything names it: an entry of vislox's (`switches: vx_mode_1`), a schedule set of
-  vislox's (`vx_mode_1 08:00-12:00`), or an entry Loxone Config made whose `CalType=` is its number
+  vislox's (`vx_mode_1 08:00-12:00`), or an entry of the pending config Loxone Config made whose `CalType=` is its number
   (`blocks[].delete` names them). A built-in mode (`Mode=` ≥ 0) and one Loxone
   Config made are not edited here (lox adopts a user mode with `adopt --uuid`; vislox's adoption, #72, moves page
   blocks only).
