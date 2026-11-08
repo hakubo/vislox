@@ -8,7 +8,7 @@
 // Nothing here talks to a Miniserver: vislox runs with --no-live.
 import { chromium } from "playwright";
 import { spawn, execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, chmodSync, existsSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, readdirSync, writeFileSync, chmodSync, existsSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -1733,6 +1733,34 @@ try {
     await page.evaluate((u) => gotoPage(S.objPage.get(u), { focus: u }), FLUR);
     await page.waitForSelector(`.blk.managed[data-uuid="${FLUR}"] .mbadge`);
     await page.waitForSelector("#legend.managed");
+  });
+  await step("a Discard refused while git is busy says so and changes nothing (#122)", async () => {
+    const lock = join(dir, ".git/index.lock");
+    const vislox = () => readdirSync(join(dir, "pages/vislox")).sort().map((f) => [f, readFileSync(join(dir, "pages/vislox", f), "utf8")]);
+    const files = vislox(), out = readFileSync(join(dir, "out.Loxone")), index = readFileSync(join(dir, ".git/index"));
+    assert.ok(files.length > 0);
+    writeFileSync(lock, "");
+    const seen = errors.length;
+    try {
+      await page.click("#btn-discard");
+      // The reply and the actions event each show it, in either order: with or without the heading.
+      await waitText("#deploy-msg", /^(Discard failed\.\n)?git is busy in this repository \(.*index\.lock is there\): try again when it is done\nNothing was discarded\.$/);
+      assert.match(await page.getAttribute("#deploy-msg", "class"), /\berror\b/);
+      // The reply itself has come (the browser logs its status).
+      for (const until = Date.now() + 10000; !errors.slice(seen).some((e) => /status of 502/.test(e));) {
+        assert.ok(Date.now() < until, "no reply to the refused Discard");
+        await page.waitForTimeout(50);
+      }
+    } finally {
+      rmSync(lock, { force: true });
+    }
+    // The refusal's own status in the console is expected; nothing else is.
+    const now = errors.splice(seen);
+    assert.ok(now.every((e) => /status of 502/.test(e)), now.join(" | "));
+    assert.deepEqual(vislox(), files);
+    assert.deepEqual(readFileSync(join(dir, "out.Loxone")), out);
+    assert.deepEqual(readFileSync(join(dir, ".git/index")), index);
+    await page.waitForFunction(() => !/Nothing pending/.test(document.querySelector("#deploy-pend")?.textContent || ""));
   });
   await step("Discard drops the edits", async () => {
     await page.click("#btn-discard");

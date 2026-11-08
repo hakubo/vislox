@@ -201,7 +201,28 @@ vx_pulseat_1 = PulseAt(At: 07:05, Pulse: "time")
 - **Discard** puts the module, lock and out back to the last commit. A lock or out the last commit does not have
   (never committed, or ignored by git) goes back to how it was before vislox's first edit since that commit,
   which vislox keeps in the git directory; one vislox never edited stays as it is, since a lost lock re-mints
-  every managed block. Discard is all or nothing: when a step fails, it puts back what the others did.
+  every managed block.
+- **Discard is all or nothing (#122).** Before it changes anything, it reads the module (a symbolic link inside
+  it as the link, never what it reaches), the lock, out and the git index byte for byte (with split index on, the
+  shared index file too), and keeps them in memory. It is refused, with *Nothing was discarded.* and nothing
+  changed, when one of them cannot be read, when the lock, out or module is a symbolic link or reached through
+  one (it would write what the link reaches, #81), and while git is at work in the repository (an
+  `index.lock`). When a step fails (`git checkout` resets the index of the paths it checks out, so a change
+  staged in the module would go with it), it puts the files back, each written in place (owner, permissions and
+  hard links stay; a link git put there is removed, never written through), and the index the way git writes it
+  (`index.lock`, then renamed), with the shared index file if git expired it. The index goes back only when it is
+  exactly what Discard's own git commands left: a change something else staged meanwhile is left as it is, and
+  the report names its paths. Then it reads everything again: *Nothing was discarded* only when everything is
+  exactly as it was. Otherwise it says *Discard stopped halfway and could not put everything back*, lists each
+  path still not as it was and why, and keeps a copy of everything as it was (from memory) in the git directory,
+  `vislox-recovery/<project>/<time>-discard/` (the files under `files/` by their path from the project directory,
+  the index as `index`), naming each listed path's copy. Nothing is written there otherwise. A Discard that works
+  resets what is staged for the files the last commit has in the module (and the lock and out, when committed),
+  as `git checkout HEAD` does; the index elsewhere in the repository is left as it is.
+- **Roll back** puts its files back the same way when it stops before anything was sent, and is refused before
+  it writes anything when a path it writes (the module's files from before, the lock, lox.toml, the base it
+  points at) is a symbolic link or reached through one. What it cannot put back is listed, with a copy in
+  `vislox-recovery/<project>/<time>-roll-back/`.
 
 ## New pages (#88)
 

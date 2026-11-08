@@ -225,6 +225,15 @@ published under the same version (see [docker/README.md](docker/README.md)).
   the file on disk) next to `current` (what the watched file holds); *on Miniserver*, live values, the log marks,
   block queries, input commands, the edit base and the app comparison follow `deployed`, so they stay off on an
   uncommitted save. A compile is compared with the deployed revision, not with the newest one.
+- A Discard that fails halfway puts back the git index too (#122): its `git checkout` had reset what was staged in
+  the module, and the recovery put back only the files, ignored its own errors and said *Nothing was discarded*.
+  Discard now reads the module, lock, out and the index (byte for byte, with a split index's shared file) before it
+  changes anything, and refuses when it cannot, when the lock, out or module is a symbolic link or reached through
+  one, or while git holds `index.lock`. On a failed step it writes the files back in place without following a
+  link, puts the index back only when nothing else staged meanwhile, reads it all again, and says *Nothing was
+  discarded* only when everything is as it was; otherwise it lists what is not, why, and where its copy is
+  (`vislox-recovery/` in the git directory, written only then). Roll back refuses a symbolic link where it writes,
+  puts its files back the same way, and lists what it could not.
 
 ## 0.2.0
 

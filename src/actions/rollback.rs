@@ -70,6 +70,14 @@ impl RollbackPlan {
     /// commit, and point lox.toml's base at a copy of the download from before
     /// it (as lox points the base at its download after a push). The project's
     /// base file stays as it is until the push is verified.
+    /// Every path [`Plan::write`] writes or removes.
+    fn writes(&self, p: &loxone_config::Project) -> Vec<PathBuf> {
+        let mut w: Vec<PathBuf> = self.remove.clone();
+        w.extend(self.files.iter().map(|(path, _)| path.clone()));
+        w.extend([p.lock.clone(), self.base_file(), p.root.join("lox.toml")]);
+        w
+    }
+
     fn write(&self, p: &loxone_config::Project) -> Result<(), String> {
         let err = |path: &Path, e: std::io::Error| format!("cannot write {}: {e}", path.display());
         for f in &self.remove {
@@ -468,9 +476,32 @@ impl Actions {
         if p.module.is_file() {
             keep.push(&p.module);
         }
-        let guard = Rollback::take(&p.module, &keep);
+        // Nothing it writes is a link or under one (#81), and all of it
+        // can be read back: refused before anything changes otherwise.
+        let writes = plan.writes(&p);
+        let taken = writes
+            .iter()
+            .map(PathBuf::as_path)
+            .chain(keep.iter().copied())
+            .try_for_each(|w| no_link(&p.root, w, "Roll back"))
+            .and_then(|_| Rollback::files(&p.root, &p.module, &keep));
+        let mut guard = match taken {
+            Ok(g) => g,
+            Err(why) => {
+                return refuse(
+                    format!("{why}\nNothing was sent, and nothing changed."),
+                    StatusCode::CONFLICT,
+                );
+            }
+        };
+        guard.copies = project_git_path(dir, "vislox-recovery").await;
         let fail = |why: String, status: StatusCode| {
-            guard.restore();
+            let left = guard.restore("Roll back");
+            let why = if left.is_empty() {
+                why
+            } else {
+                format!("{why}\n{}", guard.report("Roll back", &left))
+            };
             *self.compiled.lock().unwrap() = None;
             self.end_with("rollback", &Err(why.clone()), None);
             Err((status, why))
