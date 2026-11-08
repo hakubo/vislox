@@ -27,7 +27,7 @@ mod progress;
 mod removals;
 mod rollback;
 mod scan;
-use discard::{Rollback, no_link, project_git_path, snapshot_before_edit};
+use discard::{project_git_path, snapshot_before_edit};
 use progress::{Progress, push_step};
 pub use removals::{NEEDS_CONSENT, RemovalConsent, plan_id as removal_plan_id, refused_slug};
 use serde::Serialize;

@@ -24,6 +24,7 @@
 //!   upload waiting means nothing changed (put back); anything else is
 //!   reported as unknown.
 
+use super::discard::{Rollback, no_link};
 use super::*;
 use axum::http::StatusCode;
 
