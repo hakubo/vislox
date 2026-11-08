@@ -238,10 +238,60 @@ try {
     await page.waitForFunction(() => revById(S.rev)?.deployed && S.viewRev === S.rev, null, { timeout: 10000 });
   };
   const showNewest = async () => {
-    await page.click(".hrev >> nth=0");
+    await page.locator(".hrev").first().click();
     await page.evaluate(() => { const f = $("chk-follow"); f.checked = true; f.dispatchEvent(new Event("change")); });
-    await page.waitForFunction(() => S.rev === S.hist.history[0].id && S.viewRev === S.rev, null, { timeout: 10000 });
+    await page.waitForFunction(() => S.rev === newestRev()?.id && S.viewRev === S.rev, null, { timeout: 10000 });
   };
+  const clickRevision = async (id, compare = false) => {
+    const index = await page.evaluate((revision) => allRevs().findIndex((r) => r.id === revision), id);
+    assert.notEqual(index, -1, `revision exists: ${id}`);
+    await page.locator(".hrev").nth(index).click({ modifiers: compare ? ["Shift"] : [] });
+  };
+
+  await page.evaluate(() => {
+    const fetchOriginal = window.fetch.bind(window);
+    window.fetch = async (...args) => {
+      if (window.__delayNextView && String(args[0]).startsWith("/api/view?")) {
+        window.__delayNextView = false;
+        await new Promise((resolve) => setTimeout(resolve, 500));
+      }
+      return fetchOriginal(...args);
+    };
+  });
+  await step("Back twice quickly restores latest, its base and its URL selection", async () => {
+    const { newest, historical } = await page.evaluate(() => ({ newest: newestRev()?.id, historical: allRevs().find((r) => r.id !== newestRev()?.id)?.id }));
+    assert.ok(newest && historical, "fixture has distinct latest and historical revisions");
+    await clickRevision(historical);
+    await page.waitForFunction((id) => !S.follow && S.viewRev === id && S.rev === id, historical);
+    await page.locator("#viewport .blk").first().click();
+    await page.waitForFunction(() => !!S.sel && new URLSearchParams(location.hash.slice(1)).has("sel"));
+    const selected = await page.evaluate(() => S.sel);
+    await clickRevision(newest, true);
+    await page.waitForFunction((id) => !S.follow && S.base === id && S.viewRev === S.rev && S.view?.compared, newest);
+
+    // Hold the first Back's view request so the second navigation arrives while it is still loading.
+    await page.evaluate(() => { window.__delayNextView = true; window.__popstates = 0; window.addEventListener("popstate", () => window.__popstates++); });
+    await page.evaluate(() => history.back());
+    await page.waitForFunction(() => window.__popstates === 1);
+    await page.evaluate(() => history.back());
+    await page.waitForFunction(() => window.__popstates === 2);
+    await page.waitForFunction((id) => S.follow && S.rev === id && S.viewRev === id && S.base === revById(id)?.base, newest, { timeout: 10000 });
+    assert.equal(await page.evaluate(() => new URLSearchParams(location.hash.slice(1)).has("rev")), false);
+    assert.equal(await page.isChecked("#chk-follow"), true);
+    assert.equal(await page.evaluate(() => S.sel), null, `Back clears the historical selection ${selected}`);
+    assert.equal(await page.evaluate(() => S.base), await page.evaluate((id) => revById(id)?.base, newest));
+
+    await page.evaluate(() => { window.__popstates = 0; });
+    await page.evaluate(() => history.forward());
+    await page.waitForFunction(() => window.__popstates === 1);
+    await page.evaluate(() => history.forward());
+    await page.waitForFunction(() => window.__popstates === 2);
+    await page.waitForFunction((id) => !S.follow && S.base === id && S.viewRev === S.rev && S.view?.compared, newest, { timeout: 10000 });
+    assert.equal(await page.evaluate(() => S.sel), selected);
+    assert.equal(await page.isChecked("#chk-follow"), false);
+    await showNewest();
+    await page.evaluate(() => select(null));
+  });
 
   await step("both pages are tabs", async () => {
     assert.deepEqual(await page.$$eval(".tab", (t) => t.map((x) => x.textContent.replace(/\d+$/, "").trim())), ["Erdgeschoss", "Obergeschoss"]);

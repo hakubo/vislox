@@ -126,7 +126,7 @@ sends to the Miniserver see [miniserver.md](miniserver.md).
   Ctrl+K finds a block by its slug as well as its name. The lines follow the module's files as they are on disk,
   compiled or not, and are shown on the newest config only (the lockfile is today's). See [editing.md](editing.md#blocks-the-module-manages-64).
 - **Navigation**: Ctrl+K finds any page or block (a managed one by its slug too). There is a minimap, a "Changed pages only" filter, and links
-  (`#page=…&sel=…&rev=…`) that reopen the same page, block and revision. The browser's Back button works.
+  (`#page=…&sel=…&rev=…`) that reopen the same page, block and revision. Back and Forward restore the page, selection, revision and comparison from each URL. A URL without a revision follows the latest view and keeps its comparison with the revision it is based on.
 - **Keyboard**: the tree, tabs and canvas all work from the keyboard; press `?` for the shortcuts.
 
 ## Live values and the app
