@@ -783,7 +783,7 @@ try {
   // outputs; Loxone Config shows a flag a page writes and reads as a tag for each side, and shows it on other
   // pages as an output reference (writes) and an input reference (reads). A second vislox serves the fixture.
   // A copy outside the repository, so that no git history of this one is compared with it.
-  const memPort = port + 100, memFixture = join(mkdtempSync(join(tmpdir(), "vislox-mem-")), "memory.Loxone");
+  const memPort = await new Promise((ok) => { const t = createTcpServer(); t.listen(0, "127.0.0.1", () => { const n = t.address().port; t.close(() => ok(n)); }); }), memFixture = join(mkdtempSync(join(tmpdir(), "vislox-mem-")), "memory.Loxone");
   copyFileSync(join(here, "../fixtures/memory.Loxone"), memFixture);
   const memServer = spawn(bin, [memFixture, "--listen", `127.0.0.1:${memPort}`, "--no-live"], { stdio: ["ignore", "ignore", "pipe"] });
   let memLog = "";
