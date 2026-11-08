@@ -357,6 +357,61 @@ async fn head_commit(dir: &Path) -> String {
 }
 
 /// Take the snapshot, unless one was taken on this commit already.
+/// A file of vislox's as it was before [`hand_off_pages`] changed it.
+type PageWas = Vec<(PathBuf, String)>;
+
+/// Before any compile vislox starts (#88): on disk, hand each page vislox's
+/// files create that the base (or `deployed`) has to Loxone Config (its line
+/// loses `room:` and `category:` and takes `# page uuid:`, see
+/// [`crate::page_edit::hand_off`]), and follow a page Loxone Config renamed
+/// in the page file tied to it by UUID. lox refuses a created page renamed
+/// while `room:` remains, and a page line whose title no page has. Returns
+/// what it changed, as it was, so that a failed Sync can put it back. Files
+/// vislox cannot read are left alone (the edit says why).
+fn hand_off_pages(p: &loxone_config::Project, deployed: Option<&[u8]>) -> Result<PageWas, String> {
+    let dir = p.module.join(edit::DIR);
+    let texts = edit::Files::texts(&dir);
+    if !texts
+        .values()
+        .any(|t| t.contains("\npage \"") || t.starts_with("page \""))
+    {
+        return Ok(Vec::new());
+    }
+    let Ok(mut files) = edit::Files::from_texts(&texts) else {
+        return Ok(Vec::new());
+    };
+    let base = std::fs::read(&p.base)
+        .ok()
+        .and_then(|b| edit::parse_doc(&b).ok());
+    let dep = deployed.and_then(|b| edit::parse_doc(b).ok());
+    let docs: Vec<&loxone_config::LoxoneDoc> = base.iter().chain(dep.iter()).collect();
+    let lock = edit::Lock::read(&p.lock);
+    let mut names = crate::page_edit::hand_off(&mut files, &docs, &lock);
+    if let Some(b) = &base {
+        names.extend(crate::page_edit::follow_renames(&mut files, b));
+    }
+    let mut was = Vec::new();
+    for name in names {
+        let path = dir.join(&name);
+        let pf = &files.pages[&name];
+        let res = if pf.is_empty() {
+            std::fs::remove_file(&path)
+        } else {
+            std::fs::write(&path, pf.render())
+        };
+        res.map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+        was.push((path, texts[&name].clone()));
+    }
+    Ok(was)
+}
+
+/// Put back what [`hand_off_pages`] changed.
+fn put_back_pages(was: &PageWas) {
+    for (path, text) in was {
+        let _ = std::fs::write(path, text);
+    }
+}
+
 async fn snapshot_before_edit(dir: &Path, p: &loxone_config::Project) {
     let Some(sd) = snapshot_dir(dir).await else {
         return;
@@ -1173,6 +1228,14 @@ impl Actions {
         self.st.lock().unwrap().progress = Some(Progress::apply());
         self.begin("Apply")?;
         let _compiling = self.compile_lock.lock().await;
+        // A deployed page created here is Loxone Config's (#88): handed off
+        // before lox compiles.
+        if let Ok(p) = self.project()
+            && let Err(why) = hand_off_pages(&p, None)
+        {
+            self.end_with("apply", &Err(why.clone()), None);
+            return Err((StatusCode::CONFLICT, why));
+        }
         // First, the module must compile: else lox deploys a compile of
         // something else than the review shows (#65). Asked of lox anew,
         // not of the check's cache, which may be a refresh old.
@@ -1407,6 +1470,11 @@ impl Actions {
             before,
             after: crate::history::blob_id(&b),
         });
+        // A page created here is deployed now (#88): handed off to Loxone
+        // Config in the same commit.
+        if let Err(e) = hand_off_pages(p, None) {
+            report.push(format!("⚠ {e}"));
+        }
         self.progress(|p| p.start("commit"));
         git(dir, &["add", "-A", "."]).await?;
         let forced: Vec<String> = force_add
@@ -1870,6 +1938,18 @@ impl Actions {
         }
         let p = loxone_config::Project::load(&dir.join("lox.toml"))
             .map_err(|e| format!("cannot read lox.toml: {e}"))?;
+        // A deployed page created here is Loxone Config's (#88): handed off
+        // before lox compiles, and committed with the sync. Put back when the
+        // sync fails, so that the project stays as it was.
+        let was = hand_off_pages(&p, None)?;
+        let res = self.sync_merge(dir, &p).await;
+        if res.is_err() {
+            put_back_pages(&was);
+        }
+        res
+    }
+
+    async fn sync_merge(&self, dir: &Path, p: &loxone_config::Project) -> Result<String, String> {
         let mut notes = Vec::new();
         let rules = match run(
             &self.s.lox,
@@ -1901,6 +1981,13 @@ impl Actions {
         };
         if let Some(m) = keep_base(dir, &p.base)? {
             notes.push(m);
+        }
+        // The new base may rename a page in Loxone Config, or carry a page
+        // created here (#88): the module follows, compiled again.
+        if !hand_off_pages(p, None)?.is_empty() {
+            run(&self.s.lox, &["logic", "compile"], dir, PUSH_TIMEOUT)
+                .await
+                .map_err(|e| format!("lox logic compile failed:\n{}", last_lines(&e, 6)))?;
         }
         git(dir, &["add", "-A", "."]).await?;
         if git(dir, &["diff", "--cached", "--quiet"]).await.is_ok() {
@@ -1955,6 +2042,10 @@ impl Actions {
                 base.display()
             )
         })?;
+        // Followed before lox compiles against the download (#88).
+        if let Ok(p) = loxone_config::Project::load(&dir.join("lox.toml")) {
+            hand_off_pages(&p, None)?;
+        }
         let compile = |extra: Vec<String>| async move {
             let mut args = vec!["logic".to_string(), "compile".to_string()];
             args.extend(extra);
@@ -2048,6 +2139,9 @@ impl Actions {
         }
         let doc = edit::parse_doc(&bytes)
             .map_err(|e| fail(format!("cannot read {}: {e}", pending.display())))?;
+        // A page created here and deployed is Loxone Config's (#88): handed
+        // off on disk before anything compiles, whatever the ops change.
+        hand_off_pages(&p, deployed.as_deref().map(Vec::as_slice)).map_err(fail)?;
         let dir_path = p.module.join(edit::DIR);
         let shown = dir_path
             .strip_prefix(&p.root)
@@ -2432,11 +2526,17 @@ impl Actions {
             }
             _ => false,
         });
+        // A page created or taken out here (#88) is checked too.
+        let page_ops = req
+            .ops
+            .iter()
+            .any(|o| matches!(o, edit::Op::NewPage { .. } | edit::Op::RemovePage { .. }));
         let out_doc = if !place.moves.is_empty()
             || !written.is_empty()
             || adopting
             || lifecycle
             || rule_ops
+            || page_ops
         {
             Some(
                 std::fs::read(&p.out)
@@ -2525,6 +2625,33 @@ impl Actions {
                 }
             }
         }
+        // The page lox created for a `new_page` (its UUID in the lock's
+        // `pages`), and none left for a `remove_page`.
+        if let (true, Some(out)) = (page_ops, &out_doc) {
+            let page_at = |u: &str| {
+                edit::find_ci(&out.xml.root, u).filter(|e| e.attr("Type") == Some("Page"))
+            };
+            for op in &req.ops {
+                match op {
+                    edit::Op::NewPage { title, .. } => {
+                        let made = lock.pages.get(title).and_then(|u| page_at(u));
+                        if !made.is_some_and(|e| e.attr_decoded("Title").as_deref() == Some(title))
+                        {
+                            return Err(fail(format!(
+                                "lox logic compile did not create the page \"{title}\""
+                            )));
+                        }
+                    }
+                    edit::Op::RemovePage { page } if page_at(page).is_some() => {
+                        return Err(bad(format!(
+                            "lox logic compile still creates the page {page}: another file of the \
+                             module names it with room:; nothing was taken out"
+                        )));
+                    }
+                    _ => {}
+                }
+            }
+        }
         // Adopting changes who owns a block, never what the Miniserver runs:
         // the pending config is what it was, each block exactly the base's.
         let mut adopted = Vec::new();
@@ -2557,15 +2684,34 @@ impl Actions {
                 .or_else(|| lock.externals.get(s).map(String::as_str))
                 .or_else(|| lock.rules.get(s).map(String::as_str))
         };
+        // A page created here (#88): the UUID lox keeps for its title.
+        let page_uuid = |op: &edit::Op| match op {
+            edit::Op::NewPage { title, .. } => lock.pages.get(title).cloned(),
+            _ => None,
+        };
         let minted: Vec<Option<String>> = slugs
             .iter()
-            .map(|s| s.as_deref().and_then(uuid_of).map(String::from))
+            .zip(&req.ops)
+            .map(|(s, op)| {
+                page_uuid(op).or_else(|| s.as_deref().and_then(uuid_of).map(String::from))
+            })
             .collect();
         let added: Vec<Value> = req
             .ops
             .iter()
             .zip(&slugs)
             .filter_map(|(op, s)| {
+                // A page created here (#88), and the one it creates again.
+                if let edit::Op::NewPage {
+                    title, restores, ..
+                } = op
+                {
+                    let mut a = json!({ "page": title, "uuid": page_uuid(op) });
+                    if let Some(was) = restores {
+                        a["restores"] = json!(was);
+                    }
+                    return Some(a);
+                }
                 let s = s.as_deref()?;
                 let mut a = json!({ "slug": s, "uuid": uuid_of(s) });
                 // What it brings back under a new UUID (a block, or a rule
@@ -3171,6 +3317,8 @@ impl Actions {
             .map_err(|e| format!("cannot read lox.toml: {e}"))?;
         // Discard puts back a lock or out the last commit does not have.
         snapshot_before_edit(dir, &p).await;
+        // A deployed page created here is Loxone Config's (#88).
+        hand_off_pages(&p, None)?;
         let module = module_blobs(&p);
         let base = file_blob(&p.base);
         run(&self.s.lox, &["logic", "compile"], dir, COMPILE_TIMEOUT)
@@ -3630,10 +3778,14 @@ impl Actions {
         let mut add_under = serde_json::Map::new();
         let mut entries = serde_json::Map::new();
         let mut rule_edit = Value::Null;
+        let mut pages = Value::Null;
         if let (Some(doc), Some(base)) = (shown, self.adopt_base(&p))
             && state.why.is_none()
         {
             let (base_doc, base_ix) = (&base.0, &base.1);
+            // The rooms and categories a new page may name, and the pages
+            // vislox's files create (#88).
+            pages = crate::page_edit::edits_section(&now, base_doc, &lock, &rel_dir);
             let ix = crate::adopt::Index::of(doc);
             for (u, _) in ix.page_blocks() {
                 if lock.slug_of(u).is_none() {
@@ -3736,6 +3888,7 @@ impl Actions {
             "adopt": adopt,
             "add_under": add_under,
             "entries": entries,
+            "pages": pages,
             // `removed` and `moved` lines lox needs no more (#80): the next edit
             // drops them, and `tidy` does only that.
             "stale_lines": now.stale_lines(&lock),
@@ -4557,6 +4710,328 @@ if [ -f pages/foo.loxl ]; then echo "<!-- foo -->" >> "$out"; fi
             bytes,
         };
         a.edits(Some(deployed), pending).await
+    }
+
+    /// A new page (#88) end to end, with a stand-in lox that creates the page
+    /// a `page "…" (room: …)` line names (and keeps its UUID in the lock's
+    /// `pages`): the reply names it and its undo, `GET /api/edits` lists it,
+    /// the undo takes it out, and a compile that creates no page is refused
+    /// with everything put back. Nothing but `logic compile` ever runs.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_new_page_is_compiled_listed_and_undone() {
+        let (tmp, a) = project_for_edits();
+        let d = tmp.path().join("project");
+        std::fs::write(d.join("base.Loxone"), crate::page_edit::tests::house()).unwrap();
+        std::fs::write(d.join("out.Loxone"), crate::page_edit::tests::house()).unwrap();
+        sh(&d, "git add -A && git commit -qm rooms");
+        const NEU: &str = "2194aaaa-0000-0000-ffff504f94000001";
+        std::fs::write(
+            tmp.path().join("lox"),
+            format!(
+                r#"#!/bin/sh
+echo "$*" >> ../calls.log
+[ "$1 $2" = "logic compile" ] || exit 2
+out=out.Loxone; lock=logic.lock.json; prev=
+for a in "$@"; do [ "$prev" = --out ] && out=$a; [ "$prev" = --lock ] && lock=$a; prev=$a; done
+t=$(cat pages/vislox/*.loxl 2>/dev/null | sed -n 's/^page "\(.*\)" (room: .*/\1/p' | head -1)
+if [ -n "$t" ] && [ ! -f NOPAGE ]; then
+  sed "s#<C Type=\"Page\" V=\"178\" U=\"10000002#<C Type=\"Page\" V=\"178\" U=\"{NEU}\" Title=\"$t\" WF=\"16384\"/><C Type=\"Page\" V=\"178\" U=\"10000002#" base.Loxone > "$out"
+  printf '{{"objects":{{}},"pages":{{"%s":"{NEU}"}}}}' "$t" > "$lock"
+else
+  cp base.Loxone "$out"; printf '{{"objects":{{}}}}' > "$lock"
+fi
+"#
+            ),
+        )
+        .unwrap();
+        let req = |ops: Vec<edit::Op>| edit::Request {
+            base: blob(&d, "out.Loxone"),
+            ops,
+        };
+        let e = edits_of(&a, &d).await;
+        assert_eq!(e["pages"]["rooms"], json!(["Küche"]));
+        assert_eq!(e["pages"]["created"], json!([]));
+        let new = edit::Op::NewPage {
+            title: "Küche Logik".into(),
+            room: "Küche".into(),
+            category: Some("Beleuchtung".into()),
+            restores: None,
+        };
+        let r = a.edit(&req(vec![new.clone()]), None).await.unwrap();
+        assert_eq!(r["added"], json!([{ "page": "Küche Logik", "uuid": NEU }]));
+        assert_eq!(r["undo"], json!([{ "op": "remove_page", "page": NEU }]));
+        let file = std::fs::read_to_string(d.join("pages/vislox/kueche-logik.loxl")).unwrap();
+        assert!(
+            file.ends_with("page \"Küche Logik\" (room: \"Küche\", category: \"Beleuchtung\")\n"),
+            "{file}"
+        );
+        assert!(
+            std::fs::read_to_string(d.join("out.Loxone"))
+                .unwrap()
+                .contains(NEU)
+        );
+        let e = edits_of(&a, &d).await;
+        let c = &e["pages"]["created"][0];
+        assert_eq!(c["uuid"], NEU);
+        assert_eq!(c["title"], "Küche Logik");
+        assert_eq!(c["file"], "pages/vislox/kueche-logik.loxl");
+        assert_eq!(c["deployed"], false);
+        assert_eq!(c["remove"], Value::Null);
+        // The same title again is refused: the pending config has the page.
+        let (code, msg) = a.edit(&req(vec![new.clone()]), None).await.unwrap_err();
+        assert_eq!(code, axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(msg.contains("has a page titled"), "{msg}");
+        // Undone: the file and the page go; its undo creates it again.
+        let undo: Vec<edit::Op> = serde_json::from_value(r["undo"].clone()).unwrap();
+        let r = a.edit(&req(undo), None).await.unwrap();
+        assert!(!d.join("pages/vislox/kueche-logik.loxl").exists());
+        assert!(
+            !std::fs::read_to_string(d.join("out.Loxone"))
+                .unwrap()
+                .contains(NEU)
+        );
+        assert_eq!(r["undo"][0]["op"], "new_page");
+        assert_eq!(r["undo"][0]["restores"], NEU);
+        // Redone: the reply names the page it creates again.
+        let redo: Vec<edit::Op> = serde_json::from_value(r["undo"].clone()).unwrap();
+        let r = a.edit(&req(redo), None).await.unwrap();
+        assert_eq!(r["added"][0]["restores"], NEU);
+        let undo: Vec<edit::Op> = serde_json::from_value(r["undo"].clone()).unwrap();
+        a.edit(&req(undo), None).await.unwrap();
+        // A compile that creates no page: refused, everything put back.
+        std::fs::write(d.join("NOPAGE"), "").unwrap();
+        let out_was = std::fs::read(d.join("out.Loxone")).unwrap();
+        let (code, msg) = a.edit(&req(vec![new]), None).await.unwrap_err();
+        assert_eq!(code, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            msg.contains("did not create the page \"Küche Logik\""),
+            "{msg}"
+        );
+        assert!(!d.join("pages/vislox/kueche-logik.loxl").exists());
+        assert_eq!(std::fs::read(d.join("out.Loxone")).unwrap(), out_was);
+        let calls = std::fs::read_to_string(tmp.path().join("calls.log")).unwrap();
+        assert!(
+            calls.lines().all(|l| l.starts_with("logic compile")),
+            "{calls}"
+        );
+    }
+
+    /// A page created here, deployed, then renamed in Loxone Config (#88):
+    /// Sync hands it to Loxone Config before lox compiles (lox refuses a
+    /// created page renamed while `room:` remains), follows the new title by
+    /// its UUID, and commits that. A sync that fails puts the file back.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sync_hands_a_created_page_renamed_in_loxone_config_to_it() {
+        let (_tmp, lox) = project_with_fake_lox(true);
+        let d = _tmp.path().join("project");
+        const NEU: &str = "2194aaaa-0000-0000-ffff504f94000001";
+        let page = |t: &str| {
+            crate::page_edit::tests::house().replacen(
+                "\t\t<C Type=\"Page\" V=\"178\" U=\"10000002",
+                &format!(
+                    "\t\t<C Type=\"Page\" V=\"178\" U=\"{NEU}\" Title=\"{t}\" WF=\"16384\"/>\n\t\t<C Type=\"Page\" V=\"178\" U=\"10000002"
+                ),
+                1,
+            )
+        };
+        // Deployed: the base has the page lox created, the lock its UUID.
+        std::fs::write(d.join("base.Loxone"), page("Küche Logik")).unwrap();
+        std::fs::write(d.join("out.Loxone"), page("Küche Logik")).unwrap();
+        std::fs::write(
+            d.join("logic.lock.json"),
+            format!(r#"{{"objects":{{}},"pages":{{"Küche Logik":"{NEU}"}}}}"#),
+        )
+        .unwrap();
+        std::fs::create_dir_all(d.join("pages/vislox")).unwrap();
+        let mut files = edit::Files::default();
+        files.pages.insert(
+            "kueche-logik.loxl".into(),
+            crate::blocks::PageFile {
+                room: Some("Küche".into()),
+                // A block on it keeps the file once the page is handed off.
+                blocks: vec![crate::blocks::NewBlock {
+                    slug: "vx_and_1".into(),
+                    ty: "And".into(),
+                    ..Default::default()
+                }],
+                ..crate::blocks::PageFile::new("Küche Logik")
+            },
+        );
+        let file = d.join("pages/vislox/kueche-logik.loxl");
+        let created = files.pages["kueche-logik.loxl"].render();
+        std::fs::write(&file, &created).unwrap();
+        // Renamed in Loxone Config: what the Miniserver runs now.
+        std::fs::write(d.join("live.Loxone"), page("Kochen")).unwrap();
+        sh(&d, "git add -A && git commit -qm deployed && git push -q");
+        // As lox: a created page renamed in the base while its line has
+        // `room:` is refused, by merge and compile alike.
+        let refuse = format!(
+            "  if grep -qs '(room:' pages/vislox/*.loxl && ! grep -q 'U=\"{NEU}\" Title=\"Küche Logik\"' base.Loxone; then echo 'compile error: page \"Küche Logik\" ({NEU}) is titled \"Kochen\" in the base config' >&2; exit 1; fi\n"
+        );
+        let script = std::fs::read_to_string(&lox).unwrap().replace(
+            CLEAN_SCAN,
+            &format!(
+                "{CLEAN_SCAN}  'config merge')\n    [ -f MERGEFAIL ] && {{ echo 'merge refused' >&2; exit 1; }}\n    cp live.Loxone base.Loxone\n{refuse}    echo '{{}}' ;;\n  'logic compile')\n{refuse}    cp base.Loxone out.Loxone ;;\n"
+            ),
+        );
+        std::fs::write(&lox, script).unwrap();
+        let a = actions_for(&d, lox.clone());
+        // A sync that fails: the file is as it was, the project clean.
+        std::fs::write(d.join("MERGEFAIL"), "").unwrap();
+        sh(
+            &d,
+            "git add MERGEFAIL && git commit -qm failing && git push -q",
+        );
+        let e = a.sync().await.unwrap_err();
+        assert!(e.1.contains("merge refused"), "{e:?}");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), created);
+        assert_eq!(git_out(&d, &["status", "--porcelain"]), "");
+        sh(
+            &d,
+            "git rm -q MERGEFAIL && git commit -qm ok && git push -q",
+        );
+        // Synced: handed off before merge compiled, the title followed after.
+        let msg = a.sync().await.unwrap();
+        assert!(msg.contains("Synced"), "{msg}");
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(
+            text.contains(&format!("# page uuid: {NEU}\npage \"Kochen\"\n")),
+            "{text}"
+        );
+        assert!(!text.contains("room:"), "{text}");
+        assert_eq!(git_out(&d, &["status", "--porcelain"]), "");
+        assert_eq!(
+            git_out(&d, &["log", "-1", "--format=%s"]),
+            "Sync with the Miniserver's running config"
+        );
+    }
+
+    /// An edit that changes nothing still hands a deployed page created here
+    /// to Loxone Config (#88), on disk, before anything compiles.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unchanged_edit_still_hands_off_a_deployed_page() {
+        let (tmp, a) = project_for_edits();
+        let d = tmp.path().join("project");
+        const NEU: &str = "2194aaaa-0000-0000-ffff504f94000001";
+        let xml = crate::page_edit::tests::house().replacen(
+            "\t\t<C Type=\"Page\" V=\"178\" U=\"10000002",
+            &format!("\t\t<C Type=\"Page\" V=\"178\" U=\"{NEU}\" Title=\"Kochen\" WF=\"16384\"/>\n\t\t<C Type=\"Page\" V=\"178\" U=\"10000002"),
+            1,
+        );
+        std::fs::write(d.join("base.Loxone"), &xml).unwrap();
+        std::fs::write(d.join("out.Loxone"), &xml).unwrap();
+        std::fs::write(
+            d.join("logic.lock.json"),
+            format!(r#"{{"objects":{{}},"pages":{{"Küche Logik":"{NEU}"}}}}"#),
+        )
+        .unwrap();
+        std::fs::create_dir_all(d.join("pages/vislox")).unwrap();
+        let file = d.join("pages/vislox/kueche-logik.loxl");
+        std::fs::write(
+            &file,
+            "page \"Küche Logik\" (room: \"Küche\")\n\nvx_and_1 = And()\n",
+        )
+        .unwrap();
+        sh(&d, "git add -A && git commit -qm deployed");
+        let r = a
+            .edit(
+                &edit::Request {
+                    base: blob(&d, "out.Loxone"),
+                    ops: vec![edit::Op::Tidy],
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(r["unchanged"], true);
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(
+            text.contains(&format!("# page uuid: {NEU}\npage \"Kochen\"\n"))
+                && !text.contains("room:"),
+            "{text}"
+        );
+    }
+
+    /// A new page with the real lox (#88): set `VISLOX_TEST_LOX` to a lox
+    /// binary (v0.83.0) to run it; it never talks to a Miniserver. The page
+    /// line creates the page, a block is added on it, and undoing both takes
+    /// the page out again.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_new_page_is_created_by_lox_and_undone() {
+        let Some(lox) = std::env::var_os("VISLOX_TEST_LOX") else {
+            eprintln!("VISLOX_TEST_LOX is not set: skipped");
+            return;
+        };
+        let base = edit::tests::PROGRAM_BASE;
+        let (tmp, a) = project_with_lox_base(Path::new(&lox), base.as_bytes());
+        let d = tmp.path().join("project");
+        // The module's own file is on Küche (project_with_lox_base writes Obergeschoss).
+        std::fs::write(
+            d.join("pages/own.loxl"),
+            "# The module's own.\npage \"Küche\"\n",
+        )
+        .unwrap();
+        sh(
+            &d,
+            &format!(
+                "{} logic compile >/dev/null && git add -A && git commit -qm own",
+                Path::new(&lox).display()
+            ),
+        );
+        let req = |ops: Vec<edit::Op>| edit::Request {
+            base: blob(&d, "out.Loxone"),
+            ops,
+        };
+        let r = a
+            .edit(
+                &req(vec![edit::Op::NewPage {
+                    title: "Küche Logik".into(),
+                    room: "Küche".into(),
+                    category: None,
+                    restores: None,
+                }]),
+                None,
+            )
+            .await
+            .unwrap();
+        let page = r["added"][0]["uuid"].as_str().unwrap().to_string();
+        let out = edit::parse_doc(&std::fs::read(d.join("out.Loxone")).unwrap()).unwrap();
+        assert_eq!(
+            edit::find_ci(&out.xml.root, &page)
+                .and_then(|e| e.attr_decoded("Title"))
+                .as_deref(),
+            Some("Küche Logik")
+        );
+        let undo_page: Vec<edit::Op> = serde_json::from_value(r["undo"].clone()).unwrap();
+        let r = a
+            .edit(
+                &req(vec![edit::Op::AddBlock {
+                    page: page.clone(),
+                    ty: "And".into(),
+                    title: Some("Neu".into()),
+                    params: Default::default(),
+                    settings: Default::default(),
+                    wires: Vec::new(),
+                    restores: None,
+                }]),
+                None,
+            )
+            .await
+            .unwrap();
+        let file = std::fs::read_to_string(d.join("pages/vislox/kueche-logik.loxl")).unwrap();
+        // Not deployed: no `# page uuid:` line yet (lox may mint another).
+        assert!(!file.contains("# page uuid:"), "{file}");
+        assert!(file.contains("vx_and_1 = And(\"Neu\")"), "{file}");
+        let undo_block: Vec<edit::Op> = serde_json::from_value(r["undo"].clone()).unwrap();
+        a.edit(&req(undo_block), None).await.unwrap();
+        a.edit(&req(undo_page), None).await.unwrap();
+        assert!(!d.join("pages/vislox/kueche-logik.loxl").exists());
+        let out = edit::parse_doc(&std::fs::read(d.join("out.Loxone")).unwrap()).unwrap();
+        assert!(edit::find_ci(&out.xml.root, &page).is_none());
     }
 
     #[cfg(unix)]

@@ -449,8 +449,9 @@ pub(crate) fn page_of(files: &Files, ctx: &Ctx, file: &str) -> String {
     let Some(pf) = files.pages.get(file) else {
         return String::new();
     };
-    match &pf.uuid {
-        Some(u) => u.clone(),
+    // A page created here (#88): the UUID the lock keeps, not a stale line.
+    match crate::page_edit::created_uuid(pf, ctx.lock).or_else(|| pf.uuid.clone()) {
+        Some(u) => u,
         None => {
             let mut same = Vec::new();
             pages_titled(&ctx.base.xml.root, &pf.page, &mut same);
@@ -653,32 +654,14 @@ pub fn set_signal(files: &mut Files, ctx: &Ctx, op: &Op) -> Result<Applied, Stri
             if again && ctx.names.contains(&s) {
                 return Err(format!("`{s}` is taken: the module has that name"));
             }
-            let pg = find(&ctx.base.xml.root, page)
-                .filter(|e| e.attr("Type") == Some("Page"))
-                .ok_or_else(|| format!("no page {page} in the project's base config"))?;
-            let page_title = pg.attr_decoded("Title").unwrap_or_default().into_owned();
-            if page_title.trim().is_empty() {
-                return Err("the page has no title; name it in Loxone Config first".into());
-            }
-            let mut same = Vec::new();
-            pages_titled(&ctx.base.xml.root, &page_title, &mut same);
-            if same.first().and_then(|e| e.attr("U")) != Some(page.as_str()) {
-                return Err(format!(
-                    "{} pages are titled \"{page_title}\", and lox puts new blocks on the first; \
-                     rename one in Loxone Config to add a signal here",
-                    same.len()
-                ));
-            }
+            // A page of the base, or one created here (#88).
+            let (page_title, page_file) = crate::page_edit::target(files, ctx, page, "a signal")?;
             for p in files.pages.values_mut() {
                 p.removed.remove(&s);
                 p.dropped.remove(&s);
             }
-            let file = match files
-                .pages
-                .iter()
-                .find(|(_, p)| p.uuid.as_deref() == Some(page.as_str()))
-            {
-                Some((n, _)) => n.clone(),
+            let file = match page_file {
+                Some(n) => n,
                 None => blocks::file_name(&page_title, &|n| {
                     n == crate::edit::CLAIMS || files.pages.contains_key(n)
                 }),

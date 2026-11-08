@@ -80,6 +80,7 @@
         <button id="btn-add-block" type="button" aria-haspopup="dialog"><span aria-hidden="true">+</span> Add block</button>
         <button id="btn-relayout" type="button"><span aria-hidden="true">⇄</span> Arrange</button>
         <button id="btn-adopt-page" type="button"><span aria-hidden="true">λ</span> Adopt all</button>
+        <button id="btn-remove-page" type="button" class="hidden"><span aria-hidden="true">×</span> Remove page</button>
         <span class="hud-sep" aria-hidden="true"></span>
         <button id="btn-undo" type="button" aria-keyshortcuts="Control+Z Meta+Z"><span aria-hidden="true">↶</span> Undo</button>
         <button id="btn-redo" type="button" aria-keyshortcuts="Control+Shift+Z Meta+Shift+Z"><span aria-hidden="true">↷</span> Redo</button>
@@ -139,6 +140,7 @@
         <button type="button" data-nav="prev" title="Previous page (PageUp)" aria-label="Previous page">‹</button><button type="button" data-nav="next" title="Next page (PageDown)" aria-label="Next page">›</button>
       </div>
       <div class="tab-list" id="tab-list" role="tablist"></div>
+      <button id="btn-new-page" class="new-page-btn hidden" type="button" aria-haspopup="dialog"><span aria-hidden="true">+</span> New page</button>
       <label class="only-changed" id="only-changed-w" title="Show only pages with changes">
         <input type="checkbox" id="chk-only-changed"> Changed pages only
       </label>
@@ -244,6 +246,12 @@
   <div class="pal-box ab-box">
     <div class="ab-head"><h2 id="ab-h">Add a block</h2><span class="ab-page" id="ab-page"></span></div>
     <div id="ab-body"></div>
+  </div>
+</div>
+<div id="newpage" class="overlay hidden" role="dialog" aria-modal="true" aria-labelledby="np-h">
+  <div class="pal-box ab-box">
+    <div class="ab-head"><h2 id="np-h">New page</h2><span class="ab-page">a logic page, created by lox logic compile</span></div>
+    <div id="np-body"></div>
   </div>
 </div>
 <div id="help" class="overlay hidden" role="dialog" aria-modal="true" aria-labelledby="help-h">

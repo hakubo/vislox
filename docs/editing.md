@@ -7,8 +7,8 @@ open an NFC Code Touch (#76), push notifications: who gets them and what they sa
 Pure Flex (#78), a managed block's label and settings, its program among them (#79), deleting and renaming a
 managed block (#80), `let` constants and `defaults` (#81), expressions and named signals (#82), template
 instances (#83), virtual inputs, virtual and Modbus devices (#84), Tree and Air hardware: statistics and new
-Tree devices (#85), operating modes and calendar entries (#86), and Automatic Designer rules (#87). This page is the
-design they share. #58 to #62, #72 to #87 are built (#81 to #84 and #86 in part: see their sections); the rest says
+Tree devices (#85), operating modes and calendar entries (#86), Automatic Designer rules (#87), and new logic pages
+(#88). This page is the design they share. #58 to #62, #72 to #88 are built (#81 to #84 and #86 in part: see their sections); the rest says
 where each step plugs in.
 
 ## The rules
@@ -20,7 +20,7 @@ where each step plugs in.
   Miniserver runs.
 - **vislox writes one place: its own files under the module directory**, `<module>/vislox/`: `edits.loxl` for
   the values it claims, the wires it draws and the constants it makes (#81), and one file per page for the blocks it adds
-  (`<module>/vislox/obergeschoss.loxl`), `_periphery.loxl` for the virtual inputs and devices (#84), operating modes and
+  (`<module>/vislox/obergeschoss.loxl`; a page vislox creates, #88, starts with its file), `_periphery.loxl` for the virtual inputs and devices (#84), operating modes and
   calendar entries (#86) it adds,
   `_hardware.loxl` for the Tree and Air hardware it declares (#85), the Automatic Designer rules it states and creates
   in `edits.loxl` too (#87), and a file per program a block of them runs
@@ -86,7 +86,9 @@ POST /api/edit
                { "kind": "weekday", "days": ["weekdays"] }, { "kind": "time", "at": "09:00" },
                { "kind": "then", "block": "<block uuid>", "command": "on" } ] } },
            { "op": "new_rule", "title": "Pumpe Mittag", "value": { "active": false, "lines": [
-               { "kind": "time", "at": "12:30" }, { "kind": "then", "block": "<block uuid>", "command": "on" } ] } } ] }
+               { "kind": "time", "at": "12:30" }, { "kind": "then", "block": "<block uuid>", "command": "on" } ] } },
+           { "op": "new_page", "title": "Küche Logik", "room": "Küche", "category": "Beleuchtung" },
+           { "op": "remove_page", "page": "<page uuid>" } ] }
 ```
 
 `adopt`, `adopt_page` and `unadopt` go in a request of their own (#72), and so does `rename` (#80). `restore_block`
@@ -120,7 +122,10 @@ is what undoes a `remove_block` of a deployed block (#80); vislox makes it, see 
   UUID) or, once deployed, the `restore_block` that brings it back with its UUID. `rule` is as `members` (#87): its
   `previous` is what vislox's file stated (null: nothing); `new_rule` is undone by `remove_block` of the UUID lox gave
   the rule, and a rule created here is removed as a block: `remove_block`'s `previous` is the `new_rule` that creates it
-  again or, once the base has it, the `restore_rule` that brings it back with its UUID.
+  again or, once the base has it, the `restore_rule` that brings it back with its UUID. `new_page` is undone by
+  `remove_page` of the UUID lox gave the page (#88), and `remove_page`'s `previous` is the `new_page` that creates it
+  again (lox mints a new UUID: `restores` names the old one, and the reply's `added` echoes it, `{ page, uuid,
+  restores }`).
   A reconnected wire is one request, `unwire` then `wire`:
   undone, the reverse list. The ops of one request see each other: `unwire` then `wire` of the same wire is
   accepted (and changes nothing). `remove_block`'s `add_block` carries the wires the removal took out
@@ -191,6 +196,62 @@ vx_pulseat_1 = PulseAt(At: 07:05, Pulse: "time")
   (never committed, or ignored by git) goes back to how it was before vislox's first edit since that commit,
   which vislox keeps in the git directory; one vislox never edited stays as it is, since a lost lock re-mints
   every managed block. Discard is all or nothing: when a step fails, it puts back what the others did.
+
+## New pages (#88)
+
+*New page*, next to the page tabs, starts a logic page from vislox: a title, a room (required) and a category. It
+writes a file of vislox's headed by the page line, and `lox logic compile` creates the page from it, as Loxone
+Config's *Neue Seite* does (`src/page_edit.rs`):
+
+```text
+# Blocks added in vislox on this page. vislox rewrites this file on every edit;       # <module>/vislox/kueche-logik.loxl
+# see docs/editing.md in vislox.
+# vislox created this page: lox creates it from the page line until it is
+# deployed, and then hands it to Loxone Config.
+page "Küche Logik" (room: "Küche", category: "Beleuchtung")
+```
+
+- **`new_page`** (`title`, `room`, `category` optional) checks first, and changes nothing when it refuses: the title
+  is one line with no spaces at its ends, and no page of the base or the pending config has it (lox would use that
+  page as is, so it would be no new page); no file of vislox's is for that title; `room` names exactly one room of
+  the base, not the unassigned one (Loxone Config does not accept a page there), and `category` exactly one category
+  (none: lox files the page under the unassigned category). Rooms and categories are named by title, as lox resolves
+  them against the base. The file is named after the title as a page file is (`kueche-logik.loxl`).
+- lox creates the page in the program, sorted in by title, and keeps its UUID in the lockfile's `pages` (title →
+  UUID), so recompiles before the push create the same page. vislox reads it back after the compile: the reply's
+  `added` is `[{ "page": "Küche Logik", "uuid": "<page uuid>" }]`, and a compile that created no page is refused,
+  everything put back. While the file creates its page, vislox finds the page by the lock's UUID for its title; it
+  writes no `# page uuid:` line (lox may mint another UUID after a Discard or a new lock), and ignores a stale one.
+- **The new tab** is the pending config's page, so the review marks it *added*, and the Deploy pane counts it
+  (*1 page created here*).
+- **Blocks** are added there as on any page (`add_block` with its UUID, #59), and signals (#82) and template instances
+  (#83) too: they go into the same file. A page vislox's files create is taken for a page of the base while the base
+  has no page with its UUID.
+- **`remove_page`** (`page`: its UUID) drops `room:` from the line, so the compile creates the page no more, and the
+  file goes. Only for a page vislox's files create, not deployed (the base has no page with its UUID: lox never
+  deletes a page when its statement goes), and holding nothing of vislox's (a block, a signal, an instance, a `moved`
+  line, a `removed` line of a block that is not one vislox added on this page); otherwise it is refused, and `GET
+  /api/edits` says why (`pages.created[].remove`). A `removed` line of a block added on the page (the lock pins it
+  there) stays, under a page line that creates nothing, while lox needs it: so the undo of a new page and a block on
+  it is one request. The next edit drops the line, and the file with it; a `new_page` of the title takes the file
+  again. *Remove page* on the
+  page's toolbar sends it; Undo creates the page again. When another file of the module still creates the page, the
+  compile is refused.
+- **Deployed**, the page is Loxone Config's: rename it, move it or give it another room there. As soon as the base
+  (or the deployed revision) has the page, vislox hands it off on disk: the line loses `room:` and `category:` (lox's
+  way of handing a created page to Loxone Config), takes the `# page uuid:` line and the page's title. It does so
+  before every compile it starts (an edit, even one that changes nothing; Compile; Sync, before `lox config merge`
+  and again on the downloaded base, compiled again when that changed a file; Apply) and before Apply's and Sync's
+  commits. lox refuses a created page renamed in Loxone Config while the line still has `room:`; handed off, a
+  rename is followed by UUID as for any page file (the same step follows a renamed page in every page file tied to
+  it). A sync that fails puts the files back. An empty file then goes; the page stays.
+- `GET /api/edits` sends `pages`: the rooms and categories a new page may name (`rooms`, `categories`: the base's,
+  titled, the title no other's, not the unassigned ones), and each page vislox's files create (`created`: its UUID,
+  null until compiled; title, room, category, file; `deployed`, whether the base has it, the config `remove_page`
+  asks too; `remove`, null or why `remove_page` is refused).
+- Not here: renaming a created page before it is deployed (*New page* with the new title and moving its blocks is two
+  steps), *Arrange* on it before it is deployed (lox lays out a page of the base), and deleting a page Loxone Config
+  made.
 
 ## Adopting blocks (#72)
 
@@ -1782,7 +1843,8 @@ The blocks vislox added or adopted (#72) are the exception: their `.loxl` is vis
   a position when it is added (lox places it; it can be moved after), and a room or category (lox has no claim for
   them on a managed block). Its settings (`Formula:`, `Type:`, `At:`, a program, …) are given when it is added and
   changed later in Properties (#79).
-- A block on a page whose title an earlier page has, and a new page (#88).
+- A block on a page whose title an earlier page has. A new page's title before it is deployed, *Arrange* on a page
+  not deployed yet, and deleting a page Loxone Config made (#88).
 - A rule with conditions or actions Lox Logic does not write (text values, calls, speech output): it stays the app's
   (#87). A rule's states and commands cannot be listed from the app's capability table: lox keeps it private, so the
   form suggests those the config's rules use and lox's refusal names the rest.
@@ -1819,7 +1881,7 @@ Each of these plugs in as new op kinds on `POST /api/edit`, written into `<modul
 | #85 (built) | Tree and Air hardware: `Statistics:` on an I/O, new Tree devices (`kind:`, `removed`) in `_hardware.loxl` |
 | #86 (built in part) | operating modes and calendar entries added in `_periphery.loxl`, an entry's mode and date edited (`switches:`, `every:`, `easter:`, `from:`/`to:`); adopting Loxone Config's is left |
 | #87 (built) | Automatic Designer rules (`rule`, named rules, `removed`) |
-| #88 | new pages (`page "…" (room: …)`) |
+| #88 (built) | new pages (`page "…" (room: …, category: …)`, `remove_page` while not deployed) |
 
 Around the module: #64 (mark managed blocks, built), #65 (`lox logic check` errors, built), #66 (lint, built), #67 (`lox logic test`, built),
 #68 (review claimed access, recipients and schedules, built), #70 (removals on Apply, built: a block the module

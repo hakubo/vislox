@@ -43,7 +43,8 @@ Then open <http://127.0.0.1:7878>. Started without a path or `--ctx` in a direct
 - A Miniserver status chip and a preflight before Pull, Apply and Sync (right serial, FTP and web port reachable,
   config changed since the base, calendar entries changed in the app).
 - The Miniserver log and, opt-in, its Debug-Monitor.
-- For a `lox.toml` project: edit values in Properties, add blocks to a page, adopt the blocks Loxone Config drew into
+- For a `lox.toml` project: edit values in Properties, add blocks to a page, create a page in a room (`page "…"
+  (room: …)`), adopt the blocks Loxone Config drew into
   the module (`lox logic adopt`, the config unchanged), move the blocks the module manages, draw wires, edit a
   Daytimer's switching times (a Lox Logic `schedule` set), a lighting controller's moods (a `moods` set) and the
   members of a central light or shade block (`.members`), who may open an NFC Code Touch (an `access` set), who

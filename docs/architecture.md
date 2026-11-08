@@ -155,6 +155,12 @@ The binary is an `axum` server with the UI embedded (plain JS and SVG, no build 
   date (`every:`, `easter:`, `from:`/`to:`, `DateArgs`) are the `entry_mode` and `entry_date` value ops, read back from
   the config by `edit::current` (`mode_of`, `date_of`), and `GET /api/edits`' `entries` says which entries are edited
   here. `web/modes.js` has the form and the picking on the year.
+- `src/page_edit.rs` is new logic pages (#88): `new_page` (a file of vislox's headed `page "…" (room: …, category:
+  …)`, the room and category checked against the base as lox resolves them), `remove_page` (while not deployed and
+  empty), `target` (the page a block, signal or instance of vislox's goes on: a page of the base, or one created here,
+  found by the UUID lox keeps in the lockfile's `pages`, `edit::Lock::pages`) and `GET /api/edits`' `pages`.
+  `hand_off` drops `room:` once the base or the deployed revision has the page; `actions.rs`' `hand_off_pages` runs
+  it (and `follow_renames`) on disk before every compile vislox starts and before Apply's and Sync's commits.
 - `src/rules.rs` reads what an Automatic Designer rule does (#87) with lox's decompile (its own reading of the `APC=`
   payload and the app's capability table are private to lox): each rule Lox Logic writes as lines (`Line`: conditions,
   `or`, actions, blocks and modes by UUID), why not for the others; the words and the one-sentence summary Properties

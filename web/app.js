@@ -2297,6 +2297,7 @@ function editsHere() {
   const parts = [];
   if (editsPending().length) parts.push(`${plural(editsPending().length, "value")} edited here`);
   if (editsAdded().length) parts.push(`${plural(editsAdded().length, "block")} added here`);
+  if (pagesCreated().length) parts.push(`${plural(pagesCreated().length, "page")} created here`);
   if (editsMoved().length) parts.push(`${plural(editsMoved().length, "block")} moved here`);
   if (schedsPending().length) parts.push(`switching times of ${plural(schedsPending().length, "timer")} edited here`);
   if (moodsPending().length) parts.push(`moods of ${plural(moodsPending().length, "lighting controller")} edited here`);
@@ -6126,6 +6127,9 @@ function undoLabel(ops) {
   if (ops.length === 1 && op.op === "unadopt") return op.uuids.length === 1 ? `Hand ${obj(op.uuids[0])} back to Loxone Config` : `Hand ${plural(op.uuids.length, "block")} back to Loxone Config`;
   if (ops.length === 1 && op.op === "access") return `Access to ${obj(op.uuid)}${op.value == null ? ": as last written" : op.value.grants ? "" : ": shared set"}`;
   if (ops.length === 1 && op.op === "new_rule") return `New rule ${op.title}`;
+  // New pages (#88).
+  if (ops.length === 1 && op.op === "new_page") return `New page ${op.title}`;
+  if (ops.length === 1 && op.op === "remove_page") return `Remove the page ${pageCreated(op.page)?.title || S.pageOf?.get(op.page)?.title || ""}`.trim();
   if (op.op === "rule" || op.op === "restore_rule") return `Rule ${obj(op.uuid)}${op.value == null ? ": as last written" : ""}`;
   if (ops.length === 1 && op.op === "members") return `Members of ${obj(op.uuid)}${op.value == null ? ": as last written" : ""}`;
   if (ops.length === 1 && op.op === "moods") return `Moods of ${obj(op.uuid)}${op.value == null ? ": Loxone Config's" : op.value.moods ? "" : ": shared set"}`;
@@ -6873,9 +6877,15 @@ function addState() {
   return { ok: true, rev: r, page: pg };
 }
 function renderAddHud() {
+  renderNewPageBtn();
   const st = addState(), b = $("btn-add-block"), r = $("btn-relayout");
   $("hud-add").classList.toggle("hidden", !st);
   if (!st) { undoListToggle(false); return; }
+  // A page created here and not deployed (#88): Remove page, while the server says it can go.
+  const cp = st.ok ? pageCreated(st.page.uuid) : null, rp = $("btn-remove-page");
+  rp.classList.toggle("hidden", !cp || cp.deployed);
+  rp.disabled = !cp || cp.remove != null || NP.busy;
+  rp.title = !cp ? "" : cp.remove != null ? cp.remove : `Take out ${cp.title}, created here and not deployed: vislox deletes ${cp.file} (it is compiled, not deployed)`;
   renderUndo();
   b.disabled = !st.ok;
   b.title = st.ok ? `Add a block to ${st.page.title || "this page"} (it is compiled, not deployed)` : st.why;
@@ -6893,6 +6903,124 @@ function renderAddHud() {
     : why !== null ? (why || "lox cannot lay out this page")
     : `Lay out the ${plural(n, "block")} the module manages on this page afresh, as lox places new blocks (it is compiled, not deployed)`;
 }
+// ── new pages (#88) ───────────────────────────────────────────────────
+// New page writes a file of vislox's headed `page "Title" (room: "…", category: "…")`; lox logic compile creates
+// the page from it, and blocks added there go into the same file. The rooms and categories offered are the base's
+// (lox resolves them there), served with GET /api/edits' `pages`, as is whether each created page can go again.
+const NP = { open: false, draft: {}, bad: {}, busy: false, err: "" };
+/** The page vislox's files create with UUID `uuid` (#88), as GET /api/edits lists it, or null. */
+function pageCreated(uuid) { return uuid ? (S.edits?.pages?.created || []).find((p) => p.uuid && ciEq(p.uuid, uuid)) || null : null; }
+/** The pages created here that are not deployed. */
+function pagesCreated() { return (S.edits?.pages?.created || []).filter((p) => p.uuid && !p.deployed); }
+/** Whether New page can be used now, or why not: the same rules as Add block, on no particular page. */
+function newPageState() {
+  const a = S.hist?.actions;
+  if (!a?.shown || !S.view) return null;
+  if (!a.edit?.available) return { why: `Editing is off: ${a.edit?.reason || "unknown"}.` };
+  const r = editRev();
+  if (!r) return { why: "The config on disk is not in the History yet." };
+  if (S.rev !== r.id) return { why: `Pages are created on the newest config (${r.kind === "pending" ? "Pending" : "deployed"}).` };
+  if (a.running) return { why: `${a.running} is running.` };
+  if (UNDO.busy) return { why: "Undo or redo is compiling." };
+  if (!S.edits?.pages) return { why: "vislox cannot read the project's base config." };
+  if (!S.edits.pages.rooms.length) return { why: "The base config has no room a page can be in: make one in Loxone Config first." };
+  return { ok: true, rev: r };
+}
+function renderNewPageBtn() {
+  const st = newPageState(), b = $("btn-new-page");
+  b.classList.toggle("hidden", !st);
+  if (!st) return;
+  b.disabled = !st.ok || NP.busy;
+  b.title = st.ok ? "Create a logic page in a room (it is compiled, not deployed)" : st.why;
+}
+function npOpen() {
+  if (!newPageState()?.ok) return;
+  const rooms = S.edits.pages.rooms;
+  Object.assign(NP, { open: true, draft: { title: "", room: rooms.length === 1 ? rooms[0] : "", category: "" }, bad: {}, busy: false, err: "" });
+  $("newpage").classList.remove("hidden");
+  npForm();
+  $("np-title").focus();
+}
+function npClose() {
+  if (NP.busy) return;
+  NP.open = false;
+  $("newpage").classList.add("hidden");
+  $("btn-new-page").focus();
+}
+function npForm() {
+  const p = S.edits?.pages || { rooms: [], categories: [] }, d = NP.draft, dis = NP.busy ? " disabled" : "";
+  const bad = (f) => NP.bad[f] ? ` aria-invalid="true" aria-describedby="np-${f}-e"` : "";
+  const err = (f) => NP.bad[f] ? `<div class="ed-bad" id="np-${f}-e">${esc(NP.bad[f])}</div>` : "";
+  const opts = (list, v) => list.map((t) => `<option${t === v ? " selected" : ""}>${esc(t)}</option>`).join("");
+  $("np-body").innerHTML = `<div class="ab-form">
+    <div class="pr ed-row"><label class="k" for="np-title">Title</label><div class="v"><input id="np-title" data-np-field="title" value="${esc(d.title)}" placeholder="Küche Logik" autocomplete="off" spellcheck="false"${bad("title")}${dis}>${err("title")}</div></div>
+    <div class="pr ed-row"><label class="k" for="np-room">Room</label><div class="v"><select id="np-room" data-np-field="room"${bad("room")}${dis}><option value="">Pick a room…</option>${opts(p.rooms, d.room)}</select>${err("room")}</div></div>
+    <div class="pr ed-row"><label class="k" for="np-category">Category</label><div class="v"><select id="np-category" data-np-field="category"${dis}><option value="">Not assigned</option>${opts(p.categories, d.category)}</select></div></div>
+    <div class="ed-bar"><button type="button" class="primary small" data-np="add"${dis}>${NP.busy ? "Compiling…" : "Create"}</button>
+      <button type="button" class="ed-btn small" data-np="cancel"${dis}>Cancel</button>
+      <span class="ed-msg${NP.err ? " err" : ""}" role="status" aria-live="polite">${esc(NP.err || "lox creates the page in the room when it compiles; add blocks to it next. Creating compiles the module; nothing is deployed.")}</span></div>
+  </div>`;
+}
+$("np-body").addEventListener("input", (e) => {
+  const f = e.target.closest("[data-np-field]");
+  if (!f) return;
+  NP.draft[f.dataset.npField] = f.value;
+  delete NP.bad[f.dataset.npField];
+});
+$("np-body").addEventListener("change", (e) => {
+  const f = e.target.closest("select[data-np-field]");
+  if (f) { NP.draft[f.dataset.npField] = f.value; delete NP.bad[f.dataset.npField]; }
+});
+$("np-body").addEventListener("keydown", (e) => {
+  if (e.key === "Escape") { e.preventDefault(); npClose(); }
+  else if (e.key === "Enter" && e.target.tagName === "INPUT") { e.preventDefault(); npAdd(); }
+});
+$("np-body").addEventListener("click", (e) => {
+  const b = e.target.closest("[data-np]");
+  if (b?.dataset.np === "add") npAdd();
+  else if (b?.dataset.np === "cancel") npClose();
+});
+$("newpage").addEventListener("mousedown", (e) => { if (e.target.id === "newpage") npClose(); });
+$("btn-new-page").onclick = npOpen;
+async function npAdd() {
+  const st = newPageState();
+  if (!st?.ok || NP.busy) return;
+  const title = NP.draft.title.trim(), room = NP.draft.room, category = NP.draft.category;
+  NP.bad = {}; NP.err = "";
+  if (!title) NP.bad.title = "Give the page a title.";
+  else if ((S.view?.pages || []).some((p) => p.title === title)) NP.bad.title = "A page has this title already: add blocks to it, or pick another title.";
+  if (!room) NP.bad.room = "lox needs a room to create a page.";
+  if (Object.keys(NP.bad).length) { NP.err = "Fix the marked values."; npForm(); $("np-body").querySelector('[aria-invalid="true"]')?.focus(); return; }
+  NP.busy = true; npForm(); renderNewPageBtn();
+  try {
+    const res = await editAct(st.rev.blob, [{ op: "new_page", title, room, ...(category ? { category } : {}) }]);
+    NP.busy = false;
+    npClose();
+    await editShowNewest(res.blob);
+    const uuid = res.added?.[0]?.uuid, u = uuid && [...(S.pageOf?.keys() || [])].find((k) => ciEq(k, uuid));
+    if (u) gotoPage(u);
+  } catch (err) {
+    NP.busy = false; NP.err = err.message;
+    if (NP.open) npForm();
+    renderNewPageBtn();
+  }
+}
+/** Remove page: a page created here, not deployed, with nothing of vislox's on it. Undo creates it again. */
+$("btn-remove-page").onclick = async () => {
+  const st = addState(), cp = st?.ok && pageCreated(st.page.uuid);
+  if (!cp || cp.remove != null || NP.busy) return;
+  NP.busy = true; renderAddHud();
+  try {
+    const res = await editAct(st.rev.blob, [{ op: "remove_page", page: cp.uuid }], `Remove the page ${cp.title}`);
+    NP.busy = false;
+    await editShowNewest(res.blob);
+    if (!S.pageOf?.has(S.page)) { const first = visiblePages()[0]; if (first) gotoPage(first.uuid); }
+  } catch (err) {
+    NP.busy = false;
+    showMsg(err.message);
+  }
+  renderAddHud();
+};
 async function abOpen() {
   const st = addState();
   if (!st?.ok) return;

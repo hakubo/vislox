@@ -354,6 +354,13 @@ sends to the Miniserver see [miniserver.md](miniserver.md).
   pending revision and the Changes list; its Properties edit its name and constants, and *Remove* takes it out
   again until it is deployed.
 
+- **New pages** (the same project and token, #88): *New page*, next to the page tabs, asks for a title, a room
+  (required: Loxone Config needs one) and a category, from the rooms and categories of the project's base. vislox
+  writes a file headed `page "Küche Logik" (room: "Küche", category: "Beleuchtung")` and runs `lox logic compile`,
+  which creates the page. Its tab shows in the pending revision marked added, and blocks added there go into the
+  same file. *Remove page* takes it out again while it is not deployed and empty; Undo creates it again. Once
+  deployed it is Loxone Config's: rename or move it there.
+
 - **Constants and defaults** (the same project and token, #81): a parameter whose value a `let` constant or a
   `defaults` statement of the module gives says so in Properties (`Time 30min (nachlauf)`, `ModbusPollingCycle 60
   (defaults ModbusASensor)`), with the statement's file and line and how many ports take it. Comparing the newest

@@ -538,12 +538,21 @@ impl PageFile {
         }
     }
 
+    /// Nothing to write: no statement but the page line, and no page it
+    /// creates (`room:`, #88), so the file goes.
     pub fn is_empty(&self) -> bool {
-        self.blocks.is_empty()
-            && self.removed.is_empty()
-            && self.moved.is_empty()
-            && self.signals.is_empty()
-            && self.instances.is_empty()
+        self.room.is_none() && !self.holds(&|_| false)
+    }
+
+    /// Whether the file holds a statement besides its page line: a block, a
+    /// signal, an instance, a `moved` line, or a `removed` line of a slug
+    /// `gone` does not accept.
+    pub fn holds(&self, gone: &dyn Fn(&str) -> bool) -> bool {
+        !self.blocks.is_empty()
+            || !self.moved.is_empty()
+            || !self.signals.is_empty()
+            || !self.instances.is_empty()
+            || self.removed.iter().any(|s| !gone(s))
     }
 
     /// Read a file vislox wrote. Only what vislox writes is accepted, so
@@ -788,8 +797,16 @@ impl PageFile {
                 "# Blocks added in vislox on this page. vislox rewrites this file on every edit;\n\
                  # see docs/editing.md in vislox.\n",
             );
-            if let Some(u) = &self.uuid {
+            // A page the file creates (#88) takes its UUID once it is handed
+            // off to Loxone Config: before, lox may mint another one.
+            if let (Some(u), None) = (&self.uuid, &self.room) {
                 out.push_str(&format!("# {UUID_LINE} {u}\n"));
+            }
+            if self.room.is_some() {
+                out.push_str(
+                    "# vislox created this page: lox creates it from the page line until it is\n\
+                     # deployed, and then hands it to Loxone Config.\n",
+                );
             }
             out.push_str(&render_page(&page));
             out.push('\n');
