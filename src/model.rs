@@ -1907,9 +1907,17 @@ pub fn build(new: &LoxoneDoc, old: Option<&LoxoneDoc>, title: &str) -> View {
 
     // Automatic Designer rules (#87), read by lox's decompile.
     let mut rules = rule_infos(&nc, oc.as_ref().filter(|_| d.on));
+    // The rules of the compared revision this one lost, read only when there are any.
     let mut gone_rules = match &oc {
-        Some(oc) => rule_infos(oc, None),
-        None => HashMap::new(),
+        Some(oc)
+            if oc.order.iter().any(|u| {
+                !nc.els.contains_key(u)
+                    && oc.el(u).and_then(|e| e.attr("Type")) == Some(crate::rules::RULE)
+            }) =>
+        {
+            rule_infos(oc, None)
+        }
+        _ => HashMap::new(),
     };
 
     // Member lists (#75): a changed one marks its block changed (its `rec=`
