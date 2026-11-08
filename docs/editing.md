@@ -423,7 +423,7 @@ moved vx_nach -> vx_nachlauf
 - **The lines afterwards.** A `removed` line is done once lox keeps the tombstone (the lockfile no longer has the
   block), a `moved` line once lox moved the entry; `lox logic lint` reports them as `stale-lifecycle`. Every edit
   drops them first (`Files::tidy`), so they never pile up. `GET /api/edits`' `stale_lines` lists them as written, the
-  Deploy pane offers *Drop them*, and `tidy` (a request that asks for nothing else) drops them and compiles; the
+  Deploy pane offers *Remove obsolete statements*, and `tidy` (a request that asks for nothing else) drops them and compiles; the
   config does not change.
 
 ## Block settings (#79)
@@ -919,8 +919,8 @@ end
   lock's pin back, taken out of lox's tombstone; it is routed by the tombstone's type, never by the request, and refused
   while another rule has its name). The reply's `added` names the rule an undone delete creates again next to the UUID
   it had (`restores`), as for a block, and the browser follows it in its history. A rule
-  whose output feeds a block in the pending config is not deleted (lox refuses it too). The `removed` lines lox needs
-  no more are dropped as for blocks (`Files::tidy`).
+  whose output feeds a block in the pending config is not deleted (lox refuses it too). The obsolete `removed`
+  statements are removed as for blocks (`Files::tidy`).
 - **Not deployed and Revert.** `GET /api/edits` sends `rules`: per rule vislox's file states now or stated in the
   deployed revision, `value`, `deployed` (what Revert sends), `created` (its slug and name, for a rule created here),
   `deployed_title`, `missing` and `pending` (the pending config's rule reads otherwise than the deployed one's,
@@ -2036,8 +2036,8 @@ lost is deleted only with consent to exactly that list, see [features.md](featur
   changed here (Loxone Config or the module drew it). The Deploy pane counts the wires drawn and taken out here.
 - A block of vislox's files shows its slug in the Edit section with *Rename* (a field: Enter renames, Escape
   cancels; the draft closes when the selection or the pending config changes) and, once deployed or adopted,
-  *Delete* (asks first; off with `blocks[].delete` as the reason). The Deploy pane lists the `removed` and `moved`
-  lines lox needs no more, with *Drop them* (#80).
+  *Delete* (asks first; off with `blocks[].delete` as the reason). The Deploy pane lists the obsolete `removed` and `moved`
+  statements, with *Remove obsolete statements* (#80).
 - *Arrange*, next to *Add block*, lays out the page's managed blocks afresh. It is off, with the reason, where
   the server would refuse it (`arrange` in `GET /api/edits`).
 - A refused move puts the block back where it was. A move that compiled stays drawn even when showing the new

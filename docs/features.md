@@ -449,7 +449,7 @@ sends to the Miniserver see [miniserver.md](miniserver.md).
   files with lox's own rename and adds `moved <old> -> <new>`: the block keeps its UUIDs and the config does not
   change (vislox checks). *Delete* drops the declaration and adds `removed <slug>`: the review shows the block
   removed, Apply deletes it on the Miniserver after you confirm the removals (as any removal), and Undo brings it
-  back with its UUIDs until then. Once compiled, the Deploy pane offers to drop the lines lox needs no more (lint's
+  back with its UUIDs until then. Once compiled, the Deploy pane offers to remove the obsolete statements (lint's
   `stale-lifecycle`). How: [editing.md](editing.md#deleting-and-renaming-managed-blocks-80).
 
 - **Draw wires** (the same project and token): drag from an output to an input of another block (or the other way

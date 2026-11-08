@@ -5,6 +5,11 @@ published under the same version (see [docker/README.md](docker/README.md)).
 
 ## Unreleased
 
+- Wording (#128): unsupported lint now says *Lint is unavailable: <reason>* instead of *No lint findings*. The `removed`
+  and `moved` lines lox no longer needs are called *obsolete statements in vislox-managed files*, with one button and
+  Undo label, *Remove obsolete statements*. The Roll back confirmation says the program is *recompiled from the module
+  version before that deployment*. The CLI help and the web header say vislox is read-only by default, with optional
+  editing and deployment. No behaviour changes.
 - An edit made while the page still shows the config before its own previous edit is refused in the browser, with
   the reason (*The last edit is still being shown*), instead of being sent for the server to refuse with 409 (follow-up
   to #141). It is one check, in the function every edit is sent by; it ends when the History shows another config
