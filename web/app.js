@@ -122,6 +122,10 @@ function writeHash(push) {
   if (push) history.pushState(null, "", s); else history.replaceState(null, "", s);
 }
 let popstateSeq = 0;
+let historyLoadSeq = 0;
+let historyRetryTimer = null;
+let historyRetryDelay = 1000;
+let streamRetryTimer = null;
 window.addEventListener("popstate", async () => {
   const seq = ++popstateSeq;
   const h = readHash();
@@ -158,9 +162,23 @@ function followLatest(navigation) {
   return loadHistory(false, navigation);
 }
 async function loadHistory(fromEvent, navigation) {
+  const seq = ++historyLoadSeq;
   let h;
-  try { h = await api("/api/history"); } catch (e) { if (navigation == null || navigation === popstateSeq) setStatus("server unreachable", "error"); return; }
-  if (navigation != null && navigation !== popstateSeq) return;
+  try { h = await api("/api/history"); } catch (e) {
+    if (seq !== historyLoadSeq || (navigation != null && navigation !== popstateSeq)) return;
+    setStatus("server unreachable", "error");
+    if (!S.hist && historyRetryTimer == null) {
+      const delay = historyRetryDelay;
+      historyRetryDelay = Math.min(historyRetryDelay * 2, 30000);
+      historyRetryTimer = setTimeout(() => { historyRetryTimer = null; loadHistory(); }, delay);
+    }
+    return;
+  }
+  if (seq !== historyLoadSeq || (navigation != null && navigation !== popstateSeq)) return;
+  clearTimeout(historyRetryTimer);
+  historyRetryTimer = null;
+  historyRetryDelay = 1000;
+  if ($("status").classList.contains("error")) setStatus("live", "live");
   const prevNewest = newestRev(S.hist)?.id;
   S.hist = h;
   $("doc-sub").textContent = h.label + (h.error ? " · " + h.error : "");
@@ -8476,7 +8494,7 @@ function flash(n) {
 function connect() {
   const es = new EventSource("/api/events");
   // Changes while the stream was down (or before it opened) are not replayed: catch up.
-  es.onopen = () => { setStatus("live", "live"); if (S.hist) loadHistory(); };
+  es.onopen = () => { if (S.hist) setStatus("live", "live"); loadHistory(); };
   // A new deployed revision may have taken over the app's calendar edits.
   es.addEventListener("history", () => { loadHistory(true); loadCal(); });
   // `changed`: re-read it. `read` again unchanged: only an Apply waiting for a read cares.
@@ -8493,7 +8511,12 @@ function connect() {
   });
   es.addEventListener("calendar", () => loadCal());
   es.addEventListener("operate", (e) => { if (S.hist) { S.hist.operate = JSON.parse(e.data); renderHistory(); } });
-  es.onerror = () => setStatus("disconnected — retrying", "error");
+  es.onerror = () => {
+    setStatus("disconnected — retrying", "error");
+    if (es.readyState === EventSource.CLOSED && streamRetryTimer == null) {
+      streamRetryTimer = setTimeout(() => { streamRetryTimer = null; connect(); }, 1000);
+    }
+  };
 }
 S.hash = readHash();
 loadHistory().then(connect);

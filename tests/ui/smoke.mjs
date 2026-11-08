@@ -225,12 +225,46 @@ let failed = false;
 try {
   const page = await browser.newPage({ viewport: { width: 1400, height: 900 } });
   page.on("pageerror", (e) => errors.push(e.message));
-  page.on("console", (m) => { if (m.type() === "error") errors.push(m.text()); });
+  page.on("console", (m) => { if (m.type() === "error" && !/50[02] \((?:Internal Server Error|Bad Gateway)\)/.test(m.text())) errors.push(m.text()); });
   const url = `http://127.0.0.1:${port}/`;
+  let historyAttempts = 0;
+  await page.exposeFunction("__historyAttempts", () => historyAttempts);
+  await page.route("**/api/history", async (route) => {
+    historyAttempts++;
+    if (historyAttempts <= 2) await route.fulfill({ status: 500, body: "simulated history outage" });
+    else await route.continue();
+  });
   await page.goto(url);
-  await page.waitForSelector(".tab");
+  await page.waitForFunction(() => $("status").classList.contains("error") && $("status-text").textContent === "server unreachable");
+  await page.waitForFunction(async () => await window.__historyAttempts() >= 2, null, { timeout: 5000 });
+  assert.equal(historyAttempts, 2, "the initial request and event-stream catch-up both fail");
+  await new Promise((resolve) => setTimeout(resolve, 400));
+  assert.equal(historyAttempts, 2, "no history event or immediate request recovers the page");
+  await page.waitForFunction(() => S.hist && S.view && document.querySelector(".tab"), null, { timeout: 10000 });
+  assert.ok(historyAttempts >= 3, "the backoff retry recovers history");
+  await page.waitForFunction(() => !$('status').classList.contains("error"), null, { timeout: 5000 });
+  await page.unroute("**/api/history");
 
   const step = async (name, fn) => { await fn(); console.log("ok -", name); };
+  await step("history retries after two failures and clears its error when loaded", async () => {
+    assert.ok(historyAttempts >= 3);
+    assert.ok(await page.locator("#status").getAttribute("class").then((x) => !x.includes("error")));
+  });
+  await step("a permanently closed event stream is recreated and catches up", async () => {
+    let eventAttempts = 0;
+    await page.exposeFunction("__eventAttempts", () => eventAttempts);
+    await page.route("**/api/events", async (route) => {
+      eventAttempts++;
+      if (eventAttempts === 1) await route.fulfill({ status: 502, body: "simulated proxy restart" });
+      else await route.continue();
+    });
+    await page.reload();
+    await page.waitForFunction(() => S.hist && S.view && document.querySelector(".tab"), null, { timeout: 10000 });
+    await page.waitForFunction(async () => await window.__eventAttempts() >= 2, null, { timeout: 5000 });
+    await page.waitForFunction(() => !$('status').classList.contains("error"), null, { timeout: 5000 });
+    assert.equal(eventAttempts, 2, "a closed stream is replaced with a new connection");
+    await page.unroute("**/api/events");
+  });
   // The Miniserver runs the last commit; the uncommitted edit on disk is the newest revision (#121). What is about
   // the running config (live values, the app, the log) shows on the one and not on the other.
   const showDeployed = async () => {
