@@ -5,6 +5,12 @@ published under the same version (see [docker/README.md](docker/README.md)).
 
 ## Unreleased
 
+- An older answer of `GET /api/edits` arriving after a newer one no longer overwrites it (follow-up to #124/#126):
+  the browser starts a load for each change of the server's edit key, the answers can cross, and the stale one was
+  kept because the key already named the newer. Only the newest load applies, as the check's and the History's do.
+- The Revert of an adopted block in the Changes list comes on when the edit that adopted it ends. The list was drawn
+  while that edit was still running, with Revert off, and nothing drew it again (#133, a flaky browser step).
+
 - Edit values in Properties (a `lox.toml` project, with the admin token): a block's name, room and category, the
   constant of an unwired input, and the settings of a physical input or output or a device. vislox writes them
   into its own file of the module (`<module>/vislox/edits.loxl`) and runs `lox logic compile`; they show as the

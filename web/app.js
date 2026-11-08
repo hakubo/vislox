@@ -1798,10 +1798,10 @@ function renderChanges() {
       go.textContent = `Adopt into vislox: ${v.objects[b.uuid]?.title || b.slug}`;
       go.onclick = () => select(b.uuid); d.appendChild(go);
       const revert = document.createElement("button"); revert.type = "button"; revert.textContent = "Revert";
-      revert.disabled = !!b.hand_back || !adoptState()?.ok;
-      revert.title = b.hand_back || "Hand back to Loxone Config";
+      revert.dataset.adoptRevert = b.uuid;
       revert.onclick = () => { select(b.uuid); adoptHandBack(b.uuid); }; d.appendChild(revert); box.appendChild(d);
     }
+    adoptRevertSync();
   };
   const compact = (!v.compared || !v.changes.length) && !adopted.length;
   $("right").classList.toggle("compact", compact);
@@ -3341,13 +3341,20 @@ function settingsRows(o, row, marks, chg) {
 S.edits = null; // GET /api/edits: what vislox's file claims, and which of it is not deployed
 S.edit = { uuid: null, open: false, draft: {}, bad: {}, busy: false, msg: "", err: "" };
 S.editsKey = null; // the server's key of what /api/edits says (vislox's file, deployed and pending config)
+S.editsSeq = 0;
 async function loadEdits() {
+  // Loads overlap (each change of the key starts one): an older answer arriving after a newer one is dropped, as
+  // `S.editsKey` already names the newer and nothing would load it again.
+  const seq = ++S.editsSeq;
   const hwWas = JSON.stringify((S.edits?.blocks || []).filter((b) => b.hardware).map((b) => [b.uuid, b.paired]));
   const mdWas = mdEditKey();
   const adoptionsWas = JSON.stringify(adoptedUncommitted());
   const was = managedSet(), under = JSON.stringify(S.edits?.add_under || null), consts = JSON.stringify(S.edits?.constants || null), exprs = JSON.stringify([S.edits?.expressions || null, S.edits?.templates?.instances || null, S.edits?.templates?.templates || null]);
   if (!S.hist?.actions?.shown) { S.edits = null; managedRefresh(was); return; }
-  try { S.edits = await api("/api/edits"); } catch { S.edits = null; S.editsKey = null; }
+  let got = null, failed = false;
+  try { got = await api("/api/edits"); } catch { failed = true; }
+  if (seq !== S.editsSeq) return;
+  if (failed) { S.edits = null; S.editsKey = null; } else S.edits = got;
   // The managed blocks' badges and the legend follow the lockfile and the module (#64); the expressions'
   // groups follow the module too (#82).
   const exprsNow = JSON.stringify([S.edits?.expressions || null, S.edits?.templates?.instances || null, S.edits?.templates?.templates || null]);
@@ -6177,6 +6184,18 @@ $("props").addEventListener("keydown", (e) => {
 // an edit like any other: compiled, never deployed, undone through its reply's `undo`.
 const AD = { uuid: null, open: false, slug: "", busy: false, msg: "", err: "" };
 /** Whether adopting can be asked now: `{ ok, rev }`, or `{ why }`. */
+/** The Changes list's Revert of each adopted block follows whether an edit can be sent now. It is drawn with the
+ *  list, and an edit running then (or finished since) is no reason for it to stay off: this runs wherever that
+ *  state changes (renderAddHud: an edit starts or ends, History's actions). */
+function adoptRevertSync() {
+  const st = adoptState(), box = $("changes");
+  if (!box) return;
+  for (const btn of box.querySelectorAll("[data-adopt-revert]")) {
+    const b = editsBlock(btn.dataset.adoptRevert);
+    btn.disabled = !!b?.hand_back || !st?.ok;
+    btn.title = b?.hand_back || (st?.ok ? "Hand back to Loxone Config" : st?.why || "Hand back to Loxone Config");
+  }
+}
 function adoptState() {
   const a = S.hist?.actions;
   if (!a?.shown || !a.edit?.available) return null;
@@ -7178,6 +7197,7 @@ function addState() {
 }
 function renderAddHud() {
   renderNewPageBtn();
+  adoptRevertSync();
   const st = addState(), b = $("btn-add-block"), r = $("btn-relayout");
   $("hud-add").classList.toggle("hidden", !st);
   if (!st) { undoListToggle(false); return; }
