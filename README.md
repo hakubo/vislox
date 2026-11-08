@@ -99,7 +99,7 @@ Miniserver it shows (the repository's `<serial>` or `192_168_1_77` folder), else
 | `--no-live` | | Never connect to the Miniserver: no live values, status checks, log, structure file or backups reads. |
 | `--live-from <FILE>` | | Live values from a file (or `-` for stdin) of `lox stream -o json --initial` lines, e.g. a recording. |
 | `--no-pull` | | Hide *Pull from Miniserver*. |
-| `--lox <PATH>` | | The lox binary. Default `lox`. |
+| `--lox <PATH>` | | The lox binary. Default `lox`. Explicit relative paths are made absolute against vislox's startup directory before lox commands change directories. Bare names use `PATH` at each run. |
 | `--admin-token-file <FILE>` | | A file holding the passphrase that Apply, Sync and Discard ask for. Without it they are off. |
 | `--operate` | | Let the browser send commands to virtual inputs. Needs `--admin-token-file` and live values from the Miniserver. |
 | `--monitor` | `VISLOX_MONITOR=1` | Receive the Miniserver's Debug-Monitor (UDP). |

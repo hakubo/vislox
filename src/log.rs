@@ -48,14 +48,8 @@ impl LoxCmd {
             return Err(why.to_string());
         }
         let f = found.map_err(|e| format!("no lox configuration: {e}"))?;
-        let lox = crate::pull::which(lox).ok_or_else(|| {
-            format!(
-                "`{}` not found (install lox, or pass --lox <path>)",
-                lox.display()
-            )
-        })?;
         Ok(LoxCmd {
-            lox,
+            lox: lox.to_path_buf(),
             ctx: f.ctx.clone(),
             cwd: start.to_path_buf(),
         })

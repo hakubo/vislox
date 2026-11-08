@@ -187,7 +187,11 @@ type CalDrift = ((String, u64), Arc<serde_json::Value>);
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args = Args::parse();
+    let mut args = Args::parse();
+    // Resolve `--lox` while the process is still in its startup directory.
+    // All lox commands can change their working directory (often into the
+    // project), so a relative executable path must not be interpreted there.
+    args.lox = pull::resolve_lox(&args.lox)?;
     if args.discover {
         let found = tokio::task::spawn_blocking(|| discover::search(discover::WAIT)).await?;
         println!("{}", discover::describe(&found));
