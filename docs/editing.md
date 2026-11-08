@@ -101,8 +101,9 @@ is what undoes a `remove_block` of a deployed block (#80); vislox makes it, see 
 - `base` is the git blob id of what the browser showed: the newest compile, or the deployed config when nothing
   is pending. When the file on disk is another one (someone compiled, applied or discarded), the edit is refused
   with 409, and the browser shows the new revision first.
-  The browser does not send an edit while it is still fetching the config of its own previous edit (the controls say
-  *The last edit is still being shown*), so that a quick second edit is not refused for it.
+  The browser refuses an edit made while it still shows the config before its own previous edit (*The last edit is
+  still being shown*; `undoSend` checks, so every edit is covered), until the History shows another config or 10 s
+  have passed, so that a quick second edit is not sent only to be refused here.
 - `value: null` drops vislox's claim: lox puts back the value Loxone Config had before.
 - The reply has, per op, what undoes it (`previous`), the new pending blob id, and the blocks it added with the
   UUIDs lox minted (`added: [{ slug, uuid }]`). For a value, `previous` is the value vislox claimed before: the

@@ -155,54 +155,84 @@ fn check(
     })
 }
 
-/// Run `c`, retrying briefly while the binary is "busy" (ETXTBSY): on
-/// Linux, a file just written can still be held open for writing by a child
-/// another thread forked at that moment, and executing it fails until that
-/// child execs.
+/// The one policy for running a binary that was just written: on Linux it can still be held open for writing by
+/// a child another thread forked at that moment, and executing it fails (ETXTBSY, "busy") until that child
+/// execs. Try again for about a second, then give the error.
+const BUSY_TRIES: u32 = 40;
+const BUSY_WAIT: std::time::Duration = std::time::Duration::from_millis(25);
+
+fn is_busy<T>(r: &std::io::Result<T>) -> bool {
+    matches!(r, Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy)
+}
+
+/// The tries of one run: `again` says whether a result is a busy binary worth another try (after waiting).
+pub(crate) struct BusyRetry(u32);
+
+impl BusyRetry {
+    pub(crate) fn new() -> Self {
+        Self(0)
+    }
+
+    fn next<T>(&mut self, r: &std::io::Result<T>) -> bool {
+        if !is_busy(r) || self.0 >= BUSY_TRIES {
+            return false;
+        }
+        self.0 += 1;
+        true
+    }
+
+    pub(crate) async fn again<T>(&mut self, r: &std::io::Result<T>) -> bool {
+        let more = self.next(r);
+        if more {
+            tokio::time::sleep(BUSY_WAIT).await;
+        }
+        more
+    }
+
+    #[cfg(test)]
+    pub(crate) fn again_blocking<T>(&mut self, r: &std::io::Result<T>) -> bool {
+        let more = self.next(r);
+        if more {
+            std::thread::sleep(BUSY_WAIT);
+        }
+        more
+    }
+}
+
+/// `c.output()`, again while its binary is busy.
 pub(crate) async fn output_retrying(
     c: &mut tokio::process::Command,
 ) -> std::io::Result<std::process::Output> {
-    let mut tries = 0;
+    let mut busy = BusyRetry::new();
     loop {
-        match c.output().await {
-            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && tries < 20 => {
-                tries += 1;
-                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-            }
-            res => return res,
+        let r = c.output().await;
+        if !busy.again(&r).await {
+            return r;
         }
     }
 }
 
-/// [`output_retrying`] for `spawn`: the same wait while the binary is busy.
+/// `c.spawn()`, again while its binary is busy.
 pub(crate) async fn spawn_retrying(
     c: &mut tokio::process::Command,
 ) -> std::io::Result<tokio::process::Child> {
-    let mut tries = 0;
+    let mut busy = BusyRetry::new();
     loop {
-        match c.spawn() {
-            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && tries < 20 => {
-                tries += 1;
-                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-            }
-            res => return res,
+        let r = c.spawn();
+        if !busy.again(&r).await {
+            return r;
         }
     }
 }
 
-/// [`output_retrying`] for a blocking command (the tests run stand-in executables they just wrote).
+/// `c.output()` for a test that runs a stand-in it just wrote, again while it is busy.
 #[cfg(test)]
-pub(crate) fn output_retrying_blocking(
-    c: &mut std::process::Command,
-) -> std::io::Result<std::process::Output> {
-    let mut tries = 0;
+pub(crate) fn output_blocking(c: &mut std::process::Command) -> std::process::Output {
+    let mut busy = BusyRetry::new();
     loop {
-        match c.output() {
-            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && tries < 20 => {
-                tries += 1;
-                std::thread::sleep(std::time::Duration::from_millis(25));
-            }
-            res => return res,
+        let r = c.output();
+        if !busy.again_blocking(&r) {
+            return r.unwrap();
         }
     }
 }
@@ -246,9 +276,7 @@ mod tests {
         }
 
         let resolved = resolve_lox_from(Path::new("./bin/lox"), &startup).unwrap();
-        let child =
-            output_retrying_blocking(std::process::Command::new(resolved).current_dir(&elsewhere))
-                .unwrap();
+        let child = output_blocking(std::process::Command::new(&resolved).current_dir(&elsewhere));
         assert!(child.status.success());
         assert_eq!(child.stdout, b"ran");
     }
@@ -270,14 +298,14 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
         let resolved = resolve_lox(&executable).unwrap();
-        let child =
-            output_retrying_blocking(std::process::Command::new(resolved).env_clear()).unwrap();
+        let child = output_blocking(std::process::Command::new(&resolved).env_clear());
         assert!(child.status.success());
         assert_eq!(child.stdout, b"ran");
     }
 
-    /// A stand-in lox that was just written can still be open for writing in a child another test thread forked:
-    /// running it then fails with ETXTBSY until that child execs. Held open here for a while, on purpose.
+    /// A stand-in that was just written can still be open for writing in a child another test thread forked:
+    /// running it then fails with ETXTBSY until that child execs. Held open here until the first refusal is
+    /// seen, then let go: no timing.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_busy_executable_is_waited_for_not_failed() {
@@ -286,32 +314,53 @@ mod tests {
         let lox = tmp.path().join("lox");
         std::fs::write(&lox, "#!/bin/sh\nprintf ran").unwrap();
         std::fs::set_permissions(&lox, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let holder = std::fs::OpenOptions::new().append(true).open(&lox).unwrap();
-        // (Linux and others refuse it; macOS runs it, and there is nothing to wait for.)
-        #[cfg(target_os = "linux")]
-        assert_eq!(
-            std::process::Command::new(&lox)
-                .output()
-                .unwrap_err()
-                .kind(),
-            std::io::ErrorKind::ExecutableFileBusy,
-            "a file open for writing is not executable"
-        );
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(150));
-            drop(holder);
-        });
-        let mut c = tokio::process::Command::new(&lox);
-        let out = output_retrying(&mut c).await.unwrap();
+        let open = || std::fs::OpenOptions::new().append(true).open(&lox).unwrap();
+
+        let mut holder = Some(open());
+        let mut busy = BusyRetry::new();
+        let mut attempts = 0;
+        let out = loop {
+            attempts += 1;
+            let r = tokio::process::Command::new(&lox).output().await;
+            if is_busy(&r) {
+                holder.take();
+            }
+            if !busy.again(&r).await {
+                break r.unwrap();
+            }
+        };
         assert_eq!(out.stdout, b"ran");
-        let holder = std::fs::OpenOptions::new().append(true).open(&lox).unwrap();
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(150));
-            drop(holder);
-        });
+        // (Linux refuses a file open for writing, once; macOS runs it, and there is nothing to wait for.)
+        #[cfg(target_os = "linux")]
+        assert_eq!(attempts, 2);
+        #[cfg(not(target_os = "linux"))]
+        assert!(attempts >= 1);
+
+        let mut holder = Some(open());
         let mut c = tokio::process::Command::new(&lox);
-        let mut child = spawn_retrying(&mut c).await.unwrap();
+        let mut child = loop {
+            let r = c.spawn();
+            if is_busy(&r) {
+                holder.take();
+            }
+            if !busy.again(&r).await {
+                break r.unwrap();
+            }
+        };
         assert!(child.wait().await.unwrap().success());
+        let mut holder = Some(open());
+        let mut c = std::process::Command::new(&lox);
+        let mut busy = BusyRetry::new();
+        let out = loop {
+            let r = c.output();
+            if is_busy(&r) {
+                holder.take();
+            }
+            if !busy.again_blocking(&r) {
+                break r.unwrap();
+            }
+        };
+        assert_eq!(out.stdout, b"ran");
     }
 
     #[cfg(unix)]
