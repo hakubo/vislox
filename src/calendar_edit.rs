@@ -42,6 +42,8 @@ pub const ENTRY: &str = crate::calendar::ENTRY;
 /// The argument that names the mode an entry switches on, and the setting
 /// of an `add_block` that carries the mode's UUID.
 pub const SWITCHES: &str = "switches";
+pub const UNWRITABLE_DATE: &str =
+    "This calendar date cannot be written by Lox Logic; it stays read-only";
 /// The setting of an `add_block` that carries the date as the source writes it.
 pub const DATE: &str = "date";
 
@@ -497,9 +499,7 @@ fn not_ours_el(
         return format!("{name}: only a calendar entry switches a mode on a date");
     }
     if date_of(el).is_none() {
-        return format!(
-            "{name}: this calendar date cannot be written by Lox Logic; it stays read-only"
-        );
+        return format!("{name}: {UNWRITABLE_DATE}");
     }
     match ctx.lock.slug_of(uuid) {
         Some(s) if files.block(s).is_none() => {
@@ -537,10 +537,7 @@ pub fn edit_refusals(
             let why = if !ours {
                 Some(not_ours_el(files, ctx, el, u))
             } else if date_of(el).is_none() {
-                Some(
-                    "This calendar date cannot be written by Lox Logic; it stays read-only"
-                        .to_string(),
-                )
+                Some(UNWRITABLE_DATE.to_string())
             } else {
                 None
             };

@@ -173,8 +173,16 @@ pub(super) fn why_not(
     if files
         .claims
         .0
-        .iter()
-        .any(|(k, c)| k.eq_ignore_ascii_case(u) && c.claims())
+        .get(u)
+        .or_else(|| {
+            files
+                .claims
+                .0
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(u))
+                .map(|(_, c)| c)
+        })
+        .is_some_and(|c| c.claims())
         || files.claims.1.iter().any(|w| w.to.0 == s || w.from.0 == s)
         || files.claims.set_claimed(&s)
     {
@@ -234,14 +242,22 @@ fn order(cands: &mut Vec<Cand>, base: &loxone_config::LoxoneDoc, index: &adopt::
 }
 
 /// Only the outermost picks need a lox invocation: a device includes its I/O.
-fn roots<'a>(cands: &'a [Cand], base: &loxone_config::LoxoneDoc) -> Vec<&'a Cand> {
+fn roots<'a>(cands: &'a [Cand], index: &adopt::Index) -> Vec<&'a Cand> {
+    let selected: BTreeSet<_> = cands
+        .iter()
+        .filter(|c| {
+            index
+                .get(&c.uuid)
+                .is_some_and(|e| crate::periphery::of(&e.ty).is_some())
+        })
+        .map(|c| c.uuid.to_ascii_lowercase())
+        .collect();
     cands
         .iter()
         .filter(|c| {
-            !cands.iter().any(|parent| {
-                !parent.uuid.eq_ignore_ascii_case(&c.uuid)
-                    && edit::find_ci(&base.xml.root, &parent.uuid)
-                        .is_some_and(|el| edit::find_ci(el, &c.uuid).is_some())
+            index.get(&c.uuid).is_none_or(|e| {
+                crate::periphery::of(&e.ty).is_none()
+                    || !e.ancestors.iter().any(|u| selected.contains(u))
             })
         })
         .collect()
@@ -298,7 +314,7 @@ impl Actions {
             match op {
                 edit::Op::Adopt { blocks } => {
                     for b in blocks {
-                        if cands.iter().any(|c| c.uuid.eq_ignore_ascii_case(&b.uuid)) {
+                        if cands.iter().any(|c| c.uuid == b.uuid) {
                             return Err(bad(format!("{} is adopted twice", title_of(&b.uuid))));
                         }
                         if let Some(why) = why_not(&b.uuid) {
@@ -321,10 +337,7 @@ impl Actions {
                         };
                         chosen.insert(slug.clone());
                         cands.push(Cand {
-                            uuid: crate::edit::find_ci(&base.xml.root, &b.uuid)
-                                .and_then(|e| e.attr("U"))
-                                .unwrap_or(&b.uuid)
-                                .to_string(),
+                            uuid: b.uuid.clone(),
                             title: title_of(&b.uuid),
                             slug,
                             page: None,
@@ -337,6 +350,7 @@ impl Actions {
                     }
                     pages.entry(page.clone()).or_default();
                     for (u, ty, title) in adopt::on_page(doc, page) {
+                        let u = base_ix.get(&u).map(|e| e.uuid.clone()).unwrap_or(u);
                         if lock.slug_of(&u).is_some() || cands.iter().any(|c| c.uuid == u) {
                             continue;
                         }
@@ -405,7 +419,7 @@ impl Actions {
         let (mut tree, mut lock_was, mut lock_now) = (original.clone(), lock0, l0.clone());
         // A device takes its descendants with it. An inverse names every
         // adopted object (and its slug), but lox must run only for the roots.
-        for c in roots(&cands, base) {
+        for c in roots(&cands, &base_ix) {
             // A block pinned as an extern (by an earlier adoption of this
             // request, or vislox's extern of a block adopted before) is
             // adopted under that name: lox moves the lines on the extern into
@@ -562,7 +576,7 @@ mod tests {
             page: None,
         })
         .collect();
-        let run = roots(&picks, &doc);
+        let run = roots(&picks, &adopt::Index::of(&doc));
         assert_eq!(
             run.iter().map(|c| c.slug.as_str()).collect::<Vec<_>>(),
             ["vx_device", "vx_input"]

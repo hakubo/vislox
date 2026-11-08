@@ -142,6 +142,12 @@ ${gateXml("GreaterEqual", EXG, "teiler.AQ &gt;= 28", 960, null)}${gateXml("And",
 // Objects of the object tree (#84): the house's Virtual Inputs folder (VI_F), a Virtual Outputs folder and a
 // Netzwerkperipherie folder with a Modbus server Loxone Config made (WP, a made-up address).
 const VI_F = "10000000-0000-0002-ffff504f94000001", NET_F = "7e000001-0000-0000-ffff504f94000001", WP = "7e000002-0000-0000-ffff504f94000001";
+const IMPORT_HTTP = "7d000002-0000-0000-ffff504f94000001", IMPORT_CMD = "7d000001-0000-0000-ffff504f94000001";
+const importedHttpXml = `\t\t\t<C Type="VirtualHttpIn" V="178" U="${IMPORT_HTTP}" Title="Imported HTTP" Address="http://192.0.2.30/status" Poll="60">
+\t\t\t\t<C Type="VirtualHttpInCmd" V="178" U="${IMPORT_CMD}" Title="Imported Command" Check="value">
+\t\t\t\t</C>
+\t\t\t</C>
+`;
 const periphXml = `\t\t<C Type="VirtualOutCaption" V="178" U="7e000000-0000-0000-ffff504f94000001" Title="Virtuelle Ausgänge">\n\t\t</C>\n` +
   `\t\t<C Type="WeatherCaption" V="178" U="${NET_F}" Title="Netzwerkperipherie">\n` +
   `\t\t\t<C Type="ModbusServer" V="178" U="${WP}" Title="Wärmepumpe" Cl="0,0,0" WF="16384" Address="192.0.2.12:502" Timeout="2000">\n\t\t\t</C>\n\t\t</C>\n`;
@@ -274,7 +280,7 @@ const base0 = readFileSync(fixture, "utf8").replace('<Co K="Q" U="10000009-0000-
     `\t\t<C Type="Page" V="178" U="${MELDUNGEN}" Title="Meldungen" WF="16384">\n` +
     `\t\t\t<C Type="OutputRefLM" V="178" U="${WARN}" Title="Frostwarnung" Px="960" Py="960" Px2="2304" Py2="1656" Cl="0,0,0" Nio="2" Ref="${FROST}"><Co K="AI" U="40000031-0000-0001-ffff504f94000001"/><Co K="AQ" U="40000031-0000-0002-ffff504f94000001"/><LoggerMailer RefNotification="${FROST}" On="Frost im Garten" MinimumTime="43200000" NL="1"/></C>\n` +
     "\t\t</C>\n" + regelnXml + zeitenXml + konstXml + ausdruckXml + vorlagenXml + "\t</C>\n</ControlList>");
-const base = base0.replace(`\t\t<C Type="Place" V="178" U="${KITCHEN}"`, `${flexXml}\t\t<C Type="Place" V="178" U="${KITCHEN}"`)
+const base = base0.replace('<C Type="VirtualIn"', `${importedHttpXml}<C Type="VirtualIn"`).replace(`\t\t<C Type="Place" V="178" U="${KITCHEN}"`, `${flexXml}\t\t<C Type="Place" V="178" U="${KITCHEN}"`)
   .replace(`\t\t<C Type="Page" V="178" U="${MELDUNGEN}"`, `${beschXml}\t\t<C Type="Page" V="178" U="${MELDUNGEN}"`)
   .replace('\t\t<C Type="ModeCaption"', `${periphXml}${hwXml}\t\t<C Type="ModeCaption"`);
 assert.ok(base.includes(WP), "the Modbus server is in the base");
@@ -396,17 +402,29 @@ if (process.argv.slice(2, 4).join(" ") === "logic adopt") {
     console.error(\`error: compile error: cannot adopt InputRef "\${title}" (uuid \${uuid}): attribute \\\`Ref\\\` is not understood by the rebuild and would be lost\`);
     process.exit(1);
   }
-  if (["Mode", "CalendarEntry", "VirtualIn"].includes(ty)) {
+  if (["Mode", "CalendarEntry", "VirtualIn", "VirtualHttpIn"].includes(ty)) {
     const lk = JSON.parse(fs.readFileSync(lockPath, "utf8"));
     const file = mod + "/objects.loxl";
     let args = "";
-    if (ty === "CalendarEntry") args = ', switches: holiday, every: 12-24';
+    if (ty === "CalendarEntry") {
+      const party = Object.entries(lk.objects || {}).find(([,o]) => o.uuid === ${JSON.stringify(PARTY)})?.[0];
+      args = lines[i].includes('CalType="-1"') ? ', switches: ' + (party || '"Party"') + ', every: 12-31' : ', switches: holiday, every: 12-24';
+    }
+    if (ty === "VirtualHttpIn") {
+      args = ', Address: "http://192.0.2.30/status", Poll: 60';
+      if (Object.values(lk.objects || {}).some((o) => o.uuid === ${JSON.stringify(IMPORT_CMD)})) { console.error("child already managed"); process.exit(1); }
+    }
     fs.writeFileSync(file, (fs.existsSync(file) ? fs.readFileSync(file, "utf8") : "") + \`\${slug} = \${ty}("\${title}"\${args})\\n\`);
     const ports = {};
     for (let j = i + 1; j < lines.length && !lines[j].includes("</C>"); j++) {
       const co = lines[j].match(/<Co K="([^" ]+)"[^>]* U="([^"]+)"/); if (co) ports[co[1]] = co[2];
     }
     lk.objects = { ...lk.objects, [slug]: { uuid, type: ty, ports, layout: null } };
+    if (ty === "VirtualHttpIn") {
+      const child = slug + "_command";
+      fs.appendFileSync(file, \`\${child} = VirtualHttpInCmd("Imported Command", device: \${slug}, Check: "value")\\n\`);
+      lk.objects[child] = { uuid: ${JSON.stringify(IMPORT_CMD)}, type: "VirtualHttpInCmd", ports: {}, layout: null };
+    }
     fs.writeFileSync(lockPath, JSON.stringify(lk));
     process.exit(0);
   }
@@ -3308,6 +3326,42 @@ try {
     await page.waitForSelector('#props [data-ed="remove"]:not([disabled])');
     await send(() => page.click('#props [data-ed="remove"]'), "take the device out again");
     assert.doesNotMatch(hfile(), /= TreeDevice\(/);
+  });
+  await step("device Revert and Undo restore the whole adoption group, root first (#133)", async () => {
+    await settled();
+    const reply = await page.evaluate(([u, slug]) => adoptSend(u, [{ op: "adopt", blocks: [{ uuid: u.toUpperCase(), slug }] }]), [IMPORT_HTTP, "vx_imported"]);
+    assert.ok(reply, await page.evaluate(() => JSON.stringify({err: AD.err, state: adoptState()})));
+    assert.equal(reply.adopted[0].uuid, IMPORT_HTTP);
+    assert.equal(reply.adopted.length, 2);
+    await page.waitForFunction(([p,c]) => [p,c].every((u) => S.edits?.blocks?.some((b) => b.uuid === u && b.adopted)), [IMPORT_HTTP, IMPORT_CMD]);
+    await settled();
+    await page.click('#changes .adoption:has-text("Imported HTTP") button:has-text("Revert")');
+    await page.waitForFunction(([p,c]) => !S.edits?.blocks?.some((b) => [p,c].includes(b.uuid)), [IMPORT_HTTP, IMPORT_CMD]);
+    await settled();
+    await undoKey(false, ([p,c]) => [p,c].every((u) => S.edits?.blocks?.some((b) => b.uuid === u && b.adopted)), [IMPORT_HTTP, IMPORT_CMD]);
+    await undoKey(false, ([p,c]) => !S.edits?.blocks?.some((b) => [p,c].includes(b.uuid)), [IMPORT_HTTP, IMPORT_CMD]);
+  });
+  await step("calendar references follow mode adoption in either order (#133)", async () => {
+    const silvester = "10000017-0000-0170-ffff504f94000001";
+    for (const entryFirst of [true, false]) {
+      for (const [u,slug] of entryFirst ? [[silvester,"vx_party_day"],[PARTY,"vx_party"]] : [[PARTY,"vx_party"],[silvester,"vx_party_day"]]) {
+        await settled();
+        const reply = await page.evaluate(([uuid,slug]) => adoptSend(uuid, [{op:"adopt",blocks:[{uuid,slug}]}]), [u,slug]);
+        assert.ok(reply, "adoption compiled");
+        await page.waitForFunction((u) => S.edits?.blocks?.some((b) => b.uuid === u && b.adopted), u);
+      }
+      await settled();
+      const pfile = join(dir,"pages","vislox","_periphery.loxl");
+      assert.match(readFileSync(pfile,"utf8"), /switches: vx_party, every: 12-31/);
+      await page.evaluate((u) => adoptHandBack(u), PARTY);
+      await page.waitForFunction((u) => !S.edits?.blocks?.some((b) => b.uuid === u), PARTY);
+      await settled();
+      assert.match(readFileSync(pfile,"utf8"), /switches: "Party", every: 12-31/);
+      await undoKey(false, (u) => S.edits?.blocks?.some((b) => b.uuid === u && b.adopted), PARTY);
+      await page.evaluate((uuids) => adoptSend(uuids[0], [{op:"unadopt",uuids}]), [PARTY,silvester]);
+      await page.waitForFunction((uuids) => !S.edits?.blocks?.some((b) => uuids.includes(b.uuid)), [PARTY,silvester]);
+      await settled();
+    }
   });
   await step("object-tree adoption, edit, undo and hand back (#86)", async () => {
     for (const [uuid, slug] of [[PARTY, "vx_party"], [HEILIGABEND, "vx_christmas"], ["10000001-0000-0010-ffff504f94000001", "vx_temperature"]]) {

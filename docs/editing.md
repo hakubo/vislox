@@ -335,6 +335,10 @@ vislox runs `lox logic adopt --uuid` on a scratch copy, moves the declarations i
 `<module>/vislox/_periphery.loxl`, and verifies that the compiled config keeps the same objects,
 UUIDs, connectors and values. The existing editors then edit them.
 
+Handing back a device includes its adopted descendants, so Undo can restore the whole group.
+Adopting a mode rewrites calendar entries in vislox's files from the mode's title to its slug;
+handing the mode back reverses those references.
+
 Adoption is pending: Changes lists it with Revert, and Apply names it in its review. Undo an edit
 before undoing adoption; Revert on the adoption hands ownership back once its changes are reverted.
 Adopting never deploys. Only Apply, after confirmation, deploys and commits the ownership change.

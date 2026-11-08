@@ -216,6 +216,9 @@ pub fn name_in(doc: &LoxoneDoc, uuid: &str) -> String {
 /// One object of an [`Index`].
 #[derive(Clone, Debug)]
 pub struct Entry {
+    pub uuid: String,
+    pub ancestors: Vec<String>,
+    pub ordinal: usize,
     pub ty: String,
     pub title: String,
     /// The logic page it is drawn on (its nearest `Page` ancestor).
@@ -238,19 +241,32 @@ impl Index {
         fn walk(
             el: &Element,
             page: Option<&str>,
+            ancestors: &mut Vec<String>,
             out: &mut std::collections::HashMap<String, Entry>,
         ) {
             let mut here = page;
             if let (Some(u), Some(ty)) = (el.attr("U"), el.attr("Type")) {
                 out.insert(
-                    u.to_string(),
+                    u.to_ascii_lowercase(),
                     Entry {
+                        uuid: u.to_string(),
+                        ancestors: ancestors.clone(),
+                        ordinal: out.len(),
                         ty: ty.to_string(),
-                        read_only: if ty == "Mode" && el.attr("Mode").and_then(|v| v.parse::<i64>().ok()).is_none_or(|n| n >= 0) {
+                        read_only: if ty == "Mode"
+                            && el
+                                .attr("Mode")
+                                .and_then(|v| v.parse::<i64>().ok())
+                                .is_none_or(|n| n >= 0)
+                        {
                             Some("Built-in operating modes stay read-only".into())
-                        } else if ty == "CalendarEntry" && crate::calendar_edit::date_of(el).is_none() {
-                            Some("This calendar date cannot be written by Lox Logic; it stays read-only".into())
-                        } else { None },
+                        } else if ty == "CalendarEntry"
+                            && crate::calendar_edit::date_of(el).is_none()
+                        {
+                            Some(crate::calendar_edit::UNWRITABLE_DATE.into())
+                        } else {
+                            None
+                        },
                         title: el.attr_decoded("Title").unwrap_or_default().into_owned(),
                         page: page.map(String::from),
                         ports: el
@@ -264,22 +280,36 @@ impl Index {
                     here = Some(u);
                 }
             }
+            let has_id = el.attr("U").filter(|_| el.attr("Type").is_some());
+            if let Some(u) = has_id {
+                ancestors.push(u.to_ascii_lowercase());
+            }
             for c in el.child_elements() {
-                walk(c, here, out);
+                walk(c, here, ancestors, out);
+            }
+            if has_id.is_some() {
+                ancestors.pop();
             }
         }
         let mut out = std::collections::HashMap::new();
-        walk(&doc.xml.root, None, &mut out);
+        walk(&doc.xml.root, None, &mut Vec::new(), &mut out);
         Index(out)
     }
 
     pub fn get(&self, uuid: &str) -> Option<&Entry> {
-        self.0.get(uuid).or_else(|| {
-            self.0
-                .iter()
-                .find(|(u, _)| u.eq_ignore_ascii_case(uuid))
-                .map(|(_, e)| e)
-        })
+        self.0.get(&uuid.to_ascii_lowercase())
+    }
+
+    /// Canonical UUIDs in document order, including the root itself.
+    pub fn subtree(&self, uuid: &str) -> Vec<&Entry> {
+        let key = uuid.to_ascii_lowercase();
+        let mut entries: Vec<_> = self
+            .0
+            .values()
+            .filter(|e| e.uuid.eq_ignore_ascii_case(uuid) || e.ancestors.contains(&key))
+            .collect();
+        entries.sort_by_key(|e| e.ordinal);
+        entries
     }
 
     /// [`title_or`] of `uuid`.
@@ -289,10 +319,13 @@ impl Index {
 
     /// Page blocks and object-tree kinds supported by vislox, by UUID.
     pub fn candidates(&self) -> impl Iterator<Item = (&String, &Entry)> {
-        self.0.iter().filter(|(_, e)| {
-            (e.page.is_some() && e.ty != "Page" && connectors::builtin(&e.ty).is_some())
-                || crate::periphery::of(&e.ty).is_some()
-        })
+        self.0
+            .values()
+            .filter(|e| {
+                (e.page.is_some() && e.ty != "Page" && connectors::builtin(&e.ty).is_some())
+                    || crate::periphery::of(&e.ty).is_some()
+            })
+            .map(|e| (&e.uuid, e))
     }
 }
 
@@ -559,7 +592,7 @@ pub fn extract(
     }
     // A name an adopted block's statements use, as vislox's files name it.
     let mut needs: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
-    let mut name = |owner: &str, s: &str| -> Result<String, String> {
+    let mut name = |owner: &str, s: &str, value: bool| -> Result<String, String> {
         if let Some(m) = rename.get(s) {
             return Ok(m.clone());
         }
@@ -584,10 +617,13 @@ pub fn extract(
             return Ok(s.to_string());
         }
         if objects_after.contains_key(s) {
+            if value {
+                return Err(format!(
+                    "its value references `{s}`, which the module declares in its own .loxl file; adopt this object with lox or change that source file"
+                ));
+            }
             return Err(format!(
-                "it is wired to `{s}`, which the module manages in its own .loxl file; vislox's \
-                 files name only their own blocks and Loxone Config's (adopt it with lox, or wire \
-                 it in that file)"
+                "it is wired to `{s}`, which the module manages in its own .loxl file; vislox's files name only their own blocks and Loxone Config's (adopt it with lox, or wire it in that file)"
             ));
         }
         Err(format!(
@@ -633,16 +669,17 @@ pub fn extract(
                         // notification's `OutputRefLM`, #77): an extern of
                         // vislox's, as a value, never a wire.
                         BindingKind::Param(Value::Ref(s))
-                            if [crate::blocks::MIRRORS, crate::periphery::DEVICE, "switches"]
-                                .contains(&x.port.as_str()) =>
+                            if crate::blocks::value_ref_arg(&x.port) =>
                         {
                             nb.args.push((
                                 x.port.clone(),
                                 Value::Ref(
-                                    if DAY_WORDS.contains(&s.as_str()) && x.port == "switches" {
+                                    if DAY_WORDS.contains(&s.as_str())
+                                        && x.port == crate::calendar_edit::SWITCHES
+                                    {
                                         s.clone()
                                     } else {
-                                        name(&slug, s)?
+                                        name(&slug, s, true)?
                                     },
                                 ),
                             ))
@@ -657,7 +694,7 @@ pub fn extract(
                         BindingKind::Param(Value::Ref(s)) => nb.wires.push((
                             x.port.clone(),
                             PortRef {
-                                slug: name(&slug, s)?,
+                                slug: name(&slug, s, false)?,
                                 port: String::new(),
                             },
                         )),
@@ -673,7 +710,7 @@ pub fn extract(
                         BindingKind::Wire(r) => nb.wires.push((
                             x.port.clone(),
                             PortRef {
-                                slug: name(&slug, &r.slug)?,
+                                slug: name(&slug, &r.slug, false)?,
                                 port: r.port.clone(),
                             },
                         )),
@@ -720,7 +757,7 @@ pub fn extract(
                         w.to, w.from
                     )
                 })?;
-                let to = name(&from, &w.to.slug)?;
+                let to = name(&from, &w.to.slug, false)?;
                 wires.push((
                     from.clone(),
                     FileWire {
@@ -1168,6 +1205,32 @@ mod tests {
         )
         .unwrap();
         assert_eq!(a[0].block.wires[0].1.slug, "flur");
+    }
+
+    #[test]
+    fn a_module_mode_value_is_refused_as_a_value_not_a_wire() {
+        let (mut after, mut l0, mut l1) = lox_wrote();
+        after.insert(
+            "erdgeschoss.loxl".into(),
+            "page \"Erdgeschoss\"\ngate = And(\"O1001\", switches: party)\n".into(),
+        );
+        l0["objects"]["party"] = json!({"uuid":"10000011-0000-0110-ffff504f94000001"});
+        l1["objects"]["party"] = l0["objects"]["party"].clone();
+        l1["extern_wires"] = json!([]);
+        let e = extract(
+            &BTreeMap::new(),
+            &after,
+            (&l0, &l1),
+            &BTreeMap::from([(GATE.into(), "vx_gate".into())]),
+            &|_| false,
+            &BTreeSet::new(),
+            &base(),
+        )
+        .unwrap_err();
+        assert!(
+            e.contains("value references `party`") && !e.contains("wired"),
+            "{e}"
+        );
     }
 
     #[test]
