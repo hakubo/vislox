@@ -40,7 +40,10 @@ the binary.
 - `src/actions.rs` runs Apply (`lox config push --force`, `git commit`, `git push`), Sync (`lox config merge`,
   `git commit`, `git push`) and Discard (`git checkout` of the module, lock and out; the files and the git index
   are read first and put back, verified, when a step fails, see [editing.md](editing.md)). Apply's steps follow
-  lox's progress lines as they come.
+  lox's progress lines as they come. `actions/discard.rs` is Discard: the snapshot of the lock and out from
+  before vislox's first edit, and what it reads first and puts back on a failure (`Rollback`, which Roll back
+  shares, and the git index). `actions/progress.rs` is an Apply's or a Roll back's steps (`Progress`) and the
+  step each of lox's progress lines starts.
 - `src/rollback.rs` finds the downloads `lox config push` leaves in a project's `backups/` (`<stamp>-pre-push` and
   `-post-push`) for Roll back (#69): a commit whose base is a post-push program is a push, and its pre-push
   program is what ran before. It reads and checks them; `actions/rollback.rs` plans the Roll back (`POST
@@ -74,6 +77,8 @@ the binary.
   lets Properties edit (`view.objects[…].edit`), and vislox's file of claims in the module
   (`<module>/vislox/edits.loxl`), read and checked with lox's own parser and linter. `actions.rs` writes it and
   runs `lox logic compile` (`POST /api/edit`), and lists what is edited and not deployed (`GET /api/edits`).
+  `edit/request.rs` is the request (`Op`, `Request`); `edit/files.rs` reads and writes vislox's files (`Claims`
+  for the claims file, `Files` for all of them); `edit.rs` re-exports both and applies the ops.
 - `src/sched_edit.rs` is editing a Daytimer's switching times (#73): the `schedule` op's value (columns by
   operating-mode UUID), checked as lox would (minutes, `24:00`, overlaps, an analog timer's values), written as
   `schedule vx_… end` sets and `.schedule` claims in `edits.loxl` (the columns spelled as lox takes them: day
