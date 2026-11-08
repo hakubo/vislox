@@ -1,0 +1,11 @@
+{
+  "name": "vislox-frontend-checks",
+  "private": true,
+  "scripts": {
+    "lint": "eslint web/*.js"
+  },
+  "devDependencies": {
+    "eslint": "9.39.5",
+    "globals": "16.5.0"
+  }
+}

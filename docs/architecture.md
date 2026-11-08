@@ -2,6 +2,18 @@
 
 The binary is an `axum` server with the UI embedded (plain JS and SVG, no build step).
 
+`web/index.html` loads classic scripts in order: `navigation.js`, `app.js`, then `modes.js`.
+`navigation.js` owns URL state, Back/Forward navigation and history loading, including request
+sequence guards and retry state. Its header lists the shared state and refresh dependencies.
+It defines functions and registers a popstate listener before `app.js` starts the initial loads;
+those functions use app/calendar globals only when called. `app.js` keeps the shared `S` state,
+rendering, editing and deployment logic; `modes.js` owns the operating-mode calendar.
+The scripts share the browser global scope, with explicit imports in `eslint.config.mjs` and
+`/* exported */` comments for lint. They are embedded individually with `include_str!` and routed
+in `src/main.rs`. All assets use `Cache-Control: no-cache` (no ETag or hashed filenames), so new
+scripts need both an HTML script tag and an embedded route. No bundler or npm package ships in
+the binary.
+
 - `src/source.rs` resolves the path into the watched files.
 - `src/history.rs` keeps revisions keyed by git blob id. A live snapshot and the commit with the same
   bytes therefore match, and git content is read with `git cat-file` only when needed.

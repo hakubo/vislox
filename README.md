@@ -173,6 +173,7 @@ config's serial, and refuses otherwise. Every request is described in [docs/mini
 ## Development
 
 ```bash
+npm ci && npm run lint  # Node 22.13+; no frontend build step
 cargo fmt --check && cargo clippy --all-targets -- -D warnings
 cargo test
 cargo build --release
@@ -182,6 +183,12 @@ VISLOX_BIN=target/release/vislox node tests/ui/apply.mjs   # Apply's steps, with
 VISLOX_BIN=target/release/vislox node tests/ui/edit.mjs    # editing values, adding and moving blocks, with a stand-in lox
 VISLOX_BIN=target/release/vislox node tests/ui/rollback.mjs  # rolling back an Apply, with a stand-in lox
 ```
+
+The root npm package pins ESLint and its browser globals with a lockfile. `npm run lint` checks every
+`web/*.js` classic script for undefined/unused names, redeclarations, duplicate keys/cases, unreachable
+code and unsafe comparisons; it enforces no formatting style. Nullish `== null`/`!= null` checks remain
+allowed. Shared globals are declared per consuming file in `eslint.config.mjs`; `/* exported */`
+comments mark names used by another script. Update both when moving a shared function.
 
 CI (`.github/workflows/ci.yml`) runs all of these on every push to `main` and every pull request.
 
