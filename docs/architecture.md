@@ -7,7 +7,9 @@ The binary is an `axum` server with the UI embedded (plain JS and SVG, no build 
   bytes therefore match, and git content is read with `git cat-file` only when needed.
 - `src/model.rs` turns a revision, plus an optional base, into pages, objects, wires, cross-page links,
   properties and a change list. It uses `loxone_config::diff` and adds its own checks for attributes,
-  positions and wires.
+  positions and wires. A memory flag (`Memory`) and its references (`InputRef` reads it, `OutputRef` writes it)
+  carry a `flag` (#104): where it is written and read, from its wires and its references, compared by UUID without
+  regard to case; a reference's wire to the object it mirrors is not drawn.
 - `src/schedule.rs` reads a Daytimer's (or a room controller's) switching times from the `.Loxone` file, in the
   terms of the Miniserver's Daytimer event table, for Properties, the change list and the live comparison.
 - `src/rights.rs` reads who may open each NFC Code Touch and who gets each push notification from the users

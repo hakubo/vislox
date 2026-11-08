@@ -657,7 +657,9 @@ function renderFar() {
     if (o.shape !== "tag" || o.moved_to) continue;
     const [x, y, w] = o.rect;
     const t = o.target || {};
-    const addr = t.iname ? ` · ${t.iname}` : "";
+    const wr = L.wired?.get(o.uuid);
+    const mem = o.ty === "Memory" || t.ty === "Memory" ? tagAddr(o, o.ports.some((q) => q.side === "R" && wr?.has(q.key)), !wr) : "";
+    const addr = t.iname ? ` · ${t.iname}` : mem ? ` · ${mem}` : "";
     el("text", { class: "far-sub", x: x + w / 2, y: y + ROW / 2 + tagPx * 0.36, "text-anchor": "middle", "font-size": tagPx }, L.far, clip(o.title + addr, Math.floor((w * v.k) / (tagPx * v.k * 0.56))));
   }
   // Links to other pages: name and page, as big as the bar allows.
@@ -720,12 +722,22 @@ function wrapObj(parent, o, cls) {
   hoverTip(g, () => objTip(o));
   return g;
 }
+/** What a tooltip says of a memory flag, or of a reference to one: which side of the flag it is. */
+function flagTip(o, f) {
+  const n = (l) => l.length ? `${l.length}` : "nothing";
+  const role = { flag: "Memory flag", writes: "Writes memory flag", reads: "Reads memory flag" }[f.role];
+  const what = f.role === "flag" ? "" : ` <b>${esc(f.title)}</b>`;
+  const where = o.target?.page_title ? ` on page “${esc(o.target.page_title)}”` : "";
+  const go = o.target?.page && o.target.page !== S.page ? "<br><span class='tm'>double-click to go there</span>" : "";
+  return `${role}${what}${where}<br><span class="tm">written by ${n(f.written)} · read by ${n(f.read)}</span>${go}`;
+}
 function objTip(o) {
   const info = S.view.objects[o.uuid] || {};
   const parts = [`<b>${esc(displayTitle(o))}</b> <span class="tm">${esc(prettyType(o.ty))}</span>`];
   if (autoTitle(o.title) && o.title) parts.push(`<span class="tm">${esc(o.title)}</span>`);
   if (info.old_title) parts.push(`renamed from <i>${esc(info.old_title)}</i>`);
-  if (o.target) parts.push(`mirrors <b>${esc(o.target.title)}</b>${o.target.page_title ? ` on page “${esc(o.target.page_title)}”` : o.target.path ? ` in ${esc(o.target.path)}` : ""}${o.target.page && o.target.page !== S.page ? "<br><span class='tm'>double-click to go there</span>" : ""}`);
+  if (info.flag) parts.push(flagTip(o, info.flag));
+  else if (o.target) parts.push(`mirrors <b>${esc(o.target.title)}</b>${o.target.page_title ? ` on page “${esc(o.target.page_title)}”` : o.target.path ? ` in ${esc(o.target.path)}` : ""}${o.target.page && o.target.page !== S.page ? "<br><span class='tm'>double-click to go there</span>" : ""}`);
   if (info.room || info.category) parts.push(esc([info.room, info.category].filter(Boolean).join(" · ")));
   if (o.ty === "Text") parts.push(esc(clip(noteText(o), 300)).replace(/\n/g, "<br>"));
   if (o.status) parts.push(`<i>${o.status}</i>`);
@@ -949,6 +961,17 @@ function drawKind(g, cx, cy, analog) {
   }
 }
 
+/** The address a tag shows in its pill, and which way the flag goes through it: a memory flag is written
+ *  through its input (`→M`) and read through its outputs (`M→`), as an output reference and an input
+ *  reference of it show it; a memory flag wired on neither side is just `M`. */
+function tagAddr(o, right, unwired) {
+  const t = o.target || {};
+  if (t.iname) return t.iname;
+  if (o.ty === "Memory") return unwired ? "M" : right ? "M→" : "→M";
+  if (t.ty === "Memory") return o.ty === "InputRef" ? "M→" : "→M";
+  return o.ty === "OutputRefLM" ? "✉" : "";
+}
+
 function drawTag(parent, o, page) {
   const [x, y, w, h] = o.rect;
   const g = wrapObj(parent, o, "tag");
@@ -956,32 +979,46 @@ function drawTag(parent, o, page) {
   const sideWired = (side) => o.ports.some((q) => q.side === side && wired?.has(q.key));
   // The side the wire leaves from: where it is wired, else what the type says.
   const feedsRight = sideWired("R") || (!sideWired("L") && o.ty === "InputRef");
-  // Analog if the wires on its feeding side are; an unwired reference goes by its address (AI, AQ, VI…).
-  const fed = o.ports.filter((q) => (q.side === "R") === feedsRight && L.kind.has(o.uuid + "|" + q.key));
-  const analog = fed.length ? fed.some((q) => L.kind.get(o.uuid + "|" + q.key)) : /^(A[QI]|VI|VA)/.test(o.target?.iname || "");
+  // A memory flag written and read on this page is two tags, as Loxone Config shows it: the one it is
+  // written through (the input's wire) and the one it is read through (the outputs' wires).
+  const split = o.ty === "Memory" && sideWired("L") && sideWired("R");
+  const gap = h, fw = split ? Math.floor((w - gap) / 2) : w;
   const rx = h / 2, cy = y + h / 2;
-  el("rect", { class: "halo", x: x - 50, y: y - 50, width: w + 100, height: h + 100, rx: rx + 50 }, g);
-  el("rect", { class: "bar", x, y, width: w, height: h, rx, ry: rx }, g);
   const t = o.target || {};
-  const addr = t.iname || (o.ty === "Memory" ? "M" : o.ty === "OutputRefLM" ? "✉" : "");
-  const addrW = addr ? Math.max(400, addr.length * 76 + 180) : 0;
-  // The address sits in its own pill at the wired end, with the kind chip beside it.
-  const ax = feedsRight ? x + w - addrW : x;
-  if (addr) {
-    el("rect", { class: "addr", x: ax, y, width: addrW, height: h, rx, ry: rx }, g);
-    el("text", { class: "addr-t", x: ax + addrW / 2, y: cy + 38, "text-anchor": "middle" }, g, clip(addr, 7));
-  }
-  const kx = feedsRight ? ax - 100 : ax + addrW + 100;
-  drawKind(g, kx, cy, analog);
-  const icX = feedsRight ? x + 110 : x + w - 110;
-  el("text", { class: "ic-t", x: icX, y: cy + 36, "text-anchor": "middle" }, g, t.page ? "⚙" : "i");
   const offPage = t.page && t.page !== page.uuid;
-  const nameW = w - addrW - 220 - 200 - 60;
-  const name = clip(o.title + (offPage ? " ↗" : ""), Math.floor(nameW / 60));
-  if (feedsRight) el("text", { class: "cell-t", x: x + 210, y: cy + 36 }, g, name);
-  else el("text", { class: "cell-t", x: x + w - 210, y: cy + 36, "text-anchor": "end" }, g, name);
+  for (const right of split ? [false, true] : [feedsRight]) {
+    const bx = split && right ? x + w - fw : x;
+    // Analog if the wires on its feeding side are; an unwired reference goes by its address (AI, AQ, VI…).
+    const fed = o.ports.filter((q) => (q.side === "R") === right && L.kind.has(o.uuid + "|" + q.key));
+    const analog = fed.length ? fed.some((q) => L.kind.get(o.uuid + "|" + q.key)) : /^(A[QI]|VI|VA)/.test(t.iname || "");
+    el("rect", { class: "halo", x: bx - 50, y: y - 50, width: fw + 100, height: h + 100, rx: rx + 50 }, g);
+    el("rect", { class: "bar", x: bx, y, width: fw, height: h, rx, ry: rx }, g);
+    const addr = tagAddr(o, right, !sideWired("L") && !sideWired("R"));
+    const addrW = addr ? (split ? 300 : Math.max(400, addr.length * 76 + 180)) : 0;
+    // The address sits in its own pill at the wired end, with the kind chip beside it.
+    const ax = right ? bx + fw - addrW : bx;
+    if (addr) {
+      el("rect", { class: "addr", x: ax, y, width: addrW, height: h, rx, ry: rx }, g);
+      el("text", { class: "addr-t", x: ax + addrW / 2, y: cy + 38, "text-anchor": "middle" }, g, clip(addr, 7));
+    }
+    if (split) {
+      // Half a tag: the name only, as far as it fits.
+      const room = fw - addrW - 120;
+      if (right) el("text", { class: "cell-t", x: bx + 70, y: cy + 36 }, g, clip(o.title, Math.floor(room / 46)));
+      else el("text", { class: "cell-t", x: bx + fw - 70, y: cy + 36, "text-anchor": "end" }, g, clip(o.title, Math.floor(room / 46)));
+      continue;
+    }
+    const kx = right ? ax - 100 : ax + addrW + 100;
+    drawKind(g, kx, cy, analog);
+    const icX = right ? bx + 110 : bx + fw - 110;
+    el("text", { class: "ic-t", x: icX, y: cy + 36, "text-anchor": "middle" }, g, t.page ? "⚙" : "i");
+    const nameW = fw - addrW - 220 - 200 - 60;
+    const name = clip(o.title + (offPage ? " ↗" : ""), Math.floor(nameW / 60));
+    if (right) el("text", { class: "cell-t", x: bx + 210, y: cy + 36 }, g, name);
+    else el("text", { class: "cell-t", x: bx + fw - 210, y: cy + 36, "text-anchor": "end" }, g, name);
+  }
   for (const side of ["L", "R"]) {
-    const q = o.ports.find((p) => p.side === side && wired?.has(p.key)) || ((side === "R") === feedsRight ? o.ports.find((p) => p.side === side) : null);
+    const q = o.ports.find((p) => p.side === side && wired?.has(p.key)) || (split || (side === "R") === feedsRight ? o.ports.find((p) => p.side === side) : null);
     if (q) drawStub(g, q);
   }
 }
@@ -1296,7 +1333,17 @@ function renderPropsBody() {
   section("Inputs", ins, ins.length);
   section("Outputs", outs, outs.length);
 
-  if (o.mirrored_by.length) {
+  if (o.flag) {
+    // A memory flag is written through its input and read through its outputs; on other pages Loxone
+    // Config shows it as an output reference (writes it) and an input reference (reads it) (#104).
+    const f = o.flag, self = f.role === "flag";
+    const sites = (l, none) => l.length ? l.map((t) => `<div class="conn">${REF_TYPES.has(t.ty) ? `<button type="button" class="lnk" data-go="${esc(t.uuid)}" data-page="${esc(t.page || "")}">${t.ty === "InputRef" ? "Input" : "Output"} reference on ${t.page === S.page ? "this page" : esc(t.page_title || "a page")}</button>` : linkTarget(t)}</div>`).join("") : `<span class="none-v">${none}</span>`;
+    const rows = [];
+    if (!self) rows.push(row(f.role === "writes" ? "Writes" : "Reads", `<div class="conn">${linkTarget(o.target)}</div>`));
+    rows.push(row("Written", sites(f.written, "nowhere: nothing sets it"), "", "Where the flag is set: the blocks wired to its input and the output references of it"));
+    rows.push(row("Read", sites(f.read, "nowhere: nothing uses it"), "", "Where the flag is used: the blocks wired to its outputs and the input references of it"));
+    section("Memory flag", rows, f.written.length + f.read.length);
+  } else if (o.mirrored_by.length) {
     section("Shown on pages", o.mirrored_by.map(([pg, ref]) => {
       const p = S.pageOf.get(pg);
       return row("Page", `<button type="button" class="lnk" data-page="${esc(pg)}" data-go="${esc(ref)}">${esc(p?.title || pg)}</button>`);

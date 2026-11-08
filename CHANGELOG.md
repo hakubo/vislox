@@ -214,6 +214,12 @@ published under the same version (see [docker/README.md](docker/README.md)).
   headed `page "…" (room: …, category: …)` and runs `lox logic compile`, which creates the page; its tab is marked
   added, blocks added there go into its file, and *Remove page* (or Undo) takes it out while it is not deployed and
   empty. Once deployed, the line loses `room:` so that Loxone Config owns the page. Never deploys.
+- Memory flags and their references read the way Loxone Config shows them (#104): a flag is drawn as a tag for each
+  side in use (**→M** written through its input, **M→** read through its outputs; a flag wired on both sides is two
+  tags), an output reference of a flag is **→M** and an input reference **M→**, a flag wired to another page has a
+  link at its port, and a reference's plumbing wire to its flag is not drawn. Properties has *Memory flag*: where
+  the flag is written and where it is read, each a link. A flag set from two places no longer shows one of them as
+  its value.
 
 ## 0.2.0
 

@@ -779,6 +779,80 @@ try {
     await page.keyboard.press("Escape");
     await page.waitForSelector("#help.hidden", { state: "attached" });
   });
+  // Memory flags and references to them (#104): a flag is written through its input and read through its
+  // outputs; Loxone Config shows a flag a page writes and reads as a tag for each side, and shows it on other
+  // pages as an output reference (writes) and an input reference (reads). A second vislox serves the fixture.
+  const memPort = port + 100, memFixture = join(here, "../fixtures/memory.Loxone");
+  const memServer = spawn(bin, [memFixture, "--listen", `127.0.0.1:${memPort}`, "--no-live"], { stdio: ["ignore", "ignore", "pipe"] });
+  let memLog = "";
+  memServer.stderr.on("data", (d) => (memLog += d));
+  try {
+    await new Promise((ok, fail) => {
+      const t = setTimeout(() => fail(new Error("the memory vislox did not start:\n" + memLog)), 15000);
+      memServer.stderr.on("data", () => { if (memLog.includes("open http")) { clearTimeout(t); ok(); } });
+      memServer.on("exit", (c) => fail(new Error(`the memory vislox exited ${c}:\n${memLog}`)));
+    });
+    const mp = await browser.newPage({ viewport: { width: 1400, height: 900 } });
+    mp.on("pageerror", (e) => errors.push(e.message));
+    mp.on("console", (m) => { if (m.type() === "error") errors.push(m.text()); });
+    await mp.goto(`http://127.0.0.1:${memPort}/`);
+    await mp.waitForSelector(".tab");
+    const tag = (n) => `#viewport [data-uuid="4000000${n}-0000-0000-ffff504f94000001"]`;
+    const addrs = (n) => mp.$$eval(`${tag(n)} .addr-t`, (t) => t.map((x) => x.textContent));
+    const flagSection = () => mp.textContent('#props [data-body="Memory flag"]');
+    await step("a flag written and read on one page is two tags; one used one way is one", async () => {
+      await mp.waitForSelector(tag(4));
+      // Anwesend is only written here: its input's tag. Hilfsmerker is written by the And and read by the Not.
+      assert.deepEqual(await addrs(4), ["→M"]);
+      assert.equal((await mp.$$(`${tag(4)} .bar`)).length, 1);
+      assert.equal((await mp.$$(`${tag(4)} .stub`)).length, 1);
+      assert.deepEqual(await addrs(6), ["→M", "M→"]);
+      assert.equal((await mp.$$(`${tag(6)} .bar`)).length, 2);
+      assert.equal((await mp.$$(`${tag(6)} .stub`)).length, 2);
+    });
+    await step("a flag written from another page has a link at its input", async () => {
+      assert.deepEqual(await addrs(5), ["→M"]);
+      const x = await mp.$$eval("#viewport .xref", (n) => n.map((g) => g.textContent));
+      assert.equal(x.length, 1, x.join(" | "));
+      assert.match(x[0], /Q: OR.*Alarmlo/);
+    });
+    await step("a flag's Properties say where it is written and read, with links", async () => {
+      await mp.click(tag(6) + " .bar", { force: true });
+      await mp.waitForFunction(() => document.querySelector(".ph-t")?.textContent === "Hilfsmerker");
+      assert.match(await flagSection(), /Written.*O2001.*this page.*Output reference on Alarmlogik/s);
+      assert.match(await flagSection(), /Read.*O2002.*this page/s);
+      // Anwesend is read through an input reference on the other page, and nothing else.
+      await mp.click(tag(4) + " .bar", { force: true });
+      await mp.waitForFunction(() => document.querySelector(".ph-t")?.textContent === "Anwesend");
+      assert.match(await flagSection(), /Written.*O2001.*Read.*Input reference on Alarmlogik/s);
+      await mp.click(tag(5) + " .bar", { force: true });
+      await mp.waitForFunction(() => document.querySelector(".ph-t")?.textContent === "Alarm");
+      assert.match(await flagSection(), /Written.*O2003.*Alarmlogik.*Readnowhere: nothing uses it/s);
+    });
+    await step("a link in a flag's Properties opens the reference that reads it", async () => {
+      await mp.click(tag(4) + " .bar", { force: true });
+      await mp.waitForFunction(() => document.querySelector(".ph-t")?.textContent === "Anwesend");
+      await mp.click('#props .lnk:has-text("Input reference on Alarmlogik")');
+      await mp.waitForFunction(() => document.querySelector('.tab[aria-selected="true"]')?.textContent.startsWith("Alarmlogik"));
+      await mp.waitForFunction(() => document.querySelector(".ph-s")?.textContent === "Input Ref");
+      assert.match(await flagSection(), /ReadsAnwesend.*Written.*O2001.*Read.*Input reference on this page/s);
+    });
+    await step("references to a flag show its side, and their wire to the flag is not drawn", async () => {
+      assert.deepEqual(await mp.$$eval("#viewport .tag .addr-t", (t) => t.map((x) => x.textContent).sort()), ["M→", "→M"]);
+      // The Or reads one reference and feeds the other; the references' own wires to the flag are not drawn.
+      assert.equal((await mp.$$("#viewport .wire")).length, 2);
+      const x = await mp.$$eval("#viewport .xref", (n) => n.map((g) => g.textContent));
+      assert.equal(x.length, 1, x.join(" | "));
+      assert.match(x[0], /Alarm.*Anwesen/);
+      // A link to the Alarm flag lies over the tag, so the click goes to the tag itself.
+      await mp.dispatchEvent('#viewport .tag:has(.addr-t:text("→M")) .bar', "click");
+      await mp.waitForFunction(() => document.querySelector(".ph-s")?.textContent === "Output Ref");
+      assert.match(await flagSection(), /WritesHilfsmerker.*Written.*O2001.*Output reference on this page/s);
+    });
+    await mp.close();
+  } finally {
+    memServer.kill("SIGINT");
+  }
   await step("no errors in the browser", async () => {
     assert.deepEqual(errors, []);
   });
