@@ -658,7 +658,9 @@ function renderFar() {
     const [x, y, w] = o.rect;
     const t = o.target || {};
     const wr = L.wired?.get(o.uuid);
-    const mem = o.ty === "Memory" || t.ty === "Memory" ? tagAddr(o, o.ports.some((q) => q.side === "R" && wr?.has(q.key)), !wr) : "";
+    const right = o.ports.some((q) => q.side === "R" && wr?.has(q.key));
+    // A flag wired on both sides is two tags: both ways show.
+    const mem = memSplit(o) ? `${tagAddr(o, false)} ${tagAddr(o, true)}` : o.ty === "Memory" || t.ty === "Memory" ? tagAddr(o, right, !wr) : "";
     const addr = t.iname ? ` · ${t.iname}` : mem ? ` · ${mem}` : "";
     el("text", { class: "far-sub", x: x + w / 2, y: y + ROW / 2 + tagPx * 0.36, "text-anchor": "middle", "font-size": tagPx }, L.far, clip(o.title + addr, Math.floor((w * v.k) / (tagPx * v.k * 0.56))));
   }
@@ -972,6 +974,14 @@ function tagAddr(o, right, unwired) {
   return o.ty === "OutputRefLM" ? "✉" : "";
 }
 
+/** A memory flag wired on both sides of this page is two tags, as Loxone Config shows it: the one it is written
+ *  through (the input's wire) and the one it is read through (the outputs' wires). */
+function memSplit(o) {
+  const wired = L.wired?.get(o.uuid);
+  const sideWired = (side) => o.ports.some((q) => q.side === side && wired?.has(q.key));
+  return o.ty === "Memory" && sideWired("L") && sideWired("R");
+}
+
 function drawTag(parent, o, page) {
   const [x, y, w, h] = o.rect;
   const g = wrapObj(parent, o, "tag");
@@ -979,10 +989,8 @@ function drawTag(parent, o, page) {
   const sideWired = (side) => o.ports.some((q) => q.side === side && wired?.has(q.key));
   // The side the wire leaves from: where it is wired, else what the type says.
   const feedsRight = sideWired("R") || (!sideWired("L") && o.ty === "InputRef");
-  // A memory flag written and read on this page is two tags, as Loxone Config shows it: the one it is
-  // written through (the input's wire) and the one it is read through (the outputs' wires).
-  const split = o.ty === "Memory" && sideWired("L") && sideWired("R");
-  const gap = h, fw = split ? Math.floor((w - gap) / 2) : w;
+  const split = memSplit(o);
+  const gap = h / 2, fw = split ? Math.floor((w - gap) / 2) : w;
   const rx = h / 2, cy = y + h / 2;
   const t = o.target || {};
   const offPage = t.page && t.page !== page.uuid;
@@ -1001,21 +1009,15 @@ function drawTag(parent, o, page) {
       el("rect", { class: "addr", x: ax, y, width: addrW, height: h, rx, ry: rx }, g);
       el("text", { class: "addr-t", x: ax + addrW / 2, y: cy + 38, "text-anchor": "middle" }, g, clip(addr, 7));
     }
-    if (split) {
-      // Half a tag: the name only, as far as it fits.
-      const room = fw - addrW - 120;
-      if (right) el("text", { class: "cell-t", x: bx + 70, y: cy + 36 }, g, clip(o.title, Math.floor(room / 46)));
-      else el("text", { class: "cell-t", x: bx + fw - 70, y: cy + 36, "text-anchor": "end" }, g, clip(o.title, Math.floor(room / 46)));
-      continue;
-    }
     const kx = right ? ax - 100 : ax + addrW + 100;
     drawKind(g, kx, cy, analog);
     const icX = right ? bx + 110 : bx + fw - 110;
     el("text", { class: "ic-t", x: icX, y: cy + 36, "text-anchor": "middle" }, g, t.page ? "⚙" : "i");
-    const nameW = fw - addrW - 220 - 200 - 60;
-    const name = clip(o.title + (offPage ? " ↗" : ""), Math.floor(nameW / 60));
-    if (right) el("text", { class: "cell-t", x: bx + 210, y: cy + 36 }, g, name);
-    else el("text", { class: "cell-t", x: bx + fw - 210, y: cy + 36, "text-anchor": "end" }, g, name);
+    // Half a tag has less room: tighter padding and narrower letters, the name clipped to what is left.
+    const pad = split ? 170 : 210, nameW = split ? fw - addrW - 108 - pad - 40 : fw - addrW - 220 - 200 - 60;
+    const name = clip(o.title + (offPage ? " ↗" : ""), Math.floor(nameW / (split ? 50 : 60)));
+    if (right) el("text", { class: "cell-t", x: bx + pad, y: cy + 36 }, g, name);
+    else el("text", { class: "cell-t", x: bx + fw - pad, y: cy + 36, "text-anchor": "end" }, g, name);
   }
   for (const side of ["L", "R"]) {
     const q = o.ports.find((p) => p.side === side && wired?.has(p.key)) || (split || (side === "R") === feedsRight ? o.ports.find((p) => p.side === side) : null);

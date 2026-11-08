@@ -782,7 +782,9 @@ try {
   // Memory flags and references to them (#104): a flag is written through its input and read through its
   // outputs; Loxone Config shows a flag a page writes and reads as a tag for each side, and shows it on other
   // pages as an output reference (writes) and an input reference (reads). A second vislox serves the fixture.
-  const memPort = port + 100, memFixture = join(here, "../fixtures/memory.Loxone");
+  // A copy outside the repository, so that no git history of this one is compared with it.
+  const memPort = port + 100, memFixture = join(mkdtempSync(join(tmpdir(), "vislox-mem-")), "memory.Loxone");
+  copyFileSync(join(here, "../fixtures/memory.Loxone"), memFixture);
   const memServer = spawn(bin, [memFixture, "--listen", `127.0.0.1:${memPort}`, "--no-live"], { stdio: ["ignore", "ignore", "pipe"] });
   let memLog = "";
   memServer.stderr.on("data", (d) => (memLog += d));
@@ -809,6 +811,17 @@ try {
       assert.deepEqual(await addrs(6), ["→M", "M→"]);
       assert.equal((await mp.$$(`${tag(6)} .bar`)).length, 2);
       assert.equal((await mp.$$(`${tag(6)} .stub`)).length, 2);
+      // Each half keeps the kind chip and the icon of a whole tag.
+      assert.equal((await mp.$$(`${tag(6)} .kind-ring`)).length, 2);
+      assert.equal((await mp.$$(`${tag(6)} .ic-t`)).length, 2);
+    });
+    await step("zoomed out, a flag wired on both sides names both ways", async () => {
+      for (let i = 0; i < 12 && !(await mp.$("#viewport .far-sub")); i++) await mp.click("#btn-zoom-out");
+      await mp.waitForSelector("#viewport .far-sub");
+      const far = await mp.$$eval("#viewport .far-sub", (t) => t.map((x) => x.textContent));
+      assert.ok(far.some((t) => /Hilfsmerker.*→M M→/.test(t)), far.join(" | "));
+      assert.ok(far.some((t) => /Anwesend.*→M$/.test(t) && !/M→/.test(t)), far.join(" | "));
+      await mp.click("#btn-fit");
     });
     await step("a flag written from another page has a link at its input", async () => {
       assert.deepEqual(await addrs(5), ["→M"]);
