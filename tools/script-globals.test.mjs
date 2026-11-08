@@ -6,9 +6,10 @@ import { Linter } from "eslint";
 import config from "../eslint.config.mjs";
 import { scriptGlobals } from "./script-globals.mjs";
 
-const scripts = ["navigation", "app", "modes"].map((name) => ({
-  file: `web/${name}.js`,
-  source: readFileSync(new URL(`../web/${name}.js`, import.meta.url), "utf8"),
+const html = readFileSync(new URL("../web/index.html", import.meta.url), "utf8");
+const scripts = [...html.matchAll(/<script\b[^>]*\bsrc=["']\/([^"']+\.js)["'][^>]*>/g)].map(([, path]) => ({
+  file: `web/${path}`,
+  source: readFileSync(new URL(`../web/${path}`, import.meta.url), "utf8"),
 }));
 
 test("export headers generate readonly globals in the other loaded scripts", () => {
@@ -20,10 +21,13 @@ test("export headers generate readonly globals in the other loaded scripts", () 
   assert.deepEqual(configs[1].languageOptions.globals, { value: "readonly" });
 });
 
-test("renaming the producer's select without updating its export fails", () => {
-  assert.throws(() => scriptGlobals(scripts.map((s) => s.file === "web/app.js"
-    ? { ...s, source: s.source.replace("function select(", "function renamedSelect(") } : s)), /exported name select has no top-level binding/);
-});
+for (const [file, name] of [["app", "select"], ["editing", "editAct"], ["deploy", "renderActions"]]) {
+  test(`renaming ${file}'s ${name} without updating its export fails`, () => {
+    assert.throws(() => scriptGlobals(scripts.map((s) => s.file === `web/${file}.js`
+      ? { ...s, source: s.source.replace(`function ${name}(`, `function renamed_${name}(`) } : s)),
+    new RegExp(`exported name ${name} has no top-level binding`));
+  });
+}
 
 test("removing an export removes the consumer's global", () => {
   const changed = scripts.map((s) => s.file === "web/app.js"

@@ -2,17 +2,30 @@
 
 The binary is an `axum` server with the UI embedded (plain JS and SVG, no build step).
 
-`web/index.html` loads classic scripts in order: `navigation.js`, `app.js`, then `modes.js`.
-`navigation.js` owns URL state, Back/Forward navigation and history loading, including request
-sequence guards and retry state. Its header lists the shared state and refresh dependencies.
-It defines functions and registers a popstate listener before `app.js` starts the initial loads;
-the listener ignores events until `S` exists. Those functions use app/calendar globals only when called. `app.js` keeps the shared `S` state,
-rendering, editing and deployment logic; `modes.js` owns the operating-mode calendar.
+`web/index.html` loads classic scripts in this order:
+
+1. `navigation.js`: URL state, Back/Forward navigation and history loading/retries, with request sequence guards.
+2. `app.js`: shared `S` state, canvas/tree/Properties rendering, live values and the per-kind editor drafts,
+   forms and handlers. It registers handlers but leaves the initial server loads to `start.js`.
+3. `editing.js`: shared edit loading/refresh, revision/edit gates, the single edit-send path, this tab's
+   undo/redo stack and its storage, and waiting for the newest compile to be shown.
+4. `deploy.js`: deployment pane, check/test/lint lists and links, defaults naming/review text, hardware and
+   post-deploy status, removals/Roll back plans, confirmations and Apply/Sync/Discard handlers.
+5. `modes.js`: operating-mode calendar and its editors.
+6. `start.js`: the original startup statements, in order, after all definitions and state are initialized.
+
+The extracted modules' headers list their state reads/writes and render/refresh dependencies. Per-kind
+editors stay in `app.js` and call `editAct` in `editing.js`; deployment uses the existing `act` transport
+and refreshes the same history/view functions. Request guards, undo ordering, confirmations and UUID
+comparisons are unchanged. [frontend-module-moves.md](frontend-module-moves.md) records the item-by-item
+comparison against main, with a reproducible verifier.
+
 The scripts share the browser global scope. `eslint.config.mjs` generates imports from the
-`/* exported */` headers after checking declarations and cross-script binding clashes. They are embedded individually with `include_str!` and routed
-in `src/main.rs`. All assets use `Cache-Control: no-cache` (no ETag or hashed filenames), so new
-scripts need both an HTML script tag and an embedded route. No bundler or npm package ships in
-the binary.
+`/* exported */` headers after checking declarations and cross-script binding clashes. The lint self-test
+reads the same HTML script list, so new modules participate in those checks. Files are embedded individually
+with `include_str!` and routed in `src/main.rs`. All assets use `Cache-Control: no-cache` (no ETag or hashed
+filenames), so a new script needs both an HTML script tag and an embedded route. No bundler or npm package
+ships in the binary.
 
 - `src/source.rs` resolves the path into the watched files.
 - `src/history.rs` keeps revisions keyed by git blob id. A live snapshot and the commit with the same
