@@ -1,15 +1,12 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
 import test from "node:test";
 import { runInNewContext } from "node:vm";
 import { Linter } from "eslint";
 import config from "../eslint.config.mjs";
+import { loadScripts } from "./web-scripts.mjs";
 import { scriptGlobals } from "./script-globals.mjs";
 
-const scripts = ["navigation", "app", "modes"].map((name) => ({
-  file: `web/${name}.js`,
-  source: readFileSync(new URL(`../web/${name}.js`, import.meta.url), "utf8"),
-}));
+const scripts = loadScripts();
 
 test("export headers generate readonly globals in the other loaded scripts", () => {
   const configs = scriptGlobals([
@@ -20,10 +17,13 @@ test("export headers generate readonly globals in the other loaded scripts", () 
   assert.deepEqual(configs[1].languageOptions.globals, { value: "readonly" });
 });
 
-test("renaming the producer's select without updating its export fails", () => {
-  assert.throws(() => scriptGlobals(scripts.map((s) => s.file === "web/app.js"
-    ? { ...s, source: s.source.replace("function select(", "function renamedSelect(") } : s)), /exported name select has no top-level binding/);
-});
+for (const [file, name] of [["app", "select"], ["editing", "editAct"], ["deploy", "renderActions"]]) {
+  test(`renaming ${file}'s ${name} without updating its export fails`, () => {
+    assert.throws(() => scriptGlobals(scripts.map((s) => s.file === `web/${file}.js`
+      ? { ...s, source: s.source.replace(`function ${name}(`, `function renamed_${name}(`) } : s)),
+    new RegExp(`exported name ${name} has no top-level binding`));
+  });
+}
 
 test("removing an export removes the consumer's global", () => {
   const changed = scripts.map((s) => s.file === "web/app.js"
@@ -67,4 +67,28 @@ test("popstate before app.js provides S is ignored", async () => {
     popstate = listener;
   } } });
   await popstate();
+});
+
+test("load-time event registrations must use the readiness gate", () => {
+  for (const source of [
+    'window.addEventListener("keydown", () => {});',
+    'document.querySelectorAll("button").forEach((b) => { b.onclick = () => {}; });',
+    'document.onclick = () => {};',
+  ]) {
+    const messages = new Linter().verify(source, config, { filename: "web/probe.js" });
+    assert(messages.some((m) => m.ruleId === "startup/ready-listeners"), source);
+  }
+});
+
+test("whenReady preserves this, arguments and return values after startup", () => {
+  const context = { window: { addEventListener() {} } };
+  runInNewContext(scripts[0].source, context);
+  let calls = 0;
+  const receiver = { value: 3 };
+  const handler = context.whenReady(function (n) { calls++; return this.value + n; });
+  assert.equal(handler.call(receiver, 4), undefined);
+  assert.equal(calls, 0);
+  context.window.VISLOX_READY = true;
+  assert.equal(handler.call(receiver, 4), 7);
+  assert.equal(calls, 1);
 });

@@ -1,4 +1,4 @@
-/* exported $, S, UNDO, api, ciEq, displayTitle, editAct, editRev, editShowNewest, editsBlock, editsChanged, esc, gotoPage, hideTip, liveHere, liveOn, liveStart, liveVal, loadRunning, loadView, nodeById, plural, removalsPreview, renderActions, renderHistory, renderLiveSwitch, renderLog, renderPull, renderSelects, rollbackPreview, running, seUuid, select, setStatus, showTip, showingWhy, svg, undoSync */
+/* exported $, AB, EDIT_ATTR, KIND, MV, PREVIEW_TTL, S, accessPending, api, appIssues, applyFocus, autoTitle, awaitedAppRead, calApplyWarning, ciEq, claimAt, claimsOf, connect, constAt, constLet, constPending, constUse, displayTitle, editsMoved, editsWires, esc, fmtWhen, goClicked, gotoPage, hideTip, isDeployed, liveHere, liveOn, liveStart, liveStreaming, liveVal, loadApp, loadAppFromMs, loadCal, loadMs, loadRunning, loadView, logStale, lvSpan, managedRefresh, managedSet, managedSrc, membersPending, moodsPending, msWarn, narrowText, nodeById, pageCreated, pagesCreated, plural, portName, prettyType, renderAddHud, renderChanges, renderHistory, renderLiveSwitch, renderLog, renderPage, renderProps, renderPull, renderRights, renderSelects, renderStale, renderTree, rulesPending, running, sameEnd, schedsPending, scheduleConflicts, seUuid, select, setLive, setStatus, showTip, srcPath, staleText, svg, tilesPending, wcardRefresh */
 "use strict";
 // vislox — Loxone Config style viewer: read-only by default, with optional editing and deployment.
 // Canvas coordinates are the config's own units: one port row is 192.
@@ -375,7 +375,7 @@ function renderTabs() {
     if (p.uuid === S.page) requestAnimationFrame(() => t.scrollIntoView({ block: "nearest", inline: "nearest" }));
   }
 }
-$("tab-list").addEventListener("keydown", (e) => {
+$("tab-list").addEventListener("keydown", whenReady((e) => {
   if (e.key !== "ArrowLeft" && e.key !== "ArrowRight" && e.key !== "Home" && e.key !== "End") return;
   e.preventDefault();
   const tabs = [...$("tab-list").querySelectorAll(".tab")];
@@ -383,7 +383,7 @@ $("tab-list").addEventListener("keydown", (e) => {
   i = e.key === "Home" ? 0 : e.key === "End" ? tabs.length - 1 : Math.max(0, Math.min(tabs.length - 1, i + (e.key === "ArrowRight" ? 1 : -1)));
   gotoPage(tabs[i].dataset.uuid);
   $("tab-list").querySelector(`[data-uuid="${CSS.escape(tabs[i].dataset.uuid)}"]`)?.focus();
-});
+}));
 function gotoPage(uuid, opts) {
   if (!uuid || !S.pageOf.has(uuid)) return;
   // Going to a page leaves the Operating modes view.
@@ -403,9 +403,9 @@ function stepPage(d) {
   const j = Math.max(0, Math.min(pages.length - 1, i + d));
   if (pages[j]) gotoPage(pages[j].uuid);
 }
-document.querySelectorAll(".tab-nav button").forEach((b) => (b.onclick = () => stepPage(b.dataset.nav === "next" ? 1 : -1)));
-$("chk-only-changed").onchange = (e) => { S.onlyChanged = e.target.checked; renderTabs(); };
-$("btn-pages").onclick = () => openPalette("");
+document.querySelectorAll(".tab-nav button").forEach((b) => (b.onclick = whenReady(() => stepPage(b.dataset.nav === "next" ? 1 : -1))));
+$("chk-only-changed").onchange = whenReady((e) => { S.onlyChanged = e.target.checked; renderTabs(); });
+$("btn-pages").onclick = whenReady(() => openPalette(""));
 
 // ── canvas ─────────────────────────────────────────────────────────────
 const svg = $("canvas"), vpG = $("viewport");
@@ -452,19 +452,19 @@ function zoomAt(f, cx, cy) {
 }
 function zoomCenter(f) { zoomAt(f, svg.clientWidth / 2, svg.clientHeight / 2); }
 function pan(dx, dy) { const v = S.vp[S.page]; if (v) { v.x += dx; v.y += dy; applyVp(); } }
-svg.addEventListener("wheel", (e) => {
+svg.addEventListener("wheel", whenReady((e) => {
   e.preventDefault();
   const r = svg.getBoundingClientRect();
   if (e.ctrlKey || !e.shiftKey) zoomAt(Math.pow(1.0018, -e.deltaY), e.clientX - r.left, e.clientY - r.top);
   else pan(-e.deltaY, 0);
-}, { passive: false });
+}), { passive: false });
 let drag = null;
-svg.addEventListener("mousedown", (e) => {
+svg.addEventListener("mousedown", whenReady((e) => {
   if (e.button !== 0 && e.button !== 1) return;
   drag = { x: e.clientX, y: e.clientY, moved: false };
   svg.classList.add("panning");
-});
-window.addEventListener("mousemove", (e) => {
+}));
+window.addEventListener("mousemove", whenReady((e) => {
   // A wire being drawn holds the page still; so does a move with no button down (the pan's mouse-up
   // clears it only after a timer).
   if (!drag || WR) return;
@@ -472,17 +472,17 @@ window.addEventListener("mousemove", (e) => {
   const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
   if (Math.abs(dx) + Math.abs(dy) > 3) drag.moved = true;
   if (drag.moved) { pan(dx, dy); drag.x = e.clientX; drag.y = e.clientY; hideTip(); }
-});
-window.addEventListener("mouseup", () => { svg.classList.remove("panning"); setTimeout(() => (drag = null), 0); });
-svg.addEventListener("click", (e) => {
+}));
+window.addEventListener("mouseup", whenReady(() => { svg.classList.remove("panning"); setTimeout(() => (drag = null), 0); }));
+svg.addEventListener("click", whenReady((e) => {
   if (drag && drag.moved) return;
   if (e.target === svg || e.target.classList.contains("sheet") || e.target.classList.contains("sheet-dots")) { select(null); wcardClose(); }
-});
-$("btn-fit").onclick = fit;
-$("btn-zoom-in").onclick = () => zoomCenter(1.25);
-$("btn-zoom-out").onclick = () => zoomCenter(0.8);
-$("btn-zoom-pct").onclick = () => { const v = S.vp[S.page]; if (v) zoomCenter(K100 / v.k); };
-window.addEventListener("resize", () => { if (S.page && !S.vp[S.page]) fit(); updateMinimap(); });
+}));
+$("btn-fit").onclick = whenReady(fit);
+$("btn-zoom-in").onclick = whenReady(() => zoomCenter(1.25));
+$("btn-zoom-out").onclick = whenReady(() => zoomCenter(0.8));
+$("btn-zoom-pct").onclick = whenReady(() => { const v = S.vp[S.page]; if (v) zoomCenter(K100 / v.k); });
+window.addEventListener("resize", whenReady(() => { if (S.page && !S.vp[S.page]) fit(); updateMinimap(); }));
 
 const tip = $("tooltip");
 function showTip(e, html) {
@@ -1072,9 +1072,9 @@ function minimapGo(e) {
   applyVp();
 }
 let mmDrag = false;
-$("minimap").addEventListener("mousedown", (e) => { mmDrag = true; minimapGo(e); e.preventDefault(); });
-window.addEventListener("mousemove", (e) => { if (mmDrag) minimapGo(e); });
-window.addEventListener("mouseup", () => (mmDrag = false));
+$("minimap").addEventListener("mousedown", whenReady((e) => { mmDrag = true; minimapGo(e); e.preventDefault(); }));
+window.addEventListener("mousemove", whenReady((e) => { if (mmDrag) minimapGo(e); }));
+window.addEventListener("mouseup", whenReady(() => (mmDrag = false)));
 
 // ── selection, focus mode & properties ────────────────────────────────
 function select(uuid, opts) {
@@ -1336,7 +1336,7 @@ function renderPropsBody() {
       return `<section><button type="button" class="ps-h" aria-expanded="${open}" data-sec="${esc(s.name)}">${esc(s.name)}${s.count ? `<span class="count">${s.count}</span>` : ""}</button><div class="ps-b" data-body="${esc(s.name)}"${open ? "" : " hidden"}>${s.rows.join("")}</div></section>`;
     }).join("");
 }
-$("props").addEventListener("keydown", (e) => {
+$("props").addEventListener("keydown", whenReady((e) => {
   if (e.target.id === "ad-slug" && e.key === "Enter") { e.preventDefault(); adoptSave(S.sel); return; }
   if (e.target.id === "ad-slug" && e.key === "Escape") { e.preventDefault(); e.stopPropagation(); adoptClose(); return; }
   if (e.target.id === "rn-slug" && e.key === "Enter") { e.preventDefault(); renameSave(S.sel); return; }
@@ -1353,9 +1353,9 @@ $("props").addEventListener("keydown", (e) => {
   if (f && e.key === "Escape") { e.preventDefault(); e.stopPropagation(); editClose(); return; }
   const i = e.target.closest(".op input");
   if (i && e.key === "Enter") { e.preventDefault(); operate(i.dataset.opUuid, i.value); }
-});
-$("props").addEventListener("toggle", (e) => { if (e.target.classList?.contains("ex-new")) { exSync(); S.ex.draft["new:open"] = e.target.open; } }, true);
-$("props").addEventListener("input", (e) => {
+}));
+$("props").addEventListener("toggle", whenReady((e) => { if (e.target.classList?.contains("ex-new")) { exSync(); S.ex.draft["new:open"] = e.target.open; } }), true);
+$("props").addEventListener("input", whenReady((e) => {
   if (e.target.dataset.exField) { exSync(); S.ex.draft[e.target.dataset.exField] = e.target.value; return; }
   if (e.target.id === "ad-slug") { AD.slug = e.target.value; return; }
   if (e.target.dataset.dfltField) { DF.value = e.target.value; DF.err = ""; return; }
@@ -1365,8 +1365,8 @@ $("props").addEventListener("input", (e) => {
   if (!f || S.edit.uuid !== S.sel) return;
   S.edit.draft[f.dataset.edField] = f.value;
   delete S.edit.bad[f.dataset.edField];
-});
-$("props").addEventListener("click", (e) => {
+}));
+$("props").addEventListener("click", whenReady((e) => {
   const xb = e.target.closest("[data-ex]");
   if (xb) { exAct(xb.dataset.ex, xb.dataset.id); return; }
   const db = e.target.closest("[data-dflt]");
@@ -1420,7 +1420,7 @@ $("props").addEventListener("click", (e) => {
   if (!a) return;
   if (a.dataset.page) gotoPage(a.dataset.page, { focus: a.dataset.go });
   select(a.dataset.go);
-});
+}));
 
 /** How a change reconfigures a device (`device.how`, `hardware[].how`). */
 const HW_HOW = {
@@ -1566,7 +1566,7 @@ function toggleNode(uuid) {
   S.treeFocus = uuid;
   renderTree();
 }
-$("tree").addEventListener("click", (e) => {
+$("tree").addEventListener("click", whenReady((e) => {
   const row = e.target.closest(".tn-row");
   if (!row) return;
   const uuid = row.dataset.uuid;
@@ -1575,13 +1575,13 @@ $("tree").addEventListener("click", (e) => {
   if (e.target.closest("[data-add-under]")) { abOpenUnder(uuid); return; }
   if (e.target.closest(".tn-tw") && row.hasAttribute("aria-expanded")) { toggleNode(uuid); return; }
   activateNode(uuid);
-});
-$("tree").addEventListener("dblclick", (e) => {
+}));
+$("tree").addEventListener("dblclick", whenReady((e) => {
   if (e.target.closest("[data-modes], [data-add-under]")) return;
   const row = e.target.closest(".tn-row");
   if (row && row.hasAttribute("aria-expanded")) toggleNode(row.dataset.uuid);
-});
-$("tree").addEventListener("keydown", (e) => {
+}));
+$("tree").addEventListener("keydown", whenReady((e) => {
   const rows = [...$("tree").querySelectorAll(".tn-row")];
   if (!rows.length) return;
   let i = rows.findIndex((r) => r.dataset.uuid === S.treeFocus);
@@ -1609,11 +1609,11 @@ $("tree").addEventListener("keydown", (e) => {
     default: return;
   }
   e.preventDefault();
-});
-$("tree").addEventListener("focus", () => {
+}));
+$("tree").addEventListener("focus", whenReady(() => {
   if (!S.treeFocus) { const r = $("tree").querySelector(".tn-row"); if (r) { S.treeFocus = r.dataset.uuid; r.classList.add("kfocus"); } }
-});
-$("tree-filter").addEventListener("input", renderTree);
+}));
+$("tree-filter").addEventListener("input", whenReady(renderTree));
 
 // ── changes ────────────────────────────────────────────────────────────
 const KIND = { added: ["+", "added"], removed: ["−", "removed"], renamed: ["~", "renamed"], param: ["~", "parameters"], attr: ["~", "settings"], rights: ["~", "rights"], "wire+": ["+", "wires added"], "wire-": ["−", "wires removed"], moved: ["↔", "moved"] };
@@ -1775,8 +1775,8 @@ function markCurrentChange() {
   const c = shownChanges()[S.chgIdx];
   if (c?.obj) vpG.querySelectorAll(`[data-uuid="${CSS.escape(c.obj)}"]`).forEach((n) => n.classList.add("cur-change"));
 }
-$("chg-prev").onclick = () => gotoChange(S.chgIdx < 0 ? -1 : S.chgIdx - 1);
-$("chg-next").onclick = () => gotoChange(S.chgIdx + 1);
+$("chg-prev").onclick = whenReady(() => gotoChange(S.chgIdx < 0 ? -1 : S.chgIdx - 1));
+$("chg-next").onclick = whenReady(() => gotoChange(S.chgIdx + 1));
 
 // ── command palette ────────────────────────────────────────────────────
 // The palette also picks a block for an editor (`pal.pick`, #75: a central block's new member): only blocks of
@@ -1913,47 +1913,47 @@ function palOpen(i) {
   else { gotoPage(it.page, { focus: it.uuid }); select(it.uuid); }
   svg.focus({ preventScroll: true });
 }
-$("pal-input").addEventListener("input", renderPalette);
-$("pal-input").addEventListener("keydown", (e) => {
+$("pal-input").addEventListener("input", whenReady(renderPalette));
+$("pal-input").addEventListener("keydown", whenReady((e) => {
   if (e.key === "ArrowDown") { palMove(1); e.preventDefault(); }
   else if (e.key === "ArrowUp") { palMove(-1); e.preventDefault(); }
   else if (e.key === "Enter") { palOpen(pal.idx); e.preventDefault(); }
   else if (e.key === "Escape") { closePalette(); e.preventDefault(); }
-});
-$("pal-list").addEventListener("click", (e) => { const li = e.target.closest("[data-i]"); if (li) palOpen(+li.dataset.i); });
-$("palette").addEventListener("mousedown", (e) => { if (e.target.id === "palette") closePalette(); });
-$("btn-search").onclick = () => openPalette("");
+}));
+$("pal-list").addEventListener("click", whenReady((e) => { const li = e.target.closest("[data-i]"); if (li) palOpen(+li.dataset.i); }));
+$("palette").addEventListener("mousedown", whenReady((e) => { if (e.target.id === "palette") closePalette(); }));
+$("btn-search").onclick = whenReady(() => openPalette(""));
 
 // ── help ───────────────────────────────────────────────────────────────
 function openHelp() { $("help").classList.remove("hidden"); $("help-close").focus(); }
 function closeHelp() { $("help").classList.add("hidden"); }
-$("btn-help").onclick = openHelp;
-$("help-close").onclick = closeHelp;
-$("help").addEventListener("mousedown", (e) => { if (e.target.id === "help") closeHelp(); });
+$("btn-help").onclick = whenReady(openHelp);
+$("help-close").onclick = whenReady(closeHelp);
+$("help").addEventListener("mousedown", whenReady((e) => { if (e.target.id === "help") closeHelp(); }));
 
 // ── controls ───────────────────────────────────────────────────────────
-$("sel-rev").onchange = (e) => {
+$("sel-rev").onchange = whenReady((e) => {
   S.rev = e.target.value;
   S.base = revById(S.rev)?.base || null;
   S.follow = false; $("chk-follow").checked = false;
   renderHistory(); renderSelects(); loadView(); writeHash(true);
-};
-$("sel-base").onchange = (e) => { S.base = e.target.value || null; S.follow = false; $("chk-follow").checked = false; renderHistory(); loadView(); writeHash(true); };
-$("chk-changes").onchange = (e) => {
+});
+$("sel-base").onchange = whenReady((e) => { S.base = e.target.value || null; S.follow = false; $("chk-follow").checked = false; renderHistory(); loadView(); writeHash(true); });
+$("chk-changes").onchange = whenReady((e) => {
   S.marks = e.target.checked;
   if (!S.view) return;
   renderLegend(); renderTabs(); renderTree(); renderPage(); renderProps(); applyFocus(); renderModes(); renderTests(); renderLint();
-};
-$("chk-live").onchange = (e) => setLive(e.target.checked);
+});
+$("chk-live").onchange = whenReady((e) => setLive(e.target.checked));
 $("chk-live-dim").checked = S.live.dim;
-$("chk-live-dim").onchange = (e) => { S.live.dim = e.target.checked; setPref("liveDim", S.live.dim); renderLiveSwitch(); };
+$("chk-live-dim").onchange = whenReady((e) => { S.live.dim = e.target.checked; setPref("liveDim", S.live.dim); renderLiveSwitch(); });
 $("chk-live-query").checked = S.live.query;
-$("chk-live-query").onchange = (e) => { S.live.query = e.target.checked; setPref("liveQuery", S.live.query); renderLiveSwitch(); };
-$("chk-dim").onchange = (e) => { S.dim = e.target.checked; renderPage(); applyFocus(); };
-$("chk-only-managed").onchange = (e) => { S.onlyManaged = e.target.checked; renderPage(); applyFocus(); };
-$("chk-follow").onchange = (e) => { if (e.target.checked) followLatest(); else S.follow = false; writeHash(false); };
+$("chk-live-query").onchange = whenReady((e) => { S.live.query = e.target.checked; setPref("liveQuery", S.live.query); renderLiveSwitch(); });
+$("chk-dim").onchange = whenReady((e) => { S.dim = e.target.checked; renderPage(); applyFocus(); });
+$("chk-only-managed").onchange = whenReady((e) => { S.onlyManaged = e.target.checked; renderPage(); applyFocus(); });
+$("chk-follow").onchange = whenReady((e) => { if (e.target.checked) followLatest(); else S.follow = false; writeHash(false); });
 
-window.addEventListener("keydown", (e) => {
+window.addEventListener("keydown", whenReady((e) => {
   if (e.defaultPrevented) return;
   if (!$("palette").classList.contains("hidden") || !$("help").classList.contains("hidden")) {
     if (e.key === "Escape") { closePalette(); closeHelp(); }
@@ -2007,10 +2007,10 @@ window.addEventListener("keydown", (e) => {
     default: return;
   }
   e.preventDefault();
-});
+}));
 
 for (const [sid, a, b] of [["split-left", "tree-pane", "props-pane"], ["split-right", "hist-pane", "chg-pane"]]) {
-  $(sid).addEventListener("mousedown", (e) => {
+  $(sid).addEventListener("mousedown", whenReady((e) => {
     e.preventDefault();
     const A = $(a), B = $(b), total = A.offsetHeight + B.offsetHeight, y0 = e.clientY, h0 = A.offsetHeight;
     const mv = (ev) => {
@@ -2020,7 +2020,7 @@ for (const [sid, a, b] of [["split-left", "tree-pane", "props-pane"], ["split-ri
     const up = () => { window.removeEventListener("mousemove", mv); window.removeEventListener("mouseup", up); };
     window.addEventListener("mousemove", mv);
     window.addEventListener("mouseup", up);
-  });
+  }));
 }
 
 // ── pull from the Miniserver ───────────────────────────────────────────
@@ -2063,7 +2063,7 @@ async function pull() {
     pulling = false; renderPull(); loadMs(true);
   }
 }
-$("btn-pull").onclick = pull;
+$("btn-pull").onclick = whenReady(pull);
 
 // ── which config the Miniserver runs ───────────────────────────────────
 // Pull and Apply take the newest backup in /prog; the Miniserver may run another file (an upload
@@ -2094,8 +2094,8 @@ function renderRunning() {
   box.innerHTML = `<div class="ms-line" title="${esc(tip)}"><span>${r.from === "def.log" ? "Runs" : "Probably runs"} <code>${esc(r.running || "?")}</code>${r.firmware ? ` · fw ${esc(r.firmware)}` : ""}</span>${again}</div>` +
     (r.warnings || []).map((w) => `<div class="ms-warn" data-kind="${esc(w.kind)}">⚠ ${esc(w.text)}</div>`).join("");
 }
-$("ms-run").addEventListener("click", (e) => { if (e.target.closest(".ms-again")) loadRunning(true); });
-$("pull-msg").onclick = () => pullMsg("");
+$("ms-run").addEventListener("click", whenReady((e) => { if (e.target.closest(".ms-again")) loadRunning(true); }));
+$("pull-msg").onclick = whenReady(() => pullMsg(""));
 
 // ── the Miniserver: status chip and preflight ──────────────────────────
 // The server checks the Miniserver lox talks to (its web port, FTP, the unauthenticated
@@ -2183,8 +2183,8 @@ function renderStale() {
   $("stale-sync").classList.toggle("hidden", !syncOk);
   $("stale-row").classList.toggle("hidden", !pullOk && !syncOk);
 }
-$("stale-pull").onclick = () => $("btn-pull").click();
-$("stale-sync").onclick = () => $("btn-sync").click();
+$("stale-pull").onclick = whenReady(() => $("btn-pull").click());
+$("stale-sync").onclick = whenReady(() => $("btn-sync").click());
 
 // ── calendar entries changed in the Loxone app ─────────────────────────
 // The server reads the Miniserver's entries (calendargetentries, admin only) when live values
@@ -2260,398 +2260,31 @@ function renderCalDrift() {
   $("cal-drift-sync").classList.toggle("hidden", !syncOk);
   $("cal-drift-row").classList.toggle("hidden", !pullOk && !syncOk);
 }
-$("cal-drift-pull").onclick = () => $("btn-pull").click();
-$("cal-drift-sync").onclick = () => $("btn-sync").click();
-$("cal-drift-list").addEventListener("click", (e) => {
+$("cal-drift-pull").onclick = whenReady(() => $("btn-pull").click());
+$("cal-drift-sync").onclick = whenReady(() => $("btn-sync").click());
+$("cal-drift-list").addEventListener("click", whenReady((e) => {
   const g = e.target.closest("[data-go]");
   if (!g) return;
   const u = g.dataset.go, pg = S.view?.objects[u]?.page;
   if (pg) gotoPage(pg, { focus: u });
   select(u);
-});
+}));
 function closeMsPop() { $("ms-pop").classList.add("hidden"); $("ms-chip").setAttribute("aria-expanded", "false"); }
-$("ms-chip").onclick = () => {
+$("ms-chip").onclick = whenReady(() => {
   const open = $("ms-pop").classList.toggle("hidden") === false;
   $("ms-chip").setAttribute("aria-expanded", String(open));
   if (open) loadMs();
-};
-$("ms-recheck").onclick = async () => {
+});
+$("ms-recheck").onclick = whenReady(async () => {
   const b = $("ms-recheck");
   b.disabled = true; b.textContent = "Checking…";
   await loadMs(true);
   b.disabled = false; b.textContent = "Check again";
-};
-document.addEventListener("keydown", (e) => {
+});
+document.addEventListener("keydown", whenReady((e) => {
   if (e.key === "Escape" && !$("ms-pop").classList.contains("hidden")) { closeMsPop(); $("ms-chip").focus(); e.stopPropagation(); }
-}, true);
-document.addEventListener("click", (e) => { if (!e.target.closest(".ms-wrap")) closeMsPop(); });
-
-// ── apply, sync, discard ───────────────────────────────────────────────
-// Whoever edits the lox.toml project's module and compiles it (a person, or an agent working in the
-// repository), the compile shows as the pending revision. Apply deploys it (lox config push) and
-// pushes to git; Sync makes the Miniserver's running config the base; Discard drops the compile.
-function adminToken(ask) {
-  let t = "";
-  try { t = localStorage.getItem("vislox.token") || ""; } catch { /* private mode */ }
-  if (!t && ask) {
-    t = (window.prompt("Admin token for changes (the contents of vislox's --admin-token-file):") || "").trim();
-    if (t) try { localStorage.setItem("vislox.token", t); } catch { /* private mode */ }
-  }
-  return t;
-}
-async function act(path, body) {
-  const t = adminToken(true);
-  if (!t) throw new Error("Changes need the admin token.");
-  const r = await fetch(path, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "X-Vislox-Token": t, "X-Vislox": "act" },
-    body: JSON.stringify(body || {}),
-  });
-  const j = await r.json().catch(() => ({}));
-  if (r.status === 401) try { localStorage.removeItem("vislox.token"); } catch { /* private mode */ }
-  if (j.preflight || /apply|sync/.test(path)) loadMs(true);
-  if (!r.ok) { const e = new Error(j.error || r.statusText); e.data = j; throw e; }
-  return j;
-}
-function deployMsg(text, error, warn) {
-  const m = $("deploy-msg");
-  m.textContent = text || "";
-  m.className = "deploy-msg" + (error ? " error" : warn ? " warn" : "") + (text ? "" : " hidden");
-}
-/** “ They include 3 values edited here and 1 block added here.”, or nothing. */
-function editsHere() {
-  const parts = [];
-  if (editsPending().length) parts.push(`${plural(editsPending().length, "value")} edited here`);
-  if (editsAdded().length) parts.push(`${plural(editsAdded().length, "block")} added here`);
-  if (pagesCreated().length) parts.push(`${plural(pagesCreated().length, "page")} created here`);
-  if (editsMoved().length) parts.push(`${plural(editsMoved().length, "block")} moved here`);
-  if (schedsPending().length) parts.push(`switching times of ${plural(schedsPending().length, "timer")} edited here`);
-  if (moodsPending().length) parts.push(`moods of ${plural(moodsPending().length, "lighting controller")} edited here`);
-  if (membersPending().length) parts.push(`members of ${plural(membersPending().length, "central block")} edited here`);
-  if (rulesPending().length) parts.push(`${plural(rulesPending().length, "Automatic Designer rule")} edited here`);
-  if (accessPending().length) parts.push(`access to ${accessPending().length} NFC Code Touch${accessPending().length === 1 ? "" : "es"} edited here`);
-  if (accessPending("recipients").length) parts.push(`recipients of ${plural(accessPending("recipients").length, "push notification")} edited here`);
-  if (tilesPending().length) parts.push(`tiles of ${tilesPending().length === 1 ? "1 Touch Pure Flex" : `${tilesPending().length} Touch Pure Flex devices`} edited here`);
-  // The module's constants and defaults (#81): a default names the blocks it changes.
-  for (const p of constPending()) {
-    parts.push(p.kind === "let" ? `the constant ${p.name} (${plural(p.uses, "use")})`
-      : `the default ${p.name} ${p.port}, which changes ${plural(p.blocks.length, "block")} (${dfltList(p.blocks)})`);
-  }
-  const drawn = editsWires().filter((w) => w.now).length, out = editsWires().length - drawn;
-  if (drawn) parts.push(`${plural(drawn, "wire")} drawn here`);
-  if (out) parts.push(`${plural(out, "wire")} taken out here`);
-  return parts.length ? ` They include ${parts.join(" and ")}.` : "";
-}
-/** The newest compile, if it differs from what is deployed. */
-function pendingChange() {
-  const p = S.hist?.pending?.[0];
-  const base = p && revById(p.base);
-  return p && base && p.blob !== base.blob ? p : null;
-}
-// One Apply at a time: from the click until the confirmation is answered (and the request sent),
-// a second click does nothing.
-let applyAsking = false;
-function renderActions() {
-  const a = S.hist?.actions;
-  $("deploy-pane").classList.toggle("hidden", !a?.shown);
-  // Add mode and Add entry wait while Apply or another action runs (#86).
-  if (MD.open) mdRenderEdit();
-  renderStale();
-  renderAddHud();
-  if (!a?.shown) return;
-  const busy = !!a.running;
-  const pend = pendingChange();
-  renderCheck();
-  $("deploy-pend").classList.toggle("idle", !pend && !a.running);
-  $("deploy-pend").textContent = a.running === "Apply" ? "Deploying to the Miniserver… (download, check, upload, restart, verify)"
-    : a.running === "Roll back" ? "Rolling back on the Miniserver… (backup, tests, download, check, upload, restart, verify)"
-    : a.running === "Edit" ? "Compiling the edit… (lox logic compile; nothing is deployed)"
-    : a.running === "Compile" ? "Compiling the module… (lox logic compile; nothing is deployed)"
-    : a.running ? `${a.running}…` : pend ? `Compiled changes are pending (${fmtWhen(pend.time)}), not deployed.` +
-      editsHere() + " Review them, then apply."
-    : !a.apply.available ? `Apply is off: ${a.apply.reason}.`
-    : adoptedUncommitted().length ? `Nothing pending: adopting changes nothing the Miniserver runs. ${plural(adoptedUncommitted().length, "block")} adopted here ${adoptedUncommitted().length === 1 ? "goes" : "go"} into git with the next Apply; Undo hands ${adoptedUncommitted().length === 1 ? "it" : "them"} back.`
-    : `Nothing pending. ${a.edit?.available ? "Edit values in Properties, add blocks to a page, or edit" : "Edit"} the project's module and compile it (lox logic …); the result shows here for review.`;
-  $("deploy-row").classList.toggle("hidden", !pend && !a.running && !removing());
-  $("btn-apply").disabled = !a.apply.available || busy || (!pend && !removing()) || applyAsking || checkBroken() || !!testsFailing();
-  const sync = $("btn-sync");
-  sync.disabled = !a.apply.available || busy || !!pend;
-  sync.classList.toggle("busy", a.running === "Sync");
-  sync.querySelector(".lbl").textContent = a.running === "Sync" ? "Syncing…" : "Sync from Miniserver";
-  sync.title = !a.apply.available ? `Cannot sync: ${a.apply.reason}`
-    : pend ? "Apply or discard the pending changes first"
-    : "Make the Miniserver's running config the project's base (lox config merge), then commit and push" + msWarn("sync");
-  $("btn-discard").disabled = !a.apply.available || busy || !pend;
-  $("btn-apply").title = !a.apply.available ? `Cannot apply: ${a.apply.reason}`
-    : checkBroken() ? "Cannot apply: the module doesn't compile (see above)"
-    : testsFailing() ? `Cannot apply: ${testsFailing()} (see Tests above)`
-    : "Deploy to the Miniserver with lox config push, then commit and push to git" + msWarn("apply");
-  renderSteps(a);
-  renderPush(a);
-  renderStaleLines(a);
-  const last = a.last;
-  if (last && last.at !== renderActions.shownAt) {
-    renderActions.shownAt = last.at;
-    const done = (verb) => verb + (last.warn && last.unpushed ? ", but not verified and not pushed to git" : last.warn ? ", but not verified"
-      : last.unpushed ? ", but not pushed to git" : "") + ".\n";
-    const head = { apply: [done("Applied"), "Apply failed.\n"],
-      rollback: [done("Rolled back"), "Roll back failed.\n"], sync: ["", "Sync failed.\n"], discard: ["", "Discard failed.\n"], compile: ["", "Compile failed.\n"],
-      push: ["", "Not pushed to git.\n"] }[last.kind] || ["", ""];
-    deployMsg(head[last.ok ? 0 : 1] + last.message, !last.ok, last.ok && (last.warn || last.unpushed));
-    // What the new program logged as it started.
-    if (last.kind === "apply" || last.kind === "rollback") logStale();
-    if (last.kind !== "discard" && S.hist?.running) loadRunning(true);
-  }
-}
-// ── personal data before a git push (#71) ─────────────────────────────
-// Every git push vislox makes (Apply, Roll back, Sync) first asks lox logic scan about what it would send: each
-// config file in the commits the remote does not have. lox names where personal data is (element and attribute,
-// the value's length), never the value. On a finding, a file lox cannot read, or no answer, nothing is pushed: the
-// commit stays local (an Apply has deployed it), and this box lists the findings and what to do. Push to git scans
-// again, then pushes.
-/** The commits the git remote does not have, and why. */
-function renderPush(a) {
-  const box = $("deploy-push"), p = a.push;
-  box.classList.toggle("hidden", !p);
-  if (!p) { box.innerHTML = ""; return; }
-  box.classList.toggle("error", p.state !== "behind");
-  box.classList.toggle("hint", p.state === "behind");
-  const head = { found: "Not pushed to git: personal data", unscanned: "Not pushed to git: couldn't check for personal data",
-    failed: "Not pushed to git: git push failed", behind: "Not pushed to git yet" }[p.state] || "Not pushed to git";
-  const ran = a.last?.ok && ["apply", "rollback"].includes(a.last.kind) && a.last.at >= p.at - 1
-    ? "The Miniserver runs the deployed config and the commit records it: only the git remote is behind. " : "";
-  const items = (p.findings || []).map((f) => `<li><span class="ck-at">${esc(f.file + (f.entry ? ` › ${f.entry}` : "") + (f.line ? `:${f.line}` : ""))}</span>` +
-    `${esc(f.kind)} — ${esc(f.what)}${f.len != null ? ` (${plural(f.len, "char")})` : ""}${f.now ? "" : ` · only in ${f.commit ? `commit ${esc(f.commit)}` : "an earlier commit"}, deleted since`}</li>`);
-  if (p.total > items.length) items.push(`<li>… and ${plural(p.total - items.length, "more finding")}</li>`);
-  const why = !a.apply?.available ? `Cannot push: ${a.apply?.reason || ""}` : a.running ? `${a.running} is running` : "";
-  box.innerHTML = `<div class="ck-h">${esc(head)}</div><div class="ck-sub">${esc(ran + p.message)}.</div>` +
-    (items.length ? `<ul class="ps-list">${items.join("")}</ul>` : "") + (p.advice ? `<pre>${esc(p.advice)}</pre>` : "") +
-    `<div class="ck-row"><button type="button" id="btn-push" class="ghost small"${why ? " disabled" : ""}
-      title="${esc(why || "Check the commits not pushed yet for personal data again (lox logic scan), then git push")}">${a.running === "Push" ? "Pushing…" : "Push to git"}</button></div>`;
-}
-// ── obsolete statements (#80) ─────────────────────────────────────
-// A `removed` or `moved` line of vislox's files is done once the compile applied it (lox logic lint calls it
-// stale-lifecycle). The next edit removes it; this box offers to remove them now, as an edit of its own.
-function renderStaleLines(a) {
-  const box = $("deploy-lines"), lines = S.edits?.stale_lines || [];
-  const r = editRev(), shown = !!lines.length && !!r && S.rev === r.id && !!a.edit?.available;
-  box.classList.toggle("hidden", !shown);
-  if (!shown) { box.innerHTML = ""; return; }
-  const why = a.running ? `${a.running} is running` : UNDO.busy || UNDO.inflight ? "An edit is compiling" : "";
-  box.innerHTML = `<div class="ck-h">${plural(lines.length, "obsolete statement")} in vislox-managed files</div>` +
-    `<div class="ck-sub">The compile applied ${lines.length === 1 ? "it" : "them"} (lint: stale-lifecycle); the next edit removes ${lines.length === 1 ? "it" : "them"} too.</div>` +
-    `<ul class="ps-list">${lines.map((l) => `<li class="mono">${esc(l)}</li>`).join("")}</ul>` +
-    `<div class="ck-row"><button type="button" id="btn-tidy" class="ghost small"${why ? ` disabled title="${esc(why)}"` : ' title="Take the obsolete statements out of vislox-managed files and compile: the config does not change"'}>Remove obsolete statements</button></div>`;
-}
-$("deploy-lines").addEventListener("click", async (e) => {
-  if (!e.target.closest("#btn-tidy")) return;
-  const r = editRev();
-  if (!r) return;
-  deployMsg("");
-  try {
-    const res = await editAct(r.blob, [{ op: "tidy" }], "Remove obsolete statements");
-    await editShowNewest(res.blob);
-  } catch (err) { deployMsg(err.message, true); }
-});
-$("deploy-push").addEventListener("click", async (e) => {
-  if (!e.target.closest("#btn-push")) return;
-  deployMsg("");
-  try { const j = await act("/api/push"); deployMsg(j.message); } catch (err) { deployMsg(err.message, true); }
-});
-/** Apply's steps as they happen: lox's progress, and what vislox sees of the program restart. */
-function renderSteps(a) {
-  const box = $("deploy-steps"), p = a.progress;
-  box.classList.toggle("hidden", !p);
-  clearTimeout(renderSteps.tick);
-  if (!p) return;
-  const icon = { wait: "·", run: "●", ok: "✓", skip: "–", fail: "✕" };
-  const nowS = Date.now() / 1000;
-  const secs = (s) => s.at == null ? "" : s.state === "run" ? `${Math.max(0, Math.round(nowS - s.at))} s` : s.end != null && s.end - s.at >= 1 ? `${s.end - s.at} s` : "";
-  box.innerHTML = p.steps.map((s) => `<li class="st-${esc(s.state)}"${s.state === "run" ? ' aria-current="step"' : ""}>` +
-    `<span class="ic" aria-label="${esc(s.state)}">${icon[s.state] || "·"}</span><span class="l">${esc(s.label)}</span><span class="t">${esc(secs(s))}</span>` +
-    (s.detail ? `<span class="d">${esc(s.detail)}</span>` : "") + "</li>").join("");
-  // The running step's clock.
-  if (a.running === "Apply" || a.running === "Roll back") renderSteps.tick = setTimeout(() => renderSteps(S.hist?.actions || a), 1000);
-}
-/** After an Apply: view the deployed revision compared with the one it replaced, with live values,
- *  and list what changed with each block's first value. */
-async function showDeployed() {
-  await loadHistory();
-  const d = S.hist?.actions?.last?.deployed;
-  if (!d) return;
-  const hist = S.hist.history;
-  const rev = hist.find((r) => r.blob === d.after);
-  if (!rev) return;
-  const prev = d.before && d.before !== d.after ? hist.find((r) => r.blob === d.before) : null;
-  S.rev = rev.id;
-  S.base = prev?.id || rev.base;
-  if (rev !== hist[0]) { S.follow = false; $("chk-follow").checked = false; }
-  renderHistory(); renderSelects();
-  await loadView();
-  writeHash(true);
-  if (S.hist.live?.available && !S.live.on) setLive(true, false); // not a retry after a stop
-  // What this Apply changed, kept: the view may change before the box does.
-  const v = S.view, seen = new Set(), rows = [], objs = {};
-  for (const c of v?.compared ? v.changes : []) {
-    if (!c.obj || seen.has(c.obj) || !v.objects[c.obj]) continue;
-    seen.add(c.obj);
-    rows.push(c);
-    objs[c.obj] = v.objects[c.obj];
-  }
-  // Removed devices are gone from the bus on purpose.
-  S.deployed = { rows, objs, hw: (v?.compared ? v.hardware || [] : []).filter((x) => x.how !== "removed"), kind: S.hist.actions?.last?.kind };
-  renderDeployed();
-  watchBus(S.deployed);
-}
-// ── hardware ───────────────────────────────────────────────────────────
-// A change to an extension or a device object reconfigures hardware: the Miniserver sends the device a
-// new configuration, which the device stores. `view.hardware` lists those devices. The devices on the bus
-// come from `lox extensions` (GET /api/hardware, read-only): before Apply, a new serial that is not on the
-// bus is a warning; after Apply, the reconfigured devices show whether they are online.
-function hwInfo() { return S.hist?.hardware || { available: false }; }
-/** The devices on the bus; with `ms`, gives up after that long (a hung lox must not block Apply's dialog). */
-async function loadBus(ms) {
-  const ctl = new AbortController(), t = ms && setTimeout(() => ctl.abort(), ms);
-  let r;
-  try { r = await fetch("/api/hardware", { headers: { "X-Vislox": "hardware" }, signal: ctl.signal }); } catch (e) {
-    throw new Error(e.name === "AbortError" ? `no answer within ${ms / 1000} s` : e.message);
-  } finally { clearTimeout(t); }
-  const j = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(j.error || r.statusText);
-  if (j.available === false) throw new Error(j.reason || "the bus cannot be read");
-  if (j.error) throw new Error(j.error);
-  return j.devices || [];
-}
-/** A device of `view.hardware` on the bus. The server writes serials as the bus list does; a device
- *  whose serial cannot be looked for (`check` false: not paired yet, or an Air device, whose `IP=` is no
- *  bus serial) is matched by name, and only to show its state, never to warn that it is missing. */
-function onBus(d, bus) {
-  return d.check ? bus.find((b) => b.serial === d.serial) : bus.find((b) => b.name === d.title);
-}
-/** What is on the Miniserver now: the newest revision that is not a compile. Both Apply's confirmation and
- *  the after-Apply list compare with it, so they count the same devices. */
-function deployedRev() { return S.hist?.history.find(isDeployed) || null; }
-/** How long Apply's confirmation waits for the device list and the bus, together, before it asks anyway
- *  (and says the bus check did not finish). */
-const HW_WAIT = 6000;
-/** The devices the pending change reconfigures, and, for new serials, whether they are on the bus; and what
- *  it does to access rights and notification recipients (#68): one request (`/api/apply/changes`). */
-async function pendingHardware(pend, against) {
-  const base = against || deployedRev()?.id || pend.base || "";
-  const until = Date.now() + HW_WAIT;
-  let devs, rights;
-  try {
-    const ctl = new AbortController(), t = setTimeout(() => ctl.abort(), HW_WAIT);
-    try {
-      const r = await fetch(`/api/apply/changes?rev=${encodeURIComponent(pend.id)}&base=${encodeURIComponent(base)}`, { signal: ctl.signal });
-      const j = await r.json();
-      if (!r.ok) throw new Error(j.error || r.statusText);
-      devs = j.devices || [];
-      rights = j.rights || [];
-    } finally { clearTimeout(t); }
-  } catch (e) { return { error: e.name === "AbortError" ? `no answer within ${HW_WAIT / 1000} s` : e.message, devs: [], rights: null }; }
-  const fresh = devs.filter((d) => (d.how === "added" || d.how === "replaced" || d.how === "paired") && d.check);
-  if (!fresh.length || !hwInfo().available) return { devs, rights, fresh: [] };
-  try {
-    const bus = await loadBus(Math.max(1000, until - Date.now()));
-    return { devs, rights, fresh, missing: fresh.filter((d) => !onBus(d, bus)) };
-  } catch (e) { return { devs, rights, fresh, busError: e.message }; }
-}
-function hwLine(d) {
-  const what = d.how === "replaced" || d.how === "unpaired" ? `${d.how}, serial ${d.old_serial || "—"} → ${d.serial || "—"}`
-    : d.how === "paired" ? `paired, serial ${d.serial || "—"}` : d.how === "changed" ? "settings"
-    // A Tree device with no serial (created by the module, #85): lox config push says so too.
-    : d.how === "added" && d.unpaired ? "added, not paired: pair it with a Tree search in Loxone Config" : d.how;
-  return `  ${d.title} (${d.kind}): ${what}`;
-}
-/** Apply's confirmation: "This reconfigures 3 devices", and new serials that are not on the bus. */
-function hwApplyText(hw) {
-  if (!hw) return "";
-  if (hw.error) return `Could not check which devices this reconfigures: ${hw.error}\n\n`;
-  if (!hw.devs.length) return "";
-  const n = hw.devs.length;
-  let t = `This reconfigures ${plural(n, "device")}: ${n === 1 ? "it stores" : "they store"} the new configuration, and a device can drop offline while it does.\n` +
-    hw.devs.slice(0, 8).map(hwLine).join("\n") + (n > 8 ? `\n  and ${n - 8} more` : "") + "\n\n";
-  if (hw.missing?.length) {
-    t = `⚠ Not on the bus (lox extensions does not list ${hw.missing.length === 1 ? "it" : "them"}): ` +
-      hw.missing.map((d) => `${d.title} (${d.kind}), serial ${d.serial}`).join("; ") +
-      `. Until that device is connected, its inputs and outputs do not work.\n\n` + t;
-  } else if (hw.busError) {
-    t = `The new serials were not checked against the bus (lox extensions: ${hw.busError}).\n\n` + t;
-  }
-  return t;
-}
-/** After Apply: ask the bus for the reconfigured devices' online state now and for a few minutes. */
-const BUS_EVERY = 15000, BUS_FOR = 180000;
-async function watchBus(d) {
-  if (!d.hw.length || !hwInfo().available) return;
-  d.bus = { at: 0, devices: null, error: "", offline: new Map(), until: Date.now() + BUS_FOR };
-  while (S.deployed === d) {
-    try {
-      const bus = await loadBus();
-      if (S.deployed !== d) return;
-      d.bus.devices = bus; d.bus.error = ""; d.bus.at = Date.now();
-      for (const x of d.hw) { const b = onBus(x, bus); if (b && !b.online && !d.bus.offline.has(x.uuid)) d.bus.offline.set(x.uuid, d.bus.at); }
-    } catch (e) { if (S.deployed !== d) return; d.bus.error = e.message; }
-    renderDeployed();
-    if (Date.now() >= d.bus.until) return;
-    await new Promise((ok) => setTimeout(ok, BUS_EVERY));
-  }
-}
-function deployedHardware(d) {
-  if (!d.hw?.length) return "";
-  const b = d.bus;
-  const rows = d.hw.slice(0, 12).map((x) => {
-    const on = b?.devices ? onBus(x, b.devices) : null;
-    const was = b?.offline.get(x.uuid);
-    const state = !b ? "" : !b.devices ? (b.error ? "" : "checking…") : !on ? (x.check ? "not on the bus" : "—") : on.online ? (was ? `online (was offline at ${new Date(was).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })})` : "online") : "offline";
-    const bad = b?.devices && ((!on && x.check) || (on && !on.online) || was);
-    return `<div class="pr hw-dev${bad ? " off" : ""}"><span class="k">${esc(x.how === "changed" ? "settings" : x.how)}</span>` +
-      `<button type="button" class="go" data-go="${esc(x.uuid)}" title="${esc(x.kind)}">${esc(x.title)}</button><span class="why">${esc(state)}</span></div>`;
-  }).join("");
-  const note = !hwInfo().available ? `The bus cannot be read: ${hwInfo().reason || "no lox"}.`
-    : b?.error ? `Cannot read the bus: ${b.error}`
-    : b && Date.now() < b.until ? "Checked every 15 s for 3 minutes (lox extensions)." : b ? "Checked with lox extensions." : "";
-  return `<div class="h">Reconfigured devices</div>${rows}` + (d.hw.length > 12 ? `<div class="note">and ${d.hw.length - 12} more</div>` : "") + (note ? `<div class="note">${esc(note)}</div>` : "");
-}
-/** The changed blocks of the deployed revision, each with a link and its first live value. */
-function renderDeployed() {
-  const box = $("deploy-new"), d = S.deployed;
-  const rows = (d?.rows || []).filter((c) => c.kind !== "removed");
-  const check = d ? deployedAppCheck(d) : "";
-  const hw = d ? deployedHardware(d) : "";
-  box.classList.toggle("hidden", !rows.length && !check && !hw);
-  if (!rows.length && !check && !hw) { box.innerHTML = ""; return; }
-  const shown = rows.slice(0, 12).map((c) => {
-    const o = d.objs[c.obj];
-    const q = o.ports.find((p) => p.conns.some((x) => x.dir === "out")) || o.ports[0];
-    const name = autoTitle(o.title) ? prettyType(o.ty) : o.title;
-    return `<div class="pr"><span class="k ${esc(c.kind)}">${esc(KIND[c.kind]?.[1] || c.kind)}</span>` +
-      `<button type="button" class="go" data-go="${esc(c.obj)}" title="${esc(o.path || "")}">${esc(name)}</button>${q ? lvSpan(q.uuid) : ""}</div>`;
-  }).join("");
-  box.innerHTML = `<div class="h">Changed by this ${S.deployed.kind === "rollback" ? "Roll back" : "Apply"}<button type="button" class="x" aria-label="Close">×</button></div>${shown}` +
-    (rows.length > 12 ? `<div class="note">and ${rows.length - 12} more in Changes</div>` : "") +
-    (rows.length ? '<div class="note">Values fill in as the Miniserver sends them; the canvas marks every change.</div>' : "") + hw + check;
-}
-/** After Apply: blocks the new config shows in the app that the Miniserver's new structure file lacks, or has
- *  elsewhere, and removed blocks it still shows. */
-function deployedAppCheck(d) {
-  const a = S.app;
-  const objs = Object.values(d.objs).filter((o) => o.status === "removed" ? o.app?.shown || a?.controls?.[o.uuid] : o.app && (o.app.shown || a?.controls?.[o.uuid]));
-  if (!objs.length) return "";
-  // The server counts the structure files it read: one read after Apply started is the new config's.
-  if (!awaitedAppRead()) {
-    // A live session with the Miniserver reads the new structure file itself.
-    const viaLive = S.live.on && /^https?:/.test(S.hist?.live?.source || "");
-    const why = a?.available && viaLive ? "Waiting for the Miniserver's new structure file…" : "";
-    const btn = a?.available && !viaLive ? `<button type="button" class="app-load lnk">Read what the app shows now</button>` : "";
-    return why || btn ? `<div class="note">${esc(why)}${btn}</div>` : "";
-  }
-  const bad = objs.map((o) => [o, appIssues(o)]).filter(([, i]) => i.length);
-  if (!bad.length) return `<div class="note">The app shows these blocks as the config says.</div>`;
-  return `<div class="h warn-h">In the app</div>` + bad.map(([o, issues]) =>
-    `<div class="pr app-warn"><span class="k">⚠</span><button type="button" class="go" data-go="${esc(o.uuid)}">${esc(autoTitle(o.title) ? prettyType(o.ty) : o.title)}</button><span class="why">${esc(issues.join("; "))}</span></div>`).join("");
-}
+}), true);
+document.addEventListener("click", whenReady((e) => { if (!e.target.closest(".ms-wrap")) closeMsPop(); }));
 
 // ── in the app ─────────────────────────────────────────────────────────
 // The Miniserver's structure file (LoxAPP3.json) lists what the app shows:
@@ -2743,257 +2376,6 @@ function appRows(o, row, chg, marks) {
   if (err) rows.push(`<div class="app-note warn">${esc(err)}</div>`);
   return { rows, count: 0 };
 }
-$("deploy-new").addEventListener("click", (e) => {
-  if (e.target.closest(".x")) { $("deploy-new").classList.add("hidden"); S.deployed = null; return; }
-  if (e.target.closest(".app-load")) { loadAppFromMs(); return; }
-  const g = e.target.closest("[data-go]");
-  if (!g) return;
-  const u = g.dataset.go, pg = S.view?.objects[u]?.page;
-  if (pg) gotoPage(pg, { focus: u });
-  select(u);
-});
-$("btn-apply").onclick = async () => {
-  if (applyAsking) return;
-  applyAsking = true;
-  $("btn-apply").disabled = true;
-  try { await apply(); } finally { applyAsking = false; renderActions(); }
-};
-/** For Apply's confirmation: the schedules on the Miniserver the pending config would change. */
-async function pendingScheduleText(pend) {
-  let blocks;
-  try { blocks = await api(`/api/schedules?rev=${encodeURIComponent(pend.id)}`); } catch (e) {
-    return `⚠ The switching times could not be compared with the Miniserver's (${e.message}): edits made in the app may be replaced.\n\n`;
-  }
-  if (!blocks.length) return "";
-  if (!liveStreaming()) return "Live values are off, so the switching times were not compared with the Miniserver's (edits in the app).\n\n";
-  const c = scheduleConflicts(blocks);
-  return c.length ? `⚠ The Miniserver runs other switching times than this config for:\n  ${c.join("\n  ")}\nApplying replaces them with the config's (an edit in the app among them).\n\n` : "";
-}
-/** The push would remove blocks (#70): lox refuses the module for a block it lost, or the lockfile deletes blocks
- *  the Miniserver runs. Apply asks for exactly those first. */
-function removing() { return S.check?.available && S.check.ok && S.check.removals ? S.check.removals : null; }
-async function apply() {
-  // Blocks the push would remove (#70): first exactly which, with consent; then Apply's confirmation is about the
-  // program deployed with them removed (the plan), not the compile from before.
-  if (removing()) {
-    const consent = await askRemovals("applying");
-    if (!consent) return;
-    if (!(await confirmApply(S.removals.revision, true))) { await dropRemovals(); return; }
-    await deploy("/api/apply", { allow_removals: consent }, "applying");
-    return;
-  }
-  const pend = pendingChange();
-  if (!pend || !(await confirmApply(pend, false))) return;
-  await deploy("/api/apply", {}, "applying");
-}
-/** Apply's confirmation for the program `pend` would deploy: what changed on the Miniserver since, who loses access
- *  (#68), switching times, calendar entries, devices. `plan`: it is a removal plan (#70), deployed exactly. */
-async function confirmApply(pend, plan) {
-  // Ask the Miniserver once more whether its config changed after the base, and for the
-  // calendar entries edited in the app.
-  const [, calNow, hw] = await Promise.all([loadMs(true), loadCal(true), pendingHardware(pend)]);
-  const stale = staleText();
-  const sched = await pendingScheduleText(pend);
-  const rights = rightsApplyText(hw);
-  const src = !plan && S.check?.available && S.check.ok && S.check.stale;
-  const srcText = src ? `⚠ The pending revision is from before the latest edit to ${src.files?.length ? src.files.join(", ") : "the module"}. ` +
-    "lox config push compiles the module as it is, so Apply deploys changes this review does not show. Compile first to review them.\n\n" : "";
-  return window.confirm((stale ? `⚠ ${stale} Applying overwrites what changed there since.\n\n` : "") + srcText + rights + sched + constApplyText() + (adoptedUncommitted().length ? `Adopt into vislox: ${adoptedUncommitted().map((b) => b.slug).join(", ")}. Ownership is committed with Apply.\n\n` : "") +
-    calApplyWarning(calNow) + hwApplyText(hw) +
-    (plan ? `Deploy "${pend.label}" to the Miniserver, with the removals you confirmed?\n\nvislox compiles exactly this program into the project (it refuses if anything changed since), ` +
-      "then the tests must pass (lox logic test). "
-      : "Deploy the pending changes to the Miniserver?\n\nFirst the module must compile and its tests pass (lox logic test). ") +
-    "Then lox config push uploads the config and restarts the Miniserver's program (a few seconds), " +
-    "checks that it runs exactly the compiled config, then vislox commits and pushes to git.");
-}
-// ── removed managed blocks (#70) ───────────────────────────────────────
-// A push deletes every block its lockfile tombstones: those the module lost (lox compiles it only with the removal
-// allowed, --allow-removals), and those an earlier compile tombstoned. The server works out what Apply would deploy
-// with them removed, changing nothing (POST /api/removals/plan): the blocks it deletes, where they are, what is
-// wired to them, who loses access or a notification with them (#68), and the program, shown here as the revision
-// "Removals allowed" compared with what runs. Apply sends the program's blob id and exactly those blocks back; the
-// server compiles exactly that, and puts the project back if anything fails before the push. A consent is for one
-// request: a retry asks again.
-/** The removal plan this tab asked for, while the server keeps it (one at a time: another tab's replaces it), it
- *  is about what runs, and younger than the server keeps it. */
-function removalsPreview() {
-  const p = S.removals;
-  if (!p) return null;
-  const deployed = deployedRev();
-  const kept = S.hist?.actions ? S.hist.actions.removals : p.rev;
-  if (kept !== p.rev || (deployed?.id ?? null) !== (p.base ?? null) || Date.now() - S.removalsAt > PREVIEW_TTL) { S.removals = null; return null; }
-  return p;
-}
-/** Forget this tab's plan, here and on the server; show the newest revision again if the plan was shown. */
-async function dropRemovals() {
-  const p = S.removals;
-  if (!p) return;
-  S.removals = null;
-  try { await fetch("/api/removals/cancel", { method: "POST", headers: { "Content-Type": "application/json", "X-Vislox": "removals" }, body: JSON.stringify({ rev: p.rev }) }); } catch { /* the server forgets it anyway */ }
-  // The view load draws the Deploy pane again; without one, it is drawn here.
-  if (S.rev === p.rev) { S.rev = editRev()?.id || p.base; S.base = null; renderHistory(); renderSelects(); await loadView(); writeHash(true); }
-  else { renderHistory(); renderCheck(); }
-}
-/** `Licht (Or) on page "EG": from Taster.Q, to Lampe.I1`: where a block is and what is wired to it. */
-function removalLine(b) {
-  if (!b.deployed) return `${b.slug} (${b.type || "block"}): not on the Miniserver, the lockfile forgets it`;
-  const at = b.page_title ? ` on page "${b.page_title}"` : "";
-  const end = (w) => `${w.other.title}${w.other.port ? "." + w.other.port : ""}${w.other.page_title && w.other.page_title !== b.page_title ? ` (${w.other.page_title})` : ""}`;
-  const from = (b.wires || []).filter((w) => w.dir === "in").map((w) => `${end(w)} → ${w.port}`);
-  const to = (b.wires || []).filter((w) => w.dir === "out").map((w) => `${w.port} → ${end(w)}`);
-  const wired = [...(from.length ? [`wired from ${from.join(", ")}`] : []), ...(to.length ? [`wired to ${to.join(", ")}`] : [])];
-  if (b.refs) wired.push(plural(b.refs, "reference") + " on other pages");
-  return `${b.title} (${b.type || "block"}, ${b.slug})${at}${wired.length ? ": " + wired.join("; ") : ": nothing wired"}`;
-}
-/** Ask the server for the plan and show it, compared with what runs. */
-async function removalsPlan() {
-  const plan = await act("/api/removals/plan");
-  S.removals = plan; S.removalsAt = Date.now();
-  // The server keeps this plan now (the next history read says so too).
-  if (S.hist?.actions) S.hist.actions.removals = plan.rev;
-  S.rev = plan.rev; S.base = plan.base; S.follow = false; $("chk-follow").checked = false;
-  renderHistory(); renderSelects(); await loadView(); writeHash(true);
-  return plan;
-}
-/** The confirmation: exactly the blocks the plan deletes. The consent, or null (the plan is then forgotten). */
-async function askRemovals(doing) {
-  let plan;
-  try { plan = await removalsPlan(); } catch (err) { deployMsg(`Cannot work out the removals: ${err.message}`, true); return null; }
-  const on = plan.blocks.filter((b) => b.deployed), off = plan.blocks.filter((b) => !b.deployed);
-  const lose = rightsApplyText({ rights: plan.rights });
-  const text = (on.length ? `Remove ${plural(on.length, "block")} from the Miniserver?\n\n` +
-    "The module no longer has them, or its lockfile deletes them, so lox removes them only when you allow it:\n" +
-    on.map((b) => `  • ${removalLine(b)}`).join("\n") + (off.length ? "\n\n" : "")
-    : `Let the lockfile forget ${plural(off.length, "block")} the module no longer has?\n\n`) +
-    (off.length ? `Never deployed, only the lockfile forgets ${off.length === 1 ? "it" : "them"}:\n` + off.map((b) => `  • ${removalLine(b)}`).join("\n") : "") +
-    (lose ? `\n\n${lose.trim()}` : "") +
-    `\n\nThe revision "${plan.revision.label}" shows what would run then. Apply deploys exactly this and refuses if the module, ` +
-    `its lockfile or the base change before the push. Remove ${plan.blocks.length === 1 ? "it" : "them"} and go on ${doing}?`;
-  if (!window.confirm(text)) { await dropRemovals(); return null; }
-  return { reviewed: plan.blob, blocks: plan.blocks.map((b) => b.uuid) };
-}
-/** Apply's and Roll back's request (#69): lox refuses some pushes until the user allows them; ask, then retry
- *  with that allowed. Afterwards, the deployed revision compared with the one it replaced. */
-async function deploy(path, body, doing) {
-  deployMsg("");
-  $("deploy-new").classList.add("hidden");
-  S.deployed = null;
-  // The structure file the server reads after this is the new config's.
-  try { S.applyReads = (await api("/api/app")).reads ?? 0; } catch { S.applyReads = S.app?.reads ?? 0; }
-  const opts = { ...body };
-  for (let tries = 0; tries < 3; tries++) {
-    // Deployed: the plan is history, and the view switches to what runs now.
-    try { await act(path, opts); if (opts.allow_removals) S.removals = null; await showDeployed(); return; } catch (err) {
-      const h = err.data?.hints || {};
-      // A consent is for one request: refused, the server put the project back. A retry asks again.
-      const consented = !!opts.allow_removals;
-      delete opts.allow_removals;
-      if (h.accept_version && !opts.accept_version && window.confirm(
-        `This config was saved by a newer Loxone Config (version ${h.accept_version}) than the project last compiled with.\n\n` +
-        `Accept that version and go on ${doing}? Nothing else changes; the project's lockfile records the new version.`)) {
-        opts.accept_version = h.accept_version; continue;
-      }
-      if (h.custom_changes && !opts.discard_custom_changes && window.confirm(
-        `The Miniserver holds ${h.custom_changes.length} change(s) that are not in its program file ` +
-        "(made in the app, the web UI or by Loxone Config without saving):\n\n  " + h.custom_changes.join("\n  ") +
-        `\n\nThe upload DELETES them. To keep them instead, load the project from the Miniserver in Loxone Config and save it, then try again.` +
-        `\n\nDelete them and go on ${doing}?`)) {
-        opts.discard_custom_changes = true; continue;
-      }
-      // A block the module lost (#70): asked each time, never carried over by itself. A Roll back takes none.
-      // The full confirmation again, now about the plan's program: that is what the retry deploys.
-      if (h.removals && !consented && path === "/api/apply") {
-        const consent = await askRemovals(doing);
-        if (consent && await confirmApply(S.removals.revision, true)) { opts.allow_removals = consent; continue; }
-        if (consent) await dropRemovals();
-      }
-      deployMsg(err.message, true);
-      return;
-    }
-  }
-}
-// ── roll back (#69) ────────────────────────────────────────────────────
-// lox config push keeps what the Miniserver ran before each push (backups/<stamp>-pre-push.zip). A Roll back
-// deploys that again the way Apply deploys: the server works out what will run (the module from before the Apply,
-// compiled onto that download) and shows it as a revision compared with what runs now; the same confirmation as
-// Apply's; then the same steps (tests, lox config push with its drift check, restart, verify), a commit and git push.
-let rollbackAsking = false;
-/** Under an Apply in the History: "Roll back to before this", when its download from before is kept. */
-function rollbackRow(r, rb) {
-  const d = document.createElement("div");
-  d.className = "rb-row";
-  const a = S.hist?.actions;
-  const why = !a?.apply?.available ? `Cannot roll back: ${a?.apply?.reason || ""}`
-    : !rb.available ? rb.reason
-    : a.running ? `${a.running} is running`
-    : pendingChange() ? "Apply or discard the pending changes first: a Roll back puts the module back to before this Apply"
-    : "";
-  const tip = why || `Deploy again what the Miniserver ran before this (${rb.backup}), the way Apply deploys, and put the module back to before it`;
-  d.innerHTML = `<button type="button" class="rb-btn"${why || rollbackAsking || applyAsking ? " disabled" : ""} title="${esc(tip)}">↶ Roll back to before this</button>`;
-  d.querySelector("button").onclick = () => rollBack(r);
-  return d;
-}
-async function rollBack(r) {
-  if (rollbackAsking || applyAsking) return;
-  rollbackAsking = true; renderHistory();
-  try { await rollBackAsk(r); } finally { rollbackAsking = false; renderHistory(); renderActions(); }
-}
-/** The Roll back's plan this tab asked for (#69), shown only here, while it is about the deployed commit and
- *  younger than the server keeps it. */
-function rollbackPreview() {
-  const r = S.rollbackRev;
-  if (!r) return null;
-  const deployed = S.hist?.history.find((x) => x.kind === "git");
-  if (deployed?.id !== r.base || Date.now() - S.rollbackAt > PREVIEW_TTL) { S.rollbackRev = null; return null; }
-  return r;
-}
-/** Forget the plan, here and on the server; show what runs again if the plan was shown. */
-async function dropRollback(back) {
-  const r = S.rollbackRev;
-  if (!r) return;
-  S.rollbackRev = null;
-  try { await fetch("/api/rollback/cancel", { method: "POST", headers: { "Content-Type": "application/json", "X-Vislox": "rollback" }, body: JSON.stringify({ rev: r.id }) }); } catch { /* the server forgets it anyway */ }
-  if (back && S.rev === r.id) { S.rev = r.base; S.base = null; renderHistory(); renderSelects(); await loadView(); writeHash(true); }
-  else renderHistory();
-}
-async function rollBackAsk(r) {
-  deployMsg("");
-  let plan;
-  try { plan = await act("/api/rollback/plan", { commit: r.id }); } catch (err) { deployMsg(`Cannot roll back: ${err.message}`, true); return; }
-  // What it deploys, compared with what runs now, behind the confirmation: in this tab only.
-  S.rollbackRev = plan.revision; S.rollbackAt = Date.now();
-  const target = plan.revision;
-  S.rev = plan.rev; S.base = plan.base; S.follow = false; $("chk-follow").checked = false;
-  renderHistory(); renderSelects(); await loadView(); writeHash(true);
-  const [, calNow, hw] = await Promise.all([loadMs(true), loadCal(true), pendingHardware(target, plan.base)]);
-  const stale = staleText();
-  const sched = await pendingScheduleText(target);
-  const n = S.viewRev === plan.rev && S.view?.compared ? S.view.changes.length : null;
-  if (!window.confirm((stale ? `⚠ ${stale} Rolling back overwrites what changed there since.\n\n` : "") + rightsApplyText(hw) + sched +
-    calApplyWarning(calNow) + hwApplyText(hw) +
-    `Roll back "${plan.subject}"?\n\nThe Miniserver then runs what it ran before it (${plan.backup})` +
-    (plan.same_bytes ? "" : ", recompiled from the module version before that deployment") +
-    (n == null ? "" : `: ${plural(n, "change")} from what it runs now, as the view shows`) +
-    ". The module and lockfile go back to before it, so nothing is pending afterwards.\n\n" +
-    "Whatever changed on the Miniserver since is lost: a save from Loxone Config stops the Roll back, and custom changes made in the app are deleted only if you allow it.\n\n" +
-    "As Apply: the tests run (lox logic test), lox config push checks that the Miniserver still runs this config and stages exactly what you reviewed, uploads, restarts the program and verifies, then vislox commits and pushes to git.")) {
-    await dropRollback(true);
-    return;
-  }
-  // The server works the plan out again, and deploys only what was reviewed.
-  await deploy("/api/rollback", { commit: plan.commit, reviewed: plan.blob }, "rolling back");
-  await dropRollback(false);
-}
-$("btn-sync").onclick = async () => {
-  deployMsg("");
-  try { const j = await act("/api/sync"); deployMsg(j.message); } catch (err) { deployMsg(err.message, true); }
-};
-$("btn-discard").onclick = async () => {
-  if (!window.confirm("Discard the pending changes? The module (with the values edited here), lock and compiled config go back to the last commit.")) return;
-  deployMsg("");
-  try { const j = await act("/api/discard"); deployMsg(j.message); } catch (err) { deployMsg(err.message, true); }
-};
-
 // ── access rights, recipients and switching times (#68) ────────────────
 // Who may open an NFC Code Touch, who gets a push notification and a Daytimer's switching times are on no logic
 // page, yet a Lox Logic claim (`haustuer.access = bewohner`, `frost.recipients = familie`, `uhr.schedule = abend`)
@@ -3074,7 +2456,7 @@ function renderRights() {
   });
   box.innerHTML = `<details${open ? " open" : ""}><summary><span class="rt-h">Rights and schedules</span> ${list.length}${lost ? ` <span class="rt-lose">· ${plural(lost, "user")} lose${lost === 1 ? "s" : ""} a right</span>` : ""}</summary><ul class="rt-list">${items.join("")}</ul></details>`;
 }
-$("rights-box").addEventListener("click", goClicked);
+$("rights-box").addEventListener("click", whenReady(goClicked));
 /** How two lists of rights differ, as the server compares them (rights.rs): a right is a principal and a
  *  schedule, both by UUID. A principal with one right before and one after, under another schedule, is
  *  rescheduled (new entry → old entry); anything else is added or removed. */
@@ -3159,26 +2541,6 @@ function msgDuration(ms) {
   return ms > 0 && ms % 3600000 === 0 ? `${ms / 3600000}h` : ms > 0 && ms % 60000 === 0 ? `${ms / 60000}min` : ms % 1000 === 0 ? `${ms / 1000}s` : `${ms}ms`;
 }
 function msgSummary(m) { return [m.on != null ? `on: ${m.on}` : "", m.off != null ? `off: ${m.off}` : ""].filter(Boolean).join(" · ") || "no message"; }
-/** For Apply's confirmation: who loses or gains a right the pending config changes, against the deployed one
- *  (`rights` of `/api/apply/changes`, fetched with the devices). Never silently empty: when that request failed,
- *  it says so. */
-function rightsApplyText(hw) {
-  if (!hw || !hw.rights) return `⚠ Couldn't check access changes: ${hw?.error || "no answer"}. Applying may take away someone's access to a door or a notification.\n\n`;
-  const lose = [], gain = [];
-  for (const c of hw.rights) {
-    const by = claimsOf(c.uuid).map(claimAt);
-    const src = by.length ? ` (${by.join(", ")})` : "";
-    const gone = c.removed_block ? ", which this removes" : "";
-    for (const u of c.lose || []) lose.push(c.kind === "access" ? `${u.title} loses access to ${c.title}${gone}${src}` : `${u.title} stops getting ${c.title}${gone}${src}`);
-    // A user who holds the new right directly gains it under its schedule: "alice gains access to Haustür (Always)".
-    const when = (u) => { const p = (c.added || []).find((x) => x.kind === "user" && x.uuid === u.uuid); return p?.schedule ? ` (${p.schedule})` : ""; };
-    for (const u of c.gain || []) gain.push(c.kind === "access" ? `${u.title} gains access to ${c.title}${when(u)}` : `${u.title} starts getting ${c.title}`);
-    // Who keeps access, but not under every schedule they had (#76): a loss of opening times, warned as one.
-    for (const n of c.narrowed || []) lose.push(narrowText(n, c.title) + src);
-  }
-  return (lose.length ? `⚠ ${lose.join("\n⚠ ")}\n\n` : "") + (gain.length ? `${gain.join("\n")}\n\n` : "");
-}
-
 // ── block settings (#79) ───────────────────────────────────────────────
 // The settings Loxone Config stores on a block's element, by their Lox Logic name and as Lox Logic writes them
 // (`At: 18:58`, `Pulse: sunset`, `Type: text`, the program of a Code16). They are edited on a block the module
@@ -3223,260 +2585,6 @@ function settingsRows(o, row, marks, chg) {
   return { rows, count: marks ? list.filter((x) => x.changed).length || undefined : undefined };
 }
 
-// ── editing values (Properties) ────────────────────────────────────────
-// A block's name, its unwired inputs' constants and the settings of a physical input or output are
-// edited here. The server writes them into vislox's own file of the project's module and runs
-// lox logic compile (docs/editing.md); the compile shows as the pending revision, so it is reviewed,
-// applied and discarded like any other. Saving never deploys: only Apply does.
-S.edits = null; // GET /api/edits: what vislox's file claims, and which of it is not deployed
-S.edit = { uuid: null, open: false, draft: {}, bad: {}, busy: false, msg: "", err: "" };
-S.editsKey = null; // the server's key of what /api/edits says (vislox's file, deployed and pending config)
-S.editsSeq = 0;
-async function loadEdits() {
-  // Loads overlap (each change of the key starts one): an older answer arriving after a newer one is dropped, as
-  // `S.editsKey` already names the newer and nothing would load it again.
-  const seq = ++S.editsSeq;
-  const hwWas = JSON.stringify((S.edits?.blocks || []).filter((b) => b.hardware).map((b) => [b.uuid, b.paired]));
-  const mdWas = mdEditKey();
-  const adoptionsWas = JSON.stringify(adoptedUncommitted());
-  const was = managedSet(), under = JSON.stringify(S.edits?.add_under || null), consts = JSON.stringify(S.edits?.constants || null), exprs = JSON.stringify([S.edits?.expressions || null, S.edits?.templates?.instances || null, S.edits?.templates?.templates || null]);
-  if (!S.hist?.actions?.shown) { S.edits = null; managedRefresh(was); return; }
-  let got = null, failed = false;
-  try { got = await api("/api/edits"); } catch { failed = true; }
-  // The caller that waits for its load (`await S.editsLoad`) waits for the newest, whose data is applied.
-  if (seq !== S.editsSeq) return S.editsLoad;
-  if (failed) { S.edits = null; S.editsKey = null; } else S.edits = got;
-  // The managed blocks' badges and the legend follow the lockfile and the module (#64); the expressions'
-  // groups follow the module too (#82).
-  const exprsNow = JSON.stringify([S.edits?.expressions || null, S.edits?.templates?.instances || null, S.edits?.templates?.templates || null]);
-  if (S.view && managedSet() === was && exprsNow !== exprs) renderPage();
-  managedRefresh(was);
-  if (S.view && JSON.stringify(adoptedUncommitted()) !== adoptionsWas) renderChanges();
-  // The claims' λ file:line in Rights and schedules too (#68); the changes a constant causes, grouped (#81).
-  if (S.view) S.view.compared && (JSON.stringify(S.edits?.constants || null) !== consts || exprsNow !== exprs) ? renderChanges() : renderRights();
-  renderActions();
-  // Where the tree offers Add (#84) follows the server's `add_under`.
-  if (S.view && (JSON.stringify(S.edits?.add_under || null) !== under ||
-    JSON.stringify((S.edits?.blocks || []).filter((b) => b.hardware).map((b) => [b.uuid, b.paired])) !== hwWas)) renderTree();
-  if (S.sel && S.view) renderProps();
-  wcardRefresh();
-  // Add mode, Add entry and each entry's Edit follow the server (#86): the year is drawn again only when what
-  // they say changed, the header's buttons always.
-  if (MD.open) mdEditKey() !== mdWas ? renderModes() : mdRenderEdit();
-}
-/** Fetch the edits again only when the server says they may have changed. */
-function editsChanged() {
-  const key = S.hist?.actions?.edit?.key ?? null;
-  if (key !== S.editsKey) { S.editsKey = key; S.editsLoad = loadEdits(); }
-  // The server checks the module when it changes and counts the checks it keeps.
-  const ck = S.hist?.actions?.edit?.check ?? null;
-  if (ck !== S.checkKey) { S.checkKey = ck; loadCheck(); }
-}
-
-// ── whether the module compiles (#65) ──────────────────────────────────
-// The server runs lox logic check on the project's module whenever it changes; GET /api/check reads the
-// last check (`actions.edit.check` counts them). While it has errors,
-// out.Loxone stays at the last compile that worked, so the review would show an older change than the
-// source: the Deploy pane says so, lists each error with its file, line and the blocks its line names,
-// and Apply is off. A module that compiles to something else than the pending config (changed outside
-// vislox, not compiled yet) offers Compile. lox logic fmt --check is a hint only.
-S.check = null;
-S.checkKey = null;
-S.checkSeq = 0;
-async function loadCheck() {
-  const seq = ++S.checkSeq;
-  if (!S.hist?.actions?.shown) {
-    const was = marksSet();
-    S.check = null;
-    if (S.view && marksSet() !== was) { renderPage(); applyFocus(); }
-    renderActions();
-    return;
-  }
-  let c;
-  try { c = await api("/api/check"); } catch { c = null; }
-  // An older request answering late does not overwrite a newer one.
-  if (seq !== S.checkSeq) return;
-  const was = marksSet();
-  S.check = c;
-  // The lint badges follow the findings (#66).
-  if (S.view && marksSet() !== was) { renderPage(); applyFocus(); }
-  renderActions();
-  if (S.sel && S.view) renderProps();
-}
-/** lox logic lint's findings (#66), when the last check has them; else none. */
-function lintAll() { return S.check?.available && S.check.lint?.available ? S.check.lint.findings || [] : []; }
-/** The findings about block `uuid`, shown on the newest config only (as the check's errors are). */
-function lintFindings(uuid) { return S.rev === editRev()?.id ? lintAll().filter((f) => f.blocks?.includes(uuid)) : []; }
-/** The findings and failed tests on blocks, to redraw the page (badges and their tooltips) only when they change. */
-function marksSet() {
-  if (S.rev !== editRev()?.id) return "";
-  return JSON.stringify([lintAll().filter((f) => f.blocks?.length).map((f) => [f.blocks, f.kind, f.message]),
-    testsBad().map((t) => [t.name, testBlocks(t), t.failures, t.error])]);
-}
-/** The module does not compile (lox logic check found errors). */
-function checkBroken() { return !!(S.check?.available && S.check.ok === false); }
-/** `pages/a.loxl:5`, or the file alone. */
-function checkAt(e) { return e.file ? `${e.file}${e.line ? ":" + e.line : ""}` : ""; }
-/** The errors whose line names the block `uuid`. */
-function checkErrors(uuid) { return checkBroken() ? S.check.errors.filter((e) => e.blocks?.includes(uuid)) : []; }
-function renderCheck() {
-  const box = $("deploy-check"), c = S.check;
-  const stale = c?.available && c.ok && c.stale;
-  const rm = removing();
-  const fmt = c?.available ? c.unformatted || [] : [];
-  box.className = "deploy-check" + (checkBroken() || stale?.error || rm ? " error" : stale ? "" : " hint") + (checkBroken() || stale || rm || fmt.length ? "" : " hidden");
-  const parts = [];
-  if (checkBroken()) {
-    const n = c.errors.length + (c.truncated || 0);
-    const items = c.errors.map((e) =>
-      `<li>${e.file ? `<span class="ck-at">${esc(checkAt(e))}</span>` : ""}${esc(e.message)} ${goButtons(e.blocks)}</li>`);
-    if (c.truncated) items.push(`<li>… and ${plural(c.truncated, "more error")}</li>`);
-    parts.push(`<div class="ck-h">The module doesn't compile: ${plural(n, "error")}</div>`,
-      `<div class="ck-sub">${pendingChange() ? "The pending revision is from the last compile that worked, not from the module as it is." : "Nothing new is compiled until it does."} Apply is off until it compiles.</div>`,
-      `<ul>${items.join("")}</ul>`);
-  } else if (rm) {
-    // The push would remove blocks (#70): review them; Apply asks.
-    const a = S.hist?.actions, busy = !!a?.running;
-    const why = !a?.apply?.available ? `Cannot review: ${a?.apply?.reason || ""}` : "";
-    const plan = removalsPreview();
-    const tombs = (rm.blocks || []).map((b) => `${b.slug} (${b.type})`).join(", ");
-    parts.push(rm.refused ? `<div class="ck-h">The module no longer has managed blocks: lox deletes them only when you allow it.</div>`
-      : `<div class="ck-h">The push would delete ${plural(rm.blocks.length, "block")} the Miniserver runs: only when you allow it.</div>`,
-      `<div class="ck-sub">${rm.refused ? `lox refuses to compile it (<span class="mono">${esc(rm.refused)}</span> is in the lockfile but not in the source). `
-        : `The lockfile deletes them: <span class="mono">${esc(tombs)}</span>. `}` +
-      "Review what Apply would delete, and what is wired to it; Apply asks you to confirm exactly these blocks.</div>",
-      plan ? `<ul class="rm-list">${plan.blocks.map((b) => `<li>${esc(removalLine(b))} ${goButtons([b.uuid], plan.rev)}</li>`).join("")}</ul>` : "",
-      `<div class="ck-row"><button type="button" id="btn-removals" class="ghost small"${why || busy ? " disabled" : ""}
-        title="${esc(why || "Compile the module with the removals allowed in a scratch copy and show it, compared with what runs. Nothing changes and nothing is deployed.")}">${plan ? "Review the removals again" : "Review the removals"}</button></div>`);
-  } else if (stale) {
-    const files = stale.files?.length ? stale.files.join(", ") : "the module";
-    const a = S.hist?.actions, busy = !!a?.running;
-    // A module that does not compile against the base would only fail again.
-    const why = !a?.apply?.available ? `Cannot compile: ${a?.apply?.reason || ""}`
-      : stale.error ? "Cannot compile: the module doesn't compile against the base (see above)" : "";
-    parts.push(`<div class="ck-h">${pendingChange() ? `Pending is from before the latest edit to ${esc(files)}.` : `The module changed (${esc(files)}) and is not compiled yet.`}</div>`,
-      stale.error ? `<div class="ck-sub">It doesn't compile against the base:</div><pre>${esc(stale.error)}</pre>`
-        : `<div class="ck-sub">Compile it to review what Apply would deploy: lox config push compiles the module as it is.</div>`,
-      `<div class="ck-row"><button type="button" id="btn-compile" class="ghost small"${why || busy ? " disabled" : ""}
-        title="${esc(why || "Compile the module into the pending revision (lox logic compile). Nothing is deployed.")}">${a?.running === "Compile" ? "Compiling…" : "Compile"}</button></div>`);
-  }
-  if (fmt.length) parts.push(`<div class="ck-fmt">Not formatted as lox logic fmt writes it: ${esc(fmt.join(", "))}. A hint only; lox logic fmt --write formats it.</div>`);
-  box.innerHTML = parts.join("");
-  renderTests();
-  renderLint();
-}
-/** The block buttons of an error or finding: each shows its block, on its page. */
-/** The loaded view when it is revision `rev`'s and the one shown, else null: names of blocks are read from no other. */
-function viewFor(rev) { return rev && S.view && S.rev === rev && S.viewRev === rev ? S.view : null; }
-/** The block buttons of an error or finding, for the config the check is about (`rev`, by default the newest: the
- *  pending compile, else the deployed config). They name the blocks of that revision, so while another one is
- *  shown (or loading) there are none: its names are not these blocks' (#126). */
-function goButtons(uuids, rev = editRev()?.id) {
-  const v = viewFor(rev);
-  return (uuids || []).filter((u) => v?.objects[u]).map((u) =>
-    `<button type="button" class="go" data-go="${esc(u)}" title="Show this block">${esc(displayTitle(v.objects[u]))}</button>`).join("");
-}
-// ── lox logic test (#67) ──────────────────────────────────────────────
-// The same check runs the module's tests (test "…" … end) in lox's simulator when the module compiles, beside
-// lint. The Tests box above Apply lists each test with pass, fail or couldn't run, the expect that did not hold
-// (expected and actual) and the blocks it checks; a block a failing test checks gets a red badge, and the test
-// in Properties. Apply is off while a test fails, and the server refuses it at its Tests pass step.
-// While the tests run again, the last results stay up; a lox without lox logic test says so once, quietly.
-/** lox logic test's tests (#67), when the last check has them; else none. */
-function testAll() { return S.check?.available && S.check.test?.available ? S.check.test.tests || [] : []; }
-/** The tests that failed or could not run. */
-function testsBad() { return testAll().filter((t) => t.status !== "pass"); }
-/** The blocks a test that did not pass is about: those of the expects that did not hold (else all it checks),
- *  and those the simulator could not model. */
-function testBlocks(t) {
-  const f = (t.failures || []).flatMap((x) => x.blocks || []);
-  return [...new Set([...(f.length ? f : t.blocks || []), ...(t.unmodeled || []).map((u) => u.uuid)])];
-}
-/** The tests that failed on block `uuid`, on the newest config only (as lint's findings). */
-function testFindings(uuid) { return S.rev === editRev()?.id ? testsBad().filter((t) => testBlocks(t).includes(uuid)) : []; }
-/** Why Apply is off for the tests: some fail, by the run of the files as they are (not one still running). */
-function testsFailing() {
-  const t = S.check?.available && !checkBroken() && S.check.current !== false ? S.check.test : null;
-  if (!t?.available || t.running) return "";
-  const n = testsBad().length;
-  return n ? `${plural(n, "test")} of lox logic test ${n === 1 ? "fails" : "fail"}` : "";
-}
-/** A failed expect: `step 1: expect both.Q == 1 — expected 1, actual 0`. */
-function expectLine(f) {
-  return `${f.step ? `step ${f.step}: ` : ""}${f.expect}${f.expected != null ? ` — expected ${f.cmp && f.cmp !== "==" ? f.cmp + " " : ""}${f.expected}, actual ${f.actual}` : ` — actual ${f.actual}`}`;
-}
-/** One test that did not pass, in a line (about block `uuid`, when given: only its expects). */
-function testLine(t, uuid) {
-  const fs = (t.failures || []).filter((f) => !uuid || !f.blocks?.length || f.blocks.includes(uuid));
-  const um = (t.unmodeled || []).filter((u) => !uuid || u.uuid === uuid);
-  const why = t.status === "error"
-    ? (um.length ? `couldn't run: the simulator has no model for ${um.map((u) => `${u.type} "${u.title}"`).join(", ")}` : `couldn't run: ${t.error || ""}`)
-    : `fails: ${fs.map(expectLine).join("; ")}`;
-  return `Test "${t.name}"${t.file ? ` (${checkAt(t)})` : ""} ${why}`;
-}
-function renderTests() {
-  const box = $("deploy-tests"), c = S.check;
-  const t = c?.available && !checkBroken() && S.rev === editRev()?.id ? c.test : null;
-  const list = t?.available ? t.tests || [] : [];
-  box.classList.toggle("hidden", !t || (t.available && !list.length && !t.running));
-  box.classList.toggle("quiet", !!t?.unsupported);
-  const bad = list.filter((x) => x.status !== "pass");
-  box.classList.toggle("error", !!bad.length);
-  box.classList.toggle("hint", !bad.length);
-  if (!t) { box.innerHTML = ""; return; }
-  if (t.unsupported) { box.innerHTML = `<div class="ck-sub">No tests run: ${esc(t.reason || "this lox has no lox logic test")}.</div>`; return; }
-  if (!t.available) { box.innerHTML = `<div class="ck-h">Tests didn't run</div><div class="ck-sub">${esc(t.reason || "")}</div>`; return; }
-  if (!list.length) { box.innerHTML = `<div class="ck-sub">Running the module's tests…</div>`; return; }
-  const was = box.querySelector("details");
-  // Open while a test fails, unless the user folded it.
-  const open = was ? was.open || (bad.length && !was.dataset.bad) : !!bad.length;
-  const icon = { pass: "✓", fail: "✕", error: "!" };
-  const items = list.map((x) => {
-    const lines = [];
-    for (const f of x.failures || []) lines.push(`<li>${f.line ? `<span class="ck-at">${esc(checkAt({ file: x.file, line: f.line }))}</span>` : ""}${esc(expectLine(f))} ${goButtons(f.blocks)}</li>`);
-    if (x.status === "error") {
-      lines.push(`<li>${esc(x.error || "")}</li>`);
-      if (x.unmodeled?.length) lines.push(`<li>Not simulated: ${x.unmodeled.map((u) => `${esc(u.type)} "${esc(u.title)}"`).join(", ")} ${goButtons(x.unmodeled.map((u) => u.uuid))}</li>`);
-    }
-    const checks = x.status === "pass" ? "" : goButtons(x.blocks);
-    return `<li class="ts-${esc(x.status)}"><span class="ts-ic" aria-label="${esc(x.status)}">${icon[x.status] || "·"}</span>` +
-      `${x.file ? `<span class="ck-at">${esc(checkAt(x))}</span>` : ""}<span class="ts-n">${esc(x.name)}</span>` +
-      `${x.status === "error" ? " couldn't run" : ""} ${checks}${lines.length ? `<ul>${lines.join("")}</ul>` : ""}</li>`;
-  });
-  const n = list.length, failed = list.filter((x) => x.status === "fail").length, errs = list.filter((x) => x.status === "error").length;
-  const head = `Tests: ${list.length - bad.length} of ${n} passed` + (failed ? `, ${failed} failed` : "") + (errs ? `, ${errs} couldn't run` : "");
-  const sub = t.running ? " · testing the latest change…"
-    : bad.length ? " · Apply is off until they pass" : " · lox logic test, in lox's simulator";
-  box.innerHTML = `<details${open ? " open" : ""}${bad.length ? ' data-bad="1"' : ""}><summary><span class="ck-h">${esc(head)}</span>${esc(sub)}</summary><ul class="ts-list">${items.join("")}</ul>` +
-    `<div class="ck-sub ts-cover">A pass covers only what the simulator models: a test that needs another block says so and names it.</div></details>`;
-}
-$("deploy-tests").addEventListener("click", goClicked);
-
-// ── lox logic lint (#66) ──────────────────────────────────────────────
-// The same check runs lox logic lint on the project when the module compiles: unused names, blocks whose
-// outputs feed nothing, users whose tag opens no Code Touch, and more. The Deploy pane lists every finding
-// by kind with its file, line and blocks; each block gets a warning badge and the finding in Properties.
-// Findings are hints: Apply never waits for them.
-// Like the badges, the list is about the newest config only: it shows while that revision is shown.
-// While lint runs again, the last findings stay up; a lox without lint says so once, quietly.
-function renderLint() {
-  const box = $("deploy-lint"), c = S.check;
-  const l = c?.available && !checkBroken() && S.rev === editRev()?.id ? c.lint : null;
-  const list = l?.available ? l.findings || [] : [];
-  box.classList.toggle("hidden", !l || (l.available && !list.length));
-  box.classList.toggle("quiet", !!l?.unsupported);
-  if (!l) { box.innerHTML = ""; return; }
-  if (l.unsupported) { box.innerHTML = `<div class="ck-sub">Lint is unavailable: ${esc(l.reason || "this lox has no lox logic lint")}.</div>`; return; }
-  if (!l.available) { box.innerHTML = `<div class="ck-h">Lint didn't run</div><div class="ck-sub">${esc(l.reason || "")}</div>`; return; }
-  const open = box.querySelector("details")?.open ?? false;
-  const kinds = [...new Set(list.map((f) => f.kind))];
-  const items = kinds.map((k) => {
-    const of = list.filter((f) => f.kind === k);
-    return `<li class="lt-kind"><span class="lt-k">${esc(k)}</span> (${of.length})<ul>${of.map((f) =>
-      `<li>${f.file ? `<span class="ck-at">${esc(checkAt(f))}</span>` : ""}<span class="mono">${esc(f.name)}</span>: ${esc(f.message)} ${goButtons(f.blocks)}</li>`).join("")}</ul></li>`;
-  });
-  box.innerHTML = `<details${open ? " open" : ""}><summary><span class="ck-h">Lint: ${plural(list.length, "finding")}</span>${l.running ? " · linting the latest change…" : ""} · hints from lox logic lint; Apply doesn't wait for them</summary><ul>${items.join("")}</ul></details>`;
-}
 /** Show the block a button of the check or lint list names, on its page. */
 function goClicked(e) {
   const g = e.target.closest("[data-go]");
@@ -3484,54 +2592,6 @@ function goClicked(e) {
   const u = g.dataset.go, pg = S.view?.objects[u]?.page;
   if (pg) gotoPage(pg, { focus: u });
   select(u);
-}
-$("deploy-lint").addEventListener("click", goClicked);
-$("deploy-check").addEventListener("click", async (e) => {
-  if (e.target.closest("#btn-compile")) {
-    deployMsg("");
-    try { const j = await act("/api/compile"); deployMsg(j.message); } catch (err) { deployMsg(err.message, true); }
-    return;
-  }
-  if (e.target.closest("#btn-removals")) {
-    deployMsg("");
-    try { await removalsPlan(); } catch (err) { deployMsg(`Cannot work out the removals: ${err.message}`, true); }
-    return;
-  }
-  goClicked(e);
-});
-/** One claimed value, whatever the order of the list: its op, object and port or setting. */
-function editKey(c) { return [c.op, c.uuid, c.port ?? c.name ?? ""].join("|"); }
-/** The revision edits are made against: the newest compile, else the deployed config (what the server's
- *  `edit_revisions` takes as the base, so both pick the same). */
-function editRev() {
-  const p = S.hist?.pending?.[0];
-  return p?.current ? p : deployedRev();
-}
-/** The block added here (#59) with UUID `uuid`, deployed or not. */
-function editsBlock(uuid) { return (S.edits?.blocks || []).find((b) => b.uuid && b.uuid === uuid) || null; }
-/** The blocks adopted here (#72) that the deployed revision's commit does not have yet. */
-function adoptedUncommitted() { return (S.edits?.blocks || []).filter((b) => b.adopted && !b.committed); }
-/** The blocks added here (#59) that are not deployed yet, or the one with UUID `uuid`. */
-function editsAdded(uuid) { return (S.edits?.blocks || []).filter((b) => b.uuid && !b.deployed && (!uuid || b.uuid === uuid)); }
-/** The values vislox edited and has not deployed yet, of one object or of all; not those of a new block, which is new as a whole. */
-function editsPending(uuid) { return (S.edits?.claims || []).filter((c) => c.pending && (c.op === "let" ? !uuid : (!uuid || c.uuid === uuid) && !editsAdded(c.uuid).length)); }
-/** vislox's constants (#81) whose value is not deployed, that a port of `o` takes. */
-function constsPending(o) {
-  const names = new Set(o.ports.map((q) => constUse(o.uuid, q.key)).filter((u) => u?.ours).map(constLet).filter(Boolean));
-  return (S.edits?.claims || []).filter((c) => c.op === "let" && c.pending && names.has(c.name));
-}
-/** Whether `o` can be edited now: `{ ok }`, or `{ why }` and maybe `{ newest }` to go to. */
-function editState(o) {
-  const a = S.hist?.actions;
-  if (!a?.shown || (!o.edit && !editsBlock(o.uuid))) return null;
-  if (!a.edit?.available) return { why: `Editing is off: ${a.edit?.reason || "unknown"}.` };
-  if (S.edits?.managed?.includes(o.uuid)) return { why: `The project's module manages this block: change its values in ${srcPath(managedSrc(o.uuid)) || "its .loxl file"}.` };
-  const r = editRev();
-  if (!r) return { why: "The config on disk is not in the History yet." };
-  if (S.rev !== r.id) return { why: `Edits are made on the newest config (${r.kind === "pending" ? "Pending" : "deployed"}).`, newest: r };
-  if (a.running) return { why: `${a.running} is running.` };
-  if (UNDO.busy) return { why: "Undo or redo is compiling." };
-  return { ok: true, rev: r };
 }
 const EDIT_ATTR = { title: "Name", room: "Room", category: "Category", statistics: "Statistics", entry_mode: "Switches on", entry_date: "Date" };
 function editLabel(o, c) { return EDIT_ATTR[c.op] || (c.op === "param" ? portName(o, c.port) : SET_LABEL[c.name] || c.name); }
@@ -3916,16 +2976,16 @@ async function tpAct(what) {
     if (u) select(u, { noReveal: true });
   }
 }
-$("props").addEventListener("input", (e) => {
+$("props").addEventListener("input", whenReady((e) => {
   if (e.target.dataset.tpField) { tpSync(); S.tp.draft[e.target.dataset.tpField] = e.target.value; }
-});
-$("props").addEventListener("click", (e) => {
+}));
+$("props").addEventListener("click", whenReady((e) => {
   const b = e.target.closest("[data-tp]");
   if (b) { e.stopPropagation(); tpAct(b.dataset.tp); }
-});
-$("props").addEventListener("keydown", (e) => {
+}));
+$("props").addEventListener("keydown", whenReady((e) => {
   if (e.target.dataset?.tpField && e.key === "Enter") { e.preventDefault(); tpAct("save"); }
-});
+}));
 /** The template group a change goes under (#83), on the newest config: `tpl <Template>` when the change is to a
  *  block of an instance whose template (or an enclosing one) changed since the deployed config, which is what is
  *  compared; else `inst <path>`, the top-level instance. */
@@ -4252,18 +3312,6 @@ const DF = { uuid: null, key: null, info: null, value: "", busy: false, err: "" 
 function constPending() { return managedShown() ? S.edits.constants?.pending || [] : []; }
 /** What names one of them across a refresh of the list: its kind, constant or type, and port. */
 function constPendingKey(p) { return [p.kind, p.name, p.port || ""].join("|"); }
-/** Whether edits can be sent now, on the newest config: `{ ok, rev }` or `{ why }`. */
-function constEditState() {
-  const a = S.hist?.actions, r = editRev();
-  if (!a?.shown || !a.edit?.available) return { why: `Editing is off${a?.edit?.reason ? `: ${a.edit.reason}` : ""}.` };
-  if (!r || S.rev !== r.id) return { why: "Edits are made on the newest config." };
-  if (a.running) return { why: `${a.running} is running.` };
-  if (UNDO.busy) return { why: "Undo or redo is compiling." };
-  return { ok: true, rev: r };
-}
-/** A block's title, else its slug, for the blocks a default reaches. */
-function dfltName(b) { const o = b.uuid && viewFor(editRev()?.id)?.objects[b.uuid]; return o ? displayTitle(o) : b.slug; }
-function dfltList(blocks) { return blocks.length ? blocks.map(dfltName).join(", ") : "none"; }
 /** *Default…* on a parameter of a managed block whose value no constant gives. */
 function dfltButton(o, q) {
   if (!S.edits?.sources?.[o.uuid] || !constEditState().ok || DF.uuid === o.uuid && DF.key === q.key) return "";
@@ -4367,15 +3415,6 @@ async function dfltRevert(key) {
   const p = constPending().find((x) => constPendingKey(x) === key);
   if (!p?.revert) return;
   await dfltSend([p.revert], p.kind === "let" ? `Revert the constant ${p.name}` : `Revert the default ${p.name} ${p.port}`);
-}
-/** Apply's review of the module's constants and defaults that change (#81): each, and the blocks a default changes. */
-function constApplyText() {
-  const p = constPending();
-  if (!p.length) return "";
-  const line = (x) => x.kind === "let"
-    ? `  • let ${x.name} = ${x.value} (was ${x.deployed ?? "none"}), ${constAt(x.file, x.line)}: ${plural(x.uses, "use")}`
-    : `  • defaults ${x.name}(${x.port}: ${x.value ?? "none"}) (was ${x.deployed ?? "none"}), ${constAt(x.file, x.line)}: changes ${plural(x.blocks.length, "block")}: ${dfltList(x.blocks)}`;
-  return `Constants and defaults that change (each sets every port that takes it):\n${p.map(line).join("\n")}\n\n`;
 }
 /** Back to the deployed value: claim what the deployed revision claimed, or nothing. */
 async function editRevert(key) {
@@ -4650,7 +3689,7 @@ function seAdd(c, at, analog) {
   c.spans.sort((a, b) => a.from - b.from);
   return s;
 }
-$("props").addEventListener("click", (e) => {
+$("props").addEventListener("click", whenReady((e) => {
   const b = e.target.closest("[data-se]");
   if (!b || b.tagName === "SELECT" || b.type === "checkbox") return;
   e.stopPropagation();
@@ -4670,8 +3709,8 @@ $("props").addEventListener("click", (e) => {
   else if (what === "copy" && c) for (const u of SE_GROUPS[b.dataset.to]) { const t = seCol(u); if (t && t !== c) t.spans = c.spans.map((s) => ({ ...s })); }
   SE.bad = {}; SE.err = "";
   renderProps();
-}, true);
-$("props").addEventListener("change", (e) => {
+}), true);
+$("props").addEventListener("change", whenReady((e) => {
   const t = e.target, what = t.dataset?.se;
   if (!what) return;
   const o = S.view?.objects[S.sel];
@@ -4686,8 +3725,8 @@ $("props").addEventListener("change", (e) => {
     if (from) { SE.cols = seDraft(from); if (!seCol(SE.sel)) SE.sel = SE_WEEK[0]; }
   }
   renderProps();
-});
-$("props").addEventListener("input", (e) => {
+}));
+$("props").addEventListener("input", whenReady((e) => {
   const f = e.target.closest?.("[data-sch-field]");
   if (!f || !SE.open || SE.busy) return;
   const [uuid, i, end] = f.dataset.schField.split("|");
@@ -4698,15 +3737,15 @@ $("props").addEventListener("input", (e) => {
   const ok = end === "value" || s[end] != null;
   f.setAttribute("aria-invalid", ok ? "false" : "true");
   seRefreshBars(!!S.view?.objects[SE.uuid]?.schedule?.analog);
-});
-$("props").addEventListener("keydown", (e) => {
+}));
+$("props").addEventListener("keydown", whenReady((e) => {
   if (!e.target.closest?.("[data-sch-field]")) return;
   if (e.key === "Enter") { e.preventDefault(); e.stopPropagation(); seSave(); }
   else if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); seClose(); }
-}, true);
+}), true);
 // Dragging on a bar: a segment moves, a handle resizes, the empty bar adds an hour there. Snapped to 15 minutes
 // (Alt: to the minute), never past the day or into the next interval.
-$("props").addEventListener("pointerdown", (e) => {
+$("props").addEventListener("pointerdown", whenReady((e) => {
   const bar = e.target.closest?.("[data-se-bar]");
   if (!bar || !SE.open || SE.busy || e.button !== 0) return;
   const c = seCol(bar.dataset.seBar), analog = !!S.view?.objects[SE.uuid]?.schedule?.analog;
@@ -4735,7 +3774,7 @@ $("props").addEventListener("pointerdown", (e) => {
   const up = () => { window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", up); SE.bad = {}; renderProps(); };
   window.addEventListener("pointermove", move);
   window.addEventListener("pointerup", up);
-});
+}));
 
 /** A shared set's claimants the config shown no longer has (deleted in Loxone Config): the server refuses
  *  to write the set while their claims stand, so each gets *Drop its claim* (`attr`: `se` or `mo`). */
@@ -4983,7 +4022,7 @@ async function moRevert(uuid) {
   if (r.why) { MO.uuid = uuid; MO.err = r.why; MO.msg = ""; renderProps(); return; }
   await moSend(o, st, { op: "moods", uuid, value: r.value }, `Revert the moods of ${displayTitle(o)}`);
 }
-$("props").addEventListener("click", (e) => {
+$("props").addEventListener("click", whenReady((e) => {
   const b = e.target.closest("[data-mo]");
   if (!b || b.tagName === "SELECT" || b.type === "checkbox") return;
   e.stopPropagation();
@@ -5008,8 +4047,8 @@ $("props").addEventListener("click", (e) => {
   MO.bad = {}; MO.err = ""; MO.warned = "";
   renderProps();
   if (what === "add") $("props").querySelector(`[data-mo-name="${MO.rows.length - 1}"]`)?.select();
-}, true);
-$("props").addEventListener("change", (e) => {
+}), true);
+$("props").addEventListener("change", whenReady((e) => {
   const t = e.target, what = t.dataset?.mo;
   if (!what) return;
   const o = S.view?.objects[S.sel];
@@ -5028,8 +4067,8 @@ $("props").addEventListener("change", (e) => {
   else if (what === "addc" && t.value) MO.extra.add(+t.value);
   MO.bad = {}; MO.err = ""; MO.warned = "";
   renderProps();
-});
-$("props").addEventListener("input", (e) => {
+}));
+$("props").addEventListener("input", whenReady((e) => {
   if (!MO.open || MO.busy) return;
   const f = e.target.closest?.("[data-mo-field], [data-mo-name]");
   if (!f) return;
@@ -5039,12 +4078,12 @@ $("props").addEventListener("input", (e) => {
     if (c) { c.a = f.value; f.setAttribute("aria-invalid", moValue(c) == null ? "true" : "false"); }
   }
   MO.warned = "";
-});
-$("props").addEventListener("keydown", (e) => {
+}));
+$("props").addEventListener("keydown", whenReady((e) => {
   if (!e.target.closest?.("[data-mo-field], [data-mo-name]")) return;
   if (e.key === "Enter") { e.preventDefault(); e.stopPropagation(); moSave(); }
   else if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); moClose(); }
-}, true);
+}), true);
 
 // ── members of a central block (#75) ───────────────────────────────────
 // A CentralLight drives a list of lighting controllers, a CentralShade a list of automatic blinds: Lox Logic writes
@@ -5195,7 +4234,7 @@ function meSave() {
   }
   meSend(o, ME.blob, { op: "members", uuid: o.uuid, value: [...ME.list] });
 }
-$("props").addEventListener("click", (e) => {
+$("props").addEventListener("click", whenReady((e) => {
   const b = e.target.closest("[data-me]");
   if (!b) return;
   e.stopPropagation();
@@ -5219,7 +4258,7 @@ $("props").addEventListener("click", (e) => {
   // Keep the keyboard where it was: on the same button of the row that moved, or the next row's.
   const j = what === "up" ? i - 1 : what === "down" ? i + 1 : Math.min(i, ME.list.length - 1);
   ($("props").querySelector(`[data-me="${what}"][data-i="${j}"]:not([disabled])`) || $("props").querySelector(`[data-me="del"][data-i="${j}"]`) || $("props").querySelector('[data-me="add"]'))?.focus();
-}, true);
+}), true);
 
 // ── Automatic Designer rules (#87) ─────────────────────────────────────
 // A rule (`AutopilotRule`) is made in the app and stored as a JSON payload; Lox Logic writes what it does as a
@@ -5477,7 +4516,7 @@ function ruPick(i) {
     back: () => $("props").querySelector(`[data-ru="pick"][data-i="${i}"]`)?.focus(),
   });
 }
-$("props").addEventListener("click", (e) => {
+$("props").addEventListener("click", whenReady((e) => {
   const b = e.target.closest("[data-ru]");
   if (!b) return;
   e.stopPropagation();
@@ -5513,9 +4552,9 @@ $("props").addEventListener("click", (e) => {
   else if (what === "down" && i < RU.lines.length - 1) RU.lines.splice(i + 1, 0, RU.lines.splice(i, 1)[0]);
   RU.err = "";
   renderProps();
-}, true);
+}), true);
 /** A field of the draft: kept as typed, the form redrawn only where its shape changes (kind, block, on/off). */
-$("props").addEventListener("input", (e) => {
+$("props").addEventListener("input", whenReady((e) => {
   const f = e.target.closest?.("[data-ru-f]");
   if (!f) return;
   const k = f.dataset.ruF, i = +f.dataset.i;
@@ -5534,7 +4573,7 @@ $("props").addEventListener("input", (e) => {
   if (save) save.disabled = !!shape;
   const m = save?.parentElement?.querySelector(".ed-msg");
   if (m) { m.textContent = shape || "Saving states the rule in the module and compiles it; nothing is deployed. lox checks each block's states and commands."; m.classList.toggle("err", !!shape); }
-});
+}));
 
 // ── who may open an NFC Code Touch (#76), who gets a push notification (#77) ──
 // A Code Touch's access rights are a Lox Logic `access` set (users and groups, each with an access schedule) and
@@ -5765,7 +4804,7 @@ async function acSame(o, set) {
   renderProps();
   $("props").querySelector('[data-ac="sameok"]')?.focus();
 }
-$("props").addEventListener("click", (e) => {
+$("props").addEventListener("click", whenReady((e) => {
   const b = e.target.closest("[data-ac]");
   if (!b || b.tagName === "SELECT" || b.type === "checkbox") return;
   e.stopPropagation();
@@ -5805,8 +4844,8 @@ $("props").addEventListener("click", (e) => {
   renderProps();
   if (what === "add") $("props").querySelector(`[data-ac-p="${AC.rows.length - 1}"]`)?.focus();
   else ($("props").querySelector(`[data-ac="del"][data-i="${Math.min(i, AC.rows.length - 1)}"]`) || $("props").querySelector('[data-ac="add"]'))?.focus();
-}, true);
-$("props").addEventListener("change", (e) => {
+}), true);
+$("props").addEventListener("change", whenReady((e) => {
   const t = e.target;
   if (!t.closest?.("[data-ac], [data-ac-p], [data-ac-s]")) return;
   const o = S.view?.objects[S.sel];
@@ -5824,7 +4863,7 @@ $("props").addEventListener("change", (e) => {
   AC.err = ""; AC.warned = "";
   renderProps();
   $("props").querySelector(t.dataset.acP != null ? `[data-ac-p="${t.dataset.acP}"]` : t.dataset.acS != null ? `[data-ac-s="${t.dataset.acS}"]` : '[data-ac="shareall"]')?.focus();
-});
+}));
 
 // ── tiles of a Touch Pure Flex (#78) ────────────────────────────────────
 // A Touch Pure Flex's tiles are a Lox Logic `tiles` set and the device's `.tiles` claim, written into vislox's file
@@ -6000,7 +5039,7 @@ async function tiSave() {
   const value = { tiles, ...(e?.set && e.shared?.length && TI.shareAll ? { set: e.set } : {}) };
   await tiSend(o, TI.blob, { op: "tiles", uuid: o.uuid, value }, `Tiles of ${displayTitle(o)}`);
 }
-$("props").addEventListener("click", (e) => {
+$("props").addEventListener("click", whenReady((e) => {
   const b = e.target.closest("[data-ti]");
   if (!b || b.tagName === "SELECT" || b.type === "checkbox") return;
   e.stopPropagation();
@@ -6027,8 +5066,8 @@ $("props").addEventListener("click", (e) => {
     renderProps();
     $("props").querySelector(`[data-ti-api="${+b.dataset.i}|0"]`)?.focus();
   }
-}, true);
-$("props").addEventListener("change", (e) => {
+}), true);
+$("props").addEventListener("change", whenReady((e) => {
   const t = e.target;
   if (t.dataset?.ti === "same") {
     const o = S.view?.objects[S.sel], st = o && tiState(o), x = (S.edits?.tile_sets || []).find((s) => s.name === t.value);
@@ -6043,20 +5082,20 @@ $("props").addEventListener("change", (e) => {
     f.to = t.checked ? [...f.to.filter((u) => u !== t.value), t.value] : f.to.filter((u) => u !== t.value);
     TI.err = "";
   }
-});
-$("props").addEventListener("input", (e) => {
+}));
+$("props").addEventListener("input", whenReady((e) => {
   if (!TI.open || TI.busy) return;
   const f = e.target.closest?.("[data-ti-api], [data-ti-text]");
   if (!f) return;
   const [i, j] = (f.dataset.tiApi ?? f.dataset.tiText).split("|").map(Number), fn = TI.rows[i]?.fns[j];
   if (!fn) return;
   if (f.dataset.tiApi != null) fn.api = f.value; else fn.text = f.value;
-});
-$("props").addEventListener("keydown", (e) => {
+}));
+$("props").addEventListener("keydown", whenReady((e) => {
   if (!e.target.closest?.("[data-ti-api], [data-ti-text]")) return;
   if (e.key === "Enter") { e.preventDefault(); e.stopPropagation(); tiSave(); }
   else if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); if (!TI.busy) { tiReset(); renderProps(); } }
-}, true);
+}), true);
 
 // ── adopting blocks (#72) ──────────────────────────────────────────────
 // `lox logic adopt` puts a block Loxone Config drew under the module: its declaration goes into vislox's
@@ -6174,7 +5213,7 @@ async function adoptPage() {
   deployMsg(`Adopted ${plural(n, "block")} on ${st.page.title || "this page"}: the config is unchanged.` +
     (sk.length ? ` ${plural(sk.length, "block")} stay${sk.length === 1 ? "s" : ""} Loxone Config's: ${sk.map((x) => `${x.title} (${x.why})`).join("; ")}` : ""), false, !!sk.length);
 }
-$("btn-adopt-page").onclick = adoptPage;
+$("btn-adopt-page").onclick = whenReady(adoptPage);
 // ── deleting and renaming managed blocks (#80) ────────────────────────
 // A block of vislox's files (added or adopted here) is renamed by its slug: lox keeps its UUIDs (`moved`), and
 // the config does not change. A deployed or adopted one is deleted (`removed`): lox takes it out of the config
@@ -6245,335 +5284,6 @@ async function editRemove(uuid) {
   if (!window.confirm(`Remove ${displayTitle(o)}? It was added here and is not deployed.`)) return;
   await editSend(uuid, st.rev, [{ op: "remove_block", uuid }], `Remove ${displayTitle(o)}`);
 }
-/** An edit is sent against the config the page shows, and the server refuses it (409) when the pending config
- *  has changed since. The reply of an edit comes before the History shows its compile: until it does, the page
- *  still shows the config the edit was made on, and another edit made on it would be refused. `undoSend`, the
- *  one way an edit is sent, refuses it here with the reason instead. Self-clearing: the History showing any other
- *  config than `base` ends it (ours, or one a compile elsewhere made), and so does time (the server decides). */
-S.sentFrom = null; // { base, at }: an edit made on the config `base` has been answered
-const SHOWING_WHY = "The last edit is still being shown. Try again in a moment.";
-function showingWhy() {
-  const s = S.sentFrom;
-  if (!s) return "";
-  if (editRev()?.blob !== s.base || Date.now() - s.at > 10000) { S.sentFrom = null; return ""; }
-  return SHOWING_WHY;
-}
-/** Show the newest config, once the History has the compile `blob` (its file watcher may lag behind the reply). */
-async function editShowNewest(blob) {
-  await loadHistory();
-  for (let i = 0; blob && editRev()?.blob !== blob && i < 40; i++) {
-    await new Promise((ok) => setTimeout(ok, 250));
-    await loadHistory();
-  }
-  const r = editRev();
-  if (r && S.rev !== r.id) { S.rev = r.id; S.base = r.base || null; renderHistory(); renderSelects(); await loadView(); }
-  // Following, the History's own refresh may have switched to it and still be loading it.
-  else if (r && S.viewRev !== r.id) await loadView();
-}
-function editGoNewest() { S.follow = true; $("chk-follow").checked = true; editShowNewest(); }
-
-// ── undo and redo (#62) ────────────────────────────────────────────────
-// Every edit's reply carries `undo`: the ops that undo it, built from each op's `previous`
-// (docs/editing.md). Undo sends them as an edit of its own, so it is checked and compiled like any
-// other (and refused like any other: never deployed, never over uncompiled module changes). Its reply's
-// `undo` is the redo. The stack is this tab's, and belongs to the pending config it was built on
-// (`blob`): when that changes outside this tab (another tab's edit, a compile, Discard, Apply, Sync, a
-// Pull), the stack no longer describes it and is cleared, saying why. It is kept in sessionStorage
-// under that blob, so a reload of this tab picks it up, and only on that very config.
-const UNDO_MAX = 50; // edits kept
-const UNDO_LAG = 20000; // ms the History may take to show this tab's own compile
-const UNDO_QUEUE = 3; // undo and redo steps waiting their turn: a held key does not pile up more
-const UNDO_KEY = "vislox.undo.";
-// done: undoable edits, oldest first; undone: redoable ones, the next redo last. `blob`, `lastAt` and
-// `deployed`: the pending config, the server's last Apply/Sync/Discard and the deployed revision the
-// stack was built on; `prev`/`since`: the blob of the request this tab sent last, and when it ended.
-// `inflight`: requests on the way; `busy`: undo and redo steps queued or running (`chain`), each until
-// the page shows what it compiled; `sending`: the edit being sent.
-const UNDO = { blob: null, lastAt: null, deployed: null, done: [], undone: [], prev: null, since: 0, note: "",
-  inflight: 0, busy: 0, chain: Promise.resolve(), sending: null };
-const IS_MAC = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent);
-const UNDO_KEYS = IS_MAC ? ["⌘Z", "⇧⌘Z"] : ["Ctrl+Z", "Shift+Ctrl+Z"];
-/** A short name for an edit, from its ops, as the page names things now (before the edit shows). */
-function undoLabel(ops) {
-  const obj = (u) => { const o = S.view?.objects[u]; return o ? displayTitle(o) : "a block"; };
-  const end = (e) => { const o = S.view?.objects[e[0]]; return `${obj(e[0])} ${o ? portName(o, e[1]) : e[1]}`; };
-  const wire = (w) => `${end(w.from)} → ${end(w.to)}`;
-  const kinds = new Set(ops.map((o) => o.op));
-  const op = ops[0];
-  // A calendar entry (#86): its name, mode and date, saved together.
-  if (ops.some((o) => o.op === "entry_mode" || o.op === "entry_date") && new Set(ops.map((o) => o.uuid)).size === 1) return `Calendar entry ${obj(op.uuid)}`;
-  if (ops.every((o) => EDIT_ATTR[o.op] || o.op === "param" || o.op === "setting")) {
-    const uuids = new Set(ops.map((o) => o.uuid));
-    if (ops.length === 1) {
-      const o = S.view?.objects[op.uuid];
-      const what = EDIT_ATTR[op.op] || (op.op === "param" ? (o ? portName(o, op.port) : op.port) : op.name);
-      return `${what} of ${obj(op.uuid)}: ${op.value == null ? "Loxone Config's value" : op.value}`;
-    }
-    return uuids.size === 1 ? `${ops.length} values of ${obj(op.uuid)}` : `${ops.length} values`;
-  }
-  if (ops.length === 1 && op.op === "add_block" && op.type === "Mode") return `Add the mode ${op.title}`;
-  if (ops.length === 1 && op.op === "add_block") return `Add ${op.title || op.type}`;
-  // Constants (#81): changed, made (and bound), dropped.
-  if (op.op === "let" && ops.length === 1) return op.value == null ? `Drop the constant ${op.name}` : `Constant ${op.name}: ${op.value}`;
-  if (op.op === "let" && ops.slice(1).every((o) => o.op === "param" && o.value === op.name)) return `Make the constant ${op.name} = ${op.value}`;
-  if (ops.length === 1 && op.op === "defaults") return op.value == null ? `Drop the default ${op.type} ${op.port}` : `Default ${op.type} ${op.port}: ${op.value}`;
-  // Made when the op is made, and kept on its history entry: a deleted block is gone from the view afterwards.
-  if (ops.length === 1 && op.op === "remove_block") { const b = editsBlock(op.uuid); return `${b?.deployed || b?.adopted ? "Delete" : "Remove"} ${obj(op.uuid)}`; }
-  if (ops.length === 1 && op.op === "restore_block") {
-    const m = (op.source || "").match(/^(\w+) = \w+\((?:"((?:[^"\\]|\\.)*)")?/);
-    return `Bring back ${S.view?.objects[op.uuid] ? obj(op.uuid) : m?.[2] || m?.[1] || "a block"}`;
-  }
-  if (ops.length === 1 && op.op === "rename") return `Rename ${obj(op.uuid)} to ${op.slug}`;
-  // Expressions and named signals (#82).
-  if (ops.length === 1 && op.op === "expr") return op.value == null ? `Drop the expression on ${end([op.uuid, op.port])}` : `${end([op.uuid, op.port])} ← ${op.value}`;
-  if (ops.length === 1 && op.op === "signal") return op.value == null ? `Drop the signal ${op.slug}` : `Signal ${op.slug} = ${op.value}${op.title ? ` (${op.title})` : ""}`;
-  if (ops.length === 2 && op.op === "signal" && ops[1].op === "expr" && op.value != null) return `Name the expression ${op.slug}`;
-  if (ops.length === 2 && op.op === "expr" && ops[1].op === "signal" && ops[1].value == null) return `Inline the signal ${ops[1].slug}`;
-  // Template instances (#83).
-  if (ops.length === 1 && op.op === "instance") return op.value == null ? `Remove the instance ${op.slug}` : `Instance ${op.slug}: ${op.value.template}`;
-  if (ops.length === 1 && op.op === "tidy") return "Remove obsolete statements";
-  if (kinds.size === 1 && op.op === "move") return ops.length === 1 ? `Move ${obj(op.uuid)}` : `Move ${plural(ops.length, "block")}`;
-  if (ops.length === 1 && op.op === "relayout") return `Arrange ${S.pageOf?.get(op.page)?.title || "the page"}`;
-  if (ops.length === 1 && op.op === "adopt") return op.blocks.length === 1 ? `Adopt ${obj(op.blocks[0].uuid)}` : `Adopt ${plural(op.blocks.length, "block")}`;
-  if (ops.length === 1 && op.op === "adopt_page") return `Adopt the blocks of ${S.pageOf?.get(op.page)?.title || "the page"}`;
-  if (ops.length === 1 && op.op === "unadopt") return op.uuids.length === 1 ? `Hand ${obj(op.uuids[0])} back to Loxone Config` : `Hand ${plural(op.uuids.length, "block")} back to Loxone Config`;
-  if (ops.length === 1 && op.op === "access") return `Access to ${obj(op.uuid)}${op.value == null ? ": as last written" : op.value.grants ? "" : ": shared set"}`;
-  if (ops.length === 1 && op.op === "new_rule") return `New rule ${op.title}`;
-  // New pages (#88).
-  if (ops.length === 1 && op.op === "new_page") return `New page ${op.title}`;
-  if (ops.length === 1 && op.op === "remove_page") return `Remove the page ${pageCreated(op.page)?.title || S.pageOf?.get(op.page)?.title || ""}`.trim();
-  if (op.op === "rule" || op.op === "restore_rule") return `Rule ${obj(op.uuid)}${op.value == null ? ": as last written" : ""}`;
-  if (ops.length === 1 && op.op === "members") return `Members of ${obj(op.uuid)}${op.value == null ? ": as last written" : ""}`;
-  if (ops.length === 1 && op.op === "moods") return `Moods of ${obj(op.uuid)}${op.value == null ? ": Loxone Config's" : op.value.moods ? "" : ": shared set"}`;
-  if (ops.length === 1 && op.op === "schedule") return `Switching times of ${obj(op.uuid)}${op.value == null ? ": Loxone Config's" : op.value.modes ? "" : ": shared set"}`;
-  if (ops.length === 1 && op.op === "wire") return `Wire ${wire(op)}`;
-  if (ops.length === 1 && op.op === "unwire") return `Delete wire ${wire(op)}`;
-  if (ops.length === 2 && op.op === "unwire" && ops[1].op === "wire") return `Reconnect ${wire(op)} to ${end(sameEnd(op.from, ops[1].from) ? ops[1].to : ops[1].from)}`;
-  return plural(ops.length, "edit");
-}
-/** What the server says now: the pending config, its last Apply/Sync/Discard, the deployed revision. */
-function undoNow() {
-  const r = editRev();
-  return r && { blob: r.blob, lastAt: S.hist?.actions?.last?.at ?? null, deployed: deployedRev()?.id ?? null };
-}
-function undoLoad(blob) {
-  try { return JSON.parse(sessionStorage.getItem(UNDO_KEY + blob) || "null"); } catch { return null; }
-}
-/** Keep the stack under its blob, and drop the ones kept for other blobs: they describe no config any more. */
-function undoSave() {
-  try {
-    for (let i = sessionStorage.length - 1; i >= 0; i--) {
-      const k = sessionStorage.key(i);
-      if (k?.startsWith(UNDO_KEY) && k !== UNDO_KEY + UNDO.blob) sessionStorage.removeItem(k);
-    }
-    if (!UNDO.blob) return;
-    if (UNDO.done.length || UNDO.undone.length) {
-      sessionStorage.setItem(UNDO_KEY + UNDO.blob, JSON.stringify({ lastAt: UNDO.lastAt, deployed: UNDO.deployed, done: UNDO.done, undone: UNDO.undone }));
-    } else sessionStorage.removeItem(UNDO_KEY + UNDO.blob);
-  } catch { /* storage off: the stack lives as long as the page */ }
-}
-/** Whether a stack built on `was` still describes the config `now`. The server's last outcome is unknown
- *  (null) after it restarted: then the blob and the deployed revision decide. */
-const undoSame = (was, now) => was.blob === now.blob && was.deployed === now.deployed && (now.lastAt == null || was.lastAt === now.lastAt);
-/** Empty the stack; `note` says why, when there was something to lose (or `always`). */
-function undoClear(note, always) {
-  if (always || UNDO.done.length || UNDO.undone.length) UNDO.note = note;
-  UNDO.done = []; UNDO.undone = [];
-}
-/** Check the stack against what the server says, and clear it (saying why) when the config changed
- *  outside this tab. Called on every History update. */
-function undoSync() {
-  const now = undoNow();
-  if (!now || UNDO.inflight) return;
-  if (UNDO.blob && undoSame(UNDO, now)) return;
-  // This tab's own compile, which the History shows a moment later.
-  if (UNDO.blob && now.blob === UNDO.prev && UNDO.deployed === now.deployed && (now.lastAt == null || UNDO.lastAt === now.lastAt) && Date.now() - UNDO.since < UNDO_LAG) return;
-  const first = !UNDO.blob;
-  // Kept for this very config by this tab (a reload): picked up.
-  const kept = first && undoLoad(now.blob);
-  if (kept && undoSame({ ...kept, blob: now.blob }, now) && (kept.done?.length || kept.undone?.length)) {
-    Object.assign(UNDO, now, { done: kept.done || [], undone: kept.undone || [], prev: null, note: "" });
-    return;
-  }
-  const why = now.lastAt != null && now.lastAt !== UNDO.lastAt ? ({ apply: "Apply deployed", discard: "Discard dropped", sync: "Sync replaced" }[S.hist?.actions?.last?.kind] || "an Apply, Sync or Discard changed") + " the pending config"
-    : now.deployed !== UNDO.deployed ? "the deployed config changed (an Apply, Sync or Pull)"
-    : "the pending config changed outside this tab (an edit in another tab, or a compile)";
-  if (!first) undoClear(`Undo history cleared: ${why}.`);
-  Object.assign(UNDO, now, { prev: null });
-  undoSave();
-}
-/** lox mints new UUIDs for a block added again (an undo of Remove, a redo of Add): the reply names the
- *  UUID it `restores`, and every edit kept here that names the old one names the new one from now on. */
-function undoRemap(added) {
-  for (const a of added || []) {
-    if (!a.restores || !a.uuid || a.restores === a.uuid) continue;
-    const swap = (v) => v === a.restores ? a.uuid : Array.isArray(v) ? v.map(swap)
-      : v && typeof v === "object" ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, swap(x)])) : v;
-    for (const e of [...UNDO.done, ...UNDO.undone]) { e.undo = swap(e.undo); e.redo = swap(e.redo); }
-    if (S.sel === a.restores) S.sel = a.uuid;
-  }
-}
-/** Send `ops` against `base`, and keep what the reply says: a new edit named `label`, or the step that
- *  undoes (`redo` false) or redoes `entry`. The one way an edit, an undo or a redo is sent. Throws as
- *  act() does, and then keeps nothing. */
-async function undoSend(base, ops, { label, entry, redo } = {}) {
-  // An undo or redo waits for the History to show the step before it (undoRun); an edit is refused meanwhile.
-  const why = entry ? "" : showingWhy();
-  if (why) throw new Error(why);
-  UNDO.inflight++;
-  renderAddHud();
-  try {
-    const res = await act("/api/edit", { base, ops });
-    // Made on another config than the stack's: the stack no longer describes it.
-    if (UNDO.blob !== base) undoClear("Undo history cleared: the edit was made on a config the history was not built on.");
-    const name = entry ? entry.label : label;
-    if (res.unchanged) {
-      // Nothing to compile: the config already is what the step leads to. The step is done, its ops kept.
-      if (entry && (redo ? UNDO.undone : UNDO.done).at(-1) === entry) {
-        (redo ? UNDO.undone : UNDO.done).pop();
-        (redo ? UNDO.done : UNDO.undone).push(entry);
-      }
-    } else {
-      undoRemap(res.added);
-      const inv = Array.isArray(res.undo) && res.undo.length ? res.undo : null;
-      if (!inv) {
-        // What came before no longer leads here: none of it can be undone safely.
-        undoClear(`“${name}” cannot be ${entry && !redo ? "redone" : "undone"}: ${res.undo_error || "the server sent no way back"}. The undo history was cleared.`, true);
-      } else if (!entry) {
-        UNDO.done.push({ label: name, undo: inv, redo: ops, at: Date.now() });
-        if (UNDO.done.length > UNDO_MAX) UNDO.done.shift();
-        UNDO.undone = [];
-        UNDO.note = "";
-      } else if (redo) {
-        UNDO.undone.pop(); entry.undo = inv; UNDO.done.push(entry);
-      } else {
-        UNDO.done.pop(); entry.redo = inv; UNDO.undone.push(entry);
-      }
-    }
-    Object.assign(UNDO, undoNow() || {}, { blob: res.blob, prev: base });
-    undoSave();
-    if (!res.unchanged && res.blob && res.blob !== base) S.sentFrom = { base, at: Date.now() };
-    return res;
-  } finally {
-    UNDO.inflight--;
-    UNDO.since = Date.now();
-    renderAddHud();
-  }
-}
-/** POST /api/edit for an edit of the page: kept for undo (`label`: how the list names it; by default
- *  made from the ops). Throws as act() does. */
-async function editAct(base, ops, label) {
-  undoSync();
-  const p = undoSend(base, ops, { label: label || undoLabel(ops) });
-  UNDO.sending = p;
-  try { return await p; } finally { if (UNDO.sending === p) UNDO.sending = null; }
-}
-/** Why undo or redo cannot run now, or null. `queue`: for a step that waits its turn behind the undo
- *  and redo steps and the edit being sent. Edits are made on the newest config, shown: the same rule as
- *  every other edit. */
-function undoWhy(queue) {
-  const a = S.hist?.actions;
-  if (!a?.shown) return "Editing is off.";
-  if (!a.edit?.available) return `Editing is off: ${a.edit?.reason || "unknown"}.`;
-  const r = editRev();
-  if (!r) return "The config on disk is not in the History yet.";
-  if (S.rev !== r.id) return `Undo and redo change the newest config (${r.kind === "pending" ? "Pending" : "deployed"}): show it first.`;
-  // An edit compiling (this tab's own save, or the step before) is waited for, not refused: the server
-  // reports it running before the page's own request comes back.
-  if (a.running && !(queue && a.running === "Edit")) return `${a.running} is running.`;
-  if (queue) return null;
-  if (UNDO.busy || UNDO.inflight || S.mvBusy || S.wrBusy || AB.busy || S.edit.busy || MV) return "An edit is compiling.";
-  return null;
-}
-/** Undo the last edit, or (`redo`) redo the last one undone. A step waits its turn behind the steps
- *  before it and the edit being sent, so a quick Ctrl+Z after a save undoes that save. */
-function undoStep(redo) {
-  const why = undoWhy(true);
-  if (why) { deployMsg(`Cannot ${redo ? "redo" : "undo"} now: ${why}`, true); return; }
-  if (UNDO.busy >= UNDO_QUEUE) return;
-  UNDO.busy++;
-  renderAddHud();
-  // Done: the page drew blocks as not movable, and Properties said it was compiling, while it ran.
-  UNDO.chain = UNDO.chain.then(() => undoRun(redo)).catch(() => {}).finally(() => {
-    UNDO.busy--;
-    renderAddHud();
-    if (!UNDO.busy && S.view) { renderPage(); if (S.sel) renderProps(); }
-  });
-}
-/** Resolves once `ok()` holds, or after `ms`. */
-async function until(ok, ms) {
-  for (const end = Date.now() + ms; !ok() && Date.now() < end;) await new Promise((r) => setTimeout(r, 50));
-}
-async function undoRun(redo) {
-  const word = redo ? "Redo" : "Undo";
-  // The edit before it first: sent, compiled, and shown.
-  if (UNDO.sending) await UNDO.sending.catch(() => {});
-  await until(() => !S.mvBusy && !S.wrBusy && !AB.busy && !S.edit.busy && !MV, 10000);
-  if (UNDO.blob && editRev()?.blob !== UNDO.blob) await editShowNewest(UNDO.blob).catch(() => {});
-  // The server done with it too: the History says so a moment after the reply.
-  await until(() => S.hist?.actions?.running !== "Edit", 30000);
-  undoSync();
-  const e = (redo ? UNDO.undone : UNDO.done).at(-1);
-  if (!e) return;
-  const why = undoWhy(true) || (editRev()?.blob !== UNDO.blob ? "the History does not show the last edit yet" : null);
-  if (why) { deployMsg(`Cannot ${word.toLowerCase()} now: ${why}`, true); return; }
-  deployMsg(`${word}: ${e.label}… (compiling; nothing is deployed)`);
-  let res;
-  try {
-    // Against the stack's own config, which the History shows (checked above).
-    res = await undoSend(UNDO.blob, redo ? e.redo : e.undo, { entry: e, redo });
-  } catch (err) {
-    deployMsg(`${word} of “${e.label}” refused: ${err.message}`, true);
-    return;
-  }
-  const cleared = !UNDO.done.length && !UNDO.undone.length && UNDO.note;
-  // What the step left out (#80: a wire whose other end is gone when a deleted block comes back).
-  const left = res.warnings?.length ? ` Left out: ${res.warnings.join("; ")}.` : "";
-  deployMsg(cleared ? UNDO.note : `${redo ? "Redone" : "Undone"}: ${e.label}. ${res.unchanged ? "Nothing changed: the config already was that way." : "Compiled: pending, not deployed. Review it, then Apply or Discard."}${left}`, false, !!cleared || !!left);
-  try {
-    await editShowNewest(res.blob);
-    if (S.sel && !S.view?.objects[S.sel]) select(null, { noReveal: true });
-    else if (S.sel) renderProps();
-  } catch (err) {
-    deployMsg(`${redo ? "Redone" : "Undone"} and compiled, but the page could not show it: ${err.message}`, true);
-  }
-}
-function renderUndo() {
-  const u = $("btn-undo"), r = $("btn-redo"), l = $("btn-undo-list");
-  if (!u) return;
-  const why = undoWhy(), last = UNDO.done.at(-1), next = UNDO.undone.at(-1);
-  u.disabled = !last || !!why;
-  r.disabled = !next || !!why;
-  u.title = last ? `Undo: ${last.label} (${UNDO_KEYS[0]})${why ? `\n${why}` : ""}` : `Nothing to undo${UNDO.note ? `\n${UNDO.note}` : ""}`;
-  r.title = next ? `Redo: ${next.label} (${UNDO_KEYS[1]})${why ? `\n${why}` : ""}` : "Nothing to redo";
-  u.setAttribute("aria-label", last ? `Undo ${last.label}` : "Undo");
-  r.setAttribute("aria-label", next ? `Redo ${next.label}` : "Redo");
-  l.classList.toggle("note", !!UNDO.note);
-  l.title = UNDO.note ? `Recent edits\n${UNDO.note}` : "Recent edits";
-  if (!$("undo-pop").classList.contains("hidden")) renderUndoList();
-}
-/** The recent edits: those undone (to redo) above the line, the done ones below, newest first. */
-function renderUndoList() {
-  const t = (at) => new Date(at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-  const li = (e, cls) => `<li class="${cls}"><span class="u-l">${esc(e.label)}</span><span class="u-t">${esc(t(e.at))}</span></li>`;
-  const undone = UNDO.undone.slice(-5), done = UNDO.done.slice().reverse().slice(0, 10);
-  $("undo-pop").innerHTML = `<h3>Recent edits in this tab</h3>` +
-    (UNDO.note ? `<p class="u-note" role="status">${esc(UNDO.note)}</p>` : "") +
-    (undone.length || done.length ? `<ol>${undone.map((e) => li(e, "undone")).join("")}${done.map((e, i) => li(e, i ? "" : "top")).join("")}</ol>` : '<p class="u-foot">No edits to undo.</p>') +
-    `<p class="u-foot">${UNDO_KEYS[0]} undoes the top one, ${UNDO_KEYS[1]} redoes. Each is compiled like an edit; nothing is deployed.</p>`;
-}
-function undoListToggle(open) {
-  const p = $("undo-pop"), b = $("btn-undo-list");
-  open ??= p.classList.contains("hidden");
-  p.classList.toggle("hidden", !open);
-  b.setAttribute("aria-expanded", String(open));
-  if (open) renderUndoList();
-}
-$("btn-undo").onclick = () => undoStep(false);
-$("btn-redo").onclick = () => undoStep(true);
-$("btn-undo-list").onclick = () => undoListToggle();
-document.addEventListener("click", (e) => { if (!e.target.closest("#undo-pop, #btn-undo-list")) undoListToggle(false); });
-
 // ── moving blocks (#60) ────────────────────────────────────────────────
 // A block the project's module manages is moved by dragging it (or Alt + an arrow key), snapped to
 // Loxone Config's grid; its wires follow. lox keeps such a block's position in the lockfile, so the
@@ -6640,15 +5350,15 @@ function mvStart(e, o) {
   svg.classList.add("moving");
   hideTip();
 }
-window.addEventListener("mousemove", (e) => {
+window.addEventListener("mousemove", whenReady((e) => {
   if (!MV?.dragging) return;
   const mx = e.clientX - MV.x0, my = e.clientY - MV.y0;
   if (!MV.moved && Math.abs(mx) + Math.abs(my) <= 3) return;
   MV.moved = true;
   const dx = snapG(MV.orig.rect[0] + mx / MV.k) - MV.orig.rect[0], dy = snapG(MV.orig.rect[1] + my / MV.k) - MV.orig.rect[1];
   mvShift(dx, dy);
-});
-window.addEventListener("mouseup", () => {
+}));
+window.addEventListener("mouseup", whenReady(() => {
   if (!MV?.dragging) return;
   svg.classList.remove("moving");
   const m = MV;
@@ -6659,7 +5369,7 @@ window.addEventListener("mouseup", () => {
   // Selected, as in Loxone Config: Properties shows the move, or why lox refused it.
   if (S.sel !== m.uuid) select(m.uuid, { noReveal: true });
   mvSend(m);
-});
+}));
 /** Alt + an arrow key: move the selected block a grid step (Shift: ten), sent once the keys rest. */
 function mvNudge([sx, sy], n) {
   const o = S.sel && curPage()?.objects.find((x) => x.uuid === S.sel && !x.moved_to);
@@ -6722,7 +5432,7 @@ async function mvRelayout() {
   if (!st?.ok || S.mvBusy || !mvOnPage(st.page).length || S.edits?.arrange?.[st.page.uuid] !== null) return;
   await mvEdit(null, st.rev, [{ op: "relayout", page: st.page.uuid }]);
 }
-$("btn-relayout").onclick = mvRelayout;
+$("btn-relayout").onclick = whenReady(mvRelayout);
 /** The Position rows of Properties: a move not deployed, with Revert; how to move a block. */
 function moveRows(o, row) {
   const out = { rows: [], count: 0 };
@@ -6874,7 +5584,7 @@ function wrCheck(t, d = WR) {
   if (d.re && sameEnd(d.re.w.from, [a.o.uuid, a.q.key]) && sameEnd(d.re.w.to, [b.o.uuid, b.q.key])) return "That is where the wire is now.";
   return wrWhy(a, b);
 }
-window.addEventListener("mousemove", (e) => {
+window.addEventListener("mousemove", whenReady((e) => {
   if (!WR) return;
   if (!WR.moved && Math.abs(e.clientX - WR.x0) + Math.abs(e.clientY - WR.y0) <= 3) return;
   WR.moved = true;
@@ -6892,8 +5602,8 @@ window.addEventListener("mousemove", (e) => {
   WR.path.classList.toggle("bad", !!best?.classList.contains("bad"));
   if (best) showTip(e, best.classList.contains("bad") ? esc(wrCheck(wrTarget(best)) || "") : "Release to wire");
   else hideTip();
-});
-window.addEventListener("mouseup", (e) => {
+}));
+window.addEventListener("mouseup", whenReady((e) => {
   if (!WR) return;
   const w = WR;
   WR = null;
@@ -6917,7 +5627,7 @@ window.addEventListener("mouseup", (e) => {
   if (w.re) ops.push({ op: "unwire", from: w.re.w.from, to: w.re.w.to });
   ops.push({ op: "wire", from: [a.o.uuid, a.q.key], to: [b.o.uuid, b.q.key] });
   wrSend(ops, w.re ? "Reconnected" : "Wired", e, w.re ? "Reconnecting: compiling…" : "Wiring: compiling…");
-});
+}));
 /** Send wire ops; the reply's pending revision is shown, a refusal (or why nothing can be sent now) in
  *  the card at the mouse (`at`). `busy`: the card's text while it compiles. */
 async function wrSend(ops, done, at, busy) {
@@ -7050,15 +5760,15 @@ function wrDelete() {
   wrSend([{ op: "unwire", from: w.from, to: w.to }], "Taken out", null);
   return true;
 }
-wcard.addEventListener("click", (e) => {
+wcard.addEventListener("click", whenReady((e) => {
   const b = e.target.closest("[data-wc]");
   if (!b) return;
   const w = S.wsel;
   if (b.dataset.wc === "close") wcardClose();
   else if (b.dataset.wc === "unwire") wrDelete();
   else if (b.dataset.wc === "rewire" && w) wrSend([{ op: "wire", from: w.from, to: w.to }], "Wired again", null);
-});
-wcard.addEventListener("mousedown", (e) => e.stopPropagation());
+}));
+wcard.addEventListener("mousedown", whenReady((e) => e.stopPropagation()));
 
 // ── adding blocks (#59) ────────────────────────────────────────────────
 // “Add block” on the page picks a type lox can create (GET /api/block-types), then its name and values.
@@ -7209,27 +5919,27 @@ function npForm() {
       <span class="ed-msg${NP.err ? " err" : ""}" role="status" aria-live="polite">${esc(NP.err || "lox creates the page in the room when it compiles; add blocks to it next. Creating compiles the module; nothing is deployed.")}</span></div>
   </div>`;
 }
-$("np-body").addEventListener("input", (e) => {
+$("np-body").addEventListener("input", whenReady((e) => {
   const f = e.target.closest("[data-np-field]");
   if (!f) return;
   NP.draft[f.dataset.npField] = f.value;
   delete NP.bad[f.dataset.npField];
-});
-$("np-body").addEventListener("change", (e) => {
+}));
+$("np-body").addEventListener("change", whenReady((e) => {
   const f = e.target.closest("select[data-np-field]");
   if (f) { NP.draft[f.dataset.npField] = f.value; delete NP.bad[f.dataset.npField]; }
-});
-$("np-body").addEventListener("keydown", (e) => {
+}));
+$("np-body").addEventListener("keydown", whenReady((e) => {
   if (e.key === "Escape") { e.preventDefault(); npClose(); }
   else if (e.key === "Enter" && e.target.tagName === "INPUT") { e.preventDefault(); npAdd(); }
-});
-$("np-body").addEventListener("click", (e) => {
+}));
+$("np-body").addEventListener("click", whenReady((e) => {
   const b = e.target.closest("[data-np]");
   if (b?.dataset.np === "add") npAdd();
   else if (b?.dataset.np === "cancel") npClose();
-});
-$("newpage").addEventListener("mousedown", (e) => { if (e.target.id === "newpage") npClose(); });
-$("btn-new-page").onclick = npOpen;
+}));
+$("newpage").addEventListener("mousedown", whenReady((e) => { if (e.target.id === "newpage") npClose(); }));
+$("btn-new-page").onclick = whenReady(npOpen);
 async function npAdd() {
   const st = newPageState();
   if (!st?.ok || NP.busy) return;
@@ -7254,7 +5964,7 @@ async function npAdd() {
   }
 }
 /** Remove page: a page created here, not deployed, with nothing of vislox's on it. Undo creates it again. */
-$("btn-remove-page").onclick = async () => {
+$("btn-remove-page").onclick = whenReady(async () => {
   const st = addState(), cp = st?.ok && pageCreated(st.page.uuid);
   if (!cp || cp.remove != null || NP.busy) return;
   NP.busy = true; renderAddHud();
@@ -7268,7 +5978,7 @@ $("btn-remove-page").onclick = async () => {
     showMsg(err.message);
   }
   renderAddHud();
-};
+});
 async function abOpen() {
   const st = addState();
   if (!st?.ok) return;
@@ -7386,24 +6096,24 @@ function abForm() {
       <span class="ed-msg${AB.err ? " err" : ""}" role="status" aria-live="polite">${esc(AB.err || (t.mirrors ? "No text means no message. Wire its input from a block once it is on the page. Adding compiles the module; nothing is deployed." : t.hardware ? "lox creates it unpaired, with the kind's inputs and outputs: pair it with a Tree search in Loxone Config. Adding compiles the module; nothing is deployed." : t.folder || t.devices ? "lox gives it its designation (VI, VHI, …). Empty settings get Loxone Config's defaults. Adding compiles the module; nothing is deployed, and nothing is sent to the device." : "Empty values get what Loxone Config places the block with. Adding compiles the module; nothing is deployed."))}</span></div>
   </div>`;
 }
-$("ab-body").addEventListener("input", (e) => {
+$("ab-body").addEventListener("input", whenReady((e) => {
   const f = e.target.closest("[data-ab-field]");
   if (!f) return;
   AB.draft[f.dataset.abField] = f.value;
   delete AB.bad[f.dataset.abField];
-});
-$("ab-body").addEventListener("keydown", (e) => {
+}));
+$("ab-body").addEventListener("keydown", whenReady((e) => {
   const f = e.target.closest("[data-ab-field]");
   if (f && e.key === "Enter" && f.tagName === "INPUT") { e.preventDefault(); abAdd(); }
   else if (f && e.key === "Escape") { e.preventDefault(); abClose(); }
-});
-$("ab-body").addEventListener("click", (e) => {
+}));
+$("ab-body").addEventListener("click", whenReady((e) => {
   const b = e.target.closest("[data-ab]");
   if (b?.dataset.ab === "add") abAdd();
   else if (b?.dataset.ab === "back") abPick("");
-});
-$("addblk").addEventListener("mousedown", (e) => { if (e.target.id === "addblk") abClose(); });
-$("btn-add-block").onclick = abOpen;
+}));
+$("addblk").addEventListener("mousedown", whenReady((e) => { if (e.target.id === "addblk") abClose(); }));
+$("btn-add-block").onclick = whenReady(abOpen);
 const AB_TIME = /^\d{1,2}:\d{2}(:\d{2})?$/;
 async function abAdd() {
   const pn = AB.parent && nodeById(AB.parent.uuid);
@@ -7633,16 +6343,16 @@ function openLog(e) {
   li.classList.add("flash");
   setTimeout(() => li.classList.remove("flash"), 2000);
 }
-$("log-toggle").onclick = () => setLogOpen(!S.log.open);
-$("btn-log").onclick = () => loadLog();
-$("chk-log-since").onchange = (e) => { S.log.onlySince = e.target.checked; setPref("logSince", S.log.onlySince); renderLog(); };
-$("log").addEventListener("click", (e) => {
+$("log-toggle").onclick = whenReady(() => setLogOpen(!S.log.open));
+$("btn-log").onclick = whenReady(() => loadLog());
+$("chk-log-since").onchange = whenReady((e) => { S.log.onlySince = e.target.checked; setPref("logSince", S.log.onlySince); renderLog(); });
+$("log").addEventListener("click", whenReady((e) => {
   const g = e.target.closest("[data-go]");
   if (!g) return;
   const u = g.dataset.go, pg = S.view?.objects[u]?.page;
   if (pg) gotoPage(pg, { focus: u });
   select(u);
-});
+}));
 
 // ── the Debug-Monitor ──────────────────────────────────────────────────
 // With `--monitor`, vislox listens for the Miniserver's debug output (UDP). Start asks the Miniserver to
@@ -7695,7 +6405,7 @@ function renderMonBar() {
   b.title = on ? "Ask the Miniserver to stop sending its debug output (dev/sps/log)"
     : `Ask the Miniserver to send its debug output to ${m.dest || "this host"}:${m.port} for ${m.minutes} min (dev/sps/log/<address>)`;
 }
-$("btn-mon").onclick = async () => {
+$("btn-mon").onclick = whenReady(async () => {
   const on = !!monInfo().until;
   if (!on && !window.confirm("Ask the Miniserver to send its debug output to vislox?\n\nThis is what Loxone Config's Debug Information does. " +
     "Nothing in the config changes and the program does not restart. vislox stops it again with Stop, when it exits, or after the time limit.")) return;
@@ -7706,7 +6416,7 @@ $("btn-mon").onclick = async () => {
     if (!r.ok) S.mon.msg = j.error || r.statusText;
   } catch (e) { S.mon.msg = e.message; }
   finally { S.mon.busy = false; renderMonBar(); setTimeout(() => { S.mon.msg = ""; renderMonBar(); }, 10000); }
-};
+});
 
 // ── live values ────────────────────────────────────────────────────────
 // The Miniserver streams a value per state UUID; a wire's source connector
@@ -8480,13 +7190,3 @@ function connect() {
     }
   };
 }
-S.hash = readHash();
-loadHistory().then(connect);
-loadMs();
-loadApp();
-loadCal();
-// The chip stays roughly current while the page is open.
-// Every minute, to notice a config saved on the Miniserver: the server asks only for its config
-// date again (reused for half a minute, so several tabs still ask once), and the full check every
-// five minutes.
-setInterval(() => { if (!document.hidden) loadMs(false, true); }, 60 * 1000);

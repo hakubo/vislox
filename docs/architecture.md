@@ -2,17 +2,34 @@
 
 The binary is an `axum` server with the UI embedded (plain JS and SVG, no build step).
 
-`web/index.html` loads classic scripts in order: `navigation.js`, `app.js`, then `modes.js`.
-`navigation.js` owns URL state, Back/Forward navigation and history loading, including request
-sequence guards and retry state. Its header lists the shared state and refresh dependencies.
-It defines functions and registers a popstate listener before `app.js` starts the initial loads;
-the listener ignores events until `S` exists. Those functions use app/calendar globals only when called. `app.js` keeps the shared `S` state,
-rendering, editing and deployment logic; `modes.js` owns the operating-mode calendar.
+`web/index.html` loads classic scripts in this order:
+
+1. `navigation.js`: URL state, Back/Forward navigation and history loading/retries, with request sequence guards.
+2. `app.js`: shared `S` state, canvas/tree/Properties rendering, live values and the per-kind editor drafts,
+   forms and handlers. It registers handlers but leaves the initial server loads to `start.js`.
+3. `editing.js`: shared edit loading/refresh, revision/edit gates, the single edit-send path, this tab's
+   undo/redo stack and its storage, and waiting for the newest compile to be shown.
+4. `deploy.js`: deployment pane, check/test/lint lists and links, defaults naming/review text, hardware and
+   post-deploy status, removals/Roll back plans, confirmations and Apply/Sync/Discard handlers.
+5. `modes.js`: operating-mode calendar and its editors.
+6. `start.js`: sets `window.VISLOX_READY` before starting the initial server loads.
+
+The extracted modules' headers list their state reads/writes and render/refresh dependencies. Per-kind
+editors stay in `app.js` and call `editAct` in `editing.js`; deployment uses the existing `act` transport
+and refreshes the same history/view functions. Request guards, undo ordering, confirmations and UUID
+comparisons are unchanged. Load-time listeners ignore events until startup: every registration uses
+`whenReady`, which returns without calling its handler until `start.js` sets `window.VISLOX_READY`.
+Lint enforces this gate, including registrations inside immediate `forEach` loops. Runtime drag handlers
+retain their original add/remove identity. The extraction's historical body comparison is recorded in PR #147;
+there is no claim that top-level execution order across the new script boundaries is unchanged.
+
 The scripts share the browser global scope. `eslint.config.mjs` generates imports from the
-`/* exported */` headers after checking declarations and cross-script binding clashes. They are embedded individually with `include_str!` and routed
-in `src/main.rs`. All assets use `Cache-Control: no-cache` (no ETag or hashed filenames), so new
-scripts need both an HTML script tag and an embedded route. No bundler or npm package ships in
-the binary.
+`/* exported */` headers after checking declarations and cross-script binding clashes. The lint self-test
+uses the shared `tools/web-scripts.mjs` loader, so new modules participate in those checks.
+`WEB_ASSETS` in `src/main.rs` embeds the files and supplies their routes; a Rust test verifies that
+the HTML script list and the table agree. All assets use `Cache-Control: no-cache` (no ETag or hashed
+filenames), so a new script needs both an HTML script tag and a table entry. No bundler or npm package
+ships in the binary.
 
 - `src/source.rs` resolves the path into the watched files.
 - `src/history.rs` keeps revisions keyed by git blob id. A live snapshot and the commit with the same
@@ -142,7 +159,7 @@ the binary.
   back under its UUID, a rename changing nothing (`loxone_config::diff`).
 - `src/constants.rs` reads the module's `let` constants and `defaults` statements and the ports that take a value
   from one (#81), with lox's parser and `defaults_taken`, for `GET /api/edits`' `constants`. vislox's own constants
-  are `Claims`' ninth field in `edit.rs` (`let vx_… = …` in `edits.loxl`), its defaults the eleventh (`defaults
+  are `Claims`' ninth field in `src/edit/files.rs` (`let vx_… = …` in `edits.loxl`), its defaults the eleventh (`defaults
   T(P: v)`); the `let` op is `set_constant`, and a `param` op whose value names a constant (`Ctx::lets`, the
   module's) binds the port to it (`constant_ref`). `constants::reach` is the blocks a default reaches (the module
   expanded without the type's statement), and `constants::pending` the values that differ from the deployed

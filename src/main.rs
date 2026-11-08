@@ -525,28 +525,8 @@ async fn main() -> Result<()> {
         });
     }
 
-    let router = Router::new()
+    let mut router = Router::new()
         .route("/", get(root))
-        .route(
-            "/navigation.js",
-            get(|| async { asset("text/javascript", include_str!("../web/navigation.js")) }),
-        )
-        .route(
-            "/app.js",
-            get(|| async { asset("text/javascript", include_str!("../web/app.js")) }),
-        )
-        .route(
-            "/modes.js",
-            get(|| async { asset("text/javascript", include_str!("../web/modes.js")) }),
-        )
-        .route(
-            "/app.css",
-            get(|| async { asset("text/css", include_str!("../web/app.css")) }),
-        )
-        .route(
-            "/icon.svg",
-            get(|| async { asset("image/svg+xml", include_str!("../assets/icon.svg")) }),
-        )
         .route("/api/history", get(api_history))
         .route("/api/view", get(api_view))
         .route("/api/schedules", get(api_schedules))
@@ -596,7 +576,11 @@ async fn main() -> Result<()> {
         .route("/api/block-types", get(api_block_types))
         .route("/api/sync", axum::routing::post(api_sync))
         .route("/api/push", axum::routing::post(api_push))
-        .route("/api/operate", axum::routing::post(api_operate))
+        .route("/api/operate", axum::routing::post(api_operate));
+    for &(path, content_type, body) in WEB_ASSETS {
+        router = router.route(path, get(move || async move { asset(content_type, body) }));
+    }
+    let router = router
         .with_state(app)
         .layer(tower_http::compression::CompressionLayer::new());
 
@@ -688,6 +672,42 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     let _ = tokio::signal::ctrl_c().await;
 }
+
+// Every static asset route is built from this table; the HTML coverage test uses it too.
+const WEB_ASSETS: &[(&str, &str, &str)] = &[
+    (
+        "/navigation.js",
+        "text/javascript",
+        include_str!("../web/navigation.js"),
+    ),
+    (
+        "/editing.js",
+        "text/javascript",
+        include_str!("../web/editing.js"),
+    ),
+    (
+        "/deploy.js",
+        "text/javascript",
+        include_str!("../web/deploy.js"),
+    ),
+    (
+        "/start.js",
+        "text/javascript",
+        include_str!("../web/start.js"),
+    ),
+    ("/app.js", "text/javascript", include_str!("../web/app.js")),
+    (
+        "/modes.js",
+        "text/javascript",
+        include_str!("../web/modes.js"),
+    ),
+    ("/app.css", "text/css", include_str!("../web/app.css")),
+    (
+        "/icon.svg",
+        "image/svg+xml",
+        include_str!("../assets/icon.svg"),
+    ),
+];
 
 fn asset(ty: &'static str, body: &'static str) -> Response {
     (
@@ -2087,6 +2107,39 @@ async fn api_operate(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_html_script_has_an_embedded_route() {
+        let html = include_str!("../web/index.html");
+        let mut scripts = std::collections::BTreeSet::new();
+        for tag in html.split("<script").skip(1) {
+            let tag = tag.split('>').next().unwrap();
+            let src = tag
+                .split_once("src=")
+                .expect("script needs a src")
+                .1
+                .trim_start();
+            let quote = src.chars().next().unwrap();
+            assert!(quote == '\'' || quote == '"', "script src must be quoted");
+            let path = src[1..].split(quote).next().unwrap();
+            assert!(scripts.insert(path), "duplicate script {path}");
+        }
+        assert!(!scripts.is_empty(), "no scripts found in index.html");
+        let embedded = WEB_ASSETS
+            .iter()
+            .filter(|(_, mime, _)| *mime == "text/javascript")
+            .map(|(path, _, _)| *path)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            scripts, embedded,
+            "HTML scripts and embedded routes must match"
+        );
+        let paths = WEB_ASSETS
+            .iter()
+            .map(|(path, _, _)| path)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(paths.len(), WEB_ASSETS.len(), "duplicate asset route");
+    }
 
     fn args(cli: &[&str]) -> Args {
         Args::parse_from(std::iter::once("vislox").chain(cli.iter().copied()))

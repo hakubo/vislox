@@ -3,12 +3,12 @@
 //! - **Apply**: `lox config push --force` deploys what is pending (download,
 //!   drift check, upload, program restart, verify), then vislox commits the
 //!   project and pushes it to its git remote. Each step shows as it happens
-//!   (`progress`): lox's own progress lines, and what vislox sees of the
+//!   (`actions/progress.rs`): lox's own progress lines, and what vislox sees of the
 //!   program restart (`restart.rs`).
 //! - **Sync**: make what the Miniserver runs now the project's base
 //!   (`lox config merge`), then commit and push.
 //! - **Discard**: put the module, lock and compiled config back to the last
-//!   commit.
+//!   commit (`actions/discard.rs`).
 //! - **Edit**: write values edited in Properties into vislox's own file of
 //!   the module (`edit.rs`), then `lox logic compile`. Never deploys.
 //!
@@ -27,7 +27,7 @@ mod progress;
 mod removals;
 mod rollback;
 mod scan;
-use discard::{Rollback, no_link, project_git_path, snapshot_before_edit};
+use discard::{project_git_path, snapshot_before_edit};
 use progress::{Progress, push_step};
 pub use removals::{NEEDS_CONSENT, RemovalConsent, plan_id as removal_plan_id, refused_slug};
 use serde::Serialize;
