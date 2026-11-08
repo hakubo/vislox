@@ -175,16 +175,22 @@ async function loadHistory(fromEvent) {
   else if (fromEvent && newest && newest.id !== prevNewest && !S.follow) setStatus("new revision in History", "live flash");
 }
 
+/** What the Miniserver runs: `deployed`, as the server says (the last Apply, Roll back or Pull, else the newest
+ *  commit; one of the history, never a compile). Not `current`, which is only what the watched file holds: an edit
+ *  on disk nothing committed is current, not run. */
+function isDeployed(r) { return !!r?.deployed; }
+
 function revButton(r, newest) {
   const info = revInfo(r);
   const b = document.createElement("button");
   b.type = "button";
-  b.className = `hrev k-${r.kind}` + (r.id === S.rev ? " sel" : "") + (r.id === S.base ? " base" : "") + (r.current ? " current" : "") + (r.current && r.kind !== "pending" && r.kind !== "backup" ? " deployed" : "");
+  b.className = `hrev k-${r.kind}` + (r.id === S.rev ? " sel" : "") + (r.id === S.base ? " base" : "") + (r.current ? " current" : "") + (isDeployed(r) ? " deployed" : "");
   b.setAttribute("aria-current", r.id === S.rev ? "true" : "false");
-  const deployed = r.current && r.kind !== "pending" && r.kind !== "backup";
+  const deployed = isDeployed(r);
   const also = r.backups?.length ? `\n\nThe Miniserver's backup${r.backups.length > 1 ? "s" : ""} ${r.backups.join(", ")} ${r.backups.length > 1 ? "hold" : "holds"} this config.` : "";
   b.title = `${r.label}\n${r.detail}\n${new Date(r.time * 1000).toLocaleString()}${also}` +
     (deployed ? "\n\nThis is the config on the Miniserver." : "") +
+    (!deployed && r.current && r.kind !== "pending" ? "\n\nThis is the file on disk, not the config on the Miniserver. Only Apply deploys it; a Pull would overwrite it." : "") +
     `\n\nClick: show it\nShift+click: compare what you see with it${r.id === S.base ? " (again: stop comparing)" : ""}`;
   const pills = [];
   if (r.kind === "pending" && r.current) pills.push('<span class="pill pend">would be deployed</span>');
@@ -2273,7 +2279,10 @@ function calDrift(c = S.cal) { return c?.available && Array.isArray(c.drift) ? c
 /** How entry `uuid` was changed in the app, when it was and the deployed revision is viewed. */
 // The drift is against the deployed config (`S.cal.rev`: the last commit, not an edit on disk); it
 // shows on that revision and on what the file on disk holds now.
-function calDriftOf(uuid) { return S.rev === S.cal?.rev || viewingDeployed() ? calDrift().find((d) => d.uuid === uuid) : undefined; }
+function calDriftOf(uuid) {
+  const r = revById(S.rev);
+  return S.rev === S.cal?.rev || (r?.current && r.kind !== "pending") ? calDrift().find((d) => d.uuid === uuid) : undefined;
+}
 function calDriftText(c = S.cal) {
   const d = calDrift(c);
   if (!d.length) return "";
@@ -2583,7 +2592,7 @@ function onBus(d, bus) {
 }
 /** What is on the Miniserver now: the newest revision that is not a compile. Both Apply's confirmation and
  *  the after-Apply list compare with it, so they count the same devices. */
-function deployedRev() { return S.hist?.history.find((r) => r.current) || null; }
+function deployedRev() { return S.hist?.history.find(isDeployed) || null; }
 /** How long Apply's confirmation waits for the device list and the bus, together, before it asks anyway
  *  (and says the bus check did not finish). */
 const HW_WAIT = 6000;
@@ -2734,8 +2743,7 @@ function appIcon(name) {
 }
 /** The viewed revision is what the Miniserver runs (its config can be compared with the app). */
 function viewingDeployed() {
-  const r = revById(S.rev);
-  return !!r && !!r.current && r.kind !== "pending";
+  return isDeployed(revById(S.rev));
 }
 /** Where the config and the app disagree about block `o`, in words. */
 function appIssues(o) {
@@ -2873,7 +2881,7 @@ async function confirmApply(pend, plan) {
 function removalsPreview() {
   const p = S.removals;
   if (!p) return null;
-  const deployed = S.hist?.history.find((x) => x.kind === "git") || S.hist?.history.find((x) => x.current);
+  const deployed = deployedRev();
   const kept = S.hist?.actions ? S.hist.actions.removals : p.rev;
   if (kept !== p.rev || (deployed?.id ?? null) !== (p.base ?? null) || Date.now() - S.removalsAt > PREVIEW_TTL) { S.removals = null; return null; }
   return p;
@@ -3539,12 +3547,11 @@ $("deploy-check").addEventListener("click", async (e) => {
 });
 /** One claimed value, whatever the order of the list: its op, object and port or setting. */
 function editKey(c) { return [c.op, c.uuid, c.port ?? c.name ?? ""].join("|"); }
-/** The revision edits are made against: the newest compile, else the deployed config on disk. */
+/** The revision edits are made against: the newest compile, else the deployed config (what the server's
+ *  `edit_revisions` takes as the base, so both pick the same). */
 function editRev() {
   const p = S.hist?.pending?.[0];
-  if (p?.current) return p;
-  const h = S.hist?.history?.[0];
-  return h?.current ? h : null;
+  return p?.current ? p : deployedRev();
 }
 /** The block added here (#59) with UUID `uuid`, deployed or not. */
 function editsBlock(uuid) { return (S.edits?.blocks || []).find((b) => b.uuid && b.uuid === uuid) || null; }
@@ -7516,7 +7523,7 @@ function logTargets() {
  *  deployed revision: the log is about what runs. */
 function logMarks() {
   const r = revById(S.rev);
-  if ((!S.log.data && !S.mon.lines.length) || S.log.stale || !r?.current || r.kind === "pending") return new Map();
+  if ((!S.log.data && !S.mon.lines.length) || S.log.stale || !isDeployed(r)) return new Map();
   const t = logTargets(), m = new Map();
   for (const e of logRecent()) for (const u of e.uuids || []) { const b = t.get(u); if (b) m.set(b, e); }
   return m;
@@ -7821,10 +7828,10 @@ function renderOpLog(box) {
   }
 }
 
-/** Live values belong to what runs on the Miniserver: the current, deployed revision. */
+/** Live values belong to what runs on the Miniserver: the deployed revision, never an uncommitted edit on disk. */
 function liveHere() {
   const r = revById(S.rev);
-  return S.live.on && !!S.live.es && !!r && !!r.current && r.kind !== "pending";
+  return S.live.on && !!S.live.es && isDeployed(r);
 }
 /** A connector's value: streamed by the Miniserver, passed on by a reference or a memory flag,
  *  a constant in the config, or computed from a simple gate's inputs (`view.live`).
@@ -8076,7 +8083,7 @@ function scheduleRows(o, row, marks) {
   else if (!live) note = `<div class="sch-note">The Miniserver sends no schedule for this block${liveStreaming() ? " (only blocks shown in the app have one)" : ""}.</div>`;
   else if (cmp.same) note = `<div class="sch-note ok">The Miniserver runs the same switching times.</div>`;
   else if (r?.kind === "pending") note = `<div class="sch-note warn">⚠ The Miniserver runs other switching times (${esc(cmp.what)}). Apply would replace them with this config's.</div>`;
-  else if (r?.current) note = `<div class="sch-note warn">⚠ Changed in the app since this config (${esc(cmp.what)}). An edit in the app is a custom change until Loxone Config saves the program: Apply refuses while one is pending, and replaces it with the config's switching times when you allow that.</div>`;
+  else if (isDeployed(r)) note = `<div class="sch-note warn">⚠ Changed in the app since this config (${esc(cmp.what)}). An edit in the app is a custom change until Loxone Config saves the program: Apply refuses while one is pending, and replaces it with the config's switching times when you allow that.</div>`;
   else note = `<div class="sch-note warn">The Miniserver runs other switching times than this revision (${esc(cmp.what)}).</div>`;
   out.push(note);
   if (si.analog && (si.default != null || live)) {
@@ -8211,7 +8218,7 @@ function renderLiveSwitch() {
   ls.title = [st.detail, info.source && `from ${info.source}`].filter(Boolean).join("\n");
   $("legend").classList.toggle("live", on);
   // With a known reason, its plain sentence (the detail's first line) says what to do.
-  $("live-note").textContent = on && !here ? "Live values show on the current, deployed revision only"
+  $("live-note").textContent = on && !here ? "Live values show on the deployed revision only (what the Miniserver runs, not an edit on disk)"
     : on && st.reason && st.state !== "live" ? (st.detail || "").split("\n")[0] : "";
   svg.classList.toggle("live", here);
   svg.classList.toggle("live-dim", here && S.live.dim);

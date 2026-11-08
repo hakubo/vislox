@@ -69,7 +69,11 @@ sends to the Miniserver see [miniserver.md](miniserver.md).
   does the view while live values are not connected (offline, stopped). Not with `--live-from`.
 ## History and change review
 
-- **History** (right): every revision, newest first. The config on the Miniserver is marked *on Miniserver*.
+- **History** (right): every revision, newest first. The config on the Miniserver is marked *on Miniserver*: the program the last Apply, Roll back or Pull left there
+  (a commit that failed after an Apply, or one made by hand, does not move it); after a restart, the newest commit;
+  without git, the file on disk. In a git repository with no commit of the file it is not known, and nothing is
+  marked. An edit on disk that nothing committed is the file vislox watches, not the deployed config: it is not
+  marked, and says *not in git*. *Pending* is compared with the deployed revision, not with the newest one.
   Click an entry to show it; Shift+click another to compare with it:
   - *Pending*: the compiled `out.Loxone` of a `lox.toml` project, compared with the deployed `base`.
     This is what `lox config push` would apply.
@@ -152,7 +156,8 @@ sends to the Miniserver see [miniserver.md](miniserver.md).
 
   Without queries, blocks with timing or memory (delays, edge detection, Formula, …) and inputs the app does
   not show stay without a value. Those wires are faded ("Dim wires without a value" in the legend turns this
-  off). Values show on the current, deployed revision only.
+  off). Values show on the deployed revision only (see History: what the last Apply, Roll back or Pull left on the
+  Miniserver). A save on disk that nothing deployed is not it, so on it live values stay off.
 
 - **In the app**: what a block looks like in the Loxone app. Properties shows whether the config shows it in the
   app, in which room and category (changes marked old → new; showing, hiding or moving a block to another room or

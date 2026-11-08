@@ -152,8 +152,9 @@ date, 3 one period, 4 a range every year, 5 a weekday of the month; the file's `
 entries are compared by their decoded dates, never by raw numbers: one date is a period of one day, and
 `operatingMode` is the file's `CalType=`. A date vislox cannot read on either side (`calMode` 5, which the file
 format does not document) is not compared; its name and mode still are. The comparison is with the deployed
-config: the newest commit of the watched file (the last Pull, Apply or Sync), not an uncommitted edit on disk or a
-pending compile; without git, the file on disk.
+config: what the last Apply, Roll back or Pull left there, else (after a restart) the newest commit of the watched
+file, not an uncommitted edit on disk or a pending compile; without git, the file on disk. Inside a git repository
+with no commit of the file, none is known, and nothing is compared.
 
 Not verified yet: whether `lox config merge` (Sync) takes over entries edited in the app, or refuses because the
 base and the download differ in more than rules (Sync then makes the plain download the base). The notice offers
@@ -226,7 +227,7 @@ one turns them off. Each time it opens, vislox asks for the heating and cooling 
 (`jdev/sps/calendargetheatperiod`, `jdev/sps/calendargetcoolperiod`, both at once, one 10 s deadline), again
 after 10 s, 30 s and every 5 minutes for one not read yet, and sends them to the browsers with the live values
 (`periods` on `/api/live`; a value of an earlier connection has `stale`, and `failed` when this one's read failed). With **Query blocks on this page**, the browser asks for the page's queries with
-`POST /api/live/query` (`{rev, page}`, only the current, deployed revision; it needs the `X-Vislox` header, so
+`POST /api/live/query` (`{rev, page}`, only the deployed revision (as the History marks it, never an uncommitted edit on disk); it needs the `X-Vislox` header, so
 that no other web page can make vislox send requests), and holds `GET /api/live/query?token=…` open with the
 one-use token it gets while it shows the page. vislox sends `jdev/sps/io/<uuid>/all` for each block the page
 needs on that same WebSocket, at most 20 a second without waiting for earlier answers, each block at most every

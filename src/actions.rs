@@ -106,6 +106,9 @@ pub struct Actions {
     pushes: crate::rollback::Pushes,
     /// The last removal plan worked out (#70), for Apply's consent to name.
     removals: Mutex<Option<removals::RemovalPlan>>,
+    /// The blob id of the program the Miniserver was last left with by an
+    /// Apply, a Roll back or a Pull ([`Actions::note_deployed`]).
+    deployed: Mutex<Option<String>>,
     /// `HEAD` and the upstream's tracking branch when a push that is behind
     /// was last looked at again ([`Actions::recheck_push`]).
     push_key: Mutex<String>,
@@ -965,12 +968,25 @@ impl Actions {
             project_cache: Mutex::new(None),
             pushes: Default::default(),
             removals: Mutex::new(None),
+            deployed: Mutex::new(None),
             push_key: Mutex::new(String::new()),
             #[cfg(test)]
             waiting: Mutex::new(None),
         };
         a.edit_state.lock().unwrap().why = a.why_not_edit_now();
         a
+    }
+
+    /// The blob id of the program the last Apply, Roll back or Pull left on
+    /// the Miniserver, for the History's `deployed` mark. `None` until one
+    /// ran since vislox started: git's newest commit stands in then.
+    pub fn deployed_blob(&self) -> Option<String> {
+        self.deployed.lock().unwrap().clone()
+    }
+
+    /// A Pull made the file on disk what the Miniserver runs.
+    pub fn note_deployed(&self, blob: String) {
+        *self.deployed.lock().unwrap() = Some(blob);
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<()> {
@@ -1471,6 +1487,10 @@ impl Actions {
             before,
             after: crate::history::blob_id(&b),
         });
+        // The Miniserver runs it now, whether or not the commit below works.
+        if let Some(d) = &deployed {
+            self.note_deployed(d.after.clone());
+        }
         // A page created here is deployed now (#88): handed off to Loxone
         // Config in the same commit.
         if let Err(e) = hand_off_pages(p, None) {
@@ -8068,6 +8088,11 @@ esac
         let dep = &info["last"]["deployed"];
         assert_eq!(dep["before"], crate::history::blob_id(b"old"));
         assert_eq!(dep["after"], crate::history::blob_id(b"new"));
+        // The History marks what the Apply left there as deployed (#121).
+        assert_eq!(
+            a.deployed_blob().as_deref(),
+            Some(crate::history::blob_id(b"new").as_str())
+        );
     }
 
     /// [`project_with_fake_lox`] whose lox finds a user's mail address in a
@@ -8726,6 +8751,10 @@ esac
         assert_eq!(
             info["last"]["deployed"]["after"],
             crate::history::blob_id(DOC_A.as_bytes())
+        );
+        assert_eq!(
+            a.deployed_blob().as_deref(),
+            Some(crate::history::blob_id(DOC_A.as_bytes()).as_str())
         );
         let steps = step_states(&a);
         for id in [

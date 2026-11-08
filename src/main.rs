@@ -696,6 +696,8 @@ fn refresh(app: &App) {
         let mut h = app.history.lock().unwrap();
         let a = h.refresh_git();
         let b = h.poll_files();
+        // What an Apply, a Roll back or a Pull left on the Miniserver.
+        let b = h.set_deployed(app.actions.deployed_blob()) || b;
         // A removal plan (#70) goes once the server no longer keeps it, it is
         // too old, or another revision runs.
         let c = h.prune_removals(app.actions.removal_plan_id().as_deref());
@@ -1122,14 +1124,16 @@ async fn api_live_query_start(
     let a = app.clone();
     let plan = move || {
         tokio::task::spawn_blocking(move || -> Result<Vec<query::Block>, String> {
-            let current = a
+            let deployed = a
                 .history
                 .lock()
                 .unwrap()
                 .find(&q.rev)
-                .is_some_and(|r| r.current && r.kind != "pending");
-            if !current {
-                return Err("only the current, deployed revision is queried".into());
+                .is_some_and(|r| r.deployed);
+            if !deployed {
+                return Err(
+                    "only the deployed revision (what the Miniserver runs) is queried".into(),
+                );
             }
             let (_, doc) = load(&a, &q.rev)?;
             Ok(model::query_plan(&doc, &q.page))
@@ -1374,7 +1378,17 @@ async fn api_pull(State(app): State<Arc<App>>, headers: axum::http::HeaderMap) -
     match app.pull.run().await {
         Ok(p) => {
             let a = app.clone();
-            let _ = tokio::task::spawn_blocking(move || refresh(&a)).await;
+            let _ = tokio::task::spawn_blocking(move || {
+                // The Miniserver's config is the file on disk now.
+                let mut h = a.history.lock().unwrap();
+                h.poll_files();
+                if let Some(blob) = h.on_disk().0 {
+                    a.actions.note_deployed(blob);
+                }
+                drop(h);
+                refresh(&a)
+            })
+            .await;
             // The base may have changed: the next check reads its date again.
             app.ms.forget();
             reread_calendar(&app);
@@ -1708,9 +1722,11 @@ async fn api_calendar(
 }
 
 /// The revision the Miniserver runs, which the app's calendar edits and
-/// vislox's edits are compared with: the deployed config. That is the newest commit of the watched file (the last Pull,
-/// Apply or Sync), not an uncommitted edit on disk, which the Miniserver
-/// does not run; without git, the file on disk. Never a pending compile.
+/// vislox's edits are compared with: the deployed config ([`history::deployed_of`]).
+/// That is what the last Apply, Roll back or Pull left there, else the newest
+/// commit of the watched file, not an uncommitted edit on disk, which the
+/// Miniserver does not run; without git, the file on disk. Never a pending
+/// compile.
 fn deployed_revision(hist: Vec<history::Revision>) -> Option<history::Revision> {
     history::deployed_of(&hist).cloned()
 }
@@ -2007,14 +2023,14 @@ async fn api_push(State(app): State<Arc<App>>, headers: axum::http::HeaderMap) -
     }
 }
 
-/// The virtual inputs of the deployed revision (the current one that is not
-/// pending), parsed once per revision. Blocking.
+/// The virtual inputs of the deployed revision (what the Miniserver runs, not
+/// an uncommitted edit or a compile), parsed once per revision. Blocking.
 fn deployed_inputs(app: &App) -> Result<Arc<operate::Inputs>, String> {
     let rev = {
         let h = app.history.lock().unwrap();
         let (_, hist) = h.list();
-        hist.into_iter()
-            .find(|r| r.current)
+        history::deployed_of(&hist)
+            .cloned()
             .ok_or("no deployed revision to look the input up in")?
     };
     app.operate

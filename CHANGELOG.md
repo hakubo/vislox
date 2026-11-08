@@ -220,6 +220,11 @@ published under the same version (see [docker/README.md](docker/README.md)).
   link at its port, and a reference's plumbing wire to its flag is not drawn. Properties has *Memory flag*: where
   the flag is written and where it is read, each a link. A flag set from two places no longer shows one of them as
   its value.
+- An edit on disk that nothing committed is no longer shown as the config on the Miniserver (#121). Revisions carry
+  `deployed` (what the last Apply, Roll back or Pull left on the Miniserver, else the newest commit; without git
+  the file on disk) next to `current` (what the watched file holds); *on Miniserver*, live values, the log marks,
+  block queries, input commands, the edit base and the app comparison follow `deployed`, so they stay off on an
+  uncommitted save. A compile is compared with the deployed revision, not with the newest one.
 
 ## 0.2.0
 
