@@ -1121,7 +1121,7 @@ try {
   // compiled (`done`: what the page shows then).
   // Settled: no undo or redo queued or sent, nothing compiling on the server, the newest config shown,
   // and Properties not waiting for a compile.
-  const SETTLED = `!UNDO.busy && !UNDO.inflight && !S.hist?.actions?.running && S.viewRev === S.rev && S.rev === editRev()?.id &&
+  const SETTLED = `!UNDO.busy && !UNDO.inflight && !showingWhy() && !S.hist?.actions?.running && S.viewRev === S.rev && S.rev === editRev()?.id &&
     !/Compiling…|Undo or redo is compiling/.test(document.querySelector("#props")?.textContent || "")`;
   const settled = () => page.waitForFunction(SETTLED, null, { timeout: 20000 });
   // The view of a pending revision, held until `release()` or answered with a 500 (#126): the check's answer then
@@ -1177,10 +1177,15 @@ try {
     await waitText('[data-body="Edit"]', /change its values in pages\/flur\.loxl:3/);
     await page.context().grantPermissions(["clipboard-read", "clipboard-write"], { origin: `http://127.0.0.1:${port}` });
     // A double click copies twice and still puts the label back.
-    await page.dblclick('[data-body="Lox Logic"] button.copy');
-    await waitText('[data-body="Lox Logic"] button.copy', /^Copied$/);
+    // On the one button node held here: a refresh of Properties (the check or the edits arriving) may replace the
+    // button meanwhile, and the label is then set on the node that was replaced.
+    await page.evaluate(() => {
+      window.__copy = document.querySelector('[data-body="Lox Logic"] button.copy');
+      window.__copy.click(); window.__copy.click();
+    });
+    await page.waitForFunction(() => window.__copy.textContent === "Copied");
     assert.equal(await page.evaluate(() => navigator.clipboard.readText()), "pages/flur.loxl:3");
-    await waitText('[data-body="Lox Logic"] button.copy', /^Copy path$/);
+    await page.waitForFunction(() => window.__copy.textContent === "Copy path");
     // A block the lock pins that no .loxl file declares: its slug, and why there is no line.
     await page.evaluate((u) => { gotoPage(S.objPage.get(u), { focus: u }); select(u); }, lagerUuid(3));
     await waitText('[data-body="Lox Logic"]', /lager_3[\s\S]*no \.loxl file declares it now/);
@@ -1711,6 +1716,52 @@ try {
       { op: "wire", from: [DIV, "AQ"], to: [METER, target] },
     ]);
     await wireShown([DIV, "AQ"], [AND, "I2"], false);
+  });
+  await step("an open wire card and a caller waiting for the edits follow the newest load (#141)", async () => {
+    // The card is drawn from /api/edits: answered with a stale list (no wire drawn here), it offers no Revert; the
+    // true answer comes after, and the card has to follow it (it was a snapshot: Delete then did nothing).
+    let stale = true;
+    await page.route("**/api/edits", async (r) => {
+      if (!stale) return r.continue().catch(() => {});
+      const resp = await r.fetch(), j = await resp.json();
+      await r.fulfill({ response: resp, json: { ...j, wires: [] } }).catch(() => {});
+    });
+    try {
+      await page.evaluate(() => { S.editsKey = "stale"; editsChanged(); return S.editsLoad; });
+      await clickWire([DIV, "AQ"], [METER, target]);
+      assert.equal(await page.locator('#wcard [data-wc="unwire"]').count(), 0);
+      stale = false;
+      await page.evaluate(() => { S.editsKey = "fresh"; editsChanged(); return S.editsLoad; });
+      await page.waitForSelector('#wcard [data-wc="unwire"]:not([disabled])', { timeout: 5000 });
+      // The edit state changes (as every History refresh may): the button is patched in place, never replaced.
+      assert.deepEqual(await page.evaluate(() => {
+        const b = document.querySelector('#wcard [data-wc="unwire"]'), out = [];
+        S.mvBusy = true; renderAddHud();
+        out.push(b.isConnected && b === document.querySelector('#wcard [data-wc="unwire"]') && b.disabled, /compiling/.test(wcard.querySelector(".wc-why").textContent));
+        S.mvBusy = false; renderAddHud();
+        out.push(b.isConnected && b === document.querySelector('#wcard [data-wc="unwire"]') && !b.disabled, wcard.querySelector(".wc-why").textContent);
+        return out;
+      }), [true, true, true, ""]);
+      // A wire the page does not draw any more closes the card.
+      assert.deepEqual(await page.evaluate(() => { S.wsel = { from: ["gone", "X"], to: ["gone", "Y"], at: [8, 8] }; wcardRefresh(); return [S.wsel, wcard.classList.contains("hidden")]; }), [null, true]);
+    } finally { await page.unroute("**/api/edits"); }
+    // Two loads overlap, the second held: whoever waits for the first waits for the second's data.
+    let n = 0, release;
+    const held = new Promise((r) => { release = r; });
+    await page.route("**/api/edits", async (r) => {
+      if (++n < 2) return r.continue().catch(() => {});
+      await held;
+      await r.continue().catch(() => {});
+    });
+    try {
+      await page.evaluate(() => { S.editsKey = "a"; editsChanged(); window.__a = S.editsLoad; S.editsKey = "b"; editsChanged(); });
+      assert.equal(await page.evaluate(() => Promise.race([window.__a.then(() => "done"), new Promise((r) => setTimeout(() => r("waiting"), 1000))])), "waiting");
+      release();
+      assert.equal(await page.evaluate(() => window.__a.then(() => "done")), "done");
+    } finally {
+      release();
+      await page.unroute("**/api/edits");
+    }
   });
   await step("Delete takes a wire drawn here out again", async () => {
     await clickWire([DIV, "AQ"], [METER, target]);
@@ -3317,7 +3368,26 @@ try {
     await page.press("#ab-q", "Enter");
     await page.fill('#ab-body [data-ab-field="title"]', "Leistung");
     await page.fill('#ab-body [data-ab-field="s:Check"]', '"power":\\v');
-    ops = await send(() => page.click('#ab-body [data-ab="add"]'), "add its command");
+    // The History is held (until `release`) after the command's add: the page still shows the config before it
+    // while the next edit is started. That edit is refused in the browser, nothing sent for the server to 409.
+    let release;
+    const held = new Promise((r) => { release = r; });
+    await page.route("**/api/history", async (r) => { await held; await r.continue().catch(() => {}); });
+    const nc = edits.length;
+    try {
+      await page.click('#ab-body [data-ab="add"]');
+      await until(() => edits.length > nc && statuses[nc] !== undefined, "add its command");
+      assert.equal(statuses[nc], 200);
+      // Once its reply is handled (not when its headers are in): the page is waiting for the History.
+      await page.waitForFunction(() => showingWhy(), null, { timeout: 10000 });
+      assert.match(await page.evaluate(() => editAct(editRev().blob, [{ op: "title", uuid: S.sel, value: "x" }]).then(() => "sent", (e) => e.message)), /still being shown/);
+      assert.equal(edits.length, nc + 1, "nothing was sent");
+    } finally {
+      release();
+      await page.unroute("**/api/history");
+    }
+    await settled();
+    ops = edits[nc].ops;
     assert.deepEqual(ops, [{ op: "add_block", page: http, type: "VirtualHttpInCmd", title: "Leistung", params: {}, settings: { Check: '"power":\\v' } }]);
     assert.match(pfile(), /^vx_virtualhttpincmd_1 = VirtualHttpInCmd\("Leistung", device: vx_virtualhttpin_1, Check: "\\"power\\":\\\\v"\)$/m);
     // A device of Loxone Config's: the Modbus server takes a Modbus device, through vislox's extern of it.

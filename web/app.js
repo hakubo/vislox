@@ -181,6 +181,9 @@ async function loadHistory(fromEvent, navigation) {
   if ($("status").classList.contains("error")) setStatus("live", "live");
   const prevNewest = newestRev(S.hist)?.id;
   S.hist = h;
+  // The History showing another config than an edit was made on ends the wait for it, for good (a Discard may
+  // bring the first one back).
+  showingWhy();
   $("doc-sub").textContent = h.label + (h.error ? " · " + h.error : "");
   if (h.vislox) {
     $("ver").textContent = "v" + h.vislox.version;
@@ -3354,7 +3357,8 @@ async function loadEdits() {
   if (!S.hist?.actions?.shown) { S.edits = null; managedRefresh(was); return; }
   let got = null, failed = false;
   try { got = await api("/api/edits"); } catch { failed = true; }
-  if (seq !== S.editsSeq) return;
+  // The caller that waits for its load (`await S.editsLoad`) waits for the newest, whose data is applied.
+  if (seq !== S.editsSeq) return S.editsLoad;
   if (failed) { S.edits = null; S.editsKey = null; } else S.edits = got;
   // The managed blocks' badges and the legend follow the lockfile and the module (#64); the expressions'
   // groups follow the module too (#82).
@@ -3369,6 +3373,7 @@ async function loadEdits() {
   if (S.view && (JSON.stringify(S.edits?.add_under || null) !== under ||
     JSON.stringify((S.edits?.blocks || []).filter((b) => b.hardware).map((b) => [b.uuid, b.paired])) !== hwWas)) renderTree();
   if (S.sel && S.view) renderProps();
+  wcardRefresh();
   // Add mode, Add entry and each entry's Edit follow the server (#86): the year is drawn again only when what
   // they say changed, the header's buttons always.
   if (MD.open) mdEditKey() !== mdWas ? renderModes() : mdRenderEdit();
@@ -6366,6 +6371,19 @@ async function editRemove(uuid) {
   if (!window.confirm(`Remove ${displayTitle(o)}? It was added here and is not deployed.`)) return;
   await editSend(uuid, st.rev, [{ op: "remove_block", uuid }], `Remove ${displayTitle(o)}`);
 }
+/** An edit is sent against the config the page shows, and the server refuses it (409) when the pending config
+ *  has changed since. The reply of an edit comes before the History shows its compile: until it does, the page
+ *  still shows the config the edit was made on, and another edit made on it would be refused. `undoSend`, the
+ *  one way an edit is sent, refuses it here with the reason instead. Self-clearing: the History showing any other
+ *  config than `base` ends it (ours, or one a compile elsewhere made), and so does time (the server decides). */
+S.sentFrom = null; // { base, at }: an edit made on the config `base` has been answered
+const SHOWING_WHY = "The last edit is still being shown. Try again in a moment.";
+function showingWhy() {
+  const s = S.sentFrom;
+  if (!s) return "";
+  if (editRev()?.blob !== s.base || Date.now() - s.at > 10000) { S.sentFrom = null; return ""; }
+  return SHOWING_WHY;
+}
 /** Show the newest config, once the History has the compile `blob` (its file watcher may lag behind the reply). */
 async function editShowNewest(blob) {
   await loadHistory();
@@ -6525,6 +6543,9 @@ function undoRemap(added) {
  *  undoes (`redo` false) or redoes `entry`. The one way an edit, an undo or a redo is sent. Throws as
  *  act() does, and then keeps nothing. */
 async function undoSend(base, ops, { label, entry, redo } = {}) {
+  // An undo or redo waits for the History to show the step before it (undoRun); an edit is refused meanwhile.
+  const why = entry ? "" : showingWhy();
+  if (why) throw new Error(why);
   UNDO.inflight++;
   renderAddHud();
   try {
@@ -6557,6 +6578,7 @@ async function undoSend(base, ops, { label, entry, redo } = {}) {
     }
     Object.assign(UNDO, undoNow() || {}, { blob: res.blob, prev: base });
     undoSave();
+    if (!res.unchanged && res.blob && res.blob !== base) S.sentFrom = { base, at: Date.now() };
     return res;
   } finally {
     UNDO.inflight--;
@@ -7080,6 +7102,37 @@ function wcardMsg(e, text, error) {
 function wcardOpen(e, w) {
   S.wmsg = null;
   S.wsel = { from: w.from, to: w.to, at: wcardAt(e) };
+  const v = wcardView(w);
+  wcard.innerHTML = v.html;
+  wcardKey = v.key;
+  wcardSync(v);
+  wcard.classList.remove("hidden");
+  wrHandles();
+  wcardPlace();
+}
+/** The open card follows what it says: /api/edits (who drew the wire) and whether an edit can be sent now
+ *  both arrive after the click. It is drawn again only when the wire's own identity changes (who drew it, what
+ *  it says); a change of the edit state (which every History refresh may bring) is patched in place, so that a
+ *  click on its button never lands on a node that was replaced. A wire the page no longer draws closes it. */
+let wcardKey = "";
+function wcardRefresh() {
+  if (!S.wsel || wcard.classList.contains("hidden")) return;
+  const w = S.view && curPage()?.wires.find((x) => sameEnd(x.from, S.wsel.from) && sameEnd(x.to, S.wsel.to));
+  if (!w) { wcardClose(); return; }
+  const v = wcardView(w);
+  if (v.key !== wcardKey) { wcard.innerHTML = v.html; wcardKey = v.key; wrHandles(); wcardPlace(); }
+  wcardSync(v);
+}
+/** The card's parts that depend on whether an edit can be sent now, set in place. */
+function wcardSync(v) {
+  const set = (el, text) => { if (el && el.textContent !== text) el.textContent = text; };
+  set(wcard.querySelector(".wc-drag"), v.st ? "Drag an end of the wire to another port to reconnect it." : "");
+  set(wcard.querySelector(".wc-why"), v.why);
+  const b = wcard.querySelector("[data-wc=unwire], [data-wc=rewire]");
+  if (b && b.disabled !== !v.st) b.disabled = !v.st;
+}
+/** `{ key, html, st, why }`: the card of wire `w`; `key` names what `html` says (not the edit state). */
+function wcardView(w) {
   const fo = WI?.objs.get(w.from[0]), to = WI?.objs.get(w.to[0]);
   const q = fo?.ports.find((x) => x.key === w.from[1]);
   const x = editsWire(w), st = wireState(), who = wireOwner(w);
@@ -7099,16 +7152,15 @@ function wcardOpen(e, w) {
   } else {
     what = `<span class="tm">${esc(S.edits?.wire_why?.[who] || "")}</span>`;
   }
-  const why = S.hist?.actions?.shown ? wireWhy() : "";
-  wcard.innerHTML = `<div class="wc-head"><b>${esc(fo ? displayTitle(fo) : "")}</b>.${esc(portName(fo, w.from[1]))} → <b>${esc(to ? displayTitle(to) : "")}</b>.${esc(portName(to, w.to[1]))}</div>` +
+  const why = btn && S.hist?.actions?.shown ? wireWhy() || "" : "";
+  const drag = who === "vislox" && !removed;
+  const html = `<div class="wc-head"><b>${esc(fo ? displayTitle(fo) : "")}</b>.${esc(portName(fo, w.from[1]))} → <b>${esc(to ? displayTitle(to) : "")}</b>.${esc(portName(to, w.to[1]))}</div>` +
     `<div class="wc-sub tm">${esc(q?.kind || (w.analog ? "analog" : "digital"))}${w.status ? " · " + esc(w.status) : ""}</div>` +
     `<div class="wc-what">${what}</div>` +
-    (who === "vislox" && !removed && st ? '<div class="wc-note tm">Drag an end of the wire to another port to reconnect it.</div>' : "") +
-    (why && btn ? `<div class="wc-note tm">${esc(why)}</div>` : "") +
-    `<div class="wc-bar">${st ? btn : ""}<button type="button" class="ed-btn small" data-wc="close">Close</button></div>`;
-  wcard.classList.remove("hidden");
-  wrHandles();
-  wcardPlace();
+    (drag ? '<div class="wc-note tm wc-drag"></div>' : "") +
+    (btn ? '<div class="wc-note tm wc-why"></div>' : "") +
+    `<div class="wc-bar">${btn}<button type="button" class="ed-btn small" data-wc="close">Close</button></div>`;
+  return { key: html, html, st, why };
 }
 function wcardClose() {
   S.wsel = null; S.wmsg = null;
@@ -7199,6 +7251,7 @@ function addState() {
 function renderAddHud() {
   renderNewPageBtn();
   adoptRevertSync();
+  wcardRefresh();
   const st = addState(), b = $("btn-add-block"), r = $("btn-relayout");
   $("hud-add").classList.toggle("hidden", !st);
   if (!st) { undoListToggle(false); return; }
