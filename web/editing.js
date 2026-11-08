@@ -430,7 +430,7 @@ function undoListToggle(open) {
   b.setAttribute("aria-expanded", String(open));
   if (open) renderUndoList();
 }
-$("btn-undo").onclick = () => undoStep(false);
-$("btn-redo").onclick = () => undoStep(true);
-$("btn-undo-list").onclick = () => undoListToggle();
-document.addEventListener("click", (e) => { if (!e.target.closest("#undo-pop, #btn-undo-list")) undoListToggle(false); });
+$("btn-undo").onclick = whenReady(() => undoStep(false));
+$("btn-redo").onclick = whenReady(() => undoStep(true));
+$("btn-undo-list").onclick = whenReady(() => undoListToggle());
+document.addEventListener("click", whenReady((e) => { if (!e.target.closest("#undo-pop, #btn-undo-list")) undoListToggle(false); }));

@@ -193,7 +193,9 @@ such as `name`, `status` and `event` must be declared locally or accessed throug
 `/* exported */` headers are the source of truth for shared globals. The config uses
 `tools/script-globals.mjs` to parse the scripts loaded by `index.html` with ESLint's own parser,
 verify each export has a top-level declaration, reject cross-script binding clashes, and generate
-readonly globals for the other scripts. This adds no parser dependency. Update the producer's
+readonly globals for the other scripts. The config and its tests share `tools/web-scripts.mjs`
+for the HTML script list. Lint also requires `whenReady` on load-time listener registrations.
+This adds no parser dependency. Update the producer's
 export header when adding or renaming a shared function; missing exports fail lint at their consumers.
 
 CI (`.github/workflows/ci.yml`) runs all of these on every push to `main` and every pull request.

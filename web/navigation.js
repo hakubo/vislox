@@ -1,4 +1,4 @@
-/* exported allRevs, followLatest, loadHistory, readHash, revById, writeHash */
+/* exported allRevs, followLatest, loadHistory, readHash, revById, whenReady, writeHash */
 "use strict";
 // Revision navigation (classic script, loaded before app.js).
 // Reads: S.hist/rev/base/follow/view/viewRev/hash/page/sel/live/rollbackRev/removals,
@@ -8,6 +8,14 @@
 // renderActions, renderLog, editsChanged, undoSync, showingWhy, loadRunning,
 // liveStart, gotoPage, select, modesOpen, modesClose, setStatus.
 // Async history and popstate requests retain their sequence guards.
+
+// Load-time handlers stay inert until all scripts initialize and start.js opens the gate.
+function whenReady(handler) {
+  return function (...args) {
+    if (!window.VISLOX_READY) return;
+    return handler.apply(this, args);
+  };
+}
 
 function allRevs() { return S.hist ? [...(rollbackPreview() ? [S.rollbackRev] : []), ...(removalsPreview() ? [S.removals.revision] : []), ...S.hist.pending, ...S.hist.history, ...(S.hist.backups || [])] : []; }
 function newestRev(hist = S.hist) { return hist ? hist.pending[0] || hist.history[0] || null : null; }
@@ -34,7 +42,7 @@ let popstateSeq = 0;
 let historyLoadSeq = 0;
 let historyRetryTimer = null;
 let historyRetryDelay = 1000;
-window.addEventListener("popstate", async () => {
+window.addEventListener("popstate", whenReady(async () => {
   if (typeof S === "undefined") return;
   const seq = ++popstateSeq;
   const h = readHash();
@@ -63,7 +71,7 @@ window.addEventListener("popstate", async () => {
       if (h.view === "modes") modesOpen({ quiet: true }); else modesClose(true);
     }
   } finally { if (seq === popstateSeq) S.applyingHash = false; }
-});
+}));
 
 // ── history ────────────────────────────────────────────────────────────
 function followLatest(navigation) {

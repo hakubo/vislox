@@ -328,36 +328,36 @@ function mdDayTip(n) {
 }
 
 // ── events ─────────────────────────────────────────────────────────────
-$("md-prev").onclick = () => modesStep(-1);
-$("md-next").onclick = () => modesStep(1);
-$("md-today").onclick = () => { MD.year = mdYmd(mdToday())[0]; renderModes(); };
-$("md-close").onclick = () => { modesClose(); svg.focus({ preventScroll: true }); };
-$("md-legend").addEventListener("click", (e) => {
+$("md-prev").onclick = whenReady(() => modesStep(-1));
+$("md-next").onclick = whenReady(() => modesStep(1));
+$("md-today").onclick = whenReady(() => { MD.year = mdYmd(mdToday())[0]; renderModes(); });
+$("md-close").onclick = whenReady(() => { modesClose(); svg.focus({ preventScroll: true }); });
+$("md-legend").addEventListener("click", whenReady((e) => {
   const c = e.target.closest("[data-mode]");
   if (!c) return;
   MD.hidden.has(c.dataset.mode) ? MD.hidden.delete(c.dataset.mode) : MD.hidden.add(c.dataset.mode);
   renderModes();
-});
+}));
 // Properties of a climate block: "Show on the year".
-$("props").addEventListener("click", (e) => { if (e.target.closest("[data-modes-open]")) modesOpen(); });
-$("md-list").addEventListener("click", (e) => {
+$("props").addEventListener("click", whenReady((e) => { if (e.target.closest("[data-modes-open]")) modesOpen(); }));
+$("md-list").addEventListener("click", whenReady((e) => {
   const b = e.target.closest("[data-go]");
   if (b) select(b.dataset.go);
-});
-$("md-grid").addEventListener("mousemove", (e) => {
+}));
+$("md-grid").addEventListener("mousemove", whenReady((e) => {
   const c = e.target.closest("[data-day]");
   if (c && MD.cache) showTip(e, mdDayTip(+c.dataset.day)); else hideTip();
-});
-$("md-grid").addEventListener("mouseleave", hideTip);
-$("md-grid").addEventListener("focusin", (e) => {
+}));
+$("md-grid").addEventListener("mouseleave", whenReady(hideTip));
+$("md-grid").addEventListener("focusin", whenReady((e) => {
   const c = e.target.closest("[data-day]");
   if (!c || !MD.cache || MD.restoringFocus) return;
   MD.focusDay = +c.dataset.day;
   const r = c.getBoundingClientRect();
   showTip({ target: c, clientX: r.left + r.width / 2, clientY: r.top + r.height / 2 }, mdDayTip(MD.focusDay));
-});
-$("md-grid").addEventListener("focusout", (e) => { if (!e.relatedTarget?.closest?.("[data-day]")) hideTip(); });
-$("md-grid").addEventListener("keydown", (e) => {
+}));
+$("md-grid").addEventListener("focusout", whenReady((e) => { if (!e.relatedTarget?.closest?.("[data-day]")) hideTip(); }));
+$("md-grid").addEventListener("keydown", whenReady((e) => {
   const c = e.target.closest("[data-day]");
   if (!c) return;
   const day = +c.dataset.day, weekday = (new Date(day * 864e5).getUTCDay() + 6) % 7;
@@ -392,8 +392,8 @@ $("md-grid").addEventListener("keydown", (e) => {
   if (year < MD_FIRST_YEAR || year > MD_LAST_YEAR) return;
   MD.year = year;
   renderModes(next);
-});
-$("md-grid").addEventListener("click", (e) => {
+}));
+$("md-grid").addEventListener("click", whenReady((e) => {
   // A day selects its first entry (one it switches on, else one removed from it).
   // While an entry is drafted, a day is picked for it instead (#86).
   const c = e.target.closest("[data-day]");
@@ -407,7 +407,7 @@ $("md-grid").addEventListener("click", (e) => {
   const d = c && MD.cache?.days.get(+c.dataset.day);
   const first = d && [...d.on, ...d.rem].find((x) => !MD.hidden.has(x.key));
   if (first) select(first.uuid);
-});
+}));
 /** The window's keys while the view is open (app.js asks first): ← / → step the year outside the date grid,
  *  Esc closes, and the keys that pan or zoom the hidden page do nothing. True when handled. */
 function modesKey(e) {
@@ -672,9 +672,9 @@ function mdRenderEdit() {
   }
 }
 
-$("md-add-mode").onclick = () => mfOpen("mode");
-$("md-add-entry").onclick = () => mfOpen("entry");
-$("md-form").addEventListener("input", (e) => {
+$("md-add-mode").onclick = whenReady(() => mfOpen("mode"));
+$("md-add-entry").onclick = whenReady(() => mfOpen("entry"));
+$("md-form").addEventListener("input", whenReady((e) => {
   const f = e.target.closest("[data-mf]");
   if (!f || !MF.open) return;
   MF.draft[f.dataset.mf] = f.value;
@@ -688,38 +688,38 @@ $("md-form").addEventListener("input", (e) => {
     mfRender();
   }
   mfPaint();
-});
-$("md-form").addEventListener("click", (e) => {
+}));
+$("md-form").addEventListener("click", whenReady((e) => {
   const b = e.target.closest("[data-mf-act]");
   if (b?.dataset.mfAct === "save") mfSave();
   else if (b?.dataset.mfAct === "cancel") mfClose();
-});
-$("md-form").addEventListener("keydown", (e) => {
+}));
+$("md-form").addEventListener("keydown", whenReady((e) => {
   if (e.key === "Enter" && e.target.tagName === "INPUT") { e.preventDefault(); mfSave(); }
   else if (e.key === "Escape" && !MF.busy) { e.preventDefault(); e.stopPropagation(); mfClose(); }
-});
-$("md-list").addEventListener("click", (e) => {
+}));
+$("md-list").addEventListener("click", whenReady((e) => {
   const b = e.target.closest("[data-md-edit]");
   if (!b) return;
   e.stopPropagation();
   select(b.dataset.mdEdit, { noReveal: true });
   mfOpen("entry", b.dataset.mdEdit);
-});
-$("md-grid").addEventListener("mousedown", (e) => {
+}));
+$("md-grid").addEventListener("mousedown", whenReady((e) => {
   const c = e.target.closest("[data-day]");
   if (!c || e.button !== 0 || !MF.open || MF.what !== "entry" || MF.busy) return;
   e.preventDefault();
   MF.keyboardAnchor = null;
   MF.drag = { a: +c.dataset.day, b: +c.dataset.day };
   mfPaint();
-});
-$("md-grid").addEventListener("mouseover", (e) => {
+}));
+$("md-grid").addEventListener("mouseover", whenReady((e) => {
   const c = MF.drag && e.target.closest("[data-day]");
   if (c && +c.dataset.day !== MF.drag.b) { MF.drag.b = +c.dataset.day; mfPaint(); }
-});
-window.addEventListener("mouseup", () => {
+}));
+window.addEventListener("mouseup", whenReady(() => {
   if (!MF.drag) return;
   const { a, b } = MF.drag;
   MF.drag = null;
   mfPick(a, b);
-});
+}));

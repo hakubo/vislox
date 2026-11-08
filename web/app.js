@@ -375,7 +375,7 @@ function renderTabs() {
     if (p.uuid === S.page) requestAnimationFrame(() => t.scrollIntoView({ block: "nearest", inline: "nearest" }));
   }
 }
-$("tab-list").addEventListener("keydown", (e) => {
+$("tab-list").addEventListener("keydown", whenReady((e) => {
   if (e.key !== "ArrowLeft" && e.key !== "ArrowRight" && e.key !== "Home" && e.key !== "End") return;
   e.preventDefault();
   const tabs = [...$("tab-list").querySelectorAll(".tab")];
@@ -383,7 +383,7 @@ $("tab-list").addEventListener("keydown", (e) => {
   i = e.key === "Home" ? 0 : e.key === "End" ? tabs.length - 1 : Math.max(0, Math.min(tabs.length - 1, i + (e.key === "ArrowRight" ? 1 : -1)));
   gotoPage(tabs[i].dataset.uuid);
   $("tab-list").querySelector(`[data-uuid="${CSS.escape(tabs[i].dataset.uuid)}"]`)?.focus();
-});
+}));
 function gotoPage(uuid, opts) {
   if (!uuid || !S.pageOf.has(uuid)) return;
   // Going to a page leaves the Operating modes view.
@@ -403,9 +403,9 @@ function stepPage(d) {
   const j = Math.max(0, Math.min(pages.length - 1, i + d));
   if (pages[j]) gotoPage(pages[j].uuid);
 }
-document.querySelectorAll(".tab-nav button").forEach((b) => (b.onclick = () => stepPage(b.dataset.nav === "next" ? 1 : -1)));
-$("chk-only-changed").onchange = (e) => { S.onlyChanged = e.target.checked; renderTabs(); };
-$("btn-pages").onclick = () => openPalette("");
+document.querySelectorAll(".tab-nav button").forEach((b) => (b.onclick = whenReady(() => stepPage(b.dataset.nav === "next" ? 1 : -1))));
+$("chk-only-changed").onchange = whenReady((e) => { S.onlyChanged = e.target.checked; renderTabs(); });
+$("btn-pages").onclick = whenReady(() => openPalette(""));
 
 // ── canvas ─────────────────────────────────────────────────────────────
 const svg = $("canvas"), vpG = $("viewport");
@@ -452,19 +452,19 @@ function zoomAt(f, cx, cy) {
 }
 function zoomCenter(f) { zoomAt(f, svg.clientWidth / 2, svg.clientHeight / 2); }
 function pan(dx, dy) { const v = S.vp[S.page]; if (v) { v.x += dx; v.y += dy; applyVp(); } }
-svg.addEventListener("wheel", (e) => {
+svg.addEventListener("wheel", whenReady((e) => {
   e.preventDefault();
   const r = svg.getBoundingClientRect();
   if (e.ctrlKey || !e.shiftKey) zoomAt(Math.pow(1.0018, -e.deltaY), e.clientX - r.left, e.clientY - r.top);
   else pan(-e.deltaY, 0);
-}, { passive: false });
+}), { passive: false });
 let drag = null;
-svg.addEventListener("mousedown", (e) => {
+svg.addEventListener("mousedown", whenReady((e) => {
   if (e.button !== 0 && e.button !== 1) return;
   drag = { x: e.clientX, y: e.clientY, moved: false };
   svg.classList.add("panning");
-});
-window.addEventListener("mousemove", (e) => {
+}));
+window.addEventListener("mousemove", whenReady((e) => {
   // A wire being drawn holds the page still; so does a move with no button down (the pan's mouse-up
   // clears it only after a timer).
   if (!drag || WR) return;
@@ -472,17 +472,17 @@ window.addEventListener("mousemove", (e) => {
   const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
   if (Math.abs(dx) + Math.abs(dy) > 3) drag.moved = true;
   if (drag.moved) { pan(dx, dy); drag.x = e.clientX; drag.y = e.clientY; hideTip(); }
-});
-window.addEventListener("mouseup", () => { svg.classList.remove("panning"); setTimeout(() => (drag = null), 0); });
-svg.addEventListener("click", (e) => {
+}));
+window.addEventListener("mouseup", whenReady(() => { svg.classList.remove("panning"); setTimeout(() => (drag = null), 0); }));
+svg.addEventListener("click", whenReady((e) => {
   if (drag && drag.moved) return;
   if (e.target === svg || e.target.classList.contains("sheet") || e.target.classList.contains("sheet-dots")) { select(null); wcardClose(); }
-});
-$("btn-fit").onclick = fit;
-$("btn-zoom-in").onclick = () => zoomCenter(1.25);
-$("btn-zoom-out").onclick = () => zoomCenter(0.8);
-$("btn-zoom-pct").onclick = () => { const v = S.vp[S.page]; if (v) zoomCenter(K100 / v.k); };
-window.addEventListener("resize", () => { if (S.page && !S.vp[S.page]) fit(); updateMinimap(); });
+}));
+$("btn-fit").onclick = whenReady(fit);
+$("btn-zoom-in").onclick = whenReady(() => zoomCenter(1.25));
+$("btn-zoom-out").onclick = whenReady(() => zoomCenter(0.8));
+$("btn-zoom-pct").onclick = whenReady(() => { const v = S.vp[S.page]; if (v) zoomCenter(K100 / v.k); });
+window.addEventListener("resize", whenReady(() => { if (S.page && !S.vp[S.page]) fit(); updateMinimap(); }));
 
 const tip = $("tooltip");
 function showTip(e, html) {
@@ -1072,9 +1072,9 @@ function minimapGo(e) {
   applyVp();
 }
 let mmDrag = false;
-$("minimap").addEventListener("mousedown", (e) => { mmDrag = true; minimapGo(e); e.preventDefault(); });
-window.addEventListener("mousemove", (e) => { if (mmDrag) minimapGo(e); });
-window.addEventListener("mouseup", () => (mmDrag = false));
+$("minimap").addEventListener("mousedown", whenReady((e) => { mmDrag = true; minimapGo(e); e.preventDefault(); }));
+window.addEventListener("mousemove", whenReady((e) => { if (mmDrag) minimapGo(e); }));
+window.addEventListener("mouseup", whenReady(() => (mmDrag = false)));
 
 // ── selection, focus mode & properties ────────────────────────────────
 function select(uuid, opts) {
@@ -1336,7 +1336,7 @@ function renderPropsBody() {
       return `<section><button type="button" class="ps-h" aria-expanded="${open}" data-sec="${esc(s.name)}">${esc(s.name)}${s.count ? `<span class="count">${s.count}</span>` : ""}</button><div class="ps-b" data-body="${esc(s.name)}"${open ? "" : " hidden"}>${s.rows.join("")}</div></section>`;
     }).join("");
 }
-$("props").addEventListener("keydown", (e) => {
+$("props").addEventListener("keydown", whenReady((e) => {
   if (e.target.id === "ad-slug" && e.key === "Enter") { e.preventDefault(); adoptSave(S.sel); return; }
   if (e.target.id === "ad-slug" && e.key === "Escape") { e.preventDefault(); e.stopPropagation(); adoptClose(); return; }
   if (e.target.id === "rn-slug" && e.key === "Enter") { e.preventDefault(); renameSave(S.sel); return; }
@@ -1353,9 +1353,9 @@ $("props").addEventListener("keydown", (e) => {
   if (f && e.key === "Escape") { e.preventDefault(); e.stopPropagation(); editClose(); return; }
   const i = e.target.closest(".op input");
   if (i && e.key === "Enter") { e.preventDefault(); operate(i.dataset.opUuid, i.value); }
-});
-$("props").addEventListener("toggle", (e) => { if (e.target.classList?.contains("ex-new")) { exSync(); S.ex.draft["new:open"] = e.target.open; } }, true);
-$("props").addEventListener("input", (e) => {
+}));
+$("props").addEventListener("toggle", whenReady((e) => { if (e.target.classList?.contains("ex-new")) { exSync(); S.ex.draft["new:open"] = e.target.open; } }), true);
+$("props").addEventListener("input", whenReady((e) => {
   if (e.target.dataset.exField) { exSync(); S.ex.draft[e.target.dataset.exField] = e.target.value; return; }
   if (e.target.id === "ad-slug") { AD.slug = e.target.value; return; }
   if (e.target.dataset.dfltField) { DF.value = e.target.value; DF.err = ""; return; }
@@ -1365,8 +1365,8 @@ $("props").addEventListener("input", (e) => {
   if (!f || S.edit.uuid !== S.sel) return;
   S.edit.draft[f.dataset.edField] = f.value;
   delete S.edit.bad[f.dataset.edField];
-});
-$("props").addEventListener("click", (e) => {
+}));
+$("props").addEventListener("click", whenReady((e) => {
   const xb = e.target.closest("[data-ex]");
   if (xb) { exAct(xb.dataset.ex, xb.dataset.id); return; }
   const db = e.target.closest("[data-dflt]");
@@ -1420,7 +1420,7 @@ $("props").addEventListener("click", (e) => {
   if (!a) return;
   if (a.dataset.page) gotoPage(a.dataset.page, { focus: a.dataset.go });
   select(a.dataset.go);
-});
+}));
 
 /** How a change reconfigures a device (`device.how`, `hardware[].how`). */
 const HW_HOW = {
@@ -1566,7 +1566,7 @@ function toggleNode(uuid) {
   S.treeFocus = uuid;
   renderTree();
 }
-$("tree").addEventListener("click", (e) => {
+$("tree").addEventListener("click", whenReady((e) => {
   const row = e.target.closest(".tn-row");
   if (!row) return;
   const uuid = row.dataset.uuid;
@@ -1575,13 +1575,13 @@ $("tree").addEventListener("click", (e) => {
   if (e.target.closest("[data-add-under]")) { abOpenUnder(uuid); return; }
   if (e.target.closest(".tn-tw") && row.hasAttribute("aria-expanded")) { toggleNode(uuid); return; }
   activateNode(uuid);
-});
-$("tree").addEventListener("dblclick", (e) => {
+}));
+$("tree").addEventListener("dblclick", whenReady((e) => {
   if (e.target.closest("[data-modes], [data-add-under]")) return;
   const row = e.target.closest(".tn-row");
   if (row && row.hasAttribute("aria-expanded")) toggleNode(row.dataset.uuid);
-});
-$("tree").addEventListener("keydown", (e) => {
+}));
+$("tree").addEventListener("keydown", whenReady((e) => {
   const rows = [...$("tree").querySelectorAll(".tn-row")];
   if (!rows.length) return;
   let i = rows.findIndex((r) => r.dataset.uuid === S.treeFocus);
@@ -1609,11 +1609,11 @@ $("tree").addEventListener("keydown", (e) => {
     default: return;
   }
   e.preventDefault();
-});
-$("tree").addEventListener("focus", () => {
+}));
+$("tree").addEventListener("focus", whenReady(() => {
   if (!S.treeFocus) { const r = $("tree").querySelector(".tn-row"); if (r) { S.treeFocus = r.dataset.uuid; r.classList.add("kfocus"); } }
-});
-$("tree-filter").addEventListener("input", renderTree);
+}));
+$("tree-filter").addEventListener("input", whenReady(renderTree));
 
 // ── changes ────────────────────────────────────────────────────────────
 const KIND = { added: ["+", "added"], removed: ["−", "removed"], renamed: ["~", "renamed"], param: ["~", "parameters"], attr: ["~", "settings"], rights: ["~", "rights"], "wire+": ["+", "wires added"], "wire-": ["−", "wires removed"], moved: ["↔", "moved"] };
@@ -1775,8 +1775,8 @@ function markCurrentChange() {
   const c = shownChanges()[S.chgIdx];
   if (c?.obj) vpG.querySelectorAll(`[data-uuid="${CSS.escape(c.obj)}"]`).forEach((n) => n.classList.add("cur-change"));
 }
-$("chg-prev").onclick = () => gotoChange(S.chgIdx < 0 ? -1 : S.chgIdx - 1);
-$("chg-next").onclick = () => gotoChange(S.chgIdx + 1);
+$("chg-prev").onclick = whenReady(() => gotoChange(S.chgIdx < 0 ? -1 : S.chgIdx - 1));
+$("chg-next").onclick = whenReady(() => gotoChange(S.chgIdx + 1));
 
 // ── command palette ────────────────────────────────────────────────────
 // The palette also picks a block for an editor (`pal.pick`, #75: a central block's new member): only blocks of
@@ -1913,47 +1913,47 @@ function palOpen(i) {
   else { gotoPage(it.page, { focus: it.uuid }); select(it.uuid); }
   svg.focus({ preventScroll: true });
 }
-$("pal-input").addEventListener("input", renderPalette);
-$("pal-input").addEventListener("keydown", (e) => {
+$("pal-input").addEventListener("input", whenReady(renderPalette));
+$("pal-input").addEventListener("keydown", whenReady((e) => {
   if (e.key === "ArrowDown") { palMove(1); e.preventDefault(); }
   else if (e.key === "ArrowUp") { palMove(-1); e.preventDefault(); }
   else if (e.key === "Enter") { palOpen(pal.idx); e.preventDefault(); }
   else if (e.key === "Escape") { closePalette(); e.preventDefault(); }
-});
-$("pal-list").addEventListener("click", (e) => { const li = e.target.closest("[data-i]"); if (li) palOpen(+li.dataset.i); });
-$("palette").addEventListener("mousedown", (e) => { if (e.target.id === "palette") closePalette(); });
-$("btn-search").onclick = () => openPalette("");
+}));
+$("pal-list").addEventListener("click", whenReady((e) => { const li = e.target.closest("[data-i]"); if (li) palOpen(+li.dataset.i); }));
+$("palette").addEventListener("mousedown", whenReady((e) => { if (e.target.id === "palette") closePalette(); }));
+$("btn-search").onclick = whenReady(() => openPalette(""));
 
 // ── help ───────────────────────────────────────────────────────────────
 function openHelp() { $("help").classList.remove("hidden"); $("help-close").focus(); }
 function closeHelp() { $("help").classList.add("hidden"); }
-$("btn-help").onclick = openHelp;
-$("help-close").onclick = closeHelp;
-$("help").addEventListener("mousedown", (e) => { if (e.target.id === "help") closeHelp(); });
+$("btn-help").onclick = whenReady(openHelp);
+$("help-close").onclick = whenReady(closeHelp);
+$("help").addEventListener("mousedown", whenReady((e) => { if (e.target.id === "help") closeHelp(); }));
 
 // ── controls ───────────────────────────────────────────────────────────
-$("sel-rev").onchange = (e) => {
+$("sel-rev").onchange = whenReady((e) => {
   S.rev = e.target.value;
   S.base = revById(S.rev)?.base || null;
   S.follow = false; $("chk-follow").checked = false;
   renderHistory(); renderSelects(); loadView(); writeHash(true);
-};
-$("sel-base").onchange = (e) => { S.base = e.target.value || null; S.follow = false; $("chk-follow").checked = false; renderHistory(); loadView(); writeHash(true); };
-$("chk-changes").onchange = (e) => {
+});
+$("sel-base").onchange = whenReady((e) => { S.base = e.target.value || null; S.follow = false; $("chk-follow").checked = false; renderHistory(); loadView(); writeHash(true); });
+$("chk-changes").onchange = whenReady((e) => {
   S.marks = e.target.checked;
   if (!S.view) return;
   renderLegend(); renderTabs(); renderTree(); renderPage(); renderProps(); applyFocus(); renderModes(); renderTests(); renderLint();
-};
-$("chk-live").onchange = (e) => setLive(e.target.checked);
+});
+$("chk-live").onchange = whenReady((e) => setLive(e.target.checked));
 $("chk-live-dim").checked = S.live.dim;
-$("chk-live-dim").onchange = (e) => { S.live.dim = e.target.checked; setPref("liveDim", S.live.dim); renderLiveSwitch(); };
+$("chk-live-dim").onchange = whenReady((e) => { S.live.dim = e.target.checked; setPref("liveDim", S.live.dim); renderLiveSwitch(); });
 $("chk-live-query").checked = S.live.query;
-$("chk-live-query").onchange = (e) => { S.live.query = e.target.checked; setPref("liveQuery", S.live.query); renderLiveSwitch(); };
-$("chk-dim").onchange = (e) => { S.dim = e.target.checked; renderPage(); applyFocus(); };
-$("chk-only-managed").onchange = (e) => { S.onlyManaged = e.target.checked; renderPage(); applyFocus(); };
-$("chk-follow").onchange = (e) => { if (e.target.checked) followLatest(); else S.follow = false; writeHash(false); };
+$("chk-live-query").onchange = whenReady((e) => { S.live.query = e.target.checked; setPref("liveQuery", S.live.query); renderLiveSwitch(); });
+$("chk-dim").onchange = whenReady((e) => { S.dim = e.target.checked; renderPage(); applyFocus(); });
+$("chk-only-managed").onchange = whenReady((e) => { S.onlyManaged = e.target.checked; renderPage(); applyFocus(); });
+$("chk-follow").onchange = whenReady((e) => { if (e.target.checked) followLatest(); else S.follow = false; writeHash(false); });
 
-window.addEventListener("keydown", (e) => {
+window.addEventListener("keydown", whenReady((e) => {
   if (e.defaultPrevented) return;
   if (!$("palette").classList.contains("hidden") || !$("help").classList.contains("hidden")) {
     if (e.key === "Escape") { closePalette(); closeHelp(); }
@@ -2007,10 +2007,10 @@ window.addEventListener("keydown", (e) => {
     default: return;
   }
   e.preventDefault();
-});
+}));
 
 for (const [sid, a, b] of [["split-left", "tree-pane", "props-pane"], ["split-right", "hist-pane", "chg-pane"]]) {
-  $(sid).addEventListener("mousedown", (e) => {
+  $(sid).addEventListener("mousedown", whenReady((e) => {
     e.preventDefault();
     const A = $(a), B = $(b), total = A.offsetHeight + B.offsetHeight, y0 = e.clientY, h0 = A.offsetHeight;
     const mv = (ev) => {
@@ -2020,7 +2020,7 @@ for (const [sid, a, b] of [["split-left", "tree-pane", "props-pane"], ["split-ri
     const up = () => { window.removeEventListener("mousemove", mv); window.removeEventListener("mouseup", up); };
     window.addEventListener("mousemove", mv);
     window.addEventListener("mouseup", up);
-  });
+  }));
 }
 
 // ── pull from the Miniserver ───────────────────────────────────────────
@@ -2063,7 +2063,7 @@ async function pull() {
     pulling = false; renderPull(); loadMs(true);
   }
 }
-$("btn-pull").onclick = pull;
+$("btn-pull").onclick = whenReady(pull);
 
 // ── which config the Miniserver runs ───────────────────────────────────
 // Pull and Apply take the newest backup in /prog; the Miniserver may run another file (an upload
@@ -2094,8 +2094,8 @@ function renderRunning() {
   box.innerHTML = `<div class="ms-line" title="${esc(tip)}"><span>${r.from === "def.log" ? "Runs" : "Probably runs"} <code>${esc(r.running || "?")}</code>${r.firmware ? ` · fw ${esc(r.firmware)}` : ""}</span>${again}</div>` +
     (r.warnings || []).map((w) => `<div class="ms-warn" data-kind="${esc(w.kind)}">⚠ ${esc(w.text)}</div>`).join("");
 }
-$("ms-run").addEventListener("click", (e) => { if (e.target.closest(".ms-again")) loadRunning(true); });
-$("pull-msg").onclick = () => pullMsg("");
+$("ms-run").addEventListener("click", whenReady((e) => { if (e.target.closest(".ms-again")) loadRunning(true); }));
+$("pull-msg").onclick = whenReady(() => pullMsg(""));
 
 // ── the Miniserver: status chip and preflight ──────────────────────────
 // The server checks the Miniserver lox talks to (its web port, FTP, the unauthenticated
@@ -2183,8 +2183,8 @@ function renderStale() {
   $("stale-sync").classList.toggle("hidden", !syncOk);
   $("stale-row").classList.toggle("hidden", !pullOk && !syncOk);
 }
-$("stale-pull").onclick = () => $("btn-pull").click();
-$("stale-sync").onclick = () => $("btn-sync").click();
+$("stale-pull").onclick = whenReady(() => $("btn-pull").click());
+$("stale-sync").onclick = whenReady(() => $("btn-sync").click());
 
 // ── calendar entries changed in the Loxone app ─────────────────────────
 // The server reads the Miniserver's entries (calendargetentries, admin only) when live values
@@ -2260,31 +2260,31 @@ function renderCalDrift() {
   $("cal-drift-sync").classList.toggle("hidden", !syncOk);
   $("cal-drift-row").classList.toggle("hidden", !pullOk && !syncOk);
 }
-$("cal-drift-pull").onclick = () => $("btn-pull").click();
-$("cal-drift-sync").onclick = () => $("btn-sync").click();
-$("cal-drift-list").addEventListener("click", (e) => {
+$("cal-drift-pull").onclick = whenReady(() => $("btn-pull").click());
+$("cal-drift-sync").onclick = whenReady(() => $("btn-sync").click());
+$("cal-drift-list").addEventListener("click", whenReady((e) => {
   const g = e.target.closest("[data-go]");
   if (!g) return;
   const u = g.dataset.go, pg = S.view?.objects[u]?.page;
   if (pg) gotoPage(pg, { focus: u });
   select(u);
-});
+}));
 function closeMsPop() { $("ms-pop").classList.add("hidden"); $("ms-chip").setAttribute("aria-expanded", "false"); }
-$("ms-chip").onclick = () => {
+$("ms-chip").onclick = whenReady(() => {
   const open = $("ms-pop").classList.toggle("hidden") === false;
   $("ms-chip").setAttribute("aria-expanded", String(open));
   if (open) loadMs();
-};
-$("ms-recheck").onclick = async () => {
+});
+$("ms-recheck").onclick = whenReady(async () => {
   const b = $("ms-recheck");
   b.disabled = true; b.textContent = "Checking…";
   await loadMs(true);
   b.disabled = false; b.textContent = "Check again";
-};
-document.addEventListener("keydown", (e) => {
+});
+document.addEventListener("keydown", whenReady((e) => {
   if (e.key === "Escape" && !$("ms-pop").classList.contains("hidden")) { closeMsPop(); $("ms-chip").focus(); e.stopPropagation(); }
-}, true);
-document.addEventListener("click", (e) => { if (!e.target.closest(".ms-wrap")) closeMsPop(); });
+}), true);
+document.addEventListener("click", whenReady((e) => { if (!e.target.closest(".ms-wrap")) closeMsPop(); }));
 
 // ── in the app ─────────────────────────────────────────────────────────
 // The Miniserver's structure file (LoxAPP3.json) lists what the app shows:
@@ -2456,7 +2456,7 @@ function renderRights() {
   });
   box.innerHTML = `<details${open ? " open" : ""}><summary><span class="rt-h">Rights and schedules</span> ${list.length}${lost ? ` <span class="rt-lose">· ${plural(lost, "user")} lose${lost === 1 ? "s" : ""} a right</span>` : ""}</summary><ul class="rt-list">${items.join("")}</ul></details>`;
 }
-$("rights-box").addEventListener("click", goClicked);
+$("rights-box").addEventListener("click", whenReady(goClicked));
 /** How two lists of rights differ, as the server compares them (rights.rs): a right is a principal and a
  *  schedule, both by UUID. A principal with one right before and one after, under another schedule, is
  *  rescheduled (new entry → old entry); anything else is added or removed. */
@@ -2976,16 +2976,16 @@ async function tpAct(what) {
     if (u) select(u, { noReveal: true });
   }
 }
-$("props").addEventListener("input", (e) => {
+$("props").addEventListener("input", whenReady((e) => {
   if (e.target.dataset.tpField) { tpSync(); S.tp.draft[e.target.dataset.tpField] = e.target.value; }
-});
-$("props").addEventListener("click", (e) => {
+}));
+$("props").addEventListener("click", whenReady((e) => {
   const b = e.target.closest("[data-tp]");
   if (b) { e.stopPropagation(); tpAct(b.dataset.tp); }
-});
-$("props").addEventListener("keydown", (e) => {
+}));
+$("props").addEventListener("keydown", whenReady((e) => {
   if (e.target.dataset?.tpField && e.key === "Enter") { e.preventDefault(); tpAct("save"); }
-});
+}));
 /** The template group a change goes under (#83), on the newest config: `tpl <Template>` when the change is to a
  *  block of an instance whose template (or an enclosing one) changed since the deployed config, which is what is
  *  compared; else `inst <path>`, the top-level instance. */
@@ -3689,7 +3689,7 @@ function seAdd(c, at, analog) {
   c.spans.sort((a, b) => a.from - b.from);
   return s;
 }
-$("props").addEventListener("click", (e) => {
+$("props").addEventListener("click", whenReady((e) => {
   const b = e.target.closest("[data-se]");
   if (!b || b.tagName === "SELECT" || b.type === "checkbox") return;
   e.stopPropagation();
@@ -3709,8 +3709,8 @@ $("props").addEventListener("click", (e) => {
   else if (what === "copy" && c) for (const u of SE_GROUPS[b.dataset.to]) { const t = seCol(u); if (t && t !== c) t.spans = c.spans.map((s) => ({ ...s })); }
   SE.bad = {}; SE.err = "";
   renderProps();
-}, true);
-$("props").addEventListener("change", (e) => {
+}), true);
+$("props").addEventListener("change", whenReady((e) => {
   const t = e.target, what = t.dataset?.se;
   if (!what) return;
   const o = S.view?.objects[S.sel];
@@ -3725,8 +3725,8 @@ $("props").addEventListener("change", (e) => {
     if (from) { SE.cols = seDraft(from); if (!seCol(SE.sel)) SE.sel = SE_WEEK[0]; }
   }
   renderProps();
-});
-$("props").addEventListener("input", (e) => {
+}));
+$("props").addEventListener("input", whenReady((e) => {
   const f = e.target.closest?.("[data-sch-field]");
   if (!f || !SE.open || SE.busy) return;
   const [uuid, i, end] = f.dataset.schField.split("|");
@@ -3737,15 +3737,15 @@ $("props").addEventListener("input", (e) => {
   const ok = end === "value" || s[end] != null;
   f.setAttribute("aria-invalid", ok ? "false" : "true");
   seRefreshBars(!!S.view?.objects[SE.uuid]?.schedule?.analog);
-});
-$("props").addEventListener("keydown", (e) => {
+}));
+$("props").addEventListener("keydown", whenReady((e) => {
   if (!e.target.closest?.("[data-sch-field]")) return;
   if (e.key === "Enter") { e.preventDefault(); e.stopPropagation(); seSave(); }
   else if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); seClose(); }
-}, true);
+}), true);
 // Dragging on a bar: a segment moves, a handle resizes, the empty bar adds an hour there. Snapped to 15 minutes
 // (Alt: to the minute), never past the day or into the next interval.
-$("props").addEventListener("pointerdown", (e) => {
+$("props").addEventListener("pointerdown", whenReady((e) => {
   const bar = e.target.closest?.("[data-se-bar]");
   if (!bar || !SE.open || SE.busy || e.button !== 0) return;
   const c = seCol(bar.dataset.seBar), analog = !!S.view?.objects[SE.uuid]?.schedule?.analog;
@@ -3774,7 +3774,7 @@ $("props").addEventListener("pointerdown", (e) => {
   const up = () => { window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", up); SE.bad = {}; renderProps(); };
   window.addEventListener("pointermove", move);
   window.addEventListener("pointerup", up);
-});
+}));
 
 /** A shared set's claimants the config shown no longer has (deleted in Loxone Config): the server refuses
  *  to write the set while their claims stand, so each gets *Drop its claim* (`attr`: `se` or `mo`). */
@@ -4022,7 +4022,7 @@ async function moRevert(uuid) {
   if (r.why) { MO.uuid = uuid; MO.err = r.why; MO.msg = ""; renderProps(); return; }
   await moSend(o, st, { op: "moods", uuid, value: r.value }, `Revert the moods of ${displayTitle(o)}`);
 }
-$("props").addEventListener("click", (e) => {
+$("props").addEventListener("click", whenReady((e) => {
   const b = e.target.closest("[data-mo]");
   if (!b || b.tagName === "SELECT" || b.type === "checkbox") return;
   e.stopPropagation();
@@ -4047,8 +4047,8 @@ $("props").addEventListener("click", (e) => {
   MO.bad = {}; MO.err = ""; MO.warned = "";
   renderProps();
   if (what === "add") $("props").querySelector(`[data-mo-name="${MO.rows.length - 1}"]`)?.select();
-}, true);
-$("props").addEventListener("change", (e) => {
+}), true);
+$("props").addEventListener("change", whenReady((e) => {
   const t = e.target, what = t.dataset?.mo;
   if (!what) return;
   const o = S.view?.objects[S.sel];
@@ -4067,8 +4067,8 @@ $("props").addEventListener("change", (e) => {
   else if (what === "addc" && t.value) MO.extra.add(+t.value);
   MO.bad = {}; MO.err = ""; MO.warned = "";
   renderProps();
-});
-$("props").addEventListener("input", (e) => {
+}));
+$("props").addEventListener("input", whenReady((e) => {
   if (!MO.open || MO.busy) return;
   const f = e.target.closest?.("[data-mo-field], [data-mo-name]");
   if (!f) return;
@@ -4078,12 +4078,12 @@ $("props").addEventListener("input", (e) => {
     if (c) { c.a = f.value; f.setAttribute("aria-invalid", moValue(c) == null ? "true" : "false"); }
   }
   MO.warned = "";
-});
-$("props").addEventListener("keydown", (e) => {
+}));
+$("props").addEventListener("keydown", whenReady((e) => {
   if (!e.target.closest?.("[data-mo-field], [data-mo-name]")) return;
   if (e.key === "Enter") { e.preventDefault(); e.stopPropagation(); moSave(); }
   else if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); moClose(); }
-}, true);
+}), true);
 
 // ── members of a central block (#75) ───────────────────────────────────
 // A CentralLight drives a list of lighting controllers, a CentralShade a list of automatic blinds: Lox Logic writes
@@ -4234,7 +4234,7 @@ function meSave() {
   }
   meSend(o, ME.blob, { op: "members", uuid: o.uuid, value: [...ME.list] });
 }
-$("props").addEventListener("click", (e) => {
+$("props").addEventListener("click", whenReady((e) => {
   const b = e.target.closest("[data-me]");
   if (!b) return;
   e.stopPropagation();
@@ -4258,7 +4258,7 @@ $("props").addEventListener("click", (e) => {
   // Keep the keyboard where it was: on the same button of the row that moved, or the next row's.
   const j = what === "up" ? i - 1 : what === "down" ? i + 1 : Math.min(i, ME.list.length - 1);
   ($("props").querySelector(`[data-me="${what}"][data-i="${j}"]:not([disabled])`) || $("props").querySelector(`[data-me="del"][data-i="${j}"]`) || $("props").querySelector('[data-me="add"]'))?.focus();
-}, true);
+}), true);
 
 // ── Automatic Designer rules (#87) ─────────────────────────────────────
 // A rule (`AutopilotRule`) is made in the app and stored as a JSON payload; Lox Logic writes what it does as a
@@ -4516,7 +4516,7 @@ function ruPick(i) {
     back: () => $("props").querySelector(`[data-ru="pick"][data-i="${i}"]`)?.focus(),
   });
 }
-$("props").addEventListener("click", (e) => {
+$("props").addEventListener("click", whenReady((e) => {
   const b = e.target.closest("[data-ru]");
   if (!b) return;
   e.stopPropagation();
@@ -4552,9 +4552,9 @@ $("props").addEventListener("click", (e) => {
   else if (what === "down" && i < RU.lines.length - 1) RU.lines.splice(i + 1, 0, RU.lines.splice(i, 1)[0]);
   RU.err = "";
   renderProps();
-}, true);
+}), true);
 /** A field of the draft: kept as typed, the form redrawn only where its shape changes (kind, block, on/off). */
-$("props").addEventListener("input", (e) => {
+$("props").addEventListener("input", whenReady((e) => {
   const f = e.target.closest?.("[data-ru-f]");
   if (!f) return;
   const k = f.dataset.ruF, i = +f.dataset.i;
@@ -4573,7 +4573,7 @@ $("props").addEventListener("input", (e) => {
   if (save) save.disabled = !!shape;
   const m = save?.parentElement?.querySelector(".ed-msg");
   if (m) { m.textContent = shape || "Saving states the rule in the module and compiles it; nothing is deployed. lox checks each block's states and commands."; m.classList.toggle("err", !!shape); }
-});
+}));
 
 // ── who may open an NFC Code Touch (#76), who gets a push notification (#77) ──
 // A Code Touch's access rights are a Lox Logic `access` set (users and groups, each with an access schedule) and
@@ -4804,7 +4804,7 @@ async function acSame(o, set) {
   renderProps();
   $("props").querySelector('[data-ac="sameok"]')?.focus();
 }
-$("props").addEventListener("click", (e) => {
+$("props").addEventListener("click", whenReady((e) => {
   const b = e.target.closest("[data-ac]");
   if (!b || b.tagName === "SELECT" || b.type === "checkbox") return;
   e.stopPropagation();
@@ -4844,8 +4844,8 @@ $("props").addEventListener("click", (e) => {
   renderProps();
   if (what === "add") $("props").querySelector(`[data-ac-p="${AC.rows.length - 1}"]`)?.focus();
   else ($("props").querySelector(`[data-ac="del"][data-i="${Math.min(i, AC.rows.length - 1)}"]`) || $("props").querySelector('[data-ac="add"]'))?.focus();
-}, true);
-$("props").addEventListener("change", (e) => {
+}), true);
+$("props").addEventListener("change", whenReady((e) => {
   const t = e.target;
   if (!t.closest?.("[data-ac], [data-ac-p], [data-ac-s]")) return;
   const o = S.view?.objects[S.sel];
@@ -4863,7 +4863,7 @@ $("props").addEventListener("change", (e) => {
   AC.err = ""; AC.warned = "";
   renderProps();
   $("props").querySelector(t.dataset.acP != null ? `[data-ac-p="${t.dataset.acP}"]` : t.dataset.acS != null ? `[data-ac-s="${t.dataset.acS}"]` : '[data-ac="shareall"]')?.focus();
-});
+}));
 
 // ── tiles of a Touch Pure Flex (#78) ────────────────────────────────────
 // A Touch Pure Flex's tiles are a Lox Logic `tiles` set and the device's `.tiles` claim, written into vislox's file
@@ -5039,7 +5039,7 @@ async function tiSave() {
   const value = { tiles, ...(e?.set && e.shared?.length && TI.shareAll ? { set: e.set } : {}) };
   await tiSend(o, TI.blob, { op: "tiles", uuid: o.uuid, value }, `Tiles of ${displayTitle(o)}`);
 }
-$("props").addEventListener("click", (e) => {
+$("props").addEventListener("click", whenReady((e) => {
   const b = e.target.closest("[data-ti]");
   if (!b || b.tagName === "SELECT" || b.type === "checkbox") return;
   e.stopPropagation();
@@ -5066,8 +5066,8 @@ $("props").addEventListener("click", (e) => {
     renderProps();
     $("props").querySelector(`[data-ti-api="${+b.dataset.i}|0"]`)?.focus();
   }
-}, true);
-$("props").addEventListener("change", (e) => {
+}), true);
+$("props").addEventListener("change", whenReady((e) => {
   const t = e.target;
   if (t.dataset?.ti === "same") {
     const o = S.view?.objects[S.sel], st = o && tiState(o), x = (S.edits?.tile_sets || []).find((s) => s.name === t.value);
@@ -5082,20 +5082,20 @@ $("props").addEventListener("change", (e) => {
     f.to = t.checked ? [...f.to.filter((u) => u !== t.value), t.value] : f.to.filter((u) => u !== t.value);
     TI.err = "";
   }
-});
-$("props").addEventListener("input", (e) => {
+}));
+$("props").addEventListener("input", whenReady((e) => {
   if (!TI.open || TI.busy) return;
   const f = e.target.closest?.("[data-ti-api], [data-ti-text]");
   if (!f) return;
   const [i, j] = (f.dataset.tiApi ?? f.dataset.tiText).split("|").map(Number), fn = TI.rows[i]?.fns[j];
   if (!fn) return;
   if (f.dataset.tiApi != null) fn.api = f.value; else fn.text = f.value;
-});
-$("props").addEventListener("keydown", (e) => {
+}));
+$("props").addEventListener("keydown", whenReady((e) => {
   if (!e.target.closest?.("[data-ti-api], [data-ti-text]")) return;
   if (e.key === "Enter") { e.preventDefault(); e.stopPropagation(); tiSave(); }
   else if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); if (!TI.busy) { tiReset(); renderProps(); } }
-}, true);
+}), true);
 
 // ── adopting blocks (#72) ──────────────────────────────────────────────
 // `lox logic adopt` puts a block Loxone Config drew under the module: its declaration goes into vislox's
@@ -5213,7 +5213,7 @@ async function adoptPage() {
   deployMsg(`Adopted ${plural(n, "block")} on ${st.page.title || "this page"}: the config is unchanged.` +
     (sk.length ? ` ${plural(sk.length, "block")} stay${sk.length === 1 ? "s" : ""} Loxone Config's: ${sk.map((x) => `${x.title} (${x.why})`).join("; ")}` : ""), false, !!sk.length);
 }
-$("btn-adopt-page").onclick = adoptPage;
+$("btn-adopt-page").onclick = whenReady(adoptPage);
 // ── deleting and renaming managed blocks (#80) ────────────────────────
 // A block of vislox's files (added or adopted here) is renamed by its slug: lox keeps its UUIDs (`moved`), and
 // the config does not change. A deployed or adopted one is deleted (`removed`): lox takes it out of the config
@@ -5350,15 +5350,15 @@ function mvStart(e, o) {
   svg.classList.add("moving");
   hideTip();
 }
-window.addEventListener("mousemove", (e) => {
+window.addEventListener("mousemove", whenReady((e) => {
   if (!MV?.dragging) return;
   const mx = e.clientX - MV.x0, my = e.clientY - MV.y0;
   if (!MV.moved && Math.abs(mx) + Math.abs(my) <= 3) return;
   MV.moved = true;
   const dx = snapG(MV.orig.rect[0] + mx / MV.k) - MV.orig.rect[0], dy = snapG(MV.orig.rect[1] + my / MV.k) - MV.orig.rect[1];
   mvShift(dx, dy);
-});
-window.addEventListener("mouseup", () => {
+}));
+window.addEventListener("mouseup", whenReady(() => {
   if (!MV?.dragging) return;
   svg.classList.remove("moving");
   const m = MV;
@@ -5369,7 +5369,7 @@ window.addEventListener("mouseup", () => {
   // Selected, as in Loxone Config: Properties shows the move, or why lox refused it.
   if (S.sel !== m.uuid) select(m.uuid, { noReveal: true });
   mvSend(m);
-});
+}));
 /** Alt + an arrow key: move the selected block a grid step (Shift: ten), sent once the keys rest. */
 function mvNudge([sx, sy], n) {
   const o = S.sel && curPage()?.objects.find((x) => x.uuid === S.sel && !x.moved_to);
@@ -5432,7 +5432,7 @@ async function mvRelayout() {
   if (!st?.ok || S.mvBusy || !mvOnPage(st.page).length || S.edits?.arrange?.[st.page.uuid] !== null) return;
   await mvEdit(null, st.rev, [{ op: "relayout", page: st.page.uuid }]);
 }
-$("btn-relayout").onclick = mvRelayout;
+$("btn-relayout").onclick = whenReady(mvRelayout);
 /** The Position rows of Properties: a move not deployed, with Revert; how to move a block. */
 function moveRows(o, row) {
   const out = { rows: [], count: 0 };
@@ -5584,7 +5584,7 @@ function wrCheck(t, d = WR) {
   if (d.re && sameEnd(d.re.w.from, [a.o.uuid, a.q.key]) && sameEnd(d.re.w.to, [b.o.uuid, b.q.key])) return "That is where the wire is now.";
   return wrWhy(a, b);
 }
-window.addEventListener("mousemove", (e) => {
+window.addEventListener("mousemove", whenReady((e) => {
   if (!WR) return;
   if (!WR.moved && Math.abs(e.clientX - WR.x0) + Math.abs(e.clientY - WR.y0) <= 3) return;
   WR.moved = true;
@@ -5602,8 +5602,8 @@ window.addEventListener("mousemove", (e) => {
   WR.path.classList.toggle("bad", !!best?.classList.contains("bad"));
   if (best) showTip(e, best.classList.contains("bad") ? esc(wrCheck(wrTarget(best)) || "") : "Release to wire");
   else hideTip();
-});
-window.addEventListener("mouseup", (e) => {
+}));
+window.addEventListener("mouseup", whenReady((e) => {
   if (!WR) return;
   const w = WR;
   WR = null;
@@ -5627,7 +5627,7 @@ window.addEventListener("mouseup", (e) => {
   if (w.re) ops.push({ op: "unwire", from: w.re.w.from, to: w.re.w.to });
   ops.push({ op: "wire", from: [a.o.uuid, a.q.key], to: [b.o.uuid, b.q.key] });
   wrSend(ops, w.re ? "Reconnected" : "Wired", e, w.re ? "Reconnecting: compiling…" : "Wiring: compiling…");
-});
+}));
 /** Send wire ops; the reply's pending revision is shown, a refusal (or why nothing can be sent now) in
  *  the card at the mouse (`at`). `busy`: the card's text while it compiles. */
 async function wrSend(ops, done, at, busy) {
@@ -5760,15 +5760,15 @@ function wrDelete() {
   wrSend([{ op: "unwire", from: w.from, to: w.to }], "Taken out", null);
   return true;
 }
-wcard.addEventListener("click", (e) => {
+wcard.addEventListener("click", whenReady((e) => {
   const b = e.target.closest("[data-wc]");
   if (!b) return;
   const w = S.wsel;
   if (b.dataset.wc === "close") wcardClose();
   else if (b.dataset.wc === "unwire") wrDelete();
   else if (b.dataset.wc === "rewire" && w) wrSend([{ op: "wire", from: w.from, to: w.to }], "Wired again", null);
-});
-wcard.addEventListener("mousedown", (e) => e.stopPropagation());
+}));
+wcard.addEventListener("mousedown", whenReady((e) => e.stopPropagation()));
 
 // ── adding blocks (#59) ────────────────────────────────────────────────
 // “Add block” on the page picks a type lox can create (GET /api/block-types), then its name and values.
@@ -5919,27 +5919,27 @@ function npForm() {
       <span class="ed-msg${NP.err ? " err" : ""}" role="status" aria-live="polite">${esc(NP.err || "lox creates the page in the room when it compiles; add blocks to it next. Creating compiles the module; nothing is deployed.")}</span></div>
   </div>`;
 }
-$("np-body").addEventListener("input", (e) => {
+$("np-body").addEventListener("input", whenReady((e) => {
   const f = e.target.closest("[data-np-field]");
   if (!f) return;
   NP.draft[f.dataset.npField] = f.value;
   delete NP.bad[f.dataset.npField];
-});
-$("np-body").addEventListener("change", (e) => {
+}));
+$("np-body").addEventListener("change", whenReady((e) => {
   const f = e.target.closest("select[data-np-field]");
   if (f) { NP.draft[f.dataset.npField] = f.value; delete NP.bad[f.dataset.npField]; }
-});
-$("np-body").addEventListener("keydown", (e) => {
+}));
+$("np-body").addEventListener("keydown", whenReady((e) => {
   if (e.key === "Escape") { e.preventDefault(); npClose(); }
   else if (e.key === "Enter" && e.target.tagName === "INPUT") { e.preventDefault(); npAdd(); }
-});
-$("np-body").addEventListener("click", (e) => {
+}));
+$("np-body").addEventListener("click", whenReady((e) => {
   const b = e.target.closest("[data-np]");
   if (b?.dataset.np === "add") npAdd();
   else if (b?.dataset.np === "cancel") npClose();
-});
-$("newpage").addEventListener("mousedown", (e) => { if (e.target.id === "newpage") npClose(); });
-$("btn-new-page").onclick = npOpen;
+}));
+$("newpage").addEventListener("mousedown", whenReady((e) => { if (e.target.id === "newpage") npClose(); }));
+$("btn-new-page").onclick = whenReady(npOpen);
 async function npAdd() {
   const st = newPageState();
   if (!st?.ok || NP.busy) return;
@@ -5964,7 +5964,7 @@ async function npAdd() {
   }
 }
 /** Remove page: a page created here, not deployed, with nothing of vislox's on it. Undo creates it again. */
-$("btn-remove-page").onclick = async () => {
+$("btn-remove-page").onclick = whenReady(async () => {
   const st = addState(), cp = st?.ok && pageCreated(st.page.uuid);
   if (!cp || cp.remove != null || NP.busy) return;
   NP.busy = true; renderAddHud();
@@ -5978,7 +5978,7 @@ $("btn-remove-page").onclick = async () => {
     showMsg(err.message);
   }
   renderAddHud();
-};
+});
 async function abOpen() {
   const st = addState();
   if (!st?.ok) return;
@@ -6096,24 +6096,24 @@ function abForm() {
       <span class="ed-msg${AB.err ? " err" : ""}" role="status" aria-live="polite">${esc(AB.err || (t.mirrors ? "No text means no message. Wire its input from a block once it is on the page. Adding compiles the module; nothing is deployed." : t.hardware ? "lox creates it unpaired, with the kind's inputs and outputs: pair it with a Tree search in Loxone Config. Adding compiles the module; nothing is deployed." : t.folder || t.devices ? "lox gives it its designation (VI, VHI, …). Empty settings get Loxone Config's defaults. Adding compiles the module; nothing is deployed, and nothing is sent to the device." : "Empty values get what Loxone Config places the block with. Adding compiles the module; nothing is deployed."))}</span></div>
   </div>`;
 }
-$("ab-body").addEventListener("input", (e) => {
+$("ab-body").addEventListener("input", whenReady((e) => {
   const f = e.target.closest("[data-ab-field]");
   if (!f) return;
   AB.draft[f.dataset.abField] = f.value;
   delete AB.bad[f.dataset.abField];
-});
-$("ab-body").addEventListener("keydown", (e) => {
+}));
+$("ab-body").addEventListener("keydown", whenReady((e) => {
   const f = e.target.closest("[data-ab-field]");
   if (f && e.key === "Enter" && f.tagName === "INPUT") { e.preventDefault(); abAdd(); }
   else if (f && e.key === "Escape") { e.preventDefault(); abClose(); }
-});
-$("ab-body").addEventListener("click", (e) => {
+}));
+$("ab-body").addEventListener("click", whenReady((e) => {
   const b = e.target.closest("[data-ab]");
   if (b?.dataset.ab === "add") abAdd();
   else if (b?.dataset.ab === "back") abPick("");
-});
-$("addblk").addEventListener("mousedown", (e) => { if (e.target.id === "addblk") abClose(); });
-$("btn-add-block").onclick = abOpen;
+}));
+$("addblk").addEventListener("mousedown", whenReady((e) => { if (e.target.id === "addblk") abClose(); }));
+$("btn-add-block").onclick = whenReady(abOpen);
 const AB_TIME = /^\d{1,2}:\d{2}(:\d{2})?$/;
 async function abAdd() {
   const pn = AB.parent && nodeById(AB.parent.uuid);
@@ -6343,16 +6343,16 @@ function openLog(e) {
   li.classList.add("flash");
   setTimeout(() => li.classList.remove("flash"), 2000);
 }
-$("log-toggle").onclick = () => setLogOpen(!S.log.open);
-$("btn-log").onclick = () => loadLog();
-$("chk-log-since").onchange = (e) => { S.log.onlySince = e.target.checked; setPref("logSince", S.log.onlySince); renderLog(); };
-$("log").addEventListener("click", (e) => {
+$("log-toggle").onclick = whenReady(() => setLogOpen(!S.log.open));
+$("btn-log").onclick = whenReady(() => loadLog());
+$("chk-log-since").onchange = whenReady((e) => { S.log.onlySince = e.target.checked; setPref("logSince", S.log.onlySince); renderLog(); });
+$("log").addEventListener("click", whenReady((e) => {
   const g = e.target.closest("[data-go]");
   if (!g) return;
   const u = g.dataset.go, pg = S.view?.objects[u]?.page;
   if (pg) gotoPage(pg, { focus: u });
   select(u);
-});
+}));
 
 // ── the Debug-Monitor ──────────────────────────────────────────────────
 // With `--monitor`, vislox listens for the Miniserver's debug output (UDP). Start asks the Miniserver to
@@ -6405,7 +6405,7 @@ function renderMonBar() {
   b.title = on ? "Ask the Miniserver to stop sending its debug output (dev/sps/log)"
     : `Ask the Miniserver to send its debug output to ${m.dest || "this host"}:${m.port} for ${m.minutes} min (dev/sps/log/<address>)`;
 }
-$("btn-mon").onclick = async () => {
+$("btn-mon").onclick = whenReady(async () => {
   const on = !!monInfo().until;
   if (!on && !window.confirm("Ask the Miniserver to send its debug output to vislox?\n\nThis is what Loxone Config's Debug Information does. " +
     "Nothing in the config changes and the program does not restart. vislox stops it again with Stop, when it exits, or after the time limit.")) return;
@@ -6416,7 +6416,7 @@ $("btn-mon").onclick = async () => {
     if (!r.ok) S.mon.msg = j.error || r.statusText;
   } catch (e) { S.mon.msg = e.message; }
   finally { S.mon.busy = false; renderMonBar(); setTimeout(() => { S.mon.msg = ""; renderMonBar(); }, 10000); }
-};
+});
 
 // ── live values ────────────────────────────────────────────────────────
 // The Miniserver streams a value per state UUID; a wire's source connector

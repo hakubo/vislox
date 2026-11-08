@@ -1,7 +1,8 @@
 "use strict";
 // Start only after app, editing, deployment and calendar definitions are loaded.
-// These are the original app.js startup statements, in their original order.
+// Open the event gate before the original server loads start.
 
+window.VISLOX_READY = true;
 S.hash = readHash();
 loadHistory().then(connect);
 loadMs();

@@ -246,6 +246,48 @@ try {
   await page.unroute("**/api/history");
 
   const step = async (name, fn) => { await fn(); console.log("ok -", name); };
+  await step("load-time listeners wait for startup while editing and deployment scripts are delayed", async () => {
+    const gap = await browser.newPage();
+    const gapErrors = [];
+    gap.on("pageerror", (e) => gapErrors.push(e.message));
+    let releaseEditing, releaseDeploy, requestedEditing, requestedDeploy;
+    const editingGate = new Promise((resolve) => { releaseEditing = resolve; });
+    const deployGate = new Promise((resolve) => { releaseDeploy = resolve; });
+    const editingRequested = new Promise((resolve) => { requestedEditing = resolve; });
+    const deployRequested = new Promise((resolve) => { requestedDeploy = resolve; });
+    await gap.route("**/editing.js", async (route) => { requestedEditing(); await editingGate; await route.continue(); });
+    await gap.route("**/deploy.js", async (route) => { requestedDeploy(); await deployGate; await route.continue(); });
+    const navigating = gap.goto(url);
+    navigating.catch(() => {});
+    const fireBeforeStartup = async () => {
+      const state = await gap.evaluate(() => {
+        window.dispatchEvent(new KeyboardEvent("keydown", { key: "Control", ctrlKey: true }));
+        window.dispatchEvent(new KeyboardEvent("keydown", { key: "y", ctrlKey: true }));
+        window.dispatchEvent(new PopStateEvent("popstate"));
+        return { ready: !!window.VISLOX_READY, applyingHash: S.applyingHash };
+      });
+      assert.deepEqual(state, { ready: false, applyingHash: false });
+      assert.deepEqual(gapErrors, []);
+    };
+    try {
+      await editingRequested;
+      await gap.waitForFunction(() => typeof S !== "undefined");
+      await fireBeforeStartup();
+      releaseEditing();
+      await deployRequested;
+      await gap.waitForFunction(() => typeof UNDO !== "undefined");
+      await fireBeforeStartup();
+      releaseDeploy();
+      await navigating;
+      await gap.waitForFunction(() => window.VISLOX_READY && S.hist && S.view);
+      assert.equal(await gap.evaluate(() => S.applyingHash), false);
+      assert.deepEqual(gapErrors, []);
+    } finally {
+      releaseEditing(); releaseDeploy();
+      await navigating.catch(() => {});
+      await gap.close();
+    }
+  });
   await step("history retries after two failures and clears its error when loaded", async () => {
     assert.ok(historyAttempts >= 3);
     assert.ok(await page.locator("#status").getAttribute("class").then((x) => !x.includes("error")));

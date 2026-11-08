@@ -170,7 +170,7 @@ function renderStaleLines(a) {
     `<ul class="ps-list">${lines.map((l) => `<li class="mono">${esc(l)}</li>`).join("")}</ul>` +
     `<div class="ck-row"><button type="button" id="btn-tidy" class="ghost small"${why ? ` disabled title="${esc(why)}"` : ' title="Take the obsolete statements out of vislox-managed files and compile: the config does not change"'}>Remove obsolete statements</button></div>`;
 }
-$("deploy-lines").addEventListener("click", async (e) => {
+$("deploy-lines").addEventListener("click", whenReady(async (e) => {
   if (!e.target.closest("#btn-tidy")) return;
   const r = editRev();
   if (!r) return;
@@ -179,12 +179,12 @@ $("deploy-lines").addEventListener("click", async (e) => {
     const res = await editAct(r.blob, [{ op: "tidy" }], "Remove obsolete statements");
     await editShowNewest(res.blob);
   } catch (err) { deployMsg(err.message, true); }
-});
-$("deploy-push").addEventListener("click", async (e) => {
+}));
+$("deploy-push").addEventListener("click", whenReady(async (e) => {
   if (!e.target.closest("#btn-push")) return;
   deployMsg("");
   try { const j = await act("/api/push"); deployMsg(j.message); } catch (err) { deployMsg(err.message, true); }
-});
+}));
 /** Apply's steps as they happen: lox's progress, and what vislox sees of the program restart. */
 function renderSteps(a) {
   const box = $("deploy-steps"), p = a.progress;
@@ -380,7 +380,7 @@ function deployedAppCheck(d) {
     `<div class="pr app-warn"><span class="k">⚠</span><button type="button" class="go" data-go="${esc(o.uuid)}">${esc(autoTitle(o.title) ? prettyType(o.ty) : o.title)}</button><span class="why">${esc(issues.join("; "))}</span></div>`).join("");
 }
 
-$("deploy-new").addEventListener("click", (e) => {
+$("deploy-new").addEventListener("click", whenReady((e) => {
   if (e.target.closest(".x")) { $("deploy-new").classList.add("hidden"); S.deployed = null; return; }
   if (e.target.closest(".app-load")) { loadAppFromMs(); return; }
   const g = e.target.closest("[data-go]");
@@ -388,13 +388,13 @@ $("deploy-new").addEventListener("click", (e) => {
   const u = g.dataset.go, pg = S.view?.objects[u]?.page;
   if (pg) gotoPage(pg, { focus: u });
   select(u);
-});
-$("btn-apply").onclick = async () => {
+}));
+$("btn-apply").onclick = whenReady(async () => {
   if (applyAsking) return;
   applyAsking = true;
   $("btn-apply").disabled = true;
   try { await apply(); } finally { applyAsking = false; renderActions(); }
-};
+});
 /** For Apply's confirmation: the schedules on the Miniserver the pending config would change. */
 async function pendingScheduleText(pend) {
   let blocks;
@@ -621,15 +621,15 @@ async function rollBackAsk(r) {
   await deploy("/api/rollback", { commit: plan.commit, reviewed: plan.blob }, "rolling back");
   await dropRollback(false);
 }
-$("btn-sync").onclick = async () => {
+$("btn-sync").onclick = whenReady(async () => {
   deployMsg("");
   try { const j = await act("/api/sync"); deployMsg(j.message); } catch (err) { deployMsg(err.message, true); }
-};
-$("btn-discard").onclick = async () => {
+});
+$("btn-discard").onclick = whenReady(async () => {
   if (!window.confirm("Discard the pending changes? The module (with the values edited here), lock and compiled config go back to the last commit.")) return;
   deployMsg("");
   try { const j = await act("/api/discard"); deployMsg(j.message); } catch (err) { deployMsg(err.message, true); }
-};
+});
 
 /** For Apply's confirmation: who loses or gains a right the pending config changes, against the deployed one
  *  (`rights` of `/api/apply/changes`, fetched with the devices). Never silently empty: when that request failed,
@@ -828,7 +828,7 @@ function renderTests() {
   box.innerHTML = `<details${open ? " open" : ""}${bad.length ? ' data-bad="1"' : ""}><summary><span class="ck-h">${esc(head)}</span>${esc(sub)}</summary><ul class="ts-list">${items.join("")}</ul>` +
     `<div class="ck-sub ts-cover">A pass covers only what the simulator models: a test that needs another block says so and names it.</div></details>`;
 }
-$("deploy-tests").addEventListener("click", goClicked);
+$("deploy-tests").addEventListener("click", whenReady(goClicked));
 
 // ── lox logic lint (#66) ──────────────────────────────────────────────
 // The same check runs lox logic lint on the project when the module compiles: unused names, blocks whose
@@ -855,8 +855,8 @@ function renderLint() {
   });
   box.innerHTML = `<details${open ? " open" : ""}><summary><span class="ck-h">Lint: ${plural(list.length, "finding")}</span>${l.running ? " · linting the latest change…" : ""} · hints from lox logic lint; Apply doesn't wait for them</summary><ul>${items.join("")}</ul></details>`;
 }
-$("deploy-lint").addEventListener("click", goClicked);
-$("deploy-check").addEventListener("click", async (e) => {
+$("deploy-lint").addEventListener("click", whenReady(goClicked));
+$("deploy-check").addEventListener("click", whenReady(async (e) => {
   if (e.target.closest("#btn-compile")) {
     deployMsg("");
     try { const j = await act("/api/compile"); deployMsg(j.message); } catch (err) { deployMsg(err.message, true); }
@@ -868,7 +868,7 @@ $("deploy-check").addEventListener("click", async (e) => {
     return;
   }
   goClicked(e);
-});
+}));
 /** A block's title, else its slug, for the blocks a default reaches. */
 function dfltName(b) { const o = b.uuid && viewFor(editRev()?.id)?.objects[b.uuid]; return o ? displayTitle(o) : b.slug; }
 function dfltList(blocks) { return blocks.length ? blocks.map(dfltName).join(", ") : "none"; }
