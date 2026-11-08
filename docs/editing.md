@@ -220,25 +220,35 @@ page "Küche Logik" (room: "Küche", category: "Beleuchtung")
 - lox creates the page in the program, sorted in by title, and keeps its UUID in the lockfile's `pages` (title →
   UUID), so recompiles before the push create the same page. vislox reads it back after the compile: the reply's
   `added` is `[{ "page": "Küche Logik", "uuid": "<page uuid>" }]`, and a compile that created no page is refused,
-  everything put back. The next edit writes the `# page uuid:` line into the file.
+  everything put back. While the file creates its page, vislox finds the page by the lock's UUID for its title; it
+  writes no `# page uuid:` line (lox may mint another UUID after a Discard or a new lock), and ignores a stale one.
 - **The new tab** is the pending config's page, so the review marks it *added*, and the Deploy pane counts it
   (*1 page created here*).
 - **Blocks** are added there as on any page (`add_block` with its UUID, #59), and signals (#82) and template instances
   (#83) too: they go into the same file. A page vislox's files create is taken for a page of the base while the base
   has no page with its UUID.
-- **`remove_page`** (`page`: its UUID) takes the file out, and the compile creates the page no more. Only for a page
-  vislox's files create, not deployed (the base has no page with its UUID: lox never deletes a page when its
-  statement goes), and holding nothing of vislox's (a block, a signal, an instance, a `removed` or `moved` line lox
-  still needs); otherwise it is refused, and `GET /api/edits` says why (`pages.created[].remove`). *Remove page* on the
+- **`remove_page`** (`page`: its UUID) drops `room:` from the line, so the compile creates the page no more, and the
+  file goes. Only for a page vislox's files create, not deployed (the base has no page with its UUID: lox never
+  deletes a page when its statement goes), and holding nothing of vislox's (a block, a signal, an instance, a `moved`
+  line, a `removed` line of a block that is not one vislox added on this page); otherwise it is refused, and `GET
+  /api/edits` says why (`pages.created[].remove`). A `removed` line of a block added on the page (the lock pins it
+  there) stays, under a page line that creates nothing, while lox needs it: so the undo of a new page and a block on
+  it is one request. The next edit drops the line, and the file with it; a `new_page` of the title takes the file
+  again. *Remove page* on the
   page's toolbar sends it; Undo creates the page again. When another file of the module still creates the page, the
   compile is refused.
-- **Deployed**, the page is Loxone Config's: rename it, move it or give it another room there. Once the base has the
-  page, vislox's next edit drops `room:` and `category:` from the line, lox's way of handing a created page to Loxone
-  Config, so that a rename there is followed by UUID as for any page file, and not refused (lox refuses a created page
-  renamed in Loxone Config while the line still has `room:`). An empty file then goes; the page stays.
+- **Deployed**, the page is Loxone Config's: rename it, move it or give it another room there. As soon as the base
+  (or the deployed revision) has the page, vislox hands it off on disk: the line loses `room:` and `category:` (lox's
+  way of handing a created page to Loxone Config), takes the `# page uuid:` line and the page's title. It does so
+  before every compile it starts (an edit, even one that changes nothing; Compile; Sync, before `lox config merge`
+  and again on the downloaded base, compiled again when that changed a file; Apply) and before Apply's and Sync's
+  commits. lox refuses a created page renamed in Loxone Config while the line still has `room:`; handed off, a
+  rename is followed by UUID as for any page file (the same step follows a renamed page in every page file tied to
+  it). A sync that fails puts the files back. An empty file then goes; the page stays.
 - `GET /api/edits` sends `pages`: the rooms and categories a new page may name (`rooms`, `categories`: the base's,
   titled, the title no other's, not the unassigned ones), and each page vislox's files create (`created`: its UUID,
-  null until compiled; title, room, category, file; `deployed`; `remove`, null or why `remove_page` is refused).
+  null until compiled; title, room, category, file; `deployed`, whether the base has it, the config `remove_page`
+  asks too; `remove`, null or why `remove_page` is refused).
 - Not here: renaming a created page before it is deployed (*New page* with the new title and moving its blocks is two
   steps), *Arrange* on it before it is deployed (lox lays out a page of the base), and deleting a page Loxone Config
   made.

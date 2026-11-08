@@ -3414,7 +3414,8 @@ try {
     await page.waitForFunction(() => S.view?.objects[S.sel]?.title === "Neu", null, { timeout: 10000 });
     assert.equal(await page.evaluate(() => S.objPage.get(S.sel)), made);
     const text = readFileSync(file, "utf8");
-    assert.match(text, new RegExp(`^# page uuid: ${made}$`, "m"));
+    // Not deployed: found by the lock's UUID, no `# page uuid:` line yet.
+    assert.doesNotMatch(text, /^# page uuid:/m);
     assert.match(text, /^page "Küche Logik" \(room: "Küche"\)\n\nvx_monoflop_\d+ = Monoflop\("Neu"\)$/m);
     // Not removed while it holds the block: the server says why.
     await page.waitForFunction(() => document.querySelector("#btn-remove-page")?.disabled && /still has what vislox added/.test(document.querySelector("#btn-remove-page").title), null, { timeout: 10000 });

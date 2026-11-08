@@ -159,7 +159,8 @@ The binary is an `axum` server with the UI embedded (plain JS and SVG, no build 
   …)`, the room and category checked against the base as lox resolves them), `remove_page` (while not deployed and
   empty), `target` (the page a block, signal or instance of vislox's goes on: a page of the base, or one created here,
   found by the UUID lox keeps in the lockfile's `pages`, `edit::Lock::pages`) and `GET /api/edits`' `pages`.
-  `edit::Files::follow_pages` ties a created page's file to that UUID and drops `room:` once the base has the page.
+  `hand_off` drops `room:` once the base or the deployed revision has the page; `actions.rs`' `hand_off_pages` runs
+  it (and `follow_renames`) on disk before every compile vislox starts and before Apply's and Sync's commits.
 - `src/rules.rs` reads what an Automatic Designer rule does (#87) with lox's decompile (its own reading of the `APC=`
   payload and the app's capability table are private to lox): each rule Lox Logic writes as lines (`Line`: conditions,
   `or`, actions, blocks and modes by UUID), why not for the others; the words and the one-sentence summary Properties

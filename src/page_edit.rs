@@ -12,10 +12,12 @@
 //! - **`remove_page`** takes the file out while the page is not deployed and
 //!   holds nothing of vislox's. A deployed page is Loxone Config's: lox never
 //!   deletes a page when its statement goes.
-//! - Once the base has the page, [`crate::edit::Files::follow_pages`] drops
-//!   `room:` and `category:` from the line (lox: *drop the arguments to hand
-//!   the page to Loxone Config*), so that a rename in Loxone Config is
-//!   followed, not refused.
+//! - **[`hand_off`]**: once the base or the deployed revision has the page,
+//!   its line loses `room:` and `category:` (lox: *drop the arguments to hand
+//!   the page to Loxone Config*), takes the `# page uuid:` line and follows
+//!   the page's title, so that a rename in Loxone Config is followed, not
+//!   refused. `actions.rs` runs it on disk before every compile vislox starts
+//!   (an edit, Compile, Sync, Apply) and before Apply's and Sync's commits.
 
 use crate::blocks::PageFile;
 use crate::edit::{Applied, CLAIMS, Ctx, Files, Lock, Op, find_ci, pages_titled};
@@ -24,15 +26,16 @@ use loxone_config::xml::Element;
 use serde_json::{Value as Json, json};
 
 /// The UUID of the page vislox's file `pf` creates (`room:` on its page
-/// line): its `# page uuid:` line, else the lockfile's `pages` entry for its
-/// title. `None`: the file creates no page, or lox has not created it yet.
+/// line): the lockfile's `pages` entry for its title, the one lox keeps
+/// while it creates the page. A `# page uuid:` line is not trusted here: it
+/// is written only once the page is handed off ([`hand_off`]), so on a file
+/// that still creates its page it is stale. `None`: the file creates no
+/// page, or lox has not created it yet.
 pub fn created_uuid(pf: &PageFile, lock: &Lock) -> Option<String> {
     if pf.periphery || pf.room.is_none() {
         return None;
     }
-    pf.uuid
-        .clone()
-        .or_else(|| lock.pages.get(&pf.page).cloned())
+    lock.pages.get(&pf.page).cloned()
 }
 
 /// The file of vislox's that creates the page `page` (case aside), and the
@@ -48,6 +51,70 @@ pub fn created_file<'a>(
         .find(|(_, p)| created_uuid(p, lock).is_some_and(|u| u.eq_ignore_ascii_case(page)))
 }
 
+/// The page element with UUID `uuid` (case aside) in `doc`.
+fn page_in<'a>(doc: &'a LoxoneDoc, uuid: &str) -> Option<&'a Element> {
+    find_ci(&doc.xml.root, uuid).filter(|e| e.attr("Type") == Some("Page"))
+}
+
+/// Hand each page vislox's files create that one of `docs` (the base, the
+/// deployed revision) has to Loxone Config: its line loses `room:` and
+/// `category:`, takes the page's UUID (`# page uuid:`) and the title the
+/// first of `docs` that has it gives it. The page is found by the UUID the
+/// lockfile keeps for its title, else by its file's `# page uuid:` line.
+/// Returns the names of the files it changed.
+pub fn hand_off(files: &mut Files, docs: &[&LoxoneDoc], lock: &Lock) -> Vec<String> {
+    let mut changed = Vec::new();
+    for (name, p) in files.pages.iter_mut() {
+        if p.periphery || p.room.is_none() {
+            continue;
+        }
+        let ids = [lock.pages.get(&p.page).cloned(), p.uuid.clone()];
+        let hit = ids.iter().flatten().find_map(|u| {
+            docs.iter().find_map(|d| {
+                let e = page_in(d, u)?;
+                Some((
+                    e.attr("U").unwrap_or(u).to_string(),
+                    e.attr_decoded("Title").map(|t| t.into_owned()),
+                ))
+            })
+        });
+        let Some((uuid, title)) = hit else { continue };
+        if let Some(t) = title.filter(|t| !t.trim().is_empty()) {
+            p.page = t;
+        }
+        p.uuid = Some(uuid);
+        p.room = None;
+        p.category = None;
+        changed.push(name.clone());
+    }
+    changed
+}
+
+/// Follow each page Loxone Config renamed in `base` in vislox's page file
+/// tied to it by UUID (`# page uuid:`): `page "…"` names the page by its
+/// title, so a stale title fails the compile. Files that create their page
+/// are [`hand_off`]'s. Returns the names of the files it changed.
+pub fn follow_renames(files: &mut Files, base: &LoxoneDoc) -> Vec<String> {
+    let mut changed = Vec::new();
+    for (name, p) in files.pages.iter_mut() {
+        if p.periphery || p.room.is_some() {
+            continue;
+        }
+        let Some(t) = p
+            .uuid
+            .as_deref()
+            .and_then(|u| page_in(base, u))
+            .and_then(|e| e.attr_decoded("Title"))
+            .filter(|t| !t.trim().is_empty() && *t != p.page)
+        else {
+            continue;
+        };
+        p.page = t.into_owned();
+        changed.push(name.clone());
+    }
+    changed
+}
+
 /// The page with UUID `page` that a new statement of vislox's goes on (a
 /// block, a signal, an instance: `what`), as `page "…"` names it: its title,
 /// and vislox's file of it when there is one. A page of the base must be the
@@ -60,14 +127,15 @@ pub fn target(
     what: &str,
 ) -> Result<(String, Option<String>), String> {
     let root = &ctx.base.xml.root;
-    if find_ci(root, page).is_none()
-        && let Some((name, pf)) = created_file(files, ctx.lock, page)
-    {
-        return Ok((pf.page.clone(), Some(name.clone())));
+    let Some(pg) = find_ci(root, page) else {
+        return match created_file(files, ctx.lock, page) {
+            Some((name, pf)) => Ok((pf.page.clone(), Some(name.clone()))),
+            None => Err(format!("no page {page} in the project's base config")),
+        };
+    };
+    if pg.attr("Type") != Some("Page") {
+        return Err(format!("no page {page} in the project's base config"));
     }
-    let pg = find_ci(root, page)
-        .filter(|e| e.attr("Type") == Some("Page"))
-        .ok_or_else(|| format!("no page {page} in the project's base config"))?;
     let title = pg.attr_decoded("Title").unwrap_or_default().into_owned();
     if title.trim().is_empty() {
         return Err("the page has no title; name it in Loxone Config first".into());
@@ -98,10 +166,9 @@ pub fn target(
     Ok((title, file))
 }
 
-/// The objects of type `ty` (`Place`, `Category`) of `doc` that a page line
-/// may name: titled, the title no other's of the type, and (`real`) not the
-/// unassigned one Loxone Config marks `First="true"`. Sorted by title.
-pub fn choices(doc: &LoxoneDoc, ty: &str, real: bool) -> Vec<String> {
+/// Every titled object of type `ty` of `doc`, with whether it is the
+/// unassigned one Loxone Config marks `First="true"`: one walk.
+fn titled_of(doc: &LoxoneDoc, ty: &str) -> Vec<(String, bool)> {
     fn walk(el: &Element, ty: &str, out: &mut Vec<(String, bool)>) {
         if el.attr("Type") == Some(ty)
             && let Some(t) = el.attr_decoded("Title")
@@ -115,6 +182,14 @@ pub fn choices(doc: &LoxoneDoc, ty: &str, real: bool) -> Vec<String> {
     }
     let mut all = Vec::new();
     walk(&doc.xml.root, ty, &mut all);
+    all
+}
+
+/// The objects of type `ty` (`Place`, `Category`) of `doc` that a page line
+/// may name: titled, the title no other's of the type, and (`real`) not the
+/// unassigned one. Sorted by title.
+pub fn choices(doc: &LoxoneDoc, ty: &str, real: bool) -> Vec<String> {
+    let all = titled_of(doc, ty);
     let mut out: Vec<String> = all
         .iter()
         .filter(|(t, first)| !(real && *first) && all.iter().filter(|(o, _)| o == t).count() == 1)
@@ -131,34 +206,30 @@ fn taxonomy(base: &LoxoneDoc, ty: &str, what: &str, title: &str) -> Result<(), S
     if title.trim().is_empty() {
         return Err(format!("give the page a {what}"));
     }
-    let real = ty == "Place";
-    if choices(base, ty, real).iter().any(|t| t == title) {
-        return Ok(());
-    }
-    fn count(el: &Element, ty: &str, title: &str) -> (usize, bool) {
-        let me =
-            el.attr("Type") == Some(ty) && el.attr_decoded("Title").is_some_and(|t| t == title);
-        let mut n = (usize::from(me), me && el.attr("First") == Some("true"));
-        for c in el.child_elements() {
-            let (k, f) = count(c, ty, title);
-            n = (n.0 + k, n.1 || f);
-        }
-        n
-    }
-    Err(match count(&base.xml.root, ty, title) {
-        (0, _) => format!(
+    let hits: Vec<bool> = titled_of(base, ty)
+        .into_iter()
+        .filter(|(t, _)| t == title)
+        .map(|(_, first)| first)
+        .collect();
+    match hits.as_slice() {
+        [] => Err(format!(
             "no {what} is titled \"{title}\" in the project's base config; make it in Loxone \
              Config first"
-        ),
-        (1, true) => format!(
+        )),
+        [true] if ty == "Place" => Err(format!(
             "Loxone Config needs a real room for a page: name a room other than \"{title}\""
-        ),
-        (n, _) => format!("{n} {what}s are titled \"{title}\"; rename one in Loxone Config"),
-    })
+        )),
+        [_] => Ok(()),
+        many => Err(format!(
+            "{} {what}s are titled \"{title}\"; rename one in Loxone Config",
+            many.len()
+        )),
+    }
 }
 
 /// A page's title as a page line takes it: one line, not empty, no spaces at
-/// its ends (the title is what lox looks the page up by).
+/// its ends (the title is what lox looks the page up by), and kept as it is
+/// by a Loxone Config save (lox's `title_save_rewrite`, as for a block's name).
 fn page_title(t: &str) -> Result<&str, String> {
     if t.chars().any(char::is_control) {
         return Err("the page's title must be one line of text".into());
@@ -171,6 +242,11 @@ fn page_title(t: &str) -> Result<&str, String> {
     }
     if t.chars().count() > 120 {
         return Err("the page's title is longer than 120 characters".into());
+    }
+    if let Some(w) = loxone_config::connectors::title_save_rewrite("Page", t) {
+        return Err(format!(
+            "the page's title: a Loxone Config save would write it as \"{w}\"; write that instead"
+        ));
     }
     Ok(t)
 }
@@ -196,11 +272,14 @@ pub fn new_page(
             ));
         }
     }
-    if let Some((name, _)) = files
+    // A file of vislox's for the title: only one `remove_page` left with the
+    // `removed` lines lox still needs is taken again.
+    let left = files
         .pages
         .iter()
         .find(|(_, p)| !p.periphery && p.page == title)
-    {
+        .map(|(n, p)| (n.clone(), p.room.is_none() && !p.holds(&|_| true)));
+    if let Some((name, false)) = &left {
         return Err(format!(
             "vislox's file {name} is for a page titled \"{title}\" already"
         ));
@@ -211,15 +290,17 @@ pub fn new_page(
         taxonomy(ctx.base, "Category", "category", c)?;
     }
     // Everything is checked: from here on `files` changes.
-    let name = crate::blocks::file_name(title, &|n| n == CLAIMS || files.pages.contains_key(n));
-    files.pages.insert(
-        name,
-        PageFile {
-            room: Some(room.to_string()),
-            category: category.map(String::from),
-            ..PageFile::new(title)
-        },
-    );
+    let name = match left {
+        Some((n, _)) => n,
+        None => crate::blocks::file_name(title, &|n| n == CLAIMS || files.pages.contains_key(n)),
+    };
+    let f = files
+        .pages
+        .entry(name)
+        .or_insert_with(|| PageFile::new(title));
+    f.uuid = None;
+    f.room = Some(room.to_string());
+    f.category = category.map(String::from);
     Ok(Applied {
         previous: Json::Null,
         added: None,
@@ -227,19 +308,11 @@ pub fn new_page(
     })
 }
 
-/// Whether vislox's file `pf` holds anything but its page line: a block, a
-/// signal, an instance, or a line lox still needs.
-fn holds_something(pf: &PageFile) -> bool {
-    !(pf.blocks.is_empty()
-        && pf.removed.is_empty()
-        && pf.moved.is_empty()
-        && pf.signals.is_empty()
-        && pf.instances.is_empty()
-        && pf.wires.is_empty())
-}
-
 /// What `remove_page` of `page` takes out (the file's name) and the
 /// `new_page` that undoes it, or why it is refused. It changes nothing.
+/// `removed` lines of blocks vislox added on the page (the lock pins them to
+/// it, or forgot them) do not keep it: an undo of a new page and a block on
+/// it is one request.
 pub fn removal(
     files: &Files,
     base: &LoxoneDoc,
@@ -250,12 +323,16 @@ pub fn removal(
         format!("vislox created no page {page}; a page Loxone Config made is deleted there")
     })?;
     let title = &pf.page;
-    if find_ci(&base.xml.root, page).is_some() {
+    if page_in(base, page).is_some() {
         return Err(format!(
             "\"{title}\" is deployed, and lox never deletes a page; delete it in Loxone Config"
         ));
     }
-    if holds_something(pf) {
+    let here = |slug: &str| match lock.placed.get(slug) {
+        None => !lock.slugs.contains_key(slug),
+        Some(at) => at.as_deref().is_some_and(|u| u.eq_ignore_ascii_case(page)),
+    };
+    if pf.holds(&here) {
         return Err(format!(
             "\"{title}\" still has what vislox added there ({name}); take that out first"
         ));
@@ -269,11 +346,20 @@ pub fn removal(
     Ok((name.clone(), undo))
 }
 
-/// `remove_page`: the file goes; its `previous` is the `new_page` that
-/// creates the page again (lox mints a new UUID: `restores`).
+/// `remove_page`: the page line loses `room:`, so the compile creates the
+/// page no more, and the file goes, unless lox still needs its `removed`
+/// lines (then it stays without them until [`Files::tidy`] drops them). Its
+/// `previous` is the `new_page` that creates the page again (lox mints a new
+/// UUID: `restores`).
 pub fn remove_page(files: &mut Files, ctx: &Ctx, page: &str) -> Result<Applied, String> {
     let (name, undo) = removal(files, ctx.base, ctx.lock, page)?;
-    files.pages.remove(&name);
+    let f = files.pages.get_mut(&name).expect("checked");
+    f.room = None;
+    f.category = None;
+    f.uuid = None;
+    if f.is_empty() {
+        files.pages.remove(&name);
+    }
     Ok(Applied {
         previous: serde_json::to_value(&undo).unwrap_or_default(),
         added: None,
@@ -282,30 +368,32 @@ pub fn remove_page(files: &mut Files, ctx: &Ctx, page: &str) -> Result<Applied, 
 }
 
 /// `GET /api/edits`' `pages`: the rooms and categories a new page may name
-/// (the base's, as lox resolves them; not the unassigned ones), and each page vislox's files create:
-/// its UUID (null until compiled), title, room, category and file, whether
-/// the deployed revision has it, and whether `remove_page` takes it out now
-/// (null) or why not.
-pub fn edits_section(
-    files: &Files,
-    base: &LoxoneDoc,
-    lock: &Lock,
-    deployed: Option<&LoxoneDoc>,
-    dir: &str,
-) -> Json {
-    // As an edit sees the files: the `removed` and `moved` lines lox needs no
-    // more go first (`Files::tidy`), so an emptied page can go at once.
-    let mut tidied = files.clone();
-    tidied.tidy(lock);
-    let created: Vec<Json> = files
+/// (the base's, as lox resolves them; not the unassigned ones), and each page
+/// vislox's files create: its UUID (null until compiled), title, room,
+/// category and file, whether the base has it (`deployed`: the config lox
+/// compiles against, the one `remove_page` asks too), and whether
+/// `remove_page` takes it out now (null) or why not.
+pub fn edits_section(files: &Files, base: &LoxoneDoc, lock: &Lock, dir: &str) -> Json {
+    let mine: Vec<(&String, &PageFile)> = files
         .pages
         .iter()
         .filter(|(_, p)| !p.periphery && p.room.is_some())
+        .collect();
+    // As an edit sees the files: the `removed` and `moved` lines lox needs no
+    // more go first (`Files::tidy`), so an emptied page can go at once. Only
+    // when there is a page to ask about.
+    let tidied = (!mine.is_empty()).then(|| {
+        let mut t = files.clone();
+        t.tidy(lock);
+        t
+    });
+    let created: Vec<Json> = mine
+        .into_iter()
         .map(|(name, p)| {
             let uuid = created_uuid(p, lock);
-            let remove = match &uuid {
-                Some(u) => removal(&tidied, base, lock, u).err(),
-                None => Some("lox has not created it yet: compile the module".to_string()),
+            let remove = match (&uuid, &tidied) {
+                (Some(u), Some(t)) => removal(t, base, lock, u).err(),
+                _ => Some("lox has not created it yet: compile the module".to_string()),
             };
             json!({
                 "uuid": uuid,
@@ -313,8 +401,7 @@ pub fn edits_section(
                 "room": p.room,
                 "category": p.category,
                 "file": format!("{dir}/{name}"),
-                "deployed": uuid.as_deref().is_some_and(|u| deployed
-                    .is_some_and(|d| find_ci(&d.xml.root, u).is_some())),
+                "deployed": uuid.as_deref().is_some_and(|u| page_in(base, u).is_some()),
                 "remove": remove,
             })
         })
@@ -524,8 +611,25 @@ pub(crate) mod tests {
         let pf = files.pages.get_mut("kueche-logik.loxl").unwrap();
         pf.blocks.clear();
         pf.removed.insert("vx_and_1".into());
-        let s = edits_section(&files, &base, &lock, Some(&base), "pages/vislox");
+        let s = edits_section(&files, &base, &lock, "pages/vislox");
         assert_eq!(s["created"][0]["remove"], Json::Null);
+        // One the lock still pins to the page does not either (an undo of the
+        // page and a block on it, in one request); one on another page does.
+        let mut pinned = lock.clone();
+        pinned.slugs.insert(
+            "vx_and_1".into(),
+            "bbbbbb01-0000-0000-ffff504f94000001".into(),
+        );
+        pinned
+            .placed
+            .insert("vx_and_1".into(), Some(NEU.to_uppercase()));
+        assert!(removal(&files, &base, &pinned, NEU).is_ok());
+        pinned.placed.insert("vx_and_1".into(), Some(OG.into()));
+        assert!(
+            removal(&files, &base, &pinned, NEU)
+                .unwrap_err()
+                .contains("still has")
+        );
         files.tidy(&lock);
         let a = apply_op(&mut files, &c, &remove).unwrap();
         assert!(files.pages.is_empty());
@@ -564,7 +668,7 @@ pub(crate) mod tests {
         );
         let err = removal(&files, &deployed, &lock, NEU).unwrap_err();
         assert!(err.contains("is deployed"), "{err}");
-        let s = edits_section(&files, &deployed, &lock, Some(&deployed), "pages/vislox");
+        let s = edits_section(&files, &deployed, &lock, "pages/vislox");
         assert_eq!(s["created"][0]["uuid"], NEU);
         assert_eq!(s["created"][0]["deployed"], true);
         assert!(
@@ -573,14 +677,51 @@ pub(crate) mod tests {
                 .unwrap()
                 .contains("deployed")
         );
-        // Renamed in Loxone Config: the file follows it, without `room:`.
+        // Renamed in Loxone Config: handed off, the file follows it without
+        // `room:`, and takes the UUID; later renames are followed by it.
         let renamed = LoxoneDoc::parse(with_page(&house(), "Kochen").as_bytes()).unwrap();
-        files.follow_pages(&renamed, &lock);
+        assert_eq!(
+            hand_off(&mut files, &[&renamed], &lock),
+            ["kueche-logik.loxl"]
+        );
         let p = &files.pages["kueche-logik.loxl"];
         assert_eq!((p.page.as_str(), p.uuid.as_deref()), ("Kochen", Some(NEU)));
         assert_eq!(p.room, None);
+        assert!(hand_off(&mut files, &[&renamed], &lock).is_empty());
+        let again = LoxoneDoc::parse(with_page(&house(), "Kochen 2").as_bytes()).unwrap();
+        assert_eq!(follow_renames(&mut files, &again), ["kueche-logik.loxl"]);
+        assert_eq!(files.pages["kueche-logik.loxl"].page, "Kochen 2");
         // Nothing left in it: the file goes, the page stays.
         assert!(files.render().is_empty());
+        // Not in the base, but in the deployed revision: handed off too.
+        let mut files2 = Files::default();
+        files2.pages.insert(
+            "kueche-logik.loxl".into(),
+            PageFile {
+                room: Some("Küche".into()),
+                ..PageFile::new("Küche Logik")
+            },
+        );
+        let base = LoxoneDoc::parse(house().as_bytes()).unwrap();
+        assert!(hand_off(&mut files2, &[&base], &lock).is_empty());
+        assert_eq!(hand_off(&mut files2, &[&base, &deployed], &lock).len(), 1);
+    }
+
+    /// A `# page uuid:` line on a file that still creates its page is stale
+    /// (lox may mint another UUID after a Discard): the lock's UUID counts,
+    /// and the line is not written again.
+    #[test]
+    fn a_stale_page_uuid_line_does_not_hide_the_created_page() {
+        let mut lock = Lock::default();
+        lock.pages.insert("Neu".into(), NEU.into());
+        let pf = PageFile {
+            uuid: Some("deadbeef-0000-0000-ffff504f94000001".into()),
+            room: Some("Küche".into()),
+            ..PageFile::new("Neu")
+        };
+        assert_eq!(created_uuid(&pf, &lock).as_deref(), Some(NEU));
+        assert!(!pf.render().contains("# page uuid:"), "{}", pf.render());
+        assert_eq!(created_uuid(&pf, &Lock::default()), None);
     }
 
     /// Not compiled yet, the page has no UUID: listed, not removable.
@@ -595,7 +736,7 @@ pub(crate) mod tests {
                 ..PageFile::new("Neu")
             },
         );
-        let s = edits_section(&files, &base, &Lock::default(), Some(&base), "pages/vislox");
+        let s = edits_section(&files, &base, &Lock::default(), "pages/vislox");
         assert_eq!(s["rooms"], json!(["Küche"]));
         assert_eq!(s["created"][0]["uuid"], Json::Null);
         assert_eq!(s["created"][0]["file"], "pages/vislox/neu.loxl");

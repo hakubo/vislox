@@ -449,11 +449,8 @@ pub(crate) fn page_of(files: &Files, ctx: &Ctx, file: &str) -> String {
     let Some(pf) = files.pages.get(file) else {
         return String::new();
     };
-    match pf
-        .uuid
-        .clone()
-        .or_else(|| crate::page_edit::created_uuid(pf, ctx.lock))
-    {
+    // A page created here (#88): the UUID the lock keeps, not a stale line.
+    match crate::page_edit::created_uuid(pf, ctx.lock).or_else(|| pf.uuid.clone()) {
         Some(u) => u,
         None => {
             let mut same = Vec::new();
