@@ -155,6 +155,16 @@ The binary is an `axum` server with the UI embedded (plain JS and SVG, no build 
   date (`every:`, `easter:`, `from:`/`to:`, `DateArgs`) are the `entry_mode` and `entry_date` value ops, read back from
   the config by `edit::current` (`mode_of`, `date_of`), and `GET /api/edits`' `entries` says which entries are edited
   here. `web/modes.js` has the form and the picking on the year.
+- `src/rules.rs` reads what an Automatic Designer rule does (#87) with lox's decompile (its own reading of the `APC=`
+  payload and the app's capability table are private to lox): each rule Lox Logic writes as lines (`Line`: conditions,
+  `or`, actions, blocks and modes by UUID), why not for the others; the words and the one-sentence summary Properties
+  shows, and a changed rule's lines for the Changes list (`model.rs`' `rule`, `rule_old`). `src/rule_edit.rs` is
+  editing them: the `rule` op (a `rule vx_<uuid> … end` declaration on an extern of `edits.loxl`, its lines turned
+  into Lox Logic and read back with lox's parser), `new_rule` (`rule vx_rule_<n> "Name"`, which lox creates and pins
+  in the lockfile's `rules`), `remove_block` and `restore_rule` of a rule created here (`removed`, its tombstone back
+  through `adopt::LockEdits::rules`), a `ClaimKind` of `set_claim::KINDS` (`Claims`' tenth field), and
+  `GET /api/edits`' `rules` and `rule_edit` (which rules vislox may state, whether one can be created, the states and
+  commands the config's rules use per block type). `managed::rule_claims` finds the module's own declarations.
 - `src/set_claim.rs`' `KINDS` lists every kind of claim on a block's whole content (switching times, moods,
   access, recipients, tiles, members) as a `ClaimKind`; `edit.rs` and `actions.rs` loop over it instead of naming each kind.
 - `src/blocks.rs` is adding blocks (#59): the types vislox offers (`GET /api/block-types`, from lox's builtin

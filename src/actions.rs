@@ -171,6 +171,7 @@ fn needs_module_names(ops: &[edit::Op]) -> bool {
                 | edit::Op::Expr { value: Some(_), .. }
                 | edit::Op::Signal { .. }
                 | edit::Op::Instance { .. }
+                | edit::Op::NewRule { .. }
         )
             // A value that may name a constant (#81); a number needs none.
             || matches!(o, edit::Op::Param { value: Some(v), .. } if edit::bare_name(v)) || crate::set_claim::kind_of(o).is_some_and(|k| k.makes_sets())
@@ -2110,6 +2111,17 @@ impl Actions {
                              library: {e}"
                         )));
                     }
+                    // Nor can a new rule's name be told from the module's (#87).
+                    if req
+                        .ops
+                        .iter()
+                        .any(|o| matches!(o, edit::Op::NewRule { .. }))
+                    {
+                        return Err(bad(format!(
+                            "the module does not read, so a new rule's name cannot be checked against \
+                             its names: {e}"
+                        )));
+                    }
                     if let Some(v) = req.ops.iter().find_map(|o| match o {
                         edit::Op::Param { value: Some(v), .. }
                             if edit::bare_name(v)
@@ -2178,7 +2190,8 @@ impl Actions {
             let mine = format!("{shown}/");
             let claims = crate::managed::set_claims(&texts, &lock)
                 .into_iter()
-                .chain(crate::managed::members_claims(&texts, &lock));
+                .chain(crate::managed::members_claims(&texts, &lock))
+                .chain(crate::managed::rule_claims(&texts, &lock));
             for c in claims {
                 let Some(k) = kinds.iter().find(|k| k.keyword() == c.kind) else {
                     continue;
@@ -2407,6 +2420,7 @@ impl Actions {
                 o,
                 edit::Op::RemoveBlock { .. }
                     | edit::Op::RestoreBlock { .. }
+                    | edit::Op::RestoreRule { .. }
                     | edit::Op::Rename { .. }
             )
         });
@@ -2449,7 +2463,7 @@ impl Actions {
                 match op {
                     // A block brought back keeps its UUIDs: lox did not mint
                     // a new one.
-                    edit::Op::RestoreBlock { uuid, .. }
+                    edit::Op::RestoreBlock { uuid, .. } | edit::Op::RestoreRule { uuid, .. }
                         if edit::find_ci(&out.xml.root, uuid).is_none() =>
                     {
                         return Err(fail(format!(
@@ -2459,7 +2473,7 @@ impl Actions {
                     edit::Op::RemoveBlock { uuid }
                         if edit::find_ci(&out.xml.root, uuid).is_some()
                             && !req.ops.iter().any(|o| {
-                                matches!(o, edit::Op::RestoreBlock { uuid: u, .. } if u.eq_ignore_ascii_case(uuid))
+                                matches!(o, edit::Op::RestoreBlock { uuid: u, .. } | edit::Op::RestoreRule { uuid: u, .. } if u.eq_ignore_ascii_case(uuid))
                             }) =>
                     {
                         return Err(fail(format!(
@@ -2515,9 +2529,11 @@ impl Actions {
             }
         }
         // A Tree device created here (#85) is an extern of the lockfile.
+        // A rule created here (#87) is pinned in the lockfile's `rules`.
         let uuid_of = |s: &str| {
             lock.uuid_of(s)
                 .or_else(|| lock.externals.get(s).map(String::as_str))
+                .or_else(|| lock.rules.get(s).map(String::as_str))
         };
         let minted: Vec<Option<String>> = slugs
             .iter()
@@ -3178,7 +3194,7 @@ impl Actions {
         pending: Option<Arc<Vec<u8>>>,
     ) -> Value {
         let off = || {
-            let mut v = json!({ "available": false, "reason": state.why, "claims": [], "managed": [], "sources": {}, "set_claims": [], "members_claims": [], "constants": { "lets": [], "defaults": [], "uses": {} }, "expressions": [], "templates": { "templates": [], "instances": [], "library": [] }, "set_kinds": {} });
+            let mut v = json!({ "available": false, "reason": state.why, "claims": [], "managed": [], "sources": {}, "set_claims": [], "members_claims": [], "rule_claims": [], "rule_edit": null, "constants": { "lets": [], "defaults": [], "uses": {} }, "expressions": [], "templates": { "templates": [], "instances": [], "library": [] }, "set_kinds": {} });
             for k in crate::set_claim::KINDS {
                 for (key, _) in k.edits_section(
                     &Default::default(),
@@ -3323,6 +3339,18 @@ impl Actions {
         let set_claims = crate::managed::set_claims(&texts, &lock);
         // And on a central block's members (#75).
         let members_claims = crate::managed::members_claims(&texts, &lock);
+        // The module's own rule declarations (#87), and the rules they state.
+        let rule_claims = crate::managed::rule_claims(&texts, &lock);
+        let mut rule_claimed = crate::set_claim::Claimed::new();
+        for c in rule_claims
+            .iter()
+            .filter(|c| !c.file.starts_with(&format!("{rel_dir}/")))
+        {
+            let into = rule_claimed.entry("rule").or_default();
+            for b in &c.blocks {
+                into.insert(b.to_ascii_lowercase(), format!("{}:{}", c.file, c.line));
+            }
+        }
         // The module's `let` constants and `defaults`, and the ports that take
         // their values from one (#81).
         let mine = format!("{rel_dir}/");
@@ -3573,6 +3601,7 @@ impl Actions {
         let mut adopt = serde_json::Map::new();
         let mut add_under = serde_json::Map::new();
         let mut entries = serde_json::Map::new();
+        let mut rule_edit = Value::Null;
         if let (Some(doc), Some(base)) = (shown, self.adopt_base(&p))
             && state.why.is_none()
         {
@@ -3617,6 +3646,12 @@ impl Actions {
             entries = crate::calendar_edit::edit_refusals(&now, &ctx);
             // And each Tree extension, for a new Tree device (#85).
             add_under.extend(crate::hw_edit::add_refusals(&ctx));
+            // Which rules vislox may state, and whether one can be created (#87).
+            let ctx = edit::Ctx {
+                claimed: &rule_claimed,
+                ..ctx
+            };
+            rule_edit = crate::rule_edit::edit_section(&now, &ctx);
         }
         // Whether each block of vislox's files can be deleted now (#80), or why
         // not: the checks `remove_block` makes first, which change nothing.
@@ -3658,6 +3693,8 @@ impl Actions {
             "sources": sources,
             "set_claims": set_claims,
             "members_claims": members_claims,
+            "rule_claims": rule_claims,
+            "rule_edit": rule_edit,
             "constants": constants,
             "expressions": expressions,
             "templates": templates,

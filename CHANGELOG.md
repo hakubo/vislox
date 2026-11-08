@@ -197,6 +197,16 @@ published under the same version (see [docker/README.md](docker/README.md)).
   period, a range every year), typed or picked on the year by a click or a drag, the draft's days outlined. Written into
   `<module>/vislox/_periphery.loxl` with the mode spelled as lox takes it; Undo, Revert, Remove and Delete as for a
   block. Entries and modes Loxone Config made stay read-only. Never deploys, never touches the live calendar.
+- Automatic Designer rules (#87): Properties of a rule says what it does in words (*On weekdays and at 09:00: Pumpe:
+  on*), its conditions grouped (`or` starts a group) and its actions in order, each with a link to the block it watches
+  or drives; the Changes list reads a changed rule per condition and action, old → new, and active ↔ inactive, in place
+  of the raw payload. *Edit rule* toggles it active and adds, removes, reorders and changes its conditions (`time`,
+  `weekday`, a block's state, `mode`, `weather`, `day`, `daylight`, `sunrise`/`sunset`/`dawn`/`dusk`, `date`) and
+  actions (a block's command, `mode`, `wait`, `notify`, `mail`, `message`); *New rule* creates a named one (`rule
+  vx_rule_<n> "Name"`), *Delete rule* deletes it (`removed`). Written as `rule` declarations into
+  `<module>/vislox/edits.loxl`; lox checks each state and command against the app's capability table. Rules Lox Logic
+  cannot write stay read-only. Undo, Revert and *Remove vislox's declaration* as for any claim. Never deploys, never
+  runs a rule.
 
 ## 0.2.0
 

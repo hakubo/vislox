@@ -906,6 +906,17 @@ rect.ghost, line.ghost { fill: #1f6fd10a; stroke: var(--moved); stroke-opacity: 
 .me-list { margin: 2px 10px 4px 30px; padding: 0; font-size: 12px; }
 .me-item { padding: 1px 0; }
 .me-ops { margin-left: 6px; white-space: nowrap; }
+/* Automatic Designer rules (#87) */
+.ru-sum { margin: 2px 10px 4px; font-size: 12px; }
+.ru-or { margin: 2px 10px; font-size: 11px; text-transform: uppercase; color: var(--muted, #888); }
+.ru-link { white-space: nowrap; }
+.ru-list { margin: 2px 10px 4px 26px; padding: 0; font-size: 12px; }
+.ru-item { padding: 3px 0; border-bottom: 1px solid var(--line, rgba(127, 127, 127, 0.2)); }
+.ru-k select { max-width: 100%; }
+.ru-fields { display: flex; flex-wrap: wrap; gap: 4px 8px; margin: 3px 0; }
+.ru-f { display: inline-flex; flex-direction: column; gap: 1px; font-size: 11px; }
+.ru-f input[type="text"] { width: 9em; }
+.ru-chk { flex-direction: row; align-items: center; gap: 4px; }
 /* Edit access (#76): a row per user or group, its access schedule, ✕. */
 .ac-list { margin: 2px 10px 4px 10px; padding: 0; list-style: none; font-size: 12px; }
 .ac-item { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; padding: 2px 0; }

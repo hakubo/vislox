@@ -36,8 +36,9 @@ Then open <http://127.0.0.1:7878>. Started without a path or `--ctx` in a direct
 - Which config the Miniserver runs (from `def.log` and `/prog`), with a warning when an upload is still waiting,
   it runs its emergency config, or the newest file was skipped; Apply checks that its upload loaded.
 - Live values on the wires, as in Loxone Config's Liveview, with opt-in queries for blocks the app does not see.
-- Properties for the selected block: connections, parameters, Daytimer schedules, calendar entries, what the
-  Loxone app shows, and the hardware a change reconfigures.
+- Properties for the selected block: connections, parameters, Daytimer schedules, calendar entries, what an
+  Automatic Designer rule does (in words, with links to its blocks), what the Loxone app shows, and the hardware a
+  change reconfigures.
 - Operating modes as a year calendar, with the heating and cooling periods.
 - A Miniserver status chip and a preflight before Pull, Apply and Sync (right serial, FTP and web port reachable,
   config changed since the base, calendar entries changed in the app).
@@ -53,7 +54,7 @@ Then open <http://127.0.0.1:7878>. Started without a path or `--ctx` in a direct
   add and edit template instances (the module's templates or lox's library: `vx_ost = Treppenlicht(…)`),
   add virtual inputs, virtual HTTP/UDP inputs and outputs and Modbus devices from the project tree and edit their
   settings, add operating modes and add or edit calendar entries on the year (`CalendarEntry("…", switches: party,
-  every: 12-31)`),
+  every: 12-31)`), edit, create and delete Automatic Designer rules (`rule … when time 09:00 then pumpe on … end`),
   then Apply, Sync and Discard from the browser.
 - For a `lox.toml` project: the blocks its Lox Logic module manages marked, each with the `.loxl` file and line that
   makes it, each parameter a `let` constant or a `defaults` statement gives named after it, and the blocks lox made
@@ -145,7 +146,7 @@ Opt-ins:
 | Sync, Discard | `--admin-token-file`, then the token | nothing; they change the project and its git repository |
 | Push to git | `--admin-token-file`, then the token | nothing; it pushes the commits git's remote lacks, after `lox logic scan` finds no personal data in them |
 | Compile (a module changed outside vislox) | `--admin-token-file`, then the token | nothing; it runs `lox logic compile` |
-| Edit values, switching times, moods, members and access rights, add, adopt, move, rename and delete blocks, template instances, draw wires | `--admin-token-file`, then the token | nothing; vislox writes its files in the module (and positions and adopted blocks in the lockfile; `lox logic adopt` runs on a copy) and runs `lox logic compile` |
+| Edit values, switching times, moods, members, access rights and rules, add, adopt, move, rename and delete blocks, template instances, draw wires | `--admin-token-file`, then the token | nothing; vislox writes its files in the module (and positions and adopted blocks in the lockfile; `lox logic adopt` runs on a copy) and runs `lox logic compile` |
 | Operate virtual inputs | `--operate` with `--admin-token-file` | `jdev/sps/io/<uuid>/<cmd>`, only to `VirtualIn` objects, each confirmed |
 | Query blocks on this page | a toggle in the legend, off by default | read-only `jdev/sps/io/<uuid>/all`, at most 20 a second |
 | Debug-Monitor | `--monitor`, then Start | `dev/sps/log/<address>`: the Miniserver sends its debug output to vislox until Stop or the time limit |

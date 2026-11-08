@@ -61,6 +61,7 @@ pub static KINDS: &[&dyn ClaimKind] = &[
     &Reg::<crate::recipients_edit::RecipientsKind>(PhantomData),
     &Reg::<crate::tiles_edit::TilesKind>(PhantomData),
     &crate::member_edit::MemberKind,
+    &crate::rule_edit::RuleKind,
 ];
 
 /// One kind of claim, as the code that is the same for every kind sees it.

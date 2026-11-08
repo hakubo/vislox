@@ -93,6 +93,9 @@ pub struct LockEdits {
     /// Each gets its `externals` entry (`matched_by: created`) and its
     /// `hardware` entry back, as lox wrote them.
     pub created: BTreeMap<String, (String, Option<String>)>,
+    /// Named Automatic Designer rules restored (#87): slug → rule UUID, the
+    /// lock's `rules` pin back, as lox wrote it.
+    pub rules: BTreeMap<String, String>,
 }
 
 impl LockEdits {
@@ -104,6 +107,7 @@ impl LockEdits {
             && self.unexternals.is_empty()
             && self.untomb.is_empty()
             && self.created.is_empty()
+            && self.rules.is_empty()
     }
 }
 
@@ -165,6 +169,14 @@ pub fn write_lock(lock: &[u8], edits: &LockEdits) -> Result<Vec<u8>, String> {
             .as_object_mut()
             .ok_or_else(|| "the lock's hardware is not a JSON object".to_string())?;
         h.insert(slug.clone(), Json::String(uuid.clone()));
+    }
+    for (slug, uuid) in &edits.rules {
+        let r = root
+            .entry("rules")
+            .or_insert_with(|| Json::Object(Default::default()))
+            .as_object_mut()
+            .ok_or_else(|| "the lock's rules are not a JSON object".to_string())?;
+        r.insert(slug.clone(), Json::String(uuid.clone()));
     }
     let wires = root
         .entry("extern_wires")

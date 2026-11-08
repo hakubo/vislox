@@ -1139,8 +1139,8 @@ function calTip(cal) {
 const propRow = (k, v, cls, tip) => `<div class="pr ${cls || ""}"><div class="k${tip ? " hinted" : ""}"${tip ? ` title="${esc(tip)}"` : ""}>${esc(k)}</div><div class="v">${v}</div></div>`;
 function renderProps() {
   // Live values re-render Properties often: keep the edit field being typed in.
-  const f = document.activeElement?.closest?.("#props [data-ed-field], #props [data-sch-field], #props [data-mo-field], #props [data-mo-name], #props [data-ex-field], #props [data-tp-field]");
-  const attr = ["data-ed-field", "data-sch-field", "data-mo-field", "data-mo-name", "data-ex-field", "data-tp-field"].find((a) => f?.hasAttribute(a));
+  const f = document.activeElement?.closest?.("#props [data-ed-field], #props [data-sch-field], #props [data-mo-field], #props [data-mo-name], #props [data-ex-field], #props [data-tp-field], #props [data-ru-field]");
+  const attr = ["data-ed-field", "data-sch-field", "data-mo-field", "data-mo-name", "data-ex-field", "data-tp-field", "data-ru-field"].find((a) => f?.hasAttribute(a));
   const keep = f && { field: f.getAttribute(attr), a: f.selectionStart, b: f.selectionEnd };
   renderPropsBody();
   if (keep) {
@@ -1150,6 +1150,7 @@ function renderProps() {
 }
 function renderPropsBody() {
   meSync();
+  ruSync();
   acSync();
   tiSync();
   const box = $("props");
@@ -1175,6 +1176,8 @@ function renderPropsBody() {
   if (mo) section("Moods", mo.rows, mo.count);
   const me = meRows(o, row, marks);
   if (me) section("Members", me.rows, me.count);
+  const ru = ruRows(o, row, marks);
+  if (ru) section("Rule", ru.rows, ru.count);
   const ti = tiRows(o, row, marks);
   if (ti) section("Tiles", ti.rows, ti.count);
   const tl = tiLinkedRows(o, row);
@@ -2298,6 +2301,7 @@ function editsHere() {
   if (schedsPending().length) parts.push(`switching times of ${plural(schedsPending().length, "timer")} edited here`);
   if (moodsPending().length) parts.push(`moods of ${plural(moodsPending().length, "lighting controller")} edited here`);
   if (membersPending().length) parts.push(`members of ${plural(membersPending().length, "central block")} edited here`);
+  if (rulesPending().length) parts.push(`${plural(rulesPending().length, "Automatic Designer rule")} edited here`);
   if (accessPending().length) parts.push(`access to ${accessPending().length} NFC Code Touch${accessPending().length === 1 ? "" : "es"} edited here`);
   if (accessPending("recipients").length) parts.push(`recipients of ${plural(accessPending("recipients").length, "push notification")} edited here`);
   if (tilesPending().length) parts.push(`tiles of ${tilesPending().length === 1 ? "1 Touch Pure Flex" : `${tilesPending().length} Touch Pure Flex devices`} edited here`);
@@ -5025,6 +5029,324 @@ $("props").addEventListener("click", (e) => {
   ($("props").querySelector(`[data-me="${what}"][data-i="${j}"]:not([disabled])`) || $("props").querySelector(`[data-me="del"][data-i="${j}"]`) || $("props").querySelector('[data-me="add"]'))?.focus();
 }, true);
 
+// ── Automatic Designer rules (#87) ─────────────────────────────────────
+// A rule (`AutopilotRule`) is made in the app and stored as a JSON payload; Lox Logic writes what it does as a
+// `rule` declaration: `active`, its conditions (all must hold; `or` starts another group) and its actions in order.
+// The server reads every rule with lox's decompile (`o.rule`: each line in words, the block or mode it names as a
+// link, and `value`, the lines with blocks and modes by UUID, which the editor starts from); one Lox Logic cannot
+// write (text values, calls, speech) is read-only with the reason. Saving sends one `rule` op with the whole
+// rule: compiled, never deployed, undone through `undo`. *New rule* opens the same form for a named rule
+// (`new_rule`: its name, a condition and an action at least), which lox creates below the config's last rule; a rule
+// created here is renamed in its form and deleted with *Delete rule*.
+// lox checks a block's states and commands against the app's capability table when it compiles: the form
+// suggests those the config's rules already use (`rule_edit.offers`), and shows lox's refusal, which lists what
+// the block offers. The draft belongs to one rule and one pending config (`blob`), as for members.
+const RU = { uuid: null, blob: null, open: false, creating: false, active: false, name: "", lines: [], busy: false, msg: "", err: "" };
+const RU_WHEN = [["time", "At a time"], ["weekday", "On days of the week"], ["state", "A block's state"], ["mode", "An operating mode"], ["weather", "The weather"], ["day", "A day of the month"], ["daylight", "Day or night"], ["sun", "Sunrise, sunset, dawn, dusk"], ["date", "On a date"]];
+const RU_THEN = [["then", "A command to a block"], ["then_mode", "Switch an operating mode"], ["notify", "A push notification"], ["mail", "A mail"], ["wait", "Wait"], ["message", "A message center entry"]];
+const RU_OPS = ["==", "!=", ">", "<", ">=", "<="];
+const RU_WEATHER = ["temperature", "dewpoint", "felt_temperature", "wind", "gusts", "wind_direction", "irradiance", "relative_irradiance", "solar_irradiance", "precipitation", "pressure", "sunshine"];
+const RU_ACTION = new Set(RU_THEN.map(([k]) => k));
+/** What `GET /api/edits` says of this rule (#87): what vislox's file states and deployed, or null. */
+function ruleEdit(uuid) { return (S.edits?.rules || []).find((r) => ciEq(r.uuid, uuid)) || null; }
+/** The rules stated or created here and not deployed. */
+function rulesPending() { return (S.edits?.rules || []).filter((r) => r.pending); }
+/** Why this rule cannot be edited here (the server's), or null; undefined when the server says nothing of it. */
+function ruWhy(o) { const m = S.edits?.rule_edit?.rules; return m ? m[o.uuid.toLowerCase()] : undefined; }
+/** Whether rules can be edited here now: `{ ok, rev }`, or `{ why }`. As for any edit, but on a rule (no values). */
+function ruState(o) {
+  const a = S.hist?.actions;
+  if (!a?.shown) return null;
+  if (!a.edit?.available) return { why: `Editing is off: ${a.edit?.reason || "unknown"}.` };
+  const r = editRev();
+  if (!r) return { why: "The config on disk is not in the History yet." };
+  if (S.rev !== r.id) return { why: `Edits are made on the newest config (${r.kind === "pending" ? "Pending" : "deployed"}).` };
+  if (a.running) return { why: `${a.running} is running.` };
+  if (UNDO.busy) return { why: "Undo or redo is compiling." };
+  if (o) {
+    const why = ruWhy(o);
+    if (why === undefined && !ruleEdit(o.uuid)) return { why: "Waiting for the server's list of rules." };
+    if (why) return { why };
+  }
+  return { ok: true, rev: r };
+}
+function ruModes() { return (S.view?.modes || []).map((m) => ({ uuid: m.uuid.toLowerCase(), title: m.title })); }
+function ruModeTitle(m) {
+  const x = ruModes().find((y) => ciEq(y.uuid, m || ""));
+  return x ? x.title : (m || "").replace(/^"|"$/g, "");
+}
+function ruDefault(kind) {
+  const mode = ruModes()[0]?.uuid || "";
+  return {
+    time: { at: "08:00" }, weekday: { days: ["weekdays"] }, state: { block: "", state: "", op: "==", value: "on" },
+    mode: { mode, on: true }, weather: { field: "temperature", op: ">", value: "25" }, day: { op: "==", value: "1" },
+    daylight: { on: true }, sun: { at: "sunrise" }, date: { date: "" }, then: { block: "", command: "" },
+    then_mode: { mode, on: true }, notify: { subject: "", text: "" }, mail: { to: "", subject: "", text: "" },
+    wait: { duration: "5s" }, message: { severity: "info", subject: "", text: "", admins: false },
+  }[kind] || {};
+}
+/** The checks the server makes on the rule's shape, first: nothing is sent while one fails. */
+function ruShape(lines) {
+  if (!lines.length) return "A rule needs a condition and an action.";
+  const first = lines.findIndex((l) => RU_ACTION.has(l.kind));
+  if (first < 0) return "A rule does something: add an action.";
+  if (lines.slice(first).some((l) => !RU_ACTION.has(l.kind))) return "A rule's conditions come before its actions.";
+  if (!first) return "A rule runs on a condition: add one.";
+  let n = 0;
+  for (const l of lines.slice(0, first)) { if (l.kind === "or") { if (!n) return "Every group of conditions (between “or”s) has one at least."; n = 0; } else n++; }
+  if (!n) return "Every group of conditions (between “or”s) has one at least.";
+  for (const l of lines) {
+    if ((l.kind === "state" || l.kind === "then") && !l.block) return "Pick the block of every condition and command.";
+    if (l.kind === "then" && !l.command.trim()) return "Every command to a block names the command.";
+    if (l.kind === "message" && /\//.test(l.subject + l.text)) return "A message's subject and text cannot contain “/”.";
+  }
+  return "";
+}
+function ruOpen(uuid, creating) {
+  const o = S.view?.objects[uuid], st = o && (creating ? ruState(null) : ruState(o));
+  if (!o?.rule || !st?.ok || (!creating && !o.rule.value)) return;
+  const c = ruleEdit(uuid)?.created;
+  const draft = creating
+    ? { active: false, name: "", lines: [{ kind: "time", ...ruDefault("time") }, { kind: "then", ...ruDefault("then") }] }
+    : { active: o.rule.value.active, name: c ? c.title : "", lines: structuredClone(o.rule.value.lines) };
+  Object.assign(RU, { uuid, blob: st.rev.blob, open: true, creating: !!creating, ...draft, busy: false, msg: "", err: "" });
+  S.closed.delete("Rule");
+  renderProps();
+  $("props").querySelector(creating ? '[data-ru-f="name"]' : '[data-ru-f="active"]')?.focus();
+}
+function ruSync() {
+  if (RU.busy) return;
+  if (RU.open && S.sel !== RU.uuid) Object.assign(RU, { open: false, creating: false, lines: [], msg: "", err: "" });
+  else if (RU.open && editRev()?.blob !== RU.blob) Object.assign(RU, { open: false, creating: false, lines: [], err: "", msg: "The pending config changed while editing: the draft was dropped. Edit the rule again." });
+}
+function ruClose() {
+  if (RU.busy) return;
+  Object.assign(RU, { open: false, creating: false, lines: [], msg: "", err: "" });
+  renderProps();
+}
+/** A block of a line, as a link (or the UUID when this config has no such object). */
+function ruBlock(u) {
+  if (!u) return '<span class="none-v">no block yet</span>';
+  const k = Object.keys(S.view?.objects || {}).find((x) => ciEq(x, u));
+  return k ? meLink(meTarget(k)) : `<span class="mono">${esc(u)}</span>`;
+}
+/** The suggestions for a block's states or commands: those the config's rules use on blocks of its type. */
+function ruOffers(u, what) {
+  const k = Object.keys(S.view?.objects || {}).find((x) => ciEq(x, u || ""));
+  return (k && S.edits?.rule_edit?.offers?.[S.view.objects[k].ty]?.[what]) || [];
+}
+function ruField(i, f, label, value, attrs = "") {
+  return `<label class="ru-f"><span>${esc(label)}</span><input type="text" data-ru-f="${f}" data-ru-field="${f}:${i}" data-i="${i}" value="${esc(value ?? "")}"${attrs}></label>`;
+}
+function ruSelect(i, f, label, value, opts) {
+  return `<label class="ru-f"><span>${esc(label)}</span><select data-ru-f="${f}" data-ru-field="${f}:${i}" data-i="${i}">${opts.map(([v, t]) => `<option value="${esc(v)}"${v === value ? " selected" : ""}>${esc(t)}</option>`).join("")}</select></label>`;
+}
+/** The fields of one line of the draft. */
+function ruLineFields(l, i, dis) {
+  const onOff = (f, label) => ruSelect(i, f, label, l[f] ? "on" : "off", [["on", "on"], ["off", "off"]]);
+  const ops = (f) => ruSelect(i, f, "Compare", l[f], RU_OPS.map((o) => [o, o]));
+  const modes = (f) => ruSelect(i, f, "Mode", (l[f] || "").toLowerCase(), [...ruModes().map((m) => [m.uuid, m.title]), ...(l[f] && !ruModes().some((m) => ciEq(m.uuid, l[f])) ? [[l[f], `${l[f]} (not in this config)`]] : [])]);
+  const list = (id, items) => items.length ? `<datalist id="${id}">${items.map((x) => `<option value="${esc(x)}">`).join("")}</datalist>` : "";
+  const pick = `<span class="ru-f"><span>Block</span>${ruBlock(l.block)} <button type="button" class="ed-btn small" data-ru="pick" data-i="${i}"${dis}>Pick…</button></span>`;
+  switch (l.kind) {
+    case "or": return '<span class="none-v">— or: the conditions below are another group —</span>';
+    case "time": return ruField(i, "at", "Time (HH:MM)", l.at);
+    case "weekday": return ruField(i, "days", "Days (mon … sun, weekdays, weekend, daily)", l.days.join(" "));
+    case "state": return pick + ruField(i, "state", "State", l.state, ` list="ru-st-${i}"`) + list(`ru-st-${i}`, ruOffers(l.block, "states")) + ops("op") + ruField(i, "value", "Value (number, on, off)", l.value);
+    case "mode": return modes("mode") + onOff("on", "While it is");
+    case "weather": return ruSelect(i, "field", "Field", l.field, RU_WEATHER.map((w) => [w, w.replace(/_/g, " ")])) + ops("op") + ruField(i, "value", "Value", l.value);
+    case "day": return ops("op") + ruField(i, "value", "Day (1 … 31)", l.value);
+    case "daylight": return ruSelect(i, "on", "While it is", l.on ? "on" : "off", [["on", "day"], ["off", "night"]]);
+    case "sun": return ruSelect(i, "at", "At", l.at, [["sunrise", "sunrise"], ["sunset", "sunset"], ["dawn", "dawn"], ["dusk", "dusk"]]);
+    case "date": {
+      const why = S.edits?.rule_edit?.date;
+      return ruField(i, "date", "Date (YYYY-MM-DD)", l.date, ' placeholder="2026-12-24"') + (why ? `<span class="ed-note">${esc(why)}</span>` : "");
+    }
+    case "then": return pick + ruField(i, "command", "Command", l.command, ` list="ru-cm-${i}"`) + list(`ru-cm-${i}`, ruOffers(l.block, "commands"));
+    case "then_mode": return modes("mode") + onOff("on", "Switch");
+    case "notify": return ruField(i, "subject", "Subject", l.subject) + ruField(i, "text", "Text", l.text);
+    case "mail": return ruField(i, "to", "To", l.to) + ruField(i, "subject", "Subject", l.subject) + ruField(i, "text", "Text", l.text);
+    case "wait": return ruField(i, "duration", "Duration (500ms, 2.5s, 5min, 1h)", l.duration);
+    case "message": return ruSelect(i, "severity", "Severity", l.severity, [["info", "info"], ["warning", "warning"], ["important", "important"], ["critical", "critical"]]) + ruField(i, "subject", "Subject", l.subject) + ruField(i, "text", "Text", l.text) +
+      `<label class="ru-f ru-chk"><input type="checkbox" data-ru-f="admins" data-i="${i}"${l.admins ? " checked" : ""}> administrators only</label>`;
+  }
+  return "";
+}
+/** The rows of the *Rule* section. */
+function ruRows(o, row, marks) {
+  const ri = o.rule;
+  if (!ri) return null;
+  const rows = [], st = ruState(o), e = ruleEdit(o.uuid), mine = RU.uuid === o.uuid ? RU : null, dis = mine?.busy ? " disabled" : "";
+  const msg = () => (mine?.msg || mine?.err ? `<span class="ed-msg${mine.err ? " err" : ""}" role="status">${esc(mine.err || mine.msg)}</span>` : "");
+  const other = (S.edits?.rule_claims || []).find((c) => c.blocks?.includes(o.uuid.toLowerCase()) && !c.file.startsWith(`${S.edits?.dir}/`));
+  if (other && e?.value) {
+    rows.push(`<div class="sch-note warn">⚠ Declared twice: ${esc(claimAt(other))} and vislox's ${esc(S.edits?.file || "")} both state this rule, and lox compiles neither until one goes.</div>`,
+      `<div class="ed-bar"><button type="button" class="ed-btn small" data-ru="drop"${dis}>Remove vislox's declaration</button>${msg()}</div>`);
+  } else if (other) rows.push(`<div class="ed-note">${esc(claimAt(other))} states this rule: change it there.</div>`);
+  if (e?.created) rows.push(`<div class="ed-note">Created here as <span class="mono">${esc(e.created.slug)}</span> in ${esc(S.edits?.file || "")}: its name and what it does are the module's.</div>`);
+  else if (e?.value) rows.push(`<div class="ed-note">Stated by vislox in ${esc(S.edits?.file || "")}: the declaration owns whether it is active, its conditions and its actions; its name stays the app's.</div>`);
+  if (e?.pending && st?.ok && !other) {
+    const back = e.created ? "Back to the deployed rule" : e.deployed ? "Back to the rule deployed" : "Back to the rule as last written: vislox's declaration goes";
+    const can = !e.created || e.deployed;
+    rows.push(row("Rule", `<span class="ed-v">edited here</span><span class="ed-tag" title="Saved into the module and compiled, not on the Miniserver yet: Apply deploys it, Discard drops it">not deployed</span>` +
+      (can ? `<button type="button" class="ed-btn small" data-ru="revert"${dis} title="${esc(back)}">Revert</button>` : ""), "pr-chg"));
+  }
+  if (!mine?.open || (mine.creating ? !ruState(null)?.ok : !st?.ok || other)) {
+    const old = marks ? o.rule_old : null;
+    rows.push(row("Status", old && old.active !== ri.active ? `<span class="old">${old.active ? "active" : "inactive"}</span><span class="new">${ri.active ? "active" : "inactive"}</span>` : (ri.active ? "active" : '<span class="none-v">inactive</span>'), old && old.active !== ri.active ? "pr-chg" : ""));
+    if (ri.why) rows.push(`<div class="ed-note">${esc(ri.why)}</div>`);
+    else {
+      rows.push(`<div class="ru-sum${old ? " pr-chg" : ""}">${old ? `<span class="old">${esc(old.summary)}</span><br>` : ""}${esc(ri.summary)}</div>`);
+      let g = 0;
+      for (const l of ri.lines) {
+        if (l.kind === "or") { g++; rows.push('<div class="ru-or">or</div>'); continue; }
+        const label = l.kind === "then" ? "Then" : "When";
+        rows.push(row(label, `${esc(l.words)}${l.target ? ` <span class="ru-link">${linkTarget(l.target)}</span>` : ""}`));
+      }
+    }
+    const bar = [];
+    if (st?.ok && !other && ri.value) bar.push(`<button type="button" class="ed-btn small" data-ru="open"${dis}>Edit rule</button>`);
+    if (st?.ok && e?.value && !e.created && !other) bar.push(`<button type="button" class="ed-btn small" data-ru="drop"${dis} title="The rule stays as last written">Remove vislox's declaration</button>`);
+    if (st?.ok && e?.created) bar.push(`<button type="button" class="ed-btn small" data-ru="delete"${dis} title="Take the rule out of the config (on Apply, of the Miniserver)">Delete rule</button>`);
+    const create = S.edits?.rule_edit?.create;
+    const ns = ruState(null);
+    if (ns?.ok) bar.push(`<button type="button" class="ed-btn small" data-ru="new"${dis || (create ? " disabled" : "")}${create ? ` title="${esc(create)}"` : ""}>New rule…</button>`);
+    if (st && !st.ok && st.why && !ri.why) rows.push(`<div class="ed-note">${esc(st.why)}</div>`);
+    if (bar.length || msg()) rows.push(`<div class="ed-bar">${bar.join("")}${msg()}</div>`);
+    return { rows, count: e?.pending ? 1 : 0 };
+  }
+  // The editor: of this rule, or of a new one.
+  if (mine.creating) rows.push('<div class="ed-note">A new rule: lox creates it below the config\'s last rule, with this name, its conditions and its actions.</div>');
+  rows.push(`<div class="ed-bar"><label class="ru-f ru-chk"><input type="checkbox" data-ru-f="active"${RU.active ? " checked" : ""}${dis}> Active</label>` +
+    (e?.created || mine.creating ? `<label class="ru-f"><span>Name</span><input type="text" data-ru-f="name" data-ru-field="name" value="${esc(RU.name)}"${dis}></label>` : "") + "</div>");
+  const items = RU.lines.map((l, i) => {
+    const kinds = RU_ACTION.has(l.kind) ? RU_THEN : l.kind === "or" ? [["or", "or"]] : RU_WHEN;
+    return `<li class="ru-item"><span class="ru-k">${l.kind === "or" ? "" : `<select data-ru-f="kind" data-i="${i}" aria-label="Kind"${dis}>${kinds.map(([k, t]) => `<option value="${k}"${k === l.kind ? " selected" : ""}>${esc(RU_ACTION.has(k) ? `Then: ${t}` : `When: ${t}`)}</option>`).join("")}</select>`}</span>` +
+      `<span class="ru-fields">${ruLineFields(l, i, dis)}</span><span class="me-ops">` +
+      `<button type="button" class="se-x" data-ru="up" data-i="${i}" aria-label="Move line ${i + 1} up"${i ? "" : " disabled"}${dis}>↑</button>` +
+      `<button type="button" class="se-x" data-ru="down" data-i="${i}" aria-label="Move line ${i + 1} down"${i < RU.lines.length - 1 ? "" : " disabled"}${dis}>↓</button>` +
+      `<button type="button" class="se-x" data-ru="del" data-i="${i}" aria-label="Remove line ${i + 1}"${dis}>✕</button></span></li>`;
+  }).join("");
+  rows.push(RU.lines.length ? `<ol class="ru-list">${items}</ol>` : '<div class="ed-note">No conditions and no actions: add a condition and an action.</div>');
+  rows.push(`<div class="ed-bar"><button type="button" class="ed-btn small" data-ru="addwhen"${dis}>Add condition</button><button type="button" class="ed-btn small" data-ru="addor"${dis}>Add “or”</button><button type="button" class="ed-btn small" data-ru="addthen"${dis}>Add action</button></div>`);
+  const shape = ruShape(RU.lines);
+  rows.push(`<div class="ed-bar"><button type="button" class="primary small" data-ru="save"${dis}${shape ? " disabled" : ""}>${mine.busy ? "Compiling…" : "Save"}</button>` +
+    `<button type="button" class="ed-btn small" data-ru="cancel"${dis}>Cancel</button>` +
+    `<span class="ed-msg${mine.err || shape ? " err" : ""}" role="status" aria-live="polite">${esc(mine.err || shape || mine.msg || "Saving states the rule in the module and compiles it; nothing is deployed. lox checks each block's states and commands.")}</span></div>`);
+  return { rows, count: e?.pending ? 1 : 0 };
+}
+/** After a new rule compiled: show it, on its page. */
+function ruShowNew(res) {
+  const uuid = res.added?.[0]?.uuid;
+  const u = uuid && Object.keys(S.view?.objects || {}).find((k) => ciEq(k, uuid));
+  if (!u) return;
+  const x = S.view.objects[u];
+  if (x.page) gotoPage(x.page, { focus: u });
+  select(u);
+}
+async function ruSend(o, base, ops, label, after) {
+  RU.uuid = o.uuid; RU.busy = true; RU.err = ""; RU.msg = ""; renderProps();
+  try {
+    const res = await editAct(base, ops, label);
+    Object.assign(RU, { open: false, creating: false, lines: [], busy: false, err: "", msg: res.unchanged ? "Nothing changed." : "Saved and compiled: pending, not deployed. Review it, then Apply or Discard." });
+    await editShowNewest(res.blob);
+    after?.(res);
+  } catch (err) {
+    RU.busy = false; RU.err = err.message;
+  }
+  renderProps();
+}
+function ruSave() {
+  const o = S.view?.objects[RU.uuid], st = o && (RU.creating ? ruState(null) : ruState(o));
+  if (!st?.ok || RU.busy || !RU.open) return;
+  if (st.rev.blob !== RU.blob) {
+    Object.assign(RU, { open: false, lines: [], err: "The pending config changed while editing: the draft was dropped. Edit the rule again.", msg: "" });
+    renderProps();
+    return;
+  }
+  const shape = ruShape(RU.lines);
+  if (shape) { RU.err = shape; renderProps(); return; }
+  if (RU.creating) {
+    const title = RU.name.trim();
+    if (!title) { RU.err = "A new rule needs a name."; renderProps(); return; }
+    ruSend(o, RU.blob, [{ op: "new_rule", title, value: { active: RU.active, lines: RU.lines } }], `New rule ${title}`, ruShowNew);
+    return;
+  }
+  const ops = [];
+  const c = ruleEdit(o.uuid)?.created;
+  if (c && RU.name.trim() !== c.title) ops.push({ op: "title", uuid: o.uuid, value: RU.name.trim() });
+  ops.push({ op: "rule", uuid: o.uuid, value: { active: RU.active, lines: RU.lines } });
+  ruSend(o, RU.blob, ops, `Rule ${displayTitle(o)}`);
+}
+function ruPick(i) {
+  const o = S.view?.objects[RU.uuid];
+  if (!o || !RU.open || RU.busy) return;
+  const types = [...new Set(Object.values(S.view.objects).map((x) => x.ty))].filter((t) => t !== "AutopilotRule");
+  openPicker({
+    title: `The block of line ${i + 1}`, placeholder: "Pick a block…", none: "No block to pick.", types, exclude: new Set(),
+    onPick: (u) => { RU.lines[i].block = u; RU.err = ""; renderProps(); $("props").querySelector(`[data-ru="pick"][data-i="${i}"]`)?.focus(); },
+    back: () => $("props").querySelector(`[data-ru="pick"][data-i="${i}"]`)?.focus(),
+  });
+}
+$("props").addEventListener("click", (e) => {
+  const b = e.target.closest("[data-ru]");
+  if (!b) return;
+  e.stopPropagation();
+  const o = S.view?.objects[S.sel], what = b.dataset.ru;
+  if (!o) return;
+  const st = ruState(o), ed = ruleEdit(o.uuid);
+  if (what === "open") return ruOpen(S.sel);
+  if (what === "cancel") return ruClose();
+  if (what === "save") return ruSave();
+  if (what === "new") return ruOpen(S.sel, true);
+  if (what === "revert") {
+    if (!st?.ok || !ed) return;
+    const ops = [];
+    if (ed.created && ed.deployed == null) return;
+    // A rule created here gets its deployed name back too.
+    if (ed.created && ed.deployed_title && ed.deployed_title !== ed.created.title) ops.push({ op: "title", uuid: o.uuid, value: ed.deployed_title });
+    ops.push({ op: "rule", uuid: o.uuid, value: ed.deployed ?? null });
+    ruSend(o, st.rev.blob, ops, `Revert the rule ${displayTitle(o)}`);
+    return;
+  }
+  if (what === "drop") { if (st?.ok || ed?.value) { const r = editRev(); if (r) ruSend(o, r.blob, [{ op: "rule", uuid: o.uuid, value: null }], `Remove vislox's declaration of ${displayTitle(o)}`); } return; }
+  if (what === "delete") { if (st?.ok && ed?.created) ruSend(o, st.rev.blob, [{ op: "remove_block", uuid: o.uuid }], `Delete the rule ${displayTitle(o)}`); return; }
+  if (RU.busy || !RU.open) return;
+  const i = +b.dataset.i;
+  if (what === "pick") return ruPick(i);
+  if (what === "addwhen" || what === "addthen" || what === "addor") {
+    const first = RU.lines.findIndex((l) => RU_ACTION.has(l.kind));
+    const at = what === "addthen" || first < 0 ? RU.lines.length : first;
+    const line = what === "addor" ? { kind: "or" } : what === "addthen" ? { kind: "then", ...ruDefault("then") } : { kind: "time", ...ruDefault("time") };
+    RU.lines.splice(at, 0, line);
+  } else if (what === "del") RU.lines.splice(i, 1);
+  else if (what === "up" && i > 0) RU.lines.splice(i - 1, 0, RU.lines.splice(i, 1)[0]);
+  else if (what === "down" && i < RU.lines.length - 1) RU.lines.splice(i + 1, 0, RU.lines.splice(i, 1)[0]);
+  RU.err = "";
+  renderProps();
+}, true);
+/** A field of the draft: kept as typed, the form redrawn only where its shape changes (kind, block, on/off). */
+$("props").addEventListener("input", (e) => {
+  const f = e.target.closest?.("[data-ru-f]");
+  if (!f) return;
+  const k = f.dataset.ruF, i = +f.dataset.i;
+  if (k === "name") { RU.name = f.value; return; }
+  if (k === "active") { RU.active = f.checked; return; }
+  const l = RU.lines[i];
+  if (!l || RU.busy) return;
+  if (k === "kind") { RU.lines[i] = { kind: f.value, ...ruDefault(f.value) }; RU.err = ""; renderProps(); return; }
+  if (k === "days") l.days = f.value.trim().split(/\s+/).filter(Boolean);
+  else if (k === "on") l.on = f.value === "on";
+  else if (k === "admins") l.admins = f.checked;
+  else l[k] = f.value;
+  RU.err = "";
+  // The Save button and message follow the draft's shape.
+  const shape = ruShape(RU.lines), save = $("props").querySelector('[data-ru="save"]');
+  if (save) save.disabled = !!shape;
+  const m = save?.parentElement?.querySelector(".ed-msg");
+  if (m) { m.textContent = shape || "Saving states the rule in the module and compiles it; nothing is deployed. lox checks each block's states and commands."; m.classList.toggle("err", !!shape); }
+});
+
 // ── who may open an NFC Code Touch (#76), who gets a push notification (#77) ──
 // A Code Touch's access rights are a Lox Logic `access` set (users and groups, each with an access schedule) and
 // the Code Touch's `.access` claim; a push notification's recipients a `recipients` set (users and groups, no
@@ -5801,6 +6123,8 @@ function undoLabel(ops) {
   if (ops.length === 1 && op.op === "adopt_page") return `Adopt the blocks of ${S.pageOf?.get(op.page)?.title || "the page"}`;
   if (ops.length === 1 && op.op === "unadopt") return op.uuids.length === 1 ? `Hand ${obj(op.uuids[0])} back to Loxone Config` : `Hand ${plural(op.uuids.length, "block")} back to Loxone Config`;
   if (ops.length === 1 && op.op === "access") return `Access to ${obj(op.uuid)}${op.value == null ? ": as last written" : op.value.grants ? "" : ": shared set"}`;
+  if (ops.length === 1 && op.op === "new_rule") return `New rule ${op.title}`;
+  if (op.op === "rule" || op.op === "restore_rule") return `Rule ${obj(op.uuid)}${op.value == null ? ": as last written" : ""}`;
   if (ops.length === 1 && op.op === "members") return `Members of ${obj(op.uuid)}${op.value == null ? ": as last written" : ""}`;
   if (ops.length === 1 && op.op === "moods") return `Moods of ${obj(op.uuid)}${op.value == null ? ": Loxone Config's" : op.value.moods ? "" : ": shared set"}`;
   if (ops.length === 1 && op.op === "schedule") return `Switching times of ${obj(op.uuid)}${op.value == null ? ": Loxone Config's" : op.value.modes ? "" : ": shared set"}`;
