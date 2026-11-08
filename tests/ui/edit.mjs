@@ -2585,6 +2585,9 @@ try {
     await until(() => edits.length > n1 && statuses[n1] !== undefined, "the add request");
     assert.equal(statuses[n1], 200);
     assert.deepEqual(edits[n1].ops, [{ op: "add_block", page: MELDUNGEN, type: "OutputRefLM", params: {}, settings: { mirrors: REGEN, On: "Es regnet", MinimumTime: "30min" } }]);
+    // The new block is selected once the add's reply is handled: that comes after the History shows the compile,
+    // so a settled view alone can still be the one before, with the old selection (the CI flake).
+    await page.waitForFunction(() => editsBlock(S.sel)?.slug === "vx_outputreflm_1", null, { timeout: 15000 });
     await settled();
     const pf = readFileSync(join(dir, "pages", "vislox", "meldungen.loxl"), "utf8");
     assert.match(pf, /^vx_outputreflm_1 = OutputRefLM\(mirrors: vx_40000022_0000_0000_ffff504f94000001, On: "Es regnet", MinimumTime: 30min\)$/m);
@@ -3766,6 +3769,41 @@ try {
     ops = await undoKey(true, () => !S.view.pages.some((p) => p.title === "Küche Logik"));
     assert.deepEqual(ops, [{ op: "remove_page", page: again }]);
     assert.equal(existsSync(file), false);
+  });
+  await step("an older /api/edits answer never overwrites a newer one (#124)", async () => {
+    await settled();
+    await page.waitForFunction(() => /Nothing pending/.test(document.querySelector("#deploy-pend")?.textContent || ""), null, { timeout: 15000 });
+    const pending = () => page.evaluate(() => (S.edits?.claims || []).filter((c) => c.pending).length);
+    assert.equal(await pending(), 0);
+    // A load of the edits is read before the edit and answers after it: held, then released.
+    let release;
+    const held = new Promise((r) => { release = r; });
+    let answered = false;
+    await page.route("**/api/edits", async (r) => {
+      if (answered) return r.continue().catch(() => {});
+      answered = true;
+      const resp = await r.fetch();
+      await held;
+      await r.fulfill({ response: resp }).catch(() => {});
+    });
+    try {
+      await page.evaluate(() => { S.editsKey = "stale"; editsChanged(); window.__old = S.editsLoad; });
+      const n = edits.length;
+      await saveTitle("Neuer");
+      await until(() => edits.length > n && statuses[n] !== undefined, "the save");
+      assert.equal(statuses[n], 200);
+      await titleIs("Neuer");
+      await page.waitForFunction(() => (S.edits?.claims || []).some((c) => c.pending), null, { timeout: 15000 });
+    } finally {
+      release();
+    }
+    // The old answer is in now: it is not what S.edits says, and nothing loads it again.
+    await page.evaluate(() => window.__old);
+    await page.unroute("**/api/edits");
+    await page.waitForTimeout(500);
+    assert.ok((await pending()) > 0, "the older answer overwrote the newer one");
+    await page.click("#btn-discard");
+    await page.waitForFunction(() => /Nothing pending/.test(document.querySelector("#deploy-pend")?.textContent || ""), null, { timeout: 15000 });
   });
   await step("nothing was deployed: lox only compiled, checked, linted and tested", async () => {
     const ran = readFileSync(calls, "utf8").trim().split("\n");

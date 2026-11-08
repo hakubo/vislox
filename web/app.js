@@ -3341,13 +3341,20 @@ function settingsRows(o, row, marks, chg) {
 S.edits = null; // GET /api/edits: what vislox's file claims, and which of it is not deployed
 S.edit = { uuid: null, open: false, draft: {}, bad: {}, busy: false, msg: "", err: "" };
 S.editsKey = null; // the server's key of what /api/edits says (vislox's file, deployed and pending config)
+S.editsSeq = 0;
 async function loadEdits() {
+  // Loads overlap (each change of the key starts one): an older answer arriving after a newer one is dropped, as
+  // `S.editsKey` already names the newer and nothing would load it again.
+  const seq = ++S.editsSeq;
   const hwWas = JSON.stringify((S.edits?.blocks || []).filter((b) => b.hardware).map((b) => [b.uuid, b.paired]));
   const mdWas = mdEditKey();
   const adoptionsWas = JSON.stringify(adoptedUncommitted());
   const was = managedSet(), under = JSON.stringify(S.edits?.add_under || null), consts = JSON.stringify(S.edits?.constants || null), exprs = JSON.stringify([S.edits?.expressions || null, S.edits?.templates?.instances || null, S.edits?.templates?.templates || null]);
   if (!S.hist?.actions?.shown) { S.edits = null; managedRefresh(was); return; }
-  try { S.edits = await api("/api/edits"); } catch { S.edits = null; S.editsKey = null; }
+  let got = null, failed = false;
+  try { got = await api("/api/edits"); } catch { failed = true; }
+  if (seq !== S.editsSeq) return;
+  if (failed) { S.edits = null; S.editsKey = null; } else S.edits = got;
   // The managed blocks' badges and the legend follow the lockfile and the module (#64); the expressions'
   // groups follow the module too (#82).
   const exprsNow = JSON.stringify([S.edits?.expressions || null, S.edits?.templates?.instances || null, S.edits?.templates?.templates || null]);
