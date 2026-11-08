@@ -400,6 +400,9 @@ async function loadView() {
   renderChanges();
   renderPage();
   renderProps();
+  // The check's errors, tests and lint findings name their blocks from this view (goButtons): their results can
+  // come before it (#126), so they are drawn again from it, not left with the labels of the view it replaced.
+  renderCheck();
   if (h) select(h.sel && v.objects[h.sel] ? h.sel : null);
   else if (S.sel) applyFocus();
   // A link or Back/Forward says whether the view is open; a reload of the revision keeps it as it is.

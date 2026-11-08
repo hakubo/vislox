@@ -1932,11 +1932,39 @@ try {
       `\ntest "Flur schaltet"\n\tflur.In1 = 1\n\tflur.In2 = 1\n\ttick 1s\n\texpect flur.Q == 1 # ${mark}\nend\n`;
     writeFileSync(flur, withTest("FAILTEST"));
     await waitText("#deploy-check", /The module changed \(pages\/flur\.loxl\) and is not compiled yet/);
-    await page.click("#btn-compile");
-    await waitText("#deploy-pend", /Compiled changes are pending/);
-    // The final state: the tests of these files ran, and failed.
-    await page.waitForFunction(() => S.check?.current && S.check.test?.available && !S.check.test.running && S.check.test.failed === 1, null, { timeout: 15000 });
-    await waitText("#deploy-tests", /Tests: 0 of 1 passed, 1 failed/);
+    // The check's results come before the pending revision's view (#126): the view is held until they are in, so
+    // the links must take their labels from the view when it comes, not from the one it replaces.
+    let release;
+    const held = new Promise((r) => { release = r; });
+    // What the box shows the moment each load of a view is done: no later event may be what corrects it.
+    await page.evaluate(() => {
+      window.__loaded = [];
+      window.__loadView = loadView;
+      loadView = async function (...a) {
+        await window.__loadView.apply(this, a);
+        window.__loaded.push({ rev: S.viewRev, go: [...document.querySelectorAll("#deploy-tests .go")].map((b) => b.textContent) });
+      };
+    });
+    await page.route("**/api/view*", async (r) => {
+      if (decodeURIComponent(new URL(r.request().url()).searchParams.get("rev") || "").startsWith("pending:")) await held;
+      await r.continue().catch(() => {});
+    });
+    try {
+      await page.click("#btn-compile");
+      await waitText("#deploy-pend", /Compiled changes are pending/);
+      // The final state: the tests of these files ran, and failed.
+      await page.waitForFunction(() => S.check?.current && S.check.test?.available && !S.check.test.running && S.check.test.failed === 1, null, { timeout: 15000 });
+      await waitText("#deploy-tests", /Tests: 0 of 1 passed, 1 failed/);
+      // Still the view of the revision before the compile: the pending one is not shown yet.
+      assert.notEqual(await page.evaluate(() => S.viewRev), await page.evaluate(() => S.rev));
+    } finally {
+      release();
+      await page.unroute("**/api/view*");
+    }
+    await page.waitForFunction(() => S.viewRev === S.rev && S.rev.startsWith("pending:") && window.__loaded.some((l) => l.rev === S.rev), null, { timeout: 15000 });
+    const loaded = await page.evaluate(() => { loadView = window.__loadView; return window.__loaded.filter((l) => l.rev.startsWith("pending:")); });
+    // Every link names its block as the loaded revision does ("Flur getestet"), as soon as the view is in.
+    assert.ok(loaded.length > 0 && loaded.every((l) => l.go.length > 0 && l.go.every((t) => t === "Flur getestet")), JSON.stringify(loaded));
     // Open while it fails: the test with its file and line, the expect with expected and actual, and its block.
     assert.match(await page.textContent("#deploy-tests"), /pages\/flur\.loxl:5Flur schaltet[\s\S]*pages\/flur\.loxl:9step 1: expect flur\.Q == 1 — expected 1, actual 0/);
     assert.match(await page.textContent("#deploy-tests"), /A pass covers only what the simulator models/);

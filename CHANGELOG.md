@@ -234,6 +234,10 @@ published under the same version (see [docker/README.md](docker/README.md)).
   discarded* only when everything is as it was; otherwise it lists what is not, why, and where its copy is
   (`vislox-recovery/` in the git directory, written only then). Roll back refuses a symbolic link where it writes,
   puts its files back the same way, and lists what it could not.
+- The links in the Deploy pane's compile errors, test results and lint findings show the block names of the revision
+  that is loaded (#126). The check's answer can come before the view of the pending revision; the links were then
+  left with the names of the view it replaced (a renamed block kept its old name) until some later event redrew
+  the pane. The pane is now drawn again each time a view is loaded.
 
 ## 0.2.0
 

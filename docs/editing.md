@@ -1161,6 +1161,11 @@ message and a button per block its line names (on the newest config); *Pending i
 `pages/x.loxl`* (or, with nothing pending, *The module changed … and is not compiled yet*) with *Compile*; and the
 formatting hint. Properties shows a block's errors in its *Lox Logic* section.
 
+The buttons name their blocks from the view that is loaded, not from the one the check was answered against: the
+check's answer (`GET /api/check`) and the view of a new pending revision arrive in either order, so the browser
+draws the pane (errors, tests, lint) again whenever a view is loaded, and a block renamed by the compile shows
+under its new name at once (#126).
+
 `lox logic test` results (#67) join this as lint does (below): `GET /api/check`'s `test`, worked out on the
 same key, shown in the same pane and on the blocks the tests check.
 
